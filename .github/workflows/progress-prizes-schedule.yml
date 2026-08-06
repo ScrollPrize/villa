@@ -6,11 +6,13 @@ on:
   schedule:
     - cron: "17 6 * * *"
       timezone: America/Los_Angeles
+    - cron: "27 7 * * *"
+      timezone: America/Los_Angeles
     - cron: "40 23 28-31 * *"
       timezone: America/Los_Angeles
     - cron: "17 0 1 * *"
       timezone: America/Los_Angeles
-    - cron: "47 6 1 * *"
+    - cron: "47 6 1-7 * *"
       timezone: America/Los_Angeles
 
 permissions: {}
@@ -46,9 +48,10 @@ jobs:
 
           const allowedSchedules = new Set([
             '17 6 * * *',
+            '27 7 * * *',
             '40 23 28-31 * *',
             '17 0 1 * *',
-            '47 6 1 * *',
+            '47 6 1-7 * *',
           ]);
           assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
           assert.equal(process.env.REPOSITORY_ID, '890972577');

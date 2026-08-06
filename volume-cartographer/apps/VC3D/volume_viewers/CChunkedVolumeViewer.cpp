@@ -116,10 +116,12 @@ struct IntersectionStyle {
     QRgb color = 0;
     int z = kIntersectionZ;
     int widthQ = 0;
+    bool dashed = false;
 
     bool operator==(const IntersectionStyle& other) const
     {
-        return color == other.color && z == other.z && widthQ == other.widthQ;
+        return color == other.color && z == other.z && widthQ == other.widthQ &&
+               dashed == other.dashed;
     }
 };
 
@@ -129,6 +131,7 @@ struct IntersectionStyleHash {
         size_t h = std::hash<QRgb>{}(style.color);
         h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(style.dashed) + 0x9e3779b9u + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -849,7 +852,7 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
-    _zOff = state.zOffset;
+    setZOffset(state.zOffset);
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
     _genCacheDirty = true;
@@ -870,6 +873,8 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
+    // Raw assignment, not setZOffset(): offscreen replay must not schedule
+    // intersection renders in the other viewers.
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
@@ -1421,7 +1426,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (_resetViewOnSurfaceChange) {
             (void)setSegmentationPointerFromFocus();
         }
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         if (_resetViewOnSurfaceChange) {
@@ -1431,7 +1436,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
@@ -1455,6 +1460,52 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
             }
         }
     }
+
+    // Safety net: whatever branch ran above, the (possibly preserved) pan can
+    // land entirely off the new segment's extent — e.g. the user had zoomed
+    // deep into a large segment and switched to a small one, leaving the
+    // viewport in a region the new quad doesn't cover (all black). If the
+    // viewport no longer intersects the segment's UV bounds, pan the view
+    // center to the nearest point of those bounds. Zoom and the focus POI are
+    // deliberately left untouched.
+    if (!isEditUpdate && isSegmentationQuadSurface && _view) {
+        auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+        try {
+            quad->ensureLoaded();
+            if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
+                points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
+                const cv::Vec3f center = quad->center();
+                const cv::Vec2f gridScale = quad->scale();
+                const float minU = -center[0];
+                const float minV = -center[1];
+                const float maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                const float maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
+                if (maxU > minU && maxV > minV) {
+                    if (!std::isfinite(_surfacePtrX) || !std::isfinite(_surfacePtrY)) {
+                        _surfacePtrX = (minU + maxU) * 0.5f;
+                        _surfacePtrY = (minV + maxV) * 0.5f;
+                    } else {
+                        const QSize viewportSize = _view->viewport()->size();
+                        const float scale = std::max(_scale, kMinScale);
+                        const float halfW = 0.5f * static_cast<float>(viewportSize.width()) / scale;
+                        const float halfH = 0.5f * static_cast<float>(viewportSize.height()) / scale;
+                        const bool viewportTouchesSegment =
+                            _surfacePtrX + halfW > minU && _surfacePtrX - halfW < maxU &&
+                            _surfacePtrY + halfH > minV && _surfacePtrY - halfH < maxV;
+                        if (!viewportTouchesSegment) {
+                            _surfacePtrX = std::clamp(_surfacePtrX, minU, maxU);
+                            _surfacePtrY = std::clamp(_surfacePtrY, minV, maxV);
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not keep segment visible after surface change:" << e.what();
+        }
+    }
+
     updateFocusMarker();
     // A new preview generation installs a new surface pointer, which retires
     // the tiles built for the previous one.
@@ -2725,12 +2776,18 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     if (!busy) {
         resizeFramebuffer();
     }
-    const int fbW = !_framebuffer.isNull()
-        ? _framebuffer.width()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
-    const int fbH = !_framebuffer.isNull()
-        ? _framebuffer.height()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+    // Capture the job at the VIEWPORT size, never the displayed framebuffer's:
+    // _framebuffer may hold a stale-size result adopted while the pane was
+    // resizing (renders in flight across a layout change), and sizing new jobs
+    // from it re-captures the stale size on every busy-time submit -- the pane
+    // then ping-pongs between the two sizes for as long as renders keep coming
+    // (visible as the image jittering up/down after a generated-view rebuild).
+    const int fbW = _view && _view->viewport()
+        ? std::max(1, _view->viewport()->width())
+        : (!_framebuffer.isNull() ? _framebuffer.width() : 1);
+    const int fbH = _view && _view->viewport()
+        ? std::max(1, _view->viewport()->height())
+        : (!_framebuffer.isNull() ? _framebuffer.height() : 1);
     auto job = captureRenderJob(reason, caller, surf, fbW, fbH, std::chrono::steady_clock::now());
     if (!job) {
         profile.setDetails("action=skip invalid_job");
@@ -2821,12 +2878,15 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (!_pendingRenderJob) {
         auto surf = _surfWeak.lock();
         if (surf && _volume && _chunkArray) {
-            const int fbW = !_framebuffer.isNull()
-                ? _framebuffer.width()
-                : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
-            const int fbH = !_framebuffer.isNull()
-                ? _framebuffer.height()
-                : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+            // Viewport size, not _framebuffer: the framebuffer was just replaced
+            // by this result, so sizing the staleness check from it would make a
+            // stale-size result always look "equivalent" and never catch up.
+            const int fbW = _view && _view->viewport()
+                ? std::max(1, _view->viewport()->width())
+                : (!_framebuffer.isNull() ? _framebuffer.width() : 1);
+            const int fbH = _view && _view->viewport()
+                ? std::max(1, _view->viewport()->height())
+                : (!_framebuffer.isNull() ? _framebuffer.height() : 1);
             auto latest = captureRenderJob("catch up after stale presentation",
                                            std::source_location::current(),
                                            surf,
@@ -2983,7 +3043,10 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
         return;
     }
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
-    _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
+    _overlayWindowHigh = std::clamp(high, 0.0f, 255.0f);
+    if (_overlayWindowHigh <= _overlayWindowLow) {
+        _overlayWindowHigh = std::min(255.0f, _overlayWindowLow + 1.0f);
+    }
     submitRender("overlay window changed");
 }
 
@@ -3108,7 +3171,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
         const auto [w, h, d] = _volume->shapeXyz();
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
-    _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
+    setZOffset(std::clamp(_zOff + delta, -maxZ, maxZ));
     _genCacheDirty = true;
     submitRender("surface offset changed");
     updateStatusLabel();
@@ -3118,10 +3181,34 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
 {
     _surfacePtrX = 0.0f;
     _surfacePtrY = 0.0f;
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     submitRender("surface offsets reset");
+}
+
+// Sets the normal offset, refreshing dependent overlays when it changes. Use
+// this instead of assigning _zOff directly unless the notification must be
+// suppressed (e.g. offscreen replay repaints).
+void CChunkedVolumeViewer::setZOffset(float value)
+{
+    if (_zOff == value) {
+        return;
+    }
+    _zOff = value;
+    notifyNormalOffsetChanged();
+}
+
+// Plane viewers draw a dashed copy of the segmentation intersection displaced
+// by the flattened viewer's normal offset; refresh them when that offset moves.
+void CChunkedVolumeViewer::notifyNormalOffsetChanged()
+{
+    if (!_viewerManager || _viewerManager->segmentationViewer() != this)
+        return;
+    _viewerManager->forEachBaseViewer([this](VolumeViewerBase* v) {
+        if (v && v != this)
+            v->scheduleIntersectionRender("segmentation normal offset changed");
+    });
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -3167,12 +3254,14 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
             quad->ensureLoaded();
             if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
                 points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
                 const cv::Vec3f center = quad->center();
                 const cv::Vec2f gridScale = quad->scale();
-                minU = -center[0] * gridScale[0];
-                minV = -center[1] * gridScale[1];
-                maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
-                maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                minU = -center[0];
+                minV = -center[1];
+                maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
                 haveBounds = maxU > minU && maxV > minV;
             }
         } catch (const std::exception& e) {
@@ -3190,7 +3279,7 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                maxV - minV,
                                viewportSize.width(),
                                viewportSize.height());
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
     recalcPyramidLevel();
     _genCacheDirty = true;
@@ -3273,7 +3362,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 const float delta = static_cast<float>(steps) * _zScrollSensitivity;
                 auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
                 shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
-                _zOff = 0.0f;
+                setZOffset(0.0f);
                 _zOffWorldDir = {0, 0, 0};
                 if (_state) {
                     _state->setSurface(_surfName, shiftedPlane, false, true);
@@ -3286,7 +3375,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 }
             }
         } else {
-            _zOff += static_cast<float>(steps) * _zScrollSensitivity;
+            setZOffset(_zOff + static_cast<float>(steps) * _zScrollSensitivity);
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
         }
@@ -4191,11 +4280,20 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
 
     QPointF scenePos;
     if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
+        // The flattened viewer's cursor point includes its normal offset, which
+        // pushes it off-plane by up to that amount; widen the depth band so the
+        // crosshair still lands on the dashed offset intersection line.
+        float tolerance = _linkedCursorViewTolerance;
+        if (auto* segViewer =
+                _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+            segViewer && segViewer != this) {
+            tolerance += std::abs(segViewer->normalOffset());
+        }
         const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
         if (!std::isfinite(projected[0]) ||
             !std::isfinite(projected[1]) ||
             !std::isfinite(projected[2]) ||
-            std::abs(projected[2] - _zOff) > _linkedCursorViewTolerance) {
+            std::abs(projected[2] - _zOff) > tolerance) {
             hideCrosshair();
             return;
         }
@@ -5176,6 +5274,15 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
 
+    // Normal offset of the flattened segmentation viewer: plane viewers draw a
+    // dashed copy of the active segment's intersection displaced by this amount
+    // so the mirrored crosshair (which maps through the offset) stays on a line.
+    float segNormalOffset = 0.0f;
+    if (auto* segViewer = _viewerManager->segmentationViewer();
+        segViewer && segViewer != this) {
+        segNormalOffset = segViewer->normalOffset();
+    }
+
     const std::uint64_t surfacesVersion = _state->surfacesVersion();
     if (!_resolvedIntersectTargets.valid ||
         _resolvedIntersectTargets.activeSeg != activeSeg.get() ||
@@ -5298,6 +5405,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     for (const auto& id : _highlightedSurfaceIds)
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
+    fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
     fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
                     (std::hash<int>{}(_framebuffer.height()) << 1);
     fp.valid = true;
@@ -5346,6 +5454,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.targetGenerationHash == b.targetGenerationHash &&
                a.activeSegHash == b.activeSegHash &&
                a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
+               a.segNormalOffsetQ == b.segNormalOffsetQ &&
                a.cameraHash == b.cameraHash;
     };
     if (geometryCacheValid && !_intersectionItems.empty() &&
@@ -5586,6 +5695,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
         };
         groupedColors[style] = baseColor;
+        // Dotted copy of the active segment's line, displaced along the surface
+        // normal by the flattened viewer's offset: it marks where that viewer's
+        // mirrored crosshair lands, so cross-referencing works off-surface too.
+        const bool drawOffsetCopy =
+            target == activeSeg && std::abs(segNormalOffset) > 1e-3f;
+        IntersectionStyle offsetStyle;
+        if (drawOffsetCopy) {
+            offsetStyle = IntersectionStyle{style.color, style.z, style.widthQ, true};
+            groupedColors[offsetStyle] = baseColor;
+        }
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
@@ -5595,6 +5714,19 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             groupedPaths[style].lineTo(b);
             if (target == activeSeg) {
                 addApprovalMaskIntersection(seg, opacity, penWidth);
+            }
+            if (drawOffsetCopy) {
+                const cv::Vec3f n0 = target->normal(seg.surfaceParams[0]);
+                const cv::Vec3f n1 = target->normal(seg.surfaceParams[1]);
+                if (!std::isfinite(n0[0]) || !std::isfinite(n0[1]) || !std::isfinite(n0[2]) ||
+                    !std::isfinite(n1[0]) || !std::isfinite(n1[1]) || !std::isfinite(n1[2]))
+                    continue;
+                const QPointF oa = planeToScene(seg.world[0] + n0 * segNormalOffset);
+                const QPointF ob = planeToScene(seg.world[1] + n1 * segNormalOffset);
+                if (!isFinitePoint(oa) || !isFinitePoint(ob))
+                    continue;
+                groupedPaths[offsetStyle].moveTo(oa);
+                groupedPaths[offsetStyle].lineTo(ob);
             }
         }
     }
@@ -5628,6 +5760,10 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
+        if (style.dashed) {
+            pen.setStyle(Qt::DotLine);
+            pen.setCapStyle(Qt::FlatCap);
+        }
         item->setTransform(QTransform());
         item->setPath(path);
         item->setPen(pen);

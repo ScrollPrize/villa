@@ -1727,6 +1727,25 @@ std::string ZarrArray::chunk_key(std::span<const std::size_t> chunk_indices) con
     return chunk_key_v2(chunk_indices);
 }
 
+std::string ZarrArray::chunk_store_key(std::span<const std::size_t> chunk_indices) const {
+    auto key = chunk_key(chunk_indices);
+    if (array_key_.empty())
+        return key;
+    return array_key_ + "/" + key;
+}
+
+bool ZarrArray::direct_chunk_payload_is_decoded_bytes() const noexcept {
+    if (is_sharded() || needs_compression() || needs_byteswap() || !meta_.filters.empty())
+        return false;
+    if (meta_.version == ZarrVersion::v2)
+        return true;
+    for (const auto& codec : meta_.codecs) {
+        if (codec.name != "bytes")
+            return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // ZarrArray -- shard I/O
 // ---------------------------------------------------------------------------

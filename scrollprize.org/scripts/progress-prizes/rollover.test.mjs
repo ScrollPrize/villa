@@ -121,6 +121,9 @@ class FakeGoogle {
     this.calls = [];
     this.nextFile = 1;
     this.nextPermission = 1;
+    this.spreadsheets = new Map();
+    this.sheetRows = new Map();
+    this.responses = new Map([[LIVE_FORM_ID, []]]);
     this.files = new Map([
       [LIVE_FORM_ID, {
         id: LIVE_FORM_ID,
@@ -303,7 +306,40 @@ class FakeGoogle {
     form.responderUri = `https://docs.google.com/forms/d/e/public-${id}/viewform`;
     this.files.set(id, file);
     this.forms.set(id, form);
+    this.responses.set(id, []);
     this.permissions.set(id, clone(this.permissions.get(parentId) ?? []));
+    return clone(file);
+  }
+
+  async createFile({ name, mimeType, parentId, appProperties }) {
+    this.record('createFile', { name, mimeType, parentId, appProperties });
+    const destination = this.requireFile(parentId);
+    const id = `managed-sheet-${this.nextFile++}`;
+    const file = {
+      id,
+      name,
+      mimeType,
+      parents: [parentId],
+      driveId: destination.driveId,
+      appProperties: clone(appProperties),
+      trashed: false,
+      capabilities: { canCopy: true, canEdit: true, canShare: true },
+    };
+    this.files.set(id, file);
+    this.permissions.set(id, clone(this.permissions.get(parentId) ?? []));
+    this.spreadsheets.set(id, {
+      spreadsheetId: id,
+      sheets: [{
+        properties: {
+          sheetId: 0,
+          title: 'Sheet1',
+          index: 0,
+          sheetType: 'GRID',
+          hidden: false,
+        },
+      }],
+    });
+    this.sheetRows.set(id, []);
     return clone(file);
   }
 
@@ -358,6 +394,42 @@ class FakeGoogle {
     return clone(form.publishSettings);
   }
 
+  async listFormResponses({ formId }) {
+    this.record('listFormResponses', { formId });
+    return clone(this.responses.get(formId) ?? []);
+  }
+
+  async getSpreadsheet({ spreadsheetId }) {
+    this.record('getSpreadsheet', { spreadsheetId });
+    const spreadsheet = this.spreadsheets.get(spreadsheetId);
+    if (!spreadsheet) throw new Error(`Missing fake spreadsheet ${spreadsheetId}`);
+    return clone(spreadsheet);
+  }
+
+  async getSheetValues({ spreadsheetId, range }) {
+    this.record('getSheetValues', { spreadsheetId, range });
+    const rows = this.sheetRows.get(spreadsheetId);
+    if (!rows) throw new Error(`Missing fake spreadsheet rows ${spreadsheetId}`);
+    if (range.endsWith('!1:1')) {
+      return rows.length === 0 ? {} : { values: [clone(rows[0])] };
+    }
+    if (range.endsWith('!A:A')) {
+      return rows.length === 0
+        ? {}
+        : { values: rows.map((row) => (row[0] === undefined ? [] : [clone(row[0])])) };
+    }
+    throw new Error(`Unsupported fake Sheet range ${range}`);
+  }
+
+  async appendSheetValues({ spreadsheetId, range, rows }) {
+    this.record('appendSheetValues', { spreadsheetId, range, rows });
+    if (!range.endsWith('!A:ZZZ')) throw new Error(`Unsupported fake append range ${range}`);
+    const current = this.sheetRows.get(spreadsheetId);
+    if (!current) throw new Error(`Missing fake spreadsheet rows ${spreadsheetId}`);
+    current.push(...clone(rows));
+    return { updates: { updatedRows: rows.length } };
+  }
+
   managed(role, cycle) {
     return [...this.files.values()].filter((file) =>
       file.appProperties?.managedBy === ROLLOVER_MANAGED_BY
@@ -368,6 +440,20 @@ class FakeGoogle {
 
 function fixedClock(instant) {
   return { now: () => new Date(instant) };
+}
+
+function fakeFormResponse(google, formId, responseId, value = 'Example entrant') {
+  const form = google.forms.get(formId);
+  const questionId = form.items[0].questionItem.question.questionId;
+  return {
+    responseId,
+    createTime: '2026-07-30T12:00:00Z',
+    lastSubmittedTime: '2026-07-30T12:00:01Z',
+    respondentEmail: 'entrant@example.org',
+    answers: {
+      [questionId]: { textAnswers: { answers: [{ value }] } },
+    },
+  };
 }
 
 function grantProductionSourceAccess(google) {
@@ -471,6 +557,51 @@ async function closedActivationCheckpoint() {
   };
 }
 
+async function manuallyActivatedProductionPair() {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  const page = new MemoryPage();
+  const preparation = service({
+    google,
+    page,
+    runtime: productionRuntime(),
+    clock: fixedClock('2026-07-26T12:00:00Z'),
+  });
+  await preparation.rollover.prepare({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  google.forms.get(LIVE_FORM_ID).publishSettings.publishState = {
+    isPublished: true,
+    isAcceptingResponses: false,
+  };
+  google.forms.get(target.id).publishSettings.publishState = {
+    isPublished: true,
+    isAcceptingResponses: true,
+  };
+  google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-07')[0].appProperties.state =
+    ROLLOVER_FILE_STATES.CLOSED;
+  google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-08')[0].appProperties.state =
+    ROLLOVER_FILE_STATES.ACTIVE;
+  google.calls.length = 0;
+  page.writes.length = 0;
+  return {
+    google,
+    page,
+    target,
+    rollover: service({
+      google,
+      page,
+      runtime: productionRuntime({
+        eventName: 'workflow_dispatch',
+        branch: 'main',
+      }),
+      clock: fixedClock('2026-08-06T12:00:00Z'),
+    }).rollover,
+  };
+}
+
 test('validate performs a read-only production preflight and resolves the public short URL', async () => {
   const google = grantProductionSourceAccess(new FakeGoogle());
   const context = service({
@@ -502,17 +633,32 @@ test('validate performs a read-only production preflight and resolves the public
   );
 });
 
-test('validate safely stops for linked Sheets and legacy publish settings', async () => {
-  const linkedGoogle = new FakeGoogle();
+test('validate treats existing linked Sheets as immutable legacy destinations', async () => {
+  const linkedGoogle = grantProductionSourceAccess(new FakeGoogle());
   linkedGoogle.forms.get(LIVE_FORM_ID).linkedSheetId = 'private-sheet';
   const linked = service({
     google: linkedGoogle,
     runtime: productionRuntime(),
   });
-  await assert.rejects(
-    linked.rollover.validate({ sourceFormId: LIVE_FORM_ID, sourceCycle: '2026-07' }),
-    /linked response Sheet/,
+  const result = await linked.rollover.validate({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(result.hasLinkedSheet, true);
+  assert.equal(result.hasManagedResponseSheet, false);
+  assert.equal(
+    linkedGoogle.calls.some(({ method }) => [
+      'createFile',
+      'appendSheetValues',
+      'updateFile',
+      'deletePermission',
+    ].includes(method)),
+    false,
   );
+});
+
+test('validate still stops safely for legacy publish settings', async () => {
 
   const legacyGoogle = new FakeGoogle();
   delete legacyGoogle.forms.get(LIVE_FORM_ID).publishSettings;
@@ -1852,6 +1998,147 @@ test('prepare resumes the one appProperties copy after an injected failure and w
   });
 });
 
+test('prepare creates distinct private monthly response Sheets without touching legacy destinations', async () => {
+  const google = new FakeGoogle();
+  google.forms.get(LIVE_FORM_ID).linkedSheetId = 'private-legacy-sheet';
+  const page = new MemoryPage();
+  await service({ google, page }).rollover.bootstrapStagingSource({
+    sourceFormId: LIVE_FORM_ID,
+    sourceCycle: '2026-07',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+  google.responses.set(source.id, [fakeFormResponse(google, source.id, 'source-response')]);
+
+  const result = await service({ google, page }).rollover.prepare({
+    targetCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const sourceSheet = google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-07')[0];
+  const targetSheet = google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-08')[0];
+  assert.ok(sourceSheet);
+  assert.ok(targetSheet);
+  assert.notEqual(sourceSheet.id, targetSheet.id);
+  assert.equal(result.sourceResponsesAppended, 1);
+  assert.equal(result.targetResponseSheetCreated, true);
+  assert.equal(google.sheetRows.get(sourceSheet.id)[1][0], 'source-response');
+  assert.equal(google.forms.get(LIVE_FORM_ID).linkedSheetId, 'private-legacy-sheet');
+  for (const sheet of [sourceSheet, targetSheet]) {
+    assert.equal(
+      google.permissions.get(sheet.id).some(({ view, type }) => (
+        view === 'published' || type === 'anyone'
+      )),
+      false,
+    );
+    assert.equal(
+      google.permissions.get(sheet.id).some(({ emailAddress }) => (
+        emailAddress === STAGING_EDITOR
+      )),
+      true,
+    );
+  }
+});
+
+test('sync-responses is append-only, idempotent, and never rewrites an existing response row', async () => {
+  const google = new FakeGoogle();
+  const page = new MemoryPage();
+  await bootstrapAndPrepare(service({ google, page }));
+  const activation = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  await activation.rollover.activate({ targetCycle: '2026-08' });
+  const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  const sheet = google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-08')[0];
+  google.forms.get(target.id).linkedSheetId = 'private-existing-linked-sheet';
+  google.responses.set(target.id, [fakeFormResponse(google, target.id, 'one', '=not-a-formula')]);
+
+  const sync = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-06T12:00:00Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-06T12:00:00Z' }),
+  }).rollover;
+  const first = await sync.syncResponses({
+    sourceCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  assert.equal(first.responsesAppended, 1);
+  const immutableFirstRow = clone(google.sheetRows.get(sheet.id)[1]);
+
+  google.responses.get(target.id)[0].answers = {
+    [google.forms.get(target.id).items[0].questionItem.question.questionId]: {
+      textAnswers: { answers: [{ value: 'edited later in Forms' }] },
+    },
+  };
+  google.responses.get(target.id).push(fakeFormResponse(google, target.id, 'two', 'Second'));
+  const second = await sync.syncResponses({
+    sourceCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  const third = await sync.syncResponses({
+    sourceCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+
+  assert.equal(second.responsesAppended, 1);
+  assert.equal(third.responsesAppended, 0);
+  assert.deepEqual(google.sheetRows.get(sheet.id)[1], immutableFirstRow);
+  assert.deepEqual(
+    google.sheetRows.get(sheet.id).slice(1).map((row) => row[0]),
+    ['one', 'two'],
+  );
+  assert.equal(google.forms.get(target.id).linkedSheetId, 'private-existing-linked-sheet');
+});
+
+test('sync-responses recovers an ambiguous append by rescanning response IDs', async () => {
+  const google = new FakeGoogle();
+  const page = new MemoryPage();
+  await bootstrapAndPrepare(service({ google, page }));
+  const activation = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  await activation.rollover.activate({ targetCycle: '2026-08' });
+  const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  const sheet = google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-08')[0];
+  google.responses.set(target.id, [fakeFormResponse(google, target.id, 'ambiguous')]);
+
+  const originalAppend = google.appendSheetValues.bind(google);
+  let failOnce = true;
+  google.appendSheetValues = async (options) => {
+    const result = await originalAppend(options);
+    if (failOnce) {
+      failOnce = false;
+      throw new Error('fixed ambiguous append failure');
+    }
+    return result;
+  };
+  const sync = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-06T12:00:00Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-06T12:00:00Z' }),
+  }).rollover;
+  await assert.rejects(sync.syncResponses({
+    sourceCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  }), /ambiguous append/);
+  const recovered = await sync.syncResponses({
+    sourceCycle: '2026-08',
+    collaboratorPermissions: [STAGING_EDITOR_PERMISSION],
+  });
+  assert.equal(recovered.responsesAppended, 0);
+  assert.deepEqual(
+    google.sheetRows.get(sheet.id).slice(1).map((row) => row[0]),
+    ['ambiguous'],
+  );
+});
+
 test('prepare refuses to copy a source that is no longer live', async () => {
   const context = service();
   await context.rollover.bootstrapStagingSource({
@@ -2085,6 +2372,234 @@ test('a missing later managed source cannot fall back to the stale initial form 
     google.calls.some(({ fileId, formId }) => fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID),
     false,
   );
+});
+
+test('reconcile-active repairs only stale Drive markers and is idempotent', async () => {
+  const context = await manuallyActivatedProductionPair();
+  const pageBefore = context.page.content;
+  const sourcePublishingBefore = clone(
+    context.google.forms.get(LIVE_FORM_ID).publishSettings.publishState,
+  );
+  const targetPublishingBefore = clone(
+    context.google.forms.get(context.target.id).publishSettings.publishState,
+  );
+  const sourcePermissionsBefore = clone(context.google.permissions.get(LIVE_FORM_ID));
+  const targetPermissionsBefore = clone(context.google.permissions.get(context.target.id));
+
+  await assert.rejects(
+    context.rollover.verify({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      mode: 'active',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /stale managed Drive state metadata/,
+  );
+  assert.equal(
+    context.google.calls.some(({ method }) => [
+      'copyFile',
+      'updateFile',
+      'createPermission',
+      'deletePermission',
+      'updateFormTitle',
+      'setPublishState',
+    ].includes(method)),
+    false,
+  );
+  context.google.calls.length = 0;
+
+  const first = await context.rollover.reconcileActive({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(first.action, 'reconcile-active');
+  assert.equal(first.status, 'active');
+  assert.equal(first.reconciled, true);
+  assert.equal(
+    context.google.files.get(LIVE_FORM_ID).appProperties.state,
+    ROLLOVER_FILE_STATES.CLOSED,
+  );
+  assert.equal(context.google.files.get(LIVE_FORM_ID).appProperties.targetCycle, '2026-08');
+  assert.equal(
+    context.google.files.get(context.target.id).appProperties.state,
+    ROLLOVER_FILE_STATES.ACTIVE,
+  );
+  assert.equal(context.target.appProperties.sourceCycle, '2026-07');
+
+  const mutations = context.google.calls.filter(({ method }) => [
+    'copyFile',
+    'updateFile',
+    'createPermission',
+    'deletePermission',
+    'updateFormTitle',
+    'setPublishState',
+  ].includes(method));
+  assert.equal(mutations.length, 2);
+  assert.deepEqual(mutations.map(({ method, fileId, appProperties }) => ({
+    method,
+    fileId,
+    state: appProperties?.state,
+  })), [
+    { method: 'updateFile', fileId: LIVE_FORM_ID, state: ROLLOVER_FILE_STATES.CLOSED },
+    { method: 'updateFile', fileId: context.target.id, state: ROLLOVER_FILE_STATES.ACTIVE },
+  ]);
+  assert.deepEqual(
+    context.google.forms.get(LIVE_FORM_ID).publishSettings.publishState,
+    sourcePublishingBefore,
+  );
+  assert.deepEqual(
+    context.google.forms.get(context.target.id).publishSettings.publishState,
+    targetPublishingBefore,
+  );
+  assert.deepEqual(context.google.permissions.get(LIVE_FORM_ID), sourcePermissionsBefore);
+  assert.deepEqual(context.google.permissions.get(context.target.id), targetPermissionsBefore);
+  assert.equal(context.page.content, pageBefore);
+  assert.deepEqual(context.page.writes, []);
+  assert.equal((await context.rollover.verify({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    mode: 'active',
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  })).status, 'valid');
+
+  context.google.calls.length = 0;
+  const second = await context.rollover.reconcileActive({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(second.reconciled, false);
+  assert.equal(
+    context.google.calls.some(({ method }) => method === 'updateFile'),
+    false,
+  );
+});
+
+for (const scenario of [
+  {
+    name: 'source publishing mismatch',
+    mutate({ google }) {
+      google.forms.get(LIVE_FORM_ID).publishSettings.publishState.isAcceptingResponses = true;
+    },
+    error: /publishing state/,
+  },
+  {
+    name: 'target ACL mismatch',
+    mutate({ google, target }) {
+      google.permissions.get(target.id).push({
+        id: 'unexpected-reconciliation-editor',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'unexpected-reconciliation-editor@example.org',
+      });
+    },
+    error: /permissions do not match/,
+  },
+  {
+    name: 'target structure mismatch',
+    mutate({ google, target }) {
+      google.forms.get(target.id).items[0].title = 'Changed after manual activation';
+    },
+    error: /structure or settings do not match/,
+  },
+  {
+    name: 'target title mismatch',
+    mutate({ google, target }) {
+      google.forms.get(target.id).info.title = 'Wrong title';
+    },
+    error: /visible form title/,
+  },
+  {
+    name: 'website cycle mismatch',
+    mutate({ page }) {
+      page.content = pageMarkdown('2026-07', LIVE_RESPONDER);
+    },
+    error: /Managed website cycle/,
+  },
+  {
+    name: 'website responder mismatch',
+    mutate({ page }) {
+      page.content = pageMarkdown(
+        '2026-08',
+        'https://docs.google.com/forms/d/e/different-public-id/viewform',
+      );
+    },
+    error: /website responder URL/,
+  },
+  {
+    name: 'wrong Drive cycle binding',
+    mutate({ target }) {
+      target.appProperties.sourceCycle = '2026-06';
+    },
+    error: /Drive cycle metadata/,
+  },
+]) {
+  test(`reconcile-active performs zero writes on ${scenario.name}`, async () => {
+    const context = await manuallyActivatedProductionPair();
+    scenario.mutate(context);
+    context.google.calls.length = 0;
+    context.page.writes.length = 0;
+    await assert.rejects(
+      context.rollover.reconcileActive({
+        targetCycle: '2026-08',
+        sourceFormId: LIVE_FORM_ID,
+        collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+      }),
+      scenario.error,
+    );
+    assert.equal(
+      context.google.calls.some(({ method }) => [
+        'copyFile',
+        'updateFile',
+        'createPermission',
+        'deletePermission',
+        'updateFormTitle',
+        'setPublishState',
+      ].includes(method)),
+      false,
+    );
+    assert.deepEqual(context.page.writes, []);
+  });
+}
+
+test('reconcile-active never touches a legacy linked response Sheet', async () => {
+  const context = await manuallyActivatedProductionPair();
+  context.google.forms.get(context.target.id).linkedSheetId = 'private-linked-sheet';
+  const result = await context.rollover.reconcileActive({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(result.status, 'active');
+  assert.equal(
+    context.google.forms.get(context.target.id).linkedSheetId,
+    'private-linked-sheet',
+  );
+  assert.equal(
+    context.google.calls.some(({ method }) => [
+      'createFile',
+      'appendSheetValues',
+      'deletePermission',
+      'setPublishState',
+    ].includes(method)),
+    false,
+  );
+});
+
+test('reconcile-active rejects schedulers and simulated clocks before Google reads', async () => {
+  for (const runtime of [
+    productionRuntime(),
+    stagingRuntime(),
+  ]) {
+    const google = new FakeGoogle();
+    const rollover = service({ google, runtime }).rollover;
+    await assert.rejects(
+      rollover.reconcileActive({ targetCycle: '2026-08' }),
+      /manual workflow_dispatch|rejects simulated clocks/,
+    );
+    assert.equal(google.calls.length, 0);
+  }
 });
 
 test('activate requires the injected preview gate before closing the source', async () => {
@@ -2395,6 +2910,49 @@ test('activate recovers after closing the source, opens the target once, and is 
   assert.equal(gateCalls.length, 3);
   assert.equal(gateCalls[0].responderUri, google.forms.get(target.id).responderUri);
   assert.equal((await active.rollover.verify({ targetCycle: '2026-08', mode: 'active' })).status, 'valid');
+});
+
+test('activation closes the source, appends its final responses, then opens the target', async () => {
+  const google = new FakeGoogle();
+  const page = new MemoryPage();
+  await bootstrapAndPrepare(service({ google, page }));
+  const source = google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0];
+  const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  const sourceSheet = google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-07')[0];
+  google.forms.get(source.id).linkedSheetId = 'private-legacy-source-sheet';
+  google.responses.set(source.id, [fakeFormResponse(google, source.id, 'last-response')]);
+  const canonicalResponsesBefore = clone(google.responses.get(source.id));
+  google.calls.length = 0;
+
+  const active = service({
+    google,
+    page,
+    clock: fixedClock('2026-08-01T07:00:01Z'),
+    runtime: stagingRuntime({ simulatedNow: '2026-08-01T07:00:01Z' }),
+  });
+  const result = await active.rollover.activate({ targetCycle: '2026-08' });
+  const closeIndex = google.calls.findIndex((call) => (
+    call.method === 'setPublishState'
+    && call.formId === source.id
+    && call.isAcceptingResponses === false
+  ));
+  const appendIndex = google.calls.findIndex((call) => (
+    call.method === 'appendSheetValues'
+    && call.spreadsheetId === sourceSheet.id
+  ));
+  const openIndex = google.calls.findIndex((call) => (
+    call.method === 'setPublishState'
+    && call.formId === target.id
+    && call.isAcceptingResponses === true
+  ));
+
+  assert.equal(result.sourceResponsesAppended, 1);
+  assert.equal(closeIndex >= 0, true);
+  assert.equal(appendIndex > closeIndex, true);
+  assert.equal(openIndex > appendIndex, true);
+  assert.deepEqual(google.responses.get(source.id), canonicalResponsesBefore);
+  assert.equal(google.forms.get(source.id).linkedSheetId, 'private-legacy-source-sheet');
+  assert.equal(sourceSheet.appProperties.state, ROLLOVER_FILE_STATES.CLOSED);
 });
 
 test('explicit staging bootstrap rewinds only the exact close-fault checkpoint', async () => {
@@ -2984,6 +3542,14 @@ test('cleanup is staging-only, unpublishes both forms, removes public access, ar
   });
   await active.rollover.activate({ targetCycle: '2026-08' });
 
+  const responseSheets = [
+    google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-07')[0],
+    google.managed(ROLLOVER_FILE_ROLES.RESPONSES, '2026-08')[0],
+  ];
+  const responseRowsBeforeCleanup = new Map(responseSheets.map(
+    (sheet) => [sheet.id, clone(google.sheetRows.get(sheet.id))],
+  ));
+
   for (const file of [
     google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0],
     google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0],
@@ -2998,8 +3564,8 @@ test('cleanup is staging-only, unpublishes both forms, removes public access, ar
 
   const first = await active.rollover.cleanup({ targetCycle: '2026-08' });
   const second = await active.rollover.cleanup({ targetCycle: '2026-08' });
-  assert.equal(first.archivedCount, 2);
-  assert.equal(second.archivedCount, 2);
+  assert.equal(first.archivedCount, 4);
+  assert.equal(second.archivedCount, 4);
   for (const file of [
     google.managed(ROLLOVER_FILE_ROLES.SOURCE, '2026-07')[0],
     google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0],
@@ -3018,6 +3584,11 @@ test('cleanup is staging-only, unpublishes both forms, removes public access, ar
     );
     assert.deepEqual(file.parents, ['private-staging-archive']);
     assert.equal(file.appProperties.state, ROLLOVER_FILE_STATES.ARCHIVED);
+  }
+  for (const sheet of responseSheets) {
+    assert.deepEqual(sheet.parents, ['private-staging-archive']);
+    assert.equal(sheet.appProperties.state, ROLLOVER_FILE_STATES.ARCHIVED);
+    assert.deepEqual(google.sheetRows.get(sheet.id), responseRowsBeforeCleanup.get(sheet.id));
   }
   assert.equal((await active.rollover.verify({ targetCycle: '2026-08', mode: 'cleaned' })).status, 'valid');
 

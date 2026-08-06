@@ -663,6 +663,13 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
     --pred-dt pred_surface.zarr
 ```
 
+`predict3d` now runs through the shared tiled 3D inference mechanics in
+`lasagna/tiled_predict3d.py`. The shared layer owns global tile/output-chunk
+lattices, fixed-depth circular Z scratch, output-chunk resume, temp cleanup, and
+atomic chunk writes. The Lasagna wrapper still owns the cos/normal products,
+normal estimation, `.lasagna.json` groups, pyramid generation, and all legacy
+CLI defaults.
+
 ### predict3d CLI flags
 
 | Flag | Default | Description |
@@ -704,6 +711,12 @@ Output chunk writes use unique temporary paths followed by atomic rename. Stale
 predict3d temp paths in the output directory are removed on startup/resume and
 after a normal finish; pid-bearing temp paths owned by other live predict3d
 processes are left alone.
+
+These resume rules are product-specific. Missing `pred_dt` chunks do not
+schedule model inference; missing one sibling of the `grad_mag/nx/ny` bundle
+does schedule only that coarse model product. Other users of the shared tiled
+runner, such as fiber 3D inference, define their own product bundles and
+completeness rules through adapters.
 
 ### Lasagna volume format (.lasagna.json)
 
@@ -747,7 +760,10 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 
 - **`source_to_base`**: Factor from source volume voxels to base (VC3D) voxels. Default 1.0 (source = base). Set to 4 if source is 4x coarser than the VC3D coordinate system.
 - **`scaledown`** per group: OME-Zarr pyramid level (power of 2). The actual scale factor is `2^scaledown`. E.g. `scaledown: 4` → level 4 → 16x downsampled from base. Use `ChannelGroup.sd_fac` in code to get the actual factor.
-- **`channels`**: Ordered list — position = channel index in the CZYX zarr (for 3D zarrs, only one channel per group).
+- **`channels`**: Current inference manifests use exactly one channel per 3D
+  ZYX group. Older preprocessing/fit manifests may list channel positions in a
+  flat CZYX intermediate; convert those intermediates to per-channel 3D
+  OME-Zarr before attaching them to VC3D.
 - Zarr paths are relative to the JSON file's directory and include the OME-Zarr level suffix.
 - Updating a single group (e.g., adding pred_dt) leaves other groups untouched.
 

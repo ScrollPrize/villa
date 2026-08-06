@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "utils/Json.hpp"
@@ -19,10 +20,15 @@ class QuadSurface;
 
 namespace vc::project {
 
+inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+
 struct Entry {
     std::string location;
     std::vector<std::string> tags;
 };
+
+[[nodiscard]] bool hasEntryTag(const Entry& entry, std::string_view tag);
+[[nodiscard]] bool isFiberLasagnaEntry(const Entry& entry);
 
 enum class Category { Volumes, Segments, NormalGrids };
 
@@ -53,6 +59,16 @@ public:
     enum class AttachSegmentsResult {
         Attached,
         AlreadyAttached,
+    };
+    enum class AttachLasagnaResult {
+        Attached,
+        AlreadyAttached,
+        VolumeIdConflict,
+    };
+    struct PreparedVolumeAttachment {
+        std::string location;
+        std::vector<std::string> tags;
+        std::shared_ptr<Volume> volume;
     };
 
     static std::shared_ptr<VolumePkg> newEmpty();
@@ -86,7 +102,10 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& volumeEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
-    [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
+    // Role-filtered views over the canonical lasagna_datasets collection.
+    [[nodiscard]] std::vector<vc::project::Entry> lasagnaDatasetEntries() const;
+    [[nodiscard]] std::vector<vc::project::Entry> fiberInferenceDatasetEntries() const;
+    [[nodiscard]] const std::vector<vc::project::Entry>& allLasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
     [[nodiscard]] std::optional<vc::project::Entry>
@@ -134,6 +153,21 @@ public:
         const std::string& location,
         const std::vector<std::string>& tags,
         const std::vector<std::string>& singletonPrefixes);
+    bool addFiberInferenceDatasetEntry(const std::string& location,
+                                       std::vector<std::string> tags = {});
+    bool reconcileFiberInferenceDatasetEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
+    AttachLasagnaResult attachPreparedLasagnaDataset(
+        const std::string& manifestLocation,
+        std::vector<std::string> manifestTags,
+        bool fiberInference,
+        const std::vector<PreparedVolumeAttachment>& preparedVolumes,
+        const std::filesystem::path& remoteCacheRoot = {},
+        bool updateSelection = true,
+        bool persistChanges = true,
+        const std::vector<std::string>& manifestSingletonPrefixes = {});
     bool removeEntry(const std::string& location);
 
     void setOutputSegments(const std::string& location);
@@ -145,6 +179,10 @@ public:
     void setSelectedLasagnaDataset(std::string location);
     void clearSelectedLasagnaDataset();
     [[nodiscard]] std::filesystem::path selectedLasagnaDatasetPath() const;
+    [[nodiscard]] std::string selectedFiberInferenceDataset() const;
+    void setSelectedFiberInferenceDataset(std::string location);
+    void clearSelectedFiberInferenceDataset();
+    [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
@@ -217,6 +255,7 @@ private:
     std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
+    std::optional<std::string> selectedFiberInferenceDataset_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;
@@ -243,7 +282,6 @@ private:
     [[nodiscard]] utils::Json toJson() const;
     void fromJson(const utils::Json& j);
 
-    static std::filesystem::path autosaveRoot_;
     static std::optional<std::string> loadFirstSegmentationDir_;
 
     mutable std::mutex segmentsMutex_;
