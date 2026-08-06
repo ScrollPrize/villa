@@ -14,14 +14,45 @@ function plan(now, scheduledCron, eventName = 'schedule') {
   return planScheduleDispatch({ now, eventName, scheduledCron });
 }
 
-test('schedule constants use the four exact Pacific cron slots', () => {
+test('schedule constants use the five exact Pacific cron slots', () => {
   assert.deepEqual(SCHEDULE_CRONS, {
     PREPARE: '17 6 * * *',
+    SYNC_RESPONSES: '27 7 * * *',
     PRE_CUTOFF: '40 23 28-31 * *',
     EARLY_RECOVERY: '17 0 1 * *',
     LATE_RECOVERY: '47 6 1-7 * *',
   });
   assert.equal(PROGRESS_PRIZE_SCHEDULES, SCHEDULE_CRONS);
+});
+
+test('the daily response sync follows the current Pacific cycle in PDT and PST', () => {
+  for (const [now, sourceCycle, targetCycle, activationAt] of [
+    ['2026-08-06T14:27:00Z', '2026-08', '2026-09', '2026-09-01T07:00:00.000Z'],
+    ['2026-12-06T15:27:00Z', '2026-12', '2027-01', '2027-01-01T08:00:00.000Z'],
+    ['2027-01-01T15:27:00Z', '2027-01', '2027-02', '2027-02-01T08:00:00.000Z'],
+  ]) {
+    const sync = plan(now, SCHEDULE_CRONS.SYNC_RESPONSES);
+    assert.equal(sync.dispatch, true, now);
+    assert.equal(sync.operation, SCHEDULE_OPERATIONS.SYNC_RESPONSES, now);
+    assert.equal(sync.reason, SCHEDULE_REASONS.RESPONSE_SYNC, now);
+    assert.equal(sync.sourceCycle, sourceCycle, now);
+    assert.equal(sync.targetCycle, targetCycle, now);
+    assert.equal(sync.activationAt.toISOString(), activationAt, now);
+  }
+});
+
+test('the response-sync slot never substitutes for preparation or activation', () => {
+  const preparationWindow = plan(
+    '2026-07-28T14:27:00Z',
+    SCHEDULE_CRONS.SYNC_RESPONSES,
+  );
+  assert.equal(preparationWindow.operation, SCHEDULE_OPERATIONS.SYNC_RESPONSES);
+  assert.equal(preparationWindow.sourceCycle, '2026-07');
+
+  const firstDay = plan('2026-08-01T14:27:00Z', SCHEDULE_CRONS.SYNC_RESPONSES);
+  assert.equal(firstDay.operation, SCHEDULE_OPERATIONS.SYNC_RESPONSES);
+  assert.equal(firstDay.sourceCycle, '2026-08');
+  assert.equal(firstDay.targetCycle, '2026-09');
 });
 
 test('only the preparation slot dispatches during the seven-day window', () => {

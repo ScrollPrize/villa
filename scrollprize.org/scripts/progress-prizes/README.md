@@ -6,6 +6,16 @@ the exact Vercel preview commit, then closes the old form before opening the new
 one. The cutoff is midnight immediately after the last calendar day in
 `America/Los_Angeles` (the published deadline remains 11:59pm Pacific).
 
+Each managed monthly form also has one distinct private Google Spreadsheet.
+The Form is the canonical response store; the automation reads responses with
+the Forms Responses API and appends previously unseen response IDs to that
+month's spreadsheet. It never updates, clears, sorts, deletes, or replaces a
+response row. Before opening the next form, activation closes and performs a
+final append-only sync of the old form, then opens the already prepared target.
+An existing Google Forms-linked Sheet is detected and left completely
+untouched; the automation never reads its cells, changes its link, moves it, or
+deletes it.
+
 A fresh copy is closed at the first possible Forms API call, before title, ACL,
 or capability reconciliation. At cutoff, the fingerprint-bound target records
 durable activation intent before the source is closed. Activation refetches and
@@ -35,9 +45,10 @@ repository secret, file, log, cache, or artifact.
   on a Vercel `repository_dispatch`. It never checks out or executes deployed
   branch code.
 - `progress-prizes-production.yml` provides guarded `validate`, `dry-run`,
-  `prepare`, `activate`, `reconcile-active`, and `verify` operations after the
-  complete staging rehearsal has passed. Every authenticated job is literal in
-  that top-level workflow and calls the same local action exercised by staging.
+  `prepare`, `sync-responses`, `activate`, `reconcile-active`, and `verify`
+  operations after the complete staging rehearsal has passed. Every
+  authenticated job is literal in that top-level workflow and calls the same
+  local action exercised by staging.
 - `progress-prizes-schedule.yml` is the secret-free scheduler added only after
   production `validate` and `dry-run` passed. Reaching `main` enables its
   Pacific-time schedules; a manual dispatch is permanently restricted to a
@@ -208,9 +219,9 @@ refresh token, or other reusable credential.
 
 ## Google WIF setup
 
-Enable the Google Forms and Drive APIs. Create separate service accounts and
-separate WIF providers (or equivalently isolated provider conditions) for staging
-and production. Map these GitHub OIDC claims:
+Enable the Google Forms, Drive, and Sheets APIs. Create separate service
+accounts and separate WIF providers (or equivalently isolated provider
+conditions) for staging and production. Map these GitHub OIDC claims:
 
 ```text
 google.subject                 = assertion.sub
@@ -265,14 +276,15 @@ a `schedule` event.
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
 constructing the `principalSet` member. Do not grant one provider impersonation
-rights on both accounts. The workflow asks for a 1200-second access token scoped
-to read-only Forms/Drive scopes for `validate`, `verify`, and dry runs. Mutations
-use `forms.body` plus `drive`: this headless workflow must find a pre-existing
-form and app-property-managed files in a Shared Drive, which `drive.file` cannot
-reliably authorize without an interactive picker. The separate service accounts,
-the two exact-file ACLs on the initial My Drive form, and the isolated Shared
-Drive ACLs bound the writable resources. Credential-file creation and global
-environment export remain disabled.
+rights on both accounts. The workflow asks for a 1200-second access token.
+`validate`, `verify`, and dry runs use read-only Forms body/response, Drive, and
+Sheets scopes. Mutations use `forms.body`, read-only `forms.responses`, `drive`,
+and `spreadsheets`: this headless workflow must find pre-existing forms and
+app-property-managed files in a Shared Drive, which `drive.file` cannot reliably
+authorize without an interactive picker. The Forms response scope is always
+read-only. The separate service accounts, the two exact-file ACLs on the initial
+My Drive form, and the isolated Shared Drive ACLs bound the writable resources.
+Credential-file creation and global environment export remain disabled.
 
 Google file access is controlled separately by Shared Drive and form ACLs. WIF
 impersonation alone grants no Drive access. The staging identity has read/copy
@@ -421,8 +433,15 @@ the immediately following month. Leave `request-id` empty for every manual run.
   fixed to seven days.
 - `prepare` is safe to dispatch repeatedly. It succeeds without opening a page
   PR outside the seven-day window. Inside the window it resumes the one managed
-  target for the cycle, keeps it published but closed, and reconstructs the one
-  marker-only draft page PR.
+  target for the cycle, creates or resumes that target's distinct private
+  response spreadsheet, keeps the form published but closed, and reconstructs
+  the one marker-only draft page PR.
+- `sync-responses` verifies that the requested source cycle is the currently
+  open form named on the website, then appends only response IDs not already in
+  its managed monthly spreadsheet. The operation creates the spreadsheet if
+  needed and is safe to repeat. It does not require the activation reviewer,
+  cannot change the website or form, and emits counts rather than response or
+  spreadsheet identifiers.
 - `verify` with `prepared` requires that exact page-only PR on current `main`;
   `active` requires the completed website and Google close/open state.
 - `activate` should be dispatched near 23:40 Pacific on the final day. The exact
@@ -430,8 +449,8 @@ the immediately following month. Leave `request-id` empty for every manual run.
   cutoff is at most one hour away (or has passed), through the secret-free
   `progress-prizes-production-activation` Environment. The job waits without a
   Google token, authenticates at cutoff, reacquires a zero-wait GitHub lease,
-  closes the source, opens and reload-verifies the target, then merges only the
-  activated commit.
+  closes the source, performs its final append-only response sync, opens and
+  reload-verifies the target, then merges only the activated commit.
 - `reconcile-active` is a manual break-glass repair for a rollover that humans
   already completed. Run `verify active` first. Reconciliation proceeds only if
   the old form is published and closed, the new form is published and open, the
@@ -479,6 +498,48 @@ otherwise the exact one-commit/one-file activation gate will reject the
 rollover. Production never deletes an old form or any response. The cleanup
 operation is staging-only and cannot be selected in the production workflow.
 
+## Monthly response spreadsheets
+
+The automation uses a private, app-property-managed spreadsheet rather than
+asking Google Forms to create a native response destination. The Forms API
+exposes `linkedSheetId` only as output, and a headless WIF service account cannot
+use the interactive Forms UI picker. This keeps authentication keyless while
+retaining Forms as the authoritative response record.
+
+One spreadsheet is created in the same environment's active Shared Drive folder
+for each form cycle. It is fingerprint-bound to that exact form and receives
+only the configured direct internal editor collaborators plus the inherited
+Shared Drive Managers. It never receives the anonymous responder permission.
+The first row is a stable header; every later row contains the response ID,
+timestamps, respondent email when Google supplies it, answers aligned by
+question ID, and a raw-answer JSON fallback. Appends use `RAW` input mode so a
+response beginning with `=` is stored as data, not evaluated as a formula.
+
+The append protocol first scans column A for existing response IDs, obtains all
+current Form responses through the read-only Forms Responses API, and appends
+only unseen IDs. After an ambiguous network failure it scans the IDs again
+before retrying, preventing a duplicate append. A later edit to a Form response
+does not rewrite its existing spreadsheet row; the latest canonical value
+remains available in Google Forms. There are intentionally no code paths for
+Sheets value update, clear, row deletion, spreadsheet deletion, or production
+file movement.
+
+Existing native linked Sheets are legacy records. Their IDs are treated as
+private, and their cells, ACLs, filenames, folders, and Form linkage are never
+mutated. A managed append-only spreadsheet may coexist with a legacy linked
+Sheet for the initial cycle. Old forms and all production monthly spreadsheets
+stay in place for response review after rollover.
+
+To backfill or check the currently active month without waiting for the daily
+schedule, dispatch only public cycle controls; no Google identifier is supplied
+on the command line:
+
+```bash
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=sync-responses -f source-cycle=2026-08 -f target-cycle=2026-09 \
+  -f verify-mode=prepared
+```
+
 ## Automated schedule and immediate smoke
 
 The scheduler owns no Google or Vercel configuration, protected Environment,
@@ -492,6 +553,10 @@ bound to the exact child run ID and public Actions URL.
   seven-day window and after cutoff. Once an exact page-only draft PR already
   sits directly above current `main`, it skips repeated preparation instead of
   force-pushing a new commit and restarting checks.
+- `07:27` Pacific is the daily append-only response sync for the currently
+  active Pacific month. It is suppressed while another production rollover job
+  is nonterminal and fails closed if the form, website, or managed spreadsheet
+  binding is inconsistent.
 - `23:40` Pacific on candidate final days dispatches activation only when the
   observed date is the actual last calendar day. The production workflow—not
   the scheduler—runs tests and the Vercel gate, requests human approval, waits
