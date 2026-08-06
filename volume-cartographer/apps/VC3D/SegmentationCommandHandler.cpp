@@ -2055,11 +2055,17 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     // Interactive renders always start from the TIFF-stack default.
     _cmdRunner->setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
+    // Remote volumes have no local meta.json for vc_render_tifxyz's
+    // readVolumeVoxelSize() to read, so the size has to come from here or the
+    // render falls back to "no metadata found" and writes TIFFs with no
+    // resolution tag at all. setRenderVoxelSize() already ignores a
+    // non-positive value, so this stays inert when the size is unknown.
     _cmdRunner->setRenderVoxelSize(
         renderVolume ? renderVolume->voxelSize() : 0.0,
         renderVolume &&
             (renderVolume->baseScaleLevel() > 0 ||
-             renderVolume->hasExplicitVoxelSizeOverride()));
+             renderVolume->hasExplicitVoxelSizeOverride() ||
+             renderVolume->isRemote()));
     _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
     const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
