@@ -447,6 +447,34 @@ Never use simulated time, fault controls, alternate branches, or staging folders
 for production; those inputs are absent and the shared action rejects them
 before authentication.
 
+Manual recovery uses public controls only; Google configuration stays inside the
+protected Environment:
+
+```bash
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=activate -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=verify -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=reconcile-active -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+```
+
+The trusted GitHub coordinator prints only these diagnostic codes:
+`main-ref-moved`, `ambiguous-pr`, `invalid-page-head`,
+`invalid-pr-association`, `invalid-main-ref`, `completed-state-missing`, and
+`unexpected-error`. The code is safe to include in an incident report; API
+bodies and private identifiers are never printed.
+
+Generated `codex/progress-prize-YYYY-MM` branches and their PRs are strictly
+marker-only. Never push a human guideline, copy, or formatting commit to a
+generated rollover branch. Put editorial changes on a separate branch and PR;
+otherwise the exact one-commit/one-file activation gate will reject the
+rollover. Production never deletes an old form or any response. The cleanup
+operation is staging-only and cannot be selected in the production workflow.
+
 ## Automated schedule and immediate smoke
 
 The scheduler owns no Google or Vercel configuration, protected Environment,
@@ -464,10 +492,13 @@ bound to the exact child run ID and public Actions URL.
   observed date is the actual last calendar day. The production workflow—not
   the scheduler—runs tests and the Vercel gate, requests human approval, waits
   for cutoff without a Google token, then authenticates.
-- `00:17` and `06:47` Pacific on the first day are independent recovery probes.
-  Delayed final-day events retain the previous source cycle through that first
-  day, while every day-two event no-ops. If an exact production run is already
-  nonterminal, the scheduler does not enqueue a stale duplicate.
+- `00:17` Pacific remains a first-day recovery probe. `06:47` Pacific retries
+  on days 1–7, always targeting the previous month's incomplete rollover. A
+  delayed day-7 event may cross local midnight before the day-8 slot; a true
+  day-8 event no-ops. If an exact production run is already nonterminal, the
+  scheduler does not enqueue a stale duplicate. A completed rollover reaches
+  read-only active verification and never creates another form or repeats
+  publishing mutations.
 
 Production and scheduler concurrency groups never cancel an in-progress run and
 use GitHub's queued concurrency mode so a manual race cannot silently replace a

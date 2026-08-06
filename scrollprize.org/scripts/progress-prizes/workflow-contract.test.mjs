@@ -37,6 +37,8 @@ const googleJobNames = [
   'recover-activate',
   'verify-active',
   'prove-activation-idempotency',
+  'reconcile-active-once',
+  'reconcile-active-twice',
   'cleanup-full-rehearsal',
   'verify-cleaned-full-rehearsal',
   'cleanup-standalone',
@@ -577,6 +579,8 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.match(rehearsal, /expect-fault: true/g);
   assert.match(rehearsal, /verify-post-merge-preview/);
   assert.match(rehearsal, /prove-activation-idempotency/);
+  assert.match(rehearsal, /reconcile-active-once/);
+  assert.match(rehearsal, /reconcile-active-twice/);
   assert.match(rehearsal, /verify-cleaned-full-rehearsal/);
   assert.match(rehearsal, /actions: read\n      checks: read/);
   assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
@@ -598,6 +602,18 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   for (const name of googleJobNames.filter((name) => name !== 'bootstrap-staging')) {
     assert.doesNotMatch(jobBlock(rehearsal, name), /allow-activation-rewind/);
   }
+  for (const name of ['reconcile-active-once', 'reconcile-active-twice']) {
+    const reconciliation = jobBlock(rehearsal, name);
+    assert.match(reconciliation, /^          operation: reconcile-active$/m);
+    assert.match(reconciliation, /^          environment: staging$/m);
+    assert.match(reconciliation, /Fetch exact merged smoke page as data/);
+    assert.match(reconciliation, /MERGE_SHA: \$\{\{ needs\.merge-smoke\.outputs\['merge-sha'\] \}\}/);
+    assert.doesNotMatch(reconciliation, /simulated-now:|fault:|expect-fault:|head-sha:|base-sha:/);
+  }
+  assert.match(
+    jobBlock(rehearsal, 'cleanup-full-rehearsal'),
+    /^      - reconcile-active-twice$/m,
+  );
 
   const pagePr = await workflow('progress-prizes-page-pr.yml');
   assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);

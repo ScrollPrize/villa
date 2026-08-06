@@ -66,7 +66,7 @@ test('scheduler exposes only a real-clock manual smoke and four Pacific schedule
     '17 6 * * *',
     '40 23 28-31 * *',
     '17 0 1 * *',
-    '47 6 1 * *',
+    '47 6 1-7 * *',
   ];
 
   assert.match(triggers, /^on:\n  workflow_dispatch:\n  schedule:/m);
