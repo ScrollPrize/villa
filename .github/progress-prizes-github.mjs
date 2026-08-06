@@ -23,6 +23,22 @@ const REPOSITORY_ID = 890972577;
 const OWNER_ID = 121906140;
 const GITHUB_ACTIONS_BOT_ID = 41898282;
 const PAGE_PATH = 'scrollprize.org/docs/34_prizes.md';
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  'ambiguous-pr',
+  'completed-state-missing',
+  'invalid-main-ref',
+  'invalid-page-head',
+  'invalid-pr-association',
+  'main-ref-moved',
+  'unexpected-error',
+]);
+
+class SafeCoordinationError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.diagnosticCode = code;
+  }
+}
 
 function previewRunId(status) {
   const match = /^https:\/\/github\.com\/ScrollPrize\/villa\/actions\/runs\/([1-9]\d*)$/
@@ -48,6 +64,19 @@ function latestPreviewStatus(statuses) {
 
 function fail(message) {
   throw new Error(message);
+}
+
+function failWithDiagnostic(code, message) {
+  if (!SAFE_DIAGNOSTIC_CODES.has(code) || code === 'unexpected-error') {
+    fail('Invalid safe diagnostic code.');
+  }
+  throw new SafeCoordinationError(code, message);
+}
+
+export function safeDiagnosticCode(error) {
+  return SAFE_DIAGNOSTIC_CODES.has(error?.diagnosticCode)
+    ? error.diagnosticCode
+    : 'unexpected-error';
 }
 
 function parseArgs(argv) {
@@ -183,7 +212,10 @@ export function activationCommitNeedsRefresh(commit, { headSha, baseSha } = {}) 
     || commit.files[0]?.filename !== PAGE_PATH
     || commit.files[0]?.status !== 'modified'
   ) {
-    fail('Only a page-only commit with a stale parent may be refreshed.');
+    failWithDiagnostic(
+      'invalid-page-head',
+      'Only a page-only commit with a stale parent may be refreshed.',
+    );
   }
   const parentSha = assertSha(commit.parents[0]?.sha ?? '');
   return parentSha !== baseSha;
@@ -292,29 +324,53 @@ export async function resolveProductionActivationState({
   const contract = assertAutomationBranch(head, base);
   if (contract.kind !== 'production') fail('Activation-state recovery is production-only.');
   const pulls = await listPulls();
-  if (!Array.isArray(pulls) || pulls.length > 1) fail('Production activation PR state is ambiguous.');
+  if (!Array.isArray(pulls) || pulls.length > 1) {
+    failWithDiagnostic('ambiguous-pr', 'Production activation PR state is ambiguous.');
+  }
+  const ref = await readMainRef();
+  if (
+    ref?.ref !== 'refs/heads/main'
+    || ref?.object?.type !== 'commit'
+    || !/^[a-f0-9]{40}$/.test(ref.object.sha ?? '')
+  ) {
+    failWithDiagnostic('invalid-main-ref', 'The authoritative production main ref is invalid.');
+  }
+  const baseSha = ref.object.sha;
+  if (baseSha !== trustedBaseSha) {
+    failWithDiagnostic('main-ref-moved', 'Production main moved after the workflow was dispatched.');
+  }
   let state;
   let sha;
-  let baseSha;
   let number = '';
   let refreshRequired = false;
   if (pulls.length === 1) {
     const pull = pulls[0];
-    sha = assertSha(pull.head?.sha ?? '');
-    baseSha = assertSha(pull.base?.sha ?? '');
-    if (baseSha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
-    assertPullBinding(pull, { head, base, headSha: sha, baseSha });
+    try {
+      assertPullAssociation(pull, { head, base });
+      sha = assertSha(pull.head?.sha ?? '');
+      // pull.base.sha is cached pull metadata. Validate its shape, but never use it
+      // to decide whether the authoritative refs/heads/main has moved.
+      assertSha(pull.base?.sha ?? '');
+      if (!Number.isInteger(pull.number) || pull.number < 1) fail('Invalid pull request number.');
+    } catch {
+      failWithDiagnostic(
+        'invalid-pr-association',
+        'The production activation pull request association is invalid.',
+      );
+    }
     const commit = await readCommit(sha);
     refreshRequired = activationCommitNeedsRefresh(commit, { headSha: sha, baseSha });
     state = 'pending';
     number = String(pull.number);
   } else {
-    const ref = await readMainRef();
-    sha = assertSha(ref?.object?.sha ?? '');
-    if (sha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
-    baseSha = sha;
+    sha = baseSha;
     const page = await readPage(sha);
-    if (page.cycle !== targetCycle) fail('Neither a pending PR nor a completed production cycle exists.');
+    if (page.cycle !== targetCycle) {
+      failWithDiagnostic(
+        'completed-state-missing',
+        'Neither a pending PR nor a completed production cycle exists.',
+      );
+    }
     state = 'completed';
   }
   return {
@@ -647,8 +703,10 @@ async function main(argv) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     await main(process.argv.slice(2));
-  } catch {
-    process.stderr.write('Progress Prize GitHub coordination failed safely.\n');
+  } catch (error) {
+    process.stderr.write(
+      `Progress Prize GitHub coordination failed safely [${safeDiagnosticCode(error)}].\n`,
+    );
     process.exitCode = 1;
   }
 }
