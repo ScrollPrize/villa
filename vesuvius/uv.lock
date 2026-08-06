@@ -935,6 +935,29 @@ wheels = [
 ]
 
 [[package]]
+name = "fastremap"
+version = "1.20.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/3c/54d2378454d92ca1a894939d7db8b1a828ba45737e05532750520dd03e9f/fastremap-1.20.0.tar.gz", hash = "sha256:a64ffb4a99fd06c6f54f0ffbf48c73532fa238c429a4278b45767a55957468a0", size = 55917, upload-time = "2026-06-11T15:36:19.713Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/66/20/00275ba5776982a7992fd828f284ba29af2674ed8f66d547502b36cdc849/fastremap-1.20.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:f06a89985c1b5619c2fd1ffe0824da83689a0f1562c58b1667e18a8ec241faf3", size = 735745, upload-time = "2026-06-11T15:35:47.947Z" },
+    { url = "https://files.pythonhosted.org/packages/41/f3/9fbaaa754dbe42a4557120af2da782c50e9fbbd0b429a86706ab8d75e0f5/fastremap-1.20.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:410e6a014b7f6e7c10aed91edc870773ce07023a6937129b3b96e69c99ee484f", size = 618685, upload-time = "2026-06-11T15:35:49.366Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/ac/f2087ade77fb852258b03b9d4ba89d3b50c1e29792d92d0826a4025c83ba/fastremap-1.20.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:114ab797b7621f50e4fbc4ef3d5f9cf0604e5199a2f2bf9b185bd1318e54765b", size = 7241954, upload-time = "2026-06-11T15:35:51.51Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/82/363d99040c496fae137de7be1036a16489d470f94d96f94eb3ef8f52eedd/fastremap-1.20.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c7a5e2abf28eb75b9b852abfcc1ceab169473d36ca2a5526e0637567d411e6e8", size = 7326676, upload-time = "2026-06-11T15:35:53.911Z" },
+    { url = "https://files.pythonhosted.org/packages/90/29/8d246dd3c0c5c5a408eddf12cca5aa5832d26344ccd22f4bcb7952270241/fastremap-1.20.0-cp314-cp314-win32.whl", hash = "sha256:9fb5bb87167a36e519b23ac28a40c2296f70082dba05db0022ed051c685da887", size = 460685, upload-time = "2026-06-11T15:35:56.489Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/0d/bb044a005bfeab74e3c488593ae31237f9912d8f2a82d085eaec054ec83f/fastremap-1.20.0-cp314-cp314-win_amd64.whl", hash = "sha256:8a1431fb5f60792f6072d4bf2216c248512c6baab8a6f1385b76b655c420896a", size = 642651, upload-time = "2026-06-11T15:35:55.234Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/57/8782a8e39cba8fd9f9ea7f0140f909af038219c3203cf0ed72906a2c9047/fastremap-1.20.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:3d19af90c62356685d77b3bb852d5701dff001224dcf847c7a2fec904eb86ec0", size = 796849, upload-time = "2026-06-11T15:35:58.311Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/33/02e447089ecdb3827513b9deb5e6298a6cd79c5a954369c2a9b2f287af3f/fastremap-1.20.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:c31a3e6aa9a88375c2b2b58f277b83ada5eb8d8122b3c0bc74b3cb719260a08a", size = 680463, upload-time = "2026-06-11T15:36:01.686Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/af/1190afa75ee6a7a22d710a4786f3cdc8d861695282f5c839d5fd6e9ff273/fastremap-1.20.0-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:78088c09176a5c14364b4c2fcbf5970375516adc94638ce02f2c7af257cb7dc2", size = 7351102, upload-time = "2026-06-11T15:36:03.834Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/ba/3b0f124b1fa2960e47d07004ba187cc4499a42d7d85029970c5a6cc43e43/fastremap-1.20.0-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fb517805c2b82b28cc7231fa5469327d6b3327a7ae8d036ab87f019e5d7096d0", size = 7203188, upload-time = "2026-06-11T15:36:05.901Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/d9/0fe3bb3ecc078dc4367c1651e23bd28ced778212be564bca972c4872b00d/fastremap-1.20.0-cp314-cp314t-win32.whl", hash = "sha256:b7701f3e5c870f84906afc9ca1daed2f046a98c4fadc66e994687439e26ade0a", size = 576045, upload-time = "2026-06-11T15:36:08.746Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/c8/e6707c4f9161063cf31bdba1284361d81716642dd18342d2349dc42cc986/fastremap-1.20.0-cp314-cp314t-win_amd64.whl", hash = "sha256:e45c389f99b77c764281350d3158e5ad3eb864d786733dedb63cc699a89ad363", size = 804680, upload-time = "2026-06-11T15:36:07.431Z" },
+]
+
+[[package]]
 name = "fft-conv-pytorch"
 version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4341,6 +4364,7 @@ all = [
     { name = "dask-image" },
     { name = "dynamic-network-architectures" },
     { name = "einops" },
+    { name = "fastremap" },
     { name = "fft-conv-pytorch" },
     { name = "fvcore" },
     { name = "huggingface-hub" },
@@ -4475,6 +4499,7 @@ requires-dist = [
     { name = "edt", specifier = ">=3.1.2" },
     { name = "einops", marker = "extra == 'all'", specifier = ">=0.8.1" },
     { name = "einops", marker = "extra == 'models'", specifier = ">=0.8.1" },
+    { name = "fastremap", marker = "extra == 'all'" },
     { name = "fft-conv-pytorch", marker = "extra == 'all'", specifier = ">=1.2.0" },
     { name = "fft-conv-pytorch", marker = "extra == 'models'", specifier = ">=1.2.0" },
     { name = "fsspec", specifier = ">=2025.9.0" },
