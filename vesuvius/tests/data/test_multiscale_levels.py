@@ -81,8 +81,11 @@ def _volume_with(data):
 def _real_group(level_names, with_metadata):
     """A genuine in-memory zarr Group, optionally carrying multiscales."""
     g = zarr.group()
+    # zarr 3 renamed Group.create_dataset to create_array; the repo supports
+    # both (pyproject allows zarr>=2.18.7,<4), so branch as the other tests do.
+    create = getattr(g, "create_array", None) or g.create_dataset
     for name in level_names:
-        g.create_array(name, shape=(2, 2, 2), dtype="u1")
+        create(name=name, shape=(2, 2, 2), dtype="u1")
     if with_metadata:
         g.attrs["multiscales"] = _multiscales(level_names)["multiscales"]
     return g
@@ -136,3 +139,92 @@ def test_level_keys_are_computed_once() -> None:
     first = vol._level_keys()
     assert vol._level_keys() is first
     assert vol._level_keys() is first
+
+
+# --------------------------------------------------------------------------
+# Reads must use the declared keys, not the level's position
+# --------------------------------------------------------------------------
+# Discovering the level names was only half the fix: every read path still
+# indexed ``self.data`` directly, which works for the legacy list of levels but
+# not for a Group, where a level is addressed by key. These tests pin the read
+# paths themselves, and deliberately use non-numeric, non-sorted paths so that
+# indexing by position or by ``str(idx)`` cannot pass by accident.
+
+_NAMED = ["full", "half", "quarter"]
+
+
+def _named_group():
+    g = zarr.group()
+    create = getattr(g, "create_array", None) or g.create_dataset
+    for n, name in enumerate(_NAMED):
+        arr = create(name=name, shape=(4 - n, 6 - n, 8 - n), dtype="u1")
+        arr[...] = n + 1
+    g.attrs["multiscales"] = _multiscales(_NAMED)["multiscales"]
+    return g
+
+
+def test_shape_uses_declared_paths() -> None:
+    vol = _volume_with(_named_group())
+    assert vol.shape(0) == (4, 6, 8)
+    assert vol.shape(1) == (3, 5, 7)
+    assert vol.shape(2) == (2, 4, 6)
+
+
+def test_ndim_uses_declared_paths() -> None:
+    vol = _volume_with(_named_group())
+    assert vol.ndim == 3
+
+
+def test_level_rejects_out_of_range() -> None:
+    vol = _volume_with(_named_group())
+    with pytest.raises(IndexError):
+        vol.shape(len(_NAMED))
+    with pytest.raises(IndexError):
+        vol.shape(-1)
+
+
+def test_single_array_store_reports_one_level() -> None:
+    arr = zarr.zeros((2, 3, 4), dtype="u1")
+    vol = _volume_with(arr)
+    assert vol.shape() == (2, 3, 4)
+    assert vol.ndim == 3
+    with pytest.raises(IndexError):
+        vol.shape(1)
+
+
+def test_legacy_list_of_levels_still_works() -> None:
+    """The pre-existing form must keep working: levels addressed by position."""
+    levels = [zarr.zeros((4, 4, 4), dtype="u1"), zarr.zeros((2, 2, 2), dtype="u1")]
+    vol = _volume_with(levels)
+    assert vol.shape(0) == (4, 4, 4)
+    assert vol.shape(1) == (2, 2, 2)
+    assert vol.ndim == 3
+
+
+def test_mixed_numeric_and_named_paths_do_not_break_sorting(capsys) -> None:
+    """``["0", "scale1"]`` must not raise when levels are listed.
+
+    Sorting with a key returning sometimes int and sometimes str compares the
+    two and raises TypeError on any store that mixes them.
+    """
+    g = zarr.group()
+    create = getattr(g, "create_array", None) or g.create_dataset
+    for name in ["0", "scale1"]:
+        create(name=name, shape=(2, 2, 2), dtype="u1")
+    g.attrs["multiscales"] = _multiscales(["0", "scale1"])["multiscales"]
+
+    vol = _volume_with(g)
+    vol.type = "zarr"
+    vol.scroll_id = None
+    vol.energy = None
+    vol.segment_id = None
+    vol.resolution = None
+    vol.url = "memory://"
+    vol.dtype = "u1"
+    vol.normalization_scheme = "none"
+    vol.return_as_type = "none"
+    vol.return_as_tensor = False
+    vol.inklabel = None
+    vol.meta()
+    out = capsys.readouterr().out
+    assert "Number of Resolution Levels: 2" in out
