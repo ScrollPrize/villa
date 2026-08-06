@@ -7648,9 +7648,23 @@ void CWindow::CreateWidgets(void)
                         span.linePointCount,
                         span.lengthVx,
                         spanAlignment,
+                        span.interpMarker,
+                        span.fiberManifest,
                     });
                 }
 
+                CFiberWidget::FiberEntry::TraceState traceState =
+                    CFiberWidget::FiberEntry::TraceState::Legacy;
+                switch (fiber.traceState) {
+                case vc3d::line_annotation::FiberTraceState::Predictions:
+                    traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+                    break;
+                case vc3d::line_annotation::FiberTraceState::Mixed:
+                    traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+                    break;
+                case vc3d::line_annotation::FiberTraceState::Legacy:
+                    break;
+                }
                 entries.push_back(CFiberWidget::FiberEntry{
                     fiber.id,
                     fiber.name,
@@ -7669,6 +7683,7 @@ void CWindow::CreateWidgets(void)
                     fiber.tags,
                     fiber.linkedFiberCount,
                     fiber.pendingLinkCount,
+                    traceState,
                 });
             }
             if (_fiberWidget) {
@@ -7804,6 +7819,15 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::fiberTagChanged,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberTag);
+            connect(widget,
+                    &CFiberWidget::fiberTraceReviewChanged,
+                    _lineAnnotationController.get(),
+                    [this](const std::vector<uint64_t>& fiberIds, bool verified) {
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->setFibersTraceReviewed(
+                                fiberIds, verified);
+                        }
+                    });
             connect(widget,
                     &CFiberWidget::hvScoreRecalculationRequested,
                     _lineAnnotationController.get(),

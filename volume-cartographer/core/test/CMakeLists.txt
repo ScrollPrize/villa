@@ -66,6 +66,8 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_tifxyz_identity)
+
 vc_add_test(NAME test_appendmask_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
@@ -148,6 +150,13 @@ vc_add_test(NAME test_fiber_widget
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNameDisplay.cpp
             ${cfiber_widget_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_fiber_trace_review
+    SOURCES test_fiber_trace_review.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
