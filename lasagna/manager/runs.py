@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 from .catalog import VolumeRecord
 from .config import ManagerConfig
-from .prefetch import volume_cache_root
+from .prefetch import build_prefetch_request, volume_cache_root
 from .snapshots import SnapshotRecord
 from .tmux import Tmux
 
@@ -119,6 +119,29 @@ print(json.dumps(out))
         return {"error": str(error)}
 
 
+def _inference_args(configured: Sequence[str], explicit: Sequence[str]) -> tuple[str, ...]:
+    explicit_device = any(
+        value in {"--device", "--devices"}
+        or value.startswith("--device=") or value.startswith("--devices=")
+        for value in explicit
+    )
+    if not explicit_device:
+        return (*configured, *explicit)
+    filtered: list[str] = []
+    skip_value = False
+    for value in configured:
+        if skip_value:
+            skip_value = False
+            continue
+        if value in {"--device", "--devices"}:
+            skip_value = True
+            continue
+        if value.startswith("--device=") or value.startswith("--devices="):
+            continue
+        filtered.append(value)
+    return (*filtered, *explicit)
+
+
 def build_fiber_command(
     config: ManagerConfig,
     snapshot: SnapshotRecord,
@@ -185,6 +208,9 @@ def launch_inference(
     original_argv: Sequence[str],
     extra_args: Sequence[str] = (),
     legacy_config: str | Path | None = None,
+    prefetch: bool = True,
+    download_workers: int = 64,
+    remote_inventory: bool = True,
     tmux: Tmux | None = None,
     now: datetime | None = None,
 ) -> Path:
@@ -211,16 +237,25 @@ def launch_inference(
         if not isinstance(runtime_config, dict):
             raise ValueError(f"legacy Fiber config must contain a JSON object: {legacy_path}")
         runtime_config_source = "legacy-file"
-    instant = now or datetime.now(timezone.utc)
-    run_uuid = str(uuid.uuid4())
-    readable = f"{snapshot.backend}-{volume.sample_id}-{volume.volume_id}-sd{scale}-{snapshot.run}-{snapshot.checkpoint}-{instant:%Y%m%d_%H%M%S}-{run_uuid[:8]}"
-    run_name = _slug(readable, 180)
-    session = "las-" + _slug(run_name, 70)
     client = tmux or Tmux()
-    if client.has_session(session):
-        raise ValueError(f"tmux session already exists: {session}")
-    run_dir = output_root / run_name
-    run_dir.mkdir(parents=True, exist_ok=False)
+    output_root.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        run_uuid = str(uuid.uuid4())
+        run_name = _slug(
+            f"{volume.sample_id}-{volume.volume_id}-las-sd{scale}-{run_uuid[:8]}",
+            120,
+        )
+        session = "las-" + _slug(run_name, 70)
+        run_dir = output_root / run_name
+        if client.has_session(session):
+            continue
+        try:
+            run_dir.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise RuntimeError("could not reserve a unique inference run name")
     (run_dir / "artifacts").mkdir()
     model_context = asdict(snapshot)
     model_context.pop("path", None)
@@ -245,16 +280,18 @@ def launch_inference(
         "manager": {"version": "0.1"},
     }
     if snapshot.backend == "fiber3d":
+        backend_args = _inference_args(config.params, extra_args)
         command, manifest = build_fiber_command(
             config, snapshot, volume, scale, run_dir,
-            extra_args=extra_args, provenance_context=provenance_context,
+            extra_args=backend_args, provenance_context=provenance_context,
             legacy_config=legacy_config,
         )
         artifact_kind = "fiber3d-prediction"
     else:
+        backend_args = _inference_args(config.params, extra_args)
         command, manifest = build_lasagna_command(
             config, snapshot, volume, scale, run_dir,
-            extra_args=extra_args, provenance_context=provenance_context,
+            extra_args=backend_args, provenance_context=provenance_context,
         )
         artifact_kind = "lasagna"
     record = {
@@ -271,11 +308,16 @@ def launch_inference(
         "pid": None,
         "process_start_time": None,
         "tmux_session": session,
+        "tmux_window_id": None,
         "private": {"hostname": socket.gethostname(), "user": getpass.getuser()},
         "manager": {"version": "0.1", **_git_revision(Path(__file__).resolve().parents[2])},
         "runtime": _runtime_info(python),
         "environment": {name: os.environ[name] for name in ("CUDA_VISIBLE_DEVICES",) if name in os.environ},
-        "source": {"volume": asdict(volume), "scale": scale, "local_path": str(volume_cache_root(config, volume) / str(scale))},
+        "source": {
+            "volume": {**asdict(volume), "selector": volume.selector},
+            "scale": scale,
+            "local_path": str(volume_cache_root(config, volume) / str(scale)),
+        },
         "snapshot": asdict(snapshot),
         "runtime_config": {"source": runtime_config_source, "sha256": hashlib.sha256(json.dumps(runtime_config, sort_keys=True, default=str).encode()).hexdigest()},
         "provenance_context_path": "provenance_context.json",
@@ -286,10 +328,20 @@ def launch_inference(
             "provenance": "artifacts/inference.json", "inventory": [],
         },
         "lifecycle": {
+            "prefetch": "pending" if prefetch else "skipped",
             "inference": "created", "staging_upload": "not_started",
             "atlas_ingest": "not_started", "atlas_publication": "not_started",
         },
+        "prefetch": {
+            "started_at": None, "ended_at": None, "error": None,
+        },
     }
+    prefetch_request = None
+    if prefetch:
+        prefetch_request = build_prefetch_request(
+            volume, volume_cache_root(config, volume), scale,
+            workers=download_workers, remote_inventory=remote_inventory,
+        )
     command_record = {
         "schema_version": 1,
         "original_argv": list(original_argv),
@@ -297,12 +349,18 @@ def launch_inference(
         "display": " ".join(__import__("shlex").quote(value) for value in command),
         "cwd": str(run_dir),
         "venv_activation": f"source {config.resolved_path('venv', required=True)}/bin/activate",
+        "prefetch": prefetch_request,
     }
     atomic_json(run_dir / "metadata.json", record)
     atomic_json(run_dir / "command.json", command_record)
     wrapper = [str(python), "-m", "lasagna.manager.runner", str(run_dir)]
     try:
-        client.create(session, "inference", wrapper)
+        window_name = _slug(f"inf-{volume.sample_id}-{run_uuid[:4]}", 24)
+        record["tmux_window_name"] = window_name
+        record["tmux_window_id"] = client.create(
+            session, window_name, wrapper, run_uuid=run_uuid,
+        )
+        atomic_json(run_dir / "metadata.json", record)
     except Exception:
         record["status"] = "failed"
         record["lifecycle"]["inference"] = "failed"
@@ -353,7 +411,12 @@ def reconcile_runs(config: ManagerConfig, tmux: Tmux | None = None) -> list[tupl
         if record.get("status") not in {"created", "running"}:
             continue
         session = str(record.get("tmux_session") or "")
-        if (session and client.has_session(session)) or _process_matches(record):
+        window_id = str(record.get("tmux_window_id") or "")
+        if (
+            (window_id and client.window_matches(window_id, str(record.get("run_uuid") or "")))
+            or (session and client.has_session(session))
+            or _process_matches(record)
+        ):
             continue
         status = "interrupted" if record.get("status") == "running" else "unknown"
         record["status"] = status

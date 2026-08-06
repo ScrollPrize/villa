@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import lasagna.manager.cli as manager_cli
 from lasagna.manager import catalog
 from lasagna.manager.catalog import CatalogCache, get_catalog, index_volumes, resolve_volume
 from lasagna.manager.cli import (
@@ -19,7 +20,10 @@ from lasagna.manager.completion import (
     canonical_executable, contextual_candidates, install_bash_completion, provider_id,
 )
 from lasagna.manager.config import ManagerConfig, initialize_config, load_config
-from lasagna.manager.prefetch import prefetch_volume, volume_cache_root
+from lasagna.manager.prefetch import (
+    build_prefetch_request, execute_prefetch_request, prefetch_volume,
+    volume_cache_root,
+)
 from lasagna.manager.runner import main as runner_main
 from lasagna.manager.runs import atomic_json, launch_inference, read_runs, reconcile_runs
 from lasagna.manager.snapshots import discover_snapshot_paths, index_snapshots, resolve_snapshot
@@ -78,6 +82,10 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
     assert loaded.snapshot_dirs == ()
     assert loaded.atlas_dir == ""
     assert loaded.upload_staging_s3 == ""
+    assert loaded.params == (
+        "--tile-size", "512", "--border", "32", "--overlap", "96",
+        "--devices", "all",
+    )
     with pytest.raises(FileExistsError):
         initialize_config()
 
@@ -90,6 +98,13 @@ def test_relative_config_paths_resolve_from_config_location(tmp_path, monkeypatc
     loaded = load_config()
     assert loaded.resolved_path("cache_dir") == tmp_path / "cache"
     assert loaded.resolved_snapshot_dirs() == (tmp_path / "runs",)
+
+
+def test_config_params_are_string_array(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('params = ["--devices", 8]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="params must be an array of strings"):
+        load_config(path)
 
 
 def test_command_unique_prefix_and_ambiguity():
@@ -513,9 +528,16 @@ class FakeTmux:
     def has_session(self, session):
         return session in self.sessions
 
-    def create(self, session, window, argv):
+    def create(self, session, window, argv, *, run_uuid):
         self.sessions.add(session)
-        self.created.append((session, window, list(argv)))
+        self.created.append((session, window, list(argv), run_uuid))
+        return "@99"
+
+    def has_window(self, window_id):
+        return window_id == "@99"
+
+    def window_matches(self, window_id, run_uuid):
+        return window_id == "@99"
 
 
 def _snapshot_and_config(tmp_path: Path):
@@ -544,9 +566,11 @@ def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
     command = json.loads((run_dir / "command.json").read_text())
     assert metadata["status"] == "created"
     assert metadata["lifecycle"] == {
-        "inference": "created", "staging_upload": "not_started",
+        "prefetch": "pending", "inference": "created", "staging_upload": "not_started",
         "atlas_ingest": "not_started", "atlas_publication": "not_started",
     }
+    assert command["prefetch"]["scale"] == 2
+    assert command["prefetch"]["workers"] == 64
     assert metadata["source"]["scale"] == 2
     assert metadata["artifacts"]["manifest"].startswith("artifacts/")
     assert command["resolved_argv"][-2:] == ["--devices", "all"]
@@ -558,6 +582,34 @@ def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
     assert context["source"]["requested_group"] == 2
     assert "path" not in context["model"]
     assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
+    assert run_dir.name.startswith(f"{volume.sample_id}-{volume.volume_id}-las-sd2-")
+    assert snapshot.run not in run_dir.name
+    assert metadata["source"]["volume"]["selector"] == volume.selector
+    assert metadata["tmux_window_name"].startswith(f"inf-{volume.sample_id}-")
+    assert fake.created[0][1] == metadata["tmux_window_name"]
+
+
+def test_run_config_params_precede_explicit_backend_overrides(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    config = replace(config, params=("--tile-size", "512", "--devices", "all"))
+    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    run_dir = launch_inference(
+        config, snapshot, volume, 1, original_argv=["inference", "run"],
+        extra_args=("--tile-size", "256", "--devices", "cuda:1"), tmux=FakeTmux(),
+    )
+    argv = json.loads((run_dir / "command.json").read_text())["resolved_argv"]
+    assert argv[-6:] == [
+        "--tile-size", "512",
+        "--tile-size", "256", "--devices", "cuda:1",
+    ]
+
+    second = launch_inference(
+        config, snapshot, volume, 1, original_argv=["inference", "run"],
+        extra_args=("--device", "cuda:1"), tmux=FakeTmux(),
+    )
+    argv = json.loads((second / "command.json").read_text())["resolved_argv"]
+    assert "--devices" not in argv
+    assert argv[-2:] == ["--device", "cuda:1"]
 
 
 def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
@@ -585,6 +637,35 @@ def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     assert "--provenance-context" in command
     assert command[-2:] == ["--devices", "all"]
     assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
+
+
+def test_inference_run_returns_after_detached_launch_without_foreground_prefetch(
+    tmp_path, monkeypatch, capsys,
+):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    cache = CatalogCache(sample_catalog(), {"sha256": "digest", "fetched_at": "now"})
+    volume = index_volumes(cache)[0]
+    calls = []
+    monkeypatch.setattr(manager_cli, "load_config", lambda: config)
+    monkeypatch.setattr(manager_cli, "get_catalog", lambda _config: cache)
+    monkeypatch.setattr(manager_cli, "index_snapshots", lambda _config: [snapshot])
+    monkeypatch.setattr(
+        manager_cli, "prefetch_volume",
+        lambda *_args, **_kwargs: pytest.fail("prefetch ran in the manager process"),
+    )
+
+    def fake_launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return tmp_path / "reserved-run"
+
+    monkeypatch.setattr(manager_cli, "launch_inference", fake_launch)
+    assert main([
+        "inference", "run", snapshot.selector, volume.selector, "2",
+        "--download-workers", "511",
+    ]) == 0
+    assert capsys.readouterr().out.strip() == str(tmp_path / "reserved-run")
+    assert calls[0][1]["prefetch"] is True
+    assert calls[0][1]["download_workers"] == 511
 
 
 def test_reconcile_marks_dead_running_record_interrupted(tmp_path):
@@ -615,6 +696,87 @@ def test_runner_captures_log_and_failed_exit(tmp_path):
     assert metadata["status"] == "failed"
     assert metadata["exit_code"] == 7
     assert "hello runner" in (run_dir / "run.log").read_text()
+
+
+def test_runner_tees_inference_output_to_log_and_terminal(tmp_path, capfd):
+    run_dir = tmp_path / "tee-output"
+    atomic_json(run_dir / "metadata.json", {
+        "status": "created", "lifecycle": {"inference": "created"},
+        "started_at": None, "ended_at": None,
+    })
+    atomic_json(run_dir / "command.json", {
+        "resolved_argv": [
+            sys.executable, "-c",
+            "import sys; sys.stdout.write('progress\\r42%'); sys.stdout.flush(); raise SystemExit(3)",
+        ],
+    })
+    assert runner_main([str(run_dir)]) == 3
+    assert b"progress\r42%" in (run_dir / "run.log").read_bytes()
+    assert "progress\r42%" in capfd.readouterr().out
+
+
+def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monkeypatch):
+    run_dir = tmp_path / "detached"
+    marker = run_dir / "prefetched"
+    provenance = run_dir / "artifacts" / "inference.json"
+    atomic_json(run_dir / "metadata.json", {
+        "status": "created", "lifecycle": {"prefetch": "pending", "inference": "created"},
+        "started_at": None, "ended_at": None,
+        "artifacts": {"provenance": "artifacts/inference.json", "inventory": []},
+    })
+    request = {
+        "version": 1, "source": "s3://bucket/volume.zarr",
+        "destination": str(run_dir / "cache"), "scale": 3, "workers": 511,
+        "anon": True, "remote_inventory": False,
+    }
+
+    def fake_prefetch(value):
+        assert value == request
+        marker.write_text("ready", encoding="utf-8")
+        return Path(value["destination"]) / str(value["scale"])
+
+    script = (
+        "from pathlib import Path; import json; "
+        f"assert Path({str(marker)!r}).is_file(); "
+        f"p=Path({str(provenance)!r}); p.parent.mkdir(parents=True, exist_ok=True); "
+        "p.write_text(json.dumps({'status':'completed','artifacts':[]}))"
+    )
+    atomic_json(run_dir / "command.json", {
+        "resolved_argv": [sys.executable, "-c", script], "prefetch": request,
+    })
+    monkeypatch.setattr("lasagna.manager.runner.execute_prefetch_request", fake_prefetch)
+
+    assert runner_main([str(run_dir)]) == 0
+    metadata = json.loads((run_dir / "metadata.json").read_text())
+    assert metadata["status"] == "completed"
+    assert metadata["lifecycle"]["prefetch"] == "completed"
+    assert metadata["prefetch"]["error"] is None
+    assert "prefetch completed" in (run_dir / "run.log").read_text()
+
+
+def test_runner_prefetch_failure_never_starts_inference(tmp_path, monkeypatch):
+    run_dir = tmp_path / "prefetch-failure"
+    marker = run_dir / "inference-started"
+    atomic_json(run_dir / "metadata.json", {
+        "status": "created", "lifecycle": {"prefetch": "pending", "inference": "created"},
+        "started_at": None, "ended_at": None,
+    })
+    atomic_json(run_dir / "command.json", {
+        "resolved_argv": [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+        "prefetch": {"version": 1},
+    })
+    monkeypatch.setattr(
+        "lasagna.manager.runner.execute_prefetch_request",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("download exploded")),
+    )
+
+    assert runner_main([str(run_dir)]) == 1
+    metadata = json.loads((run_dir / "metadata.json").read_text())
+    assert metadata["status"] == "failed"
+    assert metadata["lifecycle"]["prefetch"] == "failed"
+    assert metadata["lifecycle"]["inference"] == "created"
+    assert "download exploded" in metadata["prefetch"]["error"]
+    assert not marker.exists()
 
 
 def test_runner_copies_direct_inference_inventory(tmp_path):
@@ -657,6 +819,7 @@ def test_runner_rejects_zero_exit_without_completed_provenance(tmp_path):
 
 def test_tmux_inside_links_adjacent_without_renaming_source(monkeypatch):
     calls = []
+    linked = False
     tmux = Tmux("fake-tmux")
 
     class Result:
@@ -665,12 +828,57 @@ def test_tmux_inside_links_adjacent_without_renaming_source(monkeypatch):
             self.returncode = 0
 
     def fake_run(args, **kwargs):
+        nonlocal linked
         calls.append(args)
-        if "display-message" in args:
+        if "link-window" in args:
+            linked = True
+        if "show-options" in args:
+            return Result("run-uuid\n")
+        if "list-windows" in args:
+            suffix = "main\t5\t@9\n" if linked else ""
+            return Result("las-example\t0\t@9\n" + suffix)
+        if "display-message" in args and "#{session_name}" in args:
+            return Result("main\n")
+        if "display-message" in args and "#{window_index}" in args:
             return Result("4\n")
+        if "display-message" in args:
+            return Result("@9\n")
         return Result()
 
     monkeypatch.setattr("lasagna.manager.tmux.subprocess.run", fake_run)
-    tmux.attach("las-example", environ={"TMUX": "yes"})
-    assert ["fake-tmux", "link-window", "-a", "-s", "las-example:0", "-t", "4"] in calls
+    assert tmux.attach(
+        "las-example", window_id="@9", run_uuid="run-uuid",
+        environ={"TMUX": "yes"},
+    ) == "@9"
+    assert ["fake-tmux", "link-window", "-a", "-s", "@9", "-t", "main:4"] in calls
+    assert ["fake-tmux", "select-window", "-t", "main:5"] in calls
     assert not any("rename-window" in call for call in calls)
+
+
+def test_tmux_create_atomically_captures_and_tags_window(monkeypatch):
+    calls = []
+    tmux = Tmux("fake-tmux")
+
+    class Result:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "has-session" in args:
+            return Result(returncode=1)
+        if "new-session" in args:
+            return Result("@42\n")
+        return Result()
+
+    monkeypatch.setattr("lasagna.manager.tmux.subprocess.run", fake_run)
+    assert tmux.create("las-run", "inference", ["python", "run.py"], run_uuid="uuid") == "@42"
+    assert [
+        "fake-tmux", "new-session", "-d", "-P", "-F", "#{window_id}",
+        "-s", "las-run", "-n", "inference", "python", "run.py",
+    ] in calls
+    assert [
+        "fake-tmux", "set-option", "-w", "-t", "@42",
+        "@las_manager_run_uuid", "uuid",
+    ] in calls

@@ -40,7 +40,9 @@ las_manager --help
 ```
 
 The bootstrap installs Lasagna with `-e`, so changes in this checkout are
-immediately visible in the environment without reinstalling.
+immediately visible in the environment without reinstalling. The distribution
+also exposes the sibling Vesuvius Fiber packages and canonical `lasagna.*`
+modules; direct and managed inference do not require `PYTHONPATH`.
 
 ### Inference manager
 
@@ -58,6 +60,16 @@ las_manager volume prefetch <volume> 1 --workers 512
 las_manager inference run <snapshot> <volume> 1 -- --devices all
 las_manager inference ls
 ```
+
+Fresh configs include shared inference defaults equivalent to
+`--tile-size 512 --border 32 --overlap 96 --devices all` in the `params` token
+array. Edit that array globally or append arguments after `--` for a single-run
+override.
+
+`inference run` returns as soon as its run directory and detached tmux session
+are created. The tmux workflow performs automatic prefetch first and inference
+second; use `las_manager run ls`, `las_manager tmux attach <run>`, or follow the
+printed run directory's `run.log`.
 
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:
@@ -93,11 +105,11 @@ Cached volumes, snapshots, runs, option values, and locally known OME scale
 indices are completed contextually. A final `help` token shows help for the
 longest recognized command prefix, for example `las_manager vol pre help`.
 
-This installation currently expects the `villa` monorepo layout: Lasagna uses
-the sibling `vesuvius/src` model implementation and installs its declared model
-dependencies. It deliberately does not build Volume Cartographer, which is not
-needed for preprocessing. Copying only the `lasagna/` directory is therefore
-not yet a supported standalone installation.
+This installation currently expects the `villa` monorepo layout: Lasagna
+packages the sibling `vesuvius/src` implementation and installs its declared
+model dependencies. It deliberately does not build Volume Cartographer, which
+is not needed for preprocessing. Copying only the `lasagna/` directory is
+therefore not yet a supported standalone installation.
 
 ### Batch-download the PHerc scale-0 volumes
 

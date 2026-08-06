@@ -23,7 +23,10 @@ from .completion import (
 from .config import display_config, initialize_config, load_config
 from .prefetch import prefetch_volume
 from .open_data import upload_inference, validate_atlas_inference
-from .runs import launch_inference, read_runs, reconcile_runs, resolve_run
+from .runs import (
+    _process_matches, atomic_json, launch_inference, read_runs, reconcile_runs,
+    resolve_run,
+)
 from .snapshots import index_snapshots, resolve_snapshot
 from .tmux import Tmux
 
@@ -435,26 +438,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.backend:
                     snapshots = [record for record in snapshots if record.backend == args.backend]
                 snapshot = resolve_snapshot(snapshots, args.snapshot)
-                if not args.no_prefetch:
-                    prefetch_volume(config, volume, args.scale, workers=args.download_workers)
                 run_dir = launch_inference(
                     config, snapshot, volume, args.scale,
                     original_argv=args_list, extra_args=inference_args,
                     legacy_config=args.legacy_config,
+                    prefetch=not args.no_prefetch,
+                    download_workers=args.download_workers,
                 )
                 print(run_dir)
         elif args.command == "run":
             client = Tmux()
             for path, record in read_runs(config):
-                if record.get("tmux_session") and client.has_session(record["tmux_session"]):
+                session = str(record.get("tmux_session") or "")
+                window_id = str(record.get("tmux_window_id") or "")
+                if (
+                    (window_id and client.window_matches(window_id, str(record.get("run_uuid") or "")))
+                    or (session and client.has_session(session))
+                ):
                     _print_run(path, record)
         elif args.command == "tmux":
             _path, record = resolve_run(config, args.run)
             session = record.get("tmux_session")
+            window_id = str(record.get("tmux_window_id") or "")
             client = Tmux()
-            if not session or not client.has_session(session):
-                raise ValueError(f"run {record.get('run_name')!r} has no live tmux session")
-            client.attach(session)
+            session_live = bool(session and client.has_session(session))
+            run_uuid = str(record.get("run_uuid") or "")
+            window_live = bool(window_id and client.window_matches(window_id, run_uuid))
+            if not session_live and not window_live:
+                detail = " (inference process is still alive, but its tmux window is gone)" if _process_matches(record) else ""
+                raise ValueError(f"run {record.get('run_name')!r} has no live tmux window{detail}")
+            resolved_window = client.attach(
+                str(session or ""), window_id=window_id or None, run_uuid=run_uuid,
+            )
+            if resolved_window != window_id:
+                record["tmux_window_id"] = resolved_window
+                atomic_json(path / "metadata.json", record)
         elif args.command == "open-data":
             if args.open_data_command == "validate":
                 plan, atlas = validate_atlas_inference(

@@ -12,6 +12,10 @@ DEFAULT_CATALOG_URL = (
     "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json"
 )
 DEFAULT_OPEN_DATA_BUCKET = "s3://vesuvius-challenge-open-data"
+DEFAULT_INFERENCE_PARAMS = (
+    "--tile-size", "512", "--border", "32", "--overlap", "96",
+    "--devices", "all",
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,7 @@ class ManagerConfig:
     atlas_dir: str = ""
     upload_staging_s3: str = ""
     catalog_max_age_seconds: int = 3600
+    params: tuple[str, ...] = DEFAULT_INFERENCE_PARAMS
 
     def resolved_path(self, name: str, *, required: bool = False) -> Path | None:
         if name not in {"cache_dir", "output_dir", "venv", "atlas_dir"}:
@@ -60,11 +65,13 @@ def _validate(raw: dict[str, Any]) -> ManagerConfig:
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
-    if "snapshot_dirs" in raw:
-        values = raw["snapshot_dirs"]
+    for array_name in ("snapshot_dirs", "params"):
+        if array_name not in raw:
+            continue
+        values = raw[array_name]
         if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-            raise ValueError("snapshot_dirs must be an array of strings")
-        raw["snapshot_dirs"] = tuple(values)
+            raise ValueError(f"{array_name} must be an array of strings")
+        raw[array_name] = tuple(values)
     for name in ("catalog_url", "open_data_bucket", "cache_dir", "output_dir", "venv", "atlas_dir", "upload_staging_s3"):
         if name in raw and not isinstance(raw[name], str):
             raise ValueError(f"{name} must be a string")
@@ -86,6 +93,7 @@ def load_config(path: Path | None = None) -> ManagerConfig:
 def render_config(config: ManagerConfig = ManagerConfig()) -> str:
     values = asdict(config)
     snapshots = ", ".join(_toml_string(v) for v in values.pop("snapshot_dirs"))
+    params = ", ".join(_toml_string(v) for v in values.pop("params"))
     lines = [
         "# las_manager global configuration",
         "# Paths may contain ~ or environment variables; relative paths use this file's directory.",
@@ -98,6 +106,8 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
         f"atlas_dir = {_toml_string(values['atlas_dir'])}",
         f"upload_staging_s3 = {_toml_string(values['upload_staging_s3'])}",
         f"catalog_max_age_seconds = {values['catalog_max_age_seconds']}",
+        "# Default backend arguments; arguments after `inference run ... --` override these.",
+        f"params = [{params}]",
         "",
     ]
     return "\n".join(lines)

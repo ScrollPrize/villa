@@ -1,14 +1,10 @@
-# Status: grouped volume listing table
+# Status: reliable manager tmux attachment
 
-- [x] Capture requested output behavior in `task.md`.
-- [x] Inspect current volume rendering and filtering.
-- [x] Write implementation, testing, spec, docs, and changelog plan.
+- [x] Capture task and inspect live tmux state.
+- [x] Write implementation/test/spec/docs plan.
 - [x] Obtain and incorporate independent plan review.
-- [x] Implement grouped table rendering.
-- [x] Add exact prefetched-scale reporting.
-- [x] Add rendering and compatibility tests.
+- [x] Implement stable tmux window identity and recovery.
+- [x] Implement global default inference parameters.
+- [x] Add regression tests.
 - [x] Update specs, docs, changelog, status, and task log.
-- [x] Run final focused and real-catalog validation.
-- [x] Apply user-requested parent-row tree layout and remove redundant ID column.
-- [x] Add fixed-width 6/5/5 depth/height/width shape formatting.
-- [x] Re-run table and real-catalog validation for the revised layout.
+- [x] Run final validation.

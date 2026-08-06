@@ -1,56 +1,54 @@
-# Plan: grouped volume listing table
+# Plan: reliable manager tmux attachment
 
 ## Implementation
 
-1. Replace per-record `_print_volume` output in the human `volume ls` path with
-   one table renderer over the complete filtered record list.
-2. Use columns `SCROLL`, `VOLUME`, `SHAPE`, `VOXEL`, `FORMAT`,
-   `PREFETCHED`, and `ORIGINS`. Compute deterministic widths from headers and rendered values,
-   separate columns with two spaces, and avoid terminal-width-dependent output.
-3. Group the already deterministically sorted records by `sample_id`. Print the
-   scroll and first volume on the same row, then put `├─`/`└─` in the `SCROLL`
-   column for additional volumes while keeping long names in `VOLUME`. A
-   one-volume group has no branch marker. Omit the redundant catalog `ID` column because `long_id` begins with
-   the same ID; the JSON record continues to retain both fields.
-   The renderer sorts defensively by `(sample_id, long_id)` so direct callers
-   cannot produce repeated interleaved groups. An empty result prints the
-   header and separator only.
-4. Preserve unknown values as `-`, origin deduplication/sorting, filtering, and
-   `--json` output exactly. Do not introduce a table-formatting dependency.
-5. Populate `PREFETCHED` from numeric local OME group directories that contain
-   `.zarray` plus at least one non-metadata chunk file. Do not treat root
-   `.zattrs` advertisements or empty group metadata as downloaded data. Probe
-   lazily and stop at the first chunk per group so listing does not traverse
-   complete volumes.
-6. Render Unicode branches when the output encoding supports them and use
-   deterministic ASCII `|-`/`\-` branches otherwise. Do not inspect terminal
-   width, truncate, colorize, or otherwise make redirected output unstable.
-7. Render three-component catalog shapes in existing depth/height/width order
-   as `D×H×W`, right-aligning depth to 6 characters and height/width to 5 with
-   spaces. Preserve `-` for unknown shape and use the generic representation
-   for non-3D future records.
+1. Treat tmux's stable `window_id` value (for example `@32`), not mutable
+   session/window indices, as the durable runtime handle. Capture it atomically
+   from `new-session -P -F`, tag it with the immutable run UUID, and store it.
+   Validate ID+UUID before every attach/live decision so a restarted tmux
+   server cannot redirect a stale ID to an unrelated window.
+2. When attaching inside tmux, resolve the source window ID, link it after the
+   current window using an explicit current-session target, and select it by
+   stable ID. If already linked into the current session, only select it.
+3. Support records without a stored ID by resolving and tagging their original
+   live session. Store `runner_pid` separately from the inference child PID for
+   diagnostics; do not claim an orphan inference child is attachable when no
+   tmux window remains. Persist recovery only from attach/reconciliation, never
+   from completion.
+4. Make reconciliation and live `run ls` accept either a live session or stable
+   live window. Preserve normal outside-tmux session attachment.
+5. Add a validated global string-array `params` configuration field. Render it
+   on `config init` with tile size 512, border 32, overlap 96, and all devices;
+   insert it before arguments supplied after `--`, so explicit per-run values
+   retain final override precedence. Normalize the mutually exclusive
+   `--device`/`--devices` defaults when either is explicitly supplied. Record
+   the fully resolved argv as before.
+6. Tee inference stdout/stderr byte-for-byte from the child pipe into both the
+   durable log and wrapper stdout, preserving carriage-return progress, signal
+   forwarding, backpressure, and the real child exit code.
 
 ## Tests
 
-- Assert exact headers, alignment, sample grouping, branch markers, unknown
-  shape rendering, deterministic order, and single-record groups.
-- Assert prefetched scales are numerically ordered, metadata-only groups are
-  excluded, chunked groups are included, and absent cache roots render `-`.
-- Assert header-only empty output, interleaved-input sorting, and ASCII fallback.
-- Assert fixed 6/5/5 space padding for 3D depth/height/width components.
-- Assert filtered output and `--json` remain valid.
-- Run focused manager tests, the real cached `volume ls`, Python compilation,
-  and `git diff --check`.
+7. Add command-level tests for atomic window-ID capture and UUID tagging,
+   exact link/select targets, already-linked behavior, stale ID rejection,
+   legacy records, missing windows, and live listing.
+8. Add missing-key backward compatibility, exact TOML token-array rendering,
+   validation/config-show, both-backend argv precedence, and singular/plural
+   device override coverage.
+9. Add byte-exact runner tee coverage including carriage-return progress and a
+   nonzero child exit.
+   Run focused manager tests, compilation, and diff checks.
 
 ## Spec update
 
-Specify the grouped human table and unchanged JSON contract.
+Specify stable window-ID ownership and recovery rather than session-name-only
+attachment, plus global default inference parameter ordering.
 
 ## Docs updates
 
-Add a compact output example to `lasagna/docs/manager.md` and note `--json` for
-machine consumers.
+Document stable tmux window identity and the initialized global inference
+parameters, including explicit per-run override order.
 
 ## Changelog
 
-Add a dated entry for the grouped volume table.
+Add a short entry for reliable linked-window attachment.

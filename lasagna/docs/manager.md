@@ -28,7 +28,13 @@ snapshot_dirs = ["/ephemeral/me/fiber/runs"]
 cache_dir = "/ephemeral/me/las_manager_cache"
 output_dir = "/ephemeral/me/fiber_inferences"
 venv = "/home/me/.venv_las"
+params = ["--tile-size", "512", "--border", "32", "--overlap", "96", "--devices", "all"]
 ```
+
+`params` is a TOML array of backend argv tokens applied to every Fiber and
+Lasagna inference. Arguments supplied after `inference run ... --` follow these
+defaults and override repeated options. An explicit `--device` or `--devices`
+also removes the configured mutually exclusive device selector.
 
 ## Catalog and volume selectors
 
@@ -112,15 +118,18 @@ las_manager run ls
 las_manager tmux attach fiber-PHerc0332
 ```
 
-Prefetch completes before the detached GPU job starts, so downloader activity
-cannot collide with inference workers. `--no-prefetch` reuses an already
-populated cache. Arguments after `--` are passed unchanged to the selected backend.
+The command reserves a concise run directory, launches tmux, prints the path,
+and returns immediately. Inside tmux, prefetch completes before the GPU child
+starts, so downloader activity cannot collide with inference workers. Follow it
+with `las_manager run ls`, `las_manager tmux attach <run>`, or inspect
+`<run>/run.log`. `--no-prefetch` reuses an already populated cache. Arguments
+after `--` are passed unchanged to the selected backend.
 This includes output-format overrides such as `--ome-compressor none`; newly
 created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays
 always retain their persisted compressor, and `inference.json` inventories the
 actual compressor of every generated level.
 The configured venv is used via its absolute `bin/python`; no interactive
-activation is needed.
+activation or `PYTHONPATH` is needed after the documented monorepo install.
 
 Current Fiber snapshots embed the authoritative training/inference config and
 the manager does not extract a second runtime config. For a legacy checkpoint,
@@ -134,7 +143,10 @@ as Fiber, with `artifact_kind = "lasagna"`. The product section preserves the
 manifest's source-to-base mapping, gradient encoding scale/factor, crops,
 channel groups, Zarr paths, and output scaledowns.
 
-Each launch atomically reserves:
+Each launch atomically reserves a human label such as
+`PHerc0332-20251211183505-las-sd1-362b6b59`. This is not the Atlas canonical
+identity: complete volume, model, backend, source group, command, timestamp,
+revision, and UUID identity remain in structured metadata. The layout is:
 
 ```text
 <output_dir>/<run-name>/
@@ -149,9 +161,11 @@ Each launch atomically reserves:
 ```
 
 `metadata.json` carries the immutable UUID, complete source and checkpoint
-identity, separate inference/upload/Atlas lifecycle states, and private host
-details. `command.json` records the original and exact resolved argv. The tmux
-wrapper streams combined output to `run.log`, preserves the child exit code,
+identity, separate prefetch/inference/upload/Atlas lifecycle states, and private
+host details. `command.json` records the original and exact resolved argv plus
+the versioned prefetch request. The tmux wrapper tees inference output byte for
+byte to both `run.log` and its pane (including carriage-return progress), while
+prefetch output is logged before the child starts. It preserves the child exit code,
 and atomically records `created`, `running`, `completed`, `failed`, or
 `interrupted`. `inference ls` reconciles stale active records without deleting
 artifacts. A zero child exit is accepted as completed only when
@@ -170,7 +184,12 @@ that link plus unknown forward-compatible fields.
 
 Outside tmux, `tmux attach` attaches normally. Inside tmux, it links the run
 window immediately after the current window and selects it, avoiding nested
-tmux sessions.
+tmux sessions. New runs store a stable tmux `window_id` tagged with their run
+UUID, so linking and window renumbering do not invalidate attachment. An
+inference child can outlive a lost tmux wrapper; such a run remains visible in
+the durable inference list and log but correctly reports that no terminal can
+be reattached. Window tabs use the short `inf-<scroll>-<uuid4>` form rather
+than the full run name.
 
 ## Abbreviations and completion
 

@@ -2494,6 +2494,12 @@
   public bucket, snapshot directory list, cache/output/venv/Atlas directories,
   staging S3 origin, and catalog maximum age. It never contains AWS
   credentials. Relative paths resolve from the config file.
+- Global `params` is a string-token array passed to both inference backends.
+  Initialized configs default to `--tile-size 512 --border 32 --overlap 96
+  --devices all`. Per-run arguments after `--` follow configured tokens and
+  override them; explicit singular/plural device selection removes the
+  configured mutually exclusive device selector. Existing configs without the
+  key receive the default without migration failure.
 - The open-data catalog is cached as validated JSON plus a sidecar containing
   its source URL, SHA-256, ETag/Last-Modified, fetch/validation times, and last
   refresh error. `fetch` always revalidates; dependent commands refresh when
@@ -2552,24 +2558,45 @@
   `<cache_dir>/volumes/<sample_id>/<long_id>`. It preserves downloader metadata
   and accepts an explicit worker count; no manager-specific transfer path is
   permitted.
-- `inference run <snapshot> <volume> <scale>` prefetches synchronously by
-  default, then launches Fiber inference in a detached, manager-prefixed tmux
-  session using the configured venv's absolute Python. Additional inference
+- A Lasagna install built from the monorepo includes the sibling Vesuvius
+  namespace, Fiber inference packages, their config data, and canonical
+  `lasagna.*` modules. The configured venv must run Fiber inference without an
+  ambient `PYTHONPATH`; both editable installs and monorepo-built wheels obey
+  this contract.
+- `inference run <snapshot> <volume> <scale>` atomically reserves a run,
+  launches a detached manager-prefixed tmux session, prints its path, and
+  returns immediately. By default the tmux runner invokes the shared downloader
+  before inference; `--no-prefetch` skips it. The serialized, versioned request
+  preserves source, destination, group, workers, anonymous access, and remote
+  inventory behavior. Additional inference
   argv is preserved without shell interpolation. The positional scale selects
   the input OME group and does not alter the backend's output-scaledown default.
 - Every launch has an immutable UUID and atomically reserved output directory
   containing private `metadata.json`, `command.json`, `run.log`, and a portable
   `artifacts/` subtree. The backend-neutral record pins the complete source and
-  checkpoint identity and tracks inference, staging-upload, Atlas-ingest, and
-  Atlas-publication state independently.
+  checkpoint identity and tracks prefetch, inference, staging-upload,
+  Atlas-ingest, and Atlas-publication state independently. New directory labels
+  use `<sample>-<acquisition>-las-sd<group>-<uuid8>`; this is a concise human
+  label, not Atlas canonical identity. Full volume, model, backend, source
+  group, command, time, revision, and UUID identity remains structured metadata.
 - A manager wrapper owns the `created -> running -> completed|failed|interrupted`
-  transition, combined logging, real child exit status, and signal forwarding.
+  transition, combined prefetch/inference logging, real child exit status, and
+  signal forwarding. Prefetch tracks pending/running/completed/failed/skipped,
+  timestamps and error; failure/interruption prevents inference from starting.
+  Inference stdout/stderr is teed byte-for-byte to both `run.log` and the tmux
+  pane so attaching shows live carriage-return progress without weakening the
+  durable log or exit-code contract.
   Stale active records are reconciled against both tmux and PID/start-time
   identity without deleting artifacts. `inference ls` is the durable view;
   `run ls` contains only live tmux sessions.
 - `tmux attach` attaches normally outside tmux. Inside tmux it links the run
   window immediately after the current window and selects it, never nesting a
-  client or renaming the source window.
+  client or renaming the source window. Creation atomically captures tmux's
+  stable `window_id`, tags the window with the immutable run UUID, and validates
+  both before live/attach decisions. Numeric indices are never durable
+  identity. Window names use `inf-<sample>-<uuid4>` and are only short display
+  labels. A surviving orphan inference process is durable-running but not
+  attachable when its wrapper window is gone.
 - Subsequent ordered phases add direct portable provenance,
   shared Zstd output, Atlas Lasagna-bundle publication, and the Lasagna backend without
   introducing a second manager workflow or discarding the identities above.

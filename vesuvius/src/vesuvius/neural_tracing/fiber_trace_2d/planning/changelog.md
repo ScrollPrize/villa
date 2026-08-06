@@ -363,3 +363,20 @@
   including its manifest decoding fields and structural Zarr inventory.
 - Reused the existing catalog, prefetch, run lifecycle, completion, staging,
   and Atlas Lasagna ingestion paths without a second orchestration workflow.
+# 2026-08-06: self-contained detached manager inference
+
+- Packaged sibling Fiber/Vesuvius and canonical Lasagna modules so inference
+  needs no ambient `PYTHONPATH`.
+- Moved automatic open-data prefetch into the tmux runner with an explicit
+  lifecycle, making launch return immediately while retaining strict
+  prefetch-before-GPU ordering.
+- Replaced provenance-heavy paths with concise, collision-safe human labels
+  while retaining canonical Atlas identity in metadata.
+# 2026-08-06: manager defaults and stable tmux attachment
+
+- Added initialized global inference params for 512-voxel tiles, 32-voxel
+  borders, 96-voxel overlap, and all visible GPUs, with per-run overrides.
+- Made managed tmux identity use atomically captured, run-UUID-tagged stable
+  window IDs and distinguish orphan inference processes from attachable runs.
+- Made attached inference panes show the same live byte stream retained in the
+  durable run log.
