@@ -72,9 +72,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
-- [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks the region's patches intersect are streamed — on PHerc. Paris 4 a 200³ region reads 125 chunks (262 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
-
-- [vesuvius-repro](https://github.com/TAUIL-Abd-Elilah/vesuvius-repro): Regional reproducibility spot-checks of one selected 256³ region (central 128³ scored) from each of 41 m7 artifacts across 36 scrolls. Forty TTA-off checks match at Dice 0.9983–1.0000; PHerc. Paris 4 matches at 0.9999 with TTA on. The audit exposed previously missing configuration provenance; [#1253](https://github.com/ScrollPrize/villa/pull/1253) now records TTA, and maintainers backfilled existing artifacts. Also resolves each artifact's CT level. By TAUIL Abd Elillah
+- [vesuvius-repro](https://github.com/TAUIL-Abd-Elilah/vesuvius-repro): Regional reproducibility spot-checks of one selected 256³ region (central 128³ scored) from each of 41 m7 artifacts across 36 scrolls. Forty TTA-off checks match at Dice 0.9983–1.0000; PHerc. Paris 4 matches at 0.9999 with TTA on. The audit exposed previously missing configuration provenance; [#1253](https://github.com/ScrollPrize/villa/pull/1253) now records TTA, and maintainers backfilled existing artifacts. Also resolves each artifact's CT level. By TAUIL Abd Elilah
 
 ## Segmentation
 
