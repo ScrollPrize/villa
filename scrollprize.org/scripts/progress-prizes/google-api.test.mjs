@@ -341,10 +341,18 @@ test("paginates Form responses without requesting response mutation authority", 
 
 test("reads a bounded Sheet range and appends only raw inserted rows", async () => {
   const { client, mock } = clientFor([
+    jsonResponse({
+      spreadsheetId: "private-sheet",
+      sheets: [{ properties: { sheetId: 0, title: "Form responses", index: 0 } }],
+    }),
     jsonResponse({ range: "Form responses!A:A", values: [["Response ID"], ["one"]] }),
     jsonResponse({ updates: { updatedRows: 1 } }),
   ]);
 
+  assert.deepEqual(await client.getSpreadsheet({ spreadsheetId: "private-sheet" }), {
+    spreadsheetId: "private-sheet",
+    sheets: [{ properties: { sheetId: 0, title: "Form responses", index: 0 } }],
+  });
   assert.deepEqual(await client.getSheetValues({
     spreadsheetId: "private-sheet",
     range: "Form responses!A:A",
@@ -359,17 +367,19 @@ test("reads a bounded Sheet range and appends only raw inserted rows", async () 
   });
 
   assert.equal(
-    mock.calls[0].url.pathname,
+    mock.calls[1].url.pathname,
     "/v4/spreadsheets/private-sheet/values/Form%20responses!A%3AA",
   );
-  assert.equal(mock.calls[0].url.searchParams.get("majorDimension"), "ROWS");
+  assert.equal(mock.calls[0].url.pathname, "/v4/spreadsheets/private-sheet");
+  assert.equal(mock.calls[0].url.searchParams.get("includeGridData"), "false");
+  assert.equal(mock.calls[1].url.searchParams.get("majorDimension"), "ROWS");
   assert.equal(
-    mock.calls[1].url.pathname,
+    mock.calls[2].url.pathname,
     "/v4/spreadsheets/private-sheet/values/Form%20responses!A%3AZ:append",
   );
-  assert.equal(mock.calls[1].url.searchParams.get("valueInputOption"), "RAW");
-  assert.equal(mock.calls[1].url.searchParams.get("insertDataOption"), "INSERT_ROWS");
-  assert.deepEqual(JSON.parse(mock.calls[1].options.body), {
+  assert.equal(mock.calls[2].url.searchParams.get("valueInputOption"), "RAW");
+  assert.equal(mock.calls[2].url.searchParams.get("insertDataOption"), "INSERT_ROWS");
+  assert.deepEqual(JSON.parse(mock.calls[2].options.body), {
     majorDimension: "ROWS",
     values: [["two", "2026-08-06T12:00:00Z"]],
   });
@@ -452,15 +462,19 @@ test("redacts tokens, internal IDs, ACL identities, and editor links but keeps r
   const redacted = redactForLog(
     {
       formId: "private-form-id",
+      spreadsheetId: "private-spreadsheet-id",
+      linkedSheetId: "private-legacy-sheet-id",
       permission: { emailAddress: "editor@example.org" },
       responderUri,
-      note: "Bearer token-value and secret-value at https://docs.google.com/forms/d/editor-id/viewform",
+      note: "Bearer token-value and secret-value at https://docs.google.com/spreadsheets/d/private-id/edit",
     },
     { secrets: ["secret-value"] },
   );
 
   assert.deepEqual(redacted, {
     formId: "[REDACTED]",
+    spreadsheetId: "[REDACTED]",
+    linkedSheetId: "[REDACTED]",
     permission: { emailAddress: "[REDACTED]" },
     responderUri,
     note: "Bearer [REDACTED] and [REDACTED] at [REDACTED]",

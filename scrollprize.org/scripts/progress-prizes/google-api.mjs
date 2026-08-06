@@ -820,6 +820,19 @@ export function createGoogleApiClient({
     },
   });
 
+  const spreadsheets = Object.freeze({
+    async get({ spreadsheetId }) {
+      return transport.sheets(`/spreadsheets/${encodePath(spreadsheetId, "spreadsheetId")}`, {
+        operation: "sheets.spreadsheets.get",
+        query: {
+          includeGridData: false,
+          fields: "spreadsheetId,sheets.properties(sheetId,title,index,sheetType,hidden)",
+        },
+      });
+    },
+    values,
+  });
+
   return Object.freeze({
     drive: Object.freeze({ files, permissions }),
     forms,
@@ -852,14 +865,15 @@ export function createGoogleApiClient({
     },
     setPublishState: (options) => forms.setPublishSettings(options),
     listFormResponses: (options) => forms.listResponses(options),
+    getSpreadsheet: (options) => spreadsheets.get(options),
     getSheetValues: (options) => values.get(options),
     appendSheetValues: (options) => values.append(options),
-    sheets: Object.freeze({ values }),
+    sheets: spreadsheets,
   });
 }
 
 function isSensitiveKey(key) {
-  return /(?:authorization|access[_-]?token|refresh[_-]?token|credential|private[_-]?key|service[_-]?account|form[_-]?id|file[_-]?id|folder[_-]?id|permission[_-]?id|email(?:address)?|editor(?:uri|url)?|domain)/i.test(
+  return /(?:authorization|access[_-]?token|refresh[_-]?token|credential|private[_-]?key|service[_-]?account|form[_-]?id|file[_-]?id|folder[_-]?id|permission[_-]?id|(?:spread)?sheet[_-]?id|linked[_-]?sheet|email(?:address)?|editor(?:uri|url)?|domain)/i.test(
     key,
   );
 }
@@ -868,6 +882,10 @@ function redactString(value, secrets) {
   let redacted = value.replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, `Bearer ${REDACTED}`);
   redacted = redacted.replace(
     /https:\/\/docs\.google\.com\/forms\/d\/(?!e\/)[^/\s]+\/(?:edit|preview|viewform)(?:[^\s]*)?/gi,
+    REDACTED,
+  );
+  redacted = redacted.replace(
+    /https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/\s]+\/(?:edit|preview)(?:[^\s]*)?/gi,
     REDACTED,
   );
   redacted = redacted.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, REDACTED);
