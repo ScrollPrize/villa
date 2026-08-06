@@ -471,6 +471,47 @@ async function closedActivationCheckpoint() {
   };
 }
 
+async function manuallyActivatedProductionPair() {
+  const google = grantProductionSourceAccess(new FakeGoogle());
+  const page = new MemoryPage();
+  const preparation = service({
+    google,
+    page,
+    runtime: productionRuntime(),
+    clock: fixedClock('2026-07-26T12:00:00Z'),
+  });
+  await preparation.rollover.prepare({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  const target = google.managed(ROLLOVER_FILE_ROLES.TARGET, '2026-08')[0];
+  google.forms.get(LIVE_FORM_ID).publishSettings.publishState = {
+    isPublished: true,
+    isAcceptingResponses: false,
+  };
+  google.forms.get(target.id).publishSettings.publishState = {
+    isPublished: true,
+    isAcceptingResponses: true,
+  };
+  google.calls.length = 0;
+  page.writes.length = 0;
+  return {
+    google,
+    page,
+    target,
+    rollover: service({
+      google,
+      page,
+      runtime: productionRuntime({
+        eventName: 'workflow_dispatch',
+        branch: 'main',
+      }),
+      clock: fixedClock('2026-08-06T12:00:00Z'),
+    }).rollover,
+  };
+}
+
 test('validate performs a read-only production preflight and resolves the public short URL', async () => {
   const google = grantProductionSourceAccess(new FakeGoogle());
   const context = service({
@@ -2085,6 +2126,217 @@ test('a missing later managed source cannot fall back to the stale initial form 
     google.calls.some(({ fileId, formId }) => fileId === LIVE_FORM_ID || formId === LIVE_FORM_ID),
     false,
   );
+});
+
+test('reconcile-active repairs only stale Drive markers and is idempotent', async () => {
+  const context = await manuallyActivatedProductionPair();
+  const pageBefore = context.page.content;
+  const sourcePublishingBefore = clone(
+    context.google.forms.get(LIVE_FORM_ID).publishSettings.publishState,
+  );
+  const targetPublishingBefore = clone(
+    context.google.forms.get(context.target.id).publishSettings.publishState,
+  );
+  const sourcePermissionsBefore = clone(context.google.permissions.get(LIVE_FORM_ID));
+  const targetPermissionsBefore = clone(context.google.permissions.get(context.target.id));
+
+  await assert.rejects(
+    context.rollover.verify({
+      targetCycle: '2026-08',
+      sourceFormId: LIVE_FORM_ID,
+      mode: 'active',
+      collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+    }),
+    /stale managed Drive state metadata/,
+  );
+  assert.equal(
+    context.google.calls.some(({ method }) => [
+      'copyFile',
+      'updateFile',
+      'createPermission',
+      'deletePermission',
+      'updateFormTitle',
+      'setPublishState',
+    ].includes(method)),
+    false,
+  );
+  context.google.calls.length = 0;
+
+  const first = await context.rollover.reconcileActive({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(first.action, 'reconcile-active');
+  assert.equal(first.status, 'active');
+  assert.equal(first.reconciled, true);
+  assert.equal(
+    context.google.files.get(LIVE_FORM_ID).appProperties.state,
+    ROLLOVER_FILE_STATES.CLOSED,
+  );
+  assert.equal(context.google.files.get(LIVE_FORM_ID).appProperties.targetCycle, '2026-08');
+  assert.equal(
+    context.google.files.get(context.target.id).appProperties.state,
+    ROLLOVER_FILE_STATES.ACTIVE,
+  );
+  assert.equal(context.target.appProperties.sourceCycle, '2026-07');
+
+  const mutations = context.google.calls.filter(({ method }) => [
+    'copyFile',
+    'updateFile',
+    'createPermission',
+    'deletePermission',
+    'updateFormTitle',
+    'setPublishState',
+  ].includes(method));
+  assert.equal(mutations.length, 2);
+  assert.deepEqual(mutations.map(({ method, fileId, appProperties }) => ({
+    method,
+    fileId,
+    state: appProperties?.state,
+  })), [
+    { method: 'updateFile', fileId: LIVE_FORM_ID, state: ROLLOVER_FILE_STATES.CLOSED },
+    { method: 'updateFile', fileId: context.target.id, state: ROLLOVER_FILE_STATES.ACTIVE },
+  ]);
+  assert.deepEqual(
+    context.google.forms.get(LIVE_FORM_ID).publishSettings.publishState,
+    sourcePublishingBefore,
+  );
+  assert.deepEqual(
+    context.google.forms.get(context.target.id).publishSettings.publishState,
+    targetPublishingBefore,
+  );
+  assert.deepEqual(context.google.permissions.get(LIVE_FORM_ID), sourcePermissionsBefore);
+  assert.deepEqual(context.google.permissions.get(context.target.id), targetPermissionsBefore);
+  assert.equal(context.page.content, pageBefore);
+  assert.deepEqual(context.page.writes, []);
+  assert.equal((await context.rollover.verify({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    mode: 'active',
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  })).status, 'valid');
+
+  context.google.calls.length = 0;
+  const second = await context.rollover.reconcileActive({
+    targetCycle: '2026-08',
+    sourceFormId: LIVE_FORM_ID,
+    collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+  });
+  assert.equal(second.reconciled, false);
+  assert.equal(
+    context.google.calls.some(({ method }) => method === 'updateFile'),
+    false,
+  );
+});
+
+for (const scenario of [
+  {
+    name: 'source publishing mismatch',
+    mutate({ google }) {
+      google.forms.get(LIVE_FORM_ID).publishSettings.publishState.isAcceptingResponses = true;
+    },
+    error: /publishing state/,
+  },
+  {
+    name: 'target ACL mismatch',
+    mutate({ google, target }) {
+      google.permissions.get(target.id).push({
+        id: 'unexpected-reconciliation-editor',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'unexpected-reconciliation-editor@example.org',
+      });
+    },
+    error: /permissions do not match/,
+  },
+  {
+    name: 'target structure mismatch',
+    mutate({ google, target }) {
+      google.forms.get(target.id).items[0].title = 'Changed after manual activation';
+    },
+    error: /structure or settings do not match/,
+  },
+  {
+    name: 'target title mismatch',
+    mutate({ google, target }) {
+      google.forms.get(target.id).info.title = 'Wrong title';
+    },
+    error: /visible form title/,
+  },
+  {
+    name: 'linked response Sheet',
+    mutate({ google, target }) {
+      google.forms.get(target.id).linkedSheetId = 'private-linked-sheet';
+    },
+    error: /linked response Sheet/,
+  },
+  {
+    name: 'website cycle mismatch',
+    mutate({ page }) {
+      page.content = pageMarkdown('2026-07', LIVE_RESPONDER);
+    },
+    error: /Managed website cycle/,
+  },
+  {
+    name: 'website responder mismatch',
+    mutate({ page }) {
+      page.content = pageMarkdown(
+        '2026-08',
+        'https://docs.google.com/forms/d/e/different-public-id/viewform',
+      );
+    },
+    error: /website responder URL/,
+  },
+  {
+    name: 'wrong Drive cycle binding',
+    mutate({ target }) {
+      target.appProperties.sourceCycle = '2026-06';
+    },
+    error: /Drive cycle metadata/,
+  },
+]) {
+  test(`reconcile-active performs zero writes on ${scenario.name}`, async () => {
+    const context = await manuallyActivatedProductionPair();
+    scenario.mutate(context);
+    context.google.calls.length = 0;
+    context.page.writes.length = 0;
+    await assert.rejects(
+      context.rollover.reconcileActive({
+        targetCycle: '2026-08',
+        sourceFormId: LIVE_FORM_ID,
+        collaboratorPermissions: [PRODUCTION_EDITOR_PERMISSION],
+      }),
+      scenario.error,
+    );
+    assert.equal(
+      context.google.calls.some(({ method }) => [
+        'copyFile',
+        'updateFile',
+        'createPermission',
+        'deletePermission',
+        'updateFormTitle',
+        'setPublishState',
+      ].includes(method)),
+      false,
+    );
+    assert.deepEqual(context.page.writes, []);
+  });
+}
+
+test('reconcile-active rejects schedulers and simulated clocks before Google reads', async () => {
+  for (const runtime of [
+    productionRuntime(),
+    stagingRuntime(),
+  ]) {
+    const google = new FakeGoogle();
+    const rollover = service({ google, runtime }).rollover;
+    await assert.rejects(
+      rollover.reconcileActive({ targetCycle: '2026-08' }),
+      /manual workflow_dispatch|rejects simulated clocks/,
+    );
+    assert.equal(google.calls.length, 0);
+  }
 });
 
 test('activate requires the injected preview gate before closing the source', async () => {

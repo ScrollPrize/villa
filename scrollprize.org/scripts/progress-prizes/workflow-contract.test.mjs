@@ -512,6 +512,54 @@ test('composite production activation guard requires an exact immutable base lea
   }
 });
 
+test('composite reconcile-active guard is manual, real-clock, and marker-only', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'production',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'reconcile-active',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'false',
+    VERIFY_MODE: 'active',
+    BRANCH: 'main',
+    TARGET_BRANCH: 'main',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: '',
+    BASE_SHA: '',
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { EVENT_NAME: 'schedule' },
+    { EVENT_NAME: 'pull_request' },
+    { REF: 'refs/pull/123/merge' },
+    { SIMULATED_NOW: '2026-08-06T12:00:00.000Z' },
+    { FAULT: 'after-copy' },
+    { EXPECT_FAULT: 'true', FAULT: 'after-copy' },
+    { DRY_RUN: 'true' },
+    { ALLOW_ACTIVATION_REWIND: 'true' },
+    { HEAD_SHA: 'a'.repeat(40) },
+    { BASE_SHA: 'b'.repeat(40) },
+    { TARGET_BRANCH: 'feature/test' },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
+});
+
 test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
   const rehearsal = await workflow('progress-prizes-rehearsal.yml');
   assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);

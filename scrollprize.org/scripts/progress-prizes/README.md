@@ -35,9 +35,9 @@ repository secret, file, log, cache, or artifact.
   on a Vercel `repository_dispatch`. It never checks out or executes deployed
   branch code.
 - `progress-prizes-production.yml` provides guarded `validate`, `dry-run`,
-  `prepare`, `activate`, and `verify` operations after the complete staging
-  rehearsal has passed. Every authenticated job is literal in that top-level
-  workflow and calls the same local action exercised by staging.
+  `prepare`, `activate`, `reconcile-active`, and `verify` operations after the
+  complete staging rehearsal has passed. Every authenticated job is literal in
+  that top-level workflow and calls the same local action exercised by staging.
 - `progress-prizes-schedule.yml` is the secret-free scheduler added only after
   production `validate` and `dry-run` passed. Reaching `main` enables its
   Pacific-time schedules; a manual dispatch is permanently restricted to a
@@ -428,6 +428,15 @@ the immediately following month. Leave `request-id` empty for every manual run.
   Google token, authenticates at cutoff, reacquires a zero-wait GitHub lease,
   closes the source, opens and reload-verifies the target, then merges only the
   activated commit.
+- `reconcile-active` is a manual break-glass repair for a rollover that humans
+  already completed. Run `verify active` first. Reconciliation proceeds only if
+  the old form is published and closed, the new form is published and open, the
+  website points exactly to the new responder URL, and titles, structure,
+  linked-Sheet status, capabilities, ACLs, and copy fingerprint all match. It
+  requires the same secret-free activation Environment approval and may update
+  only the source `CLOSED` and target `ACTIVE` Drive `appProperties`. It never
+  changes a form, response, permission, folder, publishing state, or website
+  file. A second run is read-only and succeeds idempotently.
 
 If preparation, activation, or merge stops, rerun the same operation and cycle.
 Managed Drive markers make Google copy and close/open recovery idempotent. A

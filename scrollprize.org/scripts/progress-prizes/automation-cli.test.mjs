@@ -82,6 +82,7 @@ function fakeRolloverFactory({ result, capture }) {
       'bootstrapStagingSource',
       'prepare',
       'activate',
+      'reconcileActive',
       'verify',
       'cleanup',
     ].map((method) => [method, async (input) => {
@@ -673,11 +674,16 @@ test('top-level CLI keeps page validate compatibility and routes source-cycle va
   assert.equal(capture.dependencies.runtime.stagingServiceAccountEmail, PRIVATE.account);
 });
 
-test('bootstrap, verify, and cleanup commands map to the corresponding service operations', async () => {
+test('bootstrap, reconcile, verify, and cleanup commands map to service operations', async () => {
   for (const [argv, method, expectedMode] of [
     [
       ['bootstrap', '--source-cycle', '2026-07', '--dry-run'],
       'bootstrapStagingSource',
+      undefined,
+    ],
+    [
+      ['reconcile-active', '--target-cycle', '2026-08', '--source-cycle', '2026-07'],
+      'reconcileActive',
       undefined,
     ],
     [
@@ -704,6 +710,80 @@ test('bootstrap, verify, and cleanup commands map to the corresponding service o
     assert.equal(capture.method, method);
     if (expectedMode !== undefined) assert.equal(capture.input.mode, expectedMode);
   }
+});
+
+test('reconcile-active is manual-only and rejects staging controls before token or I/O', async () => {
+  for (const [argv, env, expected] of [
+    [
+      ['reconcile-active', '--target-cycle', '2026-08'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined, GITHUB_EVENT_NAME: 'schedule' }),
+      /manual workflow_dispatch/,
+    ],
+    [
+      [
+        'reconcile-active',
+        '--target-cycle', '2026-08',
+        '--simulated-now', '2026-08-06T12:00:00Z',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /rejects --simulated-now/,
+    ],
+    [
+      ['reconcile-active', '--target-cycle', '2026-08', '--fault', 'after-copy'],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /--fault is accepted only/,
+    ],
+    [
+      ['reconcile-active', '--target-cycle', '2026-08', '--dry-run'],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /--dry-run is accepted only/,
+    ],
+  ]) {
+    let clientCalls = 0;
+    let fileCalls = 0;
+    await assert.rejects(
+      runAutomationCli(argv, {
+        env,
+        googleFactory: () => { clientCalls += 1; return {}; },
+        read: async () => { fileCalls += 1; return ''; },
+        write: async () => { fileCalls += 1; },
+        output: () => {},
+      }),
+      expected,
+    );
+    assert.equal(clientCalls, 0);
+    assert.equal(fileCalls, 0);
+  }
+});
+
+test('production reconcile-active passes only the protected source and editor group', async () => {
+  const capture = {};
+  await runAutomationCli([
+    'reconcile-active',
+    '--target-cycle', '2026-08',
+    '--source-cycle', '2026-07',
+  ], {
+    env: productionEnv({ PROGRESS_PRIZE_BRANCH: 'main' }),
+    googleFactory: () => ({}),
+    rolloverFactory: fakeRolloverFactory({
+      capture,
+      result: {
+        action: 'reconcile-active',
+        status: 'active',
+        sourceCycle: '2026-07',
+        targetCycle: '2026-08',
+        responderUri: RESPONDER,
+      },
+    }),
+    output: () => {},
+  });
+  assert.equal(capture.method, 'reconcileActive');
+  assert.equal(capture.input.sourceFormId, PRIVATE.form);
+  assert.deepEqual(capture.input.collaboratorPermissions, [{
+    type: 'group',
+    role: 'writer',
+    emailAddress: 'production-editors@private.example',
+  }]);
 });
 
 test('bootstrap routes the explicit staging activation rewind and consecutive target cycle', async () => {

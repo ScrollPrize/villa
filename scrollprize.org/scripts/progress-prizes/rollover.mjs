@@ -59,6 +59,20 @@ const REQUIRED_GOOGLE_METHODS = Object.freeze([
 
 const ALLOWED_EVENTS = new Set(['schedule', 'workflow_dispatch']);
 const ALLOWED_VERIFY_MODES = new Set(['prepared', 'active', 'cleaned']);
+const RECONCILABLE_SOURCE_STATES = new Set([
+  undefined,
+  ROLLOVER_FILE_STATES.COPIED,
+  ROLLOVER_FILE_STATES.PREPARED,
+  ROLLOVER_FILE_STATES.ACTIVATING,
+  ROLLOVER_FILE_STATES.ACTIVE,
+  ROLLOVER_FILE_STATES.CLOSED,
+]);
+const RECONCILABLE_TARGET_STATES = new Set([
+  ROLLOVER_FILE_STATES.COPIED,
+  ROLLOVER_FILE_STATES.PREPARED,
+  ROLLOVER_FILE_STATES.ACTIVATING,
+  ROLLOVER_FILE_STATES.ACTIVE,
+]);
 const GOOGLE_FORM_MIME_TYPE = 'application/vnd.google-apps.form';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 const INITIAL_EXPLICIT_SOURCE_CYCLE = '2026-07';
@@ -769,6 +783,36 @@ function activationTransition(sourceSnapshot, targetSnapshot) {
     && targetState === ROLLOVER_FILE_STATES.ACTIVE
   ) return 'active';
   throw new Error('Forms are not in an allowed activation or recovery state');
+}
+
+function reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
+  sourceCycle,
+  targetCycle,
+} = {}) {
+  const sourceProperties = sourceSnapshot.file.appProperties ?? {};
+  const targetProperties = targetSnapshot.file.appProperties ?? {};
+  if (
+    !RECONCILABLE_SOURCE_STATES.has(sourceProperties.state)
+    || !RECONCILABLE_TARGET_STATES.has(targetProperties.state)
+  ) {
+    throw new Error('Drive state metadata is outside guarded active reconciliation');
+  }
+  if (
+    (hasValue(sourceProperties.targetCycle) && sourceProperties.targetCycle !== targetCycle)
+    || (hasValue(targetProperties.sourceCycle) && targetProperties.sourceCycle !== sourceCycle)
+  ) {
+    throw new Error('Drive cycle metadata is outside guarded active reconciliation');
+  }
+  return Object.freeze({
+    healthy: sourceProperties.state === ROLLOVER_FILE_STATES.CLOSED
+      && sourceProperties.targetCycle === targetCycle
+      && targetProperties.state === ROLLOVER_FILE_STATES.ACTIVE
+      && targetProperties.sourceCycle === sourceCycle,
+    sourceState: sourceProperties.state,
+    sourceTargetCycle: sourceProperties.targetCycle,
+    targetState: targetProperties.state,
+    targetSourceCycle: targetProperties.sourceCycle,
+  });
 }
 
 async function ensurePublishState(google, form, expected) {
@@ -1959,7 +2003,7 @@ export function createRolloverService({
     });
   }
 
-  async function loadActivationState({
+  async function loadActivationPair({
     targetCycle,
     sourceFormId,
     collaboratorPermissions,
@@ -2008,7 +2052,14 @@ export function createRolloverService({
       source,
       sourceSnapshot,
       targetSnapshot,
-      transition: activationTransition(sourceSnapshot, targetSnapshot),
+    });
+  }
+
+  async function loadActivationState(options) {
+    const pair = await loadActivationPair(options);
+    return Object.freeze({
+      ...pair,
+      transition: activationTransition(pair.sourceSnapshot, pair.targetSnapshot),
     });
   }
 
@@ -2152,6 +2203,99 @@ export function createRolloverService({
     });
   }
 
+  async function reconcileActive({
+    targetCycle,
+    sourceFormId,
+    collaboratorPermissions = [],
+    copySourceCollaborators = true,
+  } = {}) {
+    if (runtime.eventName !== 'workflow_dispatch') {
+      throw new Error('Active-state reconciliation requires a manual workflow_dispatch event');
+    }
+    if (hasValue(runtime.simulatedNow)) {
+      throw new Error('Active-state reconciliation rejects simulated clocks');
+    }
+    assertMutationContext(runtime);
+    parseCycle(targetCycle);
+    const sourceCycle = previousCycle(targetCycle);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
+
+    const loadAudit = async () => {
+      const pair = await loadActivationPair({
+        targetCycle,
+        sourceFormId,
+        collaboratorPermissions,
+        copySourceCollaborators,
+        sourceCycle,
+      });
+      assertExpectedPublishing(pair.sourceSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      assertExpectedPublishing(pair.targetSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: true,
+      });
+      return Object.freeze({
+        ...pair,
+        markers: reconciliationMarkerState(pair.sourceSnapshot, pair.targetSnapshot, {
+          sourceCycle,
+          targetCycle,
+        }),
+      });
+    };
+
+    let audit = await loadAudit();
+    const reconciliationRequired = !audit.markers.healthy;
+    if (reconciliationRequired) {
+      if (
+        audit.markers.sourceState !== ROLLOVER_FILE_STATES.CLOSED
+        || audit.markers.sourceTargetCycle !== targetCycle
+      ) {
+        await markFile(audit.sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
+          targetCycle,
+        }, {
+          expectedAppProperties: {
+            state: audit.markers.sourceState,
+            targetCycle: audit.markers.sourceTargetCycle,
+          },
+        });
+      }
+      if (
+        audit.markers.targetState !== ROLLOVER_FILE_STATES.ACTIVE
+        || audit.markers.targetSourceCycle !== sourceCycle
+      ) {
+        await markFile(audit.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
+          sourceCycle,
+        }, {
+          expectedAppProperties: {
+            state: audit.markers.targetState,
+            sourceCycle: audit.markers.targetSourceCycle,
+          },
+        });
+      }
+      audit = await loadAudit();
+      if (!audit.markers.healthy) {
+        throw new Error('Active-state reconciliation did not reach the exact managed marker state');
+      }
+    }
+
+    return Object.freeze({
+      action: 'reconcile-active',
+      status: 'active',
+      sourceCycle,
+      targetCycle,
+      reconciled: reconciliationRequired,
+      sourceAcceptingResponses: false,
+      targetAcceptingResponses: true,
+      responderUri: assertPublicResponderUri(audit.targetSnapshot.form.responderUri),
+    });
+  }
+
   async function verify({
     targetCycle,
     sourceFormId,
@@ -2248,6 +2392,13 @@ export function createRolloverService({
         isPublished: true,
         isAcceptingResponses: true,
       });
+      const markers = reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
+        sourceCycle,
+        targetCycle,
+      });
+      if (!markers.healthy) {
+        throw new Error('Active form pair has stale managed Drive state metadata');
+      }
     } else {
       assertStagingIdentity(runtime);
       assertNonEmptyString(runtime.archiveFolderId, 'archiveFolderId');
@@ -2366,6 +2517,7 @@ export function createRolloverService({
     bootstrapStagingSource,
     prepare,
     activate,
+    reconcileActive,
     verify,
     cleanup,
   });
