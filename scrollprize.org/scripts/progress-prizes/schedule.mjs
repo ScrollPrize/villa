@@ -13,6 +13,7 @@ import {
 
 export const SCHEDULE_CRONS = Object.freeze({
   PREPARE: '17 6 * * *',
+  SYNC_RESPONSES: '27 7 * * *',
   PRE_CUTOFF: '40 23 28-31 * *',
   EARLY_RECOVERY: '17 0 1 * *',
   LATE_RECOVERY: '47 6 1-7 * *',
@@ -26,6 +27,7 @@ export const SCHEDULE_OPERATIONS = Object.freeze({
   NONE: 'none',
   DRY_RUN: 'dry-run',
   PREPARE: 'prepare',
+  SYNC_RESPONSES: 'sync-responses',
   ACTIVATE: 'activate',
 });
 
@@ -35,6 +37,7 @@ export const SCHEDULE_REASONS = Object.freeze({
   SLOT_NOT_DUE: 'schedule-slot-not-due',
   MANUAL_DRY_RUN: 'manual-dry-run',
   PREPARATION: 'preparation-window',
+  RESPONSE_SYNC: 'response-sync',
   PRE_CUTOFF: 'pre-cutoff',
   EARLY_RECOVERY: 'early-recovery',
   LATE_RECOVERY: 'late-recovery',
@@ -79,6 +82,9 @@ function isLastDay(parts) {
 
 function cronWallTime(cron) {
   if (cron === SCHEDULE_CRONS.PREPARE) return Object.freeze({ hour: 6, minute: 17 });
+  if (cron === SCHEDULE_CRONS.SYNC_RESPONSES) {
+    return Object.freeze({ hour: 7, minute: 27 });
+  }
   if (cron === SCHEDULE_CRONS.PRE_CUTOFF) return Object.freeze({ hour: 23, minute: 40 });
   if (cron === SCHEDULE_CRONS.EARLY_RECOVERY) return Object.freeze({ hour: 0, minute: 17 });
   if (cron === SCHEDULE_CRONS.LATE_RECOVERY) return Object.freeze({ hour: 6, minute: 47 });
@@ -265,8 +271,9 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
  * instant and its trusted GitHub trigger context.
  *
  * Schedule slots are intentionally not interchangeable: only the daily 06:17
- * slot can prepare. The pre-cutoff and 00:17 slots retain first-day recovery;
- * the 06:47 slot retries the previous month's incomplete rollover on days 1–7.
+ * slot can prepare, and only the daily 07:27 slot can append responses. The
+ * pre-cutoff and 00:17 slots retain first-day recovery; the 06:47 slot retries
+ * the previous month's incomplete rollover on days 1–7.
  */
 export function planScheduleDispatch({
   now = new Date(),
@@ -289,6 +296,28 @@ export function planScheduleDispatch({
     return dispatchPlan({
       operation: SCHEDULE_OPERATIONS.DRY_RUN,
       reason: SCHEDULE_REASONS.MANUAL_DRY_RUN,
+      eventName,
+      scheduledCron: trustedCron,
+      observedAt,
+      sourceCycle,
+      targetCycle,
+      preparationOpensAt: subtractPacificCalendarDays(activationAt, PREPARATION_DAYS),
+      activationAt,
+    });
+  }
+
+  // Response mirroring is deliberately independent of the preparation and
+  // activation windows. It targets the form that should be active for the
+  // observed Pacific month. Production workflow concurrency suppresses this
+  // dispatch while a rollover is nonterminal, and the Google operation fails
+  // closed if the website and form are not exactly active for this cycle.
+  if (trustedCron === SCHEDULE_CRONS.SYNC_RESPONSES) {
+    const sourceCycle = currentPacificCycle;
+    const targetCycle = nextCycle(sourceCycle);
+    const activationAt = getCycleDeadline(sourceCycle).cutoffAt;
+    return dispatchPlan({
+      operation: SCHEDULE_OPERATIONS.SYNC_RESPONSES,
+      reason: SCHEDULE_REASONS.RESPONSE_SYNC,
       eventName,
       scheduledCron: trustedCron,
       observedAt,
