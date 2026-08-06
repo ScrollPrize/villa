@@ -431,6 +431,16 @@ test('dispatch body is fixed, consecutive, prepared, and numeric', () => {
     '9007199254740993',
   );
 
+  assert.equal(
+    buildProductionDispatch({
+      operation: 'validate',
+      sourceCycle: '2026-07',
+      targetCycle: '2026-08',
+      requestId: '20260720',
+    }).inputs.operation,
+    'validate',
+  );
+
   for (const input of [
     { operation: 'none', sourceCycle: '2026-07', targetCycle: '2026-08', requestId: '1' },
     { operation: 'prepare', sourceCycle: '2026-07', targetCycle: '2026-09', requestId: '1' },
@@ -459,7 +469,7 @@ test('dispatch posts only the fixed production request and validates exact child
     assert.deepEqual(JSON.parse(options.body), {
       ref: 'main',
       inputs: {
-        operation: 'dry-run',
+        operation: 'validate',
         'source-cycle': '2026-07',
         'target-cycle': '2026-08',
         'verify-mode': 'prepared',
@@ -476,7 +486,7 @@ test('dispatch posts only the fixed production request and validates exact child
 
   assert.deepEqual(
     await dispatchProductionWorkflow({
-      operation: 'dry-run',
+      operation: 'validate',
       sourceCycle: '2026-07',
       targetCycle: '2026-08',
       requestId: '9988',

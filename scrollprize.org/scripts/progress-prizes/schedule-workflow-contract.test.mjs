@@ -247,7 +247,7 @@ test('dedupe and dispatch use only the tested fixed helper contract', async () =
   assert.match(helper, /expectedStatus: 200/);
   assert.match(helper, /redirect: 'error'/);
   assert.match(helper, /MAX_GITHUB_RESPONSE_BYTES = 256 \* 1024/);
-  assert.match(helper, /new Set\(\['dry-run', 'prepare', 'activate'\]\)/);
+  assert.match(helper, /new Set\(\['validate', 'dry-run', 'prepare', 'activate'\]\)/);
   assert.match(helper, /'requested'[\s\S]*'queued'[\s\S]*'pending'[\s\S]*'waiting'[\s\S]*'in_progress'/);
   assert.match(
     helper,
