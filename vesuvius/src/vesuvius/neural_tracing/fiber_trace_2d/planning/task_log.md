@@ -1,81 +1,59 @@
-# Task log: process-parallel native accumulation
+# Task log: las_manager Phase 7 — Lasagna backend
 
-## Baseline
+## Scope
 
-- Current accumulation is synchronous in the coordinator. Real-run
-  `commit_sum` was 14.1 s for 294 processed tiles within 68.6 s inference.
-- Controlled four-channel 32x256x256 ring, eight-addition, five-iteration
-  benchmark: NumPy float32 0.0443 s mean with 32 MiB backing; NumPy float16
-  0.2931 s with 16 MiB backing (6.6x slower).
-- Target CPU is dual-socket Intel Xeon Platinum 8480+ (224 logical CPUs) with
-  AVX-512F, F16C, and AVX-512-FP16. The implementation must remain portable to
-  Ubuntu/macOS and amd64/arm64 through runtime dispatch and scalar fallback.
+- Add Lasagna checkpoint discovery and command construction to the existing
+  backend-neutral manager workflow.
+- Make direct Lasagna `predict3d` author the shared portable provenance format.
+- Reuse catalog, prefetch, run records, tmux, completion, artifact inventory,
+  staging upload, and Atlas Lasagna ingestion without duplicating them.
 
-## Plan review
+## Implementation notes
 
-Independent review required precise half-to-float add semantics, ISA-matched
-runtime dispatch, stable per-worker FIFO ownership, nonblocking submission with
-ack pumping, provisional activity failure safety, coordinator-owned ring
-generations, all-scale slot reference counts, flush-frontier invariants,
-strided/unaligned/tail validation, inspectable/forceable native backends,
-explicit cache/queue cleanup, backpressure diagnostics, adversarial ordering and
-failure tests, and separate kernel/pipeline benchmarks. The plan incorporates
-these requirements.
+- Phase 7 follows the independently reviewed seven-phase task plan.
+- Existing user changes and the untracked compiled `monotone_norm` extension
+  are preserved.
+- Checkpoint classification uses embedded structure, never filenames. Fiber
+  records keep their current embedded-config path; Lasagna records extract
+  patch/architecture/precision/validation metadata and use a `lasagna/...`
+  selector.
+- `launch_inference` remains the single run/tmux/lifecycle implementation. Its
+  only backend branch selects Fiber or Lasagna command construction and the
+  portable artifact kind.
+- Direct `predict3d` writes `inference.json` beside its manifest, including
+  source scales, checkpoint/runtime identity, numerical settings, preserved
+  Lasagna decoding metadata, and bounded structural output inventory.
+- Phase closeout parametrizes the atomic staging/idempotency and Atlas-ingest
+  lifecycle regressions over both `fiber3d-prediction` and `lasagna`, proving
+  that Lasagna uses the complete shared publication path rather than only its
+  validator entry point.
 
-## Implementation
+## Deviations and findings
 
-- Added `accumulator_add.cpp` as a second pybind11 extension. It accepts
-  arbitrary positive Y/Z strides with contiguous X rows, releases the GIL,
-  supports float16 and float32 destinations, and has forceable `scalar`,
-  `avx512`, and `auto` dispatch modes. AVX-512 is isolated behind GCC/Clang
-  target attributes and runtime AVX-512F+F16C detection; no global ISA flag is
-  used.
-- Added persistent spawn-context accumulator processes to the authoritative
-  shared runner. Queue items contain only shared-slot/mmap descriptors and
-  slices. Stable integer spatial ownership plus one bounded FIFO per worker
-  serializes every output chunk without locks.
-- The coordinator owns ring generation and activity metadata, retains result
-  slots until all task acknowledgements, pumps acknowledgements under queue
-  backpressure, and gates reservation at Z-row transitions. Activity is
-  committed only after successful worker completion, before canonical progress
-  and flush handling.
-- Added `--accumulator-workers` to both Fiber and Lasagna frontends, defaulting
-  to `min(CPU count, 32)`; zero uses the synchronous path. Added startup/backend
-  and task/work/queue/wall/rate diagnostics.
-- Product rings now default to float16; weights remain float32. Float32 remains
-  selectable explicitly.
+- No real download, GPU inference, S3 staging, Atlas mutation, or publication
+  was run. The user explicitly deferred the real run and will test it later;
+  remote mutation and publication remain operator-controlled.
+- The full `test_preprocess_cos_omezarr.py` run stalls in the known local Zarr
+  3.2.1 synchronous `zarr.open(..., mode="w")` path before reaching Phase 7
+  logic. The new direct-provenance test avoids that unrelated constructor and
+  passes. This is the same bounded-real-run blocker already recorded in status.
 
-## Validation and measurements
+## Validation
 
-- Manual baseline-ISA build (Python 3.14, GCC, pybind11 headers from the local
-  build cache) succeeded; runtime backend on the Xeon 8480+ is `avx512`.
-- Exhaustive 65,536-value binary16 input validation for one float32 addition
-  matches NumPy bit-for-bit for all finite outputs in both forced scalar and
-  automatic AVX-512 modes; NaN masks also match. This found and corrected an
-  initial scalar subnormal exponent error.
-- Strided Y/Z, unaligned X, and 37-element tail views match NumPy for float16
-  and float32.
-- Focused shared-runner regression passed: synchronous versus two CPU device
-  workers plus two accumulator processes produced exactly equal output chunks
-  with float16 product rings; scratch mmaps were cleaned.
-- Kernel benchmark command used a `(16,512,512)` float16 destination and
-  float32 source, eight repeated adds, seven iterations. NumPy median was
-  142.507 ms (mean 142.316, min 141.391, max 143.150); AVX-512 median was
-  7.653 ms (mean 7.654, min 7.644, max 7.663), an 18.6x median kernel speedup.
-  Forced portable scalar median was 331.671 ms. This is a kernel benchmark, not
-  an end-to-end volume throughput claim.
-
-## Deviations and limitations
-
-- The serial baseline continues through the existing `_accumulate_group`
-  coordinator routine instead of being mechanically expressed as process task
-  descriptors; it does use the same native add primitive. This keeps the
-  zero-worker diagnostic path small while exact serial/process output coverage
-  validates the two planners.
-- The environment lacks `pytest`, so pytest suites were not run. Focused
-  `unittest` cases and Python compile checks passed. A full unittest-module run
-  was stopped after it made no progress in an unrelated early test; the focused
-  affected tests were rerun individually.
-- No representative full-volume eight-GPU run was launched by the agent. The
-  new accumulator diagnostics are intended for the user's next real inference
-  comparison; no end-to-end speedup is claimed here.
+- `33 passed, 59 deselected, 6 warnings` after the Phase 7 closeout added
+  Lasagna coverage for atomic staging/idempotency and Atlas-ingest lifecycle:
+  `pytest -q test_manager.py test_manager_open_data.py
+  test_inference_provenance.py test_packaging.py
+  test_preprocess_cos_omezarr.py -k 'manager or open_data or
+  inference_provenance or packaging or direct_predict3d'`.
+- `19 passed`: full manager unit/integration file.
+- `1 passed, 59 deselected`: direct Lasagna provenance regression.
+- `python -m preprocess_cos_omezarr predict3d --help` exposes checkpoint,
+  compressor, and provenance-context arguments.
+- `lasagna.manager.cli inference run --help` exposes both backends; generated
+  Bash completion passes `bash -n`.
+- `python -m py_compile` passes for all changed Python implementation modules.
+- `git diff --check` passes.
+- A clean temporary-config smoke test passed for `config init`, `config show`,
+  top-level help, and generated Bash completion without network access or an
+  installation/bootstrap step.

@@ -1,11 +1,25 @@
-# Status: process-parallel native accumulation
+# Status: Lasagna inference manager CLI
 
-- [x] Capture task and current bottleneck measurements.
-- [x] Write mechanical/native/process/test/docs plan.
+- [x] Capture the requested manager workflow in `planning/task.md`.
+- [x] Inspect Fiber inference, downloader, packaging, checkpoint metadata, and open-data catalog schema.
+- [x] Write the implementation, compatibility, testing, spec, docs, and changelog plan.
+- [x] Inspect the checked-out Vesuvius Atlas artifact model and publication workflow.
 - [x] Obtain and incorporate independent plan review.
-- [x] Preserve and validate the synchronous accumulation baseline.
-- [x] Implement portable native add and AVX-512 runtime dispatch.
-- [x] Implement deterministic bounded accumulator process pipeline.
-- [x] Expose shared controls and diagnostics.
-- [x] Run native exactness, pipeline equivalence, and kernel performance validation.
-- [x] Update specs, docs, changelog, and task log.
+- [x] Incorporate confirmed prefetch/tmux behavior and remove unnecessary global Fiber config.
+- [x] Reorganize implementation into reviewable delivery phases.
+- [x] Implement config, catalog, snapshot, and command foundations.
+- [x] Implement prefetch, run records, Fiber backend, and tmux lifecycle.
+- [x] Make Fiber inference checkpoint-driven with a legacy-config fallback.
+- [x] Emit and preserve portable inference provenance and artifact inventory.
+- [x] Implement registry-derived Bash/Zsh completion with read-only dynamic selectors.
+- [x] Implement shared Fiber/Lasagna Zstd defaults and resume preservation.
+- [x] Implement direct checkpoint-driven Fiber inference provenance.
+- [x] Validate portable Fiber provenance against the checked-out Atlas `DataEntry` model.
+- [x] Validate backend-neutral provenance and a moved self-contained artifact bundle.
+- [ ] Run a bounded real Fiber inference (explicitly deferred by the user for later testing).
+- [x] Reuse the Atlas Lasagna type for shared Fiber/Lasagna staging, ingest, and publication.
+- [x] Implement the Lasagna manager backend on the shared manager infrastructure.
+- [x] Exercise atomic staging, idempotency, and Atlas-ingest lifecycle for both Fiber and Lasagna artifacts.
+- [x] Run focused unit and integration validation for all implemented phases.
+- [ ] Run bounded real end-to-end validation (explicitly deferred by the user; the broad local Zarr-backed suite also encounters the known Zarr 3.2.1 synchronous-create hang).
+- [x] Update Phase 7 specs, docs, changelog, status, and task log.

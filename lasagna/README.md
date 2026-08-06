@@ -36,10 +36,58 @@ lasagna-download-list --help
 lasagna-preprocess --help
 lasagna-preprocess integrate --help
 lasagna-preprocess predict3d --help
+las_manager --help
 ```
 
 The bootstrap installs Lasagna with `-e`, so changes in this checkout are
 immediately visible in the environment without reinstalling.
+
+### Inference manager
+
+`las_manager` provides configuration, discovery, prefetch, and durable tmux
+execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
+in `cache_dir`, `output_dir`, `venv`, and one or more `snapshot_dirs`, then:
+
+```bash
+las_manager config init
+${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/las_manager/config.toml"
+las_manager fetch
+las_manager volume ls --sample PHerc0332
+las_manager snapshot ls
+las_manager volume prefetch <volume> 1 --workers 512
+las_manager inference run <snapshot> <volume> 1 -- --devices all
+las_manager inference ls
+```
+
+Current Fiber checkpoints carry their authoritative inference config, so no
+separate config argument is needed. Direct inference uses the same rule:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
+  --input /path/to/volume.ome.zarr/1 \
+  --output /path/to/artifacts/fiber.lasagna.json \
+  --checkpoint /path/to/snapshots/best.pt
+```
+
+Pass a config JSON as the optional positional argument only for a legacy
+checkpoint without embedded config. Every run writes portable
+`inference.json` next to the output manifest.
+
+Direct Lasagna checkpoints are listed under `lasagna/...` selectors and use
+the same command shape:
+
+```bash
+las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices all
+```
+
+The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
+and managed Lasagna inference write portable provenance and remain compatible
+with the existing Atlas `lasagna` artifact type.
+
+Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
+same as `las_manager snapshot ls`. Install shell completion with, for example,
+`eval "$(las_manager completion bash)"`. Configuration, cache semantics, and
+selector details are documented in [`docs/manager.md`](docs/manager.md).
 
 This installation currently expects the `villa` monorepo layout: Lasagna uses
 the sibling `vesuvius/src` model implementation and installs its declared model
@@ -203,6 +251,12 @@ runner:
 ```bash
 lasagna-preprocess predict3d ... --devices all
 ```
+
+New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
+Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
+Existing arrays keep their compressor when inference resumes; a mismatch is
+reported. Use `--ome-compressor none` only when uncompressed compatibility
+output is required.
 
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
 TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
