@@ -53,7 +53,13 @@ struct GeneratedOverlay {
         bool isSeed = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
+        // Same-orientation links (H-H / V-V) render in the orange warning
+        // palette; H-V links keep the default blue/purple. Set by the
+        // controller, which owns the fiber HV state.
+        bool hasSameHvBranches = false;
+        bool hasSameHvPendingLinks = false;
         bool isLinkCandidate = false;
+        bool isSplitCandidate = false;
         bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
         char interpolationModeMarker = 'L';
@@ -968,6 +974,11 @@ struct GeneratedControlPointContextMenuOptions {
     bool stripViewer = false;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
+    bool mergeWithCandidateEnabled = false;
+    QString mergeWithCandidateLabel;
+    bool splitFromCandidateEnabled = false;
+    QString splitFromCandidateLabel;
+    QString splitFromCandidateAndLinkLabel;
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
@@ -979,6 +990,10 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
+    std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
+    std::function<void(size_t, cv::Vec3f)> designateSplitCandidate;
+    std::function<void(size_t, cv::Vec3f)> splitFromCandidate;
+    std::function<void(size_t, cv::Vec3f)> splitFromCandidateAndLink;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
     std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
 };
