@@ -89,6 +89,9 @@ same as `las_manager snapshot ls`. Install path-aware Bash completion once with
 `las_manager completion install`; it follows whichever registered venv's
 `las_manager` is currently selected by `PATH`. Configuration, cache semantics,
 and selector details are documented in [`docs/manager.md`](docs/manager.md).
+Cached volumes, snapshots, runs, option values, and locally known OME scale
+indices are completed contextually. A final `help` token shows help for the
+longest recognized command prefix, for example `las_manager vol pre help`.
 
 This installation currently expects the `villa` monorepo layout: Lasagna uses
 the sibling `vesuvius/src` model implementation and installs its declared model

@@ -1,40 +1,47 @@
-# Task log: path-aware completion installation
+# Task log: contextual help and argument completion
 
 ## Findings
 
-- Standard Python `venv` activation changes `PATH` but has no completion hook
-  protocol.
-- The host has bash-completion's lazy `_completion_loader`, so the canonical
-  user loader path is `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/las_manager`.
-- A single hard-coded completion file would select the wrong environment after
-  switching venvs. The planned loader therefore dispatches by the executable
-  currently resolved from `PATH`, backed by additive per-executable providers.
+- The open-data catalog identifies OME-Zarr origins but does not enumerate the
+  source pyramid's dataset paths or number of levels.
+- Exact scale completion can use a locally downloaded root `.zattrs`
+  `multiscales[].datasets[].path` list and numeric groups with `.zarray`.
+- The current Bash/Zsh scripts duplicate positional cases and match only full
+  command names, so a shared contextual resolver is needed for abbreviation
+  parity and broader argument coverage.
+- The current live catalog contains four volumes with
+  `properties.shape = null`; `index_volumes` defaults only a missing key, then
+  attempts to iterate explicit `None`, causing `volume ls` to fail globally.
 
 ## Deviations
 
-- Installation is intentionally Bash-only. Existing generated Zsh completion
-  remains supported; installing into a user's Zsh `fpath` is shell-policy
-  dependent and was not requested.
+- None at planning time. Unknown remote scales will intentionally produce no
+  proposals until local metadata exists; guessing would violate "available"
+  semantics and network access during completion is prohibited.
 
 ## Independent review
 
-- Use the same portable canonical identity for install and runtime dispatch,
-  including symlink coverage and no GNU-only `readlink -f`.
-- Use digest-suffixed provider functions and dispatch only to the selected
-  provider so multiple sourced files cannot overwrite one another.
-- Cover `completion install [bash]`, prefixes, and completion suggestions in
-  the shared parser/registry tests.
-- All three recommendations were incorporated before implementation.
+- Clarified longest-valid-prefix help fallback and protected arguments after
+  `--` from rewriting.
+- Added separated/equals option-value coverage, abbreviation and adapter word
+  transport, and completion termination after `--`.
+- Kept the existing value-only shell presentation; annotations remain an
+  internal tab-separated boundary rather than a newly promised UI feature.
+- Required nullable shape rendering as `shape=-` and caught misplaced legacy
+  assertions in the new regression test; both were incorporated.
 
 ## Validation
 
-- `35 passed, 6 warnings`: focused manager, open-data, provenance, and packaging
-  tests. Warnings are pre-existing Pydantic v2 deprecations from the checked-out
-  Atlas models.
-- A real installed `/home/hendrik/.venv_las/bin/las_manager completion install`
-  smoke test under a temporary `XDG_DATA_HOME` created the canonical loader,
-  registry, and provider; the loader and generated Bash output pass `bash -n`.
-- Two fake venv providers coexist, reinstall idempotently, and produce distinct
-  dynamic results when `PATH` switches between them.
-- Canonical provider identity is stable through a symlink.
-- `python -m py_compile` and `git diff --check` pass.
+- The real cached catalog indexes 71 volumes, including four null-shape entries;
+  `las_manager volume ls` prints all 71 and renders those four as `shape=-`.
+- Final focused manager/open-data/provenance/packaging/direct-provenance suite:
+  `43 passed, 59 deselected`, with six
+  pre-existing Atlas Pydantic v2 deprecation warnings.
+- Contextual subset: `13 passed`, covering help fallback/forwarding, full and
+  abbreviated completion, separated/equals option values, cache-only scales,
+  nullable shapes, multi-venv dispatch, and Bash transport.
+- Installed-command Bash transport completes abbreviated roots, cached volumes,
+  and separated option values. Generated Bash passes `bash -n`; Python modules
+  compile and `git diff --check` passes.
+- Zsh is not installed on this host, so its adapter transport is asserted in
+  generated-script tests but could not be executed in a real Zsh process.

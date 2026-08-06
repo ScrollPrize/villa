@@ -10,8 +10,13 @@ import pytest
 
 from lasagna.manager import catalog
 from lasagna.manager.catalog import CatalogCache, get_catalog, index_volumes, resolve_volume
-from lasagna.manager.cli import COMMANDS, _completion_script, _expand_command, _resolve_token, main
-from lasagna.manager.completion import canonical_executable, install_bash_completion, provider_id
+from lasagna.manager.cli import (
+    COMMANDS, _completion_script, _expand_command, _print_volume,
+    _resolve_token, _rewrite_contextual_help, main,
+)
+from lasagna.manager.completion import (
+    canonical_executable, contextual_candidates, install_bash_completion, provider_id,
+)
 from lasagna.manager.config import ManagerConfig, initialize_config, load_config
 from lasagna.manager.prefetch import prefetch_volume, volume_cache_root
 from lasagna.manager.runner import main as runner_main
@@ -105,17 +110,11 @@ def test_completion_script_is_generated_without_config(monkeypatch):
 def test_completion_scripts_cover_registry_and_dynamic_selectors():
     for shell in ("bash", "zsh"):
         script = _completion_script(shell)
-        for root in {command[0] for command in COMMANDS}:
-            assert root in script
+        assert "_complete-argv" in script
         if shell == "bash":
-            assert "_complete volume" in script
-            assert "_complete snapshot" in script
-            assert "_complete run" in script
-            assert 'completion::*) words="bash install zsh"' in script
+            assert '"${COMP_WORDS[@]:1}"' in script
         else:
-            assert "_las_manager_dynamic volume" in script
-            assert "_las_manager_dynamic snapshot" in script
-            assert "_las_manager_dynamic run" in script
+            assert '"${words[@]:2}"' in script
 
 
 def _fake_las_manager(path: Path, value: str) -> Path:
@@ -124,7 +123,7 @@ def _fake_las_manager(path: Path, value: str) -> Path:
     path.write_text(
         "#!/bin/bash\n"
         f"if [[ \"$1\" == _completion-provider-id ]]; then echo {identity}; exit 0; fi\n"
-        f"if [[ \"$1\" == _complete ]]; then printf '%s\\tprovider\\n' {value}; exit 0; fi\n"
+        f"if [[ \"$1\" == _complete-argv ]]; then printf '%s\\tprovider\\n' {value}; exit 0; fi\n"
         "exit 2\n",
         encoding="utf-8",
     )
@@ -214,6 +213,95 @@ def test_catalog_index_preserves_identity_and_selectors():
     assert resolve_volume(records, "20260101000001") == first
     with pytest.raises(ValueError, match="ambiguous"):
         resolve_volume(records, "2026")
+
+
+def test_catalog_index_tolerates_explicit_null_shape():
+    document = sample_catalog()
+    first_sample = next(iter(document["samples"].values()))
+    first_volume = next(iter(first_sample["volumes"].values()))
+    first_volume["properties"]["shape"] = None
+    cache = CatalogCache(document, {"sha256": "digest", "fetched_at": "now"})
+    records = index_volumes(cache)
+    assert records[0].shape == ()
+
+
+def test_null_shape_volume_renders_unknown(capsys):
+    document = sample_catalog()
+    first_sample = next(iter(document["samples"].values()))
+    next(iter(first_sample["volumes"].values()))["properties"]["shape"] = None
+    record = index_volumes(CatalogCache(document, {"sha256": "digest"}))[0]
+    _print_volume(record)
+    assert "shape=-" in capsys.readouterr().out
+
+
+def test_contextual_help_uses_longest_understood_prefix():
+    assert _rewrite_contextual_help(["help"]) == ["--help"]
+    assert _rewrite_contextual_help(["vol", "help"]) == ["volume", "--help"]
+    assert _rewrite_contextual_help(["vol", "pre", "help"]) == ["volume", "prefetch", "--help"]
+    assert _rewrite_contextual_help(["volume", "nonsense", "help"]) == ["volume", "--help"]
+    assert _rewrite_contextual_help(["volume", "prefetch", "anything", "help"]) == ["volume", "prefetch", "--help"]
+    forwarded = ["inference", "run", "snap", "vol", "2", "--", "help"]
+    assert _rewrite_contextual_help(forwarded) == forwarded
+    with pytest.raises(ValueError, match="unknown command"):
+        _rewrite_contextual_help(["nonsense", "help"])
+
+
+def test_contextual_help_prints_selected_parser_without_config(monkeypatch, capsys):
+    monkeypatch.setenv("LAS_MANAGER_CONFIG", "/does/not/exist")
+    with pytest.raises(SystemExit) as exit_info:
+        main(["vol", "pre", "ignored-positional", "help"])
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: las_manager volume prefetch" in output
+    assert "--workers" in output
+
+
+def test_contextual_completion_commands_options_and_values(tmp_path, monkeypatch):
+    from lasagna.manager import completion
+
+    config = configured(tmp_path)
+    catalog_cache = CatalogCache(sample_catalog(), {"sha256": "digest"})
+    records = index_volumes(catalog_cache)
+    monkeypatch.setattr(completion, "_volume_records", lambda _config: records)
+    monkeypatch.setattr(completion, "_cached_catalog", lambda _config: catalog_cache)
+    values = lambda words: [value for value, _description in contextual_candidates(config, words)]
+    assert "volume" in values(["vol"])
+    assert values(["vol", "pr"]) == ["prefetch"]
+    assert records[0].selector in values(["vol", "pre", ""])
+    assert values(["volume", "ls", "--backend=f"]) == []
+    assert values(["snapshot", "ls", "--backend", "f"]) == ["fiber3d"]
+    assert values(["snapshot", "ls", "--backend=f"]) == ["--backend=fiber3d"]
+    assert "--sample" in values(["volume", "ls", "--"])
+    assert "PHerc0001" in values(["volume", "ls", "--sample", ""])
+    assert "--format=uint8" in values(["volume", "ls", "--format="])
+    assert values(["inference", "run", "snap", "vol", "2", "--", "anything"]) == []
+
+
+def test_hidden_contextual_completion_transports_option_tokens(monkeypatch, capsys):
+    monkeypatch.setenv("LAS_MANAGER_CONFIG", "/does/not/exist")
+    assert main(["_complete-argv", "snapshot", "ls", "--backend", "f"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["fiber3d\toption value"]
+
+
+def test_contextual_completion_discovers_only_local_scales(tmp_path, monkeypatch):
+    from lasagna.manager import completion
+    from lasagna.manager.prefetch import volume_cache_root
+
+    config = configured(tmp_path)
+    record = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    monkeypatch.setattr(completion, "_volume_records", lambda _config: [record])
+    words = ["volume", "prefetch", record.selector, ""]
+    assert contextual_candidates(config, words) == []
+    root = volume_cache_root(config, record)
+    root.mkdir(parents=True)
+    (root / ".zattrs").write_text(
+        json.dumps({"multiscales": [{"datasets": [{"path": "0"}, {"path": "2"}]}]}),
+        encoding="utf-8",
+    )
+    level = root / "1"
+    level.mkdir()
+    (level / ".zarray").write_text("{}", encoding="utf-8")
+    assert [value for value, _ in contextual_candidates(config, words)] == ["0", "1", "2"]
 
 
 class FakeHeaders(dict):

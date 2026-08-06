@@ -187,11 +187,13 @@ def index_volumes(cache: CatalogCache) -> list[VolumeRecord]:
             selected = next((origin for origin in origins if any(root.get("type") == "s3" for root in _iter_values(origin.get("access_roots")))), None)
             properties = volume.get("properties") if isinstance(volume.get("properties"), dict) else {}
             license_value = properties.get("license")
+            shape_value = properties.get("shape")
+            shape_values = shape_value if isinstance(shape_value, (list, tuple)) else ()
             records.append(VolumeRecord(
                 sample_id=str(volume.get("sample_id") or sample_id),
                 volume_id=str(volume.get("id") or ""),
                 long_id=str(volume.get("long_id") or volume.get("id") or ""),
-                shape=tuple(int(v) for v in properties.get("shape", ()) if isinstance(v, (int, float))),
+                shape=tuple(int(v) for v in shape_values if isinstance(v, (int, float))),
                 pixel_size_um=float(properties["pixel_size_um"]) if properties.get("pixel_size_um") is not None else None,
                 data_format=str(properties["data_format"]) if properties.get("data_format") is not None else None,
                 license=dict(license_value) if isinstance(license_value, dict) else None,

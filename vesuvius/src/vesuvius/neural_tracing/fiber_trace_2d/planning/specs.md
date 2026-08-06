@@ -2522,6 +2522,19 @@
   Providers from multiple venvs coexist; missing venvs are inert. Installation
   support is Bash-only, while `completion bash|zsh` remains available for
   generated setup.
+- A final literal `help` before any `--` prints argparse help for the longest
+  exact or uniquely abbreviated command prefix. Unrecognized suffixes fall
+  back to the understood parent; an unrecognized first token remains an error.
+  A `help` token after `--` is forwarded to the inference backend unchanged.
+- Bash and Zsh completion delegate full word context to one shared resolver,
+  understand unique command abbreviations, and complete valid flags, static
+  option values, cached selectors, samples, formats, and locally evidenced OME
+  scale indices. Scale discovery reads only local `.zattrs` multiscale dataset
+  paths and numeric groups with `.zarray`; it does not invent unknown remote
+  levels or perform network access.
+- Nullable optional catalog collections are normalized before iteration.
+  Specifically, `properties.shape = null` is indexed and displayed as unknown
+  rather than preventing other volumes from being listed or completed.
 - `volume prefetch <volume> <scale>` calls the existing OME-Zarr downloader for
   exactly that numbered group and stores the OME root at
   `<cache_dir>/volumes/<sample_id>/<long_id>`. It preserves downloader metadata

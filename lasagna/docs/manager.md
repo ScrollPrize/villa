@@ -187,6 +187,24 @@ volumes, durable inferences, and live tmux runs. Completion uses read-only
 cache endpoints. It does not refresh the catalog, open an uncached checkpoint,
 download data, reconcile records, or otherwise modify run state.
 
+Completion also understands unique command abbreviations, command-specific
+flags, backend values, catalog sample IDs and formats, and positional volume,
+snapshot, inference, and run selectors. Scale completion is exact and
+network-free: after any part of a volume has been prefetched, it reads the
+local OME `.zattrs` dataset paths and downloaded numeric groups. Before local
+OME metadata exists, no scale is proposed rather than guessing remote levels.
+
+A final literal `help` requests help for the longest command prefix the manager
+understands:
+
+```bash
+las_manager volume help
+las_manager vol pre help
+```
+
+Arguments following `--` belong to the inference backend; a trailing `help`
+there is forwarded unchanged.
+
 ## Atlas validation and staging upload
 
 Configure a local Atlas checkout and private staging prefix:

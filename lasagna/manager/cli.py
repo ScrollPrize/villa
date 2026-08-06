@@ -9,34 +9,21 @@ from datetime import datetime, timezone
 from typing import Callable, Sequence
 
 from .catalog import get_catalog, index_volumes, resolve_volume
-from .completion import canonical_executable, install_bash_completion, provider_id, shlex_quote
+from .completion import (
+    COMMAND_REGISTRY,
+    COMMANDS,
+    canonical_executable,
+    contextual_candidates,
+    install_bash_completion,
+    provider_id,
+    shlex_quote,
+)
 from .config import display_config, initialize_config, load_config
 from .prefetch import prefetch_volume
 from .open_data import upload_inference, validate_atlas_inference
 from .runs import launch_inference, read_runs, reconcile_runs, resolve_run
 from .snapshots import index_snapshots, resolve_snapshot
 from .tmux import Tmux
-
-
-Command = tuple[str, ...]
-COMMAND_REGISTRY: tuple[tuple[Command, str], ...] = (
-    (("config", "init"), "initialize global configuration"),
-    (("config", "show"), "show resolved configuration"),
-    (("fetch",), "refresh the open-data catalog"),
-    (("snapshot", "ls"), "list configured snapshots"),
-    (("volume", "ls"), "list open-data volumes"),
-    (("volume", "prefetch"), "download one volume scale"),
-    (("inference", "ls"), "list durable inference records"),
-    (("inference", "run"), "launch inference in tmux"),
-    (("run", "ls"), "list live manager runs"),
-    (("tmux", "attach"), "attach or link a run window"),
-    (("open-data", "validate"), "validate an inference bundle for Atlas"),
-    (("open-data", "upload"), "stage and ingest an inference bundle"),
-    (("completion", "bash"), "emit Bash completion setup"),
-    (("completion", "zsh"), "emit Zsh completion setup"),
-    (("completion", "install"), "install path-aware user completion"),
-)
-COMMANDS: tuple[Command, ...] = tuple(command for command, _description in COMMAND_REGISTRY)
 
 
 def _resolve_token(token: str, choices: Sequence[str]) -> str:
@@ -59,6 +46,23 @@ def _expand_command(argv: list[str]) -> list[str]:
     if children and len(argv) > 1 and not argv[1].startswith("-"):
         argv[1] = _resolve_token(argv[1], children)
     return argv
+
+
+def _rewrite_contextual_help(argv: list[str]) -> list[str]:
+    if not argv or argv[-1] != "help" or "--" in argv[:-1]:
+        return argv
+    if len(argv) == 1:
+        return ["--help"]
+    roots = sorted({command[0] for command in COMMANDS})
+    root = _resolve_token(argv[0], roots)
+    prefix = [root]
+    children = sorted({command[1] for command in COMMANDS if len(command) > 1 and command[0] == root})
+    if children and len(argv) > 2 and not argv[1].startswith("-"):
+        try:
+            prefix.append(_resolve_token(argv[1], children))
+        except ValueError:
+            pass
+    return prefix + ["--help"]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -128,6 +132,8 @@ def _parser() -> argparse.ArgumentParser:
     hidden = sub.add_parser("_complete", help=argparse.SUPPRESS)
     hidden.add_argument("kind", choices=("volume", "snapshot", "inference", "run"))
     hidden.add_argument("prefix", nargs="?", default="")
+    contextual = sub.add_parser("_complete-argv", help=argparse.SUPPRESS)
+    contextual.add_argument("words", nargs=argparse.REMAINDER)
     sub.add_parser("_completion-provider-id", help=argparse.SUPPRESS)
     return parser
 
@@ -148,59 +154,27 @@ def _completion_script(
         function_name = function_name or "_las_manager_complete"
         script = r'''@FUNCTION@() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local words="@ROOTS@"
-  case "${COMP_WORDS[1]}:${COMP_WORDS[2]}:${COMP_CWORD}" in
-    volume:prefetch:3) words="$( @COMMAND@ _complete volume "$cur" 2>/dev/null)" ;;
-    inference:run:3) words="$( @COMMAND@ _complete snapshot "$cur" 2>/dev/null)" ;;
-    inference:run:4) words="$( @COMMAND@ _complete volume "$cur" 2>/dev/null)" ;;
-    tmux:attach:3) words="$( @COMMAND@ _complete run "$cur" 2>/dev/null)" ;;
-    open-data:validate:3|open-data:upload:3) words="$( @COMMAND@ _complete inference "$cur" 2>/dev/null)" ;;
-    config::*) words="@CONFIG@" ;;
-    snapshot::*) words="@SNAPSHOT@" ;;
-    volume::*) words="@VOLUME@" ;;
-    inference::*) words="@INFERENCE@" ;;
-    run::*) words="@RUN@" ;;
-    tmux::*) words="@TMUX@" ;;
-    completion:install:*) words="bash" ;;
-    completion::*) words="@COMPLETION@" ;;
-  esac
-  if [[ "$words" == *$'\t'* ]]; then
-    COMPREPLY=()
-    while IFS=$'\t' read -r value description; do
-      [[ "$value" == "$cur"* ]] && COMPREPLY+=("$value")
-    done <<< "$words"
-  else
-    COMPREPLY=( $(compgen -W "$words" -- "$cur") )
-  fi
+  local lines value description
+  lines="$( @COMMAND@ _complete-argv "${COMP_WORDS[@]:1}" 2>/dev/null)"
+  COMPREPLY=()
+  while IFS=$'\t' read -r value description; do
+    [[ -n "$value" && "$value" == "$cur"* ]] && COMPREPLY+=("$value")
+  done <<< "$lines"
 }
 @REGISTER@'''
     else:
         script = r'''#compdef las_manager
 _las_manager_dynamic() {
-  local kind="$1" line
+  local line
   local -a lines values
-  lines=("${(@f)$(las_manager _complete "$kind" "$PREFIX" 2>/dev/null)}")
+  lines=("${(@f)$(@COMMAND@ _complete-argv "${words[@]:2}" 2>/dev/null)}")
   for line in $lines; do
     values+=("${line%%$'\t'*}")
   done
   compadd -- $values
 }
 _las_manager() {
-  _arguments -C '1:command:(@ROOTS@)' '*::argument:->args'
-  case "$words[2]:$words[3]:$CURRENT" in
-    volume:prefetch:4) _las_manager_dynamic volume ;;
-    inference:run:4) _las_manager_dynamic snapshot ;;
-    inference:run:5) _las_manager_dynamic volume ;;
-    tmux:attach:4) _las_manager_dynamic run ;;
-    open-data:validate:4|open-data:upload:4) _las_manager_dynamic inference ;;
-    config:*) compadd -- @CONFIG@ ;;
-    snapshot:*) compadd -- @SNAPSHOT@ ;;
-    volume:*) compadd -- @VOLUME@ ;;
-    inference:*) compadd -- @INFERENCE@ ;;
-    run:*) compadd -- @RUN@ ;;
-    tmux:*) compadd -- @TMUX@ ;;
-    completion:*) compadd -- bash zsh ;;
-  esac
+  _las_manager_dynamic
 }
 compdef _las_manager las_manager'''
     replacements = {
@@ -281,12 +255,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             separator = parse_list.index("--")
             inference_args = parse_list[separator + 1:]
             parse_list = parse_list[:separator]
+        parse_list = _rewrite_contextual_help(parse_list)
         args = _parser().parse_args(_expand_command(parse_list))
         if args.command == "config" and args.config_command == "init":
             print(initialize_config(force=args.force))
             return 0
         if args.command == "_completion-provider-id":
             print(provider_id(canonical_executable(sys.argv[0])))
+            return 0
+        if args.command == "_complete-argv":
+            try:
+                config = load_config()
+            except (FileNotFoundError, ValueError, OSError):
+                config = None
+            for value, description in contextual_candidates(config, args.words):
+                print(f"{value}\t{description}")
             return 0
         if args.command == "completion":
             if args.completion_action in {"bash", "zsh"}:

@@ -2,6 +2,9 @@
 
 - Added path-aware per-user Bash completion installation for `las_manager`,
   with isolated providers that coexist across multiple virtual environments.
+- Added longest-prefix contextual help and shared argument-aware Bash/Zsh
+  completion, including exact cache-local OME scale proposals.
+- Made manager catalog indexing tolerate volumes whose optional shape is null.
 
 # 2026-08-03
 
