@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <opencv2/core.hpp>
+
 namespace vc3d::volumetric {
 
 namespace {
@@ -115,6 +117,88 @@ PerspectiveCamera perspectiveCamera(const CameraParams& cam,
     return pc;
 }
 
+SlabMargins computeSlabMargins(const CameraParams& cam,
+                               int numLayers,
+                               int zStart,
+                               float outputScale,
+                               int outW,
+                               int outH)
+{
+    SlabMargins m;
+    if (numLayers <= 0 || outW <= 0 || outH <= 0)
+        return m;
+
+    const float cU = float(outW) * 0.5f;
+    const float cV = float(outH) * 0.5f;
+    const bool perspective = cam.perspective > 0.0f;
+    const auto proj = slabProjection(cam, numLayers, zStart, outputScale, cU, cV);
+    const auto pcam = perspective
+        ? perspectiveCamera(cam, numLayers, zStart, outputScale, cU, cV,
+                            float(outW), float(outH))
+        : PerspectiveCamera{};
+
+    // Each side is at most half a screen span: enough for any practical
+    // tilt x slab-thickness product, and bounds the sampling cost (at most
+    // ~4x the screen area) when the settings go extreme.
+    const int maxMargin = std::max(outW, outH) / 2;
+
+    float minU = 0.0f, maxU = float(outW);
+    float minV = 0.0f, maxV = float(outH);
+    const float xs[2] = {0.0f, float(outW)};
+    const float ys[2] = {0.0f, float(outH)};
+    const int extremeLayers[2] = {0, numLayers - 1};
+    for (const int i : extremeLayers) {
+        for (const float x : xs) {
+            for (const float y : ys) {
+                float qu, qv;
+                if (perspective) {
+                    const float s1 = x - pcam.centerU;
+                    const float s2 = y - pcam.centerV;
+                    const float rayU = pcam.rayBase[0] + s1 * pcam.e1OverF[0] +
+                                       s2 * pcam.e2OverF[0];
+                    const float rayV = pcam.rayBase[1] + s1 * pcam.e1OverF[1] +
+                                       s2 * pcam.e2OverF[1];
+                    const float rayW = pcam.rayBase[2] + s1 * pcam.e1OverF[2] +
+                                       s2 * pcam.e2OverF[2];
+                    if (rayW >= -1e-4f) {
+                        // Past the horizon: the compositor skips these rays,
+                        // but rays just inside can reach far — take the clamp.
+                        minU = -float(maxMargin);
+                        maxU = float(outW + maxMargin);
+                        minV = -float(maxMargin);
+                        maxV = float(outH + maxMargin);
+                        continue;
+                    }
+                    const float t = pcam.layerNum[std::size_t(i)] / rayW;
+                    qu = pcam.pos[0] + t * rayU;
+                    qv = pcam.pos[1] + t * rayV;
+                } else {
+                    qu = proj.m00 * x + proj.m01 * y +
+                         proj.layerOffsets[std::size_t(i)][0];
+                    qv = proj.m10 * x + proj.m11 * y +
+                         proj.layerOffsets[std::size_t(i)][1];
+                }
+                minU = std::min(minU, qu);
+                maxU = std::max(maxU, qu);
+                minV = std::min(minV, qv);
+                maxV = std::max(maxV, qv);
+            }
+        }
+    }
+
+    // +1 for the bilinear tap's x0+1/y0+1 neighbour.
+    auto side = [maxMargin](float overshoot) {
+        if (overshoot <= 0.0f)
+            return 0;
+        return std::min(int(std::ceil(overshoot)) + 1, maxMargin);
+    };
+    m.left = side(-minU);
+    m.top = side(-minV);
+    m.right = side(maxU - float(outW));
+    m.bottom = side(maxV - float(outH));
+    return m;
+}
+
 std::array<float, 256> buildOpacityLut(float alphaMin,
                                        float alphaMax,
                                        float opacity,
@@ -147,27 +231,38 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::array<uint32_t, 256>& colorLut,
                          const std::array<float, 256>& opacityLut,
                          cv::Mat_<cv::Vec3b>& colorOut,
-                         cv::Mat_<uint8_t>& coverageOut)
+                         cv::Mat_<uint8_t>& coverageOut,
+                         const SlabMargins& margins)
 {
     const int numLayers = int(layerValues.size());
     if (numLayers == 0 || layerCoverage.size() != layerValues.size() ||
         layerValues[0].empty()) {
         return;
     }
+    // Layer buffers carry the sampling margins; the output raster is the
+    // inner screen window at offset (left, top).
     const int rows = layerValues[0].rows;
     const int cols = layerValues[0].cols;
-    colorOut.create(rows, cols);
+    const int outRows = rows - margins.top - margins.bottom;
+    const int outCols = cols - margins.left - margins.right;
+    if (outRows <= 0 || outCols <= 0)
+        return;
+    colorOut.create(outRows, outCols);
     colorOut.setTo(cv::Vec3b(0, 0, 0));
-    coverageOut.create(rows, cols);
+    coverageOut.create(outRows, outCols);
     coverageOut.setTo(uint8_t(0));
 
+    // View center and camera anchor to the screen window (in layer-buffer
+    // coordinates), so margins never change the on-screen framing.
+    const float centerU = float(margins.left) + float(outCols) * 0.5f;
+    const float centerV = float(margins.top) + float(outRows) * 0.5f;
     const bool perspective = cam.perspective > 0.0f;
     const auto proj = slabProjection(cam, numLayers, zStart, outputScale,
-                                     float(cols) * 0.5f, float(rows) * 0.5f);
+                                     centerU, centerV);
     const auto pcam = perspective
         ? perspectiveCamera(cam, numLayers, zStart, outputScale,
-                            float(cols) * 0.5f, float(rows) * 0.5f,
-                            float(cols), float(rows))
+                            centerU, centerV,
+                            float(outCols), float(outRows))
         : PerspectiveCamera{};
 
     // Per-value emission premultiplied by alpha, so the inner loop is one
@@ -183,10 +278,14 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
 
     constexpr float kEarlyOutT = 0.004f;
 
-    for (int y = 0; y < rows; ++y) {
+    // Rows are independent; each writes only its own output row.
+    cv::parallel_for_(cv::Range(0, outRows), [&](const cv::Range& range) {
+    for (int y = range.start; y < range.end; ++y) {
         auto* outRow = colorOut.ptr<cv::Vec3b>(y);
         auto* covRow = coverageOut.ptr<uint8_t>(y);
-        for (int x = 0; x < cols; ++x) {
+        const float py = float(y + margins.top);
+        for (int x = 0; x < outCols; ++x) {
+            const float px = float(x + margins.left);
             float r = 0.0f, g = 0.0f, b = 0.0f;
             float T = 1.0f;
             bool anyValid = false;
@@ -196,8 +295,8 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
             float baseU = 0.0f, baseV = 0.0f;
             float rayU = 0.0f, rayV = 0.0f, invRayW = 0.0f;
             if (perspective) {
-                const float s1 = float(x) - pcam.centerU;
-                const float s2 = float(y) - pcam.centerV;
+                const float s1 = px - pcam.centerU;
+                const float s2 = py - pcam.centerV;
                 rayU = pcam.rayBase[0] + s1 * pcam.e1OverF[0] + s2 * pcam.e2OverF[0];
                 rayV = pcam.rayBase[1] + s1 * pcam.e1OverF[1] + s2 * pcam.e2OverF[1];
                 const float rayW =
@@ -206,8 +305,8 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                     continue;  // ray points away from the slab
                 invRayW = 1.0f / rayW;
             } else {
-                baseU = proj.m00 * float(x) + proj.m01 * float(y);
-                baseV = proj.m10 * float(x) + proj.m11 * float(y);
+                baseU = proj.m00 * px + proj.m01 * py;
+                baseV = proj.m10 * px + proj.m11 * py;
             }
             // Near-to-far: the camera sits on the +w side, so highest w first.
             for (int i = numLayers - 1; i >= 0; --i) {
@@ -265,6 +364,7 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
             }
         }
     }
+    });
 }
 
 } // namespace vc3d::volumetric

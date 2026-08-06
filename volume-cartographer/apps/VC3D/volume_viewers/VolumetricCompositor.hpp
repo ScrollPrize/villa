@@ -88,6 +88,33 @@ PerspectiveCamera perspectiveCamera(const CameraParams& cam,
                                     float screenW,
                                     float screenH);
 
+// Extra slab-space sampling border (in output pixels) around the on-screen
+// window. Tilted/perspective rays read the layer stack outside the screen
+// rect near the edges; sampling only the screen-sized window silently clips
+// the visible region there. Layer buffers must be sized
+// (outH + top + bottom) x (outW + left + right), with the screen window at
+// offset (left, top).
+struct SlabMargins {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    bool any() const { return left > 0 || top > 0 || right > 0 || bottom > 0; }
+};
+
+// Tight per-side margins for the given camera and slab: the bounding box of
+// the screen-corner rays intersected with the outermost layers (exact for the
+// rigid-slab projection the compositor uses; the mapping is affine per layer
+// in the orthographic case and a homography per layer in the perspective
+// case, so corners suffice). Zero at untilted orthographic. Each side is
+// clamped to max(outW, outH) / 2 to bound cost at extreme tilt/perspective.
+SlabMargins computeSlabMargins(const CameraParams& cam,
+                               int numLayers,
+                               int zStart,
+                               float outputScale,
+                               int outW,
+                               int outH);
+
 // Opacity transfer function: 256-entry LUT from raw value.
 // alphaMin/alphaMax window the raw value to rho in [0,1], then
 // alpha = opacity * rho^gamma, scaled by segmentLength (the per-frame
@@ -101,14 +128,18 @@ std::array<float, 256> buildOpacityLut(float alphaMin,
                                        float segmentLength);
 
 // Front-to-back emission/absorption compositing through the layer stack.
-//  layerValues/layerCoverage  one buffer per layer, all output-raster sized;
-//                             layer i sits at w = zStart + i
+//  layerValues/layerCoverage  one buffer per layer, sized to the output
+//                             raster plus `margins`; layer i sits at
+//                             w = zStart + i
 //  colorLut   ARGB32 emission per raw value (window/level + colormap)
 //  opacityLut alpha per raw value (buildOpacityLut)
+//  margins    sampling border around the screen window (computeSlabMargins);
+//             the view center and camera stay anchored to the screen window
 // Layers are walked near-to-far from the camera (highest w first — the camera
 // is always on the +w side). Out-of-buffer or coverage-0 samples are fully
 // transparent. colorOut gets the accumulated RGB over black; coverageOut is 1
-// where any sample was valid.
+// where any sample was valid; both are created at the layer size minus the
+// margins.
 void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::vector<cv::Mat_<uint8_t>>& layerCoverage,
                          const CameraParams& cam,
@@ -117,6 +148,7 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::array<uint32_t, 256>& colorLut,
                          const std::array<float, 256>& opacityLut,
                          cv::Mat_<cv::Vec3b>& colorOut,
-                         cv::Mat_<uint8_t>& coverageOut);
+                         cv::Mat_<uint8_t>& coverageOut,
+                         const SlabMargins& margins = {});
 
 } // namespace vc3d::volumetric

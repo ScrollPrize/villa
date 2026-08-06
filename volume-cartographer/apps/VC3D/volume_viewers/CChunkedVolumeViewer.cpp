@@ -2230,17 +2230,23 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     // colormapped RGB buffer; the blit skips the scalar LUT for it. Shared by
     // the flattened-surface and plane (slice) paths — layer i sits at
     // w = zStart + i in slab space either way.
+    auto volumetricCamera = [&]() {
+        vc3d::volumetric::CameraParams cam;
+        cam.azimuthDeg = ctx.compositeSettings.params.camAzimuthDeg;
+        cam.tiltDeg = ctx.compositeSettings.params.camTiltDeg;
+        cam.perspective = ctx.compositeSettings.params.camPerspective;
+        return cam;
+    };
+
     auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
                                         const std::vector<cv::Mat_<uint8_t>>& layerCoverage,
                                         int zStart,
                                         bool exaggerateW,
+                                        const vc3d::volumetric::SlabMargins& margins,
                                         cv::Mat_<cv::Vec3b>& colorDst,
                                         cv::Mat_<uint8_t>& cov) {
         const auto& cs = ctx.compositeSettings;
-        vc3d::volumetric::CameraParams cam;
-        cam.azimuthDeg = cs.params.camAzimuthDeg;
-        cam.tiltDeg = cs.params.camTiltDeg;
-        cam.perspective = cs.params.camPerspective;
+        const auto cam = volumetricCamera();
 
         std::array<uint32_t, 256> colorLut{};
         vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
@@ -2261,7 +2267,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         vc3d::volumetric::compositeVolumetric(layerValues, layerCoverage, cam,
                                               zStart, ctx.scale * wScale,
                                               colorLut, opacityLut,
-                                              colorDst, cov);
+                                              colorDst, cov, margins);
     };
 
     auto samplePlane = [&](const cv::Vec3f& origin,
@@ -2291,10 +2297,22 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         layerValues.reserve(numLayers);
         layerCoverage.reserve(numLayers);
+        // Tilted/perspective rays read the slab outside the screen window near
+        // the edges; sample the layer stack with the exact extra border the
+        // camera needs (zero for the scalar methods and untilted ortho).
+        vc3d::volumetric::SlabMargins margins;
+        if (volumetricMethod) {
+            margins = vc3d::volumetric::computeSlabMargins(
+                volumetricCamera(), numLayers, zStart, ctx.scale, dst.cols, dst.rows);
+        }
+        const int sampleRows = dst.rows + margins.top + margins.bottom;
+        const int sampleCols = dst.cols + margins.left + margins.right;
+        const cv::Vec3f sampleOrigin = origin - vxStep * float(margins.left)
+                                              - vyStep * float(margins.top);
         for (int i = 0; i < numLayers; ++i) {
-            layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
-            layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
-            const cv::Vec3f layerOrigin = origin + normal * (float(zStart + i) * zStep);
+            layerValues.emplace_back(sampleRows, sampleCols, uint8_t(0));
+            layerCoverage.emplace_back(sampleRows, sampleCols, uint8_t(0));
+            const cv::Vec3f layerOrigin = sampleOrigin + normal * (float(zStart + i) * zStep);
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 array, ctx.startLevel, layerOrigin, vxStep, vyStep,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
@@ -2304,7 +2322,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             // orthographic/pinhole render is exact here (no bendy-slab
             // approximation).
             compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                     /*exaggerateW=*/false, colorValues, cov);
+                                     /*exaggerateW=*/false, margins, colorValues, cov);
             return;
         }
         LayerStack stack;
@@ -2470,12 +2488,36 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         std::vector<cv::Mat_<uint8_t>> layerValues;
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         std::vector<cv::Mat_<uint8_t>> layerTargetCoverage;
-        generateLayerStack(coords, normals, array, ctx.startLevel,
+        // Tilted/perspective rays read the slab outside the screen window
+        // near the edges. Generate and sample the layer stack over the
+        // exact expanded border the camera needs; the composite output stays
+        // screen-sized. (The extra gen only happens when the border is
+        // nonzero, i.e. the camera is actually tilted or perspective.)
+        const float wScale = std::max(cs.params.wScale, 0.01f);
+        const auto margins = vc3d::volumetric::computeSlabMargins(
+            volumetricCamera(), numLayers, zStart, ctx.scale * wScale,
+            coords.cols, coords.rows);
+        cv::Mat_<cv::Vec3f> stackCoords = coords;
+        cv::Mat_<cv::Vec3f> stackNormals = normals;
+        if (margins.any()) {
+            const cv::Size expanded(coords.cols + margins.left + margins.right,
+                                    coords.rows + margins.top + margins.bottom);
+            const cv::Vec3f expandedOffset(
+                ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f - float(margins.left),
+                ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f - float(margins.top),
+                0.0f);
+            stackCoords.release();
+            stackNormals.release();
+            ctx.surf->gen(&stackCoords, &stackNormals, expanded, {0, 0, 0},
+                          ctx.scale, expandedOffset);
+            applyPerPixelNormalOffset(stackCoords, stackNormals, ctx.zOff);
+        }
+        generateLayerStack(stackCoords, stackNormals, array, ctx.startLevel,
                            numLayers, zStart, zStep, compositeOptions,
                            nullptr, nullptr, cv::Mat_<uint8_t>(),
                            layerValues, layerCoverage, layerTargetCoverage);
         compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                 /*exaggerateW=*/true, colorDst, cov);
+                                 /*exaggerateW=*/true, margins, colorDst, cov);
     };
 
     auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,
