@@ -81,6 +81,7 @@ function fakeRolloverFactory({ result, capture }) {
       'validate',
       'bootstrapStagingSource',
       'prepare',
+      'syncResponses',
       'activate',
       'reconcileActive',
       'verify',
@@ -674,11 +675,16 @@ test('top-level CLI keeps page validate compatibility and routes source-cycle va
   assert.equal(capture.dependencies.runtime.stagingServiceAccountEmail, PRIVATE.account);
 });
 
-test('bootstrap, reconcile, verify, and cleanup commands map to service operations', async () => {
+test('bootstrap, response sync, reconcile, verify, and cleanup commands map to service operations', async () => {
   for (const [argv, method, expectedMode] of [
     [
       ['bootstrap', '--source-cycle', '2026-07', '--dry-run'],
       'bootstrapStagingSource',
+      undefined,
+    ],
+    [
+      ['sync-responses', '--source-cycle', '2026-08'],
+      'syncResponses',
       undefined,
     ],
     [
@@ -709,7 +715,41 @@ test('bootstrap, reconcile, verify, and cleanup commands map to service operatio
     });
     assert.equal(capture.method, method);
     if (expectedMode !== undefined) assert.equal(capture.input.mode, expectedMode);
+    if (method === 'syncResponses') assert.equal(capture.input.sourceCycle, '2026-08');
   }
+});
+
+test('production response sync receives only protected configuration and emits counts without IDs', async () => {
+  const capture = {};
+  const outputs = [];
+  await runAutomationCli(['sync-responses', '--source-cycle', '2026-08'], {
+    env: productionEnv({ PROGRESS_PRIZE_BRANCH: 'main' }),
+    googleFactory: () => ({}),
+    rolloverFactory: fakeRolloverFactory({
+      capture,
+      result: {
+        action: 'sync-responses',
+        status: 'synced',
+        sourceCycle: '2026-08',
+        responseSheetCreated: true,
+        responsesAppended: 3,
+        totalResponseCount: 3,
+        spreadsheetId: 'private-managed-sheet-id',
+      },
+    }),
+    output: (value) => outputs.push(value),
+  });
+
+  assert.equal(capture.method, 'syncResponses');
+  assert.equal(capture.input.sourceFormId, PRIVATE.form);
+  assert.deepEqual(capture.input.collaboratorPermissions, [{
+    type: 'group',
+    role: 'writer',
+    emailAddress: 'production-editors@private.example',
+  }]);
+  assert.equal(outputs.length, 1);
+  assert.equal(outputs[0].includes('private-managed-sheet-id'), false);
+  assert.match(outputs[0], /"spreadsheetId":"\[REDACTED\]"/);
 });
 
 test('reconcile-active is manual-only and rejects staging controls before token or I/O', async () => {

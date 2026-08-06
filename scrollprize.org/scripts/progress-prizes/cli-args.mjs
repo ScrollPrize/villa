@@ -22,6 +22,7 @@ export const GOOGLE_COMMANDS = Object.freeze([
   'validate',
   'bootstrap',
   'prepare',
+  'sync-responses',
   'activate',
   'reconcile-active',
   'verify',
@@ -110,6 +111,7 @@ export const GOOGLE_CLI_USAGE = `Google automation (private values are environme
   node automation-cli.mjs bootstrap --source-cycle YYYY-MM [--dry-run] [staging controls]
     [--allow-activation-rewind --target-cycle YYYY-MM]
   node automation-cli.mjs prepare --target-cycle YYYY-MM [--source-cycle YYYY-MM] [--dry-run]
+  node automation-cli.mjs sync-responses --source-cycle YYYY-MM
   node automation-cli.mjs activate --target-cycle YYYY-MM [--source-cycle YYYY-MM] [--fault STEP]
   node automation-cli.mjs reconcile-active --target-cycle YYYY-MM [--source-cycle YYYY-MM]
   node automation-cli.mjs verify --target-cycle YYYY-MM [--source-cycle YYYY-MM] \\
