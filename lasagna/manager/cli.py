@@ -234,13 +234,16 @@ def _print_run(path, record) -> None:
     )
 
 
-def _volume_cells(record) -> tuple[str, str, str, str, str, str]:
-    shape = "x".join(str(v) for v in record.shape) or "-"
+def _volume_cells(record) -> tuple[str, str, str, str, str]:
+    if len(record.shape) == 3:
+        depth, height, width = record.shape
+        shape = f"{depth:>6}x{height:>5}x{width:>5}"
+    else:
+        shape = "x".join(str(v) for v in record.shape) or "-"
     voxel = f"{record.pixel_size_um:g}um" if record.pixel_size_um is not None else "-"
     origins = sorted({root.get("type", "?") for origin in record.origins for root in origin.get("access_roots", ())})
     return (
         record.long_id or "-",
-        record.volume_id or "-",
         shape,
         voxel,
         record.data_format or "-",
@@ -284,7 +287,7 @@ def _prefetched_scales(config, record) -> str:
 
 
 def _render_volume_table(records, config, *, unicode_tree: bool = True) -> str:
-    headers = ("SCROLL", "VOLUME", "ID", "SHAPE", "VOXEL", "FORMAT", "PREFETCHED", "ORIGINS")
+    headers = ("SCROLL", "VOLUME", "SHAPE", "VOXEL", "FORMAT", "PREFETCHED", "ORIGINS")
     ordered = sorted(records, key=lambda record: (record.sample_id, record.long_id))
     rows: list[tuple[str, ...]] = []
     offset = 0
@@ -295,14 +298,16 @@ def _render_volume_table(records, config, *, unicode_tree: bool = True) -> str:
             end += 1
         group = ordered[offset:end]
         for index, record in enumerate(group):
-            branch = ("└─" if index == len(group) - 1 else "├─") if unicode_tree else (
-                "\\-" if index == len(group) - 1 else "|-"
-            )
-            volume, volume_id, shape, voxel, data_format, origins = _volume_cells(record)
+            if index == 0:
+                tree_cell = sample_id
+            else:
+                tree_cell = ("└─" if index == len(group) - 1 else "├─") if unicode_tree else (
+                    "\\-" if index == len(group) - 1 else "|-"
+                )
+            volume, shape, voxel, data_format, origins = _volume_cells(record)
             rows.append((
-                sample_id if index == 0 else "",
-                f"{branch} {volume}",
-                volume_id,
+                tree_cell,
+                volume,
                 shape,
                 voxel,
                 data_format,
@@ -319,7 +324,7 @@ def _render_volume_table(records, config, *, unicode_tree: bool = True) -> str:
         return "  ".join(
             value.ljust(widths[index]) if index < len(values) - 1 else value
             for index, value in enumerate(values)
-        )
+        ).rstrip()
 
     separator = tuple("-" * width for width in widths)
     return "\n".join([line(headers), line(separator), *(line(row) for row in rows)])

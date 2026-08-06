@@ -9,3 +9,6 @@
 - [x] Add rendering and compatibility tests.
 - [x] Update specs, docs, changelog, status, and task log.
 - [x] Run final focused and real-catalog validation.
+- [x] Apply user-requested parent-row tree layout and remove redundant ID column.
+- [x] Add fixed-width 6/5/5 depth/height/width shape formatting.
+- [x] Re-run table and real-catalog validation for the revised layout.

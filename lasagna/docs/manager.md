@@ -43,14 +43,17 @@ and `├─`/`└─` branches identify its volumes. `PREFETCHED` lists numeric 
 groups that already contain local chunk data in the manager cache:
 
 ```text
-SCROLL     VOLUME                                             ID              SHAPE            VOXEL    FORMAT  PREFETCHED  ORIGINS
----------  -------------------------------------------------  --------------  ---------------  -------  ------  ----------  -------
-PHerc0125  └─ 20250821151825-9.362um-1.2m-113keV-masked.zarr  20250821151825  20840x8387x8387  9.362um  uint8   1,2         s3
+SCROLL     VOLUME                                             SHAPE               VOXEL    FORMAT  PREFETCHED  ORIGINS
+---------  -------------------------------------------------  ------------------  -------  ------  ----------  -------
+PHerc0125  20250821151825-9.362um-1.2m-113keV-masked.zarr      20840x 8387x 8387  9.362um  uint8   1,2         s3
 ```
 
 Metadata-only groups are not reported as prefetched. Use `volume ls --json`
 for scripts and other machine consumers; its schema is independent of the
 human table.
+The catalog's depth/height/width shape is space-padded to widths 6/5/5 so each
+component aligns vertically. The separate volume ID is omitted from the human
+table because it is already the prefix of the long volume name.
 
 The raw catalog and validation sidecar live under `<cache_dir>/catalog`.
 `fetch` always revalidates. Volume commands refresh a missing or hour-old cache

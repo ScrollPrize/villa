@@ -16,6 +16,17 @@
 
 - None at planning time.
 
+## User review
+
+- The initial table attached branch glyphs to the volume text on the same row
+  as the scroll, which did not express the requested parent/child hierarchy.
+- After user review, the final layout keeps the first volume on the scroll row
+  and uses child branches in the `SCROLL` column only for additional volumes.
+  The redundant `ID` column is removed because the long
+  volume name already begins with that ID; JSON remains unchanged.
+- Three-dimensional shapes will retain catalog depth/height/width order while
+  using requested space-padded widths 6/5/5 for vertical component alignment.
+
 ## Independent review
 
 - Required explicit header-only empty output, defensive grouping order, exact
@@ -37,3 +48,7 @@
 - Final focused manager/open-data/provenance/packaging/direct-provenance suite:
   `46 passed, 59 deselected`, with six pre-existing Atlas Pydantic v2
   deprecation warnings. Python compilation and `git diff --check` pass.
+- After user review, the same final suite remains `46 passed, 59 deselected`.
+  The live 71-volume table confirms first-volume/scroll rows, branches only for
+  additional volumes, no duplicate ID column, 6/5/5 shape padding, and no
+  trailing whitespace on scroll rows.

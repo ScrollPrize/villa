@@ -7,6 +7,9 @@
 - Made manager catalog indexing tolerate volumes whose optional shape is null.
 - Replaced repeated `volume ls` labels with a grouped table and added exact
   chunk-backed prefetched-scale reporting.
+- Refined the volume tree so each scroll shares its first volume row and
+  branches additional volumes below, removed the duplicate ID column, and
+  aligned depth/height/width components to widths 6/5/5.
 
 # 2026-08-03
 

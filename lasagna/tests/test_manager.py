@@ -245,17 +245,19 @@ def test_volume_table_groups_sorts_and_marks_branches(tmp_path):
     table = _render_volume_table([records[1], singleton, records[0]], configured(tmp_path))
     lines = table.splitlines()
     assert lines[0].split() == [
-        "SCROLL", "VOLUME", "ID", "SHAPE", "VOXEL", "FORMAT", "PREFETCHED", "ORIGINS",
+        "SCROLL", "VOLUME", "SHAPE", "VOXEL", "FORMAT", "PREFETCHED", "ORIGINS",
     ]
     assert len(lines[1]) == len(lines[0])
     assert set(lines[1]) <= {"-", " "}
-    assert lines[2].startswith("PHerc0001  ├─ 20260101000001-2.4um.zarr")
-    assert lines[3].startswith("           └─ 20260101000002-2.4um.zarr")
-    assert lines[4].startswith("PHerc0002  └─ 20260101000003-2.4um.zarr")
+    assert lines[2].startswith("PHerc0001  20260101000001-2.4um.zarr")
+    assert lines[3].startswith("└─         20260101000002-2.4um.zarr")
+    assert lines[4].startswith("PHerc0002  20260101000003-2.4um.zarr")
     assert table.count("PHerc0001") == 1
     assert all(line.split()[-2:] == ["-", "s3"] for line in lines[2:])
     volume_column = lines[0].index("VOLUME")
-    assert all(line.index("─") == volume_column + 1 for line in lines[2:])
+    assert all(line.index("2026") == volume_column for line in lines[2:])
+    assert lines[3].index("─") == 1
+    assert all("    12x   10x    8" in line for line in lines[2:])
 
 
 def test_volume_table_prefetched_scales_require_chunk_data(tmp_path):
@@ -280,9 +282,10 @@ def test_volume_table_empty_and_ascii_fallback(tmp_path):
     config = configured(tmp_path)
     empty = _render_volume_table([], config, unicode_tree=False)
     assert len(empty.splitlines()) == 2
-    record = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
-    ascii_table = _render_volume_table([record], config, unicode_tree=False)
-    assert "\\- 20260101000001-2.4um.zarr" in ascii_table
+    records = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))
+    ascii_table = _render_volume_table(records, config, unicode_tree=False)
+    assert "\\-" in ascii_table
+    assert "20260101000001-2.4um.zarr" in ascii_table
     assert "└" not in ascii_table
 
 
@@ -473,7 +476,8 @@ def test_cli_config_init_and_volume_list(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "SCROLL" in output
     assert output.count("PHerc0001") == 1
-    assert "└─ 20260101000002-2.4um.zarr" in output
+    assert "└─" in output
+    assert "20260101000002-2.4um.zarr" in output
     assert main(["volume", "ls", "--sample", "PHerc0001", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [item["long_id"] for item in payload] == [

@@ -2506,8 +2506,12 @@
   selectors are `sample_id/long_id`, globally unique `long_id`, and globally
   unique volume ID.
 - Human `volume ls` renders a deterministic, aligned table with one header,
-  groups records by sample/scroll, prints the scroll once, and marks child
-  volumes with tree branches. Its `PREFETCHED` column contains numerically
+  groups records by sample/scroll, prints the scroll and first volume together,
+  and puts branches for additional volumes beneath it in the `SCROLL` column.
+  A single-volume scroll has no branch. The redundant `ID`
+  column is omitted because the long volume name begins with that ID. Three-D
+  shapes retain depth/height/width order and use space-padded widths 6/5/5.
+  Its `PREFETCHED` column contains numerically
   sorted local OME groups only when `.zarray` and at least one non-metadata
   chunk exist; advertised or metadata-only groups remain absent. UTF-capable
   output uses `├─`/`└─`, otherwise `|-`/`\-`. Empty results are header-only.
