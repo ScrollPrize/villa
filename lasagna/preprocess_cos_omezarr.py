@@ -6,10 +6,13 @@ del _os
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import math
 import os
 from pathlib import Path
+import platform
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +47,8 @@ try:
 		DEFAULT_INPUT_COPY_THREADS,
 		DEFAULT_INPUT_IO_THREADS,
 		DEFAULT_INPUT_READER,
+		DEFAULT_OME_COMPRESSOR,
+		OME_COMPRESSOR_CHOICES,
 		DEFAULT_PREFETCH_TILES_PER_GPU,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
@@ -99,6 +104,8 @@ except ImportError:
 		DEFAULT_INPUT_COPY_THREADS,
 		DEFAULT_INPUT_IO_THREADS,
 		DEFAULT_INPUT_READER,
+		DEFAULT_OME_COMPRESSOR,
+		OME_COMPRESSOR_CHOICES,
 		DEFAULT_PREFETCH_TILES_PER_GPU,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
@@ -1592,6 +1599,7 @@ def run_preprocess_3d(
 	base_scale: int | None = None,
 	n_levels: int = 5,
 	ome_chunk: int = 64,
+	ome_compressor: str = DEFAULT_OME_COMPRESSOR,
 	devices: str | tuple[str, ...] | None = None,
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
@@ -1863,6 +1871,7 @@ def run_preprocess_3d(
 		base_shape_zyx=base_shape_zyx,
 		n_levels=n_levels,
 		ome_chunk=oc,
+		ome_compressor=ome_compressor,
 	)
 	write_lasagna_product_manifest(
 		output_path=output_path,
@@ -1871,6 +1880,7 @@ def run_preprocess_3d(
 		crop_xyzwhd_base=crop_xyzwhd,
 		source_to_base=source_to_base,
 		grad_mag_factor=_grad_mag_factor_from_input_sd(input_sd),
+		provenance_json="inference.json",
 	)
 
 	# Level arrays (3D) for writing
@@ -2727,6 +2737,43 @@ def main_integrate(argv: list[str] | None = None) -> int:
 	return 0
 
 
+def _predict3d_repository_state() -> dict[str, object]:
+	repo = Path(__file__).resolve().parent.parent
+	try:
+		revision = subprocess.run(
+			["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True,
+			stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+		).stdout.strip()
+		dirty = bool(subprocess.run(
+			["git", "status", "--porcelain"], cwd=repo, check=True, text=True,
+			stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+		).stdout)
+		return {"revision": revision, "dirty": dirty}
+	except (OSError, subprocess.CalledProcessError):
+		return {"revision": None, "dirty": None}
+
+
+def _lasagna_product_provenance(manifest_path: Path) -> dict[str, object]:
+	manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	groups = manifest.get("groups", {})
+	return {
+		"manifest_version": manifest.get("version"),
+		"source_to_base": manifest.get("source_to_base"),
+		"base_shape_zyx": manifest.get("base_shape_zyx"),
+		"grad_mag_factor": manifest.get("grad_mag_factor"),
+		"grad_mag_encode_scale": manifest.get("grad_mag_encode_scale"),
+		"crops": manifest.get("crops", []),
+		"groups": {
+			str(name): {
+				"zarr": group.get("zarr"),
+				"scaledown": group.get("scaledown"),
+				"channels": group.get("channels", [name]),
+			}
+			for name, group in sorted(groups.items()) if isinstance(group, dict)
+		},
+	}
+
+
 def main_predict3d(argv: list[str] | None = None) -> int:
 	# Make this process the OOM killer's first target so the parent session survives
 	try:
@@ -2800,6 +2847,13 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Number of OME-Zarr pyramid levels to generate (default 5).")
 	p.add_argument("--ome-chunk", type=int, default=64,
 		help="Chunk size for OME-Zarr output levels (default 64).")
+	p.add_argument("--ome-compressor", choices=OME_COMPRESSOR_CHOICES,
+		default=DEFAULT_OME_COMPRESSOR,
+		help="Compressor for newly created output arrays; existing arrays retain their codec.")
+	p.add_argument(
+		"--provenance-context", default=None,
+		help="Private manager context JSON used to author portable inference.json.",
+	)
 	args = p.parse_args(argv)
 	if int(args.download_workers) <= 0:
 		p.error("--download-workers must be a positive integer")
@@ -2824,7 +2878,79 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			download_workers=int(args.download_workers),
 		)
 
-	run_preprocess_3d(
+	try:
+		from inference_provenance import (
+			atomic_write as write_provenance,
+			base_document,
+			finalize_document,
+			load_context,
+			sha256_file,
+		)
+	except ImportError:  # pragma: no cover - monorepo package import mode.
+		from lasagna.inference_provenance import (
+			atomic_write as write_provenance,
+			base_document,
+			finalize_document,
+			load_context,
+			sha256_file,
+		)
+	output_manifest = Path(args.output)
+	provenance_path = output_manifest.parent / "inference.json"
+	context = load_context(args.provenance_context)
+	provenance = base_document(artifact_kind="lasagna", context=context)
+	checkpoint_payload = torch.load(args.unet_checkpoint, map_location="cpu", weights_only=True)
+	checkpoint_meta = checkpoint_payload if isinstance(checkpoint_payload, dict) else {}
+	effective_tile_size = args.tile_size if args.tile_size is not None else checkpoint_meta.get("patch_size")
+	provenance.update({
+		"checkpoint": {
+			"sha256": sha256_file(args.unet_checkpoint),
+			"name": Path(args.unet_checkpoint).name,
+			"architecture": "lasagna_3d",
+			"model_patch_size": checkpoint_meta.get("model_patch_size"),
+			"norm_type": checkpoint_meta.get("norm_type"),
+			"upsample_mode": checkpoint_meta.get("upsample_mode"),
+			"precision": checkpoint_meta.get("precision"),
+		},
+		"inference": {
+			"cos_scaledown_factor_from_input": int(args.cos_scaledown),
+			"normal_scaledown_factor_from_input": int(args.scaledown),
+			"crop_xyzwhd_base": list(args.crop_xyzwhd) if args.crop_xyzwhd else None,
+			"tile_size": int(effective_tile_size) if effective_tile_size is not None else None,
+			"border": int(args.border),
+			"overlap": int(args.overlap),
+			"ome_chunk": int(args.ome_chunk),
+			"ome_compressor_requested": str(args.ome_compressor),
+			"product_accumulator_dtype": str(args.product_accumulator_dtype),
+		},
+		"atlas_model_identity": {
+			"model_id": context.get("model", {}).get("atlas_model_id") if isinstance(context.get("model"), dict) else None,
+			"source": "trusted-checkpoint-metadata" if isinstance(context.get("model"), dict) and context["model"].get("atlas_model_id") else "unresolved",
+		},
+		"repository": _predict3d_repository_state(),
+		"runtime": {
+			"python": platform.python_version(),
+			"torch": torch.__version__,
+			"zarr": getattr(zarr, "__version__", None),
+			"cuda": torch.version.cuda,
+		},
+		"manifest": output_manifest.name,
+	})
+	write_provenance(provenance_path, provenance)
+	try:
+		a_in = zarr.open(str(args.input), mode="r")
+		input_shape = tuple(int(value) for value in a_in.shape)
+		base_shape = _resolve_base_shape(str(args.input), args.base_ref, args.base_scale)
+		input_sd = max(1, round(base_shape[0] / input_shape[0])) if base_shape else None
+		requested = context.get("source", {}).get("requested_group") if isinstance(context.get("source"), dict) else None
+		if requested is None and Path(str(args.input).rstrip("/")).name.isdigit():
+			requested = int(Path(str(args.input).rstrip("/")).name)
+		provenance["source_scale"] = {
+			"requested_group": requested,
+			"observed_input_shape_zyx": list(input_shape),
+			"base_shape_zyx": list(base_shape) if base_shape else None,
+			"source_to_base_factor": input_sd,
+		}
+		run_preprocess_3d(
 		input_path=str(args.input),
 		output_path=str(args.output),
 		unet3d_checkpoint=str(args.unet_checkpoint),
@@ -2847,6 +2973,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		base_scale=args.base_scale,
 		n_levels=int(args.levels),
 		ome_chunk=int(args.ome_chunk),
+		ome_compressor=str(args.ome_compressor),
 		prefetch_workers=int(args.prefetch_workers),
 		slots_per_gpu=int(args.slots_per_gpu),
 		flush_workers=int(args.flush_workers),
@@ -2859,7 +2986,20 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		profile_pipeline=bool(args.profile_pipeline),
 		product_accumulator_dtype=str(args.product_accumulator_dtype),
 		download_workers=int(args.download_workers),
-	)
+		)
+		provenance["product"] = _lasagna_product_provenance(output_manifest)
+		finalize_document(
+			provenance, path=provenance_path, status="completed",
+			manifest_path=output_manifest,
+		)
+	except BaseException as error:
+		finalize_document(
+			provenance, path=provenance_path,
+			status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+			manifest_path=output_manifest,
+			error=type(error).__name__,
+		)
+		raise
 	return 0
 
 
