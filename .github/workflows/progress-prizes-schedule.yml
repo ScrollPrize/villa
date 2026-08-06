@@ -10,7 +10,7 @@ on:
       timezone: America/Los_Angeles
     - cron: "17 0 1 * *"
       timezone: America/Los_Angeles
-    - cron: "47 6 1 * *"
+    - cron: "47 6 1-7 * *"
       timezone: America/Los_Angeles
 
 permissions: {}
@@ -48,7 +48,7 @@ jobs:
             '17 6 * * *',
             '40 23 28-31 * *',
             '17 0 1 * *',
-            '47 6 1 * *',
+            '47 6 1-7 * *',
           ]);
           assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
           assert.equal(process.env.REPOSITORY_ID, '890972577');

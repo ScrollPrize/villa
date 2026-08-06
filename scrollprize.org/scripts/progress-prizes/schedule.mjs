@@ -15,7 +15,7 @@ export const SCHEDULE_CRONS = Object.freeze({
   PREPARE: '17 6 * * *',
   PRE_CUTOFF: '40 23 28-31 * *',
   EARLY_RECOVERY: '17 0 1 * *',
-  LATE_RECOVERY: '47 6 1 * *',
+  LATE_RECOVERY: '47 6 1-7 * *',
 });
 
 // Workflow-facing alias kept explicit so the public control contract reads as
@@ -67,6 +67,10 @@ function previousCalendarDate(parts) {
 
 function isFirstDay(parts) {
   return parts.day === 1;
+}
+
+function isLateRecoveryDay(parts) {
+  return parts.day >= 1 && parts.day <= 7;
 }
 
 function isLastDay(parts) {
@@ -160,12 +164,22 @@ function dispatchPlan({
   });
 }
 
-function classifyObservedTime(observedAt, local) {
+function classifyObservedTime(observedAt, local, scheduledCron) {
   const localCycle = formatCycle(local.year, local.month);
 
-  // The whole first Pacific calendar day is reserved for bounded activation
-  // recovery. A run delayed into day two must never select the previous cycle.
-  if (isFirstDay(local)) {
+  const lateRecoveryOrigin = scheduledCron === SCHEDULE_CRONS.LATE_RECOVERY
+    ? scheduledOriginDate(observedAt, local, scheduledCron)
+    : undefined;
+  const delayedDaySevenRecovery = local.day === 8
+    && lateRecoveryOrigin !== undefined
+    && lateRecoveryOrigin.year === local.year
+    && lateRecoveryOrigin.month === local.month
+    && lateRecoveryOrigin.day === 7;
+
+  // The first seven Pacific calendar days are bounded recovery days for the
+  // previous month's rollover. A delayed day-seven 06:47 event may cross local
+  // midnight, but a true day-eight event must never select the previous cycle.
+  if (isLateRecoveryDay(local) || delayedDaySevenRecovery) {
     const sourceCycle = previousCycle(localCycle);
     const activationAt = getCycleDeadline(sourceCycle).cutoffAt;
     const lateRecoveryAt = pacificDateTimeToInstant({
@@ -234,7 +248,16 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
       || (isFirstDay(local) && isLastDay(previousCalendarDate(local)));
   }
   const origin = scheduledOriginDate(observedAt, local, scheduledCron);
-  return isFirstDay(origin) && isFirstDay(local);
+  if (scheduledCron === SCHEDULE_CRONS.EARLY_RECOVERY) {
+    return isFirstDay(origin) && isFirstDay(local);
+  }
+  return isLateRecoveryDay(origin)
+    && origin.year === local.year
+    && origin.month === local.month
+    && (
+      isLateRecoveryDay(local)
+      || (origin.day === 7 && local.day === 8)
+    );
 }
 
 /**
@@ -242,8 +265,8 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
  * instant and its trusted GitHub trigger context.
  *
  * Schedule slots are intentionally not interchangeable: only the daily 06:17
- * slot can prepare. The three activation slots may recover a delayed final-day
- * run during the first Pacific day, but never during day two.
+ * slot can prepare. The pre-cutoff and 00:17 slots retain first-day recovery;
+ * the 06:47 slot retries the previous month's incomplete rollover on days 1–7.
  */
 export function planScheduleDispatch({
   now = new Date(),
@@ -276,7 +299,7 @@ export function planScheduleDispatch({
     });
   }
 
-  const classified = classifyObservedTime(observedAt, local);
+  const classified = classifyObservedTime(observedAt, local, trustedCron);
 
   if (classified === undefined) {
     return noDispatch({

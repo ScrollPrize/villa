@@ -19,7 +19,7 @@ test('schedule constants use the four exact Pacific cron slots', () => {
     PREPARE: '17 6 * * *',
     PRE_CUTOFF: '40 23 28-31 * *',
     EARLY_RECOVERY: '17 0 1 * *',
-    LATE_RECOVERY: '47 6 1 * *',
+    LATE_RECOVERY: '47 6 1-7 * *',
   });
   assert.equal(PROGRESS_PRIZE_SCHEDULES, SCHEDULE_CRONS);
 });
@@ -147,6 +147,36 @@ test('first-day recovery slots dispatch at 00:17 and 06:47 Pacific', () => {
   assert.equal(late.targetCycle, '2026-08');
 });
 
+test('late recovery targets the previous rollover on days 1, 2, and 7', () => {
+  for (const [now, sourceCycle, targetCycle] of [
+    ['2026-08-01T13:47:00Z', '2026-07', '2026-08'],
+    ['2026-08-02T13:47:00Z', '2026-07', '2026-08'],
+    ['2026-08-07T13:47:00Z', '2026-07', '2026-08'],
+  ]) {
+    const recovery = plan(now, SCHEDULE_CRONS.LATE_RECOVERY);
+    assert.equal(recovery.dispatch, true, now);
+    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.ACTIVATE, now);
+    assert.equal(recovery.reason, SCHEDULE_REASONS.LATE_RECOVERY, now);
+    assert.equal(recovery.sourceCycle, sourceCycle, now);
+    assert.equal(recovery.targetCycle, targetCycle, now);
+  }
+});
+
+test('late recovery handles PDT, PST, leap February, and December rollover', () => {
+  for (const [now, sourceCycle, targetCycle, activationAt] of [
+    ['2026-08-07T13:47:00Z', '2026-07', '2026-08', '2026-08-01T07:00:00.000Z'],
+    ['2026-12-07T14:47:00Z', '2026-11', '2026-12', '2026-12-01T08:00:00.000Z'],
+    ['2028-03-07T14:47:00Z', '2028-02', '2028-03', '2028-03-01T08:00:00.000Z'],
+    ['2027-01-07T14:47:00Z', '2026-12', '2027-01', '2027-01-01T08:00:00.000Z'],
+  ]) {
+    const recovery = plan(now, SCHEDULE_CRONS.LATE_RECOVERY);
+    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.ACTIVATE, now);
+    assert.equal(recovery.sourceCycle, sourceCycle, now);
+    assert.equal(recovery.targetCycle, targetCycle, now);
+    assert.equal(recovery.activationAt.toISOString(), activationAt, now);
+  }
+});
+
 test('delayed activation events recover by their actual first-day Pacific window', () => {
   const delayedPreCutoff = plan('2026-08-01T07:43:00Z', SCHEDULE_CRONS.PRE_CUTOFF);
   assert.equal(delayedPreCutoff.operation, SCHEDULE_OPERATIONS.ACTIVATE);
@@ -174,19 +204,30 @@ test('delayed activation events recover by their actual first-day Pacific window
   assert.equal(preCutoffDelayedToEndOfFirstDay.sourceCycle, '2026-07');
 });
 
-test('day-two delays always no-op instead of selecting a stale cycle', () => {
-  for (const cron of [
-    SCHEDULE_CRONS.PRE_CUTOFF,
-    SCHEDULE_CRONS.EARLY_RECOVERY,
-    SCHEDULE_CRONS.LATE_RECOVERY,
-  ]) {
+test('cutoff and 00:17 recovery slots remain bounded to the first day', () => {
+  for (const cron of [SCHEDULE_CRONS.PRE_CUTOFF, SCHEDULE_CRONS.EARLY_RECOVERY]) {
     const dayTwo = plan('2026-08-02T07:17:00Z', cron);
     assert.equal(dayTwo.dispatch, false, cron);
     assert.equal(dayTwo.operation, SCHEDULE_OPERATIONS.NONE, cron);
-    assert.equal(dayTwo.reason, SCHEDULE_REASONS.OUTSIDE_WINDOW, cron);
-    assert.equal(dayTwo.sourceCycle, '2026-08');
-    assert.equal(dayTwo.targetCycle, '2026-09');
+    assert.equal(dayTwo.reason, SCHEDULE_REASONS.SLOT_NOT_DUE, cron);
+    assert.equal(dayTwo.sourceCycle, '2026-07');
+    assert.equal(dayTwo.targetCycle, '2026-08');
   }
+});
+
+test('a delayed day-seven recovery may cross midnight but day eight no-ops', () => {
+  const delayed = plan('2026-08-08T10:00:00Z', SCHEDULE_CRONS.LATE_RECOVERY);
+  assert.equal(delayed.dispatch, true);
+  assert.equal(delayed.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(delayed.sourceCycle, '2026-07');
+  assert.equal(delayed.targetCycle, '2026-08');
+
+  const dayEight = plan('2026-08-08T13:47:00Z', SCHEDULE_CRONS.LATE_RECOVERY);
+  assert.equal(dayEight.dispatch, false);
+  assert.equal(dayEight.operation, SCHEDULE_OPERATIONS.NONE);
+  assert.equal(dayEight.reason, SCHEDULE_REASONS.OUTSIDE_WINDOW);
+  assert.equal(dayEight.sourceCycle, '2026-08');
+  assert.equal(dayEight.targetCycle, '2026-09');
 });
 
 test('manual dispatch is always a real-clock dry-run with consecutive Pacific cycles', () => {
