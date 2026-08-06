@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -111,14 +112,63 @@ TEST_CASE("grid_normal_int returns NaN when degenerate (zero cross)")
     CHECK(std::isnan(n[0]));
 }
 
+TEST_CASE("grid_normal rejects grids smaller than its stencil")
+{
+    auto twoByTwo = makePlanarGrid(2, 2);
+    auto threeByThree = makePlanarGrid(3, 3);
+    auto fourByFour = makePlanarGrid(4, 4);
+    CHECK(std::isnan(grid_normal(twoByTwo, cv::Vec3f(0.f, 0.f, 0.f))[0]));
+    CHECK(std::isnan(grid_normal(threeByThree, cv::Vec3f(1.f, 1.f, 0.f))[0]));
+    CHECK(std::isfinite(grid_normal(fourByFour, cv::Vec3f(1.f, 1.f, 0.f))[0]));
+}
+
 TEST_CASE("loc_valid Vec3f basic")
 {
     auto m = makePlanarGrid(5, 5);
-    // l is [y, x]; bounds rect is (0,0,rows-2,cols-2)
+    // l is [y, x].
     CHECK(loc_valid(m, cv::Vec2d(1.0, 1.0)));
     CHECK_FALSE(loc_valid(m, cv::Vec2d(-1.0, 0.0)));
     // out of bounds
     CHECK_FALSE(loc_valid(m, cv::Vec2d(100.0, 100.0)));
+}
+
+TEST_CASE("loc_valid accepts every complete 2x2 window")
+{
+    auto m = makePlanarGrid(5, 7);
+    int validQuads = 0;
+    for (int row = 0; row < m.rows - 1; ++row)
+        for (int col = 0; col < m.cols - 1; ++col)
+            validQuads += loc_valid(m, cv::Vec2d(row, col)) ? 1 : 0;
+
+    CHECK(validQuads == (m.rows - 1) * (m.cols - 1));
+    CHECK(loc_valid(m, cv::Vec2d(3.0, 5.0)));
+    CHECK(loc_valid(m, cv::Vec2d(3.75, 5.75)));
+    CHECK(loc_valid_xy(m, cv::Vec2d(5.0, 3.0)));
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(-0.25, 1.0)));
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(4.0, 5.0)));
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(3.0, 6.0)));
+}
+
+TEST_CASE("loc_valid handles minimum and undersized grids")
+{
+    auto minimum = makePlanarGrid(2, 2);
+    CHECK(loc_valid(minimum, cv::Vec2d(0.0, 0.0)));
+
+    auto oneRow = makePlanarGrid(1, 2);
+    auto oneCol = makePlanarGrid(2, 1);
+    CHECK_FALSE(loc_valid(oneRow, cv::Vec2d(0.0, 0.0)));
+    CHECK_FALSE(loc_valid(oneCol, cv::Vec2d(0.0, 0.0)));
+}
+
+TEST_CASE("loc_valid rejects non-finite and extreme locations")
+{
+    auto m = makePlanarGrid(5, 5);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(nan, 1.0)));
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(1.0, inf)));
+    CHECK_FALSE(loc_valid(
+        m, cv::Vec2d(std::numeric_limits<double>::max(), 1.0)));
 }
 
 TEST_CASE("loc_valid Vec3f rejects sentinel in 2x2 window")
@@ -126,17 +176,23 @@ TEST_CASE("loc_valid Vec3f rejects sentinel in 2x2 window")
     auto m = makePlanarGrid(5, 5);
     m(2, 2) = cv::Vec3f(-1.f, -1.f, -1.f);
     CHECK_FALSE(loc_valid(m, cv::Vec2d(2.0, 2.0)));
+
+    m = makePlanarGrid(5, 5);
+    m(4, 4) = cv::Vec3f(-1.f, -1.f, -1.f);
+    CHECK_FALSE(loc_valid(m, cv::Vec2d(3.0, 3.0)));
 }
 
 TEST_CASE("loc_valid Vec3d / float overloads")
 {
     cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(0, 0, 0));
     CHECK(loc_valid(md, cv::Vec2d(1.0, 1.0)));
+    CHECK(loc_valid(md, cv::Vec2d(2.0, 2.0)));
     md(1, 1) = cv::Vec3d(-1, -1, -1);
     CHECK_FALSE(loc_valid(md, cv::Vec2d(1.0, 1.0)));
 
     cv::Mat_<float> mf(4, 4, 0.0f);
     CHECK(loc_valid(mf, cv::Vec2d(1.0, 1.0)));
+    CHECK(loc_valid(mf, cv::Vec2d(2.0, 2.0)));
     mf(1, 1) = -1.0f;
     CHECK_FALSE(loc_valid(mf, cv::Vec2d(1.0, 1.0)));
     CHECK_FALSE(loc_valid(mf, cv::Vec2d(-1.0, 0.0)));
@@ -147,12 +203,15 @@ TEST_CASE("loc_valid_xy swaps axis order vs loc_valid")
     auto m = makePlanarGrid(5, 6); // rows=5, cols=6
     // valid interior in xy form
     CHECK(loc_valid_xy(m, cv::Vec2d(1.0, 1.0)));
+    CHECK(loc_valid_xy(m, cv::Vec2d(4.0, 3.0)));
     // float overload
     cv::Mat_<float> mf(4, 4, 0.0f);
     CHECK(loc_valid_xy(mf, cv::Vec2d(1.0, 1.0)));
+    CHECK(loc_valid_xy(mf, cv::Vec2d(2.0, 2.0)));
     // Vec3d overload
     cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(0, 0, 0));
     CHECK(loc_valid_xy(md, cv::Vec2d(1.0, 1.0)));
+    CHECK(loc_valid_xy(md, cv::Vec2d(2.0, 2.0)));
 }
 
 TEST_CASE("tdist returns |distance - target|")

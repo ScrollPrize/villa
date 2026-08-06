@@ -1,18 +1,20 @@
 #include "OpenDataLasagna.hpp"
 
 #include "OpenDataNormalGrids.hpp"
+#include "OpenDataSegmentCacheIO.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/ProjectVolumes.hpp"
 #include "utils/zarr.hpp"
 
 #include <QUrl>
 #include <QXmlStreamReader>
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cmath>
@@ -129,16 +131,6 @@ std::string discoverManifestKey(const OpenDataLasagnaInfo& info)
     return keys.front();
 }
 
-void writeText(const std::filesystem::path& path, std::string_view text)
-{
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("Failed to create " + path.string());
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    out.close();
-    if (!out) throw std::runtime_error("Failed to write " + path.string());
-}
-
 void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest,
                              const vc::lasagna::LasagnaChannelGroup& group)
 {
@@ -147,23 +139,22 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     if (meta.dtype != utils::ZarrDtype::uint8)
         throw std::runtime_error("Lasagna channel group '" + group.name +
                                  "' must be uint8");
-    const std::size_t spatialOffset = meta.shape.size() == 4 ? 1 : 0;
-    if ((meta.shape.size() != 3 && meta.shape.size() != 4) ||
-        meta.chunks.size() != meta.shape.size()) {
+    if (group.channels.size() != 1) {
         throw std::runtime_error("Lasagna channel group '" + group.name +
-                                 "' must be a 3D or channel-first 4D Zarr");
+                                 "' must describe exactly one 3D channel");
     }
-    if (meta.shape.size() == 4 && group.channels.size() > meta.shape[0])
+    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
         throw std::runtime_error("Lasagna channel group '" + group.name +
-                                 "' has more channels than its Zarr");
+                                 "' must be a 3D (Z,Y,X) Zarr");
+    }
     if (!manifest.baseShapeZYX) return;
     const double spacing = static_cast<double>(group.scaleFactor()) *
                            manifest.sourceToBase;
     for (std::size_t axis = 0; axis < 3; ++axis) {
         const auto expected = static_cast<std::size_t>(std::ceil(
             static_cast<double>((*manifest.baseShapeZYX)[axis]) / spacing));
-        const auto actual = meta.shape[spatialOffset + axis];
-        const auto padding = meta.chunks[spatialOffset + axis];
+        const auto actual = meta.shape[axis];
+        const auto padding = meta.chunks[axis];
         if (actual < expected || actual > expected + padding) {
             throw std::runtime_error("Lasagna channel group '" + group.name +
                                      "' shape is incompatible with base_shape_zyx");
@@ -288,8 +279,9 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
                     "Active catalog volume has an invalid coordinate level");
             }
         }
+        const auto lasagnaEntries = pkg.lasagnaDatasetEntries();
         std::vector<const vc::project::Entry*> parentMatches;
-        for (const auto& entry : pkg.lasagnaDatasetEntries()) {
+        for (const auto& entry : lasagnaEntries) {
             if (!hasTag(entry.tags, kOpenDataLasagnaEntryTag)) continue;
             if (tagValue(entry.tags, kOpenDataSampleIdTagPrefix) == sampleId &&
                 tagValue(entry.tags, "vc-open-data-volume-id:") == volumeId)
@@ -345,12 +337,15 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
             const auto* match = compatibleMatches.front();
             const auto path = vc::project::resolveLocalPath(
                 match->location, pkg.path().parent_path());
+            const auto artifactUrl =
+                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix);
             return ResolvedOpenDataLasagna{
                 path,
+                lasagnaSourceManifestLocation(*match),
                 static_cast<double>(std::uint64_t{1} << *activeLevel),
                 sampleId + "/" + volumeId + "@L" +
                     std::to_string(*activeLevel),
-                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix),
+                artifactUrl,
                 true};
         }
         if (!tagValue(volumeTags, kOpenDataLasagnaArtifactTagPrefix).empty()) {
@@ -360,12 +355,31 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
         }
     }
 
-    const auto manual = pkg.selectedLasagnaDatasetPath();
-    if (manual.empty()) return std::nullopt;
-    return ResolvedOpenDataLasagna{manual, 1.0, {}, {}, false};
+    const auto manualLocation = pkg.selectedLasagnaDataset();
+    if (manualLocation.empty()) return std::nullopt;
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = pkg.remoteCacheRootOrEmpty();
+    const auto resolvedLocation = vc::project::isLocationRemote(manualLocation)
+        ? manualLocation
+        : vc::project::resolveLocalPath(
+              manualLocation, pkg.path().parent_path()).string();
+    const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
+        resolvedLocation, options);
+    return ResolvedOpenDataLasagna{
+        dataset.manifest().manifestPath, manualLocation, 1.0, {}, {}, false};
 }
 
 } // namespace
+
+std::string lasagnaSourceManifestLocation(const vc::project::Entry& entry)
+{
+    const auto artifactUrl =
+        tagValue(entry.tags, kOpenDataLasagnaArtifactTagPrefix);
+    if (artifactUrl.empty())
+        return entry.location;
+    return joinOpenDataUrl(
+        artifactUrl, std::filesystem::path(entry.location).filename().string());
+}
 
 std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,
@@ -425,11 +439,11 @@ std::filesystem::path prepareOpenDataLasagna(
     const std::filesystem::path& remoteCacheRoot,
     std::string* errorOut)
 {
-    std::filesystem::path tempDir;
     try {
         if (remoteCacheRoot.empty())
             throw std::runtime_error("No remote cache directory configured");
-        const auto finalDir = lasagnaCacheDir(remoteCacheRoot, info);
+        const auto cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
+        const auto finalDir = lasagnaCacheDir(cacheRoot, info);
         const auto markerPath = finalDir / vc::lasagna::kLasagnaRemoteMarker;
         if (std::filesystem::is_regular_file(markerPath)) {
             auto marker = nlohmann::json::parse(std::ifstream(markerPath));
@@ -445,7 +459,7 @@ std::filesystem::path prepareOpenDataLasagna(
                         info.sourceCoordinateLevel) {
                         marker["source_coordinate_level"] =
                             info.sourceCoordinateLevel;
-                        writeText(markerPath, marker.dump(2));
+                        detail::writeStringAtomic(markerPath, marker.dump(2));
                     }
                     return manifest;
                 }
@@ -458,17 +472,13 @@ std::filesystem::path prepareOpenDataLasagna(
         if (!splitPrefixUrl(info.artifactUrl, origin, prefix))
             throw std::runtime_error("Invalid Lasagna artifact URL");
         const auto relativeName = key.substr(prefix.size());
-        const auto body = vc::httpGetString(joinOpenDataUrl(origin, key));
-        if (body.empty()) throw std::runtime_error("Lasagna manifest download was empty");
-
-        static std::atomic<std::uint64_t> serial{0};
-        tempDir = std::filesystem::path(
-            finalDir.string() + ".tmp-" + std::to_string(serial.fetch_add(1)));
-        std::error_code ec;
-        std::filesystem::remove_all(tempDir, ec);
-        std::filesystem::create_directories(tempDir);
-        const auto tempManifest = tempDir / relativeName;
-        writeText(tempManifest, body);
+        const auto manifestUrl = joinOpenDataUrl(origin, key);
+        vc::core::util::RemoteFileCacheOptions cacheOptions;
+        cacheOptions.cacheRoot = cacheRoot;
+        cacheOptions.destination =
+            (finalDir / relativeName).lexically_relative(cacheRoot);
+        const auto cached = vc::core::util::cacheRemoteFile(
+            manifestUrl, cacheOptions);
         nlohmann::json marker{
             {"version", 1},
             {"artifact_url", info.artifactUrl},
@@ -484,18 +494,11 @@ std::filesystem::path prepareOpenDataLasagna(
             marker["source_to_base"] = *info.sourceToBase;
         if (info.baseShapeZYX)
             marker["base_shape_zyx"] = *info.baseShapeZYX;
-        writeText(tempDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
-        validatePrepared(info, tempManifest);
-
-        std::filesystem::create_directories(finalDir.parent_path());
-        std::filesystem::remove_all(finalDir, ec);
-        std::filesystem::rename(tempDir, finalDir);
-        return finalDir / relativeName;
+        validatePrepared(info, cached.path);
+        detail::writeStringAtomic(
+            finalDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
+        return cached.path;
     } catch (const std::exception& e) {
-        if (!tempDir.empty()) {
-            std::error_code ec;
-            std::filesystem::remove_all(tempDir, ec);
-        }
         if (errorOut) *errorOut = e.what();
         return {};
     }
@@ -549,13 +552,33 @@ int attachOpenDataLasagna(VolumePkg& pkg,
             }
             expected.insert(manifest.string());
             const auto tags = entryTags(info);
-            if (!pkg.addLasagnaDatasetEntry(manifest.string(), tags)) {
-                pkg.reconcileLasagnaDatasetEntryTags(
-                    manifest.string(), tags,
+            try {
+                const auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
+                std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
+                for (auto& prepared :
+                     vc::lasagna::prepareLasagnaProjectVolumes(
+                         dataset, manifest.string())) {
+                    volumes.push_back({
+                        std::move(prepared.location), std::move(prepared.tags),
+                        std::move(prepared.volume)});
+                }
+                const auto result = pkg.attachPreparedLasagnaDataset(
+                    manifest.string(), tags, false, volumes, remoteCacheRoot,
+                    true, true,
                     {std::string(kOpenDataLasagnaArtifactTagPrefix),
                      std::string(kOpenDataLasagnaModelTagPrefix),
                      "vc-open-data-source-coordinate-level:",
                      "vc-open-data-coordinate-space:"});
+                if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict)
+                    throw std::runtime_error(
+                        "a Lasagna volume id conflicts with the project");
+            } catch (const std::exception& error) {
+                if (messages) {
+                    messages->push_back(
+                        "Failed to attach Lasagna volumes for " + volume.id +
+                        ": " + error.what());
+                }
+                continue;
             }
             ++attached;
         }

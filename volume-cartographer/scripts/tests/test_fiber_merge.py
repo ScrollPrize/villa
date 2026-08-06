@@ -51,6 +51,71 @@ def make_fiber(cps, branches=None, tags=None, generation=1,
     }
 
 
+def v3_segment(goal='global', mode='trace', metric=2.0, msg='trace'):
+    trace = mode == 'trace'
+    return {
+        'optimizer': 'native_fiber_trace3d',
+        'metadata_version': 3,
+        'tracer_version': 2,
+        'interp_goal': goal,
+        'interp_mode': mode,
+        'metric': metric,
+        'msg': msg,
+        'normal_manifest': '/data/normals.lasagna.json' if mode != 'cspline' else '',
+        'fiber_manifest': 's3://bucket/fibers.lasagna.json' if trace else '',
+        'trace_to_base_scale': 4.0,
+        'meeting_error_base_voxels': 2.0 if trace else None,
+        'meeting_error_ratio': 0.02 if trace else None,
+        'meeting_source': 'forward_moving_plane' if trace else '',
+        'failure_code': '',
+        'failure_detail': '',
+        'lasagna_failure_code': '',
+        'lasagna_failure_detail': '',
+        'config': {
+            'step_voxels': 4.0,
+            'cone_angle_degrees': 25.0,
+            'cone_angle_step_degrees': 5.0,
+            'cone_grid_size': 25,
+            'beam_width': 8,
+            'beam_prune_distance_voxels': 1.0,
+            'beam_lookahead_steps': 2,
+            'smoothness_weight': 2.0,
+            'smoothness_normal_weight': 0.1,
+            'smoothness_tangent_weight': 10.0,
+            'smoothness_free_angle_degrees': 0.0,
+            'cumulative_smoothness_steps': 4,
+            'cumulative_smoothness_tangent_weight': 2.0,
+            'initial_free_angle_degrees': 0.0,
+            'max_step_factor': 3.0,
+            'meeting_accept_max_error_ratio': 0.1,
+            'endpoint_accept_threshold_base_voxels': 20.0,
+        },
+    }
+
+
+def make_v3_fiber(cps, generation=1, filename='dj_x_000001.json',
+                  optimization_mode='native_fiber_trace3d'):
+    doc = make_fiber(cps, generation=generation, filename=filename)
+    doc['version'] = 3
+    doc['optimization_mode'] = optimization_mode
+    doc['control_points'] = [
+        {'position': list(point), 'segment_to_next': v3_segment()}
+        if index + 1 < len(cps) else {'position': list(point)}
+        for index, point in enumerate(cps)
+    ]
+    return doc
+
+
+def set_v3_span(doc, index, *, goal, bend):
+    mode = 'trace' if goal == 'global' else goal
+    metric = None if mode == 'cspline' else 2.0
+    doc['control_points'][index]['segment_to_next'] = v3_segment(
+        goal=goal, mode=mode, metric=metric, msg=mode)
+    start = index * 4
+    for offset in range(1, 4):
+        doc['line_points'][start + offset][1] += bend
+
+
 def link(target, local_pos, remote_pos, local_index, remote_index=0,
          pending=True):
     return {
@@ -86,6 +151,10 @@ def _l_finite(p):
     return (isinstance(p, (list, tuple)) and len(p) == 3 and
             all(isinstance(x, (int, float)) and not isinstance(x, bool) and
                 math.isfinite(x) for x in p))
+
+
+def _l_cp_position(value):
+    return value.get('position') if isinstance(value, dict) else value
 
 
 def _l_pos_eq(a, b, tol=1.0e-6):
@@ -141,7 +210,7 @@ def loader_issues(docs_by_name):
     cleanly and rewrites nothing destructive."""
     issues = []
     for name, doc in docs_by_name.items():
-        cps = doc['control_points']
+        cps = [_l_cp_position(cp) for cp in doc['control_points']]
         line = doc['line_points']
         for label, points in (('control point', cps), ('line point', line)):
             for k, point in enumerate(points):
@@ -191,7 +260,7 @@ def loader_issues(docs_by_name):
                 issues.append(f"{name}: missing linked fiber "
                               f"{entry['branch_file']}")
                 continue
-            tcps = target['control_points']
+            tcps = [_l_cp_position(cp) for cp in target['control_points']]
             tline = target['line_points']
             j = entry['branch_control_point_index']
             if not (isinstance(j, int) and 0 <= j < len(tcps)):
@@ -1003,3 +1072,240 @@ def test_duplicate_a_entries_claim_distinct_reciprocals():
     out = refresh_pair_links(a, b, 'a.json', 'b.json')
     assert out['ok']
     assert len(out['b_doc']['branches']) == 2  # no third entry restored
+
+
+def test_v3_separated_span_results_merge_atomically_without_generation_loss():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['generation'] = 2
+    remote['generation'] = 9
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 3, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['control_points'][1]['segment_to_next']['interp_goal'] == 'cspline'
+    assert merged['control_points'][3]['segment_to_next']['interp_goal'] == 'lasagna'
+    assert merged['line_points'][5:8] == local['line_points'][5:8]
+    assert merged['line_points'][13:16] == remote['line_points'][13:16]
+    assert REOPTIMIZE_TAG not in merged['tags']
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_adjacent_changes_are_a_manual_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 1, goal='cspline', bend=1.0)
+    set_v3_span(remote, 2, goal='lasagna', bend=-1.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any('unchanged base span' in conflict for conflict in result['conflicts'])
+
+
+def test_v3_same_span_different_results_are_a_manual_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 2, goal='cspline', bend=1.0)
+    set_v3_span(remote, 2, goal='lasagna', bend=-1.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any('changed differently' in conflict for conflict in result['conflicts'])
+
+
+def test_v3_identical_two_sided_span_result_is_accepted():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 2, goal='cspline', bend=1.0)
+    set_v3_span(remote, 2, goal='cspline', bend=1.0)
+    local['tags'] = ['local']
+    remote['tags'] = ['remote']
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['line_points'] == local['line_points']
+    assert result['merged']['control_points'] == local['control_points']
+    assert sorted(result['merged']['tags']) == ['local', 'remote']
+
+
+def test_v3_separated_topology_changes_preserve_dense_results_and_descriptors():
+    base = make_v3_fiber(BASE_CPS)
+    inserted = [105.0, 200.0, 300.0]
+    local = make_v3_fiber(BASE_CPS[:1] + [inserted] + BASE_CPS[1:], generation=2)
+    remote_cps = copy.deepcopy(BASE_CPS)
+    remote_cps[6] = cp(6, dz=-5.0)
+    remote = make_v3_fiber(remote_cps, generation=3)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    positions = [control['position'] for control in merged['control_points']]
+    assert inserted in positions
+    assert cp(6, dz=-5.0) in positions
+    assert all('segment_to_next' in control
+               for control in merged['control_points'][:-1])
+    assert 'segment_to_next' not in merged['control_points'][-1]
+    assert REOPTIMIZE_TAG not in merged['tags']
+    assert loader_issues({'dj_x_000001.json': merged}) == []
+
+
+def test_v3_overlapping_topology_changes_are_a_manual_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    inserted = [115.0, 200.0, 300.0]
+    local = make_v3_fiber(BASE_CPS[:2] + [inserted] + BASE_CPS[2:])
+    remote_cps = copy.deepcopy(BASE_CPS)
+    remote_cps[2] = cp(2, dz=-5.0)
+    remote = make_v3_fiber(remote_cps)
+
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any('changed differently' in conflict for conflict in result['conflicts'])
+
+
+def test_v3_optimization_mode_uses_base_aware_merge_not_newer_generation():
+    base = make_v3_fiber(BASE_CPS, optimization_mode='lasagna')
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['optimization_mode'] = 'native_fiber_trace3d'
+    local['generation'] = 2
+    remote['tags'] = ['reviewed']
+    remote['generation'] = 20
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    assert result['merged']['optimization_mode'] == 'native_fiber_trace3d'
+    assert result['merged']['tags'] == ['reviewed']
+
+
+def test_v3_unordered_control_point_line_mapping_is_a_manual_conflict():
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    del local['line_points'][8]  # remove CP 2 from its ordered dense line
+    remote['tags'] = ['remote-edit']
+
+    assert fiber_merge.is_fiber_doc(local)
+    result = merge_fibers(base, local, remote)
+
+    assert not result['ok']
+    assert any('not an ordered dense-line point' in conflict
+               for conflict in result['conflicts'])
+
+
+def test_fiber_doc_rejects_unknown_optimization_mode():
+    doc = make_v3_fiber(BASE_CPS)
+    doc['optimization_mode'] = 'guess'
+    assert not fiber_merge.is_fiber_doc(doc)
+    doc['optimization_mode'] = []
+    assert not fiber_merge.is_fiber_doc(doc)
+
+
+def test_v3_fiber_rejects_obsolete_segment_metadata_versions():
+    doc = make_v3_fiber([cp(0), cp(1)])
+    doc['control_points'][0]['segment_to_next']['metadata_version'] = 2
+    assert not fiber_merge.is_fiber_doc(doc)
+
+
+@pytest.mark.parametrize('mutation', ['missing_mode', 'missing_segment',
+                                      'final_segment', 'nonpositive_scale'])
+def test_v3_fiber_requires_complete_non_repaired_schema(mutation):
+    doc = make_v3_fiber([cp(0), cp(1), cp(2)])
+    if mutation == 'missing_mode':
+        del doc['optimization_mode']
+    elif mutation == 'missing_segment':
+        del doc['control_points'][0]['segment_to_next']
+    elif mutation == 'final_segment':
+        doc['control_points'][-1]['segment_to_next'] = v3_segment()
+    else:
+        doc['control_points'][0]['segment_to_next']['trace_to_base_scale'] = 0
+
+    assert not fiber_merge.is_fiber_doc(doc)
+    good = make_v3_fiber([cp(0), cp(1), cp(2)])
+    result = merge_fibers(doc, good, copy.deepcopy(good))
+    assert not result['ok']
+    assert result['merged'] is None
+    assert result['conflicts']
+
+
+def test_review_invalidated_when_merged_geometry_was_not_reviewed():
+    """hendrik P1: one machine retraces, the other verifies the OLD
+    geometry; the merged (new) geometry must come back needing review."""
+    base = make_v3_fiber(BASE_CPS)
+    base['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 1, goal='global', bend=1.5)  # retrace, tag kept
+    remote['tags'] = []                             # reviewed old geometry
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['line_points'][5:8] == local['line_points'][5:8]
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG in merged['tags']
+    assert any('re-added' in note for note in result['notes'])
+
+
+def test_review_survives_when_merged_geometry_is_the_reviewed_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    base['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG, 'zebra']
+    remote['tags'] = []  # reviewed; geometry unchanged everywhere
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG not in merged['tags']
+    assert 'zebra' in merged['tags']
+
+
+def test_span_mix_of_two_reviewed_sides_needs_a_fresh_review():
+    """Both sides were reviewed, but the span-atomic merge combines
+    geometry no single reviewer ever saw."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 3, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG in merged['tags']
+
+
+def test_review_tag_removed_when_merged_geometry_has_no_traces():
+    """A merged line with no trace spans must not keep interp_unreviewed:
+    the GUI cannot clear it (generic tag controls reject the reserved tag
+    and review actions reject untraced fibers)."""
+    base = make_v3_fiber(BASE_CPS)  # reviewed trace geometry, no tag
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    for span in range(len(BASE_CPS) - 1):  # refit everything to Lasagna
+        set_v3_span(local, span, goal='lasagna', bend=0.5)
+    remote['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert not fiber_merge._has_trace_span(merged)
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG not in merged['tags']
+    assert any('removed' in note for note in result['notes'])

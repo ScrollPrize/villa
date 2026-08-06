@@ -38,6 +38,7 @@ extern const ShortcutDef RawPointsOverlay;
 extern const ShortcutDef ZoomIn;
 extern const ShortcutDef ZoomOut;
 extern const ShortcutDef ResetView;
+extern const ShortcutDef ZoomToFit;
 extern const ShortcutDef WorldOffsetZPos;
 extern const ShortcutDef WorldOffsetZNeg;
 extern const ShortcutDef CycleNextSegment;

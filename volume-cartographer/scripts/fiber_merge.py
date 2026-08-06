@@ -21,7 +21,8 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
 
 Merge semantics:
 
-- Same geometry on both sides (the incident case — divergent link edits):
+- Version 1 with the same geometry on both sides (the incident case —
+  divergent link edits):
   geometry and derived fields come wholesale from the newer-generation
   side; branches merge with set semantics (additions from both sides
   survive, base-aware deletions, approvals beat both pending and
@@ -34,8 +35,15 @@ Merge semantics:
   merge via diff3 (position-aligned against the base; overlapping edits
   conflict). The optimizer cannot run here, so line_points is set to the
   merged control points verbatim (C1 holds exactly) and the merged fiber
-  is tagged `needs_reoptimization`; VC3D offers to re-fit the line on
-  load.
+  is tagged `needs_reoptimization`; VC3D offers to re-fit the line on load.
+  This legacy rule applies only to version 1 fibers.
+- Version 3: dense CP-to-CP slices and their CP-owned segment descriptors
+  are atomic. Independent local/remote changed runs merge only when at
+  least one complete unchanged base span separates them. The selected
+  dense slices are concatenated exactly, so descriptors are never dropped
+  and no placeholder/reoptimization is needed. Overlapping, adjacent, or
+  unalignable changes are manual conflicts. `optimization_mode` uses
+  ordinary base-aware three-way scalar semantics.
 - A link whose anchor control point was deleted by the merged geometry
   makes the whole merge a conflict: links are never silently dropped.
 - After any merge that involves links, the caller must run
@@ -51,6 +59,7 @@ import json
 import math
 
 POS_TOL = 1.0e-6
+LINE_POS_TOL = 1.0e-8
 
 # Matches finiteDirection's epsilon guard: a vector this short has no
 # usable direction.
@@ -59,6 +68,18 @@ _DIR_EPS = 1.0e-12
 REOPTIMIZE_TAG = 'needs_reoptimization'
 # ^ consumed by VC3D's load-time re-optimization prompt; keep the literal
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
+
+TRACE_NEEDS_REVIEW_TAG = 'interp_unreviewed'
+# ^ VC3D's review workflow for prediction-traced geometry; keep the
+#   literal in sync with kTraceNeedsReviewTag in
+#   LineAnnotationFiberSegments.hpp. A traced fiber WITHOUT the tag counts
+#   as reviewed, so a review decision is only valid for the exact geometry
+#   the reviewer saw — merge_fibers re-adds the tag when the merged
+#   geometry differs from every reviewed side.
+
+
+def _cp_position(value):
+    return value.get('position') if isinstance(value, dict) else value
 
 
 def _finite_point(p):
@@ -74,6 +95,96 @@ def _finite_point(p):
         return False
 
 
+_SEGMENT_KEYS_V3 = {
+    'optimizer', 'metadata_version', 'tracer_version',
+    'interp_goal', 'interp_mode', 'metric', 'msg',
+    'normal_manifest', 'fiber_manifest', 'trace_to_base_scale',
+    'meeting_error_base_voxels', 'meeting_error_ratio', 'meeting_source',
+    'failure_code', 'failure_detail', 'lasagna_failure_code',
+    'lasagna_failure_detail', 'config',
+}
+_CONFIG_KEYS_COMMON = {
+    'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
+    'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
+    'beam_lookahead_steps', 'smoothness_weight',
+    'smoothness_normal_weight', 'smoothness_tangent_weight',
+    'smoothness_free_angle_degrees', 'cumulative_smoothness_steps',
+    'cumulative_smoothness_tangent_weight', 'initial_free_angle_degrees',
+    'max_step_factor',
+    'endpoint_accept_threshold_base_voxels',
+}
+_CONFIG_KEYS_V3 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
+
+
+def _valid_segment(segment):
+    if not isinstance(segment, dict):
+        return False
+    if (segment.get('metadata_version'), segment.get('tracer_version')) != (3, 2):
+        return False
+    if (set(segment) != _SEGMENT_KEYS_V3 or
+            segment.get('optimizer') != 'native_fiber_trace3d' or
+            not isinstance(segment.get('normal_manifest'), str) or
+            not isinstance(segment.get('fiber_manifest'), str)):
+        return False
+    config = segment.get('config')
+    numeric = [segment.get('trace_to_base_scale')]
+    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS_V3:
+        return False
+    numeric.extend(config.values())
+    if not all(isinstance(value, (int, float)) and
+               not isinstance(value, bool) and math.isfinite(value)
+               for value in numeric):
+        return False
+    if segment['trace_to_base_scale'] <= 0:
+        return False
+    goal = segment.get('interp_goal')
+    mode = segment.get('interp_mode')
+    metric = segment.get('metric')
+    strings = [segment.get(key) for key in (
+        'msg', 'meeting_source', 'failure_code', 'failure_detail',
+        'lasagna_failure_code', 'lasagna_failure_detail')]
+    if (not isinstance(goal, str) or
+            goal not in {'global', 'cspline', 'lasagna', 'trace'} or
+            not isinstance(mode, str) or
+            mode not in {'cspline', 'lasagna', 'trace'} or
+            not all(isinstance(value, str) for value in strings) or
+            (metric is not None and
+             (isinstance(metric, bool) or not isinstance(metric, (int, float)) or
+              not math.isfinite(metric) or metric < 0)) or
+            (mode == 'cspline' and metric is not None)):
+        return False
+    positive = {
+        'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
+        'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
+        'max_step_factor', 'endpoint_accept_threshold_base_voxels',
+    }
+    non_negative = _CONFIG_KEYS_V3 - positive
+    if (any(config[key] <= 0 for key in positive) or
+            any(config[key] < 0 for key in non_negative)):
+        return False
+    integer_keys = {
+        'cone_grid_size', 'beam_width', 'beam_lookahead_steps',
+        'cumulative_smoothness_steps',
+    }
+    if any(not isinstance(config[key], int) or isinstance(config[key], bool)
+           for key in integer_keys):
+        return False
+    if not 0 <= config['meeting_accept_max_error_ratio'] <= 1:
+        return False
+    error = segment.get('meeting_error_base_voxels')
+    ratio = segment.get('meeting_error_ratio')
+    if mode == 'trace':
+        return (metric is not None and bool(segment['normal_manifest']) and
+                bool(segment['fiber_manifest']) and
+                isinstance(error, (int, float)) and not isinstance(error, bool) and
+                math.isfinite(error) and error >= 0 and
+                isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
+                math.isfinite(ratio) and ratio >= 0 and
+                bool(segment['meeting_source']) and
+                not segment['failure_code'] and not segment['failure_detail'])
+    return error is None and ratio is None and not segment['meeting_source']
+
+
 def is_fiber_doc(doc):
     """Structural AND content validity for every field this module
     computes over. Malformed (possibly remote-controlled) input must be
@@ -81,22 +192,52 @@ def is_fiber_doc(doc):
     crashing mid-merge."""
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
-    if doc.get('version', 1) != 1:
-        return False  # the loader throws on unsupported versions
-    for key in ('control_points', 'line_points'):
-        points = doc.get(key)
-        if not isinstance(points, list) or not all(_finite_point(p)
-                                                   for p in points):
+    version = doc.get('version', 1)
+    if version not in (1, 3):
+        return False
+    if version == 3 and 'optimization_mode' not in doc:
+        return False
+    if 'optimization_mode' in doc:
+        mode = doc['optimization_mode']
+        if (not isinstance(mode, str) or
+                mode not in {'lasagna', 'native_fiber_trace3d'}):
             return False
+    line_points = doc.get('line_points')
+    if not isinstance(line_points, list) or not all(_finite_point(p)
+                                                    for p in line_points):
+        return False
+    control_points = doc.get('control_points')
+    if not isinstance(control_points, list):
+        return False
+    if version == 1:
+        if not all(_finite_point(p) for p in control_points):
+            return False
+    else:
+        for index, cp in enumerate(control_points):
+            if (not isinstance(cp, dict) or
+                    not set(cp) <= {'position', 'segment_to_next'} or
+                    not _finite_point(cp.get('position'))):
+                return False
+            segment = cp.get('segment_to_next')
+            if index + 1 == len(control_points):
+                if 'segment_to_next' in cp:
+                    return False
+            elif 'segment_to_next' not in cp or not _valid_segment(segment):
+                return False
     tags = doc.get('tags', [])
     if not (isinstance(tags, list) and
             all(isinstance(tag, str) for tag in tags)):
         return False  # tags: null is unloadable ("tags must be an array")
     generation = doc.get('generation', 1)
-    if generation is not None and (isinstance(generation, bool) or
-                                   not isinstance(generation, (int, float)) or
-                                   not math.isfinite(generation)):
-        return False
+    if generation is not None:
+        if version == 3:
+            if (isinstance(generation, bool) or
+                    not isinstance(generation, int) or generation < 0):
+                return False
+        elif (isinstance(generation, bool) or
+              not isinstance(generation, (int, float)) or
+              not math.isfinite(generation)):
+            return False
     return True
 
 
@@ -106,6 +247,8 @@ def pos_eq(a, b, tol=POS_TOL):
     sqrt(3)*tol apart that the loader rejects — the exact class of
     inconsistency the destructive repair prompt punishes."""
     try:
+        a = _cp_position(a)
+        b = _cp_position(b)
         if len(a) != 3 or len(b) != 3:
             return False
         d2 = 0.0
@@ -125,7 +268,8 @@ def _seq_eq(a, b):
 
 
 def _dist2(a, b):
-    return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))
+    return sum((float(x) - float(y)) ** 2
+               for x, y in zip(_cp_position(a), _cp_position(b)))
 
 
 def _normalized(v):
@@ -321,6 +465,186 @@ def merge_control_points(base, local, remote):
     return merged, regions, conflicts
 
 
+def _control_line_indices(doc):
+    """Locate each CP on the dense line with VC3D's ordered 1e-8 rule."""
+    indices = []
+    search_from = 0
+    line = doc['line_points']
+    for control_index, control in enumerate(doc['control_points']):
+        match = next(
+            (line_index for line_index in range(search_from, len(line))
+             if pos_eq(line[line_index], control, tol=LINE_POS_TOL)),
+            None)
+        if match is None:
+            return None, (f"control point {control_index} is not an ordered "
+                          "dense-line point")
+        indices.append(match)
+        search_from = match + 1
+    return indices, None
+
+
+def _v3_chunks(doc, anchor_indices):
+    """Partition a v3 fiber at common CP anchors.
+
+    Each chunk owns all CP descriptors whose following spans lie in the
+    chunk. Its terminal CP contributes position only; its descriptor belongs
+    to the next chunk. Prefix/suffix chunks also carry extrapolated tails.
+    """
+    controls = doc['control_points']
+    if not controls:
+        return None, "version-3 span merge requires at least one control point"
+    line_indices, error = _control_line_indices(doc)
+    if error:
+        return None, error
+
+    bounds = [-1] + list(anchor_indices) + [len(controls)]
+    chunks = []
+    for left, right in zip(bounds[:-1], bounds[1:]):
+        first_control = 0 if left < 0 else left
+        final_control = len(controls) - 1 if right == len(controls) else right
+        line_start = 0 if left < 0 else line_indices[left]
+        line_end = (len(doc['line_points']) - 1
+                    if right == len(controls) else line_indices[right])
+        if final_control < first_control or line_end < line_start:
+            return None, "version-3 anchor partition is not ordered"
+        chunks.append({
+            'start_controls': copy.deepcopy(controls[first_control:final_control]),
+            'end_control': copy.deepcopy(controls[final_control]),
+            'end_position': copy.deepcopy(_cp_position(controls[final_control])),
+            'line_points': copy.deepcopy(doc['line_points'][line_start:line_end + 1]),
+        })
+    return chunks, None
+
+
+def _v3_chunk_equal(a, b):
+    return (a['start_controls'] == b['start_controls'] and
+            a['end_position'] == b['end_position'] and
+            a['line_points'] == b['line_points'])
+
+
+def _base_span_count(left_anchor, right_anchor, control_count):
+    first = 0 if left_anchor < 0 else left_anchor
+    final = control_count - 1 if right_anchor == control_count else right_anchor
+    return max(0, final - first)
+
+
+def merge_v3_span_geometry(base, local, remote):
+    """Conservatively merge complete v3 span results.
+
+    CP topology is aligned through common base anchors. A selected chunk is
+    copied verbatim from one input: its dense geometry and every CP-owned
+    descriptor therefore remain one atomic result. Different local/remote
+    changed chunks require an unchanged base span between them.
+    """
+    base_controls = base['control_points']
+    local_matches = dict(_lcs_matches(base_controls, local['control_points']))
+    remote_matches = dict(_lcs_matches(base_controls, remote['control_points']))
+    base_anchors = [index for index in sorted(local_matches)
+                    if index in remote_matches]
+    local_anchors = [local_matches[index] for index in base_anchors]
+    remote_anchors = [remote_matches[index] for index in base_anchors]
+
+    base_chunks, error = _v3_chunks(base, base_anchors)
+    if error:
+        return None, [f"base fiber: {error}"]
+    local_chunks, error = _v3_chunks(local, local_anchors)
+    if error:
+        return None, [f"local fiber: {error}"]
+    remote_chunks, error = _v3_chunks(remote, remote_anchors)
+    if error:
+        return None, [f"remote fiber: {error}"]
+
+    anchor_bounds = [-1] + base_anchors + [len(base_controls)]
+    owners = []
+    selected = []
+    conflicts = []
+    for index, (base_chunk, local_chunk, remote_chunk) in enumerate(
+            zip(base_chunks, local_chunks, remote_chunks)):
+        local_changed = not _v3_chunk_equal(local_chunk, base_chunk)
+        remote_changed = not _v3_chunk_equal(remote_chunk, base_chunk)
+        if local_changed and remote_changed:
+            if _v3_chunk_equal(local_chunk, remote_chunk):
+                owners.append('both')
+                selected.append(local_chunk)
+            else:
+                left = anchor_bounds[index]
+                right = anchor_bounds[index + 1]
+                conflicts.append(
+                    "version-3 span run changed differently on both sides "
+                    f"between base anchors {left} and {right}")
+                owners.append('conflict')
+                selected.append(base_chunk)
+        elif local_changed:
+            owners.append('local')
+            selected.append(local_chunk)
+        elif remote_changed:
+            owners.append('remote')
+            selected.append(remote_chunk)
+        else:
+            owners.append('none')
+            selected.append(base_chunk)
+    if conflicts:
+        return None, conflicts
+
+    local_only = [i for i, owner in enumerate(owners) if owner == 'local']
+    remote_only = [i for i, owner in enumerate(owners) if owner == 'remote']
+    for local_index in local_only:
+        for remote_index in remote_only:
+            low, high = sorted((local_index, remote_index))
+            separated = any(
+                owners[middle] == 'none' and
+                _base_span_count(anchor_bounds[middle],
+                                 anchor_bounds[middle + 1],
+                                 len(base_controls)) > 0
+                for middle in range(low + 1, high))
+            if not separated:
+                return None, [
+                    "version-3 local and remote span changes are adjacent; "
+                    "an unchanged base span is required between them"
+                ]
+
+    merged_controls = []
+    merged_line = []
+    for index, chunk in enumerate(selected):
+        chunk_line = chunk['line_points']
+        if not chunk_line:
+            return None, [f"version-3 span chunk {index} has no dense line points"]
+        if merged_line:
+            if merged_line[-1] != chunk_line[0]:
+                return None, [
+                    "version-3 selected span runs do not meet at an exact "
+                    f"shared control point before chunk {index}"
+                ]
+            merged_line.extend(copy.deepcopy(chunk_line[1:]))
+        else:
+            merged_line.extend(copy.deepcopy(chunk_line))
+        merged_controls.extend(copy.deepcopy(chunk['start_controls']))
+    merged_controls.append(copy.deepcopy(selected[-1]['end_control']))
+
+    if len(merged_controls) < 1 or len(merged_line) < 1:
+        return None, ["version-3 span merge produced empty geometry"]
+    return {
+        'control_points': merged_controls,
+        'line_points': merged_line,
+        'owners': owners,
+    }, []
+
+
+def merge_v3_optimization_mode(base, local, remote):
+    """Base-aware merge of the user-controlled fiber-wide policy."""
+    base_mode = base.get('optimization_mode', 'lasagna')
+    local_mode = local.get('optimization_mode', 'lasagna')
+    remote_mode = remote.get('optimization_mode', 'lasagna')
+    if local_mode == remote_mode:
+        return local_mode, None
+    if local_mode == base_mode:
+        return remote_mode, None
+    if remote_mode == base_mode:
+        return local_mode, None
+    return None, ("optimization_mode changed differently on both sides "
+                  f"({local_mode!r} vs {remote_mode!r})")
+
+
 def _branches_of(doc):
     branches = doc.get('branches', [])
     return branches if isinstance(branches, list) else []
@@ -511,6 +835,23 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
     return merged, notes, stats
 
 
+def _has_trace_span(doc):
+    """True when any span's stored geometry was produced by the prediction
+    tracer (v3 interp_mode == 'trace')."""
+    if doc.get('version', 1) != 3:
+        return False
+    control_points = doc.get('control_points') or []
+    for cp in control_points[:-1]:
+        segment = cp.get('segment_to_next') if isinstance(cp, dict) else None
+        if isinstance(segment, dict) and segment.get('interp_mode') == 'trace':
+            return True
+    return False
+
+
+def _geometry_pair(doc):
+    return (doc.get('control_points'), doc.get('line_points'))
+
+
 def merge_tags(base_doc, local_doc, remote_doc):
     base = list(base_doc.get('tags', []) or [])
     local = list(local_doc.get('tags', []) or [])
@@ -546,7 +887,7 @@ def _rebind_local_anchors(entries, control_points, line_points):
                              "geometry")
         entry['control_point_index'] = index
         entry['control_point_position'] = [float(x)
-                                           for x in control_points[index]]
+                                           for x in _cp_position(control_points[index])]
         tangent = endpoint_tangent(line_points, entry['control_point_position'])
         entry['control_point_direction'] = _snapped_direction(
             entry.get('control_point_direction'), tangent)
@@ -623,14 +964,16 @@ def merge_fibers(base, local, remote):
                       {_branch_target(entry) for entry in links_to_any(base)})
 
     if local == remote or remote == base:
-        result.update(ok=True, merged=copy.deepcopy(local),
+        merged = copy.deepcopy(local)
+        result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
                              if remote == base and local != remote else
                              ["both sides identical"]))
         return result
     if local == base:
-        result.update(ok=True, merged=copy.deepcopy(remote),
+        merged = copy.deepcopy(remote)
+        result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
         return result
@@ -660,7 +1003,35 @@ def merge_fibers(base, local, remote):
     stats = dict(branch_stats)
     reoptimize = False
 
-    if geometry_same:
+    if base.get('version', 1) == 3:
+        span_geometry, span_conflicts = merge_v3_span_geometry(
+            base, local, remote)
+        if span_conflicts:
+            result['conflicts'] = span_conflicts
+            return result
+        mode, mode_conflict = merge_v3_optimization_mode(base, local, remote)
+        if mode_conflict:
+            result['conflicts'] = [mode_conflict]
+            return result
+        carrier = span_geometry
+        local_runs = sum(owner == 'local' for owner in span_geometry['owners'])
+        remote_runs = sum(owner == 'remote' for owner in span_geometry['owners'])
+        both_runs = sum(owner == 'both' for owner in span_geometry['owners'])
+        stats['span_runs_local'] = local_runs
+        stats['span_runs_remote'] = remote_runs
+        stats['span_runs_both'] = both_runs
+        stats['geometry_merged'] = bool(local_runs and remote_runs)
+        if local_runs and remote_runs:
+            notes.append("merged separated version-3 span runs without "
+                         "reoptimizing or replacing their descriptors")
+        if not (_seq_eq(carrier['control_points'], newer['control_points']) and
+                _seq_eq(carrier['line_points'], newer['line_points'])):
+            merged_branches, anchor_conflict = _rebind_local_anchors(
+                merged_branches, carrier['control_points'], carrier['line_points'])
+            if anchor_conflict:
+                result['conflicts'] = [anchor_conflict]
+                return result
+    elif geometry_same:
         # The incident case: divergent link/metadata edits over identical
         # geometry. Every entry was VC3D-written against this geometry, so
         # no re-anchoring is needed.
@@ -714,9 +1085,15 @@ def merge_fibers(base, local, remote):
             # merged control points AS the line — trivially satisfying the
             # loader's control-points-on-line invariant — and tag for
             # re-optimization.
-            merged_cps = [[float(x) for x in p] for p in merged_cps]
+            normalized_cps = []
+            for cp in merged_cps:
+                position = [float(x) for x in _cp_position(cp)]
+                normalized_cps.append(
+                    {'position': position} if isinstance(cp, dict) else position)
+            merged_cps = normalized_cps
             carrier = {'control_points': merged_cps,
-                       'line_points': copy.deepcopy(merged_cps)}
+                       'line_points': [[float(x) for x in _cp_position(cp)]
+                                       for cp in merged_cps]}
             reoptimize = True
             notes.append("geometry merged from both sides; line set to the "
                          "control-point polyline pending reoptimization in "
@@ -735,6 +1112,8 @@ def merge_fibers(base, local, remote):
     merged = copy.deepcopy(newer)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
+    if base.get('version', 1) == 3:
+        merged['optimization_mode'] = mode
     if 'hv_classification' in carrier:
         merged['hv_classification'] = copy.deepcopy(carrier['hv_classification'])
     elif not geometry_same and 'hv_classification' in merged:
@@ -751,6 +1130,30 @@ def merge_fibers(base, local, remote):
     merged['tags'] = merge_tags(base, local, remote)
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
+    # A review decision (absence of TRACE_NEEDS_REVIEW_TAG) covers only the
+    # geometry the reviewer actually saw. If the merged result still
+    # contains prediction-traced spans but its geometry matches no side
+    # that lacks the tag, the review is stale — re-add the tag (fail-safe:
+    # unreviewed wins). Catches verify-vs-retrace races and span-mixing
+    # merges where neither reviewer saw the combined line. Conversely, a
+    # merged line with NO trace spans has left the review workflow: the
+    # tag must go, because VC3D's generic tag controls reject it and its
+    # review actions reject untraced fibers, which would strand the tag
+    # (mirrors applyTraceReviewTags on save).
+    if _has_trace_span(merged):
+        if TRACE_NEEDS_REVIEW_TAG not in merged['tags']:
+            reviewed_geometries = [
+                _geometry_pair(doc) for doc in (local, remote)
+                if TRACE_NEEDS_REVIEW_TAG not in (doc.get('tags') or [])
+            ]
+            if _geometry_pair(merged) not in reviewed_geometries:
+                merged['tags'].append(TRACE_NEEDS_REVIEW_TAG)
+                notes.append('merged geometry differs from every reviewed '
+                             'side; re-added ' + TRACE_NEEDS_REVIEW_TAG)
+    elif TRACE_NEEDS_REVIEW_TAG in merged['tags']:
+        merged['tags'].remove(TRACE_NEEDS_REVIEW_TAG)
+        notes.append('merged geometry contains no trace spans; removed ' +
+                     TRACE_NEEDS_REVIEW_TAG)
     merged['generation'] = max(generation_local, generation_remote) + 1
     manual_tag_conflict = _merge_manual_hv_tag(base, local, remote, merged,
                                                notes)
@@ -788,7 +1191,6 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     if not is_fiber_doc(a) or not is_fiber_doc(b):
         out['conflicts'].append(f"{a_name} or {b_name} is not a vc3d_fiber document")
         return out
-
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']
     a_entries = links_to(a, b_name)
@@ -809,7 +1211,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     # be 2x tolerance apart from each other. VC3D-written fields are
     # already exact, so consistent pairs still see zero changes.
     def snap_position(entry, key, point, doc_flag):
-        set_field(entry, key, [float(x) for x in point], doc_flag)
+        set_field(entry, key, [float(x) for x in _cp_position(point)], doc_flag)
 
     def snap_direction(entry, key, tangent, doc_flag):
         set_field(entry, key, _snapped_direction(entry.get(key), tangent),
@@ -932,6 +1334,10 @@ def summarize(result):
         parts.append("control points: %d local + %d remote region(s)" %
                      (stats.get('cp_regions_local', 0),
                       stats.get('cp_regions_remote', 0)))
+    if stats.get('span_runs_local') or stats.get('span_runs_remote'):
+        parts.append("v3 span runs: %d local + %d remote" %
+                     (stats.get('span_runs_local', 0),
+                      stats.get('span_runs_remote', 0)))
     added = stats.get('links_added_local', 0) + stats.get('links_added_remote', 0)
     if added:
         parts.append(f"links +{added}")

@@ -35,9 +35,9 @@ repository secret, file, log, cache, or artifact.
   on a Vercel `repository_dispatch`. It never checks out or executes deployed
   branch code.
 - `progress-prizes-production.yml` provides guarded `validate`, `dry-run`,
-  `prepare`, `activate`, and `verify` operations after the complete staging
-  rehearsal has passed. Every authenticated job is literal in that top-level
-  workflow and calls the same local action exercised by staging.
+  `prepare`, `activate`, `reconcile-active`, and `verify` operations after the
+  complete staging rehearsal has passed. Every authenticated job is literal in
+  that top-level workflow and calls the same local action exercised by staging.
 - `progress-prizes-schedule.yml` is the secret-free scheduler added only after
   production `validate` and `dry-run` passed. Reaching `main` enables its
   Pacific-time schedules; a manual dispatch is permanently restricted to a
@@ -255,8 +255,12 @@ assertion.workflow_sha == assertion.sha
 The schedule milestone does not receive Google configuration or OIDC. It
 computes the Pacific window and dispatches this exact production workflow with
 `GITHUB_TOKEN`; GitHub documents `workflow_dispatch` as an event that is allowed
-to create a new run from `GITHUB_TOKEN`. The production WIF condition therefore
-does not need to permit the schedule workflow path or a `schedule` event.
+to create a new run from `GITHUB_TOKEN`. The rehearsal uses the same pattern for
+its read-only production preflight: it dispatches `validate`, binds the exact
+returned child run, and awaits its result. Production Google authentication
+therefore remains confined to the production workflow. The production WIF
+condition does not need to permit the schedule or rehearsal workflow paths, or
+a `schedule` event.
 
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when
@@ -428,6 +432,15 @@ the immediately following month. Leave `request-id` empty for every manual run.
   Google token, authenticates at cutoff, reacquires a zero-wait GitHub lease,
   closes the source, opens and reload-verifies the target, then merges only the
   activated commit.
+- `reconcile-active` is a manual break-glass repair for a rollover that humans
+  already completed. Run `verify active` first. Reconciliation proceeds only if
+  the old form is published and closed, the new form is published and open, the
+  website points exactly to the new responder URL, and titles, structure,
+  linked-Sheet status, capabilities, ACLs, and copy fingerprint all match. It
+  requires the same secret-free activation Environment approval and may update
+  only the source `CLOSED` and target `ACTIVE` Drive `appProperties`. It never
+  changes a form, response, permission, folder, publishing state, or website
+  file. A second run is read-only and succeeds idempotently.
 
 If preparation, activation, or merge stops, rerun the same operation and cycle.
 Managed Drive markers make Google copy and close/open recovery idempotent. A
@@ -437,6 +450,34 @@ commit; any multi-file, merge, wrong-path, or query-bearing change fails closed.
 Never use simulated time, fault controls, alternate branches, or staging folders
 for production; those inputs are absent and the shared action rejects them
 before authentication.
+
+Manual recovery uses public controls only; Google configuration stays inside the
+protected Environment:
+
+```bash
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=activate -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=verify -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+gh workflow run progress-prizes-production.yml --ref main \
+  -f operation=reconcile-active -f source-cycle=2026-07 -f target-cycle=2026-08 \
+  -f verify-mode=active
+```
+
+The trusted GitHub coordinator prints only these diagnostic codes:
+`main-ref-moved`, `ambiguous-pr`, `invalid-page-head`,
+`invalid-pr-association`, `invalid-main-ref`, `completed-state-missing`, and
+`unexpected-error`. The code is safe to include in an incident report; API
+bodies and private identifiers are never printed.
+
+Generated `codex/progress-prize-YYYY-MM` branches and their PRs are strictly
+marker-only. Never push a human guideline, copy, or formatting commit to a
+generated rollover branch. Put editorial changes on a separate branch and PR;
+otherwise the exact one-commit/one-file activation gate will reject the
+rollover. Production never deletes an old form or any response. The cleanup
+operation is staging-only and cannot be selected in the production workflow.
 
 ## Automated schedule and immediate smoke
 
@@ -455,10 +496,13 @@ bound to the exact child run ID and public Actions URL.
   observed date is the actual last calendar day. The production workflow—not
   the scheduler—runs tests and the Vercel gate, requests human approval, waits
   for cutoff without a Google token, then authenticates.
-- `00:17` and `06:47` Pacific on the first day are independent recovery probes.
-  Delayed final-day events retain the previous source cycle through that first
-  day, while every day-two event no-ops. If an exact production run is already
-  nonterminal, the scheduler does not enqueue a stale duplicate.
+- `00:17` Pacific remains a first-day recovery probe. `06:47` Pacific retries
+  on days 1–7, always targeting the previous month's incomplete rollover. A
+  delayed day-7 event may cross local midnight before the day-8 slot; a true
+  day-8 event no-ops. If an exact production run is already nonterminal, the
+  scheduler does not enqueue a stale duplicate. A completed rollover reaches
+  read-only active verification and never creates another form or repeats
+  publishing mutations.
 
 Production and scheduler concurrency groups never cancel an in-progress run and
 use GitHub's queued concurrency mode so a manual race cannot silently replace a

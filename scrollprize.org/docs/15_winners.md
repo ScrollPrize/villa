@@ -38,11 +38,68 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
   />
 </head>
 
-Vesuvius Challenge has awarded **<AwardedTotal />** in prizes!
+Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
-This page lists all the prizes awarded so far:
+### \$33,500 Progress Prizes (July 2026)
 
-### \$3,000 Progress Prizes (June, 2026)
+**Goal:** Improve the tools and training methods needed to read the scrolls.
+
+<div className="flex flex-row flex-wrap">
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Hob3rMallow/scrollfiesta_public">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$20,000</div><span className="font-semibold">ScrollFiesta</span>: Ben Kyles / @hari_seldon</div>
+    <div className="text-sm text-dim">Continued development of the automatic surface mesher: now villa-compatible (zarr in, tifxyz out), snaps to papyrus in the CT scan, and produces constraints for spiral fitting.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/WillStevens/scrollreading/tree/main/pipeline9">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">Optimising patch connectivity</span>: William Stevens</div>
+    <div className="text-sm text-dim">Identifies and removes problem areas that cause sheet switching, leaving a scaffolding of known-good patches; run across all of Scroll 4.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/altommo/scrollfiesta-mls-cubecl">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Portable GPU kernels for ScrollFiesta</span>: Alan Thompson</div>
+    <div className="text-sm text-dim">A Rust/CubeCL driver for ScrollFiesta's MLS-midpoint projection hotspot that runs on AMD, NVIDIA, and WGPU.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1177">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Zarr 3 read fixes</span>: Prasad Khake</div>
+    <div className="text-sm text-dim">Fixes multiscale zarr 3 reads in the Python vesuvius Volume and restores an opt-in chunk cache.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/khj1222/vesuvius-challenge">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Ink detection validation harness</span>: Hyojun Kwon</div>
+    <div className="text-sm text-dim">A reworked ink-detection tutorial with proper held-out validation splits, plus an upstream OOM fix.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/joe-carr-data/windcheck">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">windcheck</span>: Josep Carreras</div>
+    <div className="text-sm text-dim">Detects self-intersections in tifxyz surfaces, catching silent wrap-crossing errors for large-scale filtering.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/aviad12g/tifxyz-doctor">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">TIFXYZ Doctor</span>: Aviad Cohen</div>
+    <div className="text-sm text-dim">A deterministic QA and triage tool for tifxyz surface grids: metadata, consistency, distortion, and topology checks, plus a merged VC3D bounds fix.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1072">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Faster decohesion augmentation</span>: J. Miguel Giraldo</div>
+    <div className="text-sm text-dim">Vectorized the DecohesionTransform training augmentation, replacing a per-iteration GPU kernel loop.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/TAUIL-Abd-Elilah/vesuvius-repro">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Reproducibility fixes & ROI inference</span>: TAUIL Abd Elilah</div>
+    <div className="text-sm text-dim">Assorted merged fixes and ROI inference support, plus a negative-result analysis of cross-scroll ink-signal measurement.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/7jycwjmbfn-eng/spiral-fit-consumer-gpu">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Spiral fitting on consumer GPUs</span>: Shuhan Yang</div>
+    <div className="text-sm text-dim">Makes the official spiral fitter run on 12 GB cards and without the native vc C++ extension.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1284">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">tifxyz repair & tracing fixes</span>: Erwin Nieuwlaar</div>
+    <div className="text-sm text-dim">Fixes tifxyz meta.json bounding boxes and rescales neural-tracing displacements for non-training voxel sizes.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/Bullo27/scroll-data-audit">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">scroll-data-audit</span>: Matteo Bulloni</div>
+    <div className="text-sm text-dim">Defect-hunting across the open-data catalog and volume-cartographer, with catalog metadata checks and merged VC3D fixes.</div>
+  </a>
+  <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/ScrollPrize/villa/pull/1268">
+    <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">fit_spiral fixes</span>: Nicolas Dolegieviez</div>
+    <div className="text-sm text-dim">Four merged fixes making fit_spiral work on Windows and turning silently zeroed losses into loud failures.</div>
+  </a>
+</div>
+
+### \$3,000 Progress Prizes (June 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.<br/>
 **Announcement:** <a href="https://scrollprize.substack.com/p/a-new-1m-grand-prize-for-2027">Blog post</a>

@@ -446,7 +446,8 @@ def _dbm_source_id(key_ordinal, source_index):
 
 def load_tracks_from_dbm(
         path, z_lo=None, z_hi=None, return_families=False,
-        return_source_ids=False, show_progress=True, low_memory=False):
+        return_source_ids=False, show_progress=True, low_memory=False,
+        progress=None):
     # Load tracks written by extract_surface_tracks.py. Each DBM value is a
     # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
     # within the full-resolution [z_lo, z_hi) ROI.
@@ -467,8 +468,14 @@ def load_tracks_from_dbm(
     source_ids = []
     with dbm.open(path, 'r') as db:
         keys = db.keys()
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading tracks',
+                step=0, total_steps=len(keys), unit='DB keys')
         key_ordinals = {key: index for index, key in enumerate(sorted(keys))}
-        for key in tqdm(keys, desc='loading tracks', disable=not show_progress):
+        for key_number, key in enumerate(tqdm(
+                keys, desc='loading tracks',
+                disable=not show_progress or progress is not None), start=1):
             family = None
             if return_families:
                 prefix = key.decode().split(':', 1)[0]
@@ -476,6 +483,9 @@ def load_tracks_from_dbm(
                     'vertical' if prefix in ('vx', 'vy') else None)
             entries = pickle.loads(db[key])
             if not entries:
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             if low_memory:
                 for source_index, entry in enumerate(entries):
@@ -494,12 +504,18 @@ def load_tracks_from_dbm(
                     if return_source_ids:
                         source_ids.append(_dbm_source_id(
                             key_ordinals[key], source_index))
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             # Vectorize the per-track z min/max across the whole key: concatenate
             # every non-empty track's z column and reduce per segment, rather
             # than calling .min()/.max() once per track.
             idx = [i for i in range(len(entries)) if len(entries[i])]
             if not idx:
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
             zcat = np.concatenate([entries[i][:, 0] for i in idx])
@@ -520,6 +536,9 @@ def load_tracks_from_dbm(
                 if return_source_ids:
                     source_ids.append(_dbm_source_id(
                         key_ordinals[key], source_index))
+            if progress is not None:
+                progress.update(
+                    key_number, detail=f'{len(tracks):,} tracks retained')
     if return_families and return_source_ids:
         return tracks, families, np.asarray(source_ids, dtype=np.uint64)
     if return_families:
@@ -578,7 +597,7 @@ def validate_track_sampling_config(config):
             raise ValueError('track_max_tortuosity must be null or a finite number >= 1')
         max_tortuosity = float(max_tortuosity)
 
-    max_crossings = config.get('max_track_crossing_per_step', 0)
+    max_crossings = config.get('track_max_track_crossing_per_step', 0)
     if (isinstance(max_crossings, bool) or not isinstance(max_crossings, (int, float))
             or not math.isfinite(float(max_crossings))
             or not float(max_crossings).is_integer() or int(max_crossings) < 0):
@@ -597,30 +616,38 @@ def validate_track_sampling_config(config):
     crossing_precompute_max = max(
         int(crossing_precompute_max), int(max_crossings))
 
-    crossing_mode = config.get('track_crossing_mode', 'count')
+    crossing_mode = config.get('track_crossing_mode', 'track_walk')
     if crossing_mode not in ('count', 'track_walk'):
         raise ValueError(
             "track_crossing_mode must be 'count' or 'track_walk'")
     walk_values = {}
     for key, default in (
-            ('min_walk_steps_per_track', 24),
-            ('max_walk_steps_per_track', 256),
-            ('n_walks_per_track', 4)):
+            ('track_min_walk_steps_per_track', 24),
+            ('track_max_walk_steps_per_track', 256),
+            ('track_min_walks_per_track', 2),
+            ('track_max_walks_per_track', 4)):
         value = config.get(key, default)
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(float(value))
                 or not float(value).is_integer() or int(value) <= 0):
             raise ValueError(f'{key} must be a positive integer')
         walk_values[key] = int(value)
-    if (walk_values['min_walk_steps_per_track']
-            > walk_values['max_walk_steps_per_track']):
+    if (walk_values['track_min_walk_steps_per_track']
+            > walk_values['track_max_walk_steps_per_track']):
         raise ValueError(
             'min_walk_steps_per_track must be <= max_walk_steps_per_track')
-    require_loop = config.get(
-        'track_walk_require_loop_consistency', False)
-    if not isinstance(require_loop, bool):
+    if (walk_values['track_min_walks_per_track']
+            > walk_values['track_max_walks_per_track']):
         raise ValueError(
-            'track_walk_require_loop_consistency must be boolean')
+            'min_walks_per_track must be <= max_walks_per_track')
+    minimum_cycle_travel = config.get(
+        'track_walk_minimum_cycle_travel', 20.0)
+    if (isinstance(minimum_cycle_travel, bool)
+            or not isinstance(minimum_cycle_travel, (int, float))
+            or not math.isfinite(float(minimum_cycle_travel))
+            or float(minimum_cycle_travel) < 0):
+        raise ValueError(
+            'track_walk_minimum_cycle_travel must be a finite number >= 0')
 
     sample_spacings = {}
     for key, default in (
@@ -645,7 +672,7 @@ def validate_track_sampling_config(config):
         'crossing_precompute_max': crossing_precompute_max,
         'crossing_mode': crossing_mode,
         **walk_values,
-        'walk_require_loop_consistency': require_loop,
+        'walk_minimum_cycle_travel': float(minimum_cycle_travel),
         'min_sample_spacing': sample_spacings['track_min_sample_spacing'],
         'max_sample_spacing': sample_spacings['track_max_sample_spacing'],
     }
@@ -771,18 +798,21 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         return
     current = {
         'track_length_bin_weights': prepared_tracks.get('length_bin_weights'),
-        'max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
+        'track_max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
         'track_crossing_precompute_max': prepared_tracks.get(
             'crossing_precompute_max', 0),
         'track_crossing_mode': prepared_tracks.get(
-            'track_crossing_mode', 'count'),
-        'min_walk_steps_per_track': prepared_tracks.get(
-            'min_walk_steps_per_track', 24),
-        'max_walk_steps_per_track': prepared_tracks.get(
-            'max_walk_steps_per_track', 256),
-        'n_walks_per_track': prepared_tracks.get('n_walks_per_track', 4),
-        'track_walk_require_loop_consistency': prepared_tracks.get(
-            'track_walk_require_loop_consistency', False),
+            'track_crossing_mode', 'track_walk'),
+        'track_min_walk_steps_per_track': prepared_tracks.get(
+            'track_min_walk_steps_per_track', 24),
+        'track_max_walk_steps_per_track': prepared_tracks.get(
+            'track_max_walk_steps_per_track', 256),
+        'track_min_walks_per_track': prepared_tracks.get(
+            'track_min_walks_per_track', 2),
+        'track_max_walks_per_track': prepared_tracks.get(
+            'track_max_walks_per_track', 4),
+        'track_walk_minimum_cycle_travel': prepared_tracks.get(
+            'track_walk_minimum_cycle_travel', 20.0),
     }
     current.update({
         key: config[key] for key in current
@@ -813,9 +843,14 @@ def configure_prepared_track_sampling(prepared_tracks, config):
             f'prepared crossing ceiling ({prepared_maximum}); reload with a larger '
             'track_crossing_precompute_max')
     prepared_tracks['active_max_crossings'] = maximum
-    for key in ('min_walk_steps_per_track', 'max_walk_steps_per_track',
-                'n_walks_per_track'):
+    for key in (
+            'track_min_walk_steps_per_track',
+            'track_max_walk_steps_per_track',
+            'track_min_walks_per_track',
+            'track_max_walks_per_track'):
         prepared_tracks[key] = policy[key]
+    prepared_tracks['track_walk_minimum_cycle_travel'] = \
+        policy['walk_minimum_cycle_travel']
 
 
 def _track_tangent(track, raw_index, radius_voxels=12.0):
@@ -2133,14 +2168,35 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     track_np = np.ascontiguousarray(track_np, dtype=np.float32)
     if threshold <= 0 or anchor_tree is None:
         return np.ones(track_np.shape[0], dtype=bool)
-    dist, _ = anchor_tree.query(track_np, k=1, distance_upper_bound=float(threshold), workers=-1)
-    return np.isinf(dist)
+    # A full production store can contain close to a billion points.  Passing
+    # that array to scipy in one call makes query allocate point-count-sized
+    # distance and index arrays (16 bytes/point) in addition to its internal
+    # workspace.  Keep only the final one-byte mask resident and bound every
+    # query allocation.
+    chunk_size = max(
+        1, int(os.environ.get('FIT_SPIRAL_TRACK_EXCLUSION_CHUNK', '4000000')))
+    keep = np.empty(track_np.shape[0], dtype=bool)
+    progress = tqdm(
+        total=track_np.shape[0], desc='excluding track points',
+        unit='point', unit_scale=True,
+    )
+    try:
+        for begin in range(0, track_np.shape[0], chunk_size):
+            end = min(begin + chunk_size, track_np.shape[0])
+            dist, _ = anchor_tree.query(
+                track_np[begin:end], k=1,
+                distance_upper_bound=float(threshold), workers=-1)
+            keep[begin:end] = np.isinf(dist)
+            progress.update(end - begin)
+    finally:
+        progress.close()
+    return keep
 
 
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None):
+        crossing_cache=None, track_graph=None):
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2152,7 +2208,7 @@ def prepare_main_phase_tracks(
     max_crossings = policy['max_crossings']
     crossing_precompute_max = policy['crossing_precompute_max']
     crossing_mode = policy['crossing_mode']
-    require_walk_loop = policy['walk_require_loop_consistency']
+    minimum_cycle_travel = policy['walk_minimum_cycle_travel']
 
     input_track_count = len(tracks)
     packed_input = isinstance(tracks, PackedTrackCollection)
@@ -2168,6 +2224,10 @@ def prepare_main_phase_tracks(
         raise ValueError('track_source_ids must be parallel to tracks')
     if crossing_cache is not None and working_source_ids is None:
         raise ValueError('a crossing cache requires stable track_source_ids')
+    if track_graph is not None and working_source_ids is None:
+        raise ValueError('a track graph requires stable track_source_ids')
+    if crossing_cache is not None and track_graph is not None:
+        raise ValueError('pass either crossing_cache or track_graph, not both')
     if crossing_cache is not None and exclusion_radius > 0:
         print(
             'WARNING: track crossing cache cannot be used after point-level '
@@ -2199,7 +2259,8 @@ def prepare_main_phase_tracks(
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
 
     def finish_prepared(
-            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list):
+            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list,
+            crossing_csr_override=None):
         offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
         offsets_new[0] = 0
         np.cumsum(lengths_new, out=offsets_new[1:])
@@ -2218,21 +2279,32 @@ def prepare_main_phase_tracks(
             'active_max_crossings': 0,
             'crossing_precompute_max': (
                 crossing_precompute_max
-                if working_families is not None or crossing_cache is not None
+                if (working_families is not None
+                    or crossing_cache is not None
+                    or track_graph is not None)
                 else 0),
             'track_crossing_mode': crossing_mode,
-            'track_walk_require_loop_consistency': require_walk_loop,
-            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
-            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
-            'n_walks_per_track': policy['n_walks_per_track'],
+            'track_walk_minimum_cycle_travel': minimum_cycle_travel,
+            'track_min_walk_steps_per_track': policy['track_min_walk_steps_per_track'],
+            'track_max_walk_steps_per_track': policy['track_max_walk_steps_per_track'],
+            'track_min_walks_per_track':
+                policy['track_min_walks_per_track'],
+            'track_max_walks_per_track':
+                policy['track_max_walks_per_track'],
         }
         if ((crossing_mode == 'count' and crossing_precompute_max > 0)
                 or crossing_mode == 'track_walk'):
             crossing_index = None
-            restricted_csr = None
+            restricted_csr = crossing_csr_override
             walk_index = None
             native = _load_native_track_crossings()
-            if crossing_cache is not None:
+            active_crossing_cache = crossing_cache
+            if restricted_csr is None and track_graph is not None:
+                active_crossing_cache = track_graph
+                print(
+                    f'track crossings: using TrackGraph cache for '
+                    f'{len(surviving_indices)} surviving tracks')
+            if active_crossing_cache is not None:
                 eligible_source_ids = working_source_ids[surviving_indices]
                 try:
                     if crossing_mode == 'track_walk':
@@ -2241,53 +2313,55 @@ def prepare_main_phase_tracks(
                                     native, 'prepare_cached_walk_index')):
                             walk_index = native.prepare_cached_walk_index(
                                 np.asarray(
-                                    crossing_cache['source_ids'],
+                                    active_crossing_cache['source_ids'],
                                     dtype=np.uint64),
                                 np.asarray(
-                                    crossing_cache['offsets'],
+                                    active_crossing_cache['offsets'],
                                     dtype=np.int64),
                                 np.asarray(
-                                    crossing_cache['partners'],
+                                    active_crossing_cache['partners'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['self_local'],
+                                    active_crossing_cache['self_local'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['partner_local'],
+                                    active_crossing_cache['partner_local'],
                                     dtype=np.int32),
+                                np.asarray(
+                                    active_crossing_cache['positions'],
+                                    dtype=np.float64),
                                 np.asarray(
                                     eligible_source_ids, dtype=np.uint64),
-                                np.asarray(lengths_new, dtype=np.int32),
-                                require_loop_consistency=require_walk_loop)
+                                np.asarray(lengths_new, dtype=np.int32))
                         else:
                             restricted_csr = _restrict_crossing_partner_csr(
-                                crossing_cache, eligible_source_ids)
+                                active_crossing_cache, eligible_source_ids)
                     elif crossing_precompute_max > 0:
                         if (native is not None
                                 and hasattr(
                                     native, 'prepare_cached_crossing_index')):
                             crossing_index = native.prepare_cached_crossing_index(
                                 np.asarray(
-                                    crossing_cache['source_ids'],
+                                    active_crossing_cache['source_ids'],
                                     dtype=np.uint64),
                                 np.asarray(
-                                    crossing_cache['offsets'],
+                                    active_crossing_cache['offsets'],
                                     dtype=np.int64),
                                 np.asarray(
-                                    crossing_cache['partners'],
+                                    active_crossing_cache['partners'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['self_local'],
+                                    active_crossing_cache['self_local'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['partner_local'],
+                                    active_crossing_cache['partner_local'],
                                     dtype=np.int32),
                                 np.asarray(
                                     eligible_source_ids, dtype=np.uint64),
                                 np.asarray(lengths_new, dtype=np.int32))
                         else:
                             restricted_csr = _restrict_crossing_partner_csr(
-                                crossing_cache, eligible_source_ids)
+                                active_crossing_cache, eligible_source_ids)
                     print(
                         f'track crossings: used cached CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
@@ -2348,11 +2422,12 @@ def prepare_main_phase_tracks(
                         restricted_csr['self_local'], dtype=np.int32)
                     walk_partner_local = np.asarray(
                         restricted_csr['partner_local'], dtype=np.int32)
+                    walk_positions = np.asarray(
+                        restricted_csr['positions'], dtype=np.float64)
                     walk_index = native.prepare_walk_index(
                         walk_offsets, walk_partners, walk_self,
-                        walk_partner_local,
-                        np.asarray(lengths_new, dtype=np.int32),
-                        require_loop_consistency=require_walk_loop)
+                        walk_partner_local, walk_positions,
+                        np.asarray(lengths_new, dtype=np.int32))
                 prepared['walk_index'] = walk_index
                 stats = native.walk_index_stats(prepared['walk_index'])
                 prepared['walk_index_stats'] = dict(stats)
@@ -2365,10 +2440,15 @@ def prepare_main_phase_tracks(
         configure_prepared_track_sampling(prepared, {
             'track_length_bin_weights': (
                 None if weights is None else weights.tolist()),
-            'max_track_crossing_per_step': max_crossings,
-            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
-            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
-            'n_walks_per_track': policy['n_walks_per_track'],
+            'track_max_track_crossing_per_step': max_crossings,
+            'track_min_walk_steps_per_track': policy['track_min_walk_steps_per_track'],
+            'track_max_walk_steps_per_track': policy['track_max_walk_steps_per_track'],
+            'track_min_walks_per_track':
+                policy['track_min_walks_per_track'],
+            'track_max_walks_per_track':
+                policy['track_max_walks_per_track'],
+            'track_walk_minimum_cycle_travel':
+                policy['walk_minimum_cycle_travel'],
         })
         return prepared
 
@@ -2421,53 +2501,81 @@ def prepare_main_phase_tracks(
             flat_zyx_np, lengths_new, surviving, surviving_tracks)
 
     if packed_input:
-        flat_materialized, packed_offsets = working_tracks.materialize()
-        working_tracks = _MemmapTrackCollection(
-            flat_materialized, packed_offsets)
-
-    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in working_tracks], axis=0)
-    track_id_np = np.concatenate([
-        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(working_tracks)
-    ])
+        flat_zyx_np, packed_offsets = working_tracks.materialize()
+        flat_zyx_np = np.asarray(flat_zyx_np, dtype=np.float32)
+        input_offsets = np.asarray(packed_offsets, dtype=np.int64)
+    else:
+        input_lengths = np.fromiter(
+            (len(track) for track in working_tracks),
+            dtype=np.int64, count=len(working_tracks))
+        input_offsets = np.empty(len(input_lengths) + 1, dtype=np.int64)
+        input_offsets[0] = 0
+        np.cumsum(input_lengths, out=input_offsets[1:])
+        flat_zyx_np = np.concatenate(
+            [t.astype(np.float32) for t in working_tracks], axis=0)
     keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
-    flat_zyx_np = flat_zyx_np[keep_np]
-    track_id_np = track_id_np[keep_np]
     num_tracks_orig = len(working_tracks)
-    new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
+    # Points are already grouped by track.  Segment reduction replaces the old
+    # int64 track-id-per-point array (7.3 GiB for the 2um store).
+    new_lengths = np.add.reduceat(
+        keep_np, input_offsets[:-1], dtype=np.int64)
     surviving = np.where(new_lengths >= 2)[0]
     print(f'kept {len(surviving)} / {len(working_tracks)} tracks')
     if len(surviving) == 0:
         return None
-    old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
-    old_to_new[surviving] = np.arange(len(surviving))
-    new_id = old_to_new[track_id_np]
-    keep2 = new_id >= 0
-    flat_zyx_np = flat_zyx_np[keep2]
-    new_id = new_id[keep2]
-    sort_idx = np.argsort(new_id, kind='stable')
-    flat_zyx_np = flat_zyx_np[sort_idx]
+    # Drop the residual 0/1-point tracks without constructing IDs or sorting:
+    # stable boolean compaction preserves both track and local-point order.
+    surviving_points = np.repeat(
+        new_lengths >= 2, np.diff(input_offsets))
+    keep_np &= surviving_points
+    del surviving_points
     lengths_new = new_lengths[surviving].astype(np.int64)
-    prepared_track_list = list(np.split(flat_zyx_np, np.cumsum(lengths_new)[:-1]))
+    compact_zyx_np = flat_zyx_np[keep_np]
+    crossing_csr_override = None
+    if track_graph is not None:
+        if int(keep_np.sum()) >= np.iinfo(np.int32).max:
+            raise ValueError(
+                'point-clipped track output exceeds the int32 crossing limit')
+        old_point_to_new = np.cumsum(
+            keep_np, dtype=np.int32) - np.int32(1)
+        old_point_to_new[~keep_np] = -1
+        output_offsets = np.empty(len(lengths_new) + 1, dtype=np.int64)
+        output_offsets[0] = 0
+        np.cumsum(lengths_new, out=output_offsets[1:])
+        crossing_csr_override = track_graph.clipped_csr(
+            working_source_ids, input_offsets, surviving,
+            old_point_to_new, output_offsets)
+        del old_point_to_new
+        print(
+            f'track crossings: remapped TrackGraph after point exclusion '
+            f'({len(crossing_csr_override["partners"])} directed crossings)')
+    del keep_np, flat_zyx_np
+    prepared_track_list = _MemmapTrackCollection(
+        compact_zyx_np,
+        np.r_[np.int64(0), np.cumsum(lengths_new, dtype=np.int64)])
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return finish_prepared(
-        flat_zyx_np, lengths_new, surviving, prepared_track_list)
+        compact_zyx_np, lengths_new, surviving, prepared_track_list,
+        crossing_csr_override=crossing_csr_override)
 
 
 def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     """Resample complete tracks between mandatory polyline anchors."""
     min_spacing = float(min_spacing)
     max_spacing = float(max_spacing)
-    if prepared_tracks.get('track_crossing_mode', 'count') == 'track_walk':
+    if prepared_tracks.get(
+            'track_crossing_mode', 'track_walk') == 'track_walk':
         cache_key = (
             min_spacing, max_spacing, 'track_walk',
-            prepared_tracks.get('min_walk_steps_per_track', 24),
-            prepared_tracks.get('max_walk_steps_per_track', 256),
-            prepared_tracks.get('n_walks_per_track', 4),
+            prepared_tracks.get('track_min_walk_steps_per_track', 24),
+            prepared_tracks.get('track_max_walk_steps_per_track', 256),
+            prepared_tracks.get('track_min_walks_per_track', 2),
+            prepared_tracks.get('track_max_walks_per_track', 4),
             prepared_tracks.get(
-                'track_walk_require_loop_consistency', False),
+                'track_walk_minimum_cycle_travel', 20.0),
         )
     else:
         # This key is intentionally unchanged for the default count mode.
@@ -2928,12 +3036,16 @@ def _draw_track_walk_sample(
     seed = int(torch.randint(
         0, (1 << 63) - 1, (1,), dtype=torch.int64,
         device=device, generator=generator).item())
-    hops = int(prepared_tracks['n_walks_per_track'])
+    minimum_hops = int(prepared_tracks['track_min_walks_per_track'])
+    maximum_hops = int(prepared_tracks['track_max_walks_per_track'])
     result = native.sample_walks_adaptive(
         prepared_tracks['walk_index'], probabilities_cpu, seed=seed,
-        groups=k, target_points=target_points, hops=hops,
-        minimum_steps=int(prepared_tracks['min_walk_steps_per_track']),
-        maximum_steps=int(prepared_tracks['max_walk_steps_per_track']),
+        groups=k, target_points=target_points,
+        minimum_hops=minimum_hops, maximum_hops=maximum_hops,
+        minimum_steps=int(prepared_tracks['track_min_walk_steps_per_track']),
+        maximum_steps=int(prepared_tracks['track_max_walk_steps_per_track']),
+        minimum_candidate_travel=float(
+            prepared_tracks['track_walk_minimum_cycle_travel']),
         maximum_attempts=attempts,
     )
     produced = int(result['produced'])
@@ -2944,20 +3056,44 @@ def _draw_track_walk_sample(
             f'({produced}/{k} after {int(result["attempted_candidates"])} '
             f'policy-compatible primary draws; '
             f'{stats.get("eligible_tracks", "unknown")} eligible tracks, '
-            f'{hops} hops, raw-index bounds '
-            f'[{prepared_tracks["min_walk_steps_per_track"]}, '
-            f'{prepared_tracks["max_walk_steps_per_track"]}])')
+            f'{minimum_hops}-{maximum_hops} hops, raw-index bounds '
+            f'[{prepared_tracks["track_min_walk_steps_per_track"]}, '
+            f'{prepared_tracks["track_max_walk_steps_per_track"]}])')
 
-    width = hops + 1
+    width = maximum_hops + 1
     track_matrix = torch.from_numpy(
         np.asarray(result['tracks'], dtype=np.int64)).to(device=device)
     record_matrix = torch.from_numpy(
         np.asarray(result['records'], dtype=np.int64)).to(device=device)
-    track_idx = track_matrix.reshape(-1)
-    group_id = torch.arange(
-        k, device=device, dtype=torch.int64).repeat_interleave(width)
-    row_slot = torch.arange(
-        width, device=device, dtype=torch.int64).repeat(k)
+    walk_hops = torch.from_numpy(
+        np.asarray(result['walk_hops'], dtype=np.int64)).to(device=device)
+    edge_slots_matrix = torch.arange(
+        maximum_hops, device=device, dtype=torch.int64)[None, :].expand(k, -1)
+    edge_valid = edge_slots_matrix < walk_hops[:, None]
+    edge_group_id = torch.arange(
+        k, device=device, dtype=torch.int64)[:, None].expand(
+            -1, maximum_hops)[edge_valid]
+    edge_slot = edge_slots_matrix[edge_valid]
+
+    # Keep all primary rows first: DT target caching relies on this layout.
+    # Variable-length partner rows follow in group/hop order.
+    track_idx = torch.cat([
+        track_matrix[:, 0],
+        track_matrix[:, 1:][edge_valid],
+    ])
+    group_id = torch.cat([
+        torch.arange(k, device=device, dtype=torch.int64),
+        edge_group_id,
+    ])
+    row_slot = torch.cat([
+        torch.zeros(k, device=device, dtype=torch.int64),
+        edge_slot + 1,
+    ])
+    row_index = torch.full(
+        [k, width], -1, device=device, dtype=torch.int64)
+    row_index[:, 0] = torch.arange(k, device=device, dtype=torch.int64)
+    row_index[edge_group_id, edge_slot + 1] = torch.arange(
+        k, len(track_idx), device=device, dtype=torch.int64)
     row_lengths = resampled['lengths'][track_idx]
     row_starts = torch.zeros(
         len(track_idx) + 1, dtype=torch.int64, device=device)
@@ -2993,12 +3129,12 @@ def _draw_track_walk_sample(
         flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
             len(track_idx), target_points).to(device=device)
 
-    hop_groups = torch.arange(k, device=device)[:, None]
-    hop_slots = torch.arange(hops, device=device)[None, :]
-    source_rows = (hop_groups * width + hop_slots).reshape(-1)
-    partner_rows = source_rows + 1
-    source_records = record_matrix[:, 0::2].reshape(-1)
-    partner_records = record_matrix[:, 1::2].reshape(-1)
+    source_rows = row_index[:, :-1][edge_valid]
+    partner_rows = row_index[:, 1:][edge_valid]
+    if torch.any(source_rows < 0) or torch.any(partner_rows < 0):
+        raise RuntimeError("variable track-walk row layout is incomplete")
+    source_records = record_matrix[:, 0::2][edge_valid]
+    partner_records = record_matrix[:, 1::2][edge_valid]
     record_samples = resampled['walk_record_sample']
     primary_cross_flat = (
         row_starts[source_rows] + record_samples[source_records])
@@ -3020,6 +3156,9 @@ def _draw_track_walk_sample(
         'primary_cross_flat': primary_cross_flat,
         'partner_cross_flat': partner_cross_flat,
         'partner_rows': partner_rows,
+        'edge_group_id': edge_group_id,
+        'edge_slot': edge_slot,
+        'maximum_walk_hops': maximum_hops,
     }
 
 
@@ -3042,18 +3181,20 @@ def _sample_prepared_track_points(
     resampled = _build_resampled_track_bundle(
         prepared_tracks, min_sample_spacing, max_sample_spacing)
 
-    if prepared_tracks.get('track_crossing_mode', 'count') == 'track_walk':
+    if prepared_tracks.get(
+            'track_crossing_mode', 'track_walk') == 'track_walk':
         if prefetch.prefetch_enabled() and device.type == 'cuda':
             pf = prefetch.get_prefetcher()
             generator = pf.torch_rng('tracks', device)
             walk_key = (
                 'track_walk', k, num_points_per_track,
                 float(min_sample_spacing), float(max_sample_spacing),
-                int(prepared_tracks['min_walk_steps_per_track']),
-                int(prepared_tracks['max_walk_steps_per_track']),
-                int(prepared_tracks['n_walks_per_track']),
-                bool(prepared_tracks[
-                    'track_walk_require_loop_consistency']),
+                int(prepared_tracks['track_min_walk_steps_per_track']),
+                int(prepared_tracks['track_max_walk_steps_per_track']),
+                int(prepared_tracks['track_min_walks_per_track']),
+                int(prepared_tracks['track_max_walks_per_track']),
+                float(prepared_tracks[
+                    'track_walk_minimum_cycle_travel']),
             )
             return pf.pop_or_run(
                 walk_key,
@@ -3184,22 +3325,28 @@ def _grouped_same_radius_loss(
 
 def _crossing_row_alignments(
         shifted_radii, primary_cross_flat, partner_cross_flat,
-        partner_rows, row_count, chain=False):
+        partner_rows, row_count, chain=False, edge_group_id=None,
+        edge_slot=None, group_count=None, maximum_hops=None):
     row_alignment = torch.zeros(
         row_count, device=shifted_radii.device, dtype=shifted_radii.dtype)
     if chain:
         edge_count = primary_cross_flat.numel()
-        group_count = row_count - edge_count
         if edge_count == 0:
             return row_alignment
-        if group_count <= 0 or edge_count % group_count:
-            raise ValueError("track-walk rows do not form fixed-width groups")
-        hops = edge_count // group_count
-        hop_deltas = (
+        if (edge_group_id is None or edge_slot is None
+                or group_count is None or maximum_hops is None):
+            raise ValueError("variable track-walk edge layout is incomplete")
+        edge_deltas = (
             shifted_radii[primary_cross_flat]
             - shifted_radii[partner_cross_flat]
-        ).reshape(group_count, hops)
-        row_alignment[partner_rows] = hop_deltas.cumsum(dim=1).reshape(-1).detach()
+        )
+        padded = torch.zeros(
+            [group_count, maximum_hops],
+            device=shifted_radii.device, dtype=shifted_radii.dtype)
+        padded[edge_group_id, edge_slot] = edge_deltas
+        accumulated = padded.cumsum(dim=1)
+        row_alignment[partner_rows] = accumulated[
+            edge_group_id, edge_slot].detach()
     else:
         row_alignment[partner_rows] = (
             shifted_radii[primary_cross_flat]
@@ -3223,11 +3370,11 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         return
     sample = _sample_prepared_track_points(
         prepared_tracks,
-        cfg['track_num_per_step'],
-        cfg['track_num_points_per_step'],
+        cfg['sample_count_tracks_per_step'],
+        cfg['sample_count_track_points_per_step'],
         cfg.get('track_min_sample_spacing', 20.0),
         cfg.get('track_max_sample_spacing', 60.0),
-        cfg.get('max_track_crossing_per_step', 0),
+        cfg.get('track_max_track_crossing_per_step', 0),
     )
     if sample is None:
         yield 'track_radius', zero
@@ -3257,7 +3404,11 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
             sample['partner_cross_flat'], sample['partner_rows'],
             len(track_idx),
             chain=(prepared_tracks.get(
-                'track_crossing_mode', 'count') == 'track_walk'))
+                'track_crossing_mode', 'track_walk') == 'track_walk'),
+            edge_group_id=sample.get('edge_group_id'),
+            edge_slot=sample.get('edge_slot'),
+            group_count=num_groups,
+            maximum_hops=sample.get('maximum_walk_hops'))
         flat_alignment = row_alignment[row_id]
         shifted_radii = shifted_radii + flat_alignment
         crossing_adjustments = crossing_adjustments + flat_alignment

@@ -14,6 +14,7 @@ import {
   gateSnapshot,
   isTrustedPreviewRun,
   resolveProductionActivationState,
+  safeDiagnosticCode,
   waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
 
@@ -27,7 +28,6 @@ const workflowNames = [
   'progress-prizes-vercel-preview.yml',
 ];
 const googleJobNames = [
-  'validate-production',
   'bootstrap-staging',
   'inject-copy-fault',
   'recover-prepare',
@@ -36,6 +36,8 @@ const googleJobNames = [
   'recover-activate',
   'verify-active',
   'prove-activation-idempotency',
+  'reconcile-active-once',
+  'reconcile-active-twice',
   'cleanup-full-rehearsal',
   'verify-cleaned-full-rehearsal',
   'cleanup-standalone',
@@ -174,16 +176,15 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
 
   for (const name of googleJobNames) {
     const protectedJob = jobBlock(rehearsal, name);
-    const environment = name === 'validate-production' ? 'production' : 'staging';
     assert.match(protectedJob, /runs-on: ubuntu-24\.04/);
     assert.match(protectedJob, /timeout-minutes: 20/);
-    assert.match(protectedJob, new RegExp(`environment: progress-prizes-${environment}`));
+    assert.match(protectedJob, /environment: progress-prizes-staging/);
     assert.match(protectedJob, /contents: read\n      id-token: write/);
     assert.match(protectedJob, /ref: \$\{\{ github\.sha \}\}/);
     assert.match(protectedJob, /persist-credentials: false/);
     assert.match(protectedJob, /id: google/);
     assert.match(protectedJob, /uses: \.\/\.github\/actions\/progress-prizes-google/);
-    assert.match(protectedJob, new RegExp(`^          environment: ${environment}$`, 'm'));
+    assert.match(protectedJob, /^          environment: staging$/m);
     assert.match(
       protectedJob,
       /responder-uri: \$\{\{ steps\.google\.outputs\['responder-uri'\] \}\}/,
@@ -206,24 +207,27 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   assert.doesNotMatch(rehearsal, /ref: refs\/heads\/main/);
   assert.equal(
     [...rehearsal.matchAll(/environment: progress-prizes-production/g)].length,
-    1,
+    0,
   );
   assert.equal(
     [...rehearsal.matchAll(/environment: progress-prizes-staging/g)].length,
-    googleJobNames.length - 1,
+    googleJobNames.length,
   );
   const productionValidationJob = jobBlock(rehearsal, 'validate-production');
-  assert.match(
-    productionValidationJob,
-    /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
-  );
+  assert.match(productionValidationJob, /actions: write\n      contents: read/);
+  assert.match(productionValidationJob, /progress-prizes-schedule\.mjs dispatch/);
+  assert.match(productionValidationJob, /--operation validate/);
+  assert.match(productionValidationJob, /REQUEST_ID: \$\{\{ github\.run_id \}\}/);
+  assert.match(productionValidationJob, /steps\.child\.outputs\['child-run-id'\]/);
+  assert.match(productionValidationJob, /gh run watch "\$CHILD_RUN_ID" --repo ScrollPrize\/villa --exit-status/);
+  assert.doesNotMatch(productionValidationJob, /id-token:|environment: progress-prizes-|secrets\./);
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
     googleJobNames.length,
     'every Google job must receive an independently protected staging identity',
   );
   assert.doesNotMatch(productionValidationJob, /staging-folder-id|PROGRESS_PRIZE_STAGING_FOLDER_ID/);
-  for (const name of googleJobNames.filter((name) => name !== 'validate-production')) {
+  for (const name of googleJobNames) {
     const stagingJob = jobBlock(rehearsal, name);
     assert.match(
       stagingJob,
@@ -236,7 +240,7 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   }
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID/g)].length,
-    googleJobNames.length - 1,
+    googleJobNames.length,
   );
 
   for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
@@ -511,6 +515,54 @@ test('composite production activation guard requires an exact immutable base lea
   }
 });
 
+test('composite reconcile-active guard is manual, real-clock, and marker-only', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'production',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'reconcile-active',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'false',
+    VERIFY_MODE: 'active',
+    BRANCH: 'main',
+    TARGET_BRANCH: 'main',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: '',
+    BASE_SHA: '',
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { EVENT_NAME: 'schedule' },
+    { EVENT_NAME: 'pull_request' },
+    { REF: 'refs/pull/123/merge' },
+    { SIMULATED_NOW: '2026-08-06T12:00:00.000Z' },
+    { FAULT: 'after-copy' },
+    { EXPECT_FAULT: 'true', FAULT: 'after-copy' },
+    { DRY_RUN: 'true' },
+    { ALLOW_ACTIVATION_REWIND: 'true' },
+    { HEAD_SHA: 'a'.repeat(40) },
+    { BASE_SHA: 'b'.repeat(40) },
+    { TARGET_BRANCH: 'feature/test' },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
+});
+
 test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
   const rehearsal = await workflow('progress-prizes-rehearsal.yml');
   assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
@@ -528,6 +580,8 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.match(rehearsal, /expect-fault: true/g);
   assert.match(rehearsal, /verify-post-merge-preview/);
   assert.match(rehearsal, /prove-activation-idempotency/);
+  assert.match(rehearsal, /reconcile-active-once/);
+  assert.match(rehearsal, /reconcile-active-twice/);
   assert.match(rehearsal, /verify-cleaned-full-rehearsal/);
   assert.match(rehearsal, /actions: read\n      checks: read/);
   assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
@@ -549,6 +603,18 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   for (const name of googleJobNames.filter((name) => name !== 'bootstrap-staging')) {
     assert.doesNotMatch(jobBlock(rehearsal, name), /allow-activation-rewind/);
   }
+  for (const name of ['reconcile-active-once', 'reconcile-active-twice']) {
+    const reconciliation = jobBlock(rehearsal, name);
+    assert.match(reconciliation, /^          operation: reconcile-active$/m);
+    assert.match(reconciliation, /^          environment: staging$/m);
+    assert.match(reconciliation, /Fetch exact merged smoke page as data/);
+    assert.match(reconciliation, /MERGE_SHA: \$\{\{ needs\.merge-smoke\.outputs\['merge-sha'\] \}\}/);
+    assert.doesNotMatch(reconciliation, /simulated-now:|fault:|expect-fault:|head-sha:|base-sha:/);
+  }
+  assert.match(
+    jobBlock(rehearsal, 'cleanup-full-rehearsal'),
+    /^      - reconcile-active-twice$/m,
+  );
 
   const pagePr = await workflow('progress-prizes-page-pr.yml');
   assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);
@@ -945,6 +1011,10 @@ test('production activation-state recovery distinguishes exact, stale, and compl
   const pending = await resolveProductionActivationState(options, {
     listPulls: async () => [pull],
     readCommit: async () => exactCommit,
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
   });
   assert.deepEqual(pending, {
     state: 'pending',
@@ -957,12 +1027,38 @@ test('production activation-state recovery distinguishes exact, stale, and compl
   const stale = await resolveProductionActivationState(options, {
     listPulls: async () => [pull],
     readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
   });
   assert.equal(stale.refreshRequired, true);
 
+  const incidentRegression = await resolveProductionActivationState(options, {
+    listPulls: async () => [{
+      ...pull,
+      base: { ...pull.base, sha: 'd'.repeat(40) },
+    }],
+    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
+  });
+  assert.deepEqual(incidentRegression, {
+    state: 'pending',
+    headSha,
+    baseSha,
+    pullNumber: '42',
+    refreshRequired: true,
+  });
+
   const completed = await resolveProductionActivationState(options, {
     listPulls: async () => [],
-    readMainRef: async () => ({ object: { sha: baseSha } }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
     readPage: async () => ({ cycle: '2026-08' }),
   });
   assert.deepEqual(completed, {
@@ -997,21 +1093,80 @@ test('production activation-state recovery fails closed on ambiguous or drifting
 
   await assert.rejects(
     resolveProductionActivationState(options, { listPulls: async () => [pull, pull] }),
-    /ambiguous/,
+    (error) => safeDiagnosticCode(error) === 'ambiguous-pr',
   );
   await assert.rejects(
     resolveProductionActivationState(options, {
-      listPulls: async () => [{ ...pull, base: { ...pull.base, sha: 'c'.repeat(40) } }],
+      listPulls: async () => [pull],
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: 'c'.repeat(40) },
+      }),
     }),
-    /main moved/,
+    (error) => safeDiagnosticCode(error) === 'main-ref-moved',
   );
   await assert.rejects(
     resolveProductionActivationState(options, {
       listPulls: async () => [],
-      readMainRef: async () => ({ object: { sha: baseSha } }),
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
       readPage: async () => ({ cycle: '2026-07' }),
     }),
-    /Neither a pending PR nor a completed production cycle exists/,
+    (error) => safeDiagnosticCode(error) === 'completed-state-missing',
+  );
+
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [{
+        ...pull,
+        head: { ...pull.head, repo: { id: 123, full_name: 'untrusted/fork' } },
+      }],
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
+    }),
+    (error) => safeDiagnosticCode(error) === 'invalid-pr-association',
+  );
+
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [pull],
+      readCommit: async () => ({
+        sha: headSha,
+        parents: [{ sha: baseSha }],
+        files: [
+          { filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' },
+          { filename: '.github/workflows/untrusted.yml', status: 'added' },
+        ],
+      }),
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
+    }),
+    (error) => safeDiagnosticCode(error) === 'invalid-page-head',
+  );
+});
+
+test('GitHub coordination diagnostics are bounded to an allowlist', () => {
+  assert.equal(safeDiagnosticCode({ diagnosticCode: 'main-ref-moved' }), 'main-ref-moved');
+  assert.equal(safeDiagnosticCode({
+    diagnosticCode: 'private-id-from-api-body',
+    message: 'sensitive response body',
+  }), 'unexpected-error');
+
+  const result = spawnSync(process.execPath, [
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'unknown-command',
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'Progress Prize GitHub coordination failed safely [unexpected-error].\n',
   );
 });
 

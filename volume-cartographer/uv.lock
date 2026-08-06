@@ -1597,6 +1597,33 @@ wheels = [
 ]
 
 [[package]]
+name = "rustworkx"
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ff/1a/545aa3a3e251e9da00e4acf0e5472b7fbbb15360f56d9d5342c1f93b8b93/rustworkx-0.18.0.tar.gz", hash = "sha256:5ca9cf8dbee50f8def012119ebb64771ae86916993417415aba9e845831cb436", size = 894567, upload-time = "2026-06-18T04:38:56.141Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/70/18b310752b0652d4a755b46853268c00c33401101a47f87697ad25966453/rustworkx-0.18.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:7440ba70b87bd16811d92e57d76108840dbdd89aa2fc55e4d324fa2fb6b7f9c9", size = 2295936, upload-time = "2026-06-18T04:38:01.598Z" },
+    { url = "https://files.pythonhosted.org/packages/02/4e/09152f4422204f020346a8a2b0e2f05f12d8cc60eeeee99b24f649985514/rustworkx-0.18.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7fce5218ebfb8d8f5313def1f15aad8d3c3c2bbe03e33805dff8cf8bb70370a1", size = 2145057, upload-time = "2026-06-18T04:38:03.253Z" },
+    { url = "https://files.pythonhosted.org/packages/22/68/69198f41f7f9c39fb5b2e561bf41d4cbd117fa5dfdf4631d8ba28e5ff69b/rustworkx-0.18.0-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7e0c626f76bc71d414a02502be7ec0ac2dd6eca369886bc66a2650607f2d9de6", size = 2391659, upload-time = "2026-06-18T04:38:04.942Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/81/8ac568efe0289b0ecd826cd697c3581b6a25e134145926cbfef762656167/rustworkx-0.18.0-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:91b37c5bb54e233e16c4f47383385f17be03e6a344821c2f6a39a0aebee54538", size = 2189469, upload-time = "2026-06-18T04:38:06.51Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/a4/96492d7af2ddcd15368f80329e3514060b122f306c4406fac98c08a97865/rustworkx-0.18.0-cp310-abi3-manylinux_2_28_ppc64le.whl", hash = "sha256:bcd15f7a637ca0654f329ed42a6db0cf7eac15ed89e0b32cb9d16b1b21937979", size = 2504116, upload-time = "2026-06-18T04:38:43.441Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/b0/005383bd7dc110b06ca731bd2115482f3a8c6389e0c8fe1f7f259380c4c8/rustworkx-0.18.0-cp310-abi3-manylinux_2_28_s390x.whl", hash = "sha256:567ace3b0d8ac709dc4ad4ce164472f5f59508739355221480170327a6736777", size = 3170967, upload-time = "2026-06-18T04:38:39.929Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/2f/95ca9ef9285cc6793b3e041efca6c5a194ca6731b0af732631ee074a67b3/rustworkx-0.18.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:b91cdcffeab5f498de44905a373e47e345da8f6c4f40fc969421548c4e7a5219", size = 2254008, upload-time = "2026-06-18T04:38:08.245Z" },
+    { url = "https://files.pythonhosted.org/packages/19/7b/9df6a80162e6f90fd9945e3f8063c2aa41285c27aefce1d171f99c2b829f/rustworkx-0.18.0-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:03dd1ab42974bc0ff957eccc330c0c0d9887d88240c0cd050039e215af5a3c45", size = 2447140, upload-time = "2026-06-18T04:38:09.767Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/b3/4d159b33bbc73dbebad050a0226dcfb0753d7f05fa55a8d5351e85c8c953/rustworkx-0.18.0-cp310-abi3-win32.whl", hash = "sha256:eb87a45864ffe36e4d86e826d12bb54dac9e4f76c214997dee624281d8711684", size = 2057237, upload-time = "2026-06-18T04:38:11.28Z" },
+    { url = "https://files.pythonhosted.org/packages/99/1b/b0dc8d3751c0c58d16db72bff2954a9d3871c166147007590a3aaec4d42e/rustworkx-0.18.0-cp310-abi3-win_amd64.whl", hash = "sha256:602df896b4479b83c6456f702f8ba2ac1cbb972b30723d5fe2e84e6ff3de7d70", size = 2289224, upload-time = "2026-06-18T04:38:12.961Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/eb/147e86d56de0511ee7526e5cdf6144013d9c71ba4d6ed6dcd82b6b545861/rustworkx-0.18.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:bba66b268e94efd9181d49241b2547d783770dcea9ee8c64609306a7b20ace74", size = 2339568, upload-time = "2026-06-18T04:38:14.292Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/1b/c665d30c132e73d69ca95cf552179608de6f94434ee5eb321297ef393920/rustworkx-0.18.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d51ff00fa72144813c2af33c673b7faf7182ca0ffc85cf35569b5ac4de84bc3e", size = 2118746, upload-time = "2026-06-18T04:38:15.759Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/78/04733471aa616dc0bc76f2c2e65ad89bb4ecbbfd2309231347c293906181/rustworkx-0.18.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f7099bf90fc1a7ad1789bc126e3e208d9944af2dd9f9b28f75ae148c68aa00cb", size = 2372040, upload-time = "2026-06-18T04:38:17.082Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/eb/58ed5f78ca608156ac2ce3166e41976c32345bbc36e71a3fc18390cc4de2/rustworkx-0.18.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:f562d5eeb2943024c85f631df713e7873ea8b572ada9044be82f29f923c1463a", size = 2178071, upload-time = "2026-06-18T04:38:18.571Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/96/888c7849d20b7e49d978cfe9bdd8873d709e220a09f8f6bdce226ef7c2be/rustworkx-0.18.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:8437bca6adff8e91089bd5d176ef8a499085135031e2d2df4132821578e94dd6", size = 2244227, upload-time = "2026-06-18T04:38:19.923Z" },
+    { url = "https://files.pythonhosted.org/packages/99/47/621b56c3f10138a02da9dfd636780ec9311c821fff1acf43be7292408625/rustworkx-0.18.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:ba9e9f91d0d14d21666f0d7549f4d8ed70dc84bf75483c68eee5a005ed900f3e", size = 2426773, upload-time = "2026-06-18T04:38:21.233Z" },
+]
+
+[[package]]
 name = "s3fs"
 version = "2026.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1698,8 +1725,9 @@ dependencies = [
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "pillow" },
-    { name = "posix-ipc" },
+    { name = "posix-ipc", marker = "sys_platform != 'win32'" },
     { name = "pyro-ppl" },
+    { name = "rustworkx" },
     { name = "s3fs" },
     { name = "scipy" },
     { name = "tensorstore" },
@@ -1725,8 +1753,9 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.0" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92" },
     { name = "pillow", specifier = ">=12.2.0" },
-    { name = "posix-ipc", specifier = ">=1.3.2" },
+    { name = "posix-ipc", marker = "sys_platform != 'win32'", specifier = ">=1.3.2" },
     { name = "pyro-ppl", specifier = ">=1.9.1" },
+    { name = "rustworkx", specifier = ">=0.18.0" },
     { name = "s3fs", specifier = ">=2026.6.0" },
     { name = "scipy", specifier = ">=1.18.0" },
     { name = "tensorstore", specifier = ">=0.1.80" },

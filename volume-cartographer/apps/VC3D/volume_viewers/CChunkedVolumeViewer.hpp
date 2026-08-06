@@ -229,6 +229,14 @@ public:
     bool isMeasurementActive() const;
     void clearMeasurement();
     void markSurfaceGeometryChanged();
+    // Geometry-epoch introspection: lets callers tell whether the currently
+    // DISPLAYED frame was rendered from the current surface geometry (stale
+    // in-flight frames adopt with an older epoch).
+    std::uint64_t surfaceGeometryEpoch() const { return _surfaceGeometryEpoch; }
+    std::uint64_t displayedSurfaceGeometryEpoch() const
+    {
+        return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;
+    }
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
@@ -310,6 +318,8 @@ private:
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
+    void notifyNormalOffsetChanged();
+    void setZOffset(float value);
     void rebuildChunkArray();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
@@ -591,6 +601,7 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        int segNormalOffsetQ = 0;
         size_t flattenedPlanesHash = 0;
         size_t cameraHash = 0;
         bool valid = false;

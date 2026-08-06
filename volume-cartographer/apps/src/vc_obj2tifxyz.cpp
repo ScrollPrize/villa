@@ -1,6 +1,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/TifxyzIdentity.hpp"
 #include <cctype>
 
 #include <iostream>
@@ -518,7 +519,7 @@ int main(int argc, char *argv[])
         std::cout << "usage: " << argv[0]
                   << " <input.obj> <output_directory> [stretch_factor] [mesh_units]"
                   << " [--uv-metric] [--uv-to-obj=<ratio>] [--uv-downsample=<f>]"
-                  << " [--grid-cap=<pixels>]" << std::endl;
+                  << " [--grid-cap=<pixels>] [--uuid=<id>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
@@ -530,6 +531,7 @@ int main(int argc, char *argv[])
         std::cout << "  --uv-to-obj=<ratio> : OBJ units per 1 UV unit (default: 1.0). Only used with --uv-metric." << std::endl;
         std::cout << "  --uv-downsample=<f> : Uniform UV decimation factor (>=1.0). Reduces grid by ~f^2." << std::endl;
         std::cout << "  --grid-cap=<pixels> : Upper bound on total grid pixels. Implies extra decimation if needed." << std::endl;
+        std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to the output-directory basename." << std::endl;
         std::cout << "  --tifxyz-source=<dir>: Original tifxyz being flattened. Its meta.json scale sizes the" << std::endl;
         std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
         std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
@@ -552,6 +554,7 @@ int main(int argc, char *argv[])
     float uv_downsample = 1.0f;
     uint64_t grid_cap = 0;
     std::string tifxyz_source;  // original tifxyz dir: provides scale + approval mask
+    std::string uuid_override;
 
     // Backward-compatible parsing:
     // positional numbers: stretch_factor, mesh_units
@@ -597,6 +600,14 @@ int main(int argc, char *argv[])
         }
         if (starts_with(a, "--tifxyz-source=")) {
             tifxyz_source = a.substr(std::string("--tifxyz-source=").size());
+            continue;
+        }
+        if (starts_with(a, "--uuid=")) {
+            uuid_override = a.substr(std::string("--uuid=").size());
+            if (uuid_override.empty()) {
+                std::cerr << "Invalid value for --uuid (must be non-empty)\n";
+                return EXIT_FAILURE;
+            }
             continue;
         }
         // numbers (legacy positional)
@@ -707,10 +718,8 @@ int main(int argc, char *argv[])
     }
     
     // Generate a UUID for the surface
-    std::string uuid = output_dir.filename().string();
-    if (uuid.empty()) {
-        uuid = obj_path.stem().string();
-    }
+    const std::string uuid =
+        vc::util::resolveTifxyzUuid(output_dir, obj_path, uuid_override);
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     

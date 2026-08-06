@@ -33,6 +33,7 @@ import random
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -197,6 +198,10 @@ class Stats:
         with self._lock:
             self.noremote_keys.setdefault(level, set()).discard(chunk_key)
 
+    def snapshot_noremote(self) -> dict[int, set[str]]:
+        with self._lock:
+            return {int(level): set(keys) for level, keys in self.noremote_keys.items()}
+
 
 def _noremote_path(local_root: str, level: int) -> str:
     return os.path.join(local_root, ".dl_cache", f"{level}.noremote.json")
@@ -207,8 +212,18 @@ def _load_noremote(local_root: str, levels: list[int]) -> dict[int, set[str]]:
     for lvl in levels:
         p = _noremote_path(local_root, lvl)
         if os.path.isfile(p):
-            with open(p) as f:
-                result[lvl] = set(json.load(f))
+            try:
+                with open(p, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if not isinstance(loaded, list) or any(not isinstance(key, str) for key in loaded):
+                    raise ValueError("expected a JSON list containing only string chunk keys")
+                result[lvl] = set(loaded)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                print(
+                    f"WARNING: ignoring invalid noremote cache for level {lvl} at {p}: {exc}",
+                    file=sys.stderr,
+                )
+                result[lvl] = set()
         else:
             result[lvl] = set()
     return result
@@ -216,13 +231,31 @@ def _load_noremote(local_root: str, levels: list[int]) -> dict[int, set[str]]:
 
 def _save_noremote(local_root: str, noremote: dict[int, set[str]]) -> None:
     for lvl, keys in noremote.items():
-        if not keys:
-            continue
         p = _noremote_path(local_root, lvl)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as f:
-            json.dump(sorted(keys), f)
-            f.write("\n")
+        tmp = f"{p}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        try:
+            with open(tmp, "x", encoding="utf-8") as f:
+                json.dump(sorted(keys), f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+        except (OSError, TypeError, ValueError) as exc:
+            print(
+                f"WARNING: could not save advisory noremote cache for level {lvl} at {p}: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(
+                    f"WARNING: could not remove temporary noremote cache {tmp}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +345,13 @@ def _parse_coord3(s: str) -> tuple[int, int, int]:
     if len(vals) != 3:
         raise argparse.ArgumentTypeError(f"expected 3 comma-separated ints, got {len(vals)}")
     return tuple(vals)  # type: ignore[return-value]
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _fmt_bytes(n: int) -> str:
@@ -882,7 +922,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Rectangular half-size in all dims (used with --center)")
     p.add_argument("--zrange", default=None,
                    help="Z slice range at scale 0: z0,z1 (downloads all X/Y for that Z range)")
-    p.add_argument("--workers", type=int, default=64,
+    p.add_argument("--workers", type=_positive_int, default=64,
                    help="Parallel download threads (default: 64)")
     p.add_argument("--order", choices=("z", "morton", "random"), default="z",
                    help="Chunk queue order: z is z-major z/y/x, morton is a Z-order curve (default: z)")
@@ -1065,7 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
     stop_evt.set()
     scanner_thread.join(timeout=5)
 
-    _save_noremote(local_root, st.noremote_keys)
+    _save_noremote(local_root, st.snapshot_noremote())
 
     # Store S3 source URI in local .zattrs so predict3d can re-download
     _store_download_meta(local_root, remote_root, anon, args.region)
@@ -1116,6 +1156,9 @@ def download(
 
     Returns 0 on success, 1 on failure.
     """
+    workers = int(workers)
+    if workers <= 0:
+        raise ValueError("workers must be a positive integer")
     argv = [source, dest]
     if scales is not None:
         argv += ["--scales", ",".join(str(s) for s in scales)]

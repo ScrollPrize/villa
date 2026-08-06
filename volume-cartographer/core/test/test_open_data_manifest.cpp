@@ -9,6 +9,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/lasagna/Dataset.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -326,6 +327,8 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
     CHECK(resolved->manifestBacked);
     CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
     CHECK(resolved->coordinateSpace == "sample/vol-a@L3");
+    CHECK(resolved->sourceManifestLocation ==
+          "https://example.test/vol-a/data.lasagna.json");
 
     const auto native = resolveLasagnaForCoordinateTags(
         *pkg,
@@ -355,6 +358,35 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
          "vc-open-data-volume-id:vol-a",
          "vc-open-data-source-coordinate-level:6",
          "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
+}
+
+TEST_CASE("Manual project Lasagna resolution materializes a selected remote manifest")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_remote_manual_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const std::string location =
+        "https://example.test/manual/data.lasagna.json";
+    int fetches = 0;
+    vc::lasagna::LasagnaDatasetOpenOptions openOptions;
+    openOptions.remoteCacheRoot = root;
+    openOptions.remoteFileFetcher = [&](const std::string&, const std::filesystem::path& temporary) {
+        ++fetches;
+        std::ofstream(temporary) << R"({"version":2,"groups":{}})";
+    };
+    const auto cached = vc::lasagna::LasagnaDataset::openLocation(
+        location, openOptions);
+
+    auto pkg = VolumePkg::newEmpty();
+    pkg->setRemoteCacheRoot(root);
+    REQUIRE(pkg->addLasagnaDatasetEntry(location));
+    pkg->setSelectedLasagnaDataset(location);
+    const auto resolved = resolveLasagnaForCoordinateTags(*pkg, {});
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->manifestPath == cached.manifest().manifestPath);
+    CHECK(resolved->sourceManifestLocation == location);
+    CHECK(fetches == 1);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")

@@ -1,0 +1,54 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "num_steps": 100000,
+  "log_every": 100,
+  "test_every": 1000,
+  "test_sample_count": 16,
+  "test_start_iteration": 1,
+  "sample_visualization_every": 10000,
+  "test_visualization_every": 10000,
+  "run_path": "runs/fiber_trace",
+  "run_name": "fiber_trace_train",
+  "tensorboard_enabled": true,
+  "batch_size": 4,
+  "crop_size": [64, 64, 64],
+  "augmentation_crop_size": [96, 96, 96],
+  "image_normalization": "zscore",
+  "positive_direction_jitter_degrees": 30.0,
+  "control_point_margin_voxels": 10,
+  "normal_plane_jitter_voxels": 40.0,
+  "normal_perpendicular_jitter_voxels": 10.0,
+  "positive_along_fiber_limit_voxels": 40.0,
+  "negative_cone_distance_voxels": 30.0,
+  "random_valid_max_attempts": 256,
+  "random_negative_pool_size": 1000,
+  "volume_cache_dir": "/tmp/vesuvius_fiber_trace_zarr_cache",
+  "datasets": [
+    {
+      "base_volume_path": "/path/to/base-image.ome.zarr",
+      "base_volume_scale": 0,
+      "lasagna_manifest_path": "/path/to/prediction.lasagna.json",
+      "fiber_glob": "/path/to/train_fibers/*.json",
+      "test_fiber_glob": "/path/to/test_fibers/*.json"
+    }
+  ],
+  "model": {
+    "input_channels": 1,
+    "unet_base_channels": 16,
+    "unet_depth": 7,
+    "conditioned_feature_channels": 64,
+    "embedding_dim": 16,
+    "head_channels": 64,
+    "decoder_upsample_mode": "pixelshuffle"
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "temperature": 0.1,
+    "contrastive_weight": 1.0,
+    "max_contrastive_samples": 16384
+  }
+}
