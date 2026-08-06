@@ -1,3 +1,8 @@
+# 2026-08-06
+
+- Added path-aware per-user Bash completion installation for `las_manager`,
+  with isolated providers that coexist across multiple virtual environments.
+
 # 2026-08-03
 
 - Added experimental float16 shared raw-product accumulator rings while

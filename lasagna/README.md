@@ -85,9 +85,10 @@ and managed Lasagna inference write portable provenance and remain compatible
 with the existing Atlas `lasagna` artifact type.
 
 Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
-same as `las_manager snapshot ls`. Install shell completion with, for example,
-`eval "$(las_manager completion bash)"`. Configuration, cache semantics, and
-selector details are documented in [`docs/manager.md`](docs/manager.md).
+same as `las_manager snapshot ls`. Install path-aware Bash completion once with
+`las_manager completion install`; it follows whichever registered venv's
+`las_manager` is currently selected by `PATH`. Configuration, cache semantics,
+and selector details are documented in [`docs/manager.md`](docs/manager.md).
 
 This installation currently expects the `villa` monorepo layout: Lasagna uses
 the sibling `vesuvius/src` model implementation and installs its declared model

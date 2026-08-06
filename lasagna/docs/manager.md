@@ -158,7 +158,24 @@ tmux sessions.
 ## Abbreviations and completion
 
 Command tokens accept only exact or unique-prefix matches. Entity selectors
-follow the same rule but never use fuzzy matching. Generate shell setup with:
+follow the same rule but never use fuzzy matching. For Bash, install the
+standard per-user lazy-loaded completion once from each venv that provides
+`las_manager`:
+
+```bash
+las_manager completion install
+```
+
+This writes the canonical loader to
+`${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/las_manager` and
+keeps additive providers under the adjacent `las_manager` user-data tree. The
+loader resolves the external `las_manager` selected by the current `PATH` and
+dispatches only to that exact registered executable. Activating another
+registered venv switches completion automatically; deleted venv providers are
+ignored. Open a new shell after installation, or source the printed loader
+path once in the current shell.
+
+For temporary Bash setup or for Zsh, generate shell setup directly:
 
 ```bash
 eval "$(las_manager completion bash)"

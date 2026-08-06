@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Callable, Sequence
 
 from .catalog import get_catalog, index_volumes, resolve_volume
+from .completion import canonical_executable, install_bash_completion, provider_id, shlex_quote
 from .config import display_config, initialize_config, load_config
 from .prefetch import prefetch_volume
 from .open_data import upload_inference, validate_atlas_inference
@@ -31,7 +32,9 @@ COMMAND_REGISTRY: tuple[tuple[Command, str], ...] = (
     (("tmux", "attach"), "attach or link a run window"),
     (("open-data", "validate"), "validate an inference bundle for Atlas"),
     (("open-data", "upload"), "stage and ingest an inference bundle"),
-    (("completion",), "emit shell completion setup"),
+    (("completion", "bash"), "emit Bash completion setup"),
+    (("completion", "zsh"), "emit Zsh completion setup"),
+    (("completion", "install"), "install path-aware user completion"),
 )
 COMMANDS: tuple[Command, ...] = tuple(command for command, _description in COMMAND_REGISTRY)
 
@@ -119,37 +122,47 @@ def _parser() -> argparse.ArgumentParser:
         "--register-model", action="store_true",
         help="register the explicit/checkpoint Atlas model after presenting its metadata",
     )
-    completion = sub.add_parser("completion", help="emit shell completion setup")
-    completion.add_argument("shell", choices=("bash", "zsh"))
+    completion = sub.add_parser("completion", help="emit or install shell completion")
+    completion.add_argument("completion_action", choices=("bash", "zsh", "install"))
+    completion.add_argument("shell", nargs="?", choices=("bash",))
     hidden = sub.add_parser("_complete", help=argparse.SUPPRESS)
     hidden.add_argument("kind", choices=("volume", "snapshot", "inference", "run"))
     hidden.add_argument("prefix", nargs="?", default="")
+    sub.add_parser("_completion-provider-id", help=argparse.SUPPRESS)
     return parser
 
 
-def _completion_script(shell: str) -> str:
+def _completion_script(
+    shell: str,
+    *,
+    command: str = "las_manager",
+    function_name: str | None = None,
+    register: bool = True,
+) -> str:
     roots = " ".join(sorted({command[0] for command in COMMANDS}))
     children = {
         root: " ".join(sorted(command[1] for command in COMMANDS if len(command) > 1 and command[0] == root))
         for root in sorted({command[0] for command in COMMANDS})
     }
     if shell == "bash":
-        script = r'''_las_manager_complete() {
+        function_name = function_name or "_las_manager_complete"
+        script = r'''@FUNCTION@() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local words="@ROOTS@"
   case "${COMP_WORDS[1]}:${COMP_WORDS[2]}:${COMP_CWORD}" in
-    volume:prefetch:3) words="$(las_manager _complete volume "$cur" 2>/dev/null)" ;;
-    inference:run:3) words="$(las_manager _complete snapshot "$cur" 2>/dev/null)" ;;
-    inference:run:4) words="$(las_manager _complete volume "$cur" 2>/dev/null)" ;;
-    tmux:attach:3) words="$(las_manager _complete run "$cur" 2>/dev/null)" ;;
-    open-data:validate:3|open-data:upload:3) words="$(las_manager _complete inference "$cur" 2>/dev/null)" ;;
+    volume:prefetch:3) words="$( @COMMAND@ _complete volume "$cur" 2>/dev/null)" ;;
+    inference:run:3) words="$( @COMMAND@ _complete snapshot "$cur" 2>/dev/null)" ;;
+    inference:run:4) words="$( @COMMAND@ _complete volume "$cur" 2>/dev/null)" ;;
+    tmux:attach:3) words="$( @COMMAND@ _complete run "$cur" 2>/dev/null)" ;;
+    open-data:validate:3|open-data:upload:3) words="$( @COMMAND@ _complete inference "$cur" 2>/dev/null)" ;;
     config::*) words="@CONFIG@" ;;
     snapshot::*) words="@SNAPSHOT@" ;;
     volume::*) words="@VOLUME@" ;;
     inference::*) words="@INFERENCE@" ;;
     run::*) words="@RUN@" ;;
     tmux::*) words="@TMUX@" ;;
-    completion::*) words="bash zsh" ;;
+    completion:install:*) words="bash" ;;
+    completion::*) words="@COMPLETION@" ;;
   esac
   if [[ "$words" == *$'\t'* ]]; then
     COMPREPLY=()
@@ -160,7 +173,7 @@ def _completion_script(shell: str) -> str:
     COMPREPLY=( $(compgen -W "$words" -- "$cur") )
   fi
 }
-complete -F _las_manager_complete las_manager'''
+@REGISTER@'''
     else:
         script = r'''#compdef las_manager
 _las_manager_dynamic() {
@@ -190,7 +203,13 @@ _las_manager() {
   esac
 }
 compdef _las_manager las_manager'''
-    replacements = {"ROOTS": roots, **{root.upper(): value for root, value in children.items()}}
+    replacements = {
+        "ROOTS": roots,
+        "FUNCTION": function_name or "_las_manager",
+        "COMMAND": shlex_quote(command),
+        "REGISTER": f"complete -F {function_name or '_las_manager_complete'} las_manager" if register else "",
+        **{root.upper(): value for root, value in children.items()},
+    }
     for name, value in replacements.items():
         script = script.replace(f"@{name}@", value)
     return script
@@ -266,8 +285,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "config" and args.config_command == "init":
             print(initialize_config(force=args.force))
             return 0
+        if args.command == "_completion-provider-id":
+            print(provider_id(canonical_executable(sys.argv[0])))
+            return 0
         if args.command == "completion":
-            print(_completion_script(args.shell))
+            if args.completion_action in {"bash", "zsh"}:
+                print(_completion_script(args.completion_action))
+                return 0
+            shell = args.shell or "bash"
+            executable = canonical_executable(sys.argv[0])
+            identity = provider_id(executable)
+            provider_script = _completion_script(
+                shell,
+                command=str(executable),
+                function_name=f"_las_manager_complete_{identity}",
+                register=False,
+            )
+            installed = install_bash_completion(executable, provider_script)
+            print(installed)
+            print("Open a new shell, or source this file to enable completion now.")
             return 0
         config = load_config()
         if args.command == "config":

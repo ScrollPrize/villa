@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from lasagna.manager import catalog
 from lasagna.manager.catalog import CatalogCache, get_catalog, index_volumes, resolve_volume
 from lasagna.manager.cli import COMMANDS, _completion_script, _expand_command, _resolve_token, main
+from lasagna.manager.completion import canonical_executable, install_bash_completion, provider_id
 from lasagna.manager.config import ManagerConfig, initialize_config, load_config
 from lasagna.manager.prefetch import prefetch_volume, volume_cache_root
 from lasagna.manager.runner import main as runner_main
@@ -88,6 +90,7 @@ def test_command_unique_prefix_and_ambiguity():
     assert _expand_command(["sn", "l"]) == ["snapshot", "ls"]
     assert _expand_command(["con", "sh"]) == ["config", "show"]
     assert _expand_command(["f"]) == ["fetch"]
+    assert _expand_command(["completion", "ins"]) == ["completion", "install"]
     with pytest.raises(ValueError, match="ambiguous"):
         _resolve_token("f", ("fetch", "foo"))
 
@@ -108,10 +111,91 @@ def test_completion_scripts_cover_registry_and_dynamic_selectors():
             assert "_complete volume" in script
             assert "_complete snapshot" in script
             assert "_complete run" in script
+            assert 'completion::*) words="bash install zsh"' in script
         else:
             assert "_las_manager_dynamic volume" in script
             assert "_las_manager_dynamic snapshot" in script
             assert "_las_manager_dynamic run" in script
+
+
+def _fake_las_manager(path: Path, value: str) -> Path:
+    path.parent.mkdir(parents=True)
+    identity = provider_id(path)
+    path.write_text(
+        "#!/bin/bash\n"
+        f"if [[ \"$1\" == _completion-provider-id ]]; then echo {identity}; exit 0; fi\n"
+        f"if [[ \"$1\" == _complete ]]; then printf '%s\\tprovider\\n' {value}; exit 0; fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_completion_install_dispatches_to_path_selected_venv(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    first = _fake_las_manager(tmp_path / "venv-a" / "bin" / "las_manager", "alpha-volume")
+    second = _fake_las_manager(tmp_path / "venv-b" / "bin" / "las_manager", "beta-volume")
+    for executable in (first, second):
+        identity = provider_id(executable)
+        provider = _completion_script(
+            "bash", command=str(executable),
+            function_name=f"_las_manager_complete_{identity}", register=False,
+        )
+        loader = install_bash_completion(executable, provider)
+
+    registry = json.loads(
+        (tmp_path / "data/las_manager/completions/bash/providers.json").read_text(encoding="utf-8")
+    )
+    assert set(registry.values()) == {str(first), str(second)}
+    subprocess.run(["bash", "-n", str(loader)], check=True)
+
+    script = f'''source {loader!s}
+PATH={first.parent}
+COMP_WORDS=(las_manager volume prefetch "")
+COMP_CWORD=3
+_las_manager_completion_dispatch
+printf 'first=%s\\n' "${{COMPREPLY[*]}}"
+PATH={second.parent}
+COMP_WORDS=(las_manager volume prefetch "")
+COMP_CWORD=3
+_las_manager_completion_dispatch
+printf 'second=%s\\n' "${{COMPREPLY[*]}}"
+'''
+    completed = subprocess.run(["bash", "-c", script], check=True, text=True, capture_output=True)
+    assert completed.stdout.splitlines() == ["first=alpha-volume", "second=beta-volume"]
+
+    before = loader.read_bytes()
+    identity = provider_id(first)
+    install_bash_completion(
+        first,
+        _completion_script(
+            "bash", command=str(first),
+            function_name=f"_las_manager_complete_{identity}", register=False,
+        ),
+    )
+    assert loader.read_bytes() == before
+
+
+def test_completion_executable_identity_canonicalizes_symlinks(tmp_path):
+    target = tmp_path / "implementation"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    target.chmod(0o755)
+    link = tmp_path / "bin" / "las_manager"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    assert canonical_executable(str(link)) == target.resolve()
+    assert provider_id(link) == provider_id(target)
+
+
+def test_completion_install_cli_defaults_to_bash(tmp_path, monkeypatch, capsys):
+    executable = _fake_las_manager(tmp_path / "venv" / "bin" / "las_manager", "value")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr(sys, "argv", [str(executable)])
+    assert main(["completion", "ins"]) == 0
+    loader = tmp_path / "data/bash-completion/completions/las_manager"
+    assert loader.is_file()
+    assert str(loader) in capsys.readouterr().out
 
 
 def test_catalog_index_preserves_identity_and_selectors():

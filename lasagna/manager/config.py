@@ -107,7 +107,7 @@ def _toml_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _atomic_write(path: Path, data: str) -> None:
+def atomic_write_text(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -127,7 +127,7 @@ def initialize_config(*, path: Path | None = None, force: bool = False) -> Path:
     path = path or config_path()
     if path.exists() and not force:
         raise FileExistsError(f"config already exists: {path}; pass --force to replace it")
-    _atomic_write(path, render_config())
+    atomic_write_text(path, render_config())
     return path
 
 
