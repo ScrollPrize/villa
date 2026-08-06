@@ -577,6 +577,7 @@ def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
     assert any(value.endswith("best model.pt") for value in command["resolved_argv"])
     assert not any(value.endswith("fiber_config.json") for value in command["resolved_argv"])
     assert "--provenance-context" in command["resolved_argv"]
+    assert "--no-download" in command["resolved_argv"]
     context = json.loads((run_dir / "provenance_context.json").read_text())
     assert context["run_uuid"] == metadata["run_uuid"]
     assert context["source"]["requested_group"] == 2
@@ -612,6 +613,44 @@ def test_run_config_params_precede_explicit_backend_overrides(tmp_path):
     assert argv[-2:] == ["--device", "cuda:1"]
 
 
+@pytest.mark.parametrize("backend", ["fiber3d", "lasagna"])
+def test_no_prefetch_delegates_downloads_to_backend(tmp_path, backend):
+    config, fiber_snapshot = _snapshot_and_config(tmp_path)
+    snapshot = fiber_snapshot
+    if backend == "lasagna":
+        snapshot = fiber_snapshot.__class__(**{
+            **fiber_snapshot.__dict__,
+            "backend": "lasagna",
+            "selector": "lasagna/run one/best model.pt",
+            "architecture": "lasagna_3d",
+        })
+    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    run_dir = launch_inference(
+        config, snapshot, volume, 1, original_argv=["inference", "run"],
+        prefetch=False, download_workers=321, tmux=FakeTmux(),
+    )
+    command = json.loads((run_dir / "command.json").read_text())
+    metadata = json.loads((run_dir / "metadata.json").read_text())
+    assert "--no-download" not in command["resolved_argv"]
+    worker_index = command["resolved_argv"].index("--download-workers")
+    assert command["resolved_argv"][worker_index + 1] == "321"
+    assert command["prefetch"] is None
+    assert metadata["lifecycle"]["prefetch"] == "skipped"
+    cache_attrs = json.loads((volume_cache_root(config, volume) / ".zattrs").read_text())
+    assert cache_attrs["_download"] == {"source": volume.s3_url, "anon": True}
+
+
+def test_no_prefetch_respects_explicit_backend_no_download(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    run_dir = launch_inference(
+        config, snapshot, volume, 1, original_argv=["inference", "run"],
+        prefetch=False, extra_args=("--no-download",), tmux=FakeTmux(),
+    )
+    argv = json.loads((run_dir / "command.json").read_text())["resolved_argv"]
+    assert argv[-1] == "--no-download"
+
+
 def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     config, fiber_snapshot = _snapshot_and_config(tmp_path)
     snapshot = fiber_snapshot.__class__(**{
@@ -635,6 +674,7 @@ def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     assert command[1:4] == ["-m", "preprocess_cos_omezarr", "predict3d"]
     assert command[command.index("--input") + 1].endswith("/1")
     assert "--provenance-context" in command
+    assert "--no-download" in command
     assert command[-2:] == ["--devices", "all"]
     assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
 
@@ -666,6 +706,13 @@ def test_inference_run_returns_after_detached_launch_without_foreground_prefetch
     assert capsys.readouterr().out.strip() == str(tmp_path / "reserved-run")
     assert calls[0][1]["prefetch"] is True
     assert calls[0][1]["download_workers"] == 511
+    assert main([
+        "inference", "run", snapshot.selector, volume.selector, "2",
+        "--no-prefetch", "--download-workers", "333",
+    ]) == 0
+    capsys.readouterr()
+    assert calls[1][1]["prefetch"] is False
+    assert calls[1][1]["download_workers"] == 333
 
 
 def test_reconcile_marks_dead_running_record_interrupted(tmp_path):

@@ -69,7 +69,9 @@ override.
 `inference run` returns as soon as its run directory and detached tmux session
 are created. The tmux workflow performs automatic prefetch first and inference
 second; use `las_manager run ls`, `las_manager tmux attach <run>`, or follow the
-printed run directory's `run.log`.
+printed run directory's `run.log`. Passing `--no-prefetch` writes only the
+source descriptor and lets the inference backend download missing chunks on
+demand for its crop; this download belongs to the inference lifecycle.
 
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:

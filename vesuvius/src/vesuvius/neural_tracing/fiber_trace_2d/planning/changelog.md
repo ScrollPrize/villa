@@ -380,3 +380,7 @@
   window IDs and distinguish orphan inference processes from attachable runs.
 - Made attached inference panes show the same live byte stream retained in the
   durable run log.
+# 2026-08-06: manager no-prefetch download delegation
+
+- Made `inference run --no-prefetch` retain backend on-demand downloads while
+  the default prefetch-first workflow continues to disable concurrent fetching.

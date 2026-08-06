@@ -2566,7 +2566,13 @@
 - `inference run <snapshot> <volume> <scale>` atomically reserves a run,
   launches a detached manager-prefixed tmux session, prints its path, and
   returns immediately. By default the tmux runner invokes the shared downloader
-  before inference; `--no-prefetch` skips it. The serialized, versioned request
+  before inference and passes backend `--no-download`; `--no-prefetch` skips the
+  manager phase and omits backend `--no-download`, retaining normal on-demand
+  crop-aware fetching during the inference lifecycle. On an empty cache the
+  manager initializes only local `_download` source metadata, with no remote
+  scan or chunk transfer. `--download-workers` applies to both modes; explicit
+  backend arguments after `--`, including `--no-download`, retain precedence.
+  The serialized, versioned request
   preserves source, destination, group, workers, anonymous access, and remote
   inventory behavior. Additional inference
   argv is preserved without shell interpolation. The positional scale selects

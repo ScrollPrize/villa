@@ -122,7 +122,10 @@ The command reserves a concise run directory, launches tmux, prints the path,
 and returns immediately. Inside tmux, prefetch completes before the GPU child
 starts, so downloader activity cannot collide with inference workers. Follow it
 with `las_manager run ls`, `las_manager tmux attach <run>`, or inspect
-`<run>/run.log`. `--no-prefetch` reuses an already populated cache. Arguments
+`<run>/run.log`. `--no-prefetch` skips this up-front phase, initializes only the
+local source descriptor, and leaves the backend's crop-aware on-demand
+downloading enabled during inference. `--download-workers` applies to either
+mode. An explicit backend `--no-download` after `--` still wins. Arguments
 after `--` are passed unchanged to the selected backend.
 This includes output-format overrides such as `--ome-compressor none`; newly
 created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays

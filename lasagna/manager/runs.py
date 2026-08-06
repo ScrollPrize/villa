@@ -152,6 +152,7 @@ def build_fiber_command(
     extra_args: Sequence[str] = (),
     provenance_context: dict[str, Any] | None = None,
     legacy_config: str | Path | None = None,
+    no_download: bool = True,
 ) -> tuple[list[str], Path]:
     if scale < 0:
         raise ValueError("scale must be a non-negative OME-Zarr group index")
@@ -168,7 +169,7 @@ def build_fiber_command(
         *([str(Path(legacy_config).expanduser().resolve())] if legacy_config is not None else []),
         "--input", str(input_path), "--output", str(manifest),
         "--checkpoint", snapshot.path, "--provenance-context", str(context_file),
-        "--no-download", *extra_args,
+        *(["--no-download"] if no_download else []), *extra_args,
     ]
     return command, manifest
 
@@ -182,6 +183,7 @@ def build_lasagna_command(
     *,
     extra_args: Sequence[str] = (),
     provenance_context: dict[str, Any] | None = None,
+    no_download: bool = True,
 ) -> tuple[list[str], Path]:
     if scale < 0:
         raise ValueError("scale must be a non-negative OME-Zarr group index")
@@ -193,7 +195,8 @@ def build_lasagna_command(
         str(_runtime_python(config)), "-m", "preprocess_cos_omezarr", "predict3d",
         "--input", str(input_path), "--output", str(manifest),
         "--unet-checkpoint", snapshot.path,
-        "--provenance-context", str(context_file), "--no-download",
+        "--provenance-context", str(context_file),
+        *(["--no-download"] if no_download else []),
         *extra_args,
     ]
     return command, manifest
@@ -279,19 +282,30 @@ def launch_inference(
         "model": model_context,
         "manager": {"version": "0.1"},
     }
+    generated_args: tuple[str, ...] = ()
+    if not prefetch:
+        if not volume.s3_url:
+            raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
+        from lasagna.scripts.download_omezarr import initialize_download_source
+
+        initialize_download_source(
+            str(volume_cache_root(config, volume)), volume.s3_url, True,
+        )
+        generated_args = ("--download-workers", str(int(download_workers)))
     if snapshot.backend == "fiber3d":
-        backend_args = _inference_args(config.params, extra_args)
+        backend_args = _inference_args(config.params, (*generated_args, *extra_args))
         command, manifest = build_fiber_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
-            legacy_config=legacy_config,
+            legacy_config=legacy_config, no_download=prefetch,
         )
         artifact_kind = "fiber3d-prediction"
     else:
-        backend_args = _inference_args(config.params, extra_args)
+        backend_args = _inference_args(config.params, (*generated_args, *extra_args))
         command, manifest = build_lasagna_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
+            no_download=prefetch,
         )
         artifact_kind = "lasagna"
     record = {

@@ -1,10 +1,9 @@
-# Status: reliable manager tmux attachment
+# Status: manager no-prefetch download behavior
 
-- [x] Capture task and inspect live tmux state.
+- [x] Capture task and inspect current command generation.
 - [x] Write implementation/test/spec/docs plan.
 - [x] Obtain and incorporate independent plan review.
-- [x] Implement stable tmux window identity and recovery.
-- [x] Implement global default inference parameters.
+- [x] Implement both backend command modes.
 - [x] Add regression tests.
 - [x] Update specs, docs, changelog, status, and task log.
 - [x] Run final validation.
