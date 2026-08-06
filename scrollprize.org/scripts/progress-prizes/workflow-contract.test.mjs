@@ -14,6 +14,7 @@ import {
   gateSnapshot,
   isTrustedPreviewRun,
   resolveProductionActivationState,
+  safeDiagnosticCode,
   waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
 
@@ -945,6 +946,10 @@ test('production activation-state recovery distinguishes exact, stale, and compl
   const pending = await resolveProductionActivationState(options, {
     listPulls: async () => [pull],
     readCommit: async () => exactCommit,
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
   });
   assert.deepEqual(pending, {
     state: 'pending',
@@ -957,12 +962,38 @@ test('production activation-state recovery distinguishes exact, stale, and compl
   const stale = await resolveProductionActivationState(options, {
     listPulls: async () => [pull],
     readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
   });
   assert.equal(stale.refreshRequired, true);
 
+  const incidentRegression = await resolveProductionActivationState(options, {
+    listPulls: async () => [{
+      ...pull,
+      base: { ...pull.base, sha: 'd'.repeat(40) },
+    }],
+    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
+  });
+  assert.deepEqual(incidentRegression, {
+    state: 'pending',
+    headSha,
+    baseSha,
+    pullNumber: '42',
+    refreshRequired: true,
+  });
+
   const completed = await resolveProductionActivationState(options, {
     listPulls: async () => [],
-    readMainRef: async () => ({ object: { sha: baseSha } }),
+    readMainRef: async () => ({
+      ref: 'refs/heads/main',
+      object: { type: 'commit', sha: baseSha },
+    }),
     readPage: async () => ({ cycle: '2026-08' }),
   });
   assert.deepEqual(completed, {
@@ -997,21 +1028,80 @@ test('production activation-state recovery fails closed on ambiguous or drifting
 
   await assert.rejects(
     resolveProductionActivationState(options, { listPulls: async () => [pull, pull] }),
-    /ambiguous/,
+    (error) => safeDiagnosticCode(error) === 'ambiguous-pr',
   );
   await assert.rejects(
     resolveProductionActivationState(options, {
-      listPulls: async () => [{ ...pull, base: { ...pull.base, sha: 'c'.repeat(40) } }],
+      listPulls: async () => [pull],
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: 'c'.repeat(40) },
+      }),
     }),
-    /main moved/,
+    (error) => safeDiagnosticCode(error) === 'main-ref-moved',
   );
   await assert.rejects(
     resolveProductionActivationState(options, {
       listPulls: async () => [],
-      readMainRef: async () => ({ object: { sha: baseSha } }),
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
       readPage: async () => ({ cycle: '2026-07' }),
     }),
-    /Neither a pending PR nor a completed production cycle exists/,
+    (error) => safeDiagnosticCode(error) === 'completed-state-missing',
+  );
+
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [{
+        ...pull,
+        head: { ...pull.head, repo: { id: 123, full_name: 'untrusted/fork' } },
+      }],
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
+    }),
+    (error) => safeDiagnosticCode(error) === 'invalid-pr-association',
+  );
+
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [pull],
+      readCommit: async () => ({
+        sha: headSha,
+        parents: [{ sha: baseSha }],
+        files: [
+          { filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' },
+          { filename: '.github/workflows/untrusted.yml', status: 'added' },
+        ],
+      }),
+      readMainRef: async () => ({
+        ref: 'refs/heads/main',
+        object: { type: 'commit', sha: baseSha },
+      }),
+    }),
+    (error) => safeDiagnosticCode(error) === 'invalid-page-head',
+  );
+});
+
+test('GitHub coordination diagnostics are bounded to an allowlist', () => {
+  assert.equal(safeDiagnosticCode({ diagnosticCode: 'main-ref-moved' }), 'main-ref-moved');
+  assert.equal(safeDiagnosticCode({
+    diagnosticCode: 'private-id-from-api-body',
+    message: 'sensitive response body',
+  }), 'unexpected-error');
+
+  const result = spawnSync(process.execPath, [
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'unknown-command',
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(
+    result.stderr,
+    'Progress Prize GitHub coordination failed safely [unexpected-error].\n',
   );
 });
 
