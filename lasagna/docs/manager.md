@@ -254,6 +254,67 @@ upload_staging_s3 = "s3://private-staging/my-inferences"
 rclone_params = ["--s3-provider", "AWS", "--s3-env-auth", "--transfers", "512", "--buffer-size", "2M", "--size-only", "--fast-list", "-P", "--stats-one-line"]
 ```
 
+### End-to-end inference and publication workflow
+
+Run these commands in order:
+
+1. Start inference and wait for it to report `completed`:
+
+   ```bash
+   las_manager inference run <snapshot> <sample/volume> <scale>
+   las_manager inference ls
+   ```
+
+   The manager creates
+   `<output_dir>/<run-name>/`. Portable results are written below its
+   `artifacts/` directory; logs and host-specific metadata stay beside that
+   directory and are not uploaded.
+
+2. Validate the completed bundle without writing anything:
+
+   ```bash
+   las_manager open-data validate <run-name>
+   ```
+
+3. Stage the bytes and register them in the configured local Atlas checkout:
+
+   ```bash
+   las_manager open-data upload <run-name>
+   ```
+
+   This copies `artifacts/` to
+   `<upload_staging_s3>/<run-uuid>/` (for example,
+   `s3://philodemos/hendrik/lasagna/inference/<run-uuid>/`) and writes or
+   updates the corresponding files below `<atlas_dir>/data/models/lasagna/`
+   and `<atlas_dir>/data/volumes/`. It does **not** publish to the public
+   open-data bucket.
+
+4. Review, commit, push, and merge the generated Atlas metadata through the
+   normal Atlas pull-request workflow:
+
+   ```bash
+   cd <atlas_dir>
+   git diff
+   git add data/models data/volumes
+   git commit -m "Register Lasagna inference"
+   git push
+   ```
+
+5. After that metadata is merged, an Atlas operator plans and executes the
+   existing copy-first publication workflow:
+
+   ```bash
+   cd <atlas_dir>/vesuvius-atlas-py
+   uv run vesuvius-atlas data-sync plan --sample-id <sample>
+   uv run vesuvius-atlas data-sync execute --sample-id <sample>
+   uv run vesuvius-atlas data-sync status --poll
+   ```
+
+   Data sync copies the staged prediction into the canonical public open-data
+   storage and records its `public-read` origin. The Atlas catalogue export
+   then exposes that public origin online; the private staging origin is not
+   included in the public metadata.
+
 Validate or upload a completed Fiber or Lasagna run:
 
 ```bash
