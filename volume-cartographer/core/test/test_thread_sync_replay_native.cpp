@@ -4,12 +4,101 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace replay = vc::thread_sync_replay;
+
+namespace
+{
+
+replay::EventProfile representativeProfile()
+{
+    return {
+        {"Ir", 80},
+        {"Dr", 20},
+        {"Dw", 10},
+        {"D1mr", 2},
+        {"D1mw", 1},
+        {"DLmr", 1},
+        {"DLmw", 0},
+        {"Bcm", 2},
+        {"Bim", 1},
+    };
+}
+
+replay::EventCostModel dataReadModel()
+{
+    return {
+        .feature_names =
+            {
+                "non_data_instructions",
+                "data_reads",
+                "data_writes",
+                "l1_data_misses",
+                "last_level_data_misses",
+                "branch_misses",
+                "branch_weighted_l1_misses",
+            },
+        .coefficients_ns = std::vector<double>(7, 1.0),
+    };
+}
+
+}  // namespace
+
+TEST_CASE("native event-cost scoring matches the frozen feature arithmetic")
+{
+    const double expected = 50.0 + 20.0 + 10.0 + 3.0 + 1.0 + 3.0 + 9.0 / 80.0;
+    CHECK(replay::modeledProfileCostNs(representativeProfile(), dataReadModel()) == doctest::Approx(expected).epsilon(1e-14));
+
+    const auto costs = replay::modeledThreadCostsNs({{2, representativeProfile()}, {1, representativeProfile()}}, dataReadModel());
+    CHECK(costs.size() == 2);
+    CHECK(costs.at(1) == doctest::Approx(expected));
+    CHECK(costs.at(2) == doctest::Approx(expected));
+}
+
+TEST_CASE("native event-cost interactions are overflow safe")
+{
+    auto profile = representativeProfile();
+    const auto large = std::numeric_limits<std::int64_t>::max() / 4;
+    profile["Ir"] = large;
+    profile["D1mr"] = large;
+    profile["Bcm"] = large;
+    const auto cost = replay::modeledProfileCostNs(profile, dataReadModel());
+    CHECK(std::isfinite(cost));
+    CHECK(cost > 0.0);
+}
+
+TEST_CASE("native event-cost scoring rejects malformed profiles and models")
+{
+    auto profile = representativeProfile();
+    auto model = dataReadModel();
+
+    profile.erase("Ir");
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(profile, model), std::runtime_error);
+    profile = representativeProfile();
+    profile["Dr"] = -1;
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(profile, model), std::runtime_error);
+
+    model = dataReadModel();
+    model.feature_names[0] = "unknown";
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(representativeProfile(), model), std::runtime_error);
+    model = dataReadModel();
+    model.coefficients_ns.pop_back();
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(representativeProfile(), model), std::runtime_error);
+    model = dataReadModel();
+    model.coefficients_ns[0] = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(representativeProfile(), model), std::runtime_error);
+    model = dataReadModel();
+    model.stall_overlap_fraction = 0.5;
+    CHECK_THROWS_AS(replay::modeledProfileCostNs(representativeProfile(), model), std::runtime_error);
+
+    CHECK_THROWS_AS(replay::modeledThreadCostsNs({}, dataReadModel()), std::runtime_error);
+    CHECK_THROWS_AS(replay::modeledThreadCostsNs({{0, representativeProfile()}}, dataReadModel()), std::runtime_error);
+}
 
 TEST_CASE("native replay attributes a sole zero-weight trailing window")
 {

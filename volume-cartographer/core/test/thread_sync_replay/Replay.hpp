@@ -50,6 +50,18 @@ struct ReplayResult {
     double dependency_excess_scale{1.0};
 };
 
+using EventProfile = std::map<std::string, std::int64_t>;
+
+struct EventCostModel {
+    std::vector<std::string> feature_names;
+    std::vector<double> coefficients_ns;
+    double stall_overlap_fraction{0.0};
+};
+
+[[nodiscard]] double modeledProfileCostNs(const EventProfile& events, const EventCostModel& model);
+
+[[nodiscard]] std::map<std::int64_t, double> modeledThreadCostsNs(const std::map<std::int64_t, EventProfile>& profiles, const EventCostModel& model);
+
 class Graph
 {
 public:

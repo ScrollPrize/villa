@@ -2,10 +2,12 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstdint>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -20,7 +22,7 @@ using json = nlohmann::json;
 namespace
 {
 
-constexpr int kProtocolVersion = 1;
+constexpr int kProtocolVersion = 2;
 
 struct LoadedGraph {
     explicit LoadedGraph(replay::Graph graph_) : graph(std::move(graph_)) {}
@@ -96,6 +98,62 @@ replay::ReplayOptions replayOptions(const json& value)
     };
 }
 
+replay::EventCostModel eventCostModel(const json& value)
+{
+    return {
+        .feature_names = value.at("feature_names").get<std::vector<std::string>>(),
+        .coefficients_ns = value.at("coefficients_ns").get<std::vector<double>>(),
+        .stall_overlap_fraction = value.value("stall_overlap_fraction", 0.0),
+    };
+}
+
+std::map<std::int64_t, replay::EventProfile> eventProfiles(const json& value)
+{
+    if (!value.is_object() || value.empty()) {
+        throw std::runtime_error("event profiles must be a nonempty object");
+    }
+    std::map<std::int64_t, replay::EventProfile> profiles;
+    for (auto thread = value.begin(); thread != value.end(); ++thread) {
+        std::size_t consumed = 0;
+        std::int64_t thread_id = 0;
+        try {
+            thread_id = std::stoll(thread.key(), &consumed);
+        } catch (const std::exception&) {
+            throw std::runtime_error("event profile has a malformed thread ID");
+        }
+        if (consumed != thread.key().size() || thread_id <= 0) {
+            throw std::runtime_error("event profile has a malformed thread ID");
+        }
+        if (!thread.value().is_object()) {
+            throw std::runtime_error("event profile is not an object");
+        }
+        replay::EventProfile events;
+        for (auto event = thread.value().begin(); event != thread.value().end(); ++event) {
+            if (!event.value().is_number_integer() && !event.value().is_number_unsigned()) {
+                throw std::runtime_error("event profile counts must be nonnegative integers");
+            }
+            std::int64_t count = 0;
+            if (event.value().is_number_unsigned()) {
+                const auto unsigned_count = event.value().get<std::uint64_t>();
+                if (unsigned_count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    throw std::runtime_error("event profile count is too large");
+                }
+                count = static_cast<std::int64_t>(unsigned_count);
+            } else {
+                count = event.value().get<std::int64_t>();
+                if (count < 0) {
+                    throw std::runtime_error("event profile counts must be nonnegative integers");
+                }
+            }
+            events.emplace(event.key(), count);
+        }
+        if (!profiles.emplace(thread_id, std::move(events)).second) {
+            throw std::runtime_error("event profile has duplicate numeric thread IDs");
+        }
+    }
+    return profiles;
+}
+
 class Server
 {
 public:
@@ -114,7 +172,11 @@ public:
                 {"compiler_version", VC_REPLAY_COMPILER_VERSION},
                 {"build_type", VC_REPLAY_BUILD_TYPE},
                 {"architecture", VC_REPLAY_ARCHITECTURE},
+                {"profile_scoring", true},
             };
+        }
+        if (command == "model_profile_costs") {
+            return modelProfileCosts(request);
         }
         if (command == "register_attributions") {
             return registerAttributions(request);
@@ -132,6 +194,27 @@ public:
     [[nodiscard]] bool stopped() const noexcept { return _stop; }
 
 private:
+    json modelProfileCosts(const json& request)
+    {
+        const auto start = std::chrono::steady_clock::now();
+        const auto costs = replay::modeledThreadCostsNs(eventProfiles(request.at("profiles")), eventCostModel(request.at("event_cost_model")));
+        json encoded = json::object();
+        double total = 0.0;
+        for (const auto& [thread, cost] : costs) {
+            encoded[std::to_string(thread)] = cost;
+            total += cost;
+            if (!std::isfinite(total)) {
+                throw std::runtime_error("modeled thread-cost total is not finite");
+            }
+        }
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return {
+            {"thread_costs", std::move(encoded)},
+            {"total_cost", total},
+            {"native_profile_scoring_seconds", seconds},
+        };
+    }
+
     LoadedGraph& graph(const json& request)
     {
         const auto id = request.at("graph_id").get<std::string>();

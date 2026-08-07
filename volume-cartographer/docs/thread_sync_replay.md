@@ -1,14 +1,18 @@
 # Native Thread-Synchronization Replay
 
 Passive Valgrind trace collection and DRD dependency extraction remain in
-`scripts/run_thread_sync_replay.py`. Event-graph scheduling and critical-path
-playback run in the portable C++ `bench_thread_sync_replay` executable.
+the standard-library Python coordinator and shared `scripts/thread_sync_trace.py`
+parser. Event-feature calculation, profile-cost evaluation, event-graph
+scheduling, and critical-path playback run in the portable C++
+`bench_thread_sync_replay` executable.
 
 Python starts one persistent process and exchanges one JSON object per line.
-Every request and response uses `schema_version: 1` and an ordered
+Every request and response uses `schema_version: 2` and an ordered
 `request_id`. Supported commands are:
 
 - `info`: return compiler, build type, and architecture metadata.
+- `model_profile_costs`: validate raw per-thread Callgrind events and evaluate
+  the frozen event-cost model in deterministic numeric-thread order.
 - `load_graph`: load and validate one JSONL event stream under a `graph_id`.
 - `register_attributions`: assign per-thread costs to named attribution IDs.
 - `replay_batch`: execute ordered jobs against cached graph/attribution pairs.
@@ -24,6 +28,10 @@ I/O and internal process failures terminate the client operation.
 Callers locate the executable in this order: explicit `--replay-engine`,
 `VC_THREAD_SYNC_REPLAY_BIN`, beside the benchmark executable, then `PATH`.
 There is no Python fallback.
+
+The rendering CI coordinator is intentionally importable with `python3 -S` and
+does not require NumPy. NumPy remains part of offline model fitting and parity
+analysis, not production gate execution.
 
 Build and run the compatibility tests:
 

@@ -10,7 +10,7 @@ import subprocess
 import time
 from pathlib import Path
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 ENVIRONMENT_VARIABLE = "VC_THREAD_SYNC_REPLAY_BIN"
 
 
@@ -125,6 +125,25 @@ class NativeReplayEngine:
             name: str(response[name])
             for name in ("compiler", "compiler_version", "build_type", "architecture")
         }
+
+    def model_profile_costs(
+        self,
+        profiles: dict[int, dict[str, int]],
+        event_cost_model: dict[str, object],
+    ) -> tuple[dict[int, float], float]:
+        response = self._request(
+            "model_profile_costs",
+            profiles={
+                str(thread): {str(name): int(value) for name, value in events.items()}
+                for thread, events in sorted(profiles.items())
+            },
+            event_cost_model=event_cost_model,
+        )
+        costs = {
+            int(thread): float(cost)
+            for thread, cost in response["thread_costs"].items()
+        }
+        return costs, float(response["total_cost"])
 
     def register_attributions(
         self,

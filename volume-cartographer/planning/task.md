@@ -1,6 +1,6 @@
 # Task
 
-Allow the synthetic rendering regression gate to run across Valgrind version
-updates. Continue recording the profiler version for diagnostics, but do not
-fail solely because it differs from the frozen reference; let the modeled
-runtime tolerance detect material profiler or renderer changes.
+Fix the synthetic rendering CI gate so it runs in the dependency container,
+which has no NumPy. Move deterministic event-feature and thread-cost scoring
+into the C++ replay engine; retain Python only for Valgrind orchestration and
+artifact parsing. Add a clean-Python/container dependency smoke check.

@@ -969,6 +969,12 @@ versions but does not reject a version change by itself; material profiler
 effects remain subject to the modeled-score tolerance. CI retains the complete
 `render-valgrind-ci/` tree even on failure.
 
+The CI runtime does not import NumPy. Its standard-library Python coordinator
+collects and validates artifacts, while the versioned C++ replay engine computes
+event features, per-thread modeled costs, serial totals, cost attribution, and
+parallel replay. The `test_render_valgrind_ci_no_site` CTest runs this boundary
+under `python3 -S`.
+
 The 2026-08-07 GCC 15.3.0/Valgrind 3.25.1 reference collection took 15.73 s on
 the four-core calibration host. A second fresh collection and gate took 16.38
 s. Its parallel score ratios ranged from 0.993 to 1.016; all serial scores were

@@ -2,44 +2,54 @@
 
 ## Findings
 
-- GitHub Actions run `31173510984`, job `92850416859`, failed in `Install
-  deterministic profiler`; configure and benchmark steps were skipped.
-- The Ubuntu 26.04 container repository supplies Valgrind 3.26.0 while the
-  frozen reference records Valgrind 3.25.1.
-- The workflow rejected that difference before collection, and the evaluator
-  would reject it again because `valgrind_version` is part of exact reference
-  identity equality.
-- Same-run Callgrind/DRD version equality is a separate consistency check and
-  remains useful.
+- GitHub Actions reached the matrix after the Valgrind-version fix, then every
+  collector failed while importing `passive_event_model.py` because the pinned
+  dependency image has no NumPy.
+- Local validation used the host Python environment, where NumPy was installed,
+  and therefore did not cover the actual container dependency surface.
+- Dependency replay is native C++, but per-thread event feature extraction and
+  cost calculation were still performed by the NumPy calibration helper before
+  costs were sent to the native engine.
+- `run_render_valgrind_ci.py` also imports DRD parsing from
+  `run_thread_sync_replay.py`, whose top-level calibration imports pull in
+  NumPy even before a command runs.
+- The local Docker socket is not accessible to this user, so exact pinned-image
+  execution requires either another rootless runtime or a GitHub Actions run.
 
 ## Decisions
 
-- Keep profiler versions in all artifacts and references for diagnosis.
-- Ignore only reference-versus-observed Valgrind version when comparing
-  environment/workload identity.
-- Keep the modeled score, checksum, model, and all other identity checks strict.
+- Do not install NumPy in the CI workflow.
+- Move runtime event-cost calculation into the existing shared C++ replay
+  implementation and expose it through the persistent protocol.
+- Lazy-load calibration-only Python dependencies.
+- Add a `python3 -S` smoke check to prevent undeclared site-package imports.
 
 ## Plan Review
 
-- Require non-empty version metadata even though it is excluded from cross-run
-  identity equality.
-- Add explicit coverage for same-run Callgrind/DRD version consistency.
-- Populate reference and observed profiler versions before score validation so
-  a failed score artifact remains diagnosable.
-- Rename and update workflow/documentation wording that implied a pinned
-  profiler version.
+- The resulting gate has native model computation and replay, not literally
+  zero Python; Python remains a standard-library coordinator.
+- Extract the DRD parser structurally instead of relying only on lazy imports.
+- Bump the native protocol for the scoring command.
+- Define and test overflow safety, deterministic accumulation, finite input,
+  malformed profile/model rejection, and tight parity with the prior model.
+- Exercise parser and real native scoring under `python3 -S`; the full workflow
+  matrix remains the end-to-end test of all three commands.
 
 ## Validation
 
-- Focused driver unit tests: 19 passed.
-- Full benchmark Python suite: 102 passed.
-- Focused CTest `test_render_valgrind_ci_driver`: passed.
-- Full eight-case local Valgrind gate: passed; serial ratios were 1.000 and
-  parallel ratios ranged from 0.992 to 1.030.
-- Workflow YAML parsing, Python byte compilation, Ruff formatting/correctness
-  lint, and `git diff --check`: passed.
-- A broad Ruff style run exposed pre-existing `EXE001` file-mode findings and
-  one pre-existing `SIM117` nested-context finding in the touched test file;
-  those unrelated style issues were not changed.
-- Local collection used Valgrind 3.25.1. Cross-version behavior is covered by
-  unit tests; GitHub Actions will provide the first full 3.26.0 matrix.
+- Configured a clean Release benchmark build with the workflow's GCC 15
+  toolchain and `VC_MARCH_NATIVE=OFF`, then built the benchmark, replay engine,
+  and native replay tests with 32 jobs.
+- Five focused CTests passed: fixture, native replay, CI driver, no-site import
+  and scoring, and replay-model compatibility.
+- The no-site test runs with `python3 -S`, imports the complete CI driver and
+  dependency-free DRD parser, and performs a real event-cost request against
+  the C++ replay process.
+- The complete fresh eight-case Callgrind/DRD gate passed. Serial ratios were
+  exactly 1.000; parallel ratios were 1.000, 1.006, 0.995, and 1.033.
+- All 102 benchmark Python unit tests passed with one expected skip.
+- Ruff formatting and lint, Clang formatting, workflow YAML parsing, and
+  `git diff --check` passed.
+- A direct pinned-container attempt could not access this session's Docker
+  daemon socket. The repository was therefore not claimed as container-tested;
+  the next GitHub Actions execution remains the exact-image confirmation.

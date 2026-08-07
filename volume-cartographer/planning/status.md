@@ -1,12 +1,12 @@
 # Status
 
-- [x] Inspect the failed GitHub Actions job and identify the pre-gate failure.
-- [x] Review the relevant benchmark requirement and implementation.
-- [x] Write the scoped implementation and validation plan.
+- [x] Identify the container-only NumPy import failure.
+- [x] Trace the Python scoring and C++ replay boundary.
+- [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Update the benchmark specification.
-- [x] Relax only cross-run Valgrind reference identity matching.
-- [x] Update workflow installation and benchmark documentation.
-- [x] Add and run regression tests.
-- [x] Update the task log and changelog.
-- [x] Review the final diff.
+- [x] Implement native event-cost scoring and protocol support.
+- [x] Remove NumPy from the CI runtime import path.
+- [x] Add clean-environment and native parity tests.
+- [x] Update specification and documentation.
+- [x] Run full validation and inspect the final diff.
+- [x] Update task log and changelog.

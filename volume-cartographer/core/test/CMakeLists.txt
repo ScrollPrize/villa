@@ -494,6 +494,11 @@ if(VC_RUN_RENDER_BENCHMARKS)
         COMMAND ${Python3_EXECUTABLE}
             "${PROJECT_SOURCE_DIR}/core/test/test_run_render_valgrind_ci.py")
     vc_register_ctest(test_render_valgrind_ci_driver bench_render_synthetic)
+    add_test(NAME test_render_valgrind_ci_no_site
+        COMMAND ${Python3_EXECUTABLE} -S
+            "${PROJECT_SOURCE_DIR}/core/test/test_render_valgrind_ci_no_site.py"
+            --replay-engine $<TARGET_FILE:bench_thread_sync_replay>)
+    vc_register_ctest(test_render_valgrind_ci_no_site bench_thread_sync_replay)
     add_test(NAME test_thread_sync_replay_model
         COMMAND ${Python3_EXECUTABLE}
             "${PROJECT_SOURCE_DIR}/core/test/test_run_thread_sync_replay.py")
@@ -570,10 +575,8 @@ if(VC_RUN_RENDER_BENCHMARKS)
         set(_render_valgrind_ci_script_deps
             "${_render_valgrind_ci_runner}"
             "${_render_valgrind_ci_common}"
-            "${PROJECT_SOURCE_DIR}/scripts/passive_event_model.py"
             "${PROJECT_SOURCE_DIR}/scripts/native_thread_sync_replay.py"
-            "${PROJECT_SOURCE_DIR}/scripts/run_thread_sync_replay.py"
-            "${PROJECT_SOURCE_DIR}/scripts/run_render_callgrind.py")
+            "${PROJECT_SOURCE_DIR}/scripts/thread_sync_trace.py")
         set(_render_valgrind_ci_measure_outputs)
         set(_render_valgrind_ci_gate_outputs)
 

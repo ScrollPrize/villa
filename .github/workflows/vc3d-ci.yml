@@ -228,9 +228,10 @@ jobs:
           jobs=$(nproc)
           echo "Using $jobs Ninja jobs"
           cmake --build build/ci-render-benchmark \
-            --target bench_render_synthetic --parallel "$jobs"
+            --target bench_render_synthetic bench_thread_sync_replay \
+            --parallel "$jobs"
           ctest --test-dir build/ci-render-benchmark --output-on-failure \
-            -R '^test_render_synthetic_fixture$'
+            -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
       - name: Run full fresh Valgrind matrix
         working-directory: volume-cartographer
         run: |

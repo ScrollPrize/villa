@@ -2,6 +2,10 @@
 
 ## 2026-08-07
 
+- Removed NumPy from the synthetic rendering gate's runtime path. Event-feature
+  construction, per-thread cost scoring, and replay now run in the versioned
+  C++ engine; standard-library Python only coordinates Valgrind and artifacts.
+  Added native parity and validation coverage plus a `python3 -S` CI smoke test.
 - Made Valgrind version changes diagnostic rather than automatic rendering-gate
   identity failures. Both versions remain required and recorded, paired
   Callgrind/DRD collections must still match, and material profiler effects are

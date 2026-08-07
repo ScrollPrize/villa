@@ -29,6 +29,76 @@ void requireFiniteNonnegative(double value, const char* name)
     }
 }
 
+const std::vector<std::string> kLegacyFeatures{
+    "non_data_instructions",
+    "data_writes",
+    "l1_data_misses",
+    "last_level_data_misses",
+    "branch_misses",
+    "branch_weighted_l1_misses",
+};
+
+const std::vector<std::string> kExtendedFeatures{
+    "non_data_instructions",
+    "data_writes",
+    "l1_data_misses",
+    "last_level_data_misses",
+    "branch_misses",
+    "branch_weighted_l1_misses",
+    "l1_miss_serial_pressure",
+};
+
+const std::vector<std::string> kDataReadFeatures{
+    "non_data_instructions",
+    "data_reads",
+    "data_writes",
+    "l1_data_misses",
+    "last_level_data_misses",
+    "branch_misses",
+    "branch_weighted_l1_misses",
+};
+
+const std::vector<std::string> kSplitCacheFeatures{
+    "non_data_instructions",
+    "data_writes",
+    "l1_data_read_misses",
+    "l1_data_write_misses",
+    "last_level_data_read_misses",
+    "last_level_data_write_misses",
+    "branch_misses",
+    "branch_weighted_l1_misses",
+};
+
+const std::vector<std::string> kDataReadSplitCacheFeatures{
+    "non_data_instructions",
+    "data_reads",
+    "data_writes",
+    "l1_data_read_misses",
+    "l1_data_write_misses",
+    "last_level_data_read_misses",
+    "last_level_data_write_misses",
+    "branch_misses",
+    "branch_weighted_l1_misses",
+};
+
+bool supportedFeatures(const std::vector<std::string>& names)
+{
+    return names == kLegacyFeatures || names == kExtendedFeatures || names == kDataReadFeatures || names == kSplitCacheFeatures ||
+           names == kDataReadSplitCacheFeatures;
+}
+
+std::int64_t eventCount(const EventProfile& events, const std::string& name)
+{
+    const auto found = events.find(name);
+    if (found == events.end()) {
+        throw std::runtime_error("event profile is missing " + name);
+    }
+    if (found->second < 0) {
+        throw std::runtime_error("event profile has a negative " + name + " count");
+    }
+    return found->second;
+}
+
 std::vector<Dependency> uniqueDependencies(const std::vector<Dependency>& dependencies, std::size_t event_count)
 {
     std::vector<Dependency> unique;
@@ -62,6 +132,99 @@ double edgeFinish(const std::vector<Event>& events, const std::vector<double>& f
 }
 
 }  // namespace
+
+double modeledProfileCostNs(const EventProfile& events, const EventCostModel& model)
+{
+    if (!supportedFeatures(model.feature_names)) {
+        throw std::runtime_error("event-cost model has an unsupported feature basis");
+    }
+    if (model.coefficients_ns.size() != model.feature_names.size()) {
+        throw std::runtime_error("event-cost model has an invalid coefficient count");
+    }
+    if (!std::isfinite(model.stall_overlap_fraction) || model.stall_overlap_fraction < 0.0 || model.stall_overlap_fraction > 1.0) {
+        throw std::runtime_error("event-cost model has an invalid stall overlap");
+    }
+    if (model.stall_overlap_fraction != 0.0 && model.feature_names != kLegacyFeatures) {
+        throw std::runtime_error("extended event-cost models require zero overlap");
+    }
+    for (const auto coefficient : model.coefficients_ns) {
+        requireFiniteNonnegative(coefficient, "event-cost coefficient");
+    }
+
+    const auto ir = eventCount(events, "Ir");
+    const auto dr = eventCount(events, "Dr");
+    const auto dw = eventCount(events, "Dw");
+    const auto d1mr = eventCount(events, "D1mr");
+    const auto d1mw = eventCount(events, "D1mw");
+    const auto dlmr = eventCount(events, "DLmr");
+    const auto dlmw = eventCount(events, "DLmw");
+    const auto bcm = eventCount(events, "Bcm");
+    const auto bim = eventCount(events, "Bim");
+
+    const long double instructions = std::max<long double>(ir, 1.0L);
+    const long double l1_read_misses = d1mr;
+    const long double l1_write_misses = d1mw;
+    const long double l1_misses = l1_read_misses + l1_write_misses;
+    const long double last_level_read_misses = dlmr;
+    const long double last_level_write_misses = dlmw;
+    const long double branch_misses = static_cast<long double>(bcm) + bim;
+    const long double non_data =
+        std::max<long double>(0.0L, static_cast<long double>(ir) - static_cast<long double>(dr) - static_cast<long double>(dw));
+
+    const std::map<std::string, double> values{
+        {"non_data_instructions", static_cast<double>(non_data)},
+        {"data_reads", static_cast<double>(dr)},
+        {"data_writes", static_cast<double>(dw)},
+        {"l1_data_misses", static_cast<double>(l1_misses)},
+        {"l1_data_read_misses", static_cast<double>(l1_read_misses)},
+        {"l1_data_write_misses", static_cast<double>(l1_write_misses)},
+        {"last_level_data_misses", static_cast<double>(last_level_read_misses + last_level_write_misses)},
+        {"last_level_data_read_misses", static_cast<double>(last_level_read_misses)},
+        {"last_level_data_write_misses", static_cast<double>(last_level_write_misses)},
+        {"branch_misses", static_cast<double>(branch_misses)},
+        {"branch_weighted_l1_misses", static_cast<double>(l1_misses * branch_misses / instructions)},
+        {"l1_miss_serial_pressure", static_cast<double>(l1_misses * l1_misses / instructions)},
+    };
+
+    std::vector<double> contributions;
+    contributions.reserve(model.feature_names.size());
+    double total = 0.0;
+    for (std::size_t index = 0; index < model.feature_names.size(); ++index) {
+        const double value = values.at(model.feature_names[index]);
+        requireFiniteNonnegative(value, "event-cost feature");
+        const double contribution = value * model.coefficients_ns[index];
+        requireFiniteNonnegative(contribution, "event-cost contribution");
+        contributions.push_back(contribution);
+        total += contribution;
+        requireFiniteNonnegative(total, "modeled profile cost");
+    }
+    if (model.stall_overlap_fraction == 0.0) {
+        return total;
+    }
+
+    const double non_stall = contributions[0] + contributions[1];
+    const double interaction = contributions[5];
+    const double branch_stall = contributions[4] + 0.5 * interaction;
+    const double cache_stall = contributions[2] + contributions[3] + 0.5 * interaction;
+    const double adjusted = non_stall + branch_stall + cache_stall - model.stall_overlap_fraction * std::min(branch_stall, cache_stall);
+    requireFiniteNonnegative(adjusted, "modeled profile cost");
+    return adjusted;
+}
+
+std::map<std::int64_t, double> modeledThreadCostsNs(const std::map<std::int64_t, EventProfile>& profiles, const EventCostModel& model)
+{
+    if (profiles.empty()) {
+        throw std::runtime_error("event profiles are empty");
+    }
+    std::map<std::int64_t, double> costs;
+    for (const auto& [thread, events] : profiles) {
+        if (thread <= 0) {
+            throw std::runtime_error("event profile thread IDs must be positive");
+        }
+        costs.emplace(thread, modeledProfileCostNs(events, model));
+    }
+    return costs;
+}
 
 Graph::Graph(std::vector<Event> events) : _events(std::move(events))
 {

@@ -122,9 +122,13 @@
   only after all raw files and metadata validate; evaluators depend on those
   manifests and may not rerun collection.
 - The CI relative modeled-runtime score uses the frozen synthetic-only
-  data-read event model. Serial score is summed per-thread modeled work per
-  render call. Parallel score is native FIFO replay makespan per render call
-  with four workers plus one caller core, equal attribution,
+  data-read event model. Feature extraction, event-cost evaluation, deterministic
+  numeric-thread summation, cost attribution, and replay must run in the native
+  C++ replay engine. The Python CI coordinator must use only the standard
+  library at runtime; a `python3 -S` test must exercise dependency parsing and
+  native scoring. Serial score is summed per-thread modeled work per render
+  call. Parallel score is native FIFO replay makespan per render call with four
+  workers plus one caller core, equal attribution,
   `residual_fraction=0.5`, zero wake latency, the frozen cross-thread release
   latency, and unit replay/dependency-excess scales. Process startup and native
   wall timing are excluded.
@@ -198,13 +202,15 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   fixed-basic-block work slices, pair blocking futex waits with guest wakes or
   observed thread completion, and fail timing validation when dependencies are
   unresolved.
-- Passive event playback must use the native persistent replay engine. Python
-  remains responsible for Valgrind collection, dependency extraction, model
-  fitting, and reports, but production callers must load each event graph once,
-  cache named cost attributions, and submit ordered replay batches through the
-  versioned protocol. Missing native replay is an error; there is no silent
-  Python fallback. The Python replay is retained only as a temporary parity
-  oracle and must not be used for production benchmark results.
+- Passive event scoring and playback must use the native persistent replay
+  engine. Python remains responsible for Valgrind collection, dependency
+  extraction, model fitting, orchestration, and reports, but production callers
+  must ask the native engine to evaluate profile costs, load each event graph
+  once, cache named cost attributions, and submit ordered replay batches through
+  the versioned protocol. Missing native replay is an error; there is no silent
+  Python fallback. The Python replay and NumPy event model are retained only as
+  calibration/parity tools and must not be used for production benchmark
+  results.
 - Valgrind elapsed timestamps must not be used as native duration or as work
   weights. State names must distinguish traced blocking from native scheduler
   state; simulated core idle is never an observed native metric.

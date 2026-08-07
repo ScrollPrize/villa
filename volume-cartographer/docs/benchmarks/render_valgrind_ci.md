@@ -39,9 +39,10 @@ CPUs:
 ```bash
 jobs=$(nproc)
 cmake --build volume-cartographer/build/ci-render-benchmark \
-  --target bench_render_synthetic --parallel "$jobs"
+  --target bench_render_synthetic bench_thread_sync_replay --parallel "$jobs"
 ctest --test-dir volume-cartographer/build/ci-render-benchmark \
-  --output-on-failure -R '^test_render_synthetic_fixture$'
+  --output-on-failure \
+  -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target render_valgrind_ci --parallel "$jobs"
 ```
@@ -49,6 +50,12 @@ cmake --build volume-cartographer/build/ci-render-benchmark \
 Set `jobs` to a smaller positive number to limit local CPU or memory use. This
 only controls how many independent Ninja commands run at once. It does not
 change the fixed four-worker renderer fixture or five-core replay model.
+
+`test_render_valgrind_ci_no_site` runs the coordinator with `python3 -S`, parses
+a DRD fixture, and evaluates a profile through the real native replay engine.
+This prevents the dependency container from silently relying on host-installed
+Python packages. Python coordinates collection and artifact validation; all
+event-cost and replay computation is native C++.
 
 Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:

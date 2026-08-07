@@ -233,10 +233,17 @@ class RenderValgrindCiTest(unittest.TestCase):
             "coefficients_ns": [1.0] * 7,
             "stall_overlap_fraction": 0.0,
         }
-        score, replay = DRIVER.estimate_score(
-            callgrind, None, {"event_cost_model": event_model}, Path("unused")
-        )
         expected_features = 50 + 20 + 10 + 3 + 1 + 3 + (3 * 3 / 80)
+        engine = mock.MagicMock()
+        engine.__enter__.return_value = engine
+        engine.model_profile_costs.return_value = (
+            {1: expected_features},
+            expected_features,
+        )
+        with mock.patch.object(DRIVER, "NativeReplayEngine", return_value=engine):
+            score, replay = DRIVER.estimate_score(
+                callgrind, None, {"event_cost_model": event_model}, Path("unused")
+            )
         self.assertAlmostEqual(score, expected_features / 2)
         self.assertIsNone(replay)
 

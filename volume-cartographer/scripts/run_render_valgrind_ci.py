@@ -18,7 +18,6 @@ from native_thread_sync_replay import (
     attribution_request,
     replay_request,
 )
-from passive_event_model import modeled_thread_costs_ns
 from render_valgrind_common import (
     CACHE_GEOMETRY,
     SCENARIOS,
@@ -29,7 +28,7 @@ from render_valgrind_common import (
     require_supported_host,
     valgrind_version,
 )
-from run_thread_sync_replay import parse_drd_trace, write_event_stream
+from thread_sync_trace import parse_drd_trace, write_event_stream
 
 SCHEMA_VERSION = 1
 BENCHMARK_METADATA_SCHEMA = 1
@@ -339,13 +338,14 @@ def estimate_score(
         int(thread): {str(name): int(value) for name, value in events.items()}
         for thread, events in callgrind["profiles"].items()
     }
-    costs = modeled_thread_costs_ns(profiles, model["event_cost_model"])
     repetitions = int(callgrind["metadata"]["repetitions"])
-    if drd is None:
-        return sum(costs.values()) / repetitions, None
-
-    replay = model["replay"]
     with NativeReplayEngine(replay_engine.resolve()) as engine:
+        costs, total_cost = engine.model_profile_costs(
+            profiles, model["event_cost_model"]
+        )
+        if drd is None:
+            return total_cost / repetitions, None
+        replay = model["replay"]
         event_count = engine.load_graph("renderer", Path(str(drd["event_path"])))
         if event_count != int(drd["trace"]["events"]):
             raise RuntimeError("native replay loaded a different DRD event count")
