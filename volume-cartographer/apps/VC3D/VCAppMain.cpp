@@ -99,6 +99,19 @@ class WheelFocusFilter final : public QObject
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override
     {
+        // Polish fires once per widget as it is styled, so this catches every
+        // combo/spinner app-wide, including ones created later. StrongFocus
+        // (vs the default WheelFocus) stops the wheel from focusing the
+        // widget as the cursor passes over it.
+        if (event->type() == QEvent::Polish) {
+            auto* widget = qobject_cast<QWidget*>(watched);
+            if (widget && (qobject_cast<QAbstractSpinBox*>(widget) ||
+                           qobject_cast<QComboBox*>(widget))) {
+                widget->setFocusPolicy(Qt::StrongFocus);
+            }
+            return QObject::eventFilter(watched, event);
+        }
+
         if (event->type() != QEvent::Wheel)
             return QObject::eventFilter(watched, event);
 
