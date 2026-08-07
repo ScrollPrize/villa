@@ -1,7 +1,6 @@
 # Task
 
-Document how to recalibrate the synthetic rendering score model, refresh its
-eight performance references, and intentionally tighten or loosen the CI
-tolerance. Make GitHub Actions derive Ninja parallelism from the available CPU
-count instead of hardcoding four jobs, and clarify how merging activates the
-gate.
+Allow the synthetic rendering regression gate to run across Valgrind version
+updates. Continue recording the profiler version for diagnostics, but do not
+fail solely because it differs from the frozen reference; let the modeled
+runtime tolerance detect material profiler or renderer changes.

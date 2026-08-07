@@ -962,9 +962,11 @@ modeled-runtime score only. It must not be described as estimated native wall
 time. Each candidate score must fall in `[0.90, 1.10]` times the checked
 reference.
 
-The gate rejects model hashes, checksums, incomplete DRD dependencies, compiler
-or Valgrind versions, cache geometry, architecture, fixture shape, repetition
-count, and worker count that differ from the reference. CI retains the complete
+The gate rejects model hashes, checksums, incomplete DRD dependencies, compiler,
+cache geometry, architecture, fixture shape, repetition count, and worker count
+that differ from the reference. It records reference and observed Valgrind
+versions but does not reject a version change by itself; material profiler
+effects remain subject to the modeled-score tolerance. CI retains the complete
 `render-valgrind-ci/` tree even on failure.
 
 The 2026-08-07 GCC 15.3.0/Valgrind 3.25.1 reference collection took 15.73 s on

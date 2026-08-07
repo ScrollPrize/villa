@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -130,6 +131,61 @@ class RenderValgrindCiTest(unittest.TestCase):
         changed_environment["identity"]["compiler_version"] = "15.0"
         with self.assertRaisesRegex(RuntimeError, "environment"):
             DRIVER.check_reference(changed_environment, self.reference, 0.10)
+
+    def test_reference_gate_accepts_valgrind_change_and_records_versions(self):
+        result = copy.deepcopy(self.result)
+        reference = copy.deepcopy(self.reference)
+        result["identity"]["valgrind_version"] = "valgrind-3.26.0"
+        DRIVER.check_reference(result, reference, 0.10)
+        self.assertEqual(result["reference_valgrind_version"], "valgrind-3.22.0")
+        self.assertEqual(result["observed_valgrind_version"], "valgrind-3.26.0")
+        self.assertTrue(result["valgrind_version_changed"])
+
+    def test_reference_gate_keeps_valgrind_diagnostics_on_score_failure(self):
+        result = copy.deepcopy(self.result)
+        reference = copy.deepcopy(self.reference)
+        result["identity"]["valgrind_version"] = "valgrind-3.26.0"
+        result["modeled_runtime_score_ns"] = 110.1
+        with self.assertRaisesRegex(RuntimeError, "required"):
+            DRIVER.check_reference(result, reference, 0.10)
+        self.assertEqual(result["reference_valgrind_version"], "valgrind-3.22.0")
+        self.assertEqual(result["observed_valgrind_version"], "valgrind-3.26.0")
+        self.assertTrue(result["valgrind_version_changed"])
+
+    def test_reference_gate_requires_valgrind_metadata(self):
+        for source in ("reference", "observed"):
+            with self.subTest(source=source):
+                result = copy.deepcopy(self.result)
+                reference = copy.deepcopy(self.reference)
+                identity = (
+                    reference["cases"]["serial/full_res"]["identity"]
+                    if source == "reference"
+                    else result["identity"]
+                )
+                identity["valgrind_version"] = ""
+                with self.assertRaisesRegex(RuntimeError, "Valgrind version"):
+                    DRIVER.check_reference(result, reference, 0.10)
+
+    def test_pair_requires_matching_valgrind_versions(self):
+        callgrind = {
+            "case": "parallel/full_res",
+            "metadata": {},
+            "valgrind_version": "valgrind-3.25.1",
+        }
+        drd = {
+            "case": "parallel/full_res",
+            "metadata": {},
+            "valgrind_version": "valgrind-3.26.0",
+            "trace": {
+                "unmatched_futex_waits": 0,
+                "unresolved_happens_before": 0,
+            },
+        }
+        with (
+            mock.patch.object(DRIVER, "_verify_manifest_files"),
+            self.assertRaisesRegex(RuntimeError, "different Valgrind versions"),
+        ):
+            DRIVER._validate_pair(callgrind, drd)
 
     def test_reference_gate_checks_exact_checksum(self):
         self.result["checksum"] = 124

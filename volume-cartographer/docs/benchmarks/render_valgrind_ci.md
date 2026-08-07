@@ -19,8 +19,9 @@ not estimated native wall time.
 
 ## Running Locally
 
-The deterministic gate supports Linux amd64. Use the same compiler and
-Valgrind versions recorded by the reference. Configure once:
+The deterministic gate supports Linux amd64. Use the same compiler configuration
+recorded by the reference. The installed Valgrind version is recorded for
+diagnosis but is not pinned to the reference. Configure once:
 
 ```bash
 cmake -S volume-cartographer -B volume-cartographer/build/ci-render-benchmark \
@@ -59,10 +60,14 @@ Artifacts are under
 - `checked.failed.json` after a failed comparison.
 
 Start failure diagnosis with `checked.failed.json`. A checksum failure is a
-rendering behavior change. An identity failure means compiler, Valgrind, model,
-cache, fixture, or repetition settings differ. An incomplete DRD failure means
-the trace must be recollected. A score ratio outside the reported interval is a
-performance change requiring investigation or an intentional reference update.
+rendering behavior change. An identity failure means compiler, model, cache,
+fixture, or repetition settings differ. The output records
+`reference_valgrind_version`, `observed_valgrind_version`, and whether they
+changed. A profiler-version change alone is accepted; event-count or dependency
+changes still fail when they invalidate collection or move the modeled score
+outside tolerance. An incomplete DRD failure means the trace must be
+recollected. A score ratio outside the reported interval is a performance change
+requiring investigation or an intentional reference update.
 
 ## CI Activation
 

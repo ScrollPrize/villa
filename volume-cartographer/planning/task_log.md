@@ -1,37 +1,45 @@
 # Task Log
 
-## 2026-08-07
+## Findings
 
-- Started documentation and workflow follow-up for calibration/reference/
-  tolerance maintenance and runner-derived Ninja concurrency.
-- The prior implementation hardcodes `--parallel 4` in GitHub Actions and local
-  examples. The CMake artifact graph itself has no concurrency assumption.
-- The checked reference already stores `tolerance: 0.1`, but evaluation also
-  defaults independently to a Python `TOLERANCE` constant. This duplicate
-  policy value will be removed from normal CI evaluation.
-- Independent review required ordinary VC3D usage/failure documentation,
-  scoping parallelism validation to the rendering job, making the runtime
-  target runner-size-aware, and explaining path-filter versus branch-protection
-  activation. The plan now includes all four points.
-- Added `docs/benchmarks/render_valgrind_ci.md` as the VC3D operational guide
-  and linked it from the synthetic-rendering design document. It separates
-  routine use from model recalibration, eight-case score refresh, and
-  tolerance-only policy changes, and documents path filters plus branch-rule
-  enforcement.
-- Added `freeze-model` to validate synthetic-only provenance, the exact
-  seven-feature data-read basis, coefficient count, and cross-thread release
-  parameter. Unaccepted experimental calibrations require an explicit
-  `--allow-unpromoted` decision. The command reproduced the current compact
-  model exactly from `/tmp/thread-sync-event-features-v4-data_reads/model.json`.
-- Normal evaluation now reads tolerance from the checked reference. An
-  explicit `--tolerance` remains diagnostic-only, while `freeze-reference
-  --tolerance` is the supported policy update path and validates `[0, 1)`.
-- The rendering workflow uses `jobs=$(nproc)` for both benchmark compilation
-  and the Valgrind Ninja graph. Fixed renderer workers/replay cores remain part
-  of the workload model and are unchanged.
-- Added atomic `set-tolerance`; a 0.05 trial copy retained an identical
-  canonical hash for every field except `tolerance` and kept all eight cases.
-- Validation passed: 98 benchmark Python tests, focused Ruff format/lint,
-  Python byte compilation, workflow YAML parsing, and `git diff --check`.
-  A complete fresh gate using `--parallel "$(nproc)"` finished in 9.8 s; serial
-  ratios were 1.000 and parallel ratios were 1.002, 0.999, 1.010, and 0.989.
+- GitHub Actions run `31173510984`, job `92850416859`, failed in `Install
+  deterministic profiler`; configure and benchmark steps were skipped.
+- The Ubuntu 26.04 container repository supplies Valgrind 3.26.0 while the
+  frozen reference records Valgrind 3.25.1.
+- The workflow rejected that difference before collection, and the evaluator
+  would reject it again because `valgrind_version` is part of exact reference
+  identity equality.
+- Same-run Callgrind/DRD version equality is a separate consistency check and
+  remains useful.
+
+## Decisions
+
+- Keep profiler versions in all artifacts and references for diagnosis.
+- Ignore only reference-versus-observed Valgrind version when comparing
+  environment/workload identity.
+- Keep the modeled score, checksum, model, and all other identity checks strict.
+
+## Plan Review
+
+- Require non-empty version metadata even though it is excluded from cross-run
+  identity equality.
+- Add explicit coverage for same-run Callgrind/DRD version consistency.
+- Populate reference and observed profiler versions before score validation so
+  a failed score artifact remains diagnosable.
+- Rename and update workflow/documentation wording that implied a pinned
+  profiler version.
+
+## Validation
+
+- Focused driver unit tests: 19 passed.
+- Full benchmark Python suite: 102 passed.
+- Focused CTest `test_render_valgrind_ci_driver`: passed.
+- Full eight-case local Valgrind gate: passed; serial ratios were 1.000 and
+  parallel ratios ranged from 0.992 to 1.030.
+- Workflow YAML parsing, Python byte compilation, Ruff formatting/correctness
+  lint, and `git diff --check`: passed.
+- A broad Ruff style run exposed pre-existing `EXE001` file-mode findings and
+  one pre-existing `SIM117` nested-context finding in the touched test file;
+  those unrelated style issues were not changed.
+- Local collection used Valgrind 3.25.1. Cross-version behavior is covered by
+  unit tests; GitHub Actions will provide the first full 3.26.0 matrix.

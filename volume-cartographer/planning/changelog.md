@@ -2,6 +2,10 @@
 
 ## 2026-08-07
 
+- Made Valgrind version changes diagnostic rather than automatic rendering-gate
+  identity failures. Both versions remain required and recorded, paired
+  Callgrind/DRD collections must still match, and material profiler effects are
+  enforced by the unchanged modeled-score tolerance.
 - Documented VC3D rendering-gate use, activation, artifact diagnosis, model
   recalibration, reference refresh, and tolerance-policy changes. GitHub
   Actions now derives this gate's Ninja concurrency from `nproc`; the checked

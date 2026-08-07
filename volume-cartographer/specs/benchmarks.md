@@ -137,9 +137,13 @@
   independent of recalibrating the model or refreshing per-case scores.
 - Before comparing scores, CI must require exact model hash, checksum,
   benchmark schema, compiler/version, architecture target, build type,
-  Valgrind version, simulated cache geometry, fixture dimensions, repetitions,
-  and worker count. Parallel traces must have no unresolved happens-before
-  edge or unmatched blocking wait.
+  simulated cache geometry, fixture dimensions, repetitions, and worker count.
+  The reference and observed Valgrind versions must both be present and
+  recorded, but a version difference alone must not fail the gate; material
+  profiler changes are detected through the modeled-runtime tolerance. Paired
+  Callgrind and DRD artifacts from one run must use the same Valgrind version.
+  Parallel traces must have no unresolved happens-before edge or unmatched
+  blocking wait.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,

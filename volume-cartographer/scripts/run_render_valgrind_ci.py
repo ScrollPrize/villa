@@ -400,6 +400,22 @@ def validate_tolerance(value: object) -> float:
     return tolerance
 
 
+def _comparable_identity(
+    identity: object, source: str
+) -> tuple[dict[str, object], str]:
+    if not isinstance(identity, dict):
+        raise RuntimeError(  # noqa: TRY004
+            f"{source} benchmark identity is not an object"
+        )
+    version = identity.get("valgrind_version")
+    if not isinstance(version, str) or not version.strip():
+        raise RuntimeError(f"{source} benchmark identity has no Valgrind version")
+    return (
+        {name: value for name, value in identity.items() if name != "valgrind_version"},
+        version,
+    )
+
+
 def check_reference(
     result: dict[str, object],
     reference: dict[str, object],
@@ -417,7 +433,16 @@ def check_reference(
     case = reference.get("cases", {}).get(result["case"])
     if case is None:
         raise RuntimeError(f"reference has no case {result['case']}")
-    if case["identity"] != result["identity"]:
+    reference_identity, reference_version = _comparable_identity(
+        case["identity"], "reference"
+    )
+    observed_identity, observed_version = _comparable_identity(
+        result["identity"], "observed"
+    )
+    result["reference_valgrind_version"] = reference_version
+    result["observed_valgrind_version"] = observed_version
+    result["valgrind_version_changed"] = reference_version != observed_version
+    if reference_identity != observed_identity:
         raise RuntimeError("benchmark environment or workload identity changed")
     if case["checksum"] != result["checksum"]:
         raise RuntimeError("renderer checksum changed")
