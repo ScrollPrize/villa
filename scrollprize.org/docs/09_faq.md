@@ -37,12 +37,6 @@ title: "FAQ"
 
 import AwardedTotal from '@site/src/components/AwardedTotal';
 
-:::info[WORK IN PROGRESS]
-
-This page is being revised (July 8, 2026). Most answers are current; a few still describe earlier tooling or data layouts and are being updated.
-
-:::
-
 ### What is Vesuvius Challenge?
 
 Vesuvius Challenge is a machine learning, computer vision, and geometry competition to read the Herculaneum scrolls.
