@@ -1,7 +1,6 @@
 #include "LineAnnotationDialog.hpp"
 
 #include "FiberNameDisplay.hpp"
-#include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
@@ -62,7 +61,6 @@ namespace {
 // Half-width (in line-point indices) of the window used to least-squares-fit the side-view
 // plane orientation around the cursor. The fit is interpolated between adjacent window centers
 // so the orientation tracks the cursor continuously (see updateSidePlaneSurface).
-constexpr int kSideFitHalfWindow = 20;
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
@@ -1059,6 +1057,10 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     const QString disabledToolTip =
         tr("Tags become editable once the fiber has been saved.");
     for (const auto& tag : knownTags) {
+        if (tag == vc3d::line_annotation::kTraceNeedsReviewTag) {
+            // Managed by the trace review workflow, not the generic pills.
+            continue;
+        }
         const QString tagText = QString::fromStdString(tag);
         const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
                             activeTags.end();
@@ -1382,13 +1384,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
-        _linePointsd.clear();
-        _linePointsd.reserve(_generatedViews.linePoints.size());
-        for (const auto& p : _generatedViews.linePoints) {
-            _linePointsd.emplace_back(p[0], p[1], p[2]);
-        }
-        _sideFitBracket[0] = SideFit{};
-        _sideFitBracket[1] = SideFit{};
         _generatedControlIndex =
             vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
                 _generatedViews.controlPoints);
@@ -1598,13 +1593,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
-    _linePointsd.clear();
-    _linePointsd.reserve(_generatedViews.linePoints.size());
-    for (const auto& p : _generatedViews.linePoints) {
-        _linePointsd.emplace_back(p[0], p[1], p[2]);
-    }
-    _sideFitBracket[0] = SideFit{};
-    _sideFitBracket[1] = SideFit{};
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -1899,7 +1887,10 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     CChunkedVolumeViewer* viewer,
     const QPointF& scenePoint,
     const QPoint& globalPos,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState)
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState)
 {
     if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
         _generatedViews.linePoints.empty()) {
@@ -1966,6 +1957,11 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.stripViewer = stripViewer;
     options.linkWithCandidateEnabled = linkCandidateState.enabled;
     options.linkWithCandidateLabel = linkCandidateState.label;
+    options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
+    options.mergeWithCandidateLabel = mergeCandidateState.label;
+    options.splitFromCandidateEnabled = splitCandidateState.enabled;
+    options.splitFromCandidateLabel = splitCandidateState.label;
+    options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
@@ -1997,6 +1993,30 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         emit generatedControlPointLinkWithCandidateRequested(surfaceName,
                                                              controlPointIndex,
                                                              volumePoint);
+    };
+    options.mergeWithCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                     cv::Vec3f volumePoint) {
+        emit generatedControlPointMergeWithCandidateRequested(surfaceName,
+                                                              controlPointIndex,
+                                                              volumePoint);
+    };
+    options.designateSplitCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitCandidateRequested(surfaceName,
+                                                          controlPointIndex,
+                                                          volumePoint);
+    };
+    options.splitFromCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                     cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitFromCandidateRequested(surfaceName,
+                                                              controlPointIndex,
+                                                              volumePoint);
+    };
+    options.splitFromCandidateAndLink = [this, surfaceName](size_t controlPointIndex,
+                                                            cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitAndLinkFromCandidateRequested(surfaceName,
+                                                                     controlPointIndex,
+                                                                     volumePoint);
     };
     options.openNearbyAnnotation = [this](uint64_t fiberId, cv::Vec3f volumePoint) {
         emit generatedNearbyAnnotationOpenRequested(fiberId, volumePoint);
@@ -3070,8 +3090,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.controlPoints ||
         !_fastCurrentCutOverlayItems.seedPoints ||
         !_fastCurrentCutOverlayItems.linkCandidatePoints ||
+        !_fastCurrentCutOverlayItems.splitCandidatePoints ||
         !_fastCurrentCutOverlayItems.branchControlPoints ||
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
@@ -3111,6 +3134,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidatePoints->setBrush(linkCandidateBrush);
         _fastCurrentCutOverlayItems.linkCandidatePoints->setZValue(163.0);
 
+        QPen splitCandidatePen(QColor(235, 60, 60, 245));
+        splitCandidatePen.setWidthF(2.0);
+        QBrush splitCandidateBrush(QColor(235, 60, 60, 175));
+        _fastCurrentCutOverlayItems.splitCandidatePoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setPen(splitCandidatePen);
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setBrush(splitCandidateBrush);
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setZValue(163.5);
+
         QPen branchControlPen(QColor(210, 95, 255, 245));
         branchControlPen.setWidthF(2.0);
         QBrush branchControlBrush(QColor(210, 95, 255, 175));
@@ -3127,6 +3158,25 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.pendingBranchControlPoints->setBrush(
             pendingBranchControlBrush);
         _fastCurrentCutOverlayItems.pendingBranchControlPoints->setZValue(162.5);
+
+        QPen sameHvBranchControlPen(QColor(255, 140, 0, 245));
+        sameHvBranchControlPen.setWidthF(2.0);
+        QBrush sameHvBranchControlBrush(QColor(255, 140, 0, 175));
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPen(sameHvBranchControlPen);
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setBrush(
+            sameHvBranchControlBrush);
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setZValue(162.0);
+
+        QPen sameHvPendingBranchControlPen(QColor(255, 190, 120, 245));
+        sameHvPendingBranchControlPen.setWidthF(2.0);
+        QBrush sameHvPendingBranchControlBrush(QColor(255, 190, 120, 175));
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPen(
+            sameHvPendingBranchControlPen);
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setBrush(
+            sameHvPendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setZValue(162.5);
 
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
@@ -3177,8 +3227,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.controlPoints,
                                  _fastCurrentCutOverlayItems.seedPoints,
                                  _fastCurrentCutOverlayItems.linkCandidatePoints,
+                                 _fastCurrentCutOverlayItems.splitCandidatePoints,
                                  _fastCurrentCutOverlayItems.branchControlPoints,
                                  _fastCurrentCutOverlayItems.pendingBranchControlPoints,
+                                 _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
+                                 _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
                                  _fastCurrentCutOverlayItems.fiberIntersections,
                                  _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
                                  _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
@@ -3212,8 +3265,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
+    QPainterPath splitCandidatePath;
     QPainterPath branchControlPath;
     QPainterPath pendingBranchControlPath;
+    QPainterPath sameHvBranchControlPath;
+    QPainterPath sameHvPendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -3248,13 +3304,19 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
             continue;
         }
-        if (control.isLinkCandidate) {
+        if (control.isSplitCandidate) {
+            splitCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
+                                          control.isSeed ? 11.0 : 10.0);
+        } else if (control.isLinkCandidate) {
             linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
                                          control.isSeed ? 11.0 : 10.0);
         } else if (control.hasPendingLinks) {
-            pendingBranchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+            (control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
+                                           : pendingBranchControlPath)
+                .addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.hasBranches) {
-            branchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+            (control.hasSameHvBranches ? sameHvBranchControlPath : branchControlPath)
+                .addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.isSeed) {
             seedPath.addEllipse(scenePoint, 11.0, 11.0);
         } else {
@@ -3264,8 +3326,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
+    _fastCurrentCutOverlayItems.splitCandidatePoints->setPath(splitCandidatePath);
     _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
     _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
+        sameHvPendingBranchControlPath);
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
@@ -3412,6 +3478,54 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv
     return normalizedOrNan(up);
 }
 
+cv::Vec3f LineAnnotationDialog::interpolatedOrientedNormal(double linePosition) const
+{
+    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+    const auto& normals = _generatedViews.lineNormals;
+    if (normals.empty() || !std::isfinite(linePosition)) {
+        return nan;
+    }
+
+    const double position = std::clamp(
+        linePosition, 0.0, static_cast<double>(normals.size() - 1));
+    const int lower = static_cast<int>(std::floor(position));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(normals.size()) - 1);
+    const cv::Vec3f lowerNormal = normals[static_cast<size_t>(lower)];
+    cv::Vec3f upperNormal = normals[static_cast<size_t>(upper)];
+    if (!finitePoint(lowerNormal) || !finitePoint(upperNormal) ||
+        cv::norm(lowerNormal) <= 1.0e-6f ||
+        cv::norm(upperNormal) <= 1.0e-6f) {
+        return nan;
+    }
+    if (lowerNormal.dot(upperNormal) < 0.0f) {
+        upperNormal = -upperNormal;
+    }
+
+    const float t = static_cast<float>(position - static_cast<double>(lower));
+    return normalizedOrNan(lowerNormal * (1.0f - t) + upperNormal * t);
+}
+
+cv::Vec3f LineAnnotationDialog::interpolatedLineNormal(double linePosition,
+                                                       const cv::Vec3f& tangent) const
+{
+    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f up = interpolatedOrientedNormal(linePosition);
+    if (!finitePoint(up)) {
+        return nan;
+    }
+    up -= tangent * up.dot(tangent);
+    // A tiny projection means the sheet normal runs nearly along the tangent
+    // (extreme bend): the direction is unstable, so let the caller fall back.
+    if (cv::norm(up) <= 0.1f) {
+        return nan;
+    }
+    return normalizedOrNan(up);
+}
+
 bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
@@ -3419,7 +3533,16 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
     }
     const cv::Vec3f origin = interpolatedLinePoint(linePosition);
     const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
-    const cv::Vec3f upHint = interpolatedLineUp(linePosition, tangent);
+    // Display up for the cut: the sampled sheet normal, sign-oriented away
+    // from the scroll center (with the scene's y-down rendering this shows
+    // the sheet horizontal with the fiber's center-facing surface at the top
+    // of the view) -- and the orientation is a pure function of the line
+    // position. The transported line up remains the fallback where samples
+    // are missing or, at extreme bends, nearly parallel to the tangent.
+    cv::Vec3f upHint = interpolatedLineNormal(linePosition, tangent);
+    if (!finitePoint(upHint)) {
+        upHint = interpolatedLineUp(linePosition, tangent);
+    }
     if (!finitePoint(origin) || !finitePoint(tangent) || !finitePoint(upHint) ||
         cv::norm(tangent) <= 1.0e-6f ||
         cv::norm(upHint) <= 1.0e-6f) {
@@ -3442,137 +3565,38 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
     return true;
 }
 
-bool LineAnnotationDialog::computeSideFit(int center, cv::Vec3f& normal, cv::Vec3f& upHint) const
-{
-    const auto& linePoints = _generatedViews.linePoints;
-    const int count = static_cast<int>(linePoints.size());
-    if (count < 3) {
-        return false;
-    }
-    center = std::clamp(center, 0, count - 1);
-    const int first = std::max(0, center - kSideFitHalfWindow);
-    const int last = std::min(count - 1, center + kSideFitHalfWindow);
-
-    vc3d::fiber_slice::ControlSpanSelection span;
-    span.firstLineIndex = static_cast<size_t>(first);
-    span.lastLineIndex = static_cast<size_t>(last);
-    span.samples.reserve(static_cast<size_t>(last - first + 1));
-    cv::Vec3d centroid{0.0, 0.0, 0.0};
-    for (int i = first; i <= last; ++i) {
-        const cv::Vec3f& p = linePoints[static_cast<size_t>(i)];
-        if (!finitePoint(p)) {
-            continue;
-        }
-        const cv::Vec3d pd(p[0], p[1], p[2]);
-        span.samples.push_back(pd);
-        centroid += pd;
-    }
-    if (span.samples.size() < 3) {
-        return false;
-    }
-    span.centroid = centroid * (1.0 / static_cast<double>(span.samples.size()));
-    span.valid = true;
-
-    // fitLeastSquaresPlane reads linePoints[firstLineIndex/lastLineIndex] to derive the in-plane
-    // direction hint, so it needs the full polyline as cv::Vec3d. _linePointsd is the cached
-    // double-precision copy built once when the views were generated.
-    const auto fit = vc3d::fiber_slice::fitLeastSquaresPlane(span, _linePointsd);
-    if (!fit.valid) {
-        return false;
-    }
-    normal = cv::Vec3f(static_cast<float>(fit.normal[0]),
-                       static_cast<float>(fit.normal[1]),
-                       static_cast<float>(fit.normal[2]));
-    upHint = cv::Vec3f(static_cast<float>(fit.upHint[0]),
-                       static_cast<float>(fit.upHint[1]),
-                       static_cast<float>(fit.upHint[2]));
-    if (!finitePoint(normal) || !finitePoint(upHint) ||
-        cv::norm(normal) <= 1.0e-6f || cv::norm(upHint) <= 1.0e-6f) {
-        return false;
-    }
-    return true;
-}
-
-bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double linePosition)
+bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
         return false;
     }
-    const int count = static_cast<int>(_generatedViews.linePoints.size());
-    if (count < 3) {
+    const cv::Vec3f origin = interpolatedLinePoint(linePosition);
+    const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
+    if (!finitePoint(origin) || !finitePoint(tangent) ||
+        cv::norm(tangent) <= 1.0e-6f) {
         return false;
     }
-
-    // Continuous side-view orientation: fit the best-fit plane at the two integer window centers
-    // straddling the cursor and interpolate between them by the fractional position. Each fit
-    // depends only on the static line geometry, so we cache the two bracketing fits and recompute
-    // a center only when the straddle shifts (typically once per integer crossing). This keeps
-    // the orientation smooth -- no snapping at discrete window centers -- while staying cheap.
-    const double pos = std::clamp(linePosition, 0.0, static_cast<double>(count - 1));
-    const int lowerCenter = static_cast<int>(std::floor(pos));
-    const int upperCenter = std::min(lowerCenter + 1, count - 1);
-    const int wantCenters[2] = {lowerCenter, upperCenter};
-
-    SideFit next[2];
-    for (int slot = 0; slot < 2; ++slot) {
-        next[slot].center = wantCenters[slot];
-        bool reused = false;
-        for (const SideFit& cached : _sideFitBracket) {
-            if (cached.valid && cached.center == wantCenters[slot]) {
-                next[slot] = cached;
-                reused = true;
-                break;
-            }
-        }
-        if (!reused) {
-            next[slot].valid =
-                computeSideFit(wantCenters[slot], next[slot].normal, next[slot].upHint);
-        }
+    // The side cut is the current cut's frame rotated a quarter turn: the
+    // plane spanned by the line tangent and the (away-from-center oriented)
+    // sheet normal, viewed with the fiber vertical. A windowed PCA fit of
+    // the line was used here before, but its plane tumbles where the fiber's
+    // cross-fiber wander is nearly isotropic (no well-defined local fiber
+    // plane); the sheet frame is always defined and keeps both cut views
+    // consistent. normal = sheetNormal x tangent puts the stored sheet
+    // normal on the view's x axis, so the direction shown at the top of the
+    // current cut (toward the scroll center) points screen-left.
+    cv::Vec3f sheetNormal = interpolatedLineNormal(linePosition, tangent);
+    if (!finitePoint(sheetNormal)) {
+        sheetNormal = interpolatedLineUp(linePosition, tangent);
     }
-    _sideFitBracket[0] = next[0];
-    _sideFitBracket[1] = next[1];
-
-    cv::Vec3f normal;
-    cv::Vec3f upHint;
-    if (next[0].valid && next[1].valid) {
-        cv::Vec3f normal1 = next[1].normal;
-        cv::Vec3f upHint1 = next[1].upHint;
-        // PCA normals/up hints are sign-arbitrary; align the upper fit to the lower one before
-        // blending so interpolation doesn't cancel them out near a sign flip.
-        if (next[0].normal.dot(normal1) < 0.0f) {
-            normal1 = -normal1;
-        }
-        if (next[0].upHint.dot(upHint1) < 0.0f) {
-            upHint1 = -upHint1;
-        }
-        const float t = static_cast<float>(pos - static_cast<double>(lowerCenter));
-        normal = next[0].normal * (1.0f - t) + normal1 * t;
-        upHint = next[0].upHint * (1.0f - t) + upHint1 * t;
-    } else if (next[0].valid || next[1].valid) {
-        const SideFit& fit = next[0].valid ? next[0] : next[1];
-        normal = fit.normal;
-        upHint = fit.upHint;
-    } else {
+    if (!finitePoint(sheetNormal) || cv::norm(sheetNormal) <= 1.0e-6f) {
         return false;
     }
-
-    normal = normalizedOrNan(normal);
+    const cv::Vec3f normal = normalizedOrNan(sheetNormal.cross(tangent));
     if (!finitePoint(normal)) {
         return false;
     }
-    upHint -= normal * upHint.dot(normal);
-    upHint = normalizedOrNan(upHint);
-    if (!finitePoint(upHint)) {
-        return false;
-    }
-
-    // Keep the plane centered on the cursor position rather than a window centroid; the origin
-    // slides smoothly along the line while the interpolated orientation tracks it continuously.
-    const cv::Vec3f origin = interpolatedLinePoint(pos);
-    if (!finitePoint(origin)) {
-        return false;
-    }
-    plane->setFromNormalAndUp(origin, normal, upHint);
+    plane->setFromNormalAndUp(origin, normal, tangent);
     return true;
 }
 
@@ -3694,12 +3718,16 @@ void LineAnnotationDialog::updateOverviewBar()
         LineAnnotationOverviewBar::ControlDot dot;
         dot.linePosition = control.linePosition;
         // Same state palette as the cut-view overlays.
-        if (control.isLinkCandidate) {
+        if (control.isSplitCandidate) {
+            dot.color = QColor(235, 60, 60);
+        } else if (control.isLinkCandidate) {
             dot.color = QColor(60, 235, 120);
         } else if (control.hasPendingLinks) {
-            dot.color = QColor(80, 150, 255);
+            dot.color = control.hasSameHvPendingLinks ? QColor(255, 190, 120)
+                                                      : QColor(80, 150, 255);
         } else if (control.hasBranches) {
-            dot.color = QColor(210, 95, 255);
+            dot.color = control.hasSameHvBranches ? QColor(255, 140, 0)
+                                                  : QColor(210, 95, 255);
         } else {
             dot.color = QColor(255, 230, 0);
         }

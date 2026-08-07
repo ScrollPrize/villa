@@ -38,7 +38,7 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
   />
 </head>
 
-Vesuvius Challenge has awarded **<AwardedTotal />** in prizes! This page lists all the prizes awarded so far.
+Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
 ### \$33,500 Progress Prizes (July 2026)
 
