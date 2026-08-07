@@ -834,7 +834,7 @@ class FitContext:
         the trusted-geometry index. Requires no device state: the patch
         atlases are host-resident (their `device` only selects where each
         lookup's interpolated points are delivered), and the CUDA stores,
-        model, and optimiser are built later by run().
+        model, and optimiser are built later by build_device_state().
 
         The loaded inputs stay readable as attributes afterwards, so
         analysis tools can construct a context, call this, and read:
@@ -1405,18 +1405,110 @@ class FitContext:
         self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
         self.unverified_patch_atlas = unverified_patch_atlas
 
-    def run(self):
+    def _phase_mode_active(self):
+        return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
+
+    def _warn_if_sdt_loss_inactive(self):
+        # Run-mutable weights are read afresh every step, but the SDT-backed
+        # components only exist in phase mode; make a grad_mag session's
+        # nonzero SDT-backed weights a visible no-op. The native min-spacing
+        # barrier is asset-independent and remains active in either mode.
+        if self.phase_mode:
+            return
+        for weight_key in ('loss_weight_dense_spacing_count',
+                           'loss_weight_dense_spacing_density',
+                           'loss_weight_dense_attachment'):
+            if cfg[weight_key] > 0 and weight_key not in self._sdt_inactive_warned:
+                self._sdt_inactive_warned.add(weight_key)
+                print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
+                      f'{self.dense_spacing_mode!r}; this component runs only as '
+                      "part of the 'phase' bundle and is INACTIVE.")
+
+    def _subsample_shell_radius_pool(self, patch):
+        # The shell-patch radius loss draws sample_count_shell_samples random
+        # shell points per step; keep a pool of exactly that size resident on
+        # the GPU instead of the full shell cloud. A dedicated generator makes
+        # the pool deterministic (identical across DDP ranks) without
+        # perturbing the training RNG streams.
+        pool_generator = torch.Generator()
+        pool_generator.manual_seed(int(cfg['optimizer_random_seed']))
+        return subsample_rows(
+            patch.valid_zyxs, int(cfg['sample_count_shell_samples']), pool_generator,
+        ).to(device=self.device, dtype=torch.float32)
+
+    def _infer_outer_winding_idx_for_this_run(self):
+        return _infer_shell_outer_winding_idx(
+            self.spiral_and_transform.get_slice_to_spiral_transform(),
+            self.spiral_and_transform.get_dr_per_winding(),
+            self.verified_patches_list,
+            self.unattached_pcl_strips,
+            cfg,
+            z_begin,
+            z_end,
+            get_or_build_unattached_pcl_flat,
+        )
+
+    def _warn_if_dense_losses_structurally_disabled(self):
+        # Loss weights are run-mutable, so re-check each step and warn once.
+        for weight_key in _structurally_disabled_dense_weight_keys(
+                cfg, self.shell_outer_winding_idx):
+            if weight_key not in self._dense_inactive_warned:
+                self._dense_inactive_warned.add(weight_key)
+                print(f'WARNING: {weight_key} > 0 but shell_outer_winding_idx '
+                      'is unresolved (config key is None and no outer shell '
+                      'inferred one); this loss samples the spiral out to that '
+                      'winding and stays INACTIVE. Set shell_outer_winding_idx '
+                      'to enable it (some of these losses also need the '
+                      'phase/SDT assets, see any warnings above).')
+
+    def _apply_high_res_lr_scale(self, iteration):
+        scale = get_flow_field_high_res_lr_scale(iteration)
+        low_res_group = next(
+            group for group in self.optimiser.param_groups
+            if any(param is self.low_res_flow_params[0] for param in group['params']))
+        high_res_group = next(
+            group for group in self.optimiser.param_groups
+            if any(param is self.high_res_flow_params[0] for param in group['params']))
+        set_optimizer_group_lr_scale(
+            self.optimiser,
+            self.lr_scheduler,
+            group=high_res_group,
+            reference_group=low_res_group,
+            scale=scale,
+            initial_lr=cfg['optimizer_learning_rate'],
+        )
+        return scale
+
+    def _realign_lr_schedule(self, completed_steps):
+        """Align optimizer/scheduler state to the current absolute horizon."""
+        self.lr_scheduler, self.num_training_steps = realign_optimizer_lr_schedule(
+            self.optimiser,
+            self.lr_scheduler,
+            initial_lr=cfg['optimizer_learning_rate'],
+            final_factor=cfg['optimizer_lr_final_factor'],
+            completed_steps=completed_steps,
+            training_horizon=cfg['optimizer_num_training_steps'],
+            exponential=cfg['optimizer_exp_lr_schedule'],
+        )
+
+    def build_device_state(self):
+        """Allocate the session's device-resident state.
+
+        Creates the CUDA-backed volume stores, the model, optimiser and LR
+        scheduler, the prepared device track tables and the rest of the
+        device-dependent setup, preserving the original inline order: the
+        resume-checkpoint restore and the distributed reseed consume and
+        overwrite the host RNG streams, so relative order is load-bearing.
+        Requires load_host_inputs() to have run and self.out_path to be set.
+        """
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
-        has_progress = self.progress is not None
-
-        self.load_host_inputs()
 
         # ==========================================================================
         # lasagna and SDT stores
         # ==========================================================================
 
-        lasagna_volume = prepare_lasagna_volume(
+        self.lasagna_volume = prepare_lasagna_volume(
             self.scroll_zarr,
             use_normals=(cfg['loss_weight_dense_normals'] > 0 or self.phase_mode),
             use_spacing=self.grad_mag_spacing_enabled,
@@ -1431,24 +1523,24 @@ class FitContext:
             cache_directory=cache_path,
             progress=progress,
         )
-        if interactive_driver is not None and lasagna_volume:
-            self._lasagna_store = lasagna_volume['store']
+        if interactive_driver is not None and self.lasagna_volume:
+            self._lasagna_store = self.lasagna_volume['store']
 
         # Surf-SDT store: a core input of the whole phase bundle (registration,
         # count, attachment), required in phase mode even when individual
         # sub-weights are zero so run-mutable weights can be adjusted (or zeroed
         # and re-raised) at run boundaries without a session reload.
-        sdt_volume = None
+        self.sdt_volume = None
         if self.phase_mode:
             if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
                 raise RuntimeError(
                     "dense_spacing_mode='phase' requires the surf-SDT store: "
                     f'{surf_sdt_zarr_path!r}')
-            if lasagna_volume is None:
+            if self.lasagna_volume is None:
                 raise RuntimeError(
                     "dense_spacing_mode='phase' requires the dense normal stores "
                     'for band incidence/fragment handling')
-            sdt_volume = prepare_surf_sdt_volume(
+            self.sdt_volume = prepare_surf_sdt_volume(
                 surf_sdt_zarr_path,
                 surf_sdt_zarr_group,
                 z_begin=z_begin,
@@ -1458,117 +1550,19 @@ class FitContext:
                 progress=progress,
             )
             if interactive_driver is not None:
-                self._scalar_stores.append(sdt_volume['store'])
+                self._scalar_stores.append(self.sdt_volume['store'])
 
-        def phase_mode_active():
-            return self.phase_mode and sdt_volume is not None and lasagna_volume is not None
+        self._sdt_inactive_warned = set()
 
-        def grad_mag_mode_active():
-            return self.grad_mag_spacing_enabled and lasagna_volume is not None
-
-        sdt_inactive_warned = set()
-
-        def warn_if_sdt_loss_inactive():
-            # Run-mutable weights are read afresh every step, but the SDT-backed
-            # components only exist in phase mode; make a grad_mag session's
-            # nonzero SDT-backed weights a visible no-op. The native min-spacing
-            # barrier is asset-independent and remains active in either mode.
-            if self.phase_mode:
-                return
-            for weight_key in ('loss_weight_dense_spacing_count',
-                               'loss_weight_dense_spacing_density',
-                               'loss_weight_dense_attachment'):
-                if cfg[weight_key] > 0 and weight_key not in sdt_inactive_warned:
-                    sdt_inactive_warned.add(weight_key)
-                    print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
-                          f'{self.dense_spacing_mode!r}; this component runs only as '
-                          "part of the 'phase' bundle and is INACTIVE.")
-
-        out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-        out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{self.num_verified_patches}-patch'
-        if not wandb.run.name.startswith('dummy-'):
-            out_path += '_' + wandb.run.name
-        if run_tag:
-            out_path += f'_{run_tag}'
-        os.makedirs(out_path, exist_ok=True)
-
-        num_slices_for_visualisation = cfg.get('output_num_slices_for_visualization', 20)
-        device = torch.device('cuda')
-
-        def rebuild_unverified_patch_inputs(exclusion_radius):
-            """Reload only the unverified-patch pool for a Run-boundary mask edit."""
-            if not unverified_patches_path:
-                return {}, [], None, None
-            candidates = self._load_patches_from_dir(unverified_patches_path)
-            for patch_id, patch in list(candidates.items()):
-                cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
-                if (cells_to_erode > 0
-                        and not erode_patch_valid_region(patch, cells_to_erode)):
-                    del candidates[patch_id]
-                    continue
-                if not patch_intersects_z_roi(patch, z_begin, z_end):
-                    del candidates[patch_id]
-                    continue
-                patch.release_derived_caches()
-            candidates, n_masked, n_dropped = \
-                _mask_unverified_patches_near_trusted_geometry(
-                    candidates, self.trusted_geometry_tree, exclusion_radius)
-            print(
-                f'unverified patches: remasked {n_masked} vertices near trusted '
-                f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
-                f'{len(candidates)} remain')
-            candidate_list = list(candidates.values())
-            probabilities = (
-                self._prepare_patch_sampling_cache(candidate_list)
-                if candidate_list else None)
-            atlas = (
-                PatchAtlas(candidates, device='cuda')
-                if candidate_list else None)
-            return candidates, candidate_list, probabilities, atlas
+        self.num_slices_for_visualisation = cfg.get('output_num_slices_for_visualization', 20)
+        self.device = torch.device('cuda')
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
         all_zs = np.arange(z_begin, z_end)
-        umbilicus_zyx = torch.from_numpy(
-            np.concatenate([all_zs[:, None], self.umbilicus(all_zs)], axis=-1).astype(np.float32)).to(device)
-        all_zs = torch.from_numpy(all_zs).to(device)
-
-        def prepare_png_visualization_inputs():
-            zs = np.linspace(
-                z_begin,
-                z_end - 1,
-                min(num_slices_for_visualisation, z_end - 1 - z_begin),
-                dtype=np.int64,
-            )
-            if self.scroll_zarr is not None:
-                subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
-                print('loading slices for visualisation')
-                vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
-                scroll_slices = (
-                    torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
-                    / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
-                ).to(torch.uint8)
-            else:
-                subvolume_shape = (
-                    z_end - z_begin,
-                    int(np.ceil(32693 / render_volume_scale)),
-                    int(np.ceil(32693 / render_volume_scale)),
-                )
-                scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
-
-            prediction_slices, quad_labels, _ = overlay_patches_on_slices(
-                self.verified_patches_list,
-                zs,
-                subvolume_shape[1:],
-                cache_path,
-                canvas_scale=render_volume_scale,
-            )
-            yx = torch.stack(torch.meshgrid(
-                torch.arange(subvolume_shape[1], dtype=torch.float32),
-                torch.arange(subvolume_shape[2], dtype=torch.float32),
-                indexing='ij',
-            ), axis=-1).to(device) * render_volume_scale
-            return zs, yx, scroll_slices, prediction_slices, quad_labels
+        self.umbilicus_zyx = torch.from_numpy(
+            np.concatenate([all_zs[:, None], self.umbilicus(all_zs)], axis=-1).astype(np.float32)).to(self.device)
+        all_zs = torch.from_numpy(all_zs).to(self.device)
 
         # ==========================================================================
         # Model construction and resume
@@ -1581,9 +1575,9 @@ class FitContext:
         # affects the model's flow-field domain; the optimisation continues to use
         # the current z_begin/z_end for sampling, losses and rendering.
         resume_path = os.environ.get('FIT_SPIRAL_RESUME_PATH')
-        start_iteration = int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0'))
+        self.start_iteration = int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0'))
         resume_checkpoint = None
-        model_z_begin, model_z_end = z_begin, z_end
+        self.model_z_begin, self.model_z_end = z_begin, z_end
         if resume_path:
             progress.begin(
                 'loading', 'Loading fit checkpoint',
@@ -1627,7 +1621,7 @@ class FitContext:
                     checkpoint_fingerprint = _comparable_sdt_fingerprint(
                         resume_checkpoint.get('surf_sdt_fingerprint'))
                     current_fingerprint = _comparable_sdt_fingerprint(
-                        sdt_volume['fingerprint'] if sdt_volume is not None else None)
+                        self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None)
                     if (checkpoint_fingerprint is not None
                             and checkpoint_fingerprint != current_fingerprint):
                         raise RuntimeError(
@@ -1648,104 +1642,67 @@ class FitContext:
                 if incompatible:
                     raise RuntimeError(f'checkpoint model-shaping config mismatch: {incompatible}')
             if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
-                model_z_begin, model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
-                if (model_z_begin, model_z_end) != (z_begin, z_end):
+                self.model_z_begin, self.model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
+                if (self.model_z_begin, self.model_z_end) != (z_begin, z_end):
                     print(
-                        f'using checkpoint z-range [{model_z_begin}, {model_z_end}) for model parameter shapes (optimisation z-range is [{z_begin}, {z_end}))')
-                    assert z_begin >= model_z_begin and z_end <= model_z_end, (
+                        f'using checkpoint z-range [{self.model_z_begin}, {self.model_z_end}) for model parameter shapes (optimisation z-range is [{z_begin}, {z_end}))')
+                    assert z_begin >= self.model_z_begin and z_end <= self.model_z_end, (
                         f'optimisation z-range [{z_begin}, {z_end}) extends beyond the checkpoint '
-                        f"model z-range [{model_z_begin}, {model_z_end}); the flow field has no "
+                        f"model z-range [{self.model_z_begin}, {self.model_z_end}); the flow field has no "
                         'parameters outside its domain. Narrow z_begin/z_end to fit within the '
                         'checkpoint range, or train from scratch with the wider range.'
                     )
 
-        flow_field_radius = cfg['model_flow_bounds_radius']
-        flow_min_corner_spiral_zyx = torch.tensor(
-            [model_z_begin - cfg['model_flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64,
-            device=device)
-        flow_max_corner_spiral_zyx = torch.tensor(
-            [model_z_end + cfg['model_flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64,
-            device=device)
+        self.flow_field_radius = cfg['model_flow_bounds_radius']
+        self.flow_min_corner_spiral_zyx = torch.tensor(
+            [self.model_z_begin - cfg['model_flow_bounds_z_margin'], -self.flow_field_radius, -self.flow_field_radius], dtype=torch.int64,
+            device=self.device)
+        self.flow_max_corner_spiral_zyx = torch.tensor(
+            [self.model_z_end + cfg['model_flow_bounds_z_margin'], self.flow_field_radius, self.flow_field_radius], dtype=torch.int64,
+            device=self.device)
 
-        num_training_steps = cfg['optimizer_num_training_steps']
+        self.num_training_steps = cfg['optimizer_num_training_steps']
 
         progress.begin('loading', 'Constructing spiral model')
-        spiral_and_transform = SpiralAndTransform(
+        self.spiral_and_transform = SpiralAndTransform(
             flow_integration_steps=cfg['model_num_flow_integration_steps'],
             flow_integration_solver=cfg['model_flow_integration_solver'],
-            umbilicus_zyx=umbilicus_zyx,
-            flow_min_corner_zyx=flow_min_corner_spiral_zyx,
-            flow_max_corner_zyx=flow_max_corner_spiral_zyx,
+            umbilicus_zyx=self.umbilicus_zyx,
+            flow_min_corner_zyx=self.flow_min_corner_spiral_zyx,
+            flow_max_corner_zyx=self.flow_max_corner_spiral_zyx,
             config=cfg,
             spiral_outward_sense=spiral_outward_sense,
         )
-        spiral_and_transform.to(device)
+        self.spiral_and_transform.to(self.device)
 
         # ==========================================================================
         # Shell loss setup
         # ==========================================================================
 
-        shell_map = None
-        shell_valid_zyxs_gpu = None
-
-        def subsample_shell_radius_pool(patch):
-            # The shell-patch radius loss draws sample_count_shell_samples random
-            # shell points per step; keep a pool of exactly that size resident on
-            # the GPU instead of the full shell cloud. A dedicated generator makes
-            # the pool deterministic (identical across DDP ranks) without
-            # perturbing the training RNG streams.
-            pool_generator = torch.Generator()
-            pool_generator.manual_seed(int(cfg['optimizer_random_seed']))
-            return subsample_rows(
-                patch.valid_zyxs, int(cfg['sample_count_shell_samples']), pool_generator,
-            ).to(device=device, dtype=torch.float32)
+        self.shell_map = None
+        self.shell_valid_zyxs_gpu = None
 
         shell_active = self.shell_patch is not None and shell_losses_enabled()
         if shell_active:
             if cfg['loss_weight_shell_outer'] > 0:
-                shell_map = ShellPolarMap(
+                self.shell_map = ShellPolarMap(
                     self.shell_patch,
                     self.umbilicus,
                     z_min=z_begin - cfg['model_flow_bounds_z_margin'],
                     z_max=z_end + cfg['model_flow_bounds_z_margin'],
                     num_theta_bins=cfg['shell_num_theta_bins'],
-                    device=device,
+                    device=self.device,
                 )
             if cfg['loss_weight_shell_patch_radius'] > 0:
-                shell_valid_zyxs_gpu = subsample_shell_radius_pool(self.shell_patch)
-
-        def infer_outer_winding_idx_for_this_run():
-            return _infer_shell_outer_winding_idx(
-                spiral_and_transform.get_slice_to_spiral_transform(),
-                spiral_and_transform.get_dr_per_winding(),
-                self.verified_patches_list,
-                self.unattached_pcl_strips,
-                cfg,
-                z_begin,
-                z_end,
-                get_or_build_unattached_pcl_flat,
-            )
+                self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool(self.shell_patch)
 
         # Dense losses sample out to this index even when shell losses are off.
-        shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
-            cfg, shell_active, infer_outer_winding_idx_for_this_run)
+        self.shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
+            cfg, shell_active, self._infer_outer_winding_idx_for_this_run)
         for note in outer_winding_notes:
             print(note)
 
-        dense_inactive_warned = set()
-
-        def warn_if_dense_losses_structurally_disabled():
-            # Loss weights are run-mutable, so re-check each step and warn once.
-            for weight_key in _structurally_disabled_dense_weight_keys(
-                    cfg, shell_outer_winding_idx):
-                if weight_key not in dense_inactive_warned:
-                    dense_inactive_warned.add(weight_key)
-                    print(f'WARNING: {weight_key} > 0 but shell_outer_winding_idx '
-                          'is unresolved (config key is None and no outer shell '
-                          'inferred one); this loss samples the spiral out to that '
-                          'winding and stays INACTIVE. Set shell_outer_winding_idx '
-                          'to enable it (some of these losses also need the '
-                          'phase/SDT assets, see any warnings above).')
+        self._dense_inactive_warned = set()
 
         # ==========================================================================
         # Optimizer and checkpoint helpers
@@ -1754,80 +1711,51 @@ class FitContext:
         # Keep every stage's low- and high-resolution lattices in distinct groups
         # so the HR learning-rate scale is an optimizer setting, not a multiplier
         # in the model's forward path.
-        low_res_flow_params = [
+        self.low_res_flow_params = [
             flow_field.flows[0]
-            for flow_field in spiral_and_transform.flow_fields
+            for flow_field in self.spiral_and_transform.flow_fields
         ]
-        high_res_flow_params = [
+        self.high_res_flow_params = [
             flow_field.flows[1]
-            for flow_field in spiral_and_transform.flow_fields
+            for flow_field in self.spiral_and_transform.flow_fields
         ]
-        flow_field_params = low_res_flow_params + high_res_flow_params
-        gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
-        linear_params = [spiral_and_transform.linear_logits]
-        grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
-        other_params = [p for p in spiral_and_transform.parameters() if id(p) not in grouped_ids]
+        flow_field_params = self.low_res_flow_params + self.high_res_flow_params
+        self.gap_expander_params = list(self.spiral_and_transform.gap_expander_params.parameters())
+        linear_params = [self.spiral_and_transform.linear_logits]
+        grouped_ids = {id(p) for p in flow_field_params + self.gap_expander_params + linear_params}
+        other_params = [p for p in self.spiral_and_transform.parameters() if id(p) not in grouped_ids]
         initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(0)
         param_groups = [
             {'params': other_params, 'weight_decay': 0.0},
             {'params': linear_params, 'weight_decay': 0.0},
-            {'params': gap_expander_params, 'weight_decay': cfg['optimizer_weight_decay_gap_expander']},
+            {'params': self.gap_expander_params, 'weight_decay': cfg['optimizer_weight_decay_gap_expander']},
             {
-                'params': low_res_flow_params,
+                'params': self.low_res_flow_params,
                 'weight_decay': cfg['optimizer_weight_decay_flow_field'],
                 'lr_scale': 1.,
             },
             {
-                'params': high_res_flow_params,
+                'params': self.high_res_flow_params,
                 'weight_decay': cfg['optimizer_weight_decay_flow_field'],
                 'lr': cfg['optimizer_learning_rate'] * initial_high_res_lr_scale,
                 'lr_scale': initial_high_res_lr_scale,
             },
         ]
         progress.begin('loading', 'Creating optimizer')
-        optimiser = torch.optim.AdamW(param_groups, lr=cfg.optimizer_learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
+        self.optimiser = torch.optim.AdamW(param_groups, lr=cfg.optimizer_learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
         # Influence masks are scoped to one interactive Run request. They are
         # created from that run's pending inputs and discarded before its autosave.
-        influence_state = None
-        interactive_influence_loss_weight = 0.0
-        interactive_influence_anchor_samples = 0
+        self.influence_state = None
+        self.interactive_influence_loss_weight = 0.0
+        self.interactive_influence_anchor_samples = 0
         if cfg['optimizer_exp_lr_schedule']:
-            gamma = cfg['optimizer_lr_final_factor'] ** (1.0 / max(1, num_training_steps))
-            lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
+            gamma = cfg['optimizer_lr_final_factor'] ** (1.0 / max(1, self.num_training_steps))
+            self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimiser, gamma=gamma)
         else:
-            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimiser, lambda step: 1.)
 
-        def apply_high_res_lr_scale(iteration):
-            scale = get_flow_field_high_res_lr_scale(iteration)
-            low_res_group = next(
-                group for group in optimiser.param_groups
-                if any(param is low_res_flow_params[0] for param in group['params']))
-            high_res_group = next(
-                group for group in optimiser.param_groups
-                if any(param is high_res_flow_params[0] for param in group['params']))
-            set_optimizer_group_lr_scale(
-                optimiser,
-                lr_scheduler,
-                group=high_res_group,
-                reference_group=low_res_group,
-                scale=scale,
-                initial_lr=cfg['optimizer_learning_rate'],
-            )
-            return scale
-
-        def realign_lr_schedule(completed_steps):
-            """Align optimizer/scheduler state to the current absolute horizon."""
-            nonlocal lr_scheduler, num_training_steps
-            lr_scheduler, num_training_steps = realign_optimizer_lr_schedule(
-                optimiser,
-                lr_scheduler,
-                initial_lr=cfg['optimizer_learning_rate'],
-                final_factor=cfg['optimizer_lr_final_factor'],
-                completed_steps=completed_steps,
-                training_horizon=cfg['optimizer_num_training_steps'],
-                exponential=cfg['optimizer_exp_lr_schedule'],
-            )
-
+        # Checkpoint save/load helpers. Closures for now; commit 4 exposes them
+        # behind compatibility adapters as context methods.
         def checkpoint_payload(completed_iterations):
             def durable_config(value):
                 return {
@@ -1839,27 +1767,27 @@ class FitContext:
             return {
                 'schema_version': 2,
                 'completed_iterations': int(completed_iterations),
-                'spiral_and_transform': spiral_and_transform.state_dict(),
-                'optimiser': optimiser.state_dict(),
-                'scheduler': lr_scheduler.state_dict(),
+                'spiral_and_transform': self.spiral_and_transform.state_dict(),
+                'optimiser': self.optimiser.state_dict(),
+                'scheduler': self.lr_scheduler.state_dict(),
                 'cfg': durable_config(cfg),
                 'requested_config': durable_config(
-                    getattr(interactive_driver, 'requested_config', dict(cfg))),
+                    getattr(self.interactive_driver, 'requested_config', dict(cfg))),
                 'resolved_config': durable_config(cfg),
                 'lasagna_scale': lasagna_scale,
                 'lasagna_group': normal_zarr_group,
                 'surf_sdt_fingerprint': (
-                    sdt_volume['fingerprint'] if sdt_volume is not None else None),
+                    self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
                 # The model z-range, not the run window: a resumed session may
                 # optimise a narrower window than the flow field covers, and
                 # resume rebuilds parameter shapes from these values.
-                'z_begin': model_z_begin,
-                'z_end': model_z_end,
+                'z_begin': self.model_z_begin,
+                'z_end': self.model_z_end,
                 'spiral_outward_sense': spiral_outward_sense,
                 'numpy_rng_state': np.random.get_state(),
                 'torch_cpu_rng_state': torch.random.get_rng_state(),
                 'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
-                'input_manifest': dict(getattr(interactive_driver, 'input_manifest', {})),
+                'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
                 'preview_first_winding': 10,
             }
 
@@ -1886,35 +1814,38 @@ class FitContext:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
 
-        def save_model(suffix, completed_iterations=num_training_steps):
-            return save_model_to(f'{out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
+        def save_model(suffix, completed_iterations=self.num_training_steps):
+            return save_model_to(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
 
         def load_model(checkpoint):
             transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
-            spiral_and_transform.load_state_dict(transformed_spiral_state)
-            optimiser.load_state_dict(optimiser_state)
+            self.spiral_and_transform.load_state_dict(transformed_spiral_state)
+            self.optimiser.load_state_dict(optimiser_state)
             # Older checkpoints could have been saved while influence masking had
             # disabled gap weight decay. Influence state is no longer restored, so
             # restore the session configuration explicitly as well.
-            gap_param = gap_expander_params[0]
-            gap_group = next(group for group in optimiser.param_groups
+            gap_param = self.gap_expander_params[0]
+            gap_group = next(group for group in self.optimiser.param_groups
                              if any(param is gap_param for param in group['params']))
             gap_group['weight_decay'] = cfg['optimizer_weight_decay_gap_expander']
             if checkpoint.get('scheduler') is not None:
-                lr_scheduler.load_state_dict(checkpoint['scheduler'])
+                self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
+
+        self._save_model_to = save_model_to
+        self._save_model = save_model
 
         if resume_path:
             embedded_iteration = resume_checkpoint.get('completed_iterations') if isinstance(resume_checkpoint, dict) else None
             if embedded_iteration is not None:
-                start_iteration = int(embedded_iteration)
-            print(f'resuming from {resume_path} at iteration {start_iteration}')
+                self.start_iteration = int(embedded_iteration)
+            print(f'resuming from {resume_path} at iteration {self.start_iteration}')
             progress.begin(
                 'loading', 'Restoring model and optimizer',
                 detail=os.path.basename(resume_path))
             load_model(resume_checkpoint)
             if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
-                for _ in range(start_iteration):
-                    lr_scheduler.step()
+                for _ in range(self.start_iteration):
+                    self.lr_scheduler.step()
             if isinstance(resume_checkpoint, dict):
                 if resume_checkpoint.get('numpy_rng_state') is not None:
                     np.random.set_state(resume_checkpoint['numpy_rng_state'])
@@ -1940,38 +1871,38 @@ class FitContext:
         if interactive_driver is not None:
             # A checkpoint may carry the scheduler state from a shorter horizon.
             # The active session configuration is authoritative.
-            realign_lr_schedule(start_iteration)
+            self._realign_lr_schedule(self.start_iteration)
 
         progress.begin('loading', 'Synchronizing model across GPU workers')
-        broadcast_model_params(spiral_and_transform)
+        broadcast_model_params(self.spiral_and_transform)
 
         if os.environ.get('FIT_SPIRAL_TORCH_PROFILE') == '1':
-            profiler = torch.profiler.profile(
+            self.profiler = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 schedule=torch.profiler.schedule(wait=5, warmup=2, active=2, repeat=1),
-                on_trace_ready=lambda p: p.export_chrome_trace(f'{out_path}/profile.out'),
+                on_trace_ready=lambda p: p.export_chrome_trace(f'{self.out_path}/profile.out'),
                 record_shapes=True,
                 with_stack=True,
             )
-            profiler.start()
+            self.profiler.start()
         else:
-            profiler = None
+            self.profiler = None
 
         # ==========================================================================
         # Track training inputs
         # ==========================================================================
 
-        prepared_main_tracks = None
-        preview_extent_tracks = self.tracks
+        self.prepared_main_tracks = None
+        self.preview_extent_tracks = self.tracks
         if self.using_tracks:
             progress.begin(
                 'loading', 'Preparing tracks for optimization',
                 detail=f'{len(self.tracks):,} tracks')
-            prepared_main_tracks = prepare_main_phase_tracks(
+            self.prepared_main_tracks = prepare_main_phase_tracks(
                 self.tracks,
                 None,
                 float(cfg['track_exclusion_radius']),
-                device,
+                self.device,
                 anchor_tree=self.trusted_geometry_tree,
                 sampling_config=self.track_sampling_config,
                 track_families=self.track_families,
@@ -1987,22 +1918,22 @@ class FitContext:
             # With the usual zero exclusion radius, the training bundle already
             # contains every authoritative track point as one flat CPU tensor.  Reuse it
             # for preview bounds instead of walking millions of short NumPy tracks.
-            if prepared_main_tracks is not None:
+            if self.prepared_main_tracks is not None:
                 input_track_points = (
                     int(self.tracks.selected_lengths.sum())
                     if isinstance(self.tracks, PackedTrackCollection)
                     else sum(len(track) for track in self.tracks))
-                if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
-                    preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
+                if self.prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
+                    self.preview_extent_tracks = (self.prepared_main_tracks['flat_zyx_cpu'],)
 
         # A compact subsample of the trusted cloud seeds a future Run's influence
         # anchor bank. Keep it for every interactive session because influence can
         # be enabled or disabled independently on each Run request.
-        influence_anchor_geometry = None
+        self.influence_anchor_geometry = None
         if interactive_driver is not None:
             stash_generator = torch.Generator()
             stash_generator.manual_seed(int(cfg['optimizer_random_seed']))
-            influence_anchor_geometry = subsample_rows(
+            self.influence_anchor_geometry = subsample_rows(
                 self.verified_patches_and_pcls_cpu,
                 int(cfg['sample_count_influence_anchor_geometry_points']),
                 stash_generator,
@@ -2015,8 +1946,8 @@ class FitContext:
         self.verified_patches_and_pcls_cpu = None
         self.verified_patches_and_pcls_np = None
 
-        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        dr_per_winding = spiral_and_transform.get_dr_per_winding()
+        self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+        self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
 
         # ==========================================================================
         # Whole-object DT target caches (see dt_targets.py)
@@ -2024,8 +1955,8 @@ class FitContext:
 
         if cfg['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
             raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {cfg['dt_target_mode']!r}")
-        dt_target_whole_object = cfg['dt_target_mode'] == 'whole_object_quantile'
-        if dt_target_whole_object:
+        self.dt_target_whole_object = cfg['dt_target_mode'] == 'whole_object_quantile'
+        if self.dt_target_whole_object:
             progress.begin(
                 'loading', 'Preparing distance-target samples',
                 detail=(
@@ -2050,48 +1981,126 @@ class FitContext:
                     message += f', main-component fraction {cache["main_component_fraction"]:.3f}'
                 print(message)
 
-        dt_target_cache_manager = DtTargetCacheManager(
+        self.dt_target_cache_manager = DtTargetCacheManager(
             cfg['dt_target_update_interval'], report_first_dt_target_cache,
         )
-
-        # ==========================================================================
-        # Training loop
-        # ==========================================================================
 
         if is_distributed():
             np.random.seed(cfg['optimizer_random_seed'] + get_rank())
             torch.manual_seed(cfg['optimizer_random_seed'] + get_rank())
-        dist_grad_params = list(spiral_and_transform.parameters())
-        dist_grad_named = list(spiral_and_transform.named_parameters())
+        self.dist_grad_params = list(self.spiral_and_transform.parameters())
+        self.dist_grad_named = list(self.spiral_and_transform.named_parameters())
         if is_main_process():
-            n_params = sum(p.numel() for p in dist_grad_params)
-            n_bytes = sum(p.numel() * p.element_size() for p in dist_grad_params)
+            n_params = sum(p.numel() for p in self.dist_grad_params)
+            n_bytes = sum(p.numel() * p.element_size() for p in self.dist_grad_params)
             print(
                 f'trainable parameters: {n_params:,} ({n_bytes / 1e6:.1f} MB) - '
                 'gradient volume all-reduced every step in distributed mode'
             )
-        step_timer = StepTimer(
+        self.step_timer = StepTimer(
             enabled=os.environ.get('FIT_SPIRAL_PROFILE_STEPS') == '1',
             report=is_main_process(),
         )
-        nonfinite_grad_steps = torch.zeros((), device=dist_grad_params[0].device)
-        nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in dist_grad_named}
-        interactive_dt_resume_iteration = None
+        self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
+        self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
+        self.interactive_dt_resume_iteration = None
+
+    def run(self):
+        interactive_driver = self.interactive_driver
+        progress = progress_or_null(self.progress)
+        has_progress = self.progress is not None
+
+        self.load_host_inputs()
+
+        out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
+        self.out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{self.num_verified_patches}-patch'
+        if not wandb.run.name.startswith('dummy-'):
+            self.out_path += '_' + wandb.run.name
+        if run_tag:
+            self.out_path += f'_{run_tag}'
+        os.makedirs(self.out_path, exist_ok=True)
+
+        self.build_device_state()
+
+        def rebuild_unverified_patch_inputs(exclusion_radius):
+            """Reload only the unverified-patch pool for a Run-boundary mask edit."""
+            if not unverified_patches_path:
+                return {}, [], None, None
+            candidates = self._load_patches_from_dir(unverified_patches_path)
+            for patch_id, patch in list(candidates.items()):
+                cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+                if (cells_to_erode > 0
+                        and not erode_patch_valid_region(patch, cells_to_erode)):
+                    del candidates[patch_id]
+                    continue
+                if not patch_intersects_z_roi(patch, z_begin, z_end):
+                    del candidates[patch_id]
+                    continue
+                patch.release_derived_caches()
+            candidates, n_masked, n_dropped = \
+                _mask_unverified_patches_near_trusted_geometry(
+                    candidates, self.trusted_geometry_tree, exclusion_radius)
+            print(
+                f'unverified patches: remasked {n_masked} vertices near trusted '
+                f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
+                f'{len(candidates)} remain')
+            candidate_list = list(candidates.values())
+            probabilities = (
+                self._prepare_patch_sampling_cache(candidate_list)
+                if candidate_list else None)
+            atlas = (
+                PatchAtlas(candidates, device='cuda')
+                if candidate_list else None)
+            return candidates, candidate_list, probabilities, atlas
+
+        def prepare_png_visualization_inputs():
+            zs = np.linspace(
+                z_begin,
+                z_end - 1,
+                min(self.num_slices_for_visualisation, z_end - 1 - z_begin),
+                dtype=np.int64,
+            )
+            if self.scroll_zarr is not None:
+                subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
+                print('loading slices for visualisation')
+                vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
+                scroll_slices = (
+                    torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
+                    / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
+                ).to(torch.uint8)
+            else:
+                subvolume_shape = (
+                    z_end - z_begin,
+                    int(np.ceil(32693 / render_volume_scale)),
+                    int(np.ceil(32693 / render_volume_scale)),
+                )
+                scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
+
+            prediction_slices, quad_labels, _ = overlay_patches_on_slices(
+                self.verified_patches_list,
+                zs,
+                subvolume_shape[1:],
+                cache_path,
+                canvas_scale=render_volume_scale,
+            )
+            yx = torch.stack(torch.meshgrid(
+                torch.arange(subvolume_shape[1], dtype=torch.float32),
+                torch.arange(subvolume_shape[2], dtype=torch.float32),
+                indexing='ij',
+            ), axis=-1).to(self.device) * render_volume_scale
+            return zs, yx, scroll_slices, prediction_slices, quad_labels
 
         def clear_interactive_influence():
             """End the current Run request's influence window."""
-            nonlocal influence_state, interactive_influence_loss_weight
-            nonlocal interactive_influence_anchor_samples
-            nonlocal interactive_dt_resume_iteration
-            interactive_dt_resume_iteration = None
-            if influence_state is None:
-                interactive_influence_loss_weight = 0.0
-                interactive_influence_anchor_samples = 0
+            self.interactive_dt_resume_iteration = None
+            if self.influence_state is None:
+                self.interactive_influence_loss_weight = 0.0
+                self.interactive_influence_anchor_samples = 0
                 return
-            influence_state.deactivate_(spiral_and_transform, optimiser)
-            influence_state = None
-            interactive_influence_loss_weight = 0.0
-            interactive_influence_anchor_samples = 0
+            self.influence_state.deactivate_(self.spiral_and_transform, self.optimiser)
+            self.influence_state = None
+            self.interactive_influence_loss_weight = 0.0
+            self.interactive_influence_anchor_samples = 0
 
         def export_interactive_preview(generation_path, surface_id):
             # Export has its own saved RNG envelope so pausing does not alter the
@@ -2101,8 +2110,8 @@ class FitContext:
             cuda_states = torch.cuda.get_rng_state_all()
             try:
                 manifest = save_combined_preview(
-                    spiral_and_transform.get_slice_to_spiral_transform(),
-                    spiral_and_transform.get_dr_per_winding(),
+                    self.spiral_and_transform.get_slice_to_spiral_transform(),
+                    self.spiral_and_transform.get_dr_per_winding(),
                     self.verified_patches_list,
                     self.unattached_pcl_strips,
                     generation_path,
@@ -2111,7 +2120,7 @@ class FitContext:
                     z_end,
                     voxel_size_um,
                     get_or_build_unattached_pcl_flat,
-                    tracks=preview_extent_tracks,
+                    tracks=self.preview_extent_tracks,
                     surface_id=surface_id,
                     progress=progress,
                 )
@@ -2126,13 +2135,13 @@ class FitContext:
                         'track_radius', 'track_dt', 'shell_patch_radius',
                     )
                 }
-                if phase_mode_active():
+                if self._phase_mode_active():
                     diagnostic_weights['dense_spacing_phase'] = max(
                         float(cfg['loss_weight_dense_spacing']), 1.0)
                     diagnostic_weights['dense_spacing_count'] = max(
                         float(cfg['loss_weight_dense_spacing_count']), 1.0)
-                transform = spiral_and_transform.get_slice_to_spiral_transform()
-                dr = spiral_and_transform.get_dr_per_winding()
+                transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+                dr = self.spiral_and_transform.get_dr_per_winding()
                 progress.begin(
                     'exporting_preview', 'Computing preview diagnostics')
                 recorder = LossMapRecorder(
@@ -2149,10 +2158,10 @@ class FitContext:
                         cfg['sample_count_patches_per_step'],
                         cfg['sample_count_patches_per_step_for_dt'],
                         self.verified_patches_list, self.patch_atlas,
-                        self.patch_sampling_probabilities, umbilicus_zyx,
+                        self.patch_sampling_probabilities, self.umbilicus_zyx,
                         compute_dt=cfg['loss_weight_patch_dt'] > 0,
-                        shell_valid_zyxs=shell_valid_zyxs_gpu,
-                        shell_outer_winding_idx=shell_outer_winding_idx,
+                        shell_valid_zyxs=self.shell_valid_zyxs_gpu,
+                        shell_outer_winding_idx=self.shell_outer_winding_idx,
                     )
                     if self.unverified_patch_atlas is not None:
                         get_unverified_patch_losses(
@@ -2165,7 +2174,7 @@ class FitContext:
                         )
                     if cfg['loss_weight_sym_dirichlet'] > 0:
                         get_symmetric_dirichlet_loss(
-                            transform, dr, shell_outer_winding_idx,
+                            transform, dr, self.shell_outer_winding_idx,
                             cfg['sample_count_regularisation_points'])
                     if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                         get_patch_rel_winding_loss(
@@ -2175,19 +2184,19 @@ class FitContext:
                         get_patch_abs_winding_loss(
                             transform, dr, self.verified_patches, self.patch_atlas,
                             self.cross_patch_pcls)
-                    if lasagna_volume is not None:
+                    if self.lasagna_volume is not None:
                         for _loss_name, _loss_value in iter_lasagna_losses(
-                                transform, dr, lasagna_volume,
-                                shell_outer_winding_idx,
+                                transform, dr, self.lasagna_volume,
+                                self.shell_outer_winding_idx,
                                 cfg['sample_count_dense_normal_points'],
                                 compute_spacing=self.grad_mag_spacing_enabled):
                             pass
-                    if phase_mode_active():
+                    if self._phase_mode_active():
                         preview_generator = torch.Generator(device=dr.device)
                         preview_generator.manual_seed(0x243F6A88)
                         for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
-                                spiral_and_transform, transform, dr, sdt_volume,
-                                lasagna_volume, shell_outer_winding_idx, cfg,
+                                self.spiral_and_transform, transform, dr, self.sdt_volume,
+                                self.lasagna_volume, self.shell_outer_winding_idx, cfg,
                                 z_begin, z_end, generator=preview_generator):
                             pass
                     if self.unattached_pcl_strips:
@@ -2199,21 +2208,21 @@ class FitContext:
                             cfg['sample_count_unattached_pcl_points_per_step'],
                             compute_dt=cfg['loss_weight_unattached_pcl_dt'] > 0,
                         )
-                    if prepared_main_tracks is not None:
+                    if self.prepared_main_tracks is not None:
                         for _loss_name, _loss_value in iter_track_losses(
-                                transform, dr, prepared_main_tracks, cfg,
+                                transform, dr, self.prepared_main_tracks, cfg,
                                 compute_dt=cfg['loss_weight_track_dt'] > 0):
                             pass
                 # Per-pair aggregated crossing counts: mean_count - m per winding
                 # pair, the measurement behind any future discrete
                 # insert/remove/reindex operation (gradient descent cannot perform
                 # those). Written next to the loss maps as a preview artifact.
-                if phase_mode_active() and shell_outer_winding_idx is not None:
+                if self._phase_mode_active() and self.shell_outer_winding_idx is not None:
                     try:
                         with torch.no_grad():
                             pair_rows = aggregate_pair_counts(
-                                transform, dr, sdt_volume,
-                                shell_outer_winding_idx, cfg, z_begin, z_end)
+                                transform, dr, self.sdt_volume,
+                                self.shell_outer_winding_idx, cfg, z_begin, z_end)
                         pair_table_name = 'dense_spacing_pair_counts.json'
                         with open(os.path.join(generation_path, pair_table_name),
                                   'w', encoding='utf-8') as stream:
@@ -2250,9 +2259,6 @@ class FitContext:
             service's deterministic order, so a multi-rank session would append the
             same items in the same order on every rank.
             """
-            nonlocal influence_state
-            nonlocal interactive_influence_loss_weight, interactive_influence_anchor_samples
-            nonlocal interactive_dt_resume_iteration
             # Incorporation has its own saved RNG envelope so adding inputs does
             # not alter the stochastic training sequence (same discipline as the
             # interactive preview export).
@@ -2444,22 +2450,22 @@ class FitContext:
                 if new_patches or new_collections:
                     # Whole-object DT target caches index the (now longer) object
                     # pools; force recomputation on next use.
-                    dt_target_cache_manager.reset()
+                    self.dt_target_cache_manager.reset()
 
                 if run_cfg['influence_enabled'] and (new_patches or new_collections):
-                    influence_state = make_influence_state(run_cfg, torch.device('cuda'))
-                    influence_state.activate_or_extend_(
+                    self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
+                    self.influence_state.activate_or_extend_(
                         new_patches=new_patches,
                         new_collections=new_collections,
-                        spiral_and_transform=spiral_and_transform,
-                        optimiser=optimiser,
+                        spiral_and_transform=self.spiral_and_transform,
+                        optimiser=self.optimiser,
                         cfg=run_cfg,
                         z_begin=z_begin,
                         z_end=z_end,
-                        anchor_geometry_zyx=influence_anchor_geometry,
+                        anchor_geometry_zyx=self.influence_anchor_geometry,
                     )
-                    interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
-                    interactive_influence_anchor_samples = int(
+                    self.interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
+                    self.interactive_influence_anchor_samples = int(
                         run_cfg['sample_count_influence_anchor_samples_per_step'])
 
                 # run() sets the target before this callback is drained at the
@@ -2472,11 +2478,11 @@ class FitContext:
                     interactive_status['target_iteration'],
                     run_cfg['influence_disable_dt_frac'],
                 )
-                interactive_dt_resume_iteration = dt_resume_iteration
+                self.interactive_dt_resume_iteration = dt_resume_iteration
 
                 print(f'incorporated {len(new_patches)} patches and '
                       f'{len(new_collections)} point collections into the resident session; '
-                      f'DT losses disabled until iteration {interactive_dt_resume_iteration}')
+                      f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
             finally:
                 np.random.set_state(numpy_state)
                 torch.random.set_rng_state(torch_state)
@@ -2486,11 +2492,6 @@ class FitContext:
             def configure_interactive_run(config, path_changes=None):
                 """Apply Run-scoped settings without replacing the resident fit."""
                 global shell_path
-                nonlocal dt_target_whole_object, prepared_main_tracks
-                nonlocal lr_scheduler, num_training_steps
-                nonlocal shell_map
-                nonlocal shell_outer_winding_idx, shell_valid_zyxs_gpu
-                nonlocal preview_extent_tracks
 
                 path_changes = dict(path_changes or {})
                 changed = set(config)
@@ -2510,10 +2511,10 @@ class FitContext:
                     rebuilt_families = self.track_families
                     rebuilt_source_ids = self.track_source_ids
                     rebuilt_shell_patch = self.shell_patch
-                    rebuilt_shell_map = shell_map
+                    rebuilt_shell_map = self.shell_map
                     rebuilt_shell_envelope = self.shell_envelope
-                    rebuilt_shell_outer = shell_outer_winding_idx
-                    rebuilt_shell_valid = shell_valid_zyxs_gpu
+                    rebuilt_shell_outer = self.shell_outer_winding_idx
+                    rebuilt_shell_valid = self.shell_valid_zyxs_gpu
                     requested_shell_path = str(
                         path_changes.get('outer_shell', shell_path) or '')
 
@@ -2541,7 +2542,7 @@ class FitContext:
                                 if self.track_reload_source_ids is not None else None)
                             rebuilt_tracks = prepare_main_phase_tracks(
                                 rebuilt_track_rows, None,
-                                float(cfg['track_exclusion_radius']), device,
+                                float(cfg['track_exclusion_radius']), self.device,
                                 anchor_tree=self.trusted_geometry_tree,
                                 sampling_config=validate_track_sampling_config(cfg),
                                 track_families=rebuilt_families,
@@ -2556,11 +2557,11 @@ class FitContext:
                                 z_min=z_begin - cfg['model_flow_bounds_z_margin'],
                                 z_max=z_end + cfg['model_flow_bounds_z_margin'],
                                 num_theta_bins=cfg['shell_num_theta_bins'],
-                                device=device)
+                                device=self.device)
                             if cfg['loss_weight_shell_outer'] > 0 else None
                         )
                         rebuilt_shell_valid = (
-                            subsample_shell_radius_pool(rebuilt_shell_patch)
+                            self._subsample_shell_radius_pool(rebuilt_shell_patch)
                             if cfg['loss_weight_shell_patch_radius'] > 0 else None
                         )
                         rebuilt_shell_outer = int(cfg['shell_outer_winding_idx'])
@@ -2572,7 +2573,7 @@ class FitContext:
                     if reprepare_tracks and rebuilt_tracks is None and self.tracks:
                         rebuilt_tracks = prepare_main_phase_tracks(
                             self.tracks, None, float(cfg['track_exclusion_radius']),
-                            device, anchor_tree=self.trusted_geometry_tree,
+                            self.device, anchor_tree=self.trusted_geometry_tree,
                             sampling_config=validate_track_sampling_config(cfg),
                             track_families=self.track_families,
                             track_source_ids=self.track_source_ids,
@@ -2582,7 +2583,7 @@ class FitContext:
 
                     target_tracks = (
                         rebuilt_tracks
-                        if replace_prepared_tracks else prepared_main_tracks)
+                        if replace_prepared_tracks else self.prepared_main_tracks)
                     if ({'track_length_bin_weights',
                          'track_max_track_crossing_per_step',
                          'track_min_walk_steps_per_track',
@@ -2618,9 +2619,9 @@ class FitContext:
                         'sample_count_patch_dt_target_points',
                     })
                     if dt_preparation_changed:
-                        dt_target_whole_object = (
+                        self.dt_target_whole_object = (
                             cfg['dt_target_mode'] == 'whole_object_quantile')
-                        if dt_target_whole_object:
+                        if self.dt_target_whole_object:
                             prepare_patch_dt_target_samples(
                                 self.verified_patches_list,
                                 cfg['sample_count_patch_dt_target_points'],
@@ -2632,16 +2633,16 @@ class FitContext:
                                     cfg['dt_target_max_stride'])
                     if any(key.startswith('dt_') for key in changed) \
                             or dt_preparation_changed:
-                        dt_target_cache_manager.update_interval = max(
+                        self.dt_target_cache_manager.update_interval = max(
                             1, int(cfg['dt_target_update_interval']))
-                        dt_target_cache_manager.reset()
+                        self.dt_target_cache_manager.reset()
                     if changed & {
                             'optimizer_exp_lr_schedule',
                             'optimizer_learning_rate',
                             'optimizer_lr_final_factor',
                             'optimizer_num_training_steps',
                     }:
-                        realign_lr_schedule(
+                        self._realign_lr_schedule(
                             interactive_driver.status()['current_iteration'])
                 except Exception:
                     cfg.update(old_values, allow_val_change=True)
@@ -2650,18 +2651,18 @@ class FitContext:
                 if shell_changed:
                     shell_path = requested_shell_path
                     self.shell_patch = rebuilt_shell_patch
-                    shell_map = rebuilt_shell_map
+                    self.shell_map = rebuilt_shell_map
                     self.shell_envelope = rebuilt_shell_envelope
-                    shell_outer_winding_idx = rebuilt_shell_outer
-                    shell_valid_zyxs_gpu = rebuilt_shell_valid
+                    self.shell_outer_winding_idx = rebuilt_shell_outer
+                    self.shell_valid_zyxs_gpu = rebuilt_shell_valid
                     self.tracks = rebuilt_track_rows
                     self.track_families = rebuilt_families
                     self.track_source_ids = rebuilt_source_ids
                 if replace_prepared_tracks:
-                    prepared_main_tracks = rebuilt_tracks
-                    preview_extent_tracks = (
-                        (prepared_main_tracks['flat_zyx_cpu'],)
-                        if prepared_main_tracks is not None else ())
+                    self.prepared_main_tracks = rebuilt_tracks
+                    self.preview_extent_tracks = (
+                        (self.prepared_main_tracks['flat_zyx_cpu'],)
+                        if self.prepared_main_tracks is not None else ())
                 self.unverified_patches = rebuilt_unverified
                 self.unverified_patches_list = rebuilt_unverified_list
                 self.unverified_patch_sampling_probabilities = \
@@ -2671,38 +2672,42 @@ class FitContext:
             # In the usual zero-exclusion case preview bounds reuse the prepared
             # flat tensor, so the original list of per-track arrays is no longer
             # needed after setup.
-            if preview_extent_tracks is not self.tracks and self.track_reload_source is None:
+            if self.preview_extent_tracks is not self.tracks and self.track_reload_source is None:
                 self.tracks = None
             interactive_driver.on_ready(
-                completed_iterations=start_iteration,
-                output_path=out_path,
-                save_checkpoint=save_model_to,
+                completed_iterations=self.start_iteration,
+                output_path=self.out_path,
+                save_checkpoint=self._save_model_to,
                 export_preview=export_interactive_preview,
                 incorporate_inputs=incorporate_interactive_inputs,
                 finish_run=clear_interactive_influence,
                 configure_run=configure_interactive_run,
             )
 
-        # Interactive fits are resident sessions: num_training_steps still defines
+        # ==========================================================================
+        # Training loop
+        # ==========================================================================
+
+        # Interactive fits are resident sessions: self.num_training_steps still defines
         # the learning-rate schedule, but it must not cap how long the user can
         # continue optimizing (especially after restoring a completed checkpoint).
         iteration_sequence = (
-            itertools.count(start_iteration)
+            itertools.count(self.start_iteration)
             if interactive_driver is not None
-            else range(start_iteration, num_training_steps)
+            else range(self.start_iteration, self.num_training_steps)
         )
         if interactive_driver is None:
             progress.begin(
                 'optimizing', 'Optimizing',
-                step=0, total_steps=max(0, num_training_steps - start_iteration),
+                step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
                 unit='iterations')
         for iteration in tqdm(
                 iteration_sequence,
                 disable=not is_main_process() or has_progress):
             if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
                 break
-            step_timer.start('fwd')
-            flow_field_high_res_lr_scale = apply_high_res_lr_scale(iteration)
+            self.step_timer.start('fwd')
+            flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
 
             # The tiny graph paths shared by every transform evaluation this
             # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -2712,12 +2717,12 @@ class FitContext:
             # (retain_graph) until the family is released. The leaf gradients
             # accumulated across families flow through the real shared paths once,
             # next to the flow-field gradient flush below.
-            shared_transform_outputs = spiral_and_transform.get_shared_transform_tensors()
+            shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
             shared_transform_leaves = tuple(
                 output.detach().requires_grad_(True) for output in shared_transform_outputs)
-            slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform(
+            self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
                 shared=shared_transform_leaves)
-            dr_per_winding = shared_transform_leaves[0]
+            self.dr_per_winding = shared_transform_leaves[0]
 
             losses = {}
             log_metrics = {
@@ -2728,21 +2733,21 @@ class FitContext:
                 """Accumulate one loss family's gradients, then release its graph."""
                 family_loss = sum(weighted_losses.values())
                 if family_loss.requires_grad:
-                    step_timer.stop('fwd')
-                    step_timer.start('bwd')
+                    self.step_timer.stop('fwd')
+                    self.step_timer.start('bwd')
                     # The paths shared with later families end at detached leaves
                     # (shared_transform_leaves and the flow fields' internal
                     # accumulators), so this family's graph is self-contained and
                     # its buffers are freed as the backward pass consumes them.
                     family_loss.backward()
-                    step_timer.stop('bwd')
-                    step_timer.start('fwd')
+                    self.step_timer.stop('bwd')
+                    self.step_timer.start('fwd')
                 for name, value in weighted_losses.items():
                     losses[name] = value.detach()
 
             interactive_dt_suppressed = (
-                interactive_dt_resume_iteration is not None
-                and iteration < interactive_dt_resume_iteration
+                self.interactive_dt_resume_iteration is not None
+                and iteration < self.interactive_dt_resume_iteration
             )
             log_metrics['interactive_dt_suppressed'] = float(interactive_dt_suppressed)
 
@@ -2754,7 +2759,7 @@ class FitContext:
 
             # Progressive-outward DT gating: winding cutoff that grows from the
             # respective DT start step. None means no gating.
-            dt_progressive_outer = shell_outer_winding_idx
+            dt_progressive_outer = self.shell_outer_winding_idx
             patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
             track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
             unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
@@ -2767,22 +2772,22 @@ class FitContext:
             unverified_patch_dt_target_cache = None
             unattached_pcl_dt_target_cache = None
             track_dt_target_cache = None
-            if dt_target_whole_object:
+            if self.dt_target_whole_object:
                 if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
-                    patch_dt_target_cache = dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
-                        slice_to_spiral_transform, dr_per_winding,
+                    patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
+                        self.slice_to_spiral_transform, self.dr_per_winding,
                         self.verified_patches_list, self.patch_atlas, cfg['dt_target_floating_threshold'],
                     ))
                 if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
-                    unverified_patch_dt_target_cache = dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
-                        slice_to_spiral_transform, dr_per_winding,
+                    unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
+                        self.slice_to_spiral_transform, self.dr_per_winding,
                         self.unverified_patches_list, self.unverified_patch_atlas, cfg['dt_target_floating_threshold'],
                     ))
                 if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                     pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
                     if pcl_flat is not None:
-                        unattached_pcl_dt_target_cache = dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
-                            slice_to_spiral_transform, dr_per_winding,
+                        unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
+                            self.slice_to_spiral_transform, self.dr_per_winding,
                             pcl_flat['zyxs'], pcl_flat['starts'],
                             windings=pcl_flat['windings'],
                             floating_threshold=cfg['dt_target_floating_threshold'],
@@ -2790,10 +2795,10 @@ class FitContext:
                             max_stride=cfg['dt_target_max_stride'],
                             max_total_points=20_000_000,
                         ))
-                if compute_track_dt and cfg['loss_weight_track_dt'] > 0 and prepared_main_tracks is not None:
-                    track_dt_target_cache = dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
-                        slice_to_spiral_transform, dr_per_winding,
-                        prepared_main_tracks['flat_zyx_cpu'], prepared_main_tracks['offsets'],
+                if compute_track_dt and cfg['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
+                    track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
+                        self.slice_to_spiral_transform, self.dr_per_winding,
+                        self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
                         windings=None,
                         floating_threshold=cfg['dt_target_floating_threshold'],
                         num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
@@ -2802,17 +2807,17 @@ class FitContext:
                     ))
 
             patch_loss_values = get_patch_and_umbilicus_losses(
-                slice_to_spiral_transform,
-                dr_per_winding,
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
                 cfg['sample_count_patches_per_step'],
                 cfg['sample_count_patches_per_step_for_dt'],
                 self.verified_patches_list,
                 self.patch_atlas,
                 self.patch_sampling_probabilities,
-                umbilicus_zyx,
+                self.umbilicus_zyx,
                 compute_dt=compute_patch_dt,
-                shell_valid_zyxs=shell_valid_zyxs_gpu,
-                shell_outer_winding_idx=shell_outer_winding_idx,
+                shell_valid_zyxs=self.shell_valid_zyxs_gpu,
+                shell_outer_winding_idx=self.shell_outer_winding_idx,
                 dt_max_winding=patch_dt_max_winding,
                 dt_target_cache=patch_dt_target_cache,
             )
@@ -2821,7 +2826,7 @@ class FitContext:
                 'patch_dt': patch_loss_values[2] * cfg['loss_weight_patch_dt'],
                 'umbilicus': patch_loss_values[1] * cfg['loss_weight_umbilicus'],
             }
-            if shell_valid_zyxs_gpu is not None:
+            if self.shell_valid_zyxs_gpu is not None:
                 patch_family['shell_patch_radius'] = patch_loss_values[3] * cfg['loss_weight_shell_patch_radius']
             backward_family(patch_family)
             del patch_family, patch_loss_values
@@ -2831,8 +2836,8 @@ class FitContext:
                 or cfg['loss_weight_unverified_patch_dt'] > 0
             ):
                 unverified_loss_values = get_unverified_patch_losses(
-                    slice_to_spiral_transform,
-                    dr_per_winding,
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
                     cfg['sample_count_unverified_patches_per_step'],
                     cfg['sample_count_unverified_patches_per_step_for_dt'],
                     self.unverified_patches_list,
@@ -2851,9 +2856,9 @@ class FitContext:
             if cfg['loss_weight_sym_dirichlet'] > 0:
                 backward_family({
                     'sym_dirichlet': get_symmetric_dirichlet_loss(
-                        slice_to_spiral_transform,
-                        dr_per_winding,
-                        shell_outer_winding_idx,
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
+                        self.shell_outer_winding_idx,
                         cfg['sample_count_regularisation_points'],
                     ) * cfg['loss_weight_sym_dirichlet'],
                 })
@@ -2861,8 +2866,8 @@ class FitContext:
             if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                 backward_family({
                     'rel_winding': get_patch_rel_winding_loss(
-                        slice_to_spiral_transform,
-                        dr_per_winding,
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
                         self.verified_patches,
                         self.patch_atlas,
                         self.cross_patch_pcls,
@@ -2873,8 +2878,8 @@ class FitContext:
             if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                 backward_family({
                     'abs_winding': get_patch_abs_winding_loss(
-                        slice_to_spiral_transform,
-                        dr_per_winding,
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
                         self.verified_patches,
                         self.patch_atlas,
                         self.cross_patch_pcls,
@@ -2883,13 +2888,13 @@ class FitContext:
 
             if (
                 (cfg['loss_weight_dense_normals'] > 0 or self.grad_mag_spacing_enabled)
-                and lasagna_volume is not None
+                and self.lasagna_volume is not None
             ):
                 for dense_loss_name, dense_loss_value in iter_lasagna_losses(
-                    slice_to_spiral_transform,
-                    dr_per_winding,
-                    lasagna_volume,
-                    shell_outer_winding_idx,
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.lasagna_volume,
+                    self.shell_outer_winding_idx,
                     cfg['sample_count_dense_normal_points'],
                     compute_spacing=self.grad_mag_spacing_enabled,
                 ):
@@ -2902,15 +2907,15 @@ class FitContext:
                     # Release before the generator builds the next loss's graph,
                     # or both large transform graphs are resident at peak.
                     del dense_loss_value
-                if lasagna_volume.get('backend') == 'sparse_cuda':
+                if self.lasagna_volume.get('backend') == 'sparse_cuda':
                     log_metrics.update({
                         f'lasagna_{name}': value
-                        for name, value in lasagna_volume['store'].last_timings.items()
+                        for name, value in self.lasagna_volume['store'].last_timings.items()
                     })
 
-            warn_if_sdt_loss_inactive()
-            warn_if_dense_losses_structurally_disabled()
-            phase_components_active = phase_mode_active()
+            self._warn_if_sdt_loss_inactive()
+            self._warn_if_dense_losses_structurally_disabled()
+            phase_components_active = self._phase_mode_active()
             min_spacing_active = cfg['loss_weight_min_spacing'] > 0
             if phase_components_active or min_spacing_active:
                 # SDT-backed phase components require phase mode; the native
@@ -2932,12 +2937,12 @@ class FitContext:
                 pending_shared = {}
                 for component_name, component_loss, component_metrics in \
                         iter_phase_bundle_losses(
-                            spiral_and_transform,
-                            slice_to_spiral_transform,
-                            dr_per_winding,
-                            sdt_volume,
-                            lasagna_volume,
-                            shell_outer_winding_idx,
+                            self.spiral_and_transform,
+                            self.slice_to_spiral_transform,
+                            self.dr_per_winding,
+                            self.sdt_volume,
+                            self.lasagna_volume,
+                            self.shell_outer_winding_idx,
                             cfg,
                             z_begin,
                             z_end,
@@ -2960,15 +2965,15 @@ class FitContext:
                     backward_family(pending_shared)
                 del pending_shared
                 if (phase_components_active
-                        and lasagna_volume['backend'] == 'sparse_cuda'):
+                        and self.lasagna_volume['backend'] == 'sparse_cuda'):
                     log_metrics.update({
                         f'dense_spacing_phase_normal_{name}': value
-                        for name, value in lasagna_volume['store'].last_timings.items()
+                        for name, value in self.lasagna_volume['store'].last_timings.items()
                     })
-                if phase_components_active and sdt_volume['backend'] == 'sparse_cuda':
+                if phase_components_active and self.sdt_volume['backend'] == 'sparse_cuda':
                     log_metrics.update({
                         f'dense_spacing_phase_sdt_store_{name}': value
-                        for name, value in sdt_volume['store'].last_timings.items()
+                        for name, value in self.sdt_volume['store'].last_timings.items()
                     })
 
             if (
@@ -2976,8 +2981,8 @@ class FitContext:
                 and self.unattached_pcl_strips
             ):
                 unattached_loss_values = get_unattached_pcl_strip_losses(
-                    slice_to_spiral_transform,
-                    dr_per_winding,
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
                     self.unattached_pcl_strips,
                     self.pcl_sampling_strata['unattached'],
                     get_or_build_unattached_pcl_flat,
@@ -2993,11 +2998,11 @@ class FitContext:
                 })
                 del unattached_loss_values
 
-            if prepared_main_tracks is not None:
+            if self.prepared_main_tracks is not None:
                 for track_loss_name, track_loss_value in iter_track_losses(
-                    slice_to_spiral_transform,
-                    dr_per_winding,
-                    prepared_main_tracks,
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.prepared_main_tracks,
                     cfg,
                     compute_dt=compute_track_dt,
                     dt_max_winding=track_dt_max_winding,
@@ -3014,34 +3019,34 @@ class FitContext:
                     del track_loss_value
 
             shell_metrics = {}
-            if shell_map is not None:
+            if self.shell_map is not None:
                 shell_outer_loss, shell_metrics = get_shell_outer_loss(
-                    shell_map,
-                    slice_to_spiral_transform,
-                    dr_per_winding,
-                    shell_outer_winding_idx,
+                    self.shell_map,
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.shell_outer_winding_idx,
                 )
                 backward_family({
                     'shell_outer': shell_outer_loss * cfg['loss_weight_shell_outer'],
                 })
                 del shell_outer_loss
 
-            if (influence_state is not None and influence_state.active
-                    and interactive_influence_loss_weight > 0):
+            if (self.influence_state is not None and self.influence_state.active
+                    and self.interactive_influence_loss_weight > 0):
                 backward_family({
-                    'anchor': influence_state.get_anchor_loss(
-                        slice_to_spiral_transform,
-                        dr_per_winding,
-                        interactive_influence_anchor_samples,
-                    ) * interactive_influence_loss_weight,
+                    'anchor': self.influence_state.get_anchor_loss(
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
+                        self.interactive_influence_anchor_samples,
+                    ) * self.interactive_influence_loss_weight,
                 })
 
             loss = sum(losses.values())
 
-            step_timer.stop('fwd')
-            step_timer.start('bwd')
+            self.step_timer.stop('fwd')
+            self.step_timer.start('bwd')
             # Flush every stage's sparse-accumulated field gradient into its parameters.
-            for flow_field in spiral_and_transform.flow_fields:
+            for flow_field in self.spiral_and_transform.flow_fields:
                 apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
                 if apply_accumulated_field_grad is not None:
                     apply_accumulated_field_grad()
@@ -3057,13 +3062,13 @@ class FitContext:
                     [output for output, _ in shared_transform_pending],
                     [grad for _, grad in shared_transform_pending],
                 )
-            step_timer.stop('bwd')
-            step_timer.start('comm')
-            allreduce_grads_(dist_grad_params)
-            step_timer.stop('comm')
+            self.step_timer.stop('bwd')
+            self.step_timer.start('comm')
+            allreduce_grads_(self.dist_grad_params)
+            self.step_timer.stop('comm')
 
-            step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=nonfinite_grad_steps.device)
-            for name, p in dist_grad_named:
+            step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
+            for name, p in self.dist_grad_named:
                 if p.grad is not None:
                     # aminmax propagates NaN and surfaces +/-inf through two scalar
                     # reductions, avoiding the gradient-sized boolean temporaries
@@ -3071,55 +3076,55 @@ class FitContext:
                     grad_min, grad_max = torch.aminmax(p.grad)
                     param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
                     step_had_nonfinite |= param_nonfinite
-                    nonfinite_grad_by_param[name] += param_nonfinite.to(nonfinite_grad_steps.dtype)
+                    self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
                     torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-            nonfinite_grad_steps += step_had_nonfinite.to(nonfinite_grad_steps.dtype)
+            self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
 
-            if influence_state is not None and influence_state.active:
+            if self.influence_state is not None and self.influence_state.active:
                 # After the all-reduce and the accumulated-field-grad handoff, so
                 # every rank masks identical averaged gradients on both flow paths.
-                influence_state.apply_grad_masks_(spiral_and_transform)
+                self.influence_state.apply_grad_masks_(self.spiral_and_transform)
 
-            step_timer.start('opt')
-            optimiser.step()
-            step_timer.stop('opt')
-            if influence_state is not None and influence_state.active:
-                influence_state.apply_masked_gap_decay_(spiral_and_transform, optimiser)
-            optimiser.zero_grad(set_to_none=True)
-            lr_scheduler.step()
-            step_timer.tick()
-            step_timer.maybe_report(iteration)
-            if profiler is not None:
-                profiler.step()
+            self.step_timer.start('opt')
+            self.optimiser.step()
+            self.step_timer.stop('opt')
+            if self.influence_state is not None and self.influence_state.active:
+                self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
+            self.optimiser.zero_grad(set_to_none=True)
+            self.lr_scheduler.step()
+            self.step_timer.tick()
+            self.step_timer.maybe_report(iteration)
+            if self.profiler is not None:
+                self.profiler.step()
 
             if interactive_driver is not None:
                 interactive_driver.iteration_completed(
                     completed_iterations=iteration + 1,
                     total_loss=float(loss.detach().item()),
                     losses={name: float(value.detach().item()) for name, value in losses.items()},
-                    learning_rate=float(optimiser.param_groups[0]['lr']),
+                    learning_rate=float(self.optimiser.param_groups[0]['lr']),
                     metrics={name: float(value) for name, value in log_metrics.items()},
                 )
             else:
-                progress.update(iteration - start_iteration + 1)
+                progress.update(iteration - self.start_iteration + 1)
 
             if iteration % 200 == 0:
                 # Only sync to CPU and log when we actually print, avoiding a per-iter
                 # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
                 if is_main_process():
                     print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
-                    n_sanitised = int(nonfinite_grad_steps.item())
+                    n_sanitised = int(self.nonfinite_grad_steps.item())
                     if n_sanitised > 0:
                         per_param = sorted(
-                            ((name, int(count.item())) for name, count in nonfinite_grad_by_param.items() if count.item() > 0),
+                            ((name, int(count.item())) for name, count in self.nonfinite_grad_by_param.items() if count.item() > 0),
                             key=lambda name_count: -name_count[1],
                         )
                         by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
                         print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
                     wandb.log({
                         'total_loss': loss.item(),
-                        'nonfinite_grad_steps': nonfinite_grad_steps.item(),
-                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in nonfinite_grad_by_param.items()},
+                        'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
+                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
                         **{name + '_loss': value for name, value in losses.items()},
                         **shell_metrics,
                         **log_metrics,
@@ -3138,7 +3143,7 @@ class FitContext:
             progress.begin(
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
-            save_model(suffix, num_training_steps)
+            self._save_model(suffix, self.num_training_steps)
             if cfg.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')
@@ -3159,22 +3164,22 @@ class FitContext:
                 'finalizing', 'Computing satisfaction metrics and outputs')
             save_overlay_and_print_satisfaction(
                 suffix,
-                spiral_and_transform=spiral_and_transform,
-                slice_to_spiral_transform=slice_to_spiral_transform,
-                dr_per_winding=dr_per_winding,
+                spiral_and_transform=self.spiral_and_transform,
+                slice_to_spiral_transform=self.slice_to_spiral_transform,
+                dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,
                 unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
                 unverified_patches_list=self.unverified_patches_list,
                 unverified_patches_dict=self.unverified_patches,
-                out_path=out_path,
+                out_path=self.out_path,
                 cfg=cfg,
                 z_begin=z_begin,
                 z_end=z_end,
-                flow_field_radius=flow_field_radius,
-                flow_min_corner_spiral_zyx=flow_min_corner_spiral_zyx,
-                flow_max_corner_spiral_zyx=flow_max_corner_spiral_zyx,
+                flow_field_radius=self.flow_field_radius,
+                flow_min_corner_spiral_zyx=self.flow_min_corner_spiral_zyx,
+                flow_max_corner_spiral_zyx=self.flow_max_corner_spiral_zyx,
                 zs_for_visualisation=zs_for_visualisation,
                 slice_yx=slice_yx,
                 scroll_slices_for_visualisation=scroll_slices_for_visualisation,
