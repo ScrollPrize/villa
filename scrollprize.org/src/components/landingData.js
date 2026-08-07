@@ -488,6 +488,43 @@ export const team = {
       href: "https://www.linkedin.com/in/laura-trojak-726784195/",
     },
   ],
+  educe: [
+    {
+      name: "Brent Seales",
+      title: "Principal Investigator, Professor of Computer Science",
+      href: "https://educelab.engr.uky.edu/w-brent-seales",
+    },
+    {
+      name: "Seth Parker",
+      title: "Research Manager",
+      href: "https://www2.cs.uky.edu/dri/seth-parker/",
+    },
+    {
+      name: "Christy Chapman",
+      title: "Research & Partnership Manager",
+      href: "https://educelab.engr.uky.edu/christy-chapman",
+    },
+    {
+      name: "Mami Hayashida",
+      title: "Research Staff",
+      href: "https://www.ccs.uky.edu/about-ccs/staff-directory/mami-hayashida/",
+    },
+    {
+      name: "James Brusuelas",
+      title: "Associate Professor of Classics",
+      href: "https://mcl.as.uky.edu/users/jbr454",
+    },
+    {
+      name: "Beth Lutin",
+      title: "College Business Analyst",
+      href: "https://www.engr.uky.edu/directory/lutin-elizabeth",
+    },
+    {
+      name: "Roger Macfarlane",
+      title: "Professor of Classical Studies",
+      href: "https://hum.byu.edu/directory/roger-macfarlane",
+    },
+  ],
   alumni: [
     {
       name: "JP Posma",
@@ -671,6 +708,11 @@ export const team = {
 };
 
 export const partners = [
+  {
+    name: "EduceLab",
+    icon: "/img/landing/educe.svg",
+    href: "https://educelab.engr.uky.edu/",
+  },
   {
     name: "Institut de France",
     icon: "/img/landing/institute.svg",
