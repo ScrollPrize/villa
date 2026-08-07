@@ -93,6 +93,29 @@ from .utils import get_max_value, open_zarr
 Image.MAX_IMAGE_PIXELS = None
 
 
+def _multiscale_level_paths(group) -> Optional[List[str]]:
+    """Level paths from a group's OME-Zarr ``multiscales`` metadata.
+
+    Returns ``None`` when the group carries no such metadata, so callers fall
+    back to listing. Reading the metadata rather than listing is what makes
+    multiscale volumes usable over HTTP, where the store cannot enumerate its
+    own members.
+    """
+    try:
+        multiscales = group.attrs.get("multiscales")
+    except Exception:
+        return None
+    if not multiscales:
+        return None
+    try:
+        datasets = multiscales[0].get("datasets") or []
+        paths = [d["path"] for d in datasets
+                 if isinstance(d, dict) and d.get("path")]
+    except (AttributeError, IndexError, TypeError, KeyError):
+        return None
+    return paths or None
+
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -371,6 +394,58 @@ class Volume:
             print('  zarr_vol = Volume(type="zarr", path="/path/to/my/data.zarr")')
             raise
 
+    def _level_keys(self) -> List[str]:
+        """Keys of the resolution levels, in order.
+
+        Prefers OME-Zarr ``multiscales`` metadata and falls back to listing.
+        Listing is what breaks over HTTP: the store has no LIST operation, so
+        ``keys()`` and ``len()`` both come back empty and every level lookup
+        fails even though the arrays are perfectly readable by name.
+        """
+        cached = getattr(self, "_level_keys_cache", None)
+        if cached is not None:
+            return cached
+        if isinstance(self.data, zarr.Group):
+            keys = _multiscale_level_paths(self.data) or [
+                str(k) for k in self.data.keys()]
+        else:
+            # A plain array, or the legacy list-of-levels form: neither is
+            # addressed by key.
+            keys: List[str] = []
+        self._level_keys_cache = keys
+        return keys
+
+    def _num_levels(self) -> int:
+        """Number of resolution levels, without relying on listing."""
+        if isinstance(self.data, zarr.Array):
+            return 1
+        if isinstance(self.data, zarr.Group):
+            return len(self._level_keys())
+        return len(self.data)   # legacy list of levels
+
+    def _level(self, subvolume_idx: int = 0) -> zarr.Array:
+        """The array for one resolution level, whatever ``self.data`` holds.
+
+        Every read path used to index ``self.data`` directly, which only works
+        for the legacy list form: a zarr Group is addressed by key, not by
+        position. The key must come from the declared order in
+        ``_level_keys()`` rather than from ``str(subvolume_idx)``, because
+        OME-Zarr paths are allowed to be non-numeric or nested.
+        """
+        if isinstance(self.data, zarr.Array):
+            if subvolume_idx != 0:
+                raise IndexError(
+                    f"Invalid subvolume index: {subvolume_idx}. "
+                    f"This store holds a single array (level 0 only).")
+            return self.data
+        if not (0 <= subvolume_idx < self._num_levels()):
+            raise IndexError(
+                f"Invalid subvolume index: {subvolume_idx}. "
+                f"Available: 0 to {self._num_levels() - 1}")
+        if isinstance(self.data, zarr.Group):
+            return self.data[self._level_keys()[subvolume_idx]]
+        return self.data[subvolume_idx]   # legacy list of levels
+
     def _s3_storage_options(self, path: str) -> Optional[dict]:
         """Return storage_options for S3 paths, None otherwise."""
         if path.startswith('s3://'):
@@ -404,12 +479,23 @@ class Volume:
                 # Group case (e.g., OME-Zarr with multiscales)
                 # Find the first array in the group - typically '0' for highest resolution
                 first_key = None
-                for key in self.data.keys():
-                    if isinstance(self.data[key], zarr.Array):
+                for key in self._level_keys():
+                    try:
+                        member = self.data[key]
+                    except KeyError:
+                        continue
+                    if isinstance(member, zarr.Array):
                         first_key = key
                         break
                 if first_key is None:
-                    raise ValueError(f"No arrays found in zarr Group at {self.path}")
+                    hint = ("" if self._level_keys() else
+                            " The store reported no members; over HTTP that is"
+                            " expected, since HTTP has no LIST operation and a"
+                            " group can only be enumerated from its multiscales"
+                            " metadata.")
+                    raise ValueError(
+                        f"No arrays found in zarr Group at {self.path}."
+                        f" Tried keys: {self._level_keys()}.{hint}")
                 first_array = self.data[first_key]
                 if hasattr(first_array.dtype, 'numpy_dtype'):
                     self.dtype = first_array.dtype.numpy_dtype
@@ -472,14 +558,19 @@ class Volume:
             print(f"Number of Resolution Levels: 1")
             print(f"  Level 0 Shape: {self.data.shape}, Dtype: {self.data.dtype}")
         elif isinstance(self.data, zarr.Group):
-            levels = [key for key in sorted(self.data.keys(), key=lambda x: int(x) if x.isdigit() else x)
+            # Sorting must not mix int and str keys: a store with paths like
+            # ["0", "scale1"] raises TypeError on comparison. Numeric keys keep
+            # their numeric order, the rest follow in string order.
+            levels = [key for key in sorted(
+                          self._level_keys(),
+                          key=lambda x: (0, int(x), "") if x.isdigit() else (1, 0, x))
                       if isinstance(self.data[key], zarr.Array)]
             print(f"Number of Resolution Levels: {len(levels)}")
             for key in levels:
                 arr = self.data[key]
                 print(f"  Level {key} Shape: {arr.shape}, Dtype: {arr.dtype}")
         else:
-            print(f"Number of Resolution Levels: {len(self.data)}")
+            print(f"Number of Resolution Levels: {self._num_levels()}")
             for idx, store in enumerate(self.data):
                 print(f"  Level {idx} Shape: {store.shape}, Dtype: {store.dtype}")
         if self.inklabel is not None:
@@ -829,15 +920,11 @@ class Volume:
 
             # Check if the last element looks like a subvolume index (integer)
             # compared to the dimensionality of the data.
-            # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
-            if isinstance(self.data, zarr.Array):
-                data_ndim = self.data.ndim  # Dimensionality of the zarr array
-            else:
-                data_ndim = self.data[0].ndim  # Dimensionality of the base resolution
+            data_ndim = self._level(0).ndim  # Dimensionality of the base resolution
             if len(idx) == data_ndim + 1 and isinstance(idx[-1], int):
                 # Assume last element is subvolume index
                 potential_subvolume_idx = idx[-1]
-                if 0 <= potential_subvolume_idx < len(self.data):
+                if 0 <= potential_subvolume_idx < self._num_levels():
                     subvolume_idx = potential_subvolume_idx
                     coord_idx = idx[:-1]  # Use preceding elements as coordinates
                     if len(coord_idx) != data_ndim:
@@ -861,7 +948,7 @@ class Volume:
 
         elif isinstance(idx, (int, slice)):
             # Allow single index/slice if data is 1D (unlikely for volumes but possible)
-            if self.data[subvolume_idx].ndim == 1:
+            if self._level(subvolume_idx).ndim == 1:
                 coord_idx = (idx,)  # Make it a tuple
             else:
                 raise IndexError("Single index/slice provided for multi-dimensional data. Use a tuple (z, y, x, ...).")
@@ -873,8 +960,10 @@ class Volume:
             # Direct zarr array doesn't have subvolumes
             if subvolume_idx != 0:
                 raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Direct zarr array has only index 0.")
-        elif not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Must be between 0 and {len(self.data) - 1}.")
+        elif not (0 <= subvolume_idx < self._num_levels()):
+            raise IndexError(
+                f"Invalid subvolume index: {subvolume_idx}. "
+                f"Must be between 0 and {self._num_levels() - 1}.")
 
         # --- Read Data Slice ---
         if self.verbose:
@@ -882,14 +971,11 @@ class Volume:
             if isinstance(self.data, zarr.Array):
                 print(f"  Store shape: {self.data.shape}, Store dtype: {self.data.dtype}")
             else:
-                print(f"  Store shape: {self.data[subvolume_idx].shape}, Store dtype: {self.data[subvolume_idx].dtype}")
+                lvl = self._level(subvolume_idx)
+                print(f"  Store shape: {lvl.shape}, Store dtype: {lvl.dtype}")
 
         try:
-            # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
-            if isinstance(self.data, zarr.Array):
-                store = self.data
-            else:
-                store = self.data[subvolume_idx]
+            store = self._level(subvolume_idx)
 
             data_slice = self._read_with_retry(store, coord_idx)
 
@@ -901,10 +987,10 @@ class Volume:
         except Exception as e:
             print(f"ERROR during zarr read operation:")
             print(f"  Subvolume: {subvolume_idx}, Index: {coord_idx}")
-            if isinstance(self.data, zarr.Array):
-                print(f"  Store Shape: {self.data.shape}")
-            else:
-                print(f"  Store Shape: {self.data[subvolume_idx].shape}")
+            try:
+                print(f"  Store Shape: {self._level(subvolume_idx).shape}")
+            except Exception:
+                pass
             print(f"  Error: {e}")
             raise  # Re-raise the exception
 
@@ -1080,26 +1166,12 @@ class Volume:
 
     def shape(self, subvolume_idx: int = 0) -> Tuple[int, ...]:
         """Gets the shape of a specific sub-volume (resolution level)."""
-        # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
-        if isinstance(self.data, zarr.Array):
-            return tuple(self.data.shape)
-        
-        # Original behavior for when self.data is a list of resolution levels
-        if not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {len(self.data) - 1}")
-        return tuple(self.data[subvolume_idx].shape)
+        return tuple(self._level(subvolume_idx).shape)
 
     @property
     def ndim(self, subvolume_idx: int = 0) -> int:
         """Gets the number of dimensions of a specific sub-volume."""
-        # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
-        if isinstance(self.data, zarr.Array):
-            return self.data.ndim
-            
-        # Original behavior for when self.data is a list of resolution levels
-        if not (0 <= subvolume_idx < len(self.data)):
-            raise IndexError(f"Invalid subvolume index: {subvolume_idx}. Available: 0 to {len(self.data) - 1}")
-        return self.data[subvolume_idx].ndim
+        return self._level(subvolume_idx).ndim
 
 
 class Cube:
