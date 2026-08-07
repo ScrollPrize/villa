@@ -33,7 +33,6 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QProgressBar>
-#include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
 #include <QSignalBlocker>
@@ -535,6 +534,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_showAsMeshAction, &QAction::triggered, this, [this]() {
         emit showAsMeshRequested();
     });
+    annotationMenu->addSeparator();
+    _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
+    _resetViewsAction->setEnabled(false);
+    connect(_resetViewsAction, &QAction::triggered, this, [this]() {
+        resetGeneratedViews();
+    });
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
 
@@ -690,15 +695,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setMinimumWidth(0);
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
-    _resetViewsButton = new QPushButton(tr("Reset views"), buttonRow);
-    _resetViewsButton->setEnabled(false);
-    _resetViewsButton->installEventFilter(this);
-    buttonLayout->addWidget(_resetViewsButton);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
-    connect(_resetViewsButton, &QPushButton::clicked, this, [this]() {
-        resetGeneratedViews();
-    });
     installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
@@ -1186,8 +1184,8 @@ bool LineAnnotationDialog::setGeneratedRows(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     clearGeneratedOverlayRefreshConnections();
@@ -1510,8 +1508,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         if (_fullOptimizationAction) {
             _fullOptimizationAction->setEnabled(true);
         }
-        if (_resetViewsButton) {
-            _resetViewsButton->setEnabled(true);
+        if (_resetViewsAction) {
+            _resetViewsAction->setEnabled(true);
         }
         return true;
     }
@@ -1522,8 +1520,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     const bool replacingGeneratedViews = _hasGeneratedViews;
@@ -1875,8 +1873,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _fullOptimizationAction->setEnabled(true);
     }
     captureInitialGeneratedViewState();
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(true);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(true);
     }
     return true;
 }

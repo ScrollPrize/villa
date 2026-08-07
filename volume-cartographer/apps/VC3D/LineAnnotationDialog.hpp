@@ -32,7 +32,6 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QProgressBar;
-class QPushButton;
 class QCloseEvent;
 class QHBoxLayout;
 class QMenu;
@@ -368,7 +367,7 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
-    QPushButton* _resetViewsButton = nullptr;
+    QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
