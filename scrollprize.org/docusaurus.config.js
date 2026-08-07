@@ -235,12 +235,12 @@ const config = {
                 },
               ],
             },
+            { to: "/press", label: "Press", position: "left" },
             {
               href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
               label: "Donate",
               position: "left",
             },
-            { to: "/press", label: "Press", position: "left" },
             {
               href: "https://discord.gg/V4fJhvtaQn",
               label: "Join Discord",
