@@ -245,6 +245,11 @@ private:
     void bindPaneInteractions(const std::string& surfaceName,
                               CChunkedVolumeViewer* viewer,
                               bool seedPlacementEnabled);
+    // One shared cursor cross across the generated panes: the hovered pane
+    // broadcasts its cursor volume point to the others. Dialog-local —
+    // independent of the global "Sync cursor across views" toggle.
+    void connectLinkedCursorMirroring(
+        std::vector<QPointer<CChunkedVolumeViewer>> panes);
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -333,6 +338,9 @@ private:
     // "R": one-shot jump of the other panes to the cursor's line position on the
     // overview bar (works regardless of follow mode; leaves it unchanged).
     void snapPanesToOverviewCursor();
+    // Mirrors the along-line position and zoom from one strip viewer to the
+    // other; vertical offset stays per-strip.
+    void syncLinkedStripCamera(CChunkedVolumeViewer* source);
     // Pause badge on the bottom strip while mouse-follow is toggled off (Space).
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
@@ -436,6 +444,7 @@ private:
     double _currentCutNormalOffsetVx = 0.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
+    bool _syncingStripCameras = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _restoredWindowGeometry = false;

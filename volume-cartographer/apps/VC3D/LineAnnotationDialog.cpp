@@ -1316,6 +1316,43 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
         }));
 }
 
+void LineAnnotationDialog::connectLinkedCursorMirroring(
+    std::vector<QPointer<CChunkedVolumeViewer>> panes)
+{
+    for (const auto& panePtr : panes) {
+        auto* pane = panePtr.data();
+        if (!pane) {
+            continue;
+        }
+        pane->setLinkedCursorAlwaysEnabled(true);
+        const auto mirror = [panes, pane](const std::optional<cv::Vec3f>& point) {
+            for (const auto& otherPtr : panes) {
+                auto* other = otherPtr.data();
+                if (other && other != pane) {
+                    other->setLinkedCursorVolumePoint(point);
+                }
+            }
+        };
+        _generatedOverlayRefreshConnections.push_back(connect(
+            pane,
+            &CChunkedVolumeViewer::sendMouseMoveVolume,
+            this,
+            [mirror](cv::Vec3f volumePoint, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF) {
+                // Off-surface hovers emit non-finite positions; mirror those
+                // as "no point" instead of a NaN readout.
+                const bool finite = std::isfinite(volumePoint[0]) &&
+                                    std::isfinite(volumePoint[1]) &&
+                                    std::isfinite(volumePoint[2]);
+                mirror(finite ? std::optional<cv::Vec3f>(volumePoint) : std::nullopt);
+            }));
+        _generatedOverlayRefreshConnections.push_back(connect(
+            pane->graphicsView(),
+            &CVolumeViewerView::sendMouseLeftView,
+            this,
+            [mirror]() { mirror(std::nullopt); }));
+    }
+}
+
 void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
 {
     for (const auto& connection : _generatedOverlayRefreshConnections) {
@@ -1642,6 +1679,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
     currentViewer->setObjectName(tr("Current Line Cut"));
+    // This pane's top-left corner holds the one cursor-position readout shared
+    // by all generated panes (fed by connectLinkedCursorMirroring).
+    currentViewer->setProperty("vc_status_stats_top_right", true);
     auto currentApplyCamera = haveCurrentCutCamera
         ? currentCutCamera
         : generatedPaneCamera(currentViewer, camera);
@@ -1708,6 +1748,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
     sideViewer->setProperty("vc_show_custom_normal_offset", true);
     sideViewer->setProperty("vc_custom_normal_offset_vx", _sideCutNormalOffsetVx);
+    sideViewer->setProperty("vc_status_stats_top_right", true);
+    sideViewer->setProperty("vc_hide_status_position", true);
     sideViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers) {
             return shiftSideCutPlaneNormalOffsetByScrollSteps(steps);
@@ -1780,6 +1822,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             return false;
         }
         viewer->setObjectName(title);
+        // The strips are camera-linked, so the zoom/scale stats are shown once
+        // (top-right of the top strip); each keeps its own normal offset in
+        // the top-left, and the shared cursor readout lives in the current cut.
+        viewer->setProperty("vc_hide_status_position", true);
+        viewer->setProperty("vc_hide_status_poi", true);
+        if (stripIndex == 0) {
+            viewer->setProperty("vc_status_stats_top_right", true);
+        } else {
+            viewer->setProperty("vc_hide_status_stats", true);
+        }
         const bool haveStripCamera = stripIndex < stripCameras.size();
         auto stripCamera = haveStripCamera
             ? stripCameras[stripIndex]
@@ -1844,7 +1896,19 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _stripViewers.push_back(viewer);
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
+        // Strips share their along-line position and zoom; overlaysUpdated is
+        // the only notification pan/zoom emit, and syncLinkedStripCamera
+        // no-ops when the cameras already agree.
+        _generatedOverlayRefreshConnections.push_back(
+            viewer->connectOverlaysUpdated(this, [this, viewer]() {
+                syncLinkedStripCamera(viewer);
+            }));
     }
+    if (!_stripViewers.empty()) {
+        syncLinkedStripCamera(_stripViewers.front().data());
+    }
+    connectLinkedCursorMirroring(
+        {_currentCutViewer, _sideCutViewer, _stripViewers[0], _stripViewers[1]});
 
     stripSplitter->setStretchFactor(0, 1);
     stripSplitter->setStretchFactor(1, 1);
@@ -2456,7 +2520,8 @@ void LineAnnotationDialog::updateOptimizationStatusIndicator()
                                           : QStringLiteral("rgb(255, 80, 80)")));
     _optimizationStatusLabel->adjustSize();
     _optimizationStatusLabel->move(
-        std::max(0, bottomStrip->width() - _optimizationStatusLabel->width() - 10), 10);
+        std::max(0, bottomStrip->width() - _optimizationStatusLabel->width() - 10),
+        std::max(0, bottomStrip->height() - _optimizationStatusLabel->height() - 10));
     _optimizationStatusLabel->show();
     _optimizationStatusLabel->raise();
 }
@@ -3807,6 +3872,33 @@ void LineAnnotationDialog::snapPanesToOverviewCursor()
             camera.surfacePtrY = (*center)[1];
             stripViewer->applyCameraState(camera, false);
         }
+    }
+}
+
+void LineAnnotationDialog::syncLinkedStripCamera(CChunkedVolumeViewer* source)
+{
+    if (_syncingStripCameras || _closing || !source) {
+        return;
+    }
+    const auto sourceCamera = source->cameraState();
+    for (const auto& stripViewer : _stripViewers) {
+        auto* other = stripViewer.data();
+        if (!other || other == source) {
+            continue;
+        }
+        auto camera = other->cameraState();
+        // Exact comparison on purpose: the fields are copied verbatim, so the
+        // converged state is bit-identical and this is the loop terminator for
+        // the overlaysUpdated echo from applyCameraState.
+        if (camera.surfacePtrX == sourceCamera.surfacePtrX &&
+            camera.scale == sourceCamera.scale) {
+            continue;
+        }
+        camera.surfacePtrX = sourceCamera.surfacePtrX;
+        camera.scale = sourceCamera.scale;
+        _syncingStripCameras = true;
+        other->applyCameraState(camera, false);
+        _syncingStripCameras = false;
     }
 }
 

@@ -677,6 +677,11 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
     connect(_view, &CVolumeViewerView::sendMouseLeftView, this, [this]() {
         clearLineAnnotationPlacementMarker();
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+        _lastCursorVolumePos.reset();
+        updateStatusLabel();
     });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
@@ -711,6 +716,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     _statsBar = new ViewerStatsBar(this);
     _statsBar->move(10, 5);
+    _statsBarRight = new ViewerStatsBar(this);
+    _statsBarRight->setMinimumWidth(0);
+    _statsBarRight->hide();
 }
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
@@ -735,6 +743,20 @@ void CChunkedVolumeViewer::showEvent(QShowEvent* event)
         _renderStaleWhileHidden = false;
         submitRender("shown after hidden");
     }
+}
+
+void CChunkedVolumeViewer::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    repositionStatsBarRight();
+}
+
+void CChunkedVolumeViewer::repositionStatsBarRight()
+{
+    if (!_statsBarRight) {
+        return;
+    }
+    _statsBarRight->move(std::max(0, width() - _statsBarRight->width() - 10), 5);
 }
 
 bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
@@ -4273,7 +4295,14 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         }
     };
 
-    if (!_segmentationCursorMirroring || !point) {
+    const bool accepted =
+        (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
+    // Track the point for the status-bar position readout even when it doesn't
+    // project onto this viewer's surface and the crosshair stays hidden.
+    _linkedCursorVolumePos = accepted ? point : std::nullopt;
+    updateStatusLabel();
+
+    if (!accepted) {
         hideCrosshair();
         return;
     }
@@ -5869,16 +5898,24 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     QStringList items;
     QStringList sharedCacheItems;
-    items << QString("L%1").arg(_dsScaleIdx);
+    // The stats group (mip level, label, scale, framebuffer, composite) can be
+    // routed to the right-anchored bar or dropped per viewer.
+    QStringList statsItems;
+    statsItems << QString("L%1").arg(_dsScaleIdx);
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
-        items << viewerLabel;
-    items << QString("scale %1").arg(_scale, 0, 'f', 2);
-    items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
+        statsItems << viewerLabel;
+    statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);
 
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        items << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+    }
+
+    const bool showStats = !property("vc_hide_status_stats").toBool();
+    const bool statsTopRight = property("vc_status_stats_top_right").toBool();
+    if (showStats && !statsTopRight) {
+        items << statsItems;
     }
 
     if (_chunkArray) {
@@ -5937,19 +5974,31 @@ void CChunkedVolumeViewer::updateStatusLabel()
         sharedCacheItems << QStringLiteral("surface: out of band");
 
     auto surf = _surfWeak.lock();
-    if (_lastCursorVolumePos)
-        items << formatWholeVolumePosition(*_lastCursorVolumePos);
+    const auto& cursorPos =
+        _lastCursorVolumePos ? _lastCursorVolumePos : _linkedCursorVolumePos;
+    if (cursorPos && !property("vc_hide_status_position").toBool())
+        items << formatWholeVolumePosition(*cursorPos);
     if (dynamic_cast<QuadSurface*>(surf.get())) {
-        items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
-        if (_state) {
+        if (_zOff != 0.0f)
+            items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
+        if (_state && !property("vc_hide_status_poi").toBool()) {
             if (auto* poi = _state->poi("focus"))
                 items << QString("POI %1").arg(formatVec3(poi->p));
         }
     } else if (property("vc_show_custom_normal_offset").toBool()) {
-        items << QString("normal offset %1")
-                     .arg(property("vc_custom_normal_offset_vx").toDouble(), 0, 'f', 1);
+        const double offsetVx = property("vc_custom_normal_offset_vx").toDouble();
+        if (offsetVx != 0.0)
+            items << QString("normal offset %1").arg(offsetVx, 0, 'f', 1);
     }
 
     _statsBar->setItems(items);
+    _statsBar->setVisible(!items.isEmpty());
+    if (_statsBarRight) {
+        const QStringList rightItems =
+            (showStats && statsTopRight) ? statsItems : QStringList{};
+        _statsBarRight->setItems(rightItems);
+        _statsBarRight->setVisible(!rightItems.isEmpty());
+        repositionStatsBarRight();
+    }
     emit sharedCacheStatsChanged(sharedCacheItems);
 }
