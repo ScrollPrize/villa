@@ -287,6 +287,10 @@ const config = {
                   label: "Jobs",
                   to: "/jobs",
                 },
+                {
+                  label: "Press",
+                  to: "/press",
+                },
               ],
             },
           ],
