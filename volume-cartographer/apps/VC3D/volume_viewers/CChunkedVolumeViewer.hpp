@@ -427,7 +427,9 @@ private:
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
-    void updateCursorCrosshair(const QPointF& scenePos);
+    // projected=true draws the greyed-out variant used when a linked cursor
+    // point lies off this pane's plane (e.g. after a normal-offset scroll).
+    void updateCursorCrosshair(const QPointF& scenePos, bool projected = false);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -682,6 +684,7 @@ private:
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
+    bool _cursorCrosshairProjected = false;
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;

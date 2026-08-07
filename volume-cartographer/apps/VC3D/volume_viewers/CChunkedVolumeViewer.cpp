@@ -682,6 +682,11 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
         }
         _lastCursorVolumePos.reset();
         updateStatusLabel();
+        // Clear mirrored crosshairs in the other viewers too (nullopt
+        // broadcasts are never gated), so they don't freeze at the last point.
+        if (_viewerManager) {
+            _viewerManager->broadcastLinkedCursor(this, std::nullopt);
+        }
     });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
@@ -3936,10 +3941,17 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     return {};
 }
 
-void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
+void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos, bool projected)
 {
     if (!_scene || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y()))
         return;
+
+    const auto crosshairPen = [](bool greyedOut) {
+        QPen pen(greyedOut ? QColor(160, 160, 160, 190) : QColor(50, 255, 215),
+                 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(true);
+        return pen;
+    };
 
     if (!_cursorCrosshair || !_cursorCrosshair->scene()) {
         QPainterPath path;
@@ -3957,14 +3969,16 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
         path.lineTo(0.0, arm);
 
         auto* marker = new QGraphicsPathItem(path);
-        QPen pen(QColor(50, 255, 215), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        pen.setCosmetic(true);
-        marker->setPen(pen);
+        marker->setPen(crosshairPen(projected));
         marker->setBrush(Qt::NoBrush);
         marker->setZValue(120.0);
         marker->setAcceptedMouseButtons(Qt::NoButton);
         _scene->addItem(marker);
         _cursorCrosshair = marker;
+        _cursorCrosshairProjected = projected;
+    } else if (projected != _cursorCrosshairProjected) {
+        static_cast<QGraphicsPathItem*>(_cursorCrosshair)->setPen(crosshairPen(projected));
+        _cursorCrosshairProjected = projected;
     }
 
     _cursorCrosshair->setPos(scenePos);
@@ -4298,9 +4312,17 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
     const bool accepted =
         (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
     // Track the point for the status-bar position readout even when it doesn't
-    // project onto this viewer's surface and the crosshair stays hidden.
-    _linkedCursorVolumePos = accepted ? point : std::nullopt;
-    updateStatusLabel();
+    // project onto this viewer's surface and the crosshair stays hidden. Only
+    // refresh the (monolithic) status bar when the value changed and this
+    // viewer actually displays the position — this runs per mouse move on
+    // every mirrored viewer.
+    const std::optional<cv::Vec3f> linkedPoint = accepted ? point : std::nullopt;
+    if (linkedPoint != _linkedCursorVolumePos) {
+        _linkedCursorVolumePos = linkedPoint;
+        if (!property("vc_hide_status_position").toBool()) {
+            updateStatusLabel();
+        }
+    }
 
     if (!accepted) {
         hideCrosshair();
@@ -4308,6 +4330,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
     }
 
     QPointF scenePos;
+    bool offPlane = false;
     if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
         // The flattened viewer's cursor point includes its normal offset, which
         // pushes it off-plane by up to that amount; widen the depth band so the
@@ -4321,11 +4344,14 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
         if (!std::isfinite(projected[0]) ||
             !std::isfinite(projected[1]) ||
-            !std::isfinite(projected[2]) ||
-            std::abs(projected[2] - _zOff) > tolerance) {
+            !std::isfinite(projected[2])) {
             hideCrosshair();
             return;
         }
+        // Beyond the depth band the point is not on this plane (typically after
+        // a normal-offset scroll); show its in-plane projection greyed out
+        // instead of hiding — the projection is already computed.
+        offPlane = std::abs(projected[2] - _zOff) > tolerance;
         scenePos = surfaceToScene(projected[0], projected[1]);
     } else {
         scenePos = volumeToScene(*point);
@@ -4336,7 +4362,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         return;
     }
 
-    updateCursorCrosshair(scenePos);
+    updateCursorCrosshair(scenePos, offPlane);
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)

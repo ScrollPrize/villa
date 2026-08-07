@@ -1319,38 +1319,55 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
 void LineAnnotationDialog::connectLinkedCursorMirroring(
     std::vector<QPointer<CChunkedVolumeViewer>> panes)
 {
-    for (const auto& panePtr : panes) {
+    _linkedCursorPanes = std::move(panes);
+    for (const auto& panePtr : _linkedCursorPanes) {
         auto* pane = panePtr.data();
         if (!pane) {
             continue;
         }
         pane->setLinkedCursorAlwaysEnabled(true);
-        const auto mirror = [panes, pane](const std::optional<cv::Vec3f>& point) {
-            for (const auto& otherPtr : panes) {
-                auto* other = otherPtr.data();
-                if (other && other != pane) {
-                    other->setLinkedCursorVolumePoint(point);
-                }
-            }
-        };
         _generatedOverlayRefreshConnections.push_back(connect(
             pane,
             &CChunkedVolumeViewer::sendMouseMoveVolume,
             this,
-            [mirror](cv::Vec3f volumePoint, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF) {
+            [this, pane](cv::Vec3f volumePoint, Qt::MouseButtons, Qt::KeyboardModifiers, QPointF) {
                 // Off-surface hovers emit non-finite positions; mirror those
                 // as "no point" instead of a NaN readout.
                 const bool finite = std::isfinite(volumePoint[0]) &&
                                     std::isfinite(volumePoint[1]) &&
                                     std::isfinite(volumePoint[2]);
-                mirror(finite ? std::optional<cv::Vec3f>(volumePoint) : std::nullopt);
+                requestLinkedCursorMirror(
+                    pane, finite ? std::optional<cv::Vec3f>(volumePoint) : std::nullopt);
             }));
         _generatedOverlayRefreshConnections.push_back(connect(
             pane->graphicsView(),
             &CVolumeViewerView::sendMouseLeftView,
             this,
-            [mirror]() { mirror(std::nullopt); }));
+            [this, pane]() { requestLinkedCursorMirror(pane, std::nullopt); }));
     }
+}
+
+void LineAnnotationDialog::requestLinkedCursorMirror(CChunkedVolumeViewer* source,
+                                                     const std::optional<cv::Vec3f>& point)
+{
+    _linkedCursorSource = source;
+    _pendingLinkedCursorPoint = point;
+    if (_linkedCursorMirrorPending) {
+        return;
+    }
+    _linkedCursorMirrorPending = true;
+    QTimer::singleShot(16, this, [this]() {
+        _linkedCursorMirrorPending = false;
+        if (_closing) {
+            return;
+        }
+        for (const auto& panePtr : _linkedCursorPanes) {
+            auto* pane = panePtr.data();
+            if (pane && pane != _linkedCursorSource.data()) {
+                pane->setLinkedCursorVolumePoint(_pendingLinkedCursorPoint);
+            }
+        }
+    });
 }
 
 void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()

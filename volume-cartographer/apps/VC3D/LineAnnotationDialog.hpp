@@ -250,6 +250,11 @@ private:
     // independent of the global "Sync cursor across views" toggle.
     void connectLinkedCursorMirroring(
         std::vector<QPointer<CChunkedVolumeViewer>> panes);
+    // Coalesces mirror updates onto a ~render-tick cadence (same pattern as
+    // requestCurrentLinePosition): a burst of mouse moves collapses into one
+    // projection + crosshair update per non-hovered pane per tick.
+    void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
+                                   const std::optional<cv::Vec3f>& point);
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -445,6 +450,10 @@ private:
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
     bool _syncingStripCameras = false;
+    std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
+    QPointer<CChunkedVolumeViewer> _linkedCursorSource;
+    std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
+    bool _linkedCursorMirrorPending = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _restoredWindowGeometry = false;
