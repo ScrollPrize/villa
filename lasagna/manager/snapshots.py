@@ -206,7 +206,12 @@ def _extract(path: Path, run: str, stat: os.stat_result) -> SnapshotRecord:
     return record
 
 
-def index_snapshots(config: ManagerConfig, *, cached_only: bool = False) -> list[SnapshotRecord]:
+def index_snapshots(
+    config: ManagerConfig,
+    *,
+    cached_only: bool = False,
+    write_cache: bool = True,
+) -> list[SnapshotRecord]:
     cache_path = _cache_path(config)
     cache = _load_cache(cache_path)
     updated: dict[str, dict[str, Any]] = {}
@@ -223,7 +228,7 @@ def index_snapshots(config: ManagerConfig, *, cached_only: bool = False) -> list
             record = _extract(path, run, stat)
         updated[key] = asdict(record)
         records.append(record)
-    if not cached_only:
+    if not cached_only and write_cache:
         _atomic_json(cache_path, {"schema_version": 1, "entries": updated})
     return sorted(records, key=lambda record: (record.run, record.checkpoint, record.path))
 

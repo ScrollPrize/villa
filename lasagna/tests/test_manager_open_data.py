@@ -12,7 +12,9 @@ from lasagna.manager.open_data import (
     stage_upload,
     upload_inference,
     validate_inference,
+    resolve_model_id,
 )
+from lasagna.manager.snapshots import SnapshotRecord
 from lasagna.manager.runs import atomic_json
 
 
@@ -37,10 +39,120 @@ class FakeStore:
         self.objects.pop(key, None)
 
 
+def _snapshot_record(path: Path, sha256: str) -> SnapshotRecord:
+    return SnapshotRecord(
+        backend="fiber3d", run="s1_128_20260801_084232", checkpoint="best.pt",
+        selector="fiber3d/s1_128_20260801_084232/best.pt", path=str(path),
+        size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns, sha256=sha256,
+        step=None, metric_name=None, metric_value=None, patch_shape=None,
+        architecture="fiber_trace_3d", option_count=None, precision_policy=None,
+        atlas_model_id=None, model_creation_utc=None, process="fiber_trace_3d.train",
+        task="lasagna", output_schema=None, code_revision=None,
+    )
+
+
+def test_model_resolution_rehashes_snapshot_and_derives_numeric_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "s1_128_20260801_084232" / "snapshots" / "best.pt"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"checkpoint")
+    import hashlib
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    record = _snapshot_record(snapshot, digest)
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: [record])
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    assert resolve_model_id(config, {"model": {
+        "sha256": digest, "run": record.run, "checkpoint": record.checkpoint,
+    }}) == "20260801084232-lasagna"
+    snapshot.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="no configured snapshot"):
+        resolve_model_id(config, {"model": {
+            "sha256": digest, "atlas_model_id": "20260801084232",
+        }})
+
+
+def test_model_creation_offset_is_normalized_to_utc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "run" / "snapshots" / "best.pt"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"checkpoint")
+    import hashlib
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    record = SnapshotRecord(**{
+        **_snapshot_record(snapshot, digest).__dict__,
+        "model_creation_utc": "2026-08-01T10:42:32+02:00",
+    })
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: [record])
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    assert resolve_model_id(config, {"model": {"sha256": digest}}) == "20260801084232-lasagna"
+    naive = SnapshotRecord(**{**record.__dict__, "model_creation_utc": "2026-08-01T08:42:32"})
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: [naive])
+    with pytest.raises(ValueError, match="UTC offset"):
+        resolve_model_id(config, {"model": {"sha256": digest}})
+
+
+def test_model_resolution_accepts_byte_identical_checkpoint_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "s1_128_20260801_084232" / "snapshots"
+    run.mkdir(parents=True)
+    best = run / "best.pt"
+    named = run / "best91_5k.pt"
+    best.write_bytes(b"same")
+    named.write_bytes(b"same")
+    import hashlib
+    digest = hashlib.sha256(b"same").hexdigest()
+    records = [_snapshot_record(best, digest), _snapshot_record(named, digest)]
+    records[1] = SnapshotRecord(**{
+        **records[1].__dict__,
+        "checkpoint": "best91_5k.pt",
+        "selector": "fiber3d/s1_128_20260801_084232/best91_5k.pt",
+    })
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: records)
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    assert resolve_model_id(config, {"model": {
+        "sha256": digest, "run": records[0].run, "checkpoint": "best91_5k.pt",
+    }}) == "20260801084232-lasagna"
+
+
+def test_model_resolution_rejects_tampered_atlas_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "run_20260801_084232" / "snapshots" / "best.pt"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_bytes(b"checkpoint")
+    import hashlib
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    record = _snapshot_record(snapshot, digest)
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: [record])
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    base = {
+        "sha256": digest, "run": record.run, "checkpoint": record.checkpoint,
+        "snapshot": f"{record.run}/snapshots/{record.checkpoint}",
+        "architecture": "fiber3d/unet",
+    }
+    assert resolve_model_id(config, {"model": base}) == "20260801084232-lasagna"
+    with pytest.raises(ValueError, match="model.snapshot"):
+        resolve_model_id(config, {"model": {**base, "snapshot": "other/snapshots/best.pt"}})
+    with pytest.raises(ValueError, match="model.architecture"):
+        resolve_model_id(config, {"model": {**base, "architecture": "unet"}})
+
+
 def _completed_run(
     tmp_path: Path, *, license_name: str = "CC BY-NC 4.0",
     artifact_kind: str = "fiber3d-prediction",
 ) -> tuple[ManagerConfig, Path]:
+    torch = pytest.importorskip("torch")
+    snapshot = tmp_path / "runs" / "run_20260806_120000" / "snapshots" / "best.pt"
+    snapshot.parent.mkdir(parents=True)
+    torch.save({
+        "model": {},
+        "config": {"model_3d": {"output_channels": 7}},
+    }, snapshot)
+    import hashlib
+    snapshot_sha256 = hashlib.sha256(snapshot.read_bytes()).hexdigest()
     output = tmp_path / "outputs"
     run = output / "fiber-run"
     bundle = run / "artifacts"
@@ -61,7 +173,13 @@ def _completed_run(
             "requested_group": 2,
             "license": {"name": license_name},
         },
-        "model": {"atlas_model_id": "20260806120000", "task": "lasagna"},
+        "model": {
+            "atlas_model_id": "20260806120000", "task": "lasagna",
+            "architecture": "fiber3d/unet", "run": "run_20260806_120000",
+            "checkpoint": "best.pt",
+            "snapshot": "run_20260806_120000/snapshots/best.pt",
+            "sha256": snapshot_sha256,
+        },
         "artifacts": [
             {"kind": "manifest", "path": "result.lasagna.json"},
             {"kind": "ome-zarr-channel", "path": "presence.ome.zarr"},
@@ -76,17 +194,21 @@ def _completed_run(
             "atlas_ingest": "not_started", "atlas_publication": "not_started",
         },
     })
-    return ManagerConfig(
+    config = ManagerConfig(
         output_dir=str(output), cache_dir=str(tmp_path / "cache"),
         atlas_dir=str(tmp_path / "atlas"), upload_staging_s3="s3://stage/prefix",
-    ), run
+        snapshot_dirs=(str(tmp_path / "runs"),),
+    )
+    return config, run
 
 
 def test_validate_requires_completed_cc_bundle_and_model(tmp_path: Path) -> None:
     config, _run = _completed_run(tmp_path)
+    assert not (Path(config.cache_dir) / "snapshots" / "index.json").exists()
     plan = validate_inference(config, "fiber-run")
     assert plan.prefix == "prefix/inference/run-uuid"
-    assert plan.model_id == "20260806120000"
+    assert plan.model_id == "20260806120000-lasagna"
+    assert not (Path(config.cache_dir) / "snapshots" / "index.json").exists()
     assert any(item["path"] == "presence.ome.zarr/3/.zarray" for item in plan.files)
 
     bad_config, _ = _completed_run(tmp_path / "bad", license_name="private")
@@ -151,7 +273,7 @@ def test_upload_updates_independent_lifecycle_and_calls_ingester(
         (Path(calls[0]["bundle_dir"]) / "inference.json").read_text(encoding="utf-8")
     )
     assert ingested_provenance["artifact_kind"] == artifact_kind
-    assert calls[0]["register_model"] is False
+    assert "register_model" not in calls[0]
     persisted = json.loads((run / "metadata.json").read_text())
     assert persisted["upload"]["bundle_digest"]
 

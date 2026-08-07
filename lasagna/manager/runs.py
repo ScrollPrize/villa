@@ -74,6 +74,20 @@ def _git_revision(root: Path) -> dict[str, Any]:
         return {"revision": None, "dirty": None}
 
 
+def _snapshot_relative_path(config: ManagerConfig, snapshot: SnapshotRecord) -> str:
+    path = Path(snapshot.path).resolve()
+    found = False
+    for root in config.resolved_snapshot_dirs():
+        try:
+            path.relative_to(root.resolve())
+            found = True
+        except ValueError:
+            continue
+    if not found:
+        raise ValueError(f"snapshot is outside configured snapshot_dirs: {path}")
+    return f"{snapshot.run}/snapshots/{snapshot.checkpoint}"
+
+
 def _checkpoint_config(snapshot: SnapshotRecord) -> dict[str, Any]:
     try:
         import torch
@@ -262,6 +276,8 @@ def launch_inference(
     (run_dir / "artifacts").mkdir()
     model_context = asdict(snapshot)
     model_context.pop("path", None)
+    model_context["snapshot"] = _snapshot_relative_path(config, snapshot)
+    model_context["architecture"] = "fiber3d/unet" if snapshot.backend == "fiber3d" else "unet"
     provenance_context = {
         "run_uuid": run_uuid,
         "source": {

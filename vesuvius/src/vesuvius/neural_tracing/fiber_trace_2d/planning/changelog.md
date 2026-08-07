@@ -384,3 +384,11 @@
 
 - Made `inference run --no-prefetch` retain backend on-demand downloads while
   the default prefetch-first workflow continues to disable concurrent fetching.
+
+# 2026-08-07: provenance-driven Atlas model registration
+
+- Added shared direct/managed Fiber and Lasagna inference commit provenance.
+- Replaced manual upload model selection with fresh checkpoint-hash resolution
+  and automatic minimal Atlas model registration.
+- Standardized Fiber Atlas models as `fiber3d/unet` Lasagna models with numeric
+  references, relative snapshot path, and snapshot SHA-256.

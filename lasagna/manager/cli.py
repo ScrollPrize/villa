@@ -122,15 +122,8 @@ def _parser() -> argparse.ArgumentParser:
     open_data_sub = open_data.add_subparsers(dest="open_data_command", required=True)
     validate = open_data_sub.add_parser("validate", help="validate a completed portable bundle")
     validate.add_argument("inference")
-    validate.add_argument("--model-id")
-    validate.add_argument("--register-model", action="store_true")
     upload = open_data_sub.add_parser("upload", help="atomically stage and ingest a portable bundle")
     upload.add_argument("inference")
-    upload.add_argument("--model-id")
-    upload.add_argument(
-        "--register-model", action="store_true",
-        help="register the explicit/checkpoint Atlas model after presenting its metadata",
-    )
     completion = sub.add_parser("completion", help="emit or install shell completion")
     completion.add_argument("completion_action", choices=("bash", "zsh", "install"))
     completion.add_argument("shell", nargs="?", choices=("bash",))
@@ -476,8 +469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "open-data":
             if args.open_data_command == "validate":
                 plan, atlas = validate_atlas_inference(
-                    config, args.inference, model_id=args.model_id,
-                    register_model=args.register_model,
+                    config, args.inference,
                 )
                 print(json.dumps({
                     "run_uuid": plan.provenance["run_uuid"],
@@ -490,8 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }, indent=2, sort_keys=True))
             else:
                 record = upload_inference(
-                    config, args.inference, model_id=args.model_id,
-                    register_model=args.register_model,
+                    config, args.inference,
                 )
                 print(json.dumps({
                     "run_uuid": record["run_uuid"],

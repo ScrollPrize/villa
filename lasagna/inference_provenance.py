@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 from typing import Any, Mapping
 
@@ -23,6 +24,30 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def code_commit(path: str | Path | None = None) -> str | None:
+    """Return the checked-out code commit, or ``None`` outside a Git checkout."""
+    supplied = os.environ.get("VILLA_CODE_COMMIT", "").strip().lower()
+    if supplied:
+        if len(supplied) != 40 or any(character not in "0123456789abcdef" for character in supplied):
+            raise RuntimeError("VILLA_CODE_COMMIT must be a full hexadecimal Git commit")
+        return supplied
+    anchor = Path(path).resolve() if path is not None else Path(__file__).resolve()
+    cwd = anchor if anchor.is_dir() else anchor.parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    commit = result.stdout.strip().lower()
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise RuntimeError(f"git returned an invalid inference code commit: {commit!r}")
+    return commit
 
 
 def json_digest(value: Any) -> str:

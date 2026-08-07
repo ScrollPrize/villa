@@ -40,8 +40,8 @@ _OPTIONS: dict[Command, dict[str, tuple[str, ...] | None]] = {
         "--backend": ("fiber3d", "lasagna"), "--download-workers": (),
         "--no-prefetch": None, "--legacy-config": (),
     },
-    ("open-data", "validate"): {"--model-id": ("@models",), "--register-model": None},
-    ("open-data", "upload"): {"--model-id": ("@models",), "--register-model": None},
+    ("open-data", "validate"): {},
+    ("open-data", "upload"): {},
 }
 
 

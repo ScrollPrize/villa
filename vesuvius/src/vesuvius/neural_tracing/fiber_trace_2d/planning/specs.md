@@ -2618,6 +2618,11 @@
   and a bounded structural artifact inventory. It records failed/interrupted
   status after artifact initialization and never recursively inventories Zarr
   chunks.
+- The shared Fiber/Lasagna inference metadata writer records the checked-out
+  Villa revision as `inference.code_commit`; this applies to direct and managed
+  invocation. Repository dirtiness remains explicit. Packaged deployments may
+  supply the build commit when no Git checkout is present; otherwise the value
+  is null. Git provenance is not copied into Atlas model metadata.
 - The manager passes portable catalog/model/run context through an explicit
   private context file. Fiber inference, not the manager, authors inference
   facts. Private absolute paths, command, hostname/user, logs, and tmux identity
@@ -2635,7 +2640,9 @@
 
 - `las_manager open-data validate/upload` accepts completed portable Fiber and
   Lasagna bundles through one backend-neutral implementation. Both require a
-  trusted explicit Atlas model ID and a CC BY-NC 4.0 source license.
+  CC BY-NC 4.0 source license. Model identity is resolved automatically from a
+  carried ID or a freshly rehashed checkpoint in configured snapshot roots;
+  there is no normal upload-time model-ID argument.
 - Staging identity is the immutable run UUID plus the digest of the complete
   path/size/SHA-256 manifest. `_INCOMPLETE` protects the final prefix; verified
   `upload-manifest.json` is written last and marker removal commits it. Retry
@@ -2643,8 +2650,12 @@
 - Atlas maps both Fiber and Lasagna output to the existing `lasagna` copy-first
   artifact. Canonical identity is volume, canonical model ID, and
   source input level. Only validated provenance enters Atlas metadata.
-- Model registration is explicit, follows Atlas UTC datetime IDs, and rejects
-  wrong-task or conflicting IDs. Filenames never define model identity.
+- Missing models are registered automatically using an Atlas UTC datetime ID.
+  Fiber uses the minimal Lasagna model record with architecture `fiber3d/unet`,
+  task `lasagna`, process `model_training`, snapshot-root-relative checkpoint
+  path, and snapshot SHA-256. Data entries keep numeric model references.
+  Byte-identical checkpoint aliases are normalized; incompatible hashes,
+  metadata, tasks, or canonical-ID collisions are rejected before staging.
 - Public publication remains an operator-controlled Atlas data-sync action.
 
 ## Lasagna manager backend

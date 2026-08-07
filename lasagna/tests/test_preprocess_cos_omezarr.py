@@ -1978,6 +1978,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(provenance["status"], "completed")
 			self.assertEqual(provenance["source_scale"]["source_to_base_factor"], 2)
 			self.assertEqual(provenance["inference"]["tile_size"], 256)
+			self.assertRegex(provenance["inference"]["code_commit"], r"^[0-9a-f]{40}$")
 			self.assertEqual(provenance["product"]["groups"]["cos"]["scaledown"], 2)
 			self.assertEqual(provenance["atlas_model_identity"]["model_id"], "20260806123000")
 			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")

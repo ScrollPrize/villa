@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlparse
 
@@ -16,12 +17,14 @@ except ImportError:  # pragma: no cover - monorepo package import mode.
 
 from .config import ManagerConfig
 from .runs import atomic_json, resolve_run, utc_now
+from .snapshots import SnapshotRecord, index_snapshots
 
 
 SUPPORTED_LICENSE = "CC BY-NC 4.0"
 SUPPORTED_ARTIFACTS = {"fiber3d-prediction", "lasagna"}
 UPLOAD_MANIFEST = "upload-manifest.json"
 INCOMPLETE_MARKER = "_INCOMPLETE"
+_RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
 
 
 class ObjectStore(Protocol):
@@ -117,11 +120,86 @@ def _parse_staging(value: str, run_uuid: str) -> tuple[str, str]:
     return parsed.netloc, prefix
 
 
+def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> SnapshotRecord:
+    expected_hash = str(model.get("sha256") or "").lower()
+    if len(expected_hash) != 64:
+        raise ValueError("inference model.sha256 is required for Atlas model resolution")
+    candidates = [
+        record for record in index_snapshots(config, write_cache=False)
+        if record.sha256.lower() == expected_hash
+    ]
+    verified: list[SnapshotRecord] = []
+    for record in candidates:
+        path = Path(record.path)
+        if path.is_file() and _sha256(path) == expected_hash:
+            verified.append(record)
+    if not verified:
+        raise ValueError("no configured snapshot matches inference model.sha256")
+    normalized = {
+        (record.backend, record.run, record.model_creation_utc)
+        for record in verified
+    }
+    if len(normalized) != 1:
+        raise ValueError("matching snapshot copies have conflicting identity metadata")
+    expected_run = model.get("run")
+    expected_checkpoint = model.get("checkpoint")
+    named = [record for record in verified if not expected_checkpoint or record.checkpoint == str(expected_checkpoint)]
+    if expected_checkpoint and not named:
+        raise ValueError("inference model.checkpoint does not match any byte-identical snapshot copy")
+    chosen = sorted(named or verified, key=lambda record: record.path)[0]
+    if expected_run and str(expected_run) != chosen.run:
+        raise ValueError("inference model.run does not match the hashed snapshot")
+    expected_snapshot = f"{chosen.run}/snapshots/{chosen.checkpoint}"
+    if model.get("snapshot") is not None and str(model["snapshot"]) != expected_snapshot:
+        raise ValueError("inference model.snapshot does not match the hashed snapshot")
+    expected_architecture = "fiber3d/unet" if chosen.backend == "fiber3d" else "unet"
+    if model.get("architecture") is not None and str(model["architecture"]) != expected_architecture:
+        raise ValueError("inference model.architecture does not match the hashed snapshot backend")
+    if chosen.atlas_model_id and model.get("atlas_model_id"):
+        if str(chosen.atlas_model_id)[:14] != str(model["atlas_model_id"])[:14]:
+            raise ValueError("inference Atlas model ID conflicts with trusted snapshot metadata")
+    if chosen.model_creation_utc and model.get("model_creation_utc"):
+        if str(chosen.model_creation_utc) != str(model["model_creation_utc"]):
+            raise ValueError("inference model creation time conflicts with trusted snapshot metadata")
+    return chosen
+
+
+def _canonical_model_id(record: SnapshotRecord, model: dict[str, Any]) -> str:
+    carried = record.atlas_model_id
+    if carried:
+        value = str(carried)
+        if not re.match(r"^\d{14}(?:-|$)", value):
+            raise ValueError(f"invalid checkpoint Atlas model ID: {value!r}")
+        return value if "-" in value else f"{value}-lasagna"
+    creation = record.model_creation_utc
+    if creation:
+        try:
+            from datetime import datetime, timezone
+
+            stamp = datetime.fromisoformat(str(creation).replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"invalid model creation UTC: {creation!r}") from error
+        if stamp.tzinfo is None:
+            raise ValueError("model creation time must include a UTC offset")
+        stamp = stamp.astimezone(timezone.utc)
+        canonical = stamp.strftime("%Y%m%d%H%M%S")
+    else:
+        matches = _RUN_TIMESTAMP.findall(record.run)
+        if len(matches) != 1:
+            raise ValueError("snapshot run must contain exactly one YYYYMMDD_HHMMSS UTC timestamp")
+        canonical = matches[0].replace("_", "")
+    return f"{canonical}-lasagna"
+
+
+def resolve_model_id(config: ManagerConfig, provenance: dict[str, Any]) -> str:
+    model = provenance.get("model") if isinstance(provenance.get("model"), dict) else {}
+    record = _matching_snapshot(config, model)
+    return _canonical_model_id(record, model)
+
+
 def validate_inference(
     config: ManagerConfig,
     selector: str,
-    *,
-    model_id: str | None = None,
 ) -> UploadPlan:
     run_dir, record = resolve_run(config, selector)
     if record.get("status") != "completed" or record.get("lifecycle", {}).get("inference") != "completed":
@@ -139,10 +217,7 @@ def validate_inference(
     license_value = source.get("license") if isinstance(source.get("license"), dict) else {}
     if license_value.get("name") != SUPPORTED_LICENSE:
         raise ValueError(f"publication requires source license {SUPPORTED_LICENSE!r}")
-    model = provenance.get("model") if isinstance(provenance.get("model"), dict) else {}
-    resolved_model = model_id or model.get("atlas_model_id")
-    if not resolved_model:
-        raise ValueError("Atlas model identity is unresolved; pass --model-id or register the model")
+    resolved_model = resolve_model_id(config, provenance)
     bucket, prefix = _parse_staging(config.upload_staging_s3, str(record["run_uuid"]))
     files = _manifest_files(bundle)
     if not files:
@@ -212,13 +287,11 @@ def upload_inference(
     config: ManagerConfig,
     selector: str,
     *,
-    model_id: str | None = None,
-    register_model: bool = False,
     store: ObjectStore | None = None,
     validator: Any | None = None,
     ingester: Any | None = None,
 ) -> dict[str, Any]:
-    plan = validate_inference(config, selector, model_id=model_id)
+    plan = validate_inference(config, selector)
     if validator is None or ingester is None:
         atlas_validator, atlas_ingester = _load_atlas_api(config)
         validator = validator or atlas_validator
@@ -226,7 +299,6 @@ def upload_inference(
     atlas_dir = config.resolved_path("atlas_dir", required=True)
     atlas_preflight = validator(
         atlas_dir=atlas_dir, bundle_dir=plan.bundle_dir, model_id=plan.model_id,
-        register_model=register_model,
     )
     record_path = plan.run_dir / "metadata.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
@@ -250,7 +322,6 @@ def upload_inference(
             bundle_dir=plan.bundle_dir,
             staging_url=staging_url,
             model_id=plan.model_id,
-            register_model=register_model,
         )
         lifecycle["atlas_ingest"] = "completed"
         record["atlas"] = result
@@ -273,16 +344,13 @@ def validate_atlas_inference(
     config: ManagerConfig,
     selector: str,
     *,
-    model_id: str | None = None,
-    register_model: bool = False,
     validator: Any | None = None,
 ) -> tuple[UploadPlan, dict[str, Any]]:
-    plan = validate_inference(config, selector, model_id=model_id)
+    plan = validate_inference(config, selector)
     if validator is None:
         validator, _ingester = _load_atlas_api(config)
     atlas_dir = config.resolved_path("atlas_dir", required=True)
     result = validator(
         atlas_dir=atlas_dir, bundle_dir=plan.bundle_dir, model_id=plan.model_id,
-        register_model=register_model,
     )
     return plan, result

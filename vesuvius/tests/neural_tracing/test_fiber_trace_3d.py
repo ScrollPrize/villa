@@ -3146,6 +3146,8 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
     assert provenance["artifact_kind"] == "fiber3d-prediction"
     assert provenance["source_scale"]["requested_group"] == 0
     assert provenance["inference"]["effective_base_factor"] == 1
+    assert len(provenance["inference"]["code_commit"]) == 40
+    assert set(provenance["inference"]["code_commit"]) <= set("0123456789abcdef")
     assert len(provenance["artifacts"]) == 4
     assert manifest["provenance"] == "inference.json"
     for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:

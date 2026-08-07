@@ -85,7 +85,8 @@ python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
 
 Pass a config JSON as the optional positional argument only for a legacy
 checkpoint without embedded config. Every run writes portable
-`inference.json` next to the output manifest.
+`inference.json` next to the output manifest, including the exact Villa Git
+commit in `inference.code_commit`.
 
 Direct Lasagna checkpoints are listed under `lasagna/...` selectors and use
 the same command shape:

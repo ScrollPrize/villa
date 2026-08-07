@@ -512,6 +512,7 @@ def run_fiber_trace_3d_inference(
         from inference_provenance import (
             atomic_write as write_provenance,
             base_document,
+            code_commit,
             finalize_document,
             json_digest,
             load_context,
@@ -520,6 +521,7 @@ def run_fiber_trace_3d_inference(
         from lasagna.inference_provenance import (
             atomic_write as write_provenance,
             base_document,
+            code_commit,
             finalize_document,
             json_digest,
             load_context,
@@ -556,6 +558,7 @@ def run_fiber_trace_3d_inference(
             "source_to_base_factor": int(input_sd),
         },
         "inference": {
+            "code_commit": code_commit(Path(__file__)),
             "scaledown_power": power,
             "scaledown_factor_from_input": output_sd_input,
             "effective_base_factor": effective_output_sd,

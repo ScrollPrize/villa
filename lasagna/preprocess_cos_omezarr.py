@@ -2882,6 +2882,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		from inference_provenance import (
 			atomic_write as write_provenance,
 			base_document,
+			code_commit,
 			finalize_document,
 			load_context,
 			sha256_file,
@@ -2890,6 +2891,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		from lasagna.inference_provenance import (
 			atomic_write as write_provenance,
 			base_document,
+			code_commit,
 			finalize_document,
 			load_context,
 			sha256_file,
@@ -2912,6 +2914,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			"precision": checkpoint_meta.get("precision"),
 		},
 		"inference": {
+			"code_commit": code_commit(Path(__file__)),
 			"cos_scaledown_factor_from_input": int(args.cos_scaledown),
 			"normal_scaledown_factor_from_input": int(args.scaledown),
 			"crop_xyzwhd_base": list(args.crop_xyzwhd) if args.crop_xyzwhd else None,

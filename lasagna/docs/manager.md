@@ -256,14 +256,25 @@ upload_staging_s3 = "s3://private-staging/my-inferences"
 Validate or upload a completed Fiber or Lasagna run:
 
 ```bash
-las_manager open-data validate <run> --model-id 20260806120000
-las_manager open-data upload <run> --model-id 20260806120000
+las_manager open-data validate <run>
+las_manager open-data upload <run>
 ```
 
-The model ID must come from trusted checkpoint provenance or `--model-id`; it
-is never inferred from a filename. `--register-model` explicitly creates a
-normal Atlas model from carried checkpoint metadata. Conflicting IDs and wrong
-model tasks are rejected.
+The manager resolves model identity from the inference checkpoint SHA-256 and
+configured `snapshot_dirs`, freshly rehashing candidates before use. A carried
+numeric Atlas ID is honored; otherwise the actual run's single UTC timestamp
+defines the ID. Byte-identical checkpoint aliases are normalized, while hash,
+run, checkpoint, timestamp, and Atlas collisions fail before staging. Missing
+models are registered automatically.
+
+The registered model follows the existing minimal Lasagna convention: numeric
+data references, `architecture = "fiber3d/unet"`, `task = "lasagna"`,
+`creation.process = "model_training"`, the checkpoint path relative to a
+configured snapshot root, and `snapshot_sha256`. The checked-out Villa source
+commit is recorded only in portable `inference.code_commit`, not in Atlas model
+metadata; `repository.dirty` reports local modifications. Packaged deployments
+outside a Git checkout may supply `VILLA_CODE_COMMIT` and otherwise record
+`null`.
 
 Upload hashes files while reading them, writes `_INCOMPLETE` at the final
 run-UUID prefix, uploads the bundle, writes and verifies

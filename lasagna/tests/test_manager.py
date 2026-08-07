@@ -582,6 +582,8 @@ def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
     assert context["run_uuid"] == metadata["run_uuid"]
     assert context["source"]["requested_group"] == 2
     assert "path" not in context["model"]
+    assert context["model"]["snapshot"] == "run one/snapshots/best model.pt"
+    assert context["model"]["architecture"] == "fiber3d/unet"
     assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
     assert run_dir.name.startswith(f"{volume.sample_id}-{volume.volume_id}-las-sd2-")
     assert snapshot.run not in run_dir.name

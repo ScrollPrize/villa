@@ -7,7 +7,18 @@ import sys
 
 import pytest
 
-from lasagna.inference_provenance import base_document, finalize_document, validate_portable_bundle
+from lasagna.inference_provenance import code_commit, base_document, finalize_document, validate_portable_bundle
+
+
+def test_code_commit_is_full_git_hash() -> None:
+    value = code_commit(Path(__file__))
+    assert len(value) == 40
+    assert set(value) <= set("0123456789abcdef")
+
+
+def test_code_commit_accepts_packaged_build_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VILLA_CODE_COMMIT", "a" * 40)
+    assert code_commit(Path("/outside/checkout")) == "a" * 40
 
 
 def test_portable_provenance_is_redacted_and_structural(tmp_path: Path) -> None:
