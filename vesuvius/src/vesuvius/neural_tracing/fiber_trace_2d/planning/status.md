@@ -9,4 +9,4 @@
 - [x] Implement lean Lasagna data-entry ingestion in Atlas.
 - [x] Update tests, specs, docs, and changelog.
 - [x] Validate and perform one-off local existing-state cleanup; user owns remote deletion.
-- [ ] Run focused validation and commit Villa and Atlas changes separately.
+- [x] Run focused validation and commit Villa and Atlas changes separately.

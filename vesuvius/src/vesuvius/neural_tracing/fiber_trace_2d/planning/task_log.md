@@ -51,3 +51,5 @@
   the abandoned `fiber3d-prediction`/`creation_info` entry. It was removed as
   duplicate of the authoritative Atlas adapter tests, and the failed-transfer
   test was strengthened to exercise the bulk rclone path.
+- Source commits: Villa `ef09251e7` (marker-only staging) and Atlas `75a407e`
+  (lean entries plus the already registered model and two inference origins).
