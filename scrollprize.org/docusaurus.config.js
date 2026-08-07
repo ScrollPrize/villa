@@ -240,6 +240,7 @@ const config = {
               label: "Donate",
               position: "left",
             },
+            { to: "/press", label: "Press", position: "left" },
             {
               href: "https://discord.gg/V4fJhvtaQn",
               label: "Join Discord",
@@ -286,10 +287,6 @@ const config = {
                 {
                   label: "Jobs",
                   to: "/jobs",
-                },
-                {
-                  label: "Press",
-                  to: "/press",
                 },
               ],
             },
