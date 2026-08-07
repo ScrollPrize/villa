@@ -2657,6 +2657,400 @@ class FitContext:
             rebuilt_unverified_probabilities
         self.unverified_patch_atlas = rebuilt_unverified_atlas
 
+    def step(self, iteration):
+        self.step_timer.start('fwd')
+        flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
+
+        # The tiny graph paths shared by every transform evaluation this
+        # iteration (dr softplus, scaled linear logits, pinned gap logits) are
+        # cut at detached leaves. Each loss family's backward then owns its
+        # whole graph, so autograd can free the family's buffers as the
+        # backward pass consumes them instead of retaining the full graph
+        # (retain_graph) until the family is released. The leaf gradients
+        # accumulated across families flow through the real shared paths once,
+        # next to the flow-field gradient flush below.
+        shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
+        shared_transform_leaves = tuple(
+            output.detach().requires_grad_(True) for output in shared_transform_outputs)
+        self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
+            shared=shared_transform_leaves)
+        self.dr_per_winding = shared_transform_leaves[0]
+
+        losses = {}
+        log_metrics = {
+            'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
+        }
+
+        def backward_family(weighted_losses):
+            """Accumulate one loss family's gradients, then release its graph."""
+            family_loss = sum(weighted_losses.values())
+            if family_loss.requires_grad:
+                self.step_timer.stop('fwd')
+                self.step_timer.start('bwd')
+                # The paths shared with later families end at detached leaves
+                # (shared_transform_leaves and the flow fields' internal
+                # accumulators), so this family's graph is self-contained and
+                # its buffers are freed as the backward pass consumes them.
+                family_loss.backward()
+                self.step_timer.stop('bwd')
+                self.step_timer.start('fwd')
+            for name, value in weighted_losses.items():
+                losses[name] = value.detach()
+
+        interactive_dt_suppressed = (
+            self.interactive_dt_resume_iteration is not None
+            and iteration < self.interactive_dt_resume_iteration
+        )
+        log_metrics['interactive_dt_suppressed'] = float(interactive_dt_suppressed)
+
+        compute_patch_dt = not interactive_dt_suppressed and iteration > cfg['loss_start_patch_dt']
+        track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
+        compute_track_dt = not interactive_dt_suppressed and iteration > track_dt_start
+        unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
+        compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
+
+        # Progressive-outward DT gating: winding cutoff that grows from the
+        # respective DT start step. None means no gating.
+        dt_progressive_outer = self.shell_outer_winding_idx
+        patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
+        track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
+        unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
+        if patch_dt_max_winding is not None:
+            log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
+        if track_dt_max_winding is not None:
+            log_metrics['track_dt_max_winding'] = track_dt_max_winding
+
+        patch_dt_target_cache = None
+        unverified_patch_dt_target_cache = None
+        unattached_pcl_dt_target_cache = None
+        track_dt_target_cache = None
+        if self.dt_target_whole_object:
+            if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
+                patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
+                    self.slice_to_spiral_transform, self.dr_per_winding,
+                    self.verified_patches_list, self.patch_atlas, cfg['dt_target_floating_threshold'],
+                ))
+            if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
+                unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
+                    self.slice_to_spiral_transform, self.dr_per_winding,
+                    self.unverified_patches_list, self.unverified_patch_atlas, cfg['dt_target_floating_threshold'],
+                ))
+            if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
+                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
+                if pcl_flat is not None:
+                    unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
+                        self.slice_to_spiral_transform, self.dr_per_winding,
+                        pcl_flat['zyxs'], pcl_flat['starts'],
+                        windings=pcl_flat['windings'],
+                        floating_threshold=cfg['dt_target_floating_threshold'],
+                        num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
+                        max_stride=cfg['dt_target_max_stride'],
+                        max_total_points=20_000_000,
+                    ))
+            if compute_track_dt and cfg['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
+                track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
+                    self.slice_to_spiral_transform, self.dr_per_winding,
+                    self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
+                    windings=None,
+                    floating_threshold=cfg['dt_target_floating_threshold'],
+                    num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
+                    max_stride=cfg['dt_target_max_stride'],
+                    max_total_points=20_000_000,
+                ))
+
+        patch_loss_values = get_patch_and_umbilicus_losses(
+            self.slice_to_spiral_transform,
+            self.dr_per_winding,
+            cfg['sample_count_patches_per_step'],
+            cfg['sample_count_patches_per_step_for_dt'],
+            self.verified_patches_list,
+            self.patch_atlas,
+            self.patch_sampling_probabilities,
+            self.umbilicus_zyx,
+            compute_dt=compute_patch_dt,
+            shell_valid_zyxs=self.shell_valid_zyxs_gpu,
+            shell_outer_winding_idx=self.shell_outer_winding_idx,
+            dt_max_winding=patch_dt_max_winding,
+            dt_target_cache=patch_dt_target_cache,
+        )
+        patch_family = {
+            'patch_radius': patch_loss_values[0] * cfg['loss_weight_patch_radius'],
+            'patch_dt': patch_loss_values[2] * cfg['loss_weight_patch_dt'],
+            'umbilicus': patch_loss_values[1] * cfg['loss_weight_umbilicus'],
+        }
+        if self.shell_valid_zyxs_gpu is not None:
+            patch_family['shell_patch_radius'] = patch_loss_values[3] * cfg['loss_weight_shell_patch_radius']
+        backward_family(patch_family)
+        del patch_family, patch_loss_values
+
+        if self.unverified_patch_atlas is not None and (
+            cfg['loss_weight_unverified_patch_radius'] > 0
+            or cfg['loss_weight_unverified_patch_dt'] > 0
+        ):
+            unverified_loss_values = get_unverified_patch_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                cfg['sample_count_unverified_patches_per_step'],
+                cfg['sample_count_unverified_patches_per_step_for_dt'],
+                self.unverified_patches_list,
+                self.unverified_patch_atlas,
+                self.unverified_patch_sampling_probabilities,
+                compute_dt=compute_unverified_patch_dt,
+                dt_max_winding=unverified_patch_dt_max_winding,
+                dt_target_cache=unverified_patch_dt_target_cache,
+            )
+            backward_family({
+                'unverified_patch_radius': unverified_loss_values[0] * cfg['loss_weight_unverified_patch_radius'],
+                'unverified_patch_dt': unverified_loss_values[1] * cfg['loss_weight_unverified_patch_dt'],
+            })
+            del unverified_loss_values
+
+        if cfg['loss_weight_sym_dirichlet'] > 0:
+            backward_family({
+                'sym_dirichlet': get_symmetric_dirichlet_loss(
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.shell_outer_winding_idx,
+                    cfg['sample_count_regularisation_points'],
+                ) * cfg['loss_weight_sym_dirichlet'],
+            })
+
+        if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+            backward_family({
+                'rel_winding': get_patch_rel_winding_loss(
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.verified_patches,
+                    self.patch_atlas,
+                    self.cross_patch_pcls,
+                    self.pcl_sampling_strata['cross_patch'],
+                ) * cfg['loss_weight_rel_winding'],
+            })
+
+        if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+            backward_family({
+                'abs_winding': get_patch_abs_winding_loss(
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.verified_patches,
+                    self.patch_atlas,
+                    self.cross_patch_pcls,
+                ) * cfg['loss_weight_abs_winding'],
+            })
+
+        if (
+            (cfg['loss_weight_dense_normals'] > 0 or self.grad_mag_spacing_enabled)
+            and self.lasagna_volume is not None
+        ):
+            for dense_loss_name, dense_loss_value in iter_lasagna_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                self.lasagna_volume,
+                self.shell_outer_winding_idx,
+                cfg['sample_count_dense_normal_points'],
+                compute_spacing=self.grad_mag_spacing_enabled,
+            ):
+                weight = (
+                    cfg['loss_weight_dense_normals']
+                    if dense_loss_name == 'dense_normals'
+                    else cfg['loss_weight_dense_spacing']
+                )
+                backward_family({dense_loss_name: dense_loss_value * weight})
+                # Release before the generator builds the next loss's graph,
+                # or both large transform graphs are resident at peak.
+                del dense_loss_value
+            if self.lasagna_volume.get('backend') == 'sparse_cuda':
+                log_metrics.update({
+                    f'lasagna_{name}': value
+                    for name, value in self.lasagna_volume['store'].last_timings.items()
+                })
+
+        self._warn_if_sdt_loss_inactive()
+        self._warn_if_dense_losses_structurally_disabled()
+        phase_components_active = self._phase_mode_active()
+        min_spacing_active = cfg['loss_weight_min_spacing'] > 0
+        if phase_components_active or min_spacing_active:
+            # SDT-backed phase components require phase mode; the native
+            # min-spacing barrier does not. Weights are re-read every step so
+            # the barrier can be enabled at a Run boundary in either mode.
+            attachment_ramp = (
+                get_dense_attachment_ramp(iteration)
+                if phase_components_active else 0.0)
+            if phase_components_active:
+                log_metrics['dense_attachment_ramp'] = attachment_ramp
+            component_weights = phase_bundle_component_weights(
+                cfg, attachment_ramp)
+            # Components tagged '_shared_graph' (count, phase, shared-batch
+            # density) backpropagate through one central-ray graph; summing
+            # them into a single backward traverses that graph once instead
+            # of once per component. Untagged components (density supplement
+            # chunks, min_spacing, attachment) keep their own backward so at
+            # most one supplement-chunk graph is resident at a time.
+            pending_shared = {}
+            for component_name, component_loss, component_metrics in \
+                    iter_phase_bundle_losses(
+                        self.spiral_and_transform,
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
+                        self.sdt_volume,
+                        self.lasagna_volume,
+                        self.shell_outer_winding_idx,
+                        cfg,
+                        z_begin,
+                        z_end,
+                        attachment_ramp=attachment_ramp,
+                    ):
+                weighted = (
+                    component_loss * component_weights[component_name])
+                if component_metrics.pop('_shared_graph', False):
+                    pending_shared[component_name] = weighted
+                else:
+                    if pending_shared:
+                        backward_family(pending_shared)
+                        pending_shared = {}
+                    backward_family({component_name: weighted})
+                # Release before the generator builds the next component's
+                # graph, or several large graphs are resident at peak.
+                del component_loss, weighted
+                log_metrics.update(component_metrics)
+            if pending_shared:
+                backward_family(pending_shared)
+            del pending_shared
+            if (phase_components_active
+                    and self.lasagna_volume['backend'] == 'sparse_cuda'):
+                log_metrics.update({
+                    f'dense_spacing_phase_normal_{name}': value
+                    for name, value in self.lasagna_volume['store'].last_timings.items()
+                })
+            if phase_components_active and self.sdt_volume['backend'] == 'sparse_cuda':
+                log_metrics.update({
+                    f'dense_spacing_phase_sdt_store_{name}': value
+                    for name, value in self.sdt_volume['store'].last_timings.items()
+                })
+
+        if (
+            (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
+            and self.unattached_pcl_strips
+        ):
+            unattached_loss_values = get_unattached_pcl_strip_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                self.unattached_pcl_strips,
+                self.pcl_sampling_strata['unattached'],
+                get_or_build_unattached_pcl_flat,
+                cfg['sample_count_unattached_pcls_per_step'],
+                cfg['sample_count_unattached_pcl_points_per_step'],
+                compute_dt=compute_patch_dt,
+                dt_max_winding=patch_dt_max_winding,
+                dt_target_cache=unattached_pcl_dt_target_cache,
+            )
+            backward_family({
+                'unattached_pcl_radius': unattached_loss_values[0] * cfg['loss_weight_unattached_pcl_radius'],
+                'unattached_pcl_dt': unattached_loss_values[1] * cfg['loss_weight_unattached_pcl_dt'],
+            })
+            del unattached_loss_values
+
+        if self.prepared_main_tracks is not None:
+            for track_loss_name, track_loss_value in iter_track_losses(
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                self.prepared_main_tracks,
+                cfg,
+                compute_dt=compute_track_dt,
+                dt_max_winding=track_dt_max_winding,
+                dt_target_cache=track_dt_target_cache,
+            ):
+                weight = (
+                    cfg['loss_weight_track_radius']
+                    if track_loss_name == 'track_radius'
+                    else cfg['loss_weight_track_dt']
+                )
+                backward_family({track_loss_name: track_loss_value * weight})
+                # Release before the generator builds the next loss's graph,
+                # or both large transform graphs are resident at peak.
+                del track_loss_value
+
+        shell_metrics = {}
+        if self.shell_map is not None:
+            shell_outer_loss, shell_metrics = get_shell_outer_loss(
+                self.shell_map,
+                self.slice_to_spiral_transform,
+                self.dr_per_winding,
+                self.shell_outer_winding_idx,
+            )
+            backward_family({
+                'shell_outer': shell_outer_loss * cfg['loss_weight_shell_outer'],
+            })
+            del shell_outer_loss
+
+        if (self.influence_state is not None and self.influence_state.active
+                and self.interactive_influence_loss_weight > 0):
+            backward_family({
+                'anchor': self.influence_state.get_anchor_loss(
+                    self.slice_to_spiral_transform,
+                    self.dr_per_winding,
+                    self.interactive_influence_anchor_samples,
+                ) * self.interactive_influence_loss_weight,
+            })
+
+        loss = sum(losses.values())
+
+        self.step_timer.stop('fwd')
+        self.step_timer.start('bwd')
+        # Flush every stage's sparse-accumulated field gradient into its parameters.
+        for flow_field in self.spiral_and_transform.flow_fields:
+            apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
+            if apply_accumulated_field_grad is not None:
+                apply_accumulated_field_grad()
+        # Propagate the leaf gradients the family backwards accumulated on the
+        # shared transform paths through the real parameters, exactly once.
+        shared_transform_pending = [
+            (output, leaf.grad)
+            for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
+            if output.requires_grad and leaf.grad is not None
+        ]
+        if shared_transform_pending:
+            torch.autograd.backward(
+                [output for output, _ in shared_transform_pending],
+                [grad for _, grad in shared_transform_pending],
+            )
+        self.step_timer.stop('bwd')
+        self.step_timer.start('comm')
+        allreduce_grads_(self.dist_grad_params)
+        self.step_timer.stop('comm')
+
+        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
+        for name, p in self.dist_grad_named:
+            if p.grad is not None:
+                # aminmax propagates NaN and surfaces +/-inf through two scalar
+                # reductions, avoiding the gradient-sized boolean temporaries
+                # that (~torch.isfinite(grad)).any() allocates per parameter.
+                grad_min, grad_max = torch.aminmax(p.grad)
+                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
+                step_had_nonfinite |= param_nonfinite
+                self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
+
+        if self.influence_state is not None and self.influence_state.active:
+            # After the all-reduce and the accumulated-field-grad handoff, so
+            # every rank masks identical averaged gradients on both flow paths.
+            self.influence_state.apply_grad_masks_(self.spiral_and_transform)
+
+        self.step_timer.start('opt')
+        self.optimiser.step()
+        self.step_timer.stop('opt')
+        if self.influence_state is not None and self.influence_state.active:
+            self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
+        self.optimiser.zero_grad(set_to_none=True)
+        self.lr_scheduler.step()
+        self.step_timer.tick()
+        self.step_timer.maybe_report(iteration)
+        if self.profiler is not None:
+            self.profiler.step()
+
+        return loss, losses, log_metrics, shell_metrics
+
     def run(self):
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
@@ -2712,396 +3106,7 @@ class FitContext:
                 disable=not is_main_process() or has_progress):
             if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
                 break
-            self.step_timer.start('fwd')
-            flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
-
-            # The tiny graph paths shared by every transform evaluation this
-            # iteration (dr softplus, scaled linear logits, pinned gap logits) are
-            # cut at detached leaves. Each loss family's backward then owns its
-            # whole graph, so autograd can free the family's buffers as the
-            # backward pass consumes them instead of retaining the full graph
-            # (retain_graph) until the family is released. The leaf gradients
-            # accumulated across families flow through the real shared paths once,
-            # next to the flow-field gradient flush below.
-            shared_transform_outputs = self.spiral_and_transform.get_shared_transform_tensors()
-            shared_transform_leaves = tuple(
-                output.detach().requires_grad_(True) for output in shared_transform_outputs)
-            self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
-                shared=shared_transform_leaves)
-            self.dr_per_winding = shared_transform_leaves[0]
-
-            losses = {}
-            log_metrics = {
-                'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
-            }
-
-            def backward_family(weighted_losses):
-                """Accumulate one loss family's gradients, then release its graph."""
-                family_loss = sum(weighted_losses.values())
-                if family_loss.requires_grad:
-                    self.step_timer.stop('fwd')
-                    self.step_timer.start('bwd')
-                    # The paths shared with later families end at detached leaves
-                    # (shared_transform_leaves and the flow fields' internal
-                    # accumulators), so this family's graph is self-contained and
-                    # its buffers are freed as the backward pass consumes them.
-                    family_loss.backward()
-                    self.step_timer.stop('bwd')
-                    self.step_timer.start('fwd')
-                for name, value in weighted_losses.items():
-                    losses[name] = value.detach()
-
-            interactive_dt_suppressed = (
-                self.interactive_dt_resume_iteration is not None
-                and iteration < self.interactive_dt_resume_iteration
-            )
-            log_metrics['interactive_dt_suppressed'] = float(interactive_dt_suppressed)
-
-            compute_patch_dt = not interactive_dt_suppressed and iteration > cfg['loss_start_patch_dt']
-            track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
-            compute_track_dt = not interactive_dt_suppressed and iteration > track_dt_start
-            unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
-            compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
-
-            # Progressive-outward DT gating: winding cutoff that grows from the
-            # respective DT start step. None means no gating.
-            dt_progressive_outer = self.shell_outer_winding_idx
-            patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
-            track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
-            unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
-            if patch_dt_max_winding is not None:
-                log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
-            if track_dt_max_winding is not None:
-                log_metrics['track_dt_max_winding'] = track_dt_max_winding
-
-            patch_dt_target_cache = None
-            unverified_patch_dt_target_cache = None
-            unattached_pcl_dt_target_cache = None
-            track_dt_target_cache = None
-            if self.dt_target_whole_object:
-                if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
-                    patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
-                        self.slice_to_spiral_transform, self.dr_per_winding,
-                        self.verified_patches_list, self.patch_atlas, cfg['dt_target_floating_threshold'],
-                    ))
-                if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
-                    unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
-                        self.slice_to_spiral_transform, self.dr_per_winding,
-                        self.unverified_patches_list, self.unverified_patch_atlas, cfg['dt_target_floating_threshold'],
-                    ))
-                if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
-                    pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
-                    if pcl_flat is not None:
-                        unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
-                            self.slice_to_spiral_transform, self.dr_per_winding,
-                            pcl_flat['zyxs'], pcl_flat['starts'],
-                            windings=pcl_flat['windings'],
-                            floating_threshold=cfg['dt_target_floating_threshold'],
-                            num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
-                            max_stride=cfg['dt_target_max_stride'],
-                            max_total_points=20_000_000,
-                        ))
-                if compute_track_dt and cfg['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
-                    track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
-                        self.slice_to_spiral_transform, self.dr_per_winding,
-                        self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
-                        windings=None,
-                        floating_threshold=cfg['dt_target_floating_threshold'],
-                        num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
-                        max_stride=cfg['dt_target_max_stride'],
-                        max_total_points=20_000_000,
-                    ))
-
-            patch_loss_values = get_patch_and_umbilicus_losses(
-                self.slice_to_spiral_transform,
-                self.dr_per_winding,
-                cfg['sample_count_patches_per_step'],
-                cfg['sample_count_patches_per_step_for_dt'],
-                self.verified_patches_list,
-                self.patch_atlas,
-                self.patch_sampling_probabilities,
-                self.umbilicus_zyx,
-                compute_dt=compute_patch_dt,
-                shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-                shell_outer_winding_idx=self.shell_outer_winding_idx,
-                dt_max_winding=patch_dt_max_winding,
-                dt_target_cache=patch_dt_target_cache,
-            )
-            patch_family = {
-                'patch_radius': patch_loss_values[0] * cfg['loss_weight_patch_radius'],
-                'patch_dt': patch_loss_values[2] * cfg['loss_weight_patch_dt'],
-                'umbilicus': patch_loss_values[1] * cfg['loss_weight_umbilicus'],
-            }
-            if self.shell_valid_zyxs_gpu is not None:
-                patch_family['shell_patch_radius'] = patch_loss_values[3] * cfg['loss_weight_shell_patch_radius']
-            backward_family(patch_family)
-            del patch_family, patch_loss_values
-
-            if self.unverified_patch_atlas is not None and (
-                cfg['loss_weight_unverified_patch_radius'] > 0
-                or cfg['loss_weight_unverified_patch_dt'] > 0
-            ):
-                unverified_loss_values = get_unverified_patch_losses(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    cfg['sample_count_unverified_patches_per_step'],
-                    cfg['sample_count_unverified_patches_per_step_for_dt'],
-                    self.unverified_patches_list,
-                    self.unverified_patch_atlas,
-                    self.unverified_patch_sampling_probabilities,
-                    compute_dt=compute_unverified_patch_dt,
-                    dt_max_winding=unverified_patch_dt_max_winding,
-                    dt_target_cache=unverified_patch_dt_target_cache,
-                )
-                backward_family({
-                    'unverified_patch_radius': unverified_loss_values[0] * cfg['loss_weight_unverified_patch_radius'],
-                    'unverified_patch_dt': unverified_loss_values[1] * cfg['loss_weight_unverified_patch_dt'],
-                })
-                del unverified_loss_values
-
-            if cfg['loss_weight_sym_dirichlet'] > 0:
-                backward_family({
-                    'sym_dirichlet': get_symmetric_dirichlet_loss(
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.shell_outer_winding_idx,
-                        cfg['sample_count_regularisation_points'],
-                    ) * cfg['loss_weight_sym_dirichlet'],
-                })
-
-            if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
-                backward_family({
-                    'rel_winding': get_patch_rel_winding_loss(
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.verified_patches,
-                        self.patch_atlas,
-                        self.cross_patch_pcls,
-                        self.pcl_sampling_strata['cross_patch'],
-                    ) * cfg['loss_weight_rel_winding'],
-                })
-
-            if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
-                backward_family({
-                    'abs_winding': get_patch_abs_winding_loss(
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.verified_patches,
-                        self.patch_atlas,
-                        self.cross_patch_pcls,
-                    ) * cfg['loss_weight_abs_winding'],
-                })
-
-            if (
-                (cfg['loss_weight_dense_normals'] > 0 or self.grad_mag_spacing_enabled)
-                and self.lasagna_volume is not None
-            ):
-                for dense_loss_name, dense_loss_value in iter_lasagna_losses(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.lasagna_volume,
-                    self.shell_outer_winding_idx,
-                    cfg['sample_count_dense_normal_points'],
-                    compute_spacing=self.grad_mag_spacing_enabled,
-                ):
-                    weight = (
-                        cfg['loss_weight_dense_normals']
-                        if dense_loss_name == 'dense_normals'
-                        else cfg['loss_weight_dense_spacing']
-                    )
-                    backward_family({dense_loss_name: dense_loss_value * weight})
-                    # Release before the generator builds the next loss's graph,
-                    # or both large transform graphs are resident at peak.
-                    del dense_loss_value
-                if self.lasagna_volume.get('backend') == 'sparse_cuda':
-                    log_metrics.update({
-                        f'lasagna_{name}': value
-                        for name, value in self.lasagna_volume['store'].last_timings.items()
-                    })
-
-            self._warn_if_sdt_loss_inactive()
-            self._warn_if_dense_losses_structurally_disabled()
-            phase_components_active = self._phase_mode_active()
-            min_spacing_active = cfg['loss_weight_min_spacing'] > 0
-            if phase_components_active or min_spacing_active:
-                # SDT-backed phase components require phase mode; the native
-                # min-spacing barrier does not. Weights are re-read every step so
-                # the barrier can be enabled at a Run boundary in either mode.
-                attachment_ramp = (
-                    get_dense_attachment_ramp(iteration)
-                    if phase_components_active else 0.0)
-                if phase_components_active:
-                    log_metrics['dense_attachment_ramp'] = attachment_ramp
-                component_weights = phase_bundle_component_weights(
-                    cfg, attachment_ramp)
-                # Components tagged '_shared_graph' (count, phase, shared-batch
-                # density) backpropagate through one central-ray graph; summing
-                # them into a single backward traverses that graph once instead
-                # of once per component. Untagged components (density supplement
-                # chunks, min_spacing, attachment) keep their own backward so at
-                # most one supplement-chunk graph is resident at a time.
-                pending_shared = {}
-                for component_name, component_loss, component_metrics in \
-                        iter_phase_bundle_losses(
-                            self.spiral_and_transform,
-                            self.slice_to_spiral_transform,
-                            self.dr_per_winding,
-                            self.sdt_volume,
-                            self.lasagna_volume,
-                            self.shell_outer_winding_idx,
-                            cfg,
-                            z_begin,
-                            z_end,
-                            attachment_ramp=attachment_ramp,
-                        ):
-                    weighted = (
-                        component_loss * component_weights[component_name])
-                    if component_metrics.pop('_shared_graph', False):
-                        pending_shared[component_name] = weighted
-                    else:
-                        if pending_shared:
-                            backward_family(pending_shared)
-                            pending_shared = {}
-                        backward_family({component_name: weighted})
-                    # Release before the generator builds the next component's
-                    # graph, or several large graphs are resident at peak.
-                    del component_loss, weighted
-                    log_metrics.update(component_metrics)
-                if pending_shared:
-                    backward_family(pending_shared)
-                del pending_shared
-                if (phase_components_active
-                        and self.lasagna_volume['backend'] == 'sparse_cuda'):
-                    log_metrics.update({
-                        f'dense_spacing_phase_normal_{name}': value
-                        for name, value in self.lasagna_volume['store'].last_timings.items()
-                    })
-                if phase_components_active and self.sdt_volume['backend'] == 'sparse_cuda':
-                    log_metrics.update({
-                        f'dense_spacing_phase_sdt_store_{name}': value
-                        for name, value in self.sdt_volume['store'].last_timings.items()
-                    })
-
-            if (
-                (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
-                and self.unattached_pcl_strips
-            ):
-                unattached_loss_values = get_unattached_pcl_strip_losses(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.unattached_pcl_strips,
-                    self.pcl_sampling_strata['unattached'],
-                    get_or_build_unattached_pcl_flat,
-                    cfg['sample_count_unattached_pcls_per_step'],
-                    cfg['sample_count_unattached_pcl_points_per_step'],
-                    compute_dt=compute_patch_dt,
-                    dt_max_winding=patch_dt_max_winding,
-                    dt_target_cache=unattached_pcl_dt_target_cache,
-                )
-                backward_family({
-                    'unattached_pcl_radius': unattached_loss_values[0] * cfg['loss_weight_unattached_pcl_radius'],
-                    'unattached_pcl_dt': unattached_loss_values[1] * cfg['loss_weight_unattached_pcl_dt'],
-                })
-                del unattached_loss_values
-
-            if self.prepared_main_tracks is not None:
-                for track_loss_name, track_loss_value in iter_track_losses(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.prepared_main_tracks,
-                    cfg,
-                    compute_dt=compute_track_dt,
-                    dt_max_winding=track_dt_max_winding,
-                    dt_target_cache=track_dt_target_cache,
-                ):
-                    weight = (
-                        cfg['loss_weight_track_radius']
-                        if track_loss_name == 'track_radius'
-                        else cfg['loss_weight_track_dt']
-                    )
-                    backward_family({track_loss_name: track_loss_value * weight})
-                    # Release before the generator builds the next loss's graph,
-                    # or both large transform graphs are resident at peak.
-                    del track_loss_value
-
-            shell_metrics = {}
-            if self.shell_map is not None:
-                shell_outer_loss, shell_metrics = get_shell_outer_loss(
-                    self.shell_map,
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.shell_outer_winding_idx,
-                )
-                backward_family({
-                    'shell_outer': shell_outer_loss * cfg['loss_weight_shell_outer'],
-                })
-                del shell_outer_loss
-
-            if (self.influence_state is not None and self.influence_state.active
-                    and self.interactive_influence_loss_weight > 0):
-                backward_family({
-                    'anchor': self.influence_state.get_anchor_loss(
-                        self.slice_to_spiral_transform,
-                        self.dr_per_winding,
-                        self.interactive_influence_anchor_samples,
-                    ) * self.interactive_influence_loss_weight,
-                })
-
-            loss = sum(losses.values())
-
-            self.step_timer.stop('fwd')
-            self.step_timer.start('bwd')
-            # Flush every stage's sparse-accumulated field gradient into its parameters.
-            for flow_field in self.spiral_and_transform.flow_fields:
-                apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
-                if apply_accumulated_field_grad is not None:
-                    apply_accumulated_field_grad()
-            # Propagate the leaf gradients the family backwards accumulated on the
-            # shared transform paths through the real parameters, exactly once.
-            shared_transform_pending = [
-                (output, leaf.grad)
-                for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
-                if output.requires_grad and leaf.grad is not None
-            ]
-            if shared_transform_pending:
-                torch.autograd.backward(
-                    [output for output, _ in shared_transform_pending],
-                    [grad for _, grad in shared_transform_pending],
-                )
-            self.step_timer.stop('bwd')
-            self.step_timer.start('comm')
-            allreduce_grads_(self.dist_grad_params)
-            self.step_timer.stop('comm')
-
-            step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
-            for name, p in self.dist_grad_named:
-                if p.grad is not None:
-                    # aminmax propagates NaN and surfaces +/-inf through two scalar
-                    # reductions, avoiding the gradient-sized boolean temporaries
-                    # that (~torch.isfinite(grad)).any() allocates per parameter.
-                    grad_min, grad_max = torch.aminmax(p.grad)
-                    param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
-                    step_had_nonfinite |= param_nonfinite
-                    self.nonfinite_grad_by_param[name] += param_nonfinite.to(self.nonfinite_grad_steps.dtype)
-                    torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-            self.nonfinite_grad_steps += step_had_nonfinite.to(self.nonfinite_grad_steps.dtype)
-
-            if self.influence_state is not None and self.influence_state.active:
-                # After the all-reduce and the accumulated-field-grad handoff, so
-                # every rank masks identical averaged gradients on both flow paths.
-                self.influence_state.apply_grad_masks_(self.spiral_and_transform)
-
-            self.step_timer.start('opt')
-            self.optimiser.step()
-            self.step_timer.stop('opt')
-            if self.influence_state is not None and self.influence_state.active:
-                self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
-            self.optimiser.zero_grad(set_to_none=True)
-            self.lr_scheduler.step()
-            self.step_timer.tick()
-            self.step_timer.maybe_report(iteration)
-            if self.profiler is not None:
-                self.profiler.step()
+            loss, losses, log_metrics, shell_metrics = self.step(iteration)
 
             if interactive_driver is not None:
                 interactive_driver.iteration_completed(
