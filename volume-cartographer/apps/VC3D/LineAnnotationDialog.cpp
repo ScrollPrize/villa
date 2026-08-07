@@ -1,7 +1,6 @@
 #include "LineAnnotationDialog.hpp"
 
 #include "FiberNameDisplay.hpp"
-#include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
@@ -62,7 +61,6 @@ namespace {
 // Half-width (in line-point indices) of the window used to least-squares-fit the side-view
 // plane orientation around the cursor. The fit is interpolated between adjacent window centers
 // so the orientation tracks the cursor continuously (see updateSidePlaneSurface).
-constexpr int kSideFitHalfWindow = 20;
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
@@ -1386,13 +1384,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
-        _linePointsd.clear();
-        _linePointsd.reserve(_generatedViews.linePoints.size());
-        for (const auto& p : _generatedViews.linePoints) {
-            _linePointsd.emplace_back(p[0], p[1], p[2]);
-        }
-        _sideFitBracket[0] = SideFit{};
-        _sideFitBracket[1] = SideFit{};
         _generatedControlIndex =
             vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
                 _generatedViews.controlPoints);
@@ -1602,13 +1593,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
-    _linePointsd.clear();
-    _linePointsd.reserve(_generatedViews.linePoints.size());
-    for (const auto& p : _generatedViews.linePoints) {
-        _linePointsd.emplace_back(p[0], p[1], p[2]);
-    }
-    _sideFitBracket[0] = SideFit{};
-    _sideFitBracket[1] = SideFit{};
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -3494,6 +3478,54 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv
     return normalizedOrNan(up);
 }
 
+cv::Vec3f LineAnnotationDialog::interpolatedOrientedNormal(double linePosition) const
+{
+    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+    const auto& normals = _generatedViews.lineNormals;
+    if (normals.empty() || !std::isfinite(linePosition)) {
+        return nan;
+    }
+
+    const double position = std::clamp(
+        linePosition, 0.0, static_cast<double>(normals.size() - 1));
+    const int lower = static_cast<int>(std::floor(position));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(normals.size()) - 1);
+    const cv::Vec3f lowerNormal = normals[static_cast<size_t>(lower)];
+    cv::Vec3f upperNormal = normals[static_cast<size_t>(upper)];
+    if (!finitePoint(lowerNormal) || !finitePoint(upperNormal) ||
+        cv::norm(lowerNormal) <= 1.0e-6f ||
+        cv::norm(upperNormal) <= 1.0e-6f) {
+        return nan;
+    }
+    if (lowerNormal.dot(upperNormal) < 0.0f) {
+        upperNormal = -upperNormal;
+    }
+
+    const float t = static_cast<float>(position - static_cast<double>(lower));
+    return normalizedOrNan(lowerNormal * (1.0f - t) + upperNormal * t);
+}
+
+cv::Vec3f LineAnnotationDialog::interpolatedLineNormal(double linePosition,
+                                                       const cv::Vec3f& tangent) const
+{
+    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f up = interpolatedOrientedNormal(linePosition);
+    if (!finitePoint(up)) {
+        return nan;
+    }
+    up -= tangent * up.dot(tangent);
+    // A tiny projection means the sheet normal runs nearly along the tangent
+    // (extreme bend): the direction is unstable, so let the caller fall back.
+    if (cv::norm(up) <= 0.1f) {
+        return nan;
+    }
+    return normalizedOrNan(up);
+}
+
 bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
@@ -3501,7 +3533,16 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
     }
     const cv::Vec3f origin = interpolatedLinePoint(linePosition);
     const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
-    const cv::Vec3f upHint = interpolatedLineUp(linePosition, tangent);
+    // Display up for the cut: the sampled sheet normal, sign-oriented away
+    // from the scroll center (with the scene's y-down rendering this shows
+    // the sheet horizontal with the fiber's center-facing surface at the top
+    // of the view) -- and the orientation is a pure function of the line
+    // position. The transported line up remains the fallback where samples
+    // are missing or, at extreme bends, nearly parallel to the tangent.
+    cv::Vec3f upHint = interpolatedLineNormal(linePosition, tangent);
+    if (!finitePoint(upHint)) {
+        upHint = interpolatedLineUp(linePosition, tangent);
+    }
     if (!finitePoint(origin) || !finitePoint(tangent) || !finitePoint(upHint) ||
         cv::norm(tangent) <= 1.0e-6f ||
         cv::norm(upHint) <= 1.0e-6f) {
@@ -3524,137 +3565,38 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
     return true;
 }
 
-bool LineAnnotationDialog::computeSideFit(int center, cv::Vec3f& normal, cv::Vec3f& upHint) const
-{
-    const auto& linePoints = _generatedViews.linePoints;
-    const int count = static_cast<int>(linePoints.size());
-    if (count < 3) {
-        return false;
-    }
-    center = std::clamp(center, 0, count - 1);
-    const int first = std::max(0, center - kSideFitHalfWindow);
-    const int last = std::min(count - 1, center + kSideFitHalfWindow);
-
-    vc3d::fiber_slice::ControlSpanSelection span;
-    span.firstLineIndex = static_cast<size_t>(first);
-    span.lastLineIndex = static_cast<size_t>(last);
-    span.samples.reserve(static_cast<size_t>(last - first + 1));
-    cv::Vec3d centroid{0.0, 0.0, 0.0};
-    for (int i = first; i <= last; ++i) {
-        const cv::Vec3f& p = linePoints[static_cast<size_t>(i)];
-        if (!finitePoint(p)) {
-            continue;
-        }
-        const cv::Vec3d pd(p[0], p[1], p[2]);
-        span.samples.push_back(pd);
-        centroid += pd;
-    }
-    if (span.samples.size() < 3) {
-        return false;
-    }
-    span.centroid = centroid * (1.0 / static_cast<double>(span.samples.size()));
-    span.valid = true;
-
-    // fitLeastSquaresPlane reads linePoints[firstLineIndex/lastLineIndex] to derive the in-plane
-    // direction hint, so it needs the full polyline as cv::Vec3d. _linePointsd is the cached
-    // double-precision copy built once when the views were generated.
-    const auto fit = vc3d::fiber_slice::fitLeastSquaresPlane(span, _linePointsd);
-    if (!fit.valid) {
-        return false;
-    }
-    normal = cv::Vec3f(static_cast<float>(fit.normal[0]),
-                       static_cast<float>(fit.normal[1]),
-                       static_cast<float>(fit.normal[2]));
-    upHint = cv::Vec3f(static_cast<float>(fit.upHint[0]),
-                       static_cast<float>(fit.upHint[1]),
-                       static_cast<float>(fit.upHint[2]));
-    if (!finitePoint(normal) || !finitePoint(upHint) ||
-        cv::norm(normal) <= 1.0e-6f || cv::norm(upHint) <= 1.0e-6f) {
-        return false;
-    }
-    return true;
-}
-
-bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double linePosition)
+bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
         return false;
     }
-    const int count = static_cast<int>(_generatedViews.linePoints.size());
-    if (count < 3) {
+    const cv::Vec3f origin = interpolatedLinePoint(linePosition);
+    const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
+    if (!finitePoint(origin) || !finitePoint(tangent) ||
+        cv::norm(tangent) <= 1.0e-6f) {
         return false;
     }
-
-    // Continuous side-view orientation: fit the best-fit plane at the two integer window centers
-    // straddling the cursor and interpolate between them by the fractional position. Each fit
-    // depends only on the static line geometry, so we cache the two bracketing fits and recompute
-    // a center only when the straddle shifts (typically once per integer crossing). This keeps
-    // the orientation smooth -- no snapping at discrete window centers -- while staying cheap.
-    const double pos = std::clamp(linePosition, 0.0, static_cast<double>(count - 1));
-    const int lowerCenter = static_cast<int>(std::floor(pos));
-    const int upperCenter = std::min(lowerCenter + 1, count - 1);
-    const int wantCenters[2] = {lowerCenter, upperCenter};
-
-    SideFit next[2];
-    for (int slot = 0; slot < 2; ++slot) {
-        next[slot].center = wantCenters[slot];
-        bool reused = false;
-        for (const SideFit& cached : _sideFitBracket) {
-            if (cached.valid && cached.center == wantCenters[slot]) {
-                next[slot] = cached;
-                reused = true;
-                break;
-            }
-        }
-        if (!reused) {
-            next[slot].valid =
-                computeSideFit(wantCenters[slot], next[slot].normal, next[slot].upHint);
-        }
+    // The side cut is the current cut's frame rotated a quarter turn: the
+    // plane spanned by the line tangent and the (away-from-center oriented)
+    // sheet normal, viewed with the fiber vertical. A windowed PCA fit of
+    // the line was used here before, but its plane tumbles where the fiber's
+    // cross-fiber wander is nearly isotropic (no well-defined local fiber
+    // plane); the sheet frame is always defined and keeps both cut views
+    // consistent. normal = sheetNormal x tangent puts the stored sheet
+    // normal on the view's x axis, so the direction shown at the top of the
+    // current cut (toward the scroll center) points screen-left.
+    cv::Vec3f sheetNormal = interpolatedLineNormal(linePosition, tangent);
+    if (!finitePoint(sheetNormal)) {
+        sheetNormal = interpolatedLineUp(linePosition, tangent);
     }
-    _sideFitBracket[0] = next[0];
-    _sideFitBracket[1] = next[1];
-
-    cv::Vec3f normal;
-    cv::Vec3f upHint;
-    if (next[0].valid && next[1].valid) {
-        cv::Vec3f normal1 = next[1].normal;
-        cv::Vec3f upHint1 = next[1].upHint;
-        // PCA normals/up hints are sign-arbitrary; align the upper fit to the lower one before
-        // blending so interpolation doesn't cancel them out near a sign flip.
-        if (next[0].normal.dot(normal1) < 0.0f) {
-            normal1 = -normal1;
-        }
-        if (next[0].upHint.dot(upHint1) < 0.0f) {
-            upHint1 = -upHint1;
-        }
-        const float t = static_cast<float>(pos - static_cast<double>(lowerCenter));
-        normal = next[0].normal * (1.0f - t) + normal1 * t;
-        upHint = next[0].upHint * (1.0f - t) + upHint1 * t;
-    } else if (next[0].valid || next[1].valid) {
-        const SideFit& fit = next[0].valid ? next[0] : next[1];
-        normal = fit.normal;
-        upHint = fit.upHint;
-    } else {
+    if (!finitePoint(sheetNormal) || cv::norm(sheetNormal) <= 1.0e-6f) {
         return false;
     }
-
-    normal = normalizedOrNan(normal);
+    const cv::Vec3f normal = normalizedOrNan(sheetNormal.cross(tangent));
     if (!finitePoint(normal)) {
         return false;
     }
-    upHint -= normal * upHint.dot(normal);
-    upHint = normalizedOrNan(upHint);
-    if (!finitePoint(upHint)) {
-        return false;
-    }
-
-    // Keep the plane centered on the cursor position rather than a window centroid; the origin
-    // slides smoothly along the line while the interpolated orientation tracks it continuously.
-    const cv::Vec3f origin = interpolatedLinePoint(pos);
-    if (!finitePoint(origin)) {
-        return false;
-    }
-    plane->setFromNormalAndUp(origin, normal, upHint);
+    plane->setFromNormalAndUp(origin, normal, tangent);
     return true;
 }
 

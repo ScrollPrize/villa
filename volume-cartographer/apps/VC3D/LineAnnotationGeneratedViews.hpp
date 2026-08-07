@@ -177,6 +177,10 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    // Per-line-point sampled sheet normals, sign-oriented away from the
+    // scroll center (NaN where the sample is invalid). Empty when
+    // unavailable.
+    std::vector<cv::Vec3f> lineNormals;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
