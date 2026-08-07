@@ -607,3 +607,23 @@ vc_add_test(NAME test_quadsurface_extras)
 vc_add_test(NAME test_surface_patch_index_cache)
 
 vc_add_test(NAME test_volume_pkg_more)
+
+# Pins the option defaults of vc_render_tifxyz by reading them back out of
+# --help. Unlike test_merge_e2e_small this is not gated behind VC_RUN_E2E: it
+# spawns the binary but touches no volume, no surface and no fixtures, so it
+# costs milliseconds and belongs in the default pass. The regression it guards
+# — a one-word default reverting silently, with the output still looking
+# plausible — is exactly what CI has to catch. Skipped when the apps are not
+# built, e.g. coverage builds where VC_BUILD_APPS defaults to OFF.
+if(TARGET vc_render_tifxyz)
+    add_executable(test_render_tifxyz_defaults test_render_tifxyz_defaults.cpp)
+    target_link_libraries(test_render_tifxyz_defaults PRIVATE doctest::doctest)
+    vc_register_test_target(test_render_tifxyz_defaults)
+    add_dependencies(test_render_tifxyz_defaults vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_defaults COMMAND test_render_tifxyz_defaults)
+    vc_register_ctest(test_render_tifxyz_defaults test_render_tifxyz_defaults)
+    # The probe in the test prefers this variable, so ctest works regardless of
+    # the working directory or the build layout.
+    set_tests_properties(test_render_tifxyz_defaults PROPERTIES
+        ENVIRONMENT "VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>")
+endif()
