@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -15,21 +16,25 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
-from scipy.optimize import least_squares
-
 from calibrate_thread_dispatch_shared import (
-    FrequencyMonitor,
     MONITOR_CPU,
+    FrequencyMonitor,
     validate_fixed_frequency,
     validate_topology,
 )
+from native_thread_sync_replay import (
+    NativeReplayEngine,
+    attribution_request,
+    replay_request,
+    resolve_replay_engine,
+)
+from passive_event_model import modeled_thread_costs_ns
 from run_thread_sync_replay import (
     assign_costs,
     read_event_stream,
     simulate_adjusted,
 )
-from passive_event_model import modeled_thread_costs_ns
-
+from scipy.optimize import least_squares
 
 CALIBRATION_CPUS = tuple(range(8))
 MAX_PARAMETER_CORRELATION = 0.95
@@ -78,13 +83,9 @@ BASE_FIT_CASES = (
 
 MIXED_FIT_CASES = (
     Case(2, 2, 120_000, 0, 24, "fit", "mixed-grid-phase", 65_536),
-    Case(
-        4, 4, 80_000, 0, 24, "fit", "mixed-grid-random", 1_048_576, 20_000
-    ),
+    Case(4, 4, 80_000, 0, 24, "fit", "mixed-grid-random", 1_048_576, 20_000),
     Case(6, 6, 180_000, 4, 12, "fit", "mixed-grid-random", 8_388_608),
-    Case(
-        4, 2, 240_000, 8, 18, "fit", "mixed-grid-phase", 262_144, 80_000
-    ),
+    Case(4, 2, 240_000, 8, 18, "fit", "mixed-grid-phase", 262_144, 80_000),
 )
 
 FIT_CASES = (*BASE_FIT_CASES, *MIXED_FIT_CASES)
@@ -99,52 +100,162 @@ BASE_HOLDOUT_CASES = (
 )
 
 MIXED_HOLDOUT_CASES = (
-    Case(
-        3, 3, 100_000, 3, 19, "holdout", "mixed-grid-random", 131_072, 25_000
-    ),
+    Case(3, 3, 100_000, 3, 19, "holdout", "mixed-grid-random", 131_072, 25_000),
     Case(5, 5, 160_000, 0, 13, "holdout", "mixed-grid-phase", 2_097_152),
-    Case(
-        7, 4, 220_000, 6, 9, "holdout", "mixed-grid-random", 8_388_608, 55_000
-    ),
+    Case(7, 4, 220_000, 6, 9, "holdout", "mixed-grid-random", 8_388_608, 55_000),
 )
 
 HOLDOUT_CASES = (*BASE_HOLDOUT_CASES, *MIXED_HOLDOUT_CASES)
 
 DEPENDENCY_FIT_CASES = (
-    Case(2, 2, 240_000, 2, 8, "dependency_fit", "mixed-grid-phase", 65_536,
-         pair="fit_a"),
-    Case(2, 2, 60_000, 2, 32, "dependency_fit", "mixed-grid-phase", 65_536,
-         pair="fit_a"),
-    Case(4, 4, 160_000, 2, 10, "dependency_fit", "mixed-grid-random", 1_048_576,
-         pair="fit_b"),
-    Case(4, 4, 40_000, 2, 40, "dependency_fit", "mixed-grid-random", 1_048_576,
-         pair="fit_b"),
-    Case(6, 3, 200_000, 2, 10, "dependency_fit", "mixed-grid-random", 8_388_608,
-         pair="fit_c"),
-    Case(6, 3, 50_000, 2, 40, "dependency_fit", "mixed-grid-random", 8_388_608,
-         pair="fit_c"),
-    Case(4, 4, 120_000, 2, 10, "dependency_fit", "mixed-grid-phase", 262_144,
-         40_000, "fit_d"),
-    Case(4, 4, 30_000, 2, 40, "dependency_fit", "mixed-grid-phase", 262_144,
-         10_000, "fit_d"),
+    Case(
+        2, 2, 240_000, 2, 8, "dependency_fit", "mixed-grid-phase", 65_536, pair="fit_a"
+    ),
+    Case(
+        2, 2, 60_000, 2, 32, "dependency_fit", "mixed-grid-phase", 65_536, pair="fit_a"
+    ),
+    Case(
+        4,
+        4,
+        160_000,
+        2,
+        10,
+        "dependency_fit",
+        "mixed-grid-random",
+        1_048_576,
+        pair="fit_b",
+    ),
+    Case(
+        4,
+        4,
+        40_000,
+        2,
+        40,
+        "dependency_fit",
+        "mixed-grid-random",
+        1_048_576,
+        pair="fit_b",
+    ),
+    Case(
+        6,
+        3,
+        200_000,
+        2,
+        10,
+        "dependency_fit",
+        "mixed-grid-random",
+        8_388_608,
+        pair="fit_c",
+    ),
+    Case(
+        6,
+        3,
+        50_000,
+        2,
+        40,
+        "dependency_fit",
+        "mixed-grid-random",
+        8_388_608,
+        pair="fit_c",
+    ),
+    Case(
+        4,
+        4,
+        120_000,
+        2,
+        10,
+        "dependency_fit",
+        "mixed-grid-phase",
+        262_144,
+        40_000,
+        "fit_d",
+    ),
+    Case(
+        4,
+        4,
+        30_000,
+        2,
+        40,
+        "dependency_fit",
+        "mixed-grid-phase",
+        262_144,
+        10_000,
+        "fit_d",
+    ),
 )
 
 DEPENDENCY_VALIDATION_CASES = (
-    Case(3, 3, 150_000, 2, 12, "dependency_validation", "mixed-grid-phase",
-         131_072, pair="validation_a"),
-    Case(3, 3, 50_000, 2, 36, "dependency_validation", "mixed-grid-phase",
-         131_072, pair="validation_a"),
-    Case(5, 5, 100_000, 2, 12, "dependency_validation", "mixed-grid-random",
-         2_097_152, pair="validation_b"),
-    Case(5, 5, 30_000, 2, 40, "dependency_validation", "mixed-grid-random",
-         2_097_152, pair="validation_b"),
+    Case(
+        3,
+        3,
+        150_000,
+        2,
+        12,
+        "dependency_validation",
+        "mixed-grid-phase",
+        131_072,
+        pair="validation_a",
+    ),
+    Case(
+        3,
+        3,
+        50_000,
+        2,
+        36,
+        "dependency_validation",
+        "mixed-grid-phase",
+        131_072,
+        pair="validation_a",
+    ),
+    Case(
+        5,
+        5,
+        100_000,
+        2,
+        12,
+        "dependency_validation",
+        "mixed-grid-random",
+        2_097_152,
+        pair="validation_b",
+    ),
+    Case(
+        5,
+        5,
+        30_000,
+        2,
+        40,
+        "dependency_validation",
+        "mixed-grid-random",
+        2_097_152,
+        pair="validation_b",
+    ),
 )
 
 DEPENDENCY_HOLDOUT_CASES = (
-    Case(7, 4, 140_000, 2, 8, "dependency_holdout", "mixed-grid-random",
-         8_388_608, 35_000, "holdout"),
-    Case(7, 4, 40_000, 2, 28, "dependency_holdout", "mixed-grid-random",
-         8_388_608, 10_000, "holdout"),
+    Case(
+        7,
+        4,
+        140_000,
+        2,
+        8,
+        "dependency_holdout",
+        "mixed-grid-random",
+        8_388_608,
+        35_000,
+        "holdout",
+    ),
+    Case(
+        7,
+        4,
+        40_000,
+        2,
+        28,
+        "dependency_holdout",
+        "mixed-grid-random",
+        8_388_608,
+        10_000,
+        "holdout",
+    ),
 )
 
 
@@ -160,6 +271,9 @@ class ReplayPoint:
     replay_cache: dict[tuple[int, float], dict[str, float]] = field(
         default_factory=dict
     )
+    native_engine: NativeReplayEngine | None = None
+    native_graph_id: str | None = None
+    native_attribution_id: str = "nominal"
 
 
 def runner_command(
@@ -219,7 +333,12 @@ def collect_case(
     event_cost_model: Path,
 ) -> Path:
     command = runner_command(
-        runner, benchmark, output_dir, case, trace_trials, native_trials,
+        runner,
+        benchmark,
+        output_dir,
+        case,
+        trace_trials,
+        native_trials,
         event_cost_model,
     )
     completed = subprocess.run(command, check=True, text=True, capture_output=True)
@@ -229,9 +348,23 @@ def collect_case(
 
 def startup_command(benchmark: Path, workers: int) -> list[str]:
     return [
-        str(benchmark), "--mode", "futures", "--workers", str(workers),
-        "--tasks", "1", "--work-iterations", "0", "--work-kind", "grid-sample",
-        "--working-set-bytes", "512", "--rounds", "1", "--warmup-rounds", "0",
+        str(benchmark),
+        "--mode",
+        "futures",
+        "--workers",
+        str(workers),
+        "--tasks",
+        "1",
+        "--work-iterations",
+        "0",
+        "--work-kind",
+        "grid-sample",
+        "--working-set-bytes",
+        "512",
+        "--rounds",
+        "1",
+        "--warmup-rounds",
+        "0",
     ]
 
 
@@ -305,8 +438,7 @@ def fit_worker_startup(startup: dict[str, object]) -> dict[str, object]:
         "base_process_ns": base,
         "per_worker_startup_ns": float(result.x[0]),
         "maximum_median_error_percent": 100.0 * float(np.max(np.abs(errors))),
-        "rms_median_error_percent": 100.0
-        * float(np.sqrt(np.mean(errors**2))),
+        "rms_median_error_percent": 100.0 * float(np.sqrt(np.mean(errors**2))),
         "cases": [
             {
                 "workers": int(worker_count),
@@ -322,15 +454,22 @@ def fit_worker_startup(startup: dict[str, object]) -> dict[str, object]:
 
 
 def load_point(
-    case: Case, result_path: Path, event_model: dict[str, object]
+    case: Case,
+    result_path: Path,
+    event_model: dict[str, object],
+    native_engine: NativeReplayEngine | None = None,
 ) -> ReplayPoint:
     result = json.loads(result_path.read_text())
     if result["case"]["workload"] != "synthetic":
         raise RuntimeError(f"non-synthetic observation rejected: {result_path}")
     if result["trace"]["dependency_source"] != "drd_vector_clocks":
-        raise RuntimeError(f"synthetic observation lacks DRD dependencies: {result_path}")
+        raise RuntimeError(
+            f"synthetic observation lacks DRD dependencies: {result_path}"
+        )
     if result["trace"]["unresolved_happens_before"] != 0:
-        raise RuntimeError(f"synthetic observation has unresolved dependencies: {result_path}")
+        raise RuntimeError(
+            f"synthetic observation has unresolved dependencies: {result_path}"
+        )
 
     events = read_event_stream(Path(result["trace"]["event_path"]))
     profiles = {
@@ -349,6 +488,18 @@ def load_point(
         int(result["case"].get("parallel_cores", int(result["case"]["workers"]) + 1)),
     )
     native = result["native_whole_process"]
+    graph_id = None
+    if native_engine is not None:
+        graph_id = (
+            "calibration-"
+            + hashlib.sha256(str(result_path.resolve()).encode()).hexdigest()[:20]
+        )
+        event_path = Path(result["trace"]["event_path"])
+        native_engine.load_graph(graph_id, event_path)
+        native_engine.register_attributions(
+            graph_id,
+            [attribution_request("nominal", event_costs, 0.5, "equal")],
+        )
     return ReplayPoint(
         case=case,
         events=events,
@@ -366,6 +517,8 @@ def load_point(
         },
         result_path=str(result_path),
         fixed_process_ns=0.0,
+        native_engine=native_engine,
+        native_graph_id=graph_id,
     )
 
 
@@ -396,23 +549,36 @@ def predict(
     key = (cores, handoff)
     replay = point.replay_cache.get(key)
     if replay is None:
-        replay = simulate_adjusted(
-            point.events,
-            cores,
-            "fifo",
-            cross_thread_latency=handoff,
-            replay_idle_scale=1.0,
-        )
+        if point.native_engine is not None:
+            if point.native_graph_id is None:
+                raise RuntimeError("native replay point has no graph ID")
+            replay = point.native_engine.replay_batch(
+                point.native_graph_id,
+                [
+                    replay_request(
+                        "predict",
+                        point.native_attribution_id,
+                        cores,
+                        "fifo",
+                        cross_thread_latency=handoff,
+                    )
+                ],
+            )["predict"]
+        else:
+            replay = simulate_adjusted(
+                point.events,
+                cores,
+                "fifo",
+                cross_thread_latency=handoff,
+                replay_idle_scale=1.0,
+            )
         point.replay_cache[key] = replay
     adjusted = (
         replay["hard_schedule_lower_bound"]
         + dependency_scale * replay["dependency_excess"]
         + replay["raw_replay_excess"]
     )
-    return (
-        point.fixed_process_ns
-        + float(adjusted)
-    )
+    return point.fixed_process_ns + float(adjusted)
 
 
 def fit_model(
@@ -532,12 +698,9 @@ def evaluate(
                 }
             )
         serial_cores, parallel_cores = point.core_counts
-        predicted_speedup = (
-            predictions[serial_cores] / predictions[parallel_cores]
-        )
+        predicted_speedup = predictions[serial_cores] / predictions[parallel_cores]
         measured_speedup = (
-            point.native_medians[serial_cores]
-            / point.native_medians[parallel_cores]
+            point.native_medians[serial_cores] / point.native_medians[parallel_cores]
         )
         speedup_error = predicted_speedup / measured_speedup - 1.0
         all_speedup_errors.append(speedup_error)
@@ -710,11 +873,16 @@ def collect_block(
 
 
 def load_points(
-    records: list[dict[str, object]], event_model: dict[str, object]
+    records: list[dict[str, object]],
+    event_model: dict[str, object],
+    native_engine: NativeReplayEngine | None = None,
 ) -> list[ReplayPoint]:
     return [
         load_point(
-            Case(**record["case"]), Path(record["result_path"]), event_model
+            Case(**record["case"]),
+            Path(record["result_path"]),
+            event_model,
+            native_engine,
         )
         for record in records
     ]
@@ -732,6 +900,7 @@ def main() -> int:
     parser.add_argument("--trace-trials", type=int, default=3)
     parser.add_argument("--native-trials", type=int, default=5)
     parser.add_argument("--event-cost-model", required=True, type=Path)
+    parser.add_argument("--replay-engine", type=Path)
     parser.add_argument("--reuse", action="store_true")
     parser.add_argument("--base-observations", type=Path)
     parser.add_argument("--refresh-startup", action="store_true")
@@ -868,15 +1037,19 @@ def main() -> int:
         write_json(observations_path, observations)
 
     event_model = json.loads(args.event_cost_model.read_text())
+    replay_engine_path = resolve_replay_engine(args.replay_engine, args.benchmark)
+    replay_engine = NativeReplayEngine(replay_engine_path)
     startup_fit = fit_worker_startup(observations["startup"])
-    fit_points = load_points(observations["fit"], event_model)
-    holdout_points = load_points(observations["holdout"], event_model)
-    dependency_fit_points = load_points(observations["dependency_fit"], event_model)
+    fit_points = load_points(observations["fit"], event_model, replay_engine)
+    holdout_points = load_points(observations["holdout"], event_model, replay_engine)
+    dependency_fit_points = load_points(
+        observations["dependency_fit"], event_model, replay_engine
+    )
     dependency_validation_points = load_points(
-        observations["dependency_validation"], event_model
+        observations["dependency_validation"], event_model, replay_engine
     )
     dependency_holdout_points = load_points(
-        observations["dependency_holdout"], event_model
+        observations["dependency_holdout"], event_model, replay_engine
     )
 
     baseline = fit_model("handoff", fit_points)
@@ -892,12 +1065,8 @@ def main() -> int:
     baseline_validation = evaluate(
         "handoff", baseline_values, dependency_validation_points
     )
-    baseline_holdout = evaluate(
-        "handoff", baseline_values, dependency_holdout_points
-    )
-    candidate_existing = evaluate(
-        "dependency", values, holdout_points, fixed_handoff
-    )
+    baseline_holdout = evaluate("handoff", baseline_values, dependency_holdout_points)
+    candidate_existing = evaluate("dependency", values, holdout_points, fixed_handoff)
     candidate_dependency_fit = evaluate(
         "dependency", values, dependency_fit_points, fixed_handoff
     )
@@ -933,9 +1102,7 @@ def main() -> int:
         fixed_handoff,
     )
     fit_report["leave_one_pair_out"] = stability
-    fit_report["profile"] = dependency_profile(
-        dependency_fit_points, fixed_handoff
-    )
+    fit_report["profile"] = dependency_profile(dependency_fit_points, fixed_handoff)
     pair_regression = maximum_pair_regression(
         baseline_validation,
         candidate_validation,
@@ -970,17 +1137,10 @@ def main() -> int:
         and bool(observations["frequency"]["fit"]["within_tolerance"])
         and bool(observations["frequency"]["holdout"]["within_tolerance"])
         and bool(observations["frequency"]["startup"]["within_tolerance"])
-        and bool(
-            observations["frequency"]["dependency_fit"]["within_tolerance"]
-        )
-        and bool(
-            observations["frequency"]["dependency_validation"]["within_tolerance"]
-        )
-        and bool(
-            observations["frequency"]["dependency_holdout"]["within_tolerance"]
-        )
-        and startup_fit["maximum_median_error_percent"]
-        <= MAX_HOLDOUT_ERROR_PERCENT
+        and bool(observations["frequency"]["dependency_fit"]["within_tolerance"])
+        and bool(observations["frequency"]["dependency_validation"]["within_tolerance"])
+        and bool(observations["frequency"]["dependency_holdout"]["within_tolerance"])
+        and startup_fit["maximum_median_error_percent"] <= MAX_HOLDOUT_ERROR_PERCENT
     )
     candidate["selection"] = {
         "runtime_rms_relative_improvement": runtime_rms_improvement,
@@ -988,9 +1148,9 @@ def main() -> int:
         "maximum_pair_regression_percentage_points": pair_regression,
         "sealed_holdout_used_for_selection": False,
     }
-    model_valid = bool(
-        event_model.get("synthetic_calibration_valid", False)
-    ) and candidate_valid
+    model_valid = (
+        bool(event_model.get("synthetic_calibration_valid", False)) and candidate_valid
+    )
     selected_name = "dependency_excess" if candidate_valid else "handoff_only"
     selected_holdout_report = (
         candidate_validation if candidate_valid else baseline_validation
@@ -1003,9 +1163,7 @@ def main() -> int:
             strict=True,
         )
     }
-    combined_parameters["fixed_process_ns"] = float(
-        startup_fit["base_process_ns"]
-    )
+    combined_parameters["fixed_process_ns"] = float(startup_fit["base_process_ns"])
     combined_parameters["per_worker_startup_ns"] = float(
         startup_fit["per_worker_startup_ns"]
     )
@@ -1026,8 +1184,15 @@ def main() -> int:
         "worker_startup": startup_fit,
         "synthetic_calibration_valid": model_valid,
         "timing_claims_enabled": False,
+        "native_replay": {
+            "executable": str(replay_engine_path),
+            "protocol_version": 1,
+            "startup_seconds": replay_engine.startup_seconds,
+            "phases": replay_engine.timings,
+        },
     }
     write_json(args.output_dir / "model.json", model)
+    replay_engine.close()
     print_speedup_report(selected_holdout_report)
     print(json.dumps(model, indent=2, sort_keys=True))
     return 0 if model_valid else 2

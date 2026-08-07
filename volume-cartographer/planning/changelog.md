@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-08-07
+
+- Documented VC3D rendering-gate use, activation, artifact diagnosis, model
+  recalibration, reference refresh, and tolerance-policy changes. GitHub
+  Actions now derives this gate's Ninja concurrency from `nproc`; the checked
+  reference is the single normal CI source for tolerance.
+- Added a runner-sized Ninja artifact graph for the complete eight-case rendering
+  Valgrind matrix. It collects fresh separate-thread Callgrind profiles and
+  complete parallel DRD graphs, applies the frozen synthetic-only native replay
+  score, verifies exact environment/workload identity and checksum, and gates
+  every case symmetrically within 10% of its checked reference.
+- Replaced production Python passive event playback with a persistent,
+  versioned C++ replay engine. Graphs and cost attributions are cached and
+  replay requests are batched while the Python implementation remains only as
+  a compatibility oracle. On a 132,405-event shuffled renderer trace, one warm
+  replay improved from 1.380 s median to 15.5 ms with identical output, an
+  88.9x speedup.
+
 ## 2026-08-06
 
 - Added paired cache-line access-density kernels and crossed one/eight

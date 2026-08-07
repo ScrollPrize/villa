@@ -110,8 +110,36 @@
   `fallback_1`, `fallback_3`, `mixed_correlated`, and `mixed_shuffled` for
   workers 1--7. This five-scenario host-validation surface does not change the
   four-scenario/eight-case deterministic CI matrix.
-- Serial cases may execute concurrently. Parallel cases must be scheduled so
-  the aggregate configured worker count does not exceed the CI CPU allocation.
+- Native serial cases may execute concurrently. Native parallel cases must be
+  scheduled so the aggregate configured worker count does not exceed the CI
+  CPU allocation. Valgrind collection is the explicit exception: because each
+  instrumented guest is serialized by Valgrind, CI uses the runner's available
+  logical CPU count as Ninja concurrency and may run one independent Valgrind
+  process per host CPU even when each guest configures four renderer workers.
+- The CI regression graph must generate fresh separate-thread Callgrind
+  profiles for all eight cases and fresh complete DRD dependency graphs for the
+  four parallel cases. A collector publishes its completion manifest atomically
+  only after all raw files and metadata validate; evaluators depend on those
+  manifests and may not rerun collection.
+- The CI relative modeled-runtime score uses the frozen synthetic-only
+  data-read event model. Serial score is summed per-thread modeled work per
+  render call. Parallel score is native FIFO replay makespan per render call
+  with four workers plus one caller core, equal attribution,
+  `residual_fraction=0.5`, zero wake latency, the frozen cross-thread release
+  latency, and unit replay/dependency-excess scales. Process startup and native
+  wall timing are excluded.
+- The relative modeled-runtime score is not a validated absolute runtime claim.
+  Each case must remain within the symmetric tolerance in its versioned
+  reference, initially 10% in either direction. CI may neither refit the model
+  nor rewrite references.
+- The checked reference's top-level `tolerance` is the sole normal CI source
+  for the symmetric acceptance width. Changing it is an explicit policy change
+  independent of recalibrating the model or refreshing per-case scores.
+- Before comparing scores, CI must require exact model hash, checksum,
+  benchmark schema, compiler/version, architecture target, build type,
+  Valgrind version, simulated cache geometry, fixture dimensions, repetitions,
+  and worker count. Parallel traces must have no unresolved happens-before
+  edge or unmatched blocking wait.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,
@@ -119,9 +147,10 @@
 - A calibrated summary must additionally report modeled work and wall cycles,
   modeled cycles per pixel, the shared nanoseconds-per-modeled-cycle factor,
   estimated nanoseconds per pixel, estimated Mpx/s, and reference-host metadata.
-- The complete deterministic benchmark should target approximately ten seconds
-  on the reference CI runner while remaining large enough for stable per-pixel
-  counts.
+- The complete deterministic benchmark should target approximately 10--30
+  seconds on the four-core reference CI runner. Other runner sizes use their
+  available logical CPU count and may have different wall time while preserving
+  identical per-case artifacts and scores.
 - CI must run the deterministic benchmark and reject regressions beyond the
   checked-in thresholds. Raw Callgrind outputs and a machine-readable summary
   must be retained as CI artifacts for diagnosis.
@@ -165,6 +194,13 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   fixed-basic-block work slices, pair blocking futex waits with guest wakes or
   observed thread completion, and fail timing validation when dependencies are
   unresolved.
+- Passive event playback must use the native persistent replay engine. Python
+  remains responsible for Valgrind collection, dependency extraction, model
+  fitting, and reports, but production callers must load each event graph once,
+  cache named cost attributions, and submit ordered replay batches through the
+  versioned protocol. Missing native replay is an error; there is no silent
+  Python fallback. The Python replay is retained only as a temporary parity
+  oracle and must not be used for production benchmark results.
 - Valgrind elapsed timestamps must not be used as native duration or as work
   weights. State names must distinguish traced blocking from native scheduler
   state; simulated core idle is never an observed native metric.

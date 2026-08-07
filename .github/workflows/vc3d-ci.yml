@@ -192,7 +192,7 @@ jobs:
           sccache --show-stats
 
   render-benchmark:
-    name: Synthetic rendering regression (GCC Release / Callgrind)
+    name: Synthetic rendering regression (GCC Release / Valgrind replay)
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
     runs-on: ubuntu-24.04
@@ -210,40 +210,43 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends valgrind
-      - name: Configure and build Release benchmark
+          expected=$(jq -r '.cases[].identity.valgrind_version' \
+            volume-cartographer/core/test/data/render_valgrind_ci_reference.json \
+            | sort -u)
+          test "$expected" = "$(valgrind --version)"
+      - name: Configure Release benchmark graph
         working-directory: volume-cartographer
         run: |
           cmake -S . -B build/ci-render-benchmark -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
             -DCMAKE_Fortran_COMPILER=flang \
             -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
             -DVC_RUN_RENDER_BENCHMARKS=ON \
             -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
             -DVC_BUILD_FLATBOI=OFF
-          cmake --build build/ci-render-benchmark \
-            --target bench_render_synthetic --parallel 4
       - name: Verify fixture and native parallel execution
         working-directory: volume-cartographer
         run: |
+          jobs=$(nproc)
+          echo "Using $jobs Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target bench_render_synthetic --parallel "$jobs"
           ctest --test-dir build/ci-render-benchmark --output-on-failure \
             -R '^test_render_synthetic_fixture$'
-      - name: Run serial Callgrind cases concurrently
+      - name: Run full fresh Valgrind matrix
         working-directory: volume-cartographer
         run: |
-          ctest --test-dir build/ci-render-benchmark --output-on-failure \
-            --parallel 4 -R '^bench_render_callgrind_serial_'
-      - name: Run fixed-thread parallel-path Callgrind cases
-        working-directory: volume-cartographer
-        run: |
-          ctest --test-dir build/ci-render-benchmark --output-on-failure \
-            -R '^bench_render_callgrind_parallel_'
+          jobs=$(nproc)
+          echo "Using $jobs Valgrind/Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target render_valgrind_ci --parallel "$jobs"
       - name: Upload rendering benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: synthetic-rendering-callgrind
-          path: volume-cartographer/build/ci-render-benchmark/render-benchmark/
+          name: synthetic-rendering-valgrind
+          path: volume-cartographer/build/ci-render-benchmark/render-valgrind-ci/
           if-no-files-found: warn
 
   vc3d-compile-smoke:

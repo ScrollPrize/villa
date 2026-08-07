@@ -11,6 +11,7 @@ import math
 import statistics
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -18,15 +19,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from native_thread_sync_replay import (
+    NativeReplayEngine,
+    attribution_request,
+    replay_request,
+    resolve_replay_engine,
+)
 from passive_event_model import modeled_thread_costs_ns
 from run_thread_sync_replay import (
-    assign_costs,
     parse_drd_trace,
     parse_thread_profiles,
     replay_scales_for_model,
-    simulate_adjusted,
+    write_event_stream,
 )
-
 
 SCENARIOS = (
     "full_res",
@@ -69,12 +74,12 @@ def load_cases(path: Path) -> list[dict[str, object]]:
     if int(manifest.get("schema_version", 0)) != 1:
         raise RuntimeError("attribution case manifest must use schema 1")
     cases = list(manifest.get("cases", []))
-    identities = {
-        (str(case["scenario"]), int(case["workers"])) for case in cases
-    }
+    identities = {(str(case["scenario"]), int(case["workers"])) for case in cases}
     expected = {(scenario, workers) for scenario in SCENARIOS for workers in WORKERS}
     if identities != expected or len(cases) != len(expected):
-        raise RuntimeError("case manifest must contain every scenario/worker exactly once")
+        raise RuntimeError(
+            "case manifest must contain every scenario/worker exactly once"
+        )
     return cases
 
 
@@ -82,9 +87,7 @@ def validate_event_model(
     sync_model: dict[str, object], event_model: dict[str, object]
 ) -> None:
     if sync_model.get("event_cost_model") != event_model:
-        raise RuntimeError(
-            "supplied event model does not match synchronization model"
-        )
+        raise RuntimeError("supplied event model does not match synchronization model")
 
 
 def case_artifacts(case: dict[str, object]) -> list[Path]:
@@ -92,6 +95,7 @@ def case_artifacts(case: dict[str, object]) -> list[Path]:
     result = json.loads(result_path.read_text())
     paths = [result_path]
     paths.extend(Path(path) for path in result["trace"]["raw_paths"])
+    paths.extend(Path(path) for path in result["trace"].get("event_paths", []))
     prefix = case.get("callgrind_prefix")
     if prefix:
         paths.extend(Path(path) for path in sorted(glob.glob(f"{prefix}-*")))
@@ -125,9 +129,7 @@ def freeze_inputs(
     return {
         "schema_version": 1,
         "repository_revision": revision,
-        "artifacts": {
-            str(path): sha256_file(path) for path in sorted(paths)
-        },
+        "artifacts": {str(path): sha256_file(path) for path in sorted(paths)},
         "configuration": {
             "baseline_policy": BASELINE_POLICY,
             "policies": [asdict(policy) for policy in POLICIES],
@@ -175,15 +177,17 @@ def predict_case(
     case: dict[str, object],
     sync_model: dict[str, object],
     comparison_models: dict[str, dict[str, object]] | None = None,
+    replay_engine: NativeReplayEngine | None = None,
 ) -> dict[str, object]:
+    if replay_engine is None:
+        raise RuntimeError("native replay engine is required")
     result = json.loads(Path(str(case["result_path"])).read_text())
     result_case = result["case"]
     if result_case.get("workload") != "renderer":
         raise RuntimeError("attribution sensitivity accepts renderer results only")
-    if (
-        result_case["scenario"] != case["scenario"]
-        or int(result_case["workers"]) != int(case["workers"])
-    ):
+    if result_case["scenario"] != case["scenario"] or int(
+        result_case["workers"]
+    ) != int(case["workers"]):
         raise RuntimeError("renderer result identity does not match case manifest")
 
     profiles = profiles_for_case(case, result)
@@ -202,52 +206,89 @@ def predict_case(
     repetitions = int(result_case["repetitions"])
     cores = int(result_case["parallel_cores"])
 
-    for raw_path in result["trace"]["raw_paths"]:
-        parsed = parse_drd_trace(Path(raw_path))
-        for policy in POLICIES:
-            assign_costs(
-                parsed.events,
-                costs,
-                policy.residual_window_weight,
-                policy.placement,
-            )
-            assert_cost_preservation(parsed.events, costs)
-            replay = simulate_adjusted(
-                parsed.events,
-                cores,
-                "fifo",
-                cross_thread_latency=handoff,
-                replay_idle_scale=replay_idle_scale,
-                dependency_excess_scale=dependency_excess_scale,
-            )
-            predictions[policy.policy_id].append(
-                float(replay["modeled_makespan"]) / repetitions
-            )
-        for name, model in comparison_models.items():
-            assign_costs(
-                parsed.events,
-                comparison_costs[name],
-                0.5,
-                "equal",
-            )
-            assert_cost_preservation(parsed.events, comparison_costs[name])
-            model_parameters = model["parameters"]
-            model_idle_scale, model_dependency_scale = replay_scales_for_model(
-                model
-            )
-            replay = simulate_adjusted(
-                parsed.events,
-                cores,
-                "fifo",
-                cross_thread_latency=float(
-                    model_parameters["cross_thread_release_ns"]
-                ),
-                replay_idle_scale=model_idle_scale,
-                dependency_excess_scale=model_dependency_scale,
-            )
-            comparison_predictions[name].append(
-                float(replay["modeled_makespan"]) / repetitions
-            )
+    stored_event_paths = result["trace"].get("event_paths")
+    temporary = tempfile.TemporaryDirectory(prefix="vc-replay-events-")
+    try:
+        event_paths = []
+        if stored_event_paths:
+            event_paths = [Path(path) for path in stored_event_paths]
+        else:
+            for trial, raw_path in enumerate(result["trace"]["raw_paths"]):
+                parsed = parse_drd_trace(Path(raw_path))
+                event_path = Path(temporary.name) / f"trial{trial}.jsonl"
+                write_event_stream(event_path, parsed.events)
+                event_paths.append(event_path)
+
+        case_id = f"{case['scenario']}-w{case['workers']}"
+        for trial, event_path in enumerate(event_paths):
+            graph_id = f"{case_id}-trial{trial}"
+            replay_engine.load_graph(graph_id, event_path)
+            attributions = []
+            jobs = []
+            destinations: dict[str, tuple[str, str | None]] = {}
+            for policy in POLICIES:
+                attribution_id = f"primary/{policy.policy_id}"
+                attributions.append(
+                    attribution_request(
+                        attribution_id,
+                        costs,
+                        policy.residual_window_weight,
+                        policy.placement,
+                    )
+                )
+                job_id = f"primary/{policy.policy_id}"
+                jobs.append(
+                    replay_request(
+                        job_id,
+                        attribution_id,
+                        cores,
+                        "fifo",
+                        cross_thread_latency=handoff,
+                        replay_idle_scale=replay_idle_scale,
+                        dependency_excess_scale=dependency_excess_scale,
+                    )
+                )
+                destinations[job_id] = (policy.policy_id, None)
+            for name, model in comparison_models.items():
+                attribution_id = f"comparison/{name}"
+                attributions.append(
+                    attribution_request(
+                        attribution_id,
+                        comparison_costs[name],
+                        0.5,
+                        "equal",
+                    )
+                )
+                model_parameters = model["parameters"]
+                model_idle_scale, model_dependency_scale = replay_scales_for_model(
+                    model
+                )
+                job_id = f"comparison/{name}"
+                jobs.append(
+                    replay_request(
+                        job_id,
+                        attribution_id,
+                        cores,
+                        "fifo",
+                        cross_thread_latency=float(
+                            model_parameters["cross_thread_release_ns"]
+                        ),
+                        replay_idle_scale=model_idle_scale,
+                        dependency_excess_scale=model_dependency_scale,
+                    )
+                )
+                destinations[job_id] = (name, name)
+            replay_engine.register_attributions(graph_id, attributions)
+            batch = replay_engine.replay_batch(graph_id, jobs)
+            for job_id, replay in batch.items():
+                destination, comparison = destinations[job_id]
+                value = float(replay["modeled_makespan"]) / repetitions
+                if comparison is None:
+                    predictions[destination].append(value)
+                else:
+                    comparison_predictions[destination].append(value)
+    finally:
+        temporary.cleanup()
 
     measured = float(
         result["native_whole_process"][str(cores)][
@@ -365,13 +406,17 @@ def summarize(
                     statistics.fmean(value * value for value in runtime)
                 ),
                 "runtime_maximum_absolute_error_percent": max(runtime),
-                "runtime_cases_within_20_percent": sum(value <= 20.0 for value in runtime),
+                "runtime_cases_within_20_percent": sum(
+                    value <= 20.0 for value in runtime
+                ),
                 "speedup_median_absolute_error_percent": statistics.median(speedup),
                 "speedup_rms_error_percent": math.sqrt(
                     statistics.fmean(value * value for value in speedup)
                 ),
                 "speedup_maximum_absolute_error_percent": max(speedup),
-                "speedup_cases_within_20_percent": sum(value <= 20.0 for value in speedup),
+                "speedup_cases_within_20_percent": sum(
+                    value <= 20.0 for value in speedup
+                ),
             },
         }
 
@@ -379,12 +424,10 @@ def summarize(
     for report in reports.values():
         summary = report["summary"]
         summary["runtime_rms_delta_from_baseline_points"] = (
-            summary["runtime_rms_error_percent"]
-            - baseline["runtime_rms_error_percent"]
+            summary["runtime_rms_error_percent"] - baseline["runtime_rms_error_percent"]
         )
         summary["speedup_rms_delta_from_baseline_points"] = (
-            summary["speedup_rms_error_percent"]
-            - baseline["speedup_rms_error_percent"]
+            summary["speedup_rms_error_percent"] - baseline["speedup_rms_error_percent"]
         )
     diagnostic_order = sorted(
         reports,
@@ -404,6 +447,7 @@ def main() -> int:
     parser.add_argument("--event-model", type=Path, required=True)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--replay-engine", type=Path)
     parser.add_argument(
         "--compare",
         nargs=3,
@@ -414,6 +458,9 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = load_cases(args.cases)
+    first_result = json.loads(Path(str(cases[0]["result_path"])).read_text())
+    benchmark = Path(first_result["commands"]["benchmark"][0])
+    replay_engine_path = resolve_replay_engine(args.replay_engine, benchmark)
     sync_model = json.loads(args.model.read_text())
     event_model = json.loads(args.event_model.read_text())
     if sync_model.get("renderer_inputs_used") is not False:
@@ -438,23 +485,37 @@ def main() -> int:
         args.model,
         args.event_model,
         cases,
-        tuple(comparison_paths),
+        tuple(
+            [
+                *comparison_paths,
+                replay_engine_path,
+                SCRIPT_DIR / "native_thread_sync_replay.py",
+            ]
+        ),
     )
     provenance["configuration"]["comparison_models"] = list(comparison_models)
     verify_frozen_inputs(provenance)
     predictions = []
-    for index, case in enumerate(cases, 1):
-        print(
-            f"[attribution] {index}/{len(cases)} "
-            f"{case['scenario']} workers={case['workers']}",
-            flush=True,
-        )
-        predictions.append(
-            predict_case(case, sync_model, comparison_models)
-        )
+    with NativeReplayEngine(replay_engine_path) as replay_engine:
+        for index, case in enumerate(cases, 1):
+            print(
+                f"[attribution] {index}/{len(cases)} "
+                f"{case['scenario']} workers={case['workers']}",
+                flush=True,
+            )
+            predictions.append(
+                predict_case(case, sync_model, comparison_models, replay_engine)
+            )
+        native_replay = {
+            "executable": str(replay_engine_path),
+            "protocol_version": 1,
+            "startup_seconds": replay_engine.startup_seconds,
+            "phases": replay_engine.timings,
+        }
     report = {
         "schema_version": 1,
         "renderer_inputs_used_for_fit": False,
+        "native_replay": native_replay,
         **summarize(predictions),
         "model_comparisons": summarize_model_comparisons(
             predictions, tuple(comparison_models)

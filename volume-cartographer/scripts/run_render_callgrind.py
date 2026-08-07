@@ -6,10 +6,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import subprocess
 import sys
 from pathlib import Path
+
+from render_valgrind_common import (
+    CACHE_GEOMETRY,
+    callgrind_command,
+    load_renderer_metadata,
+    parse_callgrind,
+    require_supported_host,
+    valgrind_version,
+)
 
 SCHEMA_VERSION = 2
 MODEL_VERSION = 2
@@ -25,11 +33,6 @@ REQUIRED_MODEL_EVENTS = (
     "Bcm",
     "Bim",
 )
-CACHE_GEOMETRY = {
-    "I1": "32768,8,64",
-    "D1": "32768,8,64",
-    "LL": "8388608,16,64",
-}
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,34 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--repetitions", type=int)
     return parser.parse_args()
-
-
-def require_supported_host() -> None:
-    machine = platform.machine().lower()
-    if sys.platform != "linux" or machine not in {"x86_64", "amd64"}:
-        print("render Callgrind benchmark supports Linux amd64 only", file=sys.stderr)
-        raise SystemExit(77)
-
-
-def valgrind_version() -> str:
-    result = subprocess.run(
-        ["valgrind", "--version"], check=True, text=True, capture_output=True
-    )
-    return result.stdout.strip()
-
-
-def parse_callgrind(path: Path) -> dict[str, int]:
-    events: list[str] | None = None
-    totals: list[int] | None = None
-    for line in path.read_text().splitlines():
-        if line.startswith("events:"):
-            events = line.split()[1:]
-        elif line.startswith(("totals:", "summary:")):
-            totals = [int(value) for value in line.split()[1:]]
-    if not events or totals is None or len(totals) > len(events):
-        raise RuntimeError(f"cannot parse named Callgrind summary from {path}")
-    totals.extend(0 for _ in range(len(events) - len(totals)))
-    return dict(zip(events, totals, strict=True))
 
 
 def load_calibration(path: Path) -> dict[str, object]:
@@ -144,21 +119,6 @@ def calibrated_estimate(
     }
 
 
-def load_metadata(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text())
-    required = {
-        "scenario",
-        "fixture",
-        "measured_pixels",
-        "checksum",
-        "observed_threads",
-    }
-    missing = required.difference(value)
-    if missing:
-        raise RuntimeError(f"benchmark metadata is missing {sorted(missing)}")
-    return value
-
-
 def check_baseline(
     result: dict[str, object], baseline_path: Path, case_name: str
 ) -> None:
@@ -187,7 +147,11 @@ def check_baseline(
 
 def main() -> int:
     args = parse_args()
-    require_supported_host()
+    try:
+        require_supported_host()
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        return 77
     if args.check and (not args.baseline or not args.calibration):
         raise RuntimeError("--check requires --baseline and --calibration")
 
@@ -203,31 +167,19 @@ def main() -> int:
 
     env = os.environ.copy()
     env["VC_RENDER_SAMPLER_THREADS"] = str(workers)
-    command = [
-        "valgrind",
-        "--tool=callgrind",
-        "--instr-atstart=no",
-        "--collect-systime=no",
-        "--cache-sim=yes",
-        "--branch-sim=yes",
-        f"--I1={CACHE_GEOMETRY['I1']}",
-        f"--D1={CACHE_GEOMETRY['D1']}",
-        f"--LL={CACHE_GEOMETRY['LL']}",
-        f"--callgrind-out-file={raw_path}",
-        str(args.benchmark),
-        "--callgrind",
-        "--fixture",
+    command = callgrind_command(
+        args.benchmark,
         args.fixture,
-        "--scenario",
         args.scenario,
-        "--metadata",
-        str(metadata_path),
-    ]
-    if args.repetitions:
-        command.extend(("--repetitions", str(args.repetitions)))
+        metadata_path,
+        raw_path,
+        args.repetitions,
+        separate_threads=False,
+        fair_scheduler=False,
+    )
     subprocess.run(command, check=True, env=env)
 
-    metadata = load_metadata(metadata_path)
+    metadata = load_renderer_metadata(metadata_path)
     events = parse_callgrind(raw_path)
     pixels = int(metadata["measured_pixels"])
     result: dict[str, object] = {

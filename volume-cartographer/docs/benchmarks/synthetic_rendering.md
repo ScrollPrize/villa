@@ -866,19 +866,26 @@ python3 volume-cartographer/scripts/evaluate_render_attribution_sensitivity.py \
 
 ## Deterministic Cost
 
-Run the registered correctness and Callgrind tests:
+Configure the non-default Release benchmark graph and run the complete gate:
 
 ```bash
-ctest --test-dir volume-cartographer/build-release --output-on-failure \
-  -R '^test_render_synthetic_fixture$'
-ctest --test-dir volume-cartographer/build-release --output-on-failure \
-  --parallel 4 -R '^bench_render_callgrind_serial_'
-ctest --test-dir volume-cartographer/build-release --output-on-failure \
-  -R '^bench_render_callgrind_parallel_'
+cmake -S volume-cartographer -B volume-cartographer/build/ci-render-benchmark \
+  -G Ninja -DCMAKE_BUILD_TYPE=Release -DVC_MARCH_NATIVE=OFF \
+  -DVC_TESTING=ON -DVC_RUN_RENDER_BENCHMARKS=ON \
+  -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=OFF
+cmake --build volume-cartographer/build/ci-render-benchmark \
+  --target bench_render_synthetic --parallel 32
+ctest --test-dir volume-cartographer/build/ci-render-benchmark \
+  --output-on-failure -R '^test_render_synthetic_fixture$'
+jobs=$(nproc)
+cmake --build volume-cartographer/build/ci-render-benchmark \
+  --target render_valgrind_ci --parallel "$jobs"
 ```
 
-The serial cases may run concurrently. Parallel cases are `RUN_SERIAL` to avoid
-oversubscribing the fixed four-worker workload.
+Ninja owns the complete artifact graph. It schedules at most four independent
+Valgrind collectors at once. This is valid even for four-worker guest fixtures
+because Valgrind serializes each guest; native verification remains a separate
+non-oversubscribed test.
 
 Callgrind starts with instrumentation disabled. The executable materializes and
 warms the fixture, allocates one output and coverage matrix per measured
@@ -892,8 +899,8 @@ The fixed simulated cache is:
 - LL: 8 MiB, 16-way, 64-byte lines
 - Branch simulation: enabled
 
-Raw named events are reported per pixel. Model version 2 calculates modeled
-work cycles as:
+The older CTest entries remain available for aggregate-cost reports. Their
+model version 2 calculates modeled work cycles as:
 
 ```text
 Ir / modeled_ipc
@@ -902,7 +909,7 @@ Ir / modeled_ipc
 + branch_mispredict_cycles * (Bcm + Bim)
 ```
 
-The coefficients and effective parallelism values live in
+Those legacy coefficients and effective parallelism values live in
 `core/test/data/render_callgrind_model.json`. Aggregate parallel work is divided
 by the calibrated effective parallelism for the fixed worker count, then one
 shared `nanoseconds_per_modeled_cycle` factor produces estimated ns/px and
@@ -925,24 +932,55 @@ model pipeline overlap, hardware prefetching, DVFS, or true simultaneous thread
 execution. In particular, ideal-cache miss counts do not fully express the
 native difference between correlated and shuffled memory access.
 
-Raw outputs and JSON summaries are written to
-`build-release/render-benchmark/`. CI uploads that directory even when a gate
-fails.
+### Fresh Valgrind replay gate
+
+The CI gate uses `scripts/run_render_valgrind_ci.py` and writes under
+`build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`. Every case
+has a separate-thread Callgrind artifact. Parallel cases additionally have a
+DRD trace/event artifact. Collection manifests are written atomically after
+validation, and each raw file is hashed before evaluation.
+
+The frozen model is `core/test/data/render_valgrind_ci_model.json`. It uses the
+seven synthetic-only data-read event coefficients. Serial score is total
+modeled thread work per render call. Parallel score is the native FIFO replay
+makespan per call with these fixed controls:
+
+```text
+workers = 4
+cores = workers + 1 = 5
+split = equal
+residual_fraction = 0.5
+wake_latency = 0
+cross_thread_release = 3157.1798928563853 ns
+replay_idle_scale = 1
+dependency_excess_scale = 1
+```
+
+Process startup and native timing are not part of this score. The calibration
+did not pass its absolute-timing promotion gates, so the metric is a relative
+modeled-runtime score only. It must not be described as estimated native wall
+time. Each candidate score must fall in `[0.90, 1.10]` times the checked
+reference.
+
+The gate rejects model hashes, checksums, incomplete DRD dependencies, compiler
+or Valgrind versions, cache geometry, architecture, fixture shape, repetition
+count, and worker count that differ from the reference. CI retains the complete
+`render-valgrind-ci/` tree even on failure.
+
+The 2026-08-07 GCC 15.3.0/Valgrind 3.25.1 reference collection took 15.73 s on
+the four-core calibration host. A second fresh collection and gate took 16.38
+s. Its parallel score ratios ranged from 0.993 to 1.016; all serial scores were
+identical. CI derives Ninja concurrency from `nproc`; four was a property of
+that reference runner, not a workflow constant.
 
 Each calibrated JSON summary reports `modeled_cycles_per_pixel` and
 `estimated_mpx_per_second` together with the shared conversion and reference
 host. The throughput estimate is scoped to these exact synthetic fixtures.
 
-## Updating Baselines
+## Operating And Updating The Gate
 
-Regression baselines live in
-`core/test/data/render_callgrind_baseline.json`; calibration coefficients live
-separately in `core/test/data/render_callgrind_model.json`. Update baselines only after running
-all eight cases in the pinned generic Release configuration and checking that
-the cost change is expected. Preserve the measured baseline separately from the
-maximum gate, retain the checksum unless output intentionally changed, and
-record the reason in `planning/task_log.md` or `planning/changelog.md`.
-
-Do not refit the calibration merely to absorb a regression. Recalibration
-requires the full native observation protocol, all deterministic event cases,
-and passing training and held-out acceptance thresholds.
+See [VC3D Rendering Performance Gate](render_valgrind_ci.md) for local use,
+artifact diagnosis, CI activation, synthetic-only model recalibration,
+eight-case reference refresh, and intentional tolerance changes. Legacy
+aggregate-cost baselines remain in `core/test/data/render_callgrind_baseline.json`
+with coefficients in `core/test/data/render_callgrind_model.json`.

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import math
+import os
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,12 @@ SPEC = importlib.util.spec_from_file_location("run_thread_sync_replay", SCRIPT)
 REPLAY = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = REPLAY
 SPEC.loader.exec_module(REPLAY)
+
+from native_thread_sync_replay import (  # noqa: E402
+    NativeReplayEngine,
+    attribution_request,
+    replay_request,
+)
 
 
 class ThreadSyncReplayTest(unittest.TestCase):
@@ -110,9 +118,7 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
             ),
         ]
         baseline = REPLAY.simulate(events, 2, "fifo")
-        delayed = REPLAY.simulate(
-            events, 2, "fifo", cross_thread_latency=7.0
-        )
+        delayed = REPLAY.simulate(events, 2, "fifo", cross_thread_latency=7.0)
         self.assertEqual(
             delayed["modeled_makespan"], baseline["modeled_makespan"] + 7.0
         )
@@ -123,9 +129,7 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
             for index, duration in enumerate((3.0, 3.0, 2.0, 2.0, 2.0))
         ]
         raw = REPLAY.simulate_adjusted(events, 2, "fifo", replay_idle_scale=1.0)
-        lower = REPLAY.simulate_adjusted(
-            events, 2, "fifo", replay_idle_scale=0.0
-        )
+        lower = REPLAY.simulate_adjusted(events, 2, "fifo", replay_idle_scale=0.0)
         half = REPLAY.simulate_adjusted(events, 2, "fifo", replay_idle_scale=0.5)
         self.assertEqual(raw["raw_replay_makespan"], 7.0)
         self.assertEqual(lower["modeled_makespan"], 6.0)
@@ -143,15 +147,9 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
                 duration=10.0,
             ),
         ]
-        zero = REPLAY.simulate_adjusted(
-            events, 2, "fifo", dependency_excess_scale=0.0
-        )
-        half = REPLAY.simulate_adjusted(
-            events, 2, "fifo", dependency_excess_scale=0.5
-        )
-        full = REPLAY.simulate_adjusted(
-            events, 2, "fifo", dependency_excess_scale=1.0
-        )
+        zero = REPLAY.simulate_adjusted(events, 2, "fifo", dependency_excess_scale=0.0)
+        half = REPLAY.simulate_adjusted(events, 2, "fifo", dependency_excess_scale=0.5)
+        full = REPLAY.simulate_adjusted(events, 2, "fifo", dependency_excess_scale=1.0)
         self.assertEqual(zero["hard_schedule_lower_bound"], 10.0)
         self.assertEqual(zero["dependency_excess"], 10.0)
         self.assertEqual(zero["modeled_makespan"], 10.0)
@@ -183,9 +181,7 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
 
     def test_dependency_scale_rejects_invalid_bounds(self):
         with self.assertRaisesRegex(RuntimeError, "dependency excess scale"):
-            REPLAY.simulate_adjusted(
-                [], 1, "fifo", dependency_excess_scale=1.1
-            )
+            REPLAY.simulate_adjusted([], 1, "fifo", dependency_excess_scale=1.1)
 
     def test_replay_model_schema_keeps_scale_kinds_disjoint(self):
         self.assertEqual(
@@ -210,9 +206,7 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
 
     def test_synthetic_workload_uses_drd_and_spare_caller_core(self):
         self.assertEqual(REPLAY._parallel_core_count("synthetic", 7), 8)
-        self.assertIn(
-            "--tool=drd", REPLAY._valgrind_trace_tool_options("synthetic")
-        )
+        self.assertIn("--tool=drd", REPLAY._valgrind_trace_tool_options("synthetic"))
         self.assertEqual(
             REPLAY._valgrind_scheduler_options("synthetic"),
             ["--fair-sched=yes"],
@@ -243,9 +237,7 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
             REPLAY._valgrind_scheduler_options("renderer"),
             ["--fair-sched=yes"],
         )
-        self.assertEqual(
-            REPLAY._callgrind_benchmark_args(args)[-1], "--callgrind"
-        )
+        self.assertEqual(REPLAY._callgrind_benchmark_args(args)[-1], "--callgrind")
         native = REPLAY._benchmark_args(args, repetitions=512)
         self.assertEqual(native[native.index("--repetitions") + 1], "512")
         self.assertEqual(REPLAY._valgrind_scheduler_options("dispatch"), [])
@@ -258,6 +250,92 @@ SYSCALL[7,2](202) ... [async] --> Success(0x0)
         )
         self.assertEqual(REPLAY._parallel_core_count("renderer", 7), 8)
         self.assertEqual(REPLAY._parallel_core_count("dispatch", 7), 7)
+
+    @unittest.skipUnless(
+        os.environ.get("VC_THREAD_SYNC_REPLAY_BIN"),
+        "native replay executable is not configured",
+    )
+    def test_native_batch_matches_python_reference_for_all_policies(self):
+        events = [
+            REPLAY.TraceEvent(0, 1, "thread_start"),
+            REPLAY.TraceEvent(1, 2, "thread_start"),
+            REPLAY.TraceEvent(
+                2, 1, "work_quantum", dependencies=[(0, "program_order")]
+            ),
+            REPLAY.TraceEvent(
+                3,
+                2,
+                "work",
+                dependencies=[(1, "program_order"), (2, "drd_happens_before")],
+            ),
+            REPLAY.TraceEvent(4, 1, "futex_wake", dependencies=[(2, "program_order")]),
+            REPLAY.TraceEvent(
+                5,
+                2,
+                "futex_resume",
+                dependencies=[(3, "program_order"), (4, "futex_wake")],
+            ),
+            REPLAY.TraceEvent(
+                6, 1, "thread_finish", dependencies=[(4, "program_order")]
+            ),
+            REPLAY.TraceEvent(
+                7, 2, "thread_finish", dependencies=[(5, "program_order")]
+            ),
+        ]
+        costs = {1: 100.0, 2: 80.0}
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "events.jsonl"
+            REPLAY.write_event_stream(event_path, events)
+            with NativeReplayEngine(
+                Path(os.environ["VC_THREAD_SYNC_REPLAY_BIN"])
+            ) as engine:
+                engine.load_graph("parity", event_path)
+                attributions = []
+                jobs = []
+                expected = {}
+                for residual in (0.0, 0.5, 1.0):
+                    for split in ("front", "equal", "back"):
+                        attribution_id = f"r{residual:g}/{split}"
+                        attributions.append(
+                            attribution_request(attribution_id, costs, residual, split)
+                        )
+                        REPLAY.assign_costs(events, costs, residual, split)
+                        for tie in ("fifo", "round_robin"):
+                            for cores in (1, 2):
+                                job_id = f"{attribution_id}/{tie}/{cores}"
+                                jobs.append(
+                                    replay_request(
+                                        job_id,
+                                        attribution_id,
+                                        cores,
+                                        tie,
+                                        wake_latency=3.0,
+                                        cross_thread_latency=7.0,
+                                        replay_idle_scale=0.75,
+                                        dependency_excess_scale=0.25,
+                                    )
+                                )
+                                expected[job_id] = REPLAY.simulate_adjusted(
+                                    events,
+                                    cores,
+                                    tie,
+                                    wake_latency=3.0,
+                                    cross_thread_latency=7.0,
+                                    replay_idle_scale=0.75,
+                                    dependency_excess_scale=0.25,
+                                )
+                engine.register_attributions("parity", attributions)
+                actual = engine.replay_batch("parity", jobs)
+        self.assertEqual(actual.keys(), expected.keys())
+        for job_id in expected:
+            self.assertEqual(actual[job_id].keys(), expected[job_id].keys())
+            for name, value in expected[job_id].items():
+                self.assertTrue(
+                    math.isclose(
+                        actual[job_id][name], value, rel_tol=1e-12, abs_tol=1e-9
+                    ),
+                    f"{job_id} {name}: {actual[job_id][name]} != {value}",
+                )
 
 
 if __name__ == "__main__":

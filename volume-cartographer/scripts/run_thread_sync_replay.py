@@ -17,8 +17,15 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from run_render_callgrind import CACHE_GEOMETRY, modeled_work_cycles, parse_callgrind
+from native_thread_sync_replay import (
+    NativeReplayEngine,
+    attribution_request,
+    replay_request,
+    resolve_replay_engine,
+)
 from passive_event_model import modeled_thread_costs_ns
+from render_valgrind_common import CACHE_GEOMETRY, parse_thread_profiles
+from run_render_callgrind import modeled_work_cycles
 
 SCHEMA_VERSION = 3
 FUTEX_COMMAND_MASK = 0x7F
@@ -36,9 +43,7 @@ CLONE_RE = re.compile(r"SYSCALL\[\d+,(\d+)\]\(56\) sys_clone")
 SET_TID_ADDRESS_RE = re.compile(
     r"SYSCALL\[\d+,(\d+)\]\(218\) sys_set_tid_address \( (0x[0-9a-fA-F]+) \)"
 )
-DRD_SEGMENT_RE = re.compile(
-    r"New segment for thread (\d+) with vc \[([^]]*)\]"
-)
+DRD_SEGMENT_RE = re.compile(r"New segment for thread (\d+) with vc \[([^]]*)\]")
 DRD_CLOCK_RE = re.compile(r"(\d+):\s*(\d+)")
 
 
@@ -282,9 +287,7 @@ def parse_drd_trace(path: Path) -> ParsedTrace:
             }
             own_clock = clock.get(thread)
             if own_clock is None:
-                raise RuntimeError(
-                    f"DRD segment for thread {thread} has no own clock"
-                )
+                raise RuntimeError(f"DRD segment for thread {thread} has no own clock")
             event = _append_event(
                 events,
                 thread,
@@ -293,9 +296,8 @@ def parse_drd_trace(path: Path) -> ParsedTrace:
                 own_clock=own_clock,
             )
             for owner, value in clock.items():
-                if (
-                    owner != thread
-                    and value > previous_clock.get(thread, {}).get(owner, 0)
+                if owner != thread and value > previous_clock.get(thread, {}).get(
+                    owner, 0
                 ):
                     unresolved.append((event, owner, value))
             key = (thread, own_clock)
@@ -382,25 +384,6 @@ def read_event_stream(path: Path) -> list[TraceEvent]:
             raise RuntimeError(f"non-contiguous event sequence in {path}")
         events.append(event)
     return events
-
-
-def parse_thread_profiles(prefix: Path) -> dict[int, dict[str, int]]:
-    profiles: dict[int, dict[str, int]] = {}
-    for name in sorted(glob.glob(f"{prefix}-*")):
-        path = Path(name)
-        thread = None
-        for line in path.read_text().splitlines():
-            if line.startswith("thread:"):
-                thread = int(line.split()[1])
-                break
-        if thread is None:
-            raise RuntimeError(f"Callgrind profile has no thread ID: {path}")
-        if thread in profiles:
-            raise RuntimeError(f"duplicate Callgrind profile for thread {thread}")
-        profiles[thread] = parse_callgrind(path)
-    if not profiles:
-        raise RuntimeError(f"no separate-thread Callgrind profiles at {prefix}-*")
-    return profiles
 
 
 def assign_costs(
@@ -498,8 +481,7 @@ def simulate(
     eligible_fifo: list[int] = []
     if tie_policy == "fifo":
         ready_by_release = [
-            (dependency_finish[sequence], sequence)
-            for sequence in initially_ready
+            (dependency_finish[sequence], sequence) for sequence in initially_ready
         ]
         heapq.heapify(ready_by_release)
     core_available = [0.0] * cores
@@ -714,22 +696,16 @@ def simulate_adjusted(
             "replay_idle_scale": replay_idle_scale,
             "raw_simulated_core_idle": result["simulated_core_idle"],
             "modeled_makespan": adjusted,
-            "simulated_core_idle": max(
-                0.0, cores * adjusted - result["modeled_work"]
-            ),
+            "simulated_core_idle": max(0.0, cores * adjusted - result["modeled_work"]),
             "utilization": (
-                result["modeled_work"] / (cores * adjusted)
-                if adjusted
-                else 0.0
+                result["modeled_work"] / (cores * adjusted) if adjusted else 0.0
             ),
         }
     )
     return result
 
 
-def replay_scales_for_model(
-    loaded_model: dict[str, object]
-) -> tuple[float, float]:
+def replay_scales_for_model(loaded_model: dict[str, object]) -> tuple[float, float]:
     schema = int(loaded_model.get("schema_version", 1))
     parameters = loaded_model.get("parameters", {})
     if schema <= 2:
@@ -817,6 +793,7 @@ def parse_args() -> argparse.Namespace:
         / "core/test/data/render_callgrind_model.json",
     )
     parser.add_argument("--event-cost-model", type=Path)
+    parser.add_argument("--replay-engine", type=Path)
     return parser.parse_args()
 
 
@@ -878,9 +855,7 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     if affinity:
         command = ["taskset", "-c", ",".join(str(cpu) for cpu in affinity), *command]
-    return subprocess.run(
-        command, check=True, text=True, capture_output=True, env=env
-    )
+    return subprocess.run(command, check=True, text=True, capture_output=True, env=env)
 
 
 def _native_trials(
@@ -915,9 +890,7 @@ def _native_renderer_trials(
         run = _run(command, cpus[:core_count], env)
         external.append(float(time.perf_counter_ns() - start))
         output = json.loads(run.stdout)
-        internal.append(
-            float(output["native_median_seconds"]) * 1e9 / repetitions
-        )
+        internal.append(float(output["native_median_seconds"]) * 1e9 / repetitions)
     return external, internal
 
 
@@ -970,11 +943,9 @@ def main() -> int:
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    replay_engine_path = resolve_replay_engine(args.replay_engine, args.benchmark)
     if args.workload == "renderer":
-        stem = (
-            f"renderer-{args.scenario}-w{args.workers}"
-            f"-r{args.repetitions}"
-        )
+        stem = f"renderer-{args.scenario}-w{args.workers}-r{args.repetitions}"
     else:
         prefix = "synthetic-" if args.workload == "synthetic" else ""
         stem = (
@@ -1023,7 +994,16 @@ def main() -> int:
             else parse_core_trace(trial_path)
         )
     parsed = parsed_trials[0]
-    write_event_stream(event_path, parsed.events)
+    event_paths = [
+        (
+            event_path
+            if trial == 0
+            else args.output_dir / f"sync-events.{stem}.trial{trial}.jsonl"
+        )
+        for trial in range(args.trace_trials)
+    ]
+    for trial_path, trial in zip(event_paths, parsed_trials, strict=True):
+        write_event_stream(trial_path, trial.events)
 
     for old_path in glob.glob(f"{callgrind_prefix}*"):
         Path(old_path).unlink()
@@ -1078,13 +1058,10 @@ def main() -> int:
             )
         )
         per_worker_startup_ns = float(
-            loaded_model.get("parameters", {}).get(
-                "per_worker_startup_ns", 0.0
-            )
+            loaded_model.get("parameters", {}).get("per_worker_startup_ns", 0.0)
         )
         fixed_process_ns = (
-            base_process_ns
-            + max(0, args.workers - 1) * per_worker_startup_ns
+            base_process_ns + max(0, args.workers - 1) * per_worker_startup_ns
         )
         cost_inputs.append(("synthetic_event_ns", event_costs))
     elif args.workload != "synthetic":
@@ -1100,24 +1077,101 @@ def main() -> int:
         )
 
     simulations: dict[str, object] = {}
-    for cost_name, costs in cost_inputs:
-        for residual in (0.0, 0.5, 1.0):
-            for split in ("front", "equal", "back"):
-                assign_costs(parsed.events, costs, residual, split)
-                for tie in ("fifo", "round_robin"):
-                    key = f"{cost_name}/residual{residual:g}/{split}/{tie}"
-                    simulations[key] = {
-                        str(cores): simulate_adjusted(
-                            parsed.events,
-                            cores,
-                            tie,
-                            args.wake_latency,
-                            cross_thread_latency,
-                            replay_idle_scale,
-                            dependency_excess_scale,
-                        )
-                        for cores in (1, parallel_cores)
-                    }
+    with NativeReplayEngine(replay_engine_path) as replay_engine:
+        for trial, trial_event_path in enumerate(event_paths):
+            event_count = replay_engine.load_graph(f"trial{trial}", trial_event_path)
+            if event_count != len(parsed_trials[trial].events):
+                raise RuntimeError("native replay loaded a different event count")
+
+        attributions = []
+        jobs = []
+        job_destinations: dict[str, tuple[str, str]] = {}
+        for cost_name, costs in cost_inputs:
+            for residual in (0.0, 0.5, 1.0):
+                for split in ("front", "equal", "back"):
+                    attribution_id = f"{cost_name}/residual{residual:g}/{split}"
+                    attributions.append(
+                        attribution_request(attribution_id, costs, residual, split)
+                    )
+                    for tie in ("fifo", "round_robin"):
+                        key = f"{attribution_id}/{tie}"
+                        simulations[key] = {}
+                        for cores in (1, parallel_cores):
+                            job_id = f"{key}/cores{cores}"
+                            jobs.append(
+                                replay_request(
+                                    job_id,
+                                    attribution_id,
+                                    cores,
+                                    tie,
+                                    args.wake_latency,
+                                    cross_thread_latency,
+                                    replay_idle_scale,
+                                    dependency_excess_scale,
+                                )
+                            )
+                            job_destinations[job_id] = (key, str(cores))
+        replay_engine.register_attributions("trial0", attributions)
+        batch = replay_engine.replay_batch("trial0", jobs)
+        for job_id, value in batch.items():
+            key, cores = job_destinations[job_id]
+            simulations[key][cores] = value
+
+        if event_costs is not None:
+            nominal_cost_name = "synthetic_event_ns"
+            nominal_costs = event_costs
+        elif args.workload == "synthetic":
+            nominal_cost_name = "instructions"
+            nominal_costs = instruction_costs
+        else:
+            nominal_cost_name = "modeled_events"
+            nominal_costs = cost_inputs[-1][1]
+        nominal_attribution = f"{nominal_cost_name}/residual0.5/equal"
+        trace_trial_speedups = []
+        trace_trial_parallel_ns = []
+        for trial in range(args.trace_trials):
+            graph_id = f"trial{trial}"
+            attribution_id = nominal_attribution
+            if trial != 0:
+                replay_engine.register_attributions(
+                    graph_id,
+                    [attribution_request(attribution_id, nominal_costs, 0.5, "equal")],
+                )
+            trial_results = replay_engine.replay_batch(
+                graph_id,
+                [
+                    replay_request(
+                        "serial",
+                        attribution_id,
+                        1,
+                        "fifo",
+                        args.wake_latency,
+                        cross_thread_latency,
+                        replay_idle_scale,
+                        dependency_excess_scale,
+                    ),
+                    replay_request(
+                        "parallel",
+                        attribution_id,
+                        parallel_cores,
+                        "fifo",
+                        args.wake_latency,
+                        cross_thread_latency,
+                        replay_idle_scale,
+                        dependency_excess_scale,
+                    ),
+                ],
+            )
+            serial_trial = trial_results["serial"]["modeled_makespan"]
+            parallel_trial = trial_results["parallel"]["modeled_makespan"]
+            trace_trial_speedups.append(serial_trial / parallel_trial)
+            trace_trial_parallel_ns.append(parallel_trial)
+        replay_engine_diagnostics = {
+            "executable": str(replay_engine_path),
+            "protocol_version": 1,
+            "startup_seconds": replay_engine.startup_seconds,
+            "phases": replay_engine.timings,
+        }
 
     native: dict[str, object] = {}
     for cores in (1, parallel_cores):
@@ -1148,9 +1202,9 @@ def main() -> int:
                 "maximum": max(internal),
             }
             if args.workload == "renderer":
-                native[str(cores)]["measured_render_nanoseconds_per_call"] = (
-                    native[str(cores)]["measured_work_ns"]
-                )
+                native[str(cores)]["measured_render_nanoseconds_per_call"] = native[
+                    str(cores)
+                ]["measured_work_ns"]
 
     one_worker_renderer = None
     if args.workload == "renderer" and args.workers != 1:
@@ -1172,21 +1226,11 @@ def main() -> int:
             },
         }
 
-    if event_costs is not None:
-        nominal_cost_name = "synthetic_event_ns"
-        nominal_costs = event_costs
-    elif args.workload == "synthetic":
-        nominal_cost_name = "instructions"
-        nominal_costs = instruction_costs
-    else:
-        nominal_cost_name = "modeled_events"
-        nominal_costs = cost_inputs[-1][1]
     nominal_key = f"{nominal_cost_name}/residual0.5/equal/fifo"
     nominal = simulations[nominal_key]
     if args.workload == "renderer":
         native_modeled_ns = {
-            cores: native[str(cores)]["measured_work_ns"]["median"]
-            * args.repetitions
+            cores: native[str(cores)]["measured_work_ns"]["median"] * args.repetitions
             for cores in (1, parallel_cores)
         }
         native_scope = "measured render calls"
@@ -1198,59 +1242,24 @@ def main() -> int:
         native_scope = "benchmark internal measured work loop"
     else:
         native_modeled_ns = {
-            cores: native[str(cores)]["median_ns"]
-            for cores in (1, parallel_cores)
+            cores: native[str(cores)]["median_ns"] for cores in (1, parallel_cores)
         }
         native_scope = "whole process"
     predicted_speedup = (
         nominal["1"]["modeled_makespan"]
         / nominal[str(parallel_cores)]["modeled_makespan"]
     )
-    observed_speedup = (
-        native_modeled_ns[1] / native_modeled_ns[parallel_cores]
-    )
-    local_ns_per_modeled_work = (
-        native_modeled_ns[1] / nominal["1"]["modeled_makespan"]
-    )
+    observed_speedup = native_modeled_ns[1] / native_modeled_ns[parallel_cores]
+    local_ns_per_modeled_work = native_modeled_ns[1] / nominal["1"]["modeled_makespan"]
     locally_estimated_parallel_ns = (
-        nominal[str(parallel_cores)]["modeled_makespan"]
-        * local_ns_per_modeled_work
+        nominal[str(parallel_cores)]["modeled_makespan"] * local_ns_per_modeled_work
     )
     predicted_speedups = [
-        value["1"]["modeled_makespan"]
-        / value[str(parallel_cores)]["modeled_makespan"]
+        value["1"]["modeled_makespan"] / value[str(parallel_cores)]["modeled_makespan"]
         for value in simulations.values()
     ]
-    trace_trial_speedups = []
-    trace_trial_parallel_ns = []
-    for trial in parsed_trials:
-        assign_costs(trial.events, nominal_costs, 0.5, "equal")
-        serial_trial = simulate_adjusted(
-            trial.events,
-            1,
-            "fifo",
-            args.wake_latency,
-            cross_thread_latency,
-            replay_idle_scale,
-            dependency_excess_scale,
-        )["modeled_makespan"]
-        parallel_trial = simulate_adjusted(
-            trial.events,
-            parallel_cores,
-            "fifo",
-            args.wake_latency,
-            cross_thread_latency,
-            replay_idle_scale,
-            dependency_excess_scale,
-        )["modeled_makespan"]
-        trace_trial_speedups.append(
-            serial_trial / parallel_trial
-        )
-        trace_trial_parallel_ns.append(parallel_trial)
-
     complete = all(
-        trial.unmatched_waits == 0
-        and trial.unresolved_happens_before == 0
+        trial.unmatched_waits == 0 and trial.unresolved_happens_before == 0
         for trial in parsed_trials
     )
     unmatched_total = sum(trial.unmatched_waits for trial in parsed_trials)
@@ -1340,6 +1349,7 @@ def main() -> int:
             "raw_path": str(trace_path),
             "raw_paths": [str(path) for path in trace_paths],
             "event_path": str(event_path),
+            "event_paths": [str(path) for path in event_paths],
         },
         "profiles": {str(thread): events for thread, events in profiles.items()},
         "event_costs_ns_by_thread": (
@@ -1348,6 +1358,7 @@ def main() -> int:
             else None
         ),
         "simulations": simulations,
+        "native_replay": replay_engine_diagnostics,
         "validation": {
             "native_scope": native_scope,
             "nominal_simulation": nominal_key,
@@ -1357,9 +1368,7 @@ def main() -> int:
             "case_local_ns_per_modeled_work": local_ns_per_modeled_work,
             "locally_estimated_parallel_ns": locally_estimated_parallel_ns,
             "relative_parallel_runtime_error": (
-                locally_estimated_parallel_ns
-                / native_modeled_ns[parallel_cores]
-                - 1.0
+                locally_estimated_parallel_ns / native_modeled_ns[parallel_cores] - 1.0
             ),
             "sensitivity_speedup_min": min(predicted_speedups),
             "sensitivity_speedup_max": max(predicted_speedups),
@@ -1381,7 +1390,9 @@ def main() -> int:
         "fixed_process_ns": fixed_process_ns,
         "base_process_ns": base_process_ns,
         "per_worker_startup_ns": per_worker_startup_ns,
-        "event_cost_model": str(args.event_cost_model) if args.event_cost_model else None,
+        "event_cost_model": (
+            str(args.event_cost_model) if args.event_cost_model else None
+        ),
         "commands": {
             "trace": trace_commands,
             "callgrind": callgrind_command,
