@@ -1662,6 +1662,10 @@ class FitContext:
             device=self.device)
 
         self.num_training_steps = cfg['optimizer_num_training_steps']
+        # _save_model's default completed_iterations is the configured horizon at
+        # setup time, unaffected by any later interactive schedule realignment
+        # (preserving the former closure's def-time default binding).
+        self._initial_num_training_steps = self.num_training_steps
 
         progress.begin('loading', 'Constructing spiral model')
         self.spiral_and_transform = SpiralAndTransform(
@@ -1754,86 +1758,6 @@ class FitContext:
         else:
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimiser, lambda step: 1.)
 
-        # Checkpoint save/load helpers. Closures for now; commit 4 exposes them
-        # behind compatibility adapters as context methods.
-        def checkpoint_payload(completed_iterations):
-            def durable_config(value):
-                return {
-                    key: item for key, item in dict(value).items()
-                    if not key.startswith('interactive_influence_')
-                    and key != 'loss_weight_anchor'
-                }
-
-            return {
-                'schema_version': 2,
-                'completed_iterations': int(completed_iterations),
-                'spiral_and_transform': self.spiral_and_transform.state_dict(),
-                'optimiser': self.optimiser.state_dict(),
-                'scheduler': self.lr_scheduler.state_dict(),
-                'cfg': durable_config(cfg),
-                'requested_config': durable_config(
-                    getattr(self.interactive_driver, 'requested_config', dict(cfg))),
-                'resolved_config': durable_config(cfg),
-                'lasagna_scale': lasagna_scale,
-                'lasagna_group': normal_zarr_group,
-                'surf_sdt_fingerprint': (
-                    self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
-                # The model z-range, not the run window: a resumed session may
-                # optimise a narrower window than the flow field covers, and
-                # resume rebuilds parameter shapes from these values.
-                'z_begin': self.model_z_begin,
-                'z_end': self.model_z_end,
-                'spiral_outward_sense': spiral_outward_sense,
-                'numpy_rng_state': np.random.get_state(),
-                'torch_cpu_rng_state': torch.random.get_rng_state(),
-                'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
-                'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
-                'preview_first_winding': 10,
-            }
-
-        def save_model_to(path, completed_iterations):
-            destination = os.path.abspath(path)
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
-            temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
-            try:
-                torch.save(checkpoint_payload(completed_iterations), temporary)
-                # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
-                with open(temporary, 'rb+') as stream:
-                    os.fsync(stream.fileno())
-                os.replace(temporary, destination)
-                try:
-                    directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                except OSError:
-                    pass
-                return destination
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-
-        def save_model(suffix, completed_iterations=self.num_training_steps):
-            return save_model_to(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
-
-        def load_model(checkpoint):
-            transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
-            self.spiral_and_transform.load_state_dict(transformed_spiral_state)
-            self.optimiser.load_state_dict(optimiser_state)
-            # Older checkpoints could have been saved while influence masking had
-            # disabled gap weight decay. Influence state is no longer restored, so
-            # restore the session configuration explicitly as well.
-            gap_param = self.gap_expander_params[0]
-            gap_group = next(group for group in self.optimiser.param_groups
-                             if any(param is gap_param for param in group['params']))
-            gap_group['weight_decay'] = cfg['optimizer_weight_decay_gap_expander']
-            if checkpoint.get('scheduler') is not None:
-                self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
-
-        self._save_model_to = save_model_to
-        self._save_model = save_model
-
         if resume_path:
             embedded_iteration = resume_checkpoint.get('completed_iterations') if isinstance(resume_checkpoint, dict) else None
             if embedded_iteration is not None:
@@ -1842,7 +1766,7 @@ class FitContext:
             progress.begin(
                 'loading', 'Restoring model and optimizer',
                 detail=os.path.basename(resume_path))
-            load_model(resume_checkpoint)
+            self.load_checkpoint(resume_checkpoint)
             if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
                 for _ in range(self.start_iteration):
                     self.lr_scheduler.step()
@@ -2005,6 +1929,734 @@ class FitContext:
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
         self.interactive_dt_resume_iteration = None
 
+    # ==========================================================================
+    # Checkpoint save/load
+    # ==========================================================================
+
+    def _checkpoint_payload(self, completed_iterations):
+        def durable_config(value):
+            return {
+                key: item for key, item in dict(value).items()
+                if not key.startswith('interactive_influence_')
+                and key != 'loss_weight_anchor'
+            }
+
+        return {
+            'schema_version': 2,
+            'completed_iterations': int(completed_iterations),
+            'spiral_and_transform': self.spiral_and_transform.state_dict(),
+            'optimiser': self.optimiser.state_dict(),
+            'scheduler': self.lr_scheduler.state_dict(),
+            'cfg': durable_config(cfg),
+            'requested_config': durable_config(
+                getattr(self.interactive_driver, 'requested_config', dict(cfg))),
+            'resolved_config': durable_config(cfg),
+            'lasagna_scale': lasagna_scale,
+            'lasagna_group': normal_zarr_group,
+            'surf_sdt_fingerprint': (
+                self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
+            # The model z-range, not the run window: a resumed session may
+            # optimise a narrower window than the flow field covers, and
+            # resume rebuilds parameter shapes from these values.
+            'z_begin': self.model_z_begin,
+            'z_end': self.model_z_end,
+            'spiral_outward_sense': spiral_outward_sense,
+            'numpy_rng_state': np.random.get_state(),
+            'torch_cpu_rng_state': torch.random.get_rng_state(),
+            'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
+            'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
+            'preview_first_winding': 10,
+        }
+
+    def save_checkpoint(self, path, completed_iterations):
+        destination = os.path.abspath(path)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
+        try:
+            torch.save(self._checkpoint_payload(completed_iterations), temporary)
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+            try:
+                directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+            return destination
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _save_model(self, suffix, completed_iterations=None):
+        if completed_iterations is None:
+            completed_iterations = self._initial_num_training_steps
+        return self.save_checkpoint(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
+
+    def load_checkpoint(self, checkpoint):
+        transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
+        self.spiral_and_transform.load_state_dict(transformed_spiral_state)
+        self.optimiser.load_state_dict(optimiser_state)
+        # Older checkpoints could have been saved while influence masking had
+        # disabled gap weight decay. Influence state is no longer restored, so
+        # restore the session configuration explicitly as well.
+        gap_param = self.gap_expander_params[0]
+        gap_group = next(group for group in self.optimiser.param_groups
+                         if any(param is gap_param for param in group['params']))
+        gap_group['weight_decay'] = cfg['optimizer_weight_decay_gap_expander']
+        if checkpoint.get('scheduler') is not None:
+            self.lr_scheduler.load_state_dict(checkpoint['scheduler'])
+
+    def _rebuild_unverified_patch_inputs(self, exclusion_radius):
+        """Reload only the unverified-patch pool for a Run-boundary mask edit."""
+        if not unverified_patches_path:
+            return {}, [], None, None
+        candidates = self._load_patches_from_dir(unverified_patches_path)
+        for patch_id, patch in list(candidates.items()):
+            cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+            if (cells_to_erode > 0
+                    and not erode_patch_valid_region(patch, cells_to_erode)):
+                del candidates[patch_id]
+                continue
+            if not patch_intersects_z_roi(patch, z_begin, z_end):
+                del candidates[patch_id]
+                continue
+            patch.release_derived_caches()
+        candidates, n_masked, n_dropped = \
+            _mask_unverified_patches_near_trusted_geometry(
+                candidates, self.trusted_geometry_tree, exclusion_radius)
+        print(
+            f'unverified patches: remasked {n_masked} vertices near trusted '
+            f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
+            f'{len(candidates)} remain')
+        candidate_list = list(candidates.values())
+        probabilities = (
+            self._prepare_patch_sampling_cache(candidate_list)
+            if candidate_list else None)
+        atlas = (
+            PatchAtlas(candidates, device='cuda')
+            if candidate_list else None)
+        return candidates, candidate_list, probabilities, atlas
+
+    def _prepare_png_visualization_inputs(self):
+        zs = np.linspace(
+            z_begin,
+            z_end - 1,
+            min(self.num_slices_for_visualisation, z_end - 1 - z_begin),
+            dtype=np.int64,
+        )
+        if self.scroll_zarr is not None:
+            subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
+            print('loading slices for visualisation')
+            vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
+            scroll_slices = (
+                torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
+                / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
+            ).to(torch.uint8)
+        else:
+            subvolume_shape = (
+                z_end - z_begin,
+                int(np.ceil(32693 / render_volume_scale)),
+                int(np.ceil(32693 / render_volume_scale)),
+            )
+            scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
+
+        prediction_slices, quad_labels, _ = overlay_patches_on_slices(
+            self.verified_patches_list,
+            zs,
+            subvolume_shape[1:],
+            cache_path,
+            canvas_scale=render_volume_scale,
+        )
+        yx = torch.stack(torch.meshgrid(
+            torch.arange(subvolume_shape[1], dtype=torch.float32),
+            torch.arange(subvolume_shape[2], dtype=torch.float32),
+            indexing='ij',
+        ), axis=-1).to(self.device) * render_volume_scale
+        return zs, yx, scroll_slices, prediction_slices, quad_labels
+
+    def _clear_interactive_influence(self):
+        """End the current Run request's influence window."""
+        self.interactive_dt_resume_iteration = None
+        if self.influence_state is None:
+            self.interactive_influence_loss_weight = 0.0
+            self.interactive_influence_anchor_samples = 0
+            return
+        self.influence_state.deactivate_(self.spiral_and_transform, self.optimiser)
+        self.influence_state = None
+        self.interactive_influence_loss_weight = 0.0
+        self.interactive_influence_anchor_samples = 0
+
+    def export_preview(self, generation_path, surface_id):
+        progress = progress_or_null(self.progress)
+        # Export has its own saved RNG envelope so pausing does not alter the
+        # stochastic training sequence.
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            manifest = save_combined_preview(
+                self.spiral_and_transform.get_slice_to_spiral_transform(),
+                self.spiral_and_transform.get_dr_per_winding(),
+                self.verified_patches_list,
+                self.unattached_pcl_strips,
+                generation_path,
+                cfg,
+                z_begin,
+                z_end,
+                voxel_size_um,
+                get_or_build_unattached_pcl_flat,
+                tracks=self.preview_extent_tracks,
+                surface_id=surface_id,
+                progress=progress,
+            )
+            diagnostic_weights = {
+                name: cfg.get(f'loss_weight_{name}', 0.0)
+                for name in (
+                    'patch_radius', 'patch_dt',
+                    'unverified_patch_radius', 'unverified_patch_dt',
+                    'sym_dirichlet', 'rel_winding', 'abs_winding',
+                    'dense_normals', 'dense_spacing', 'dense_attachment',
+                    'unattached_pcl_radius', 'unattached_pcl_dt',
+                    'track_radius', 'track_dt', 'shell_patch_radius',
+                )
+            }
+            if self._phase_mode_active():
+                diagnostic_weights['dense_spacing_phase'] = max(
+                    float(cfg['loss_weight_dense_spacing']), 1.0)
+                diagnostic_weights['dense_spacing_count'] = max(
+                    float(cfg['loss_weight_dense_spacing_count']), 1.0)
+            transform = self.spiral_and_transform.get_slice_to_spiral_transform()
+            dr = self.spiral_and_transform.get_dr_per_winding()
+            progress.begin(
+                'exporting_preview', 'Computing preview diagnostics')
+            recorder = LossMapRecorder(
+                manifest,
+                generation_path,
+                z0=z_begin - int(cfg['model_flow_bounds_z_margin']),
+                grid_spacing=int(cfg['output_step_size']),
+                dr_per_winding=dr,
+                weights=diagnostic_weights,
+            )
+            with torch.no_grad(), capture_loss_maps(recorder, suppress_errors=True):
+                get_patch_and_umbilicus_losses(
+                    transform, dr,
+                    cfg['sample_count_patches_per_step'],
+                    cfg['sample_count_patches_per_step_for_dt'],
+                    self.verified_patches_list, self.patch_atlas,
+                    self.patch_sampling_probabilities, self.umbilicus_zyx,
+                    compute_dt=cfg['loss_weight_patch_dt'] > 0,
+                    shell_valid_zyxs=self.shell_valid_zyxs_gpu,
+                    shell_outer_winding_idx=self.shell_outer_winding_idx,
+                )
+                if self.unverified_patch_atlas is not None:
+                    get_unverified_patch_losses(
+                        transform, dr,
+                        cfg['sample_count_unverified_patches_per_step'],
+                        cfg['sample_count_unverified_patches_per_step_for_dt'],
+                        self.unverified_patches_list, self.unverified_patch_atlas,
+                        self.unverified_patch_sampling_probabilities,
+                        compute_dt=cfg['loss_weight_unverified_patch_dt'] > 0,
+                    )
+                if cfg['loss_weight_sym_dirichlet'] > 0:
+                    get_symmetric_dirichlet_loss(
+                        transform, dr, self.shell_outer_winding_idx,
+                        cfg['sample_count_regularisation_points'])
+                if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
+                    get_patch_rel_winding_loss(
+                        transform, dr, self.verified_patches, self.patch_atlas,
+                        self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'])
+                if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
+                    get_patch_abs_winding_loss(
+                        transform, dr, self.verified_patches, self.patch_atlas,
+                        self.cross_patch_pcls)
+                if self.lasagna_volume is not None:
+                    for _loss_name, _loss_value in iter_lasagna_losses(
+                            transform, dr, self.lasagna_volume,
+                            self.shell_outer_winding_idx,
+                            cfg['sample_count_dense_normal_points'],
+                            compute_spacing=self.grad_mag_spacing_enabled):
+                        pass
+                if self._phase_mode_active():
+                    preview_generator = torch.Generator(device=dr.device)
+                    preview_generator.manual_seed(0x243F6A88)
+                    for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
+                            self.spiral_and_transform, transform, dr, self.sdt_volume,
+                            self.lasagna_volume, self.shell_outer_winding_idx, cfg,
+                            z_begin, z_end, generator=preview_generator):
+                        pass
+                if self.unattached_pcl_strips:
+                    get_unattached_pcl_strip_losses(
+                        transform, dr, self.unattached_pcl_strips,
+                        self.pcl_sampling_strata['unattached'],
+                        get_or_build_unattached_pcl_flat,
+                        cfg['sample_count_unattached_pcls_per_step'],
+                        cfg['sample_count_unattached_pcl_points_per_step'],
+                        compute_dt=cfg['loss_weight_unattached_pcl_dt'] > 0,
+                    )
+                if self.prepared_main_tracks is not None:
+                    for _loss_name, _loss_value in iter_track_losses(
+                            transform, dr, self.prepared_main_tracks, cfg,
+                            compute_dt=cfg['loss_weight_track_dt'] > 0):
+                        pass
+            # Per-pair aggregated crossing counts: mean_count - m per winding
+            # pair, the measurement behind any future discrete
+            # insert/remove/reindex operation (gradient descent cannot perform
+            # those). Written next to the loss maps as a preview artifact.
+            if self._phase_mode_active() and self.shell_outer_winding_idx is not None:
+                try:
+                    with torch.no_grad():
+                        pair_rows = aggregate_pair_counts(
+                            transform, dr, self.sdt_volume,
+                            self.shell_outer_winding_idx, cfg, z_begin, z_end)
+                    pair_table_name = 'dense_spacing_pair_counts.json'
+                    with open(os.path.join(generation_path, pair_table_name),
+                              'w', encoding='utf-8') as stream:
+                        json.dump(pair_rows, stream, indent=1)
+                    manifest = dict(manifest)
+                    manifest['dense_spacing_pair_counts'] = pair_table_name
+                except Exception as error:
+                    print('WARNING: could not aggregate per-pair crossing counts: '
+                          f'{type(error).__name__}: {error}')
+            if recorder.error is not None:
+                print('WARNING: could not generate Spiral loss overlays: '
+                      f'{type(recorder.error).__name__}: {recorder.error}')
+                return manifest
+            try:
+                entries = recorder.finish()
+                return attach_loss_maps_to_manifest(manifest, generation_path, entries)
+            except Exception as error:
+                print('WARNING: could not publish Spiral loss overlays: '
+                      f'{type(error).__name__}: {error}')
+                return manifest
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    def incorporate_interactive_inputs(self, records, influence_config=None):
+        """Append uploaded ephemeral inputs to the resident fit structures.
+
+        Runs on the fitter thread at a pause boundary. Incorporation is
+        append-only: only the new items are loaded and validated, and they are
+        concatenated onto the structures the fitter already holds (the patch
+        GPU atlas, the sampling caches, the PCL strip list). Existing tensors
+        and prepared samplers are reused untouched. The record order is the
+        service's deterministic order, so a multi-rank session would append the
+        same items in the same order on every rank.
+        """
+        # Incorporation has its own saved RNG envelope so adding inputs does
+        # not alter the stochastic training sequence (same discipline as the
+        # interactive preview export).
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            # Be defensive about a previously interrupted boundary: a new
+            # batch must never union with an earlier Run request's masks.
+            self._clear_interactive_influence()
+            run_cfg = dict(cfg)
+            run_cfg.update(dict(influence_config or {}))
+            new_patches = {}
+            new_collections = {}
+            for record in records:
+                kind = record.get('kind')
+                path = record.get('path')
+                input_id = record.get('id')
+                if kind == 'patch':
+                    if cfg['input_disable_patches']:
+                        raise RuntimeError('disable_patches=True: this session takes no patches')
+                    if input_id in self.verified_patches or input_id in new_patches:
+                        raise RuntimeError(f'Patch {input_id!r} is already part of this session')
+                    patch = load_tifxyz(path)
+                    cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+                    if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
+                        raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
+                    if not patch_intersects_z_roi(patch, z_begin, z_end):
+                        raise RuntimeError(
+                            f'Patch {input_id!r} does not intersect the fitted z range '
+                            f'[{z_begin}, {z_end})')
+                    patch.release_derived_caches()
+                    new_patches[input_id] = patch
+                elif kind == 'fiber':
+                    pcl = load_fiber_point_collection(
+                        path, self.next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
+                    if pcl is None:
+                        raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
+                    pcl['source_file'] = path
+                    pcl.setdefault('metadata', {})['winding_is_absolute'] = False
+                    pcl['metadata']['input_role'] = 'fiber'
+                    hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
+                    pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
+                    new_collections[self.next_id] = pcl
+                    self.next_id += 1
+                elif kind == 'pcl':
+                    role = record.get('role')
+                    loaded = load_point_collection(path) or {}
+                    if not loaded:
+                        raise RuntimeError(f'PCL document {input_id!r} contains no collections')
+                    for pcl in loaded.values():
+                        pcl['source_file'] = path
+                        pcl['sampling_group'] = path
+                        pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
+                        pcl['metadata']['input_role'] = role
+                        new_collections[self.next_id] = pcl
+                        self.next_id += 1
+                else:
+                    raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
+
+            # Weighted sampling intentionally requires every group to be named.
+            # Validate uploaded groups before mutating any resident patch/PCL pools,
+            # so a missing weight cannot leave a half-incorporated session behind.
+            if new_collections and cfg['pcl_sampling_weights'] is not None:
+                build_pcl_sampling_strata(
+                    pcl['sampling_group'] for pcl in new_collections.values())
+
+            # ---- Patches: sampling caches, probabilities, atlas append ----
+            if new_patches:
+                for patch in new_patches.values():
+                    self._prepare_patch_sampling_cache([patch])
+                self.verified_patches.update(new_patches)
+                self.verified_patches_list.extend(new_patches.values())
+                areas = np.array([float(p.area) for p in self.verified_patches_list],
+                                 dtype=np.float32)
+                inv_weights = areas ** 0.5
+                self.patch_sampling_probabilities = inv_weights / inv_weights.sum()
+                self.patch_atlas.append_patches(new_patches)
+                if cfg['dt_target_mode'] == 'whole_object_quantile':
+                    prepare_patch_dt_target_samples(
+                        list(new_patches.values()),
+                        cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
+                    )
+
+            # ---- Point collections: link, classify, strip-materialise ----
+            if new_collections:
+                for pcl in new_collections.values():
+                    for point in pcl['points'].values():
+                        point['zyx'] = np.array(
+                            [point['p'][2], point['p'][1], point['p'][0]],
+                            dtype=np.float32)
+                link_points_to_patches(
+                    self.verified_patches,
+                    new_collections,
+                    tolerance=self.link_distance_tolerance,
+                    surface_index_tolerance=self.link_distance_tolerance,
+                    distance_scale=1.0,
+                    general_hit_policy='largest_area',
+                )
+                new_cross_patch = {}
+                new_unattached = {}
+                for pid, pcl in new_collections.items():
+                    num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
+                    num_unattached = len(pcl['points']) - num_attached
+                    if pcl.get('metadata', {}).get('winding_is_absolute', False):
+                        attached_points = [point for point in pcl['points'].values()
+                                           if 'on_patch' in point]
+                        if any(not np.isfinite(point['winding_annotation'])
+                               or point['winding_annotation'] <= 0
+                               for point in attached_points):
+                            raise RuntimeError(
+                                f'Absolute-winding pcl {pcl.get("name")!r} must annotate every '
+                                f'attached point with a positive winding number')
+                        new_cross_patch[pid] = pcl
+                        continue
+                    if num_attached >= 2:
+                        new_cross_patch[pid] = pcl
+                    if num_unattached >= 1:
+                        new_unattached[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
+
+                z_margin = cfg['patch_loss_z_margin']
+                for pid in list(new_unattached.keys()):
+                    pcl = new_unattached[pid]
+                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+                    best_start, best_end = 0, 0
+                    run_start = 0
+                    for i, (_, point) in enumerate(sorted_items):
+                        z = point['zyx'][0]
+                        if z_begin - z_margin <= z < z_end + z_margin:
+                            if i + 1 - run_start > best_end - best_start:
+                                best_start, best_end = run_start, i + 1
+                        else:
+                            run_start = i + 1
+                    kept_items = sorted_items[best_start:best_end]
+                    if len(kept_items) < 2:
+                        del new_unattached[pid]
+                    else:
+                        pcl['points'] = dict(kept_items)
+
+                normalise_pcl_winding_annotations(new_cross_patch)
+                normalise_pcl_winding_annotations(new_unattached)
+
+                for pcl in new_cross_patch.values():
+                    points_by_patch = {}
+                    for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+                        if 'on_patch' not in point:
+                            continue
+                        pid = point['on_patch']['id']
+                        if pid not in self.verified_patches:
+                            continue
+                        points_by_patch.setdefault(pid, []).append(point)
+                    pcl['points_by_patch'] = points_by_patch
+                    self.cross_patch_pcls.append(pcl)
+
+                min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
+                for pcl_id, pcl in new_unattached.items():
+                    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+                    if len(sorted_items) < 2:
+                        continue
+                    zyxs = np.stack([point['zyx'] for _, point in sorted_items],
+                                    axis=0).astype(np.float32)
+                    windings = np.array(
+                        [point['winding_annotation'] for _, point in sorted_items],
+                        dtype=np.float32)
+                    if min_point_spacing > 0 and len(zyxs) > 2:
+                        keep = [0]
+                        last_kept = zyxs[0]
+                        for i in range(1, len(zyxs) - 1):
+                            if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
+                                keep.append(i)
+                                last_kept = zyxs[i]
+                        keep.append(len(zyxs) - 1)
+                        zyxs = zyxs[keep]
+                        windings = windings[keep]
+                    self.unattached_pcl_strips.append({
+                        'id': pcl_id,
+                        'name': pcl.get('name'),
+                        'source_file': pcl.get('source_file'),
+                        'zyxs': zyxs,
+                        'windings': windings,
+                    })
+                    self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
+                # The flat GPU bundle is derived from the strip list; drop it so
+                # the next consumer rebuilds it including the appended strips.
+                self.unattached_pcl_strips.flat = None
+                # Sampling strata index into the (now longer) pools.
+                self._rebuild_pcl_sampling_strata()
+
+            if new_patches or new_collections:
+                # Whole-object DT target caches index the (now longer) object
+                # pools; force recomputation on next use.
+                self.dt_target_cache_manager.reset()
+
+            if run_cfg['influence_enabled'] and (new_patches or new_collections):
+                self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
+                self.influence_state.activate_or_extend_(
+                    new_patches=new_patches,
+                    new_collections=new_collections,
+                    spiral_and_transform=self.spiral_and_transform,
+                    optimiser=self.optimiser,
+                    cfg=run_cfg,
+                    z_begin=z_begin,
+                    z_end=z_end,
+                    anchor_geometry_zyx=self.influence_anchor_geometry,
+                )
+                self.interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
+                self.interactive_influence_anchor_samples = int(
+                    run_cfg['sample_count_influence_anchor_samples_per_step'])
+
+            # run() sets the target before this callback is drained at the
+            # pause boundary, so this is exactly the iteration window requested
+            # alongside the new inputs. Do not let a later incorporation
+            # shorten an already-active DT-free window.
+            interactive_status = self.interactive_driver.status()
+            dt_resume_iteration = get_interactive_dt_resume_iteration(
+                interactive_status['current_iteration'],
+                interactive_status['target_iteration'],
+                run_cfg['influence_disable_dt_frac'],
+            )
+            self.interactive_dt_resume_iteration = dt_resume_iteration
+
+            print(f'incorporated {len(new_patches)} patches and '
+                  f'{len(new_collections)} point collections into the resident session; '
+                  f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    def apply_config(self, config, path_changes=None):
+        """Apply Run-scoped settings without replacing the resident fit."""
+        global shell_path  # module-global mutation kept as-is (PR 2 revisits)
+
+        path_changes = dict(path_changes or {})
+        changed = set(config)
+        old_values = {key: cfg[key] for key in config}
+        cfg.update(config, allow_val_change=True)
+        try:
+            shell_changed = (
+                bool(changed & {
+                    key for key in cfg.keys()
+                    if str(key).startswith('shell_')
+                })
+                or 'outer_shell' in path_changes
+            )
+            rebuilt_tracks = None
+            replace_prepared_tracks = False
+            rebuilt_track_rows = self.tracks
+            rebuilt_families = self.track_families
+            rebuilt_source_ids = self.track_source_ids
+            rebuilt_shell_patch = self.shell_patch
+            rebuilt_shell_map = self.shell_map
+            rebuilt_shell_envelope = self.shell_envelope
+            rebuilt_shell_outer = self.shell_outer_winding_idx
+            rebuilt_shell_valid = self.shell_valid_zyxs_gpu
+            requested_shell_path = str(
+                path_changes.get('outer_shell', shell_path) or '')
+
+            if shell_changed:
+                if not requested_shell_path:
+                    raise ValueError(
+                        'shell configuration requires an outer shell path')
+                rebuilt_shell_patch = load_tifxyz(requested_shell_path)
+                rebuilt_shell_envelope = (
+                    ShellPolarMap(
+                        rebuilt_shell_patch, self.umbilicus,
+                        z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+                        z_max=z_end + cfg['model_flow_bounds_z_margin'],
+                        num_theta_bins=cfg['shell_num_theta_bins'],
+                        device='cpu')
+                    if self.filter_tracks_by_shell else None
+                )
+                if self.filter_tracks_by_shell and self.track_reload_source is not None:
+                    (rebuilt_track_rows, rebuilt_families,
+                     kept_track_indices) = filter_tracks_to_outer_shell(
+                        self.track_reload_source, rebuilt_shell_envelope,
+                        self.track_reload_families, return_indices=True)
+                    rebuilt_source_ids = (
+                        self.track_reload_source_ids[kept_track_indices]
+                        if self.track_reload_source_ids is not None else None)
+                    rebuilt_tracks = prepare_main_phase_tracks(
+                        rebuilt_track_rows, None,
+                        float(cfg['track_exclusion_radius']), self.device,
+                        anchor_tree=self.trusted_geometry_tree,
+                        sampling_config=validate_track_sampling_config(cfg),
+                        track_families=rebuilt_families,
+                        track_source_ids=rebuilt_source_ids,
+                        crossing_cache=self.track_crossing_cache,
+                        track_graph=self.track_graph)
+                    replace_prepared_tracks = True
+
+                rebuilt_shell_map = (
+                    ShellPolarMap(
+                        rebuilt_shell_patch, self.umbilicus,
+                        z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+                        z_max=z_end + cfg['model_flow_bounds_z_margin'],
+                        num_theta_bins=cfg['shell_num_theta_bins'],
+                        device=self.device)
+                    if cfg['loss_weight_shell_outer'] > 0 else None
+                )
+                rebuilt_shell_valid = (
+                    self._subsample_shell_radius_pool(rebuilt_shell_patch)
+                    if cfg['loss_weight_shell_patch_radius'] > 0 else None
+                )
+                rebuilt_shell_outer = int(cfg['shell_outer_winding_idx'])
+
+            reprepare_tracks = bool(changed & {
+                'track_max_tortuosity',
+                'track_exclusion_radius',
+            })
+            if reprepare_tracks and rebuilt_tracks is None and self.tracks:
+                rebuilt_tracks = prepare_main_phase_tracks(
+                    self.tracks, None, float(cfg['track_exclusion_radius']),
+                    self.device, anchor_tree=self.trusted_geometry_tree,
+                    sampling_config=validate_track_sampling_config(cfg),
+                    track_families=self.track_families,
+                    track_source_ids=self.track_source_ids,
+                    crossing_cache=self.track_crossing_cache,
+                    track_graph=self.track_graph)
+                replace_prepared_tracks = True
+
+            target_tracks = (
+                rebuilt_tracks
+                if replace_prepared_tracks else self.prepared_main_tracks)
+            if ({'track_length_bin_weights',
+                 'track_max_track_crossing_per_step',
+                 'track_min_walk_steps_per_track',
+                 'track_max_walk_steps_per_track',
+                 'track_min_walks_per_track',
+                 'track_max_walks_per_track',
+                 'track_walk_minimum_cycle_travel'}
+                    & changed):
+                configure_prepared_track_sampling(target_tracks, config)
+
+            if 'patch_loss_z_margin' in changed:
+                self.patch_sampling_probabilities = \
+                    self._prepare_patch_sampling_cache(self.verified_patches_list)
+                if self.unverified_patches_list:
+                    self.unverified_patch_sampling_probabilities = \
+                        self._prepare_patch_sampling_cache(
+                            self.unverified_patches_list)
+            if 'patch_unverified_patch_exclusion_radius' in changed:
+                (rebuilt_unverified, rebuilt_unverified_list,
+                 rebuilt_unverified_probabilities,
+                 rebuilt_unverified_atlas) = \
+                    self._rebuild_unverified_patch_inputs(float(
+                        cfg['patch_unverified_patch_exclusion_radius']))
+            else:
+                rebuilt_unverified = self.unverified_patches
+                rebuilt_unverified_list = self.unverified_patches_list
+                rebuilt_unverified_probabilities = \
+                    self.unverified_patch_sampling_probabilities
+                rebuilt_unverified_atlas = self.unverified_patch_atlas
+
+            dt_preparation_changed = bool(changed & {
+                'dt_target_mode', 'dt_target_max_stride',
+                'sample_count_patch_dt_target_points',
+            })
+            if dt_preparation_changed:
+                self.dt_target_whole_object = (
+                    cfg['dt_target_mode'] == 'whole_object_quantile')
+                if self.dt_target_whole_object:
+                    prepare_patch_dt_target_samples(
+                        self.verified_patches_list,
+                        cfg['sample_count_patch_dt_target_points'],
+                        cfg['dt_target_max_stride'])
+                    if self.unverified_patches_list:
+                        prepare_patch_dt_target_samples(
+                            self.unverified_patches_list,
+                            cfg['sample_count_patch_dt_target_points'],
+                            cfg['dt_target_max_stride'])
+            if any(key.startswith('dt_') for key in changed) \
+                    or dt_preparation_changed:
+                self.dt_target_cache_manager.update_interval = max(
+                    1, int(cfg['dt_target_update_interval']))
+                self.dt_target_cache_manager.reset()
+            if changed & {
+                    'optimizer_exp_lr_schedule',
+                    'optimizer_learning_rate',
+                    'optimizer_lr_final_factor',
+                    'optimizer_num_training_steps',
+            }:
+                self._realign_lr_schedule(
+                    self.interactive_driver.status()['current_iteration'])
+        except Exception:
+            cfg.update(old_values, allow_val_change=True)
+            raise
+
+        if shell_changed:
+            shell_path = requested_shell_path
+            self.shell_patch = rebuilt_shell_patch
+            self.shell_map = rebuilt_shell_map
+            self.shell_envelope = rebuilt_shell_envelope
+            self.shell_outer_winding_idx = rebuilt_shell_outer
+            self.shell_valid_zyxs_gpu = rebuilt_shell_valid
+            self.tracks = rebuilt_track_rows
+            self.track_families = rebuilt_families
+            self.track_source_ids = rebuilt_source_ids
+        if replace_prepared_tracks:
+            self.prepared_main_tracks = rebuilt_tracks
+            self.preview_extent_tracks = (
+                (self.prepared_main_tracks['flat_zyx_cpu'],)
+                if self.prepared_main_tracks is not None else ())
+        self.unverified_patches = rebuilt_unverified
+        self.unverified_patches_list = rebuilt_unverified_list
+        self.unverified_patch_sampling_probabilities = \
+            rebuilt_unverified_probabilities
+        self.unverified_patch_atlas = rebuilt_unverified_atlas
+
     def run(self):
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
@@ -2022,653 +2674,7 @@ class FitContext:
 
         self.build_device_state()
 
-        def rebuild_unverified_patch_inputs(exclusion_radius):
-            """Reload only the unverified-patch pool for a Run-boundary mask edit."""
-            if not unverified_patches_path:
-                return {}, [], None, None
-            candidates = self._load_patches_from_dir(unverified_patches_path)
-            for patch_id, patch in list(candidates.items()):
-                cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
-                if (cells_to_erode > 0
-                        and not erode_patch_valid_region(patch, cells_to_erode)):
-                    del candidates[patch_id]
-                    continue
-                if not patch_intersects_z_roi(patch, z_begin, z_end):
-                    del candidates[patch_id]
-                    continue
-                patch.release_derived_caches()
-            candidates, n_masked, n_dropped = \
-                _mask_unverified_patches_near_trusted_geometry(
-                    candidates, self.trusted_geometry_tree, exclusion_radius)
-            print(
-                f'unverified patches: remasked {n_masked} vertices near trusted '
-                f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
-                f'{len(candidates)} remain')
-            candidate_list = list(candidates.values())
-            probabilities = (
-                self._prepare_patch_sampling_cache(candidate_list)
-                if candidate_list else None)
-            atlas = (
-                PatchAtlas(candidates, device='cuda')
-                if candidate_list else None)
-            return candidates, candidate_list, probabilities, atlas
-
-        def prepare_png_visualization_inputs():
-            zs = np.linspace(
-                z_begin,
-                z_end - 1,
-                min(self.num_slices_for_visualisation, z_end - 1 - z_begin),
-                dtype=np.int64,
-            )
-            if self.scroll_zarr is not None:
-                subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
-                print('loading slices for visualisation')
-                vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
-                scroll_slices = (
-                    torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
-                    / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
-                ).to(torch.uint8)
-            else:
-                subvolume_shape = (
-                    z_end - z_begin,
-                    int(np.ceil(32693 / render_volume_scale)),
-                    int(np.ceil(32693 / render_volume_scale)),
-                )
-                scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
-
-            prediction_slices, quad_labels, _ = overlay_patches_on_slices(
-                self.verified_patches_list,
-                zs,
-                subvolume_shape[1:],
-                cache_path,
-                canvas_scale=render_volume_scale,
-            )
-            yx = torch.stack(torch.meshgrid(
-                torch.arange(subvolume_shape[1], dtype=torch.float32),
-                torch.arange(subvolume_shape[2], dtype=torch.float32),
-                indexing='ij',
-            ), axis=-1).to(self.device) * render_volume_scale
-            return zs, yx, scroll_slices, prediction_slices, quad_labels
-
-        def clear_interactive_influence():
-            """End the current Run request's influence window."""
-            self.interactive_dt_resume_iteration = None
-            if self.influence_state is None:
-                self.interactive_influence_loss_weight = 0.0
-                self.interactive_influence_anchor_samples = 0
-                return
-            self.influence_state.deactivate_(self.spiral_and_transform, self.optimiser)
-            self.influence_state = None
-            self.interactive_influence_loss_weight = 0.0
-            self.interactive_influence_anchor_samples = 0
-
-        def export_interactive_preview(generation_path, surface_id):
-            # Export has its own saved RNG envelope so pausing does not alter the
-            # stochastic training sequence.
-            numpy_state = np.random.get_state()
-            torch_state = torch.random.get_rng_state()
-            cuda_states = torch.cuda.get_rng_state_all()
-            try:
-                manifest = save_combined_preview(
-                    self.spiral_and_transform.get_slice_to_spiral_transform(),
-                    self.spiral_and_transform.get_dr_per_winding(),
-                    self.verified_patches_list,
-                    self.unattached_pcl_strips,
-                    generation_path,
-                    cfg,
-                    z_begin,
-                    z_end,
-                    voxel_size_um,
-                    get_or_build_unattached_pcl_flat,
-                    tracks=self.preview_extent_tracks,
-                    surface_id=surface_id,
-                    progress=progress,
-                )
-                diagnostic_weights = {
-                    name: cfg.get(f'loss_weight_{name}', 0.0)
-                    for name in (
-                        'patch_radius', 'patch_dt',
-                        'unverified_patch_radius', 'unverified_patch_dt',
-                        'sym_dirichlet', 'rel_winding', 'abs_winding',
-                        'dense_normals', 'dense_spacing', 'dense_attachment',
-                        'unattached_pcl_radius', 'unattached_pcl_dt',
-                        'track_radius', 'track_dt', 'shell_patch_radius',
-                    )
-                }
-                if self._phase_mode_active():
-                    diagnostic_weights['dense_spacing_phase'] = max(
-                        float(cfg['loss_weight_dense_spacing']), 1.0)
-                    diagnostic_weights['dense_spacing_count'] = max(
-                        float(cfg['loss_weight_dense_spacing_count']), 1.0)
-                transform = self.spiral_and_transform.get_slice_to_spiral_transform()
-                dr = self.spiral_and_transform.get_dr_per_winding()
-                progress.begin(
-                    'exporting_preview', 'Computing preview diagnostics')
-                recorder = LossMapRecorder(
-                    manifest,
-                    generation_path,
-                    z0=z_begin - int(cfg['model_flow_bounds_z_margin']),
-                    grid_spacing=int(cfg['output_step_size']),
-                    dr_per_winding=dr,
-                    weights=diagnostic_weights,
-                )
-                with torch.no_grad(), capture_loss_maps(recorder, suppress_errors=True):
-                    get_patch_and_umbilicus_losses(
-                        transform, dr,
-                        cfg['sample_count_patches_per_step'],
-                        cfg['sample_count_patches_per_step_for_dt'],
-                        self.verified_patches_list, self.patch_atlas,
-                        self.patch_sampling_probabilities, self.umbilicus_zyx,
-                        compute_dt=cfg['loss_weight_patch_dt'] > 0,
-                        shell_valid_zyxs=self.shell_valid_zyxs_gpu,
-                        shell_outer_winding_idx=self.shell_outer_winding_idx,
-                    )
-                    if self.unverified_patch_atlas is not None:
-                        get_unverified_patch_losses(
-                            transform, dr,
-                            cfg['sample_count_unverified_patches_per_step'],
-                            cfg['sample_count_unverified_patches_per_step_for_dt'],
-                            self.unverified_patches_list, self.unverified_patch_atlas,
-                            self.unverified_patch_sampling_probabilities,
-                            compute_dt=cfg['loss_weight_unverified_patch_dt'] > 0,
-                        )
-                    if cfg['loss_weight_sym_dirichlet'] > 0:
-                        get_symmetric_dirichlet_loss(
-                            transform, dr, self.shell_outer_winding_idx,
-                            cfg['sample_count_regularisation_points'])
-                    if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
-                        get_patch_rel_winding_loss(
-                            transform, dr, self.verified_patches, self.patch_atlas,
-                            self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'])
-                    if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
-                        get_patch_abs_winding_loss(
-                            transform, dr, self.verified_patches, self.patch_atlas,
-                            self.cross_patch_pcls)
-                    if self.lasagna_volume is not None:
-                        for _loss_name, _loss_value in iter_lasagna_losses(
-                                transform, dr, self.lasagna_volume,
-                                self.shell_outer_winding_idx,
-                                cfg['sample_count_dense_normal_points'],
-                                compute_spacing=self.grad_mag_spacing_enabled):
-                            pass
-                    if self._phase_mode_active():
-                        preview_generator = torch.Generator(device=dr.device)
-                        preview_generator.manual_seed(0x243F6A88)
-                        for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
-                                self.spiral_and_transform, transform, dr, self.sdt_volume,
-                                self.lasagna_volume, self.shell_outer_winding_idx, cfg,
-                                z_begin, z_end, generator=preview_generator):
-                            pass
-                    if self.unattached_pcl_strips:
-                        get_unattached_pcl_strip_losses(
-                            transform, dr, self.unattached_pcl_strips,
-                            self.pcl_sampling_strata['unattached'],
-                            get_or_build_unattached_pcl_flat,
-                            cfg['sample_count_unattached_pcls_per_step'],
-                            cfg['sample_count_unattached_pcl_points_per_step'],
-                            compute_dt=cfg['loss_weight_unattached_pcl_dt'] > 0,
-                        )
-                    if self.prepared_main_tracks is not None:
-                        for _loss_name, _loss_value in iter_track_losses(
-                                transform, dr, self.prepared_main_tracks, cfg,
-                                compute_dt=cfg['loss_weight_track_dt'] > 0):
-                            pass
-                # Per-pair aggregated crossing counts: mean_count - m per winding
-                # pair, the measurement behind any future discrete
-                # insert/remove/reindex operation (gradient descent cannot perform
-                # those). Written next to the loss maps as a preview artifact.
-                if self._phase_mode_active() and self.shell_outer_winding_idx is not None:
-                    try:
-                        with torch.no_grad():
-                            pair_rows = aggregate_pair_counts(
-                                transform, dr, self.sdt_volume,
-                                self.shell_outer_winding_idx, cfg, z_begin, z_end)
-                        pair_table_name = 'dense_spacing_pair_counts.json'
-                        with open(os.path.join(generation_path, pair_table_name),
-                                  'w', encoding='utf-8') as stream:
-                            json.dump(pair_rows, stream, indent=1)
-                        manifest = dict(manifest)
-                        manifest['dense_spacing_pair_counts'] = pair_table_name
-                    except Exception as error:
-                        print('WARNING: could not aggregate per-pair crossing counts: '
-                              f'{type(error).__name__}: {error}')
-                if recorder.error is not None:
-                    print('WARNING: could not generate Spiral loss overlays: '
-                          f'{type(recorder.error).__name__}: {recorder.error}')
-                    return manifest
-                try:
-                    entries = recorder.finish()
-                    return attach_loss_maps_to_manifest(manifest, generation_path, entries)
-                except Exception as error:
-                    print('WARNING: could not publish Spiral loss overlays: '
-                          f'{type(error).__name__}: {error}')
-                    return manifest
-            finally:
-                np.random.set_state(numpy_state)
-                torch.random.set_rng_state(torch_state)
-                torch.cuda.set_rng_state_all(cuda_states)
-
-        def incorporate_interactive_inputs(records, influence_config=None):
-            """Append uploaded ephemeral inputs to the resident fit structures.
-
-            Runs on the fitter thread at a pause boundary. Incorporation is
-            append-only: only the new items are loaded and validated, and they are
-            concatenated onto the structures the fitter already holds (the patch
-            GPU atlas, the sampling caches, the PCL strip list). Existing tensors
-            and prepared samplers are reused untouched. The record order is the
-            service's deterministic order, so a multi-rank session would append the
-            same items in the same order on every rank.
-            """
-            # Incorporation has its own saved RNG envelope so adding inputs does
-            # not alter the stochastic training sequence (same discipline as the
-            # interactive preview export).
-            numpy_state = np.random.get_state()
-            torch_state = torch.random.get_rng_state()
-            cuda_states = torch.cuda.get_rng_state_all()
-            try:
-                # Be defensive about a previously interrupted boundary: a new
-                # batch must never union with an earlier Run request's masks.
-                clear_interactive_influence()
-                run_cfg = dict(cfg)
-                run_cfg.update(dict(influence_config or {}))
-                new_patches = {}
-                new_collections = {}
-                for record in records:
-                    kind = record.get('kind')
-                    path = record.get('path')
-                    input_id = record.get('id')
-                    if kind == 'patch':
-                        if cfg['input_disable_patches']:
-                            raise RuntimeError('disable_patches=True: this session takes no patches')
-                        if input_id in self.verified_patches or input_id in new_patches:
-                            raise RuntimeError(f'Patch {input_id!r} is already part of this session')
-                        patch = load_tifxyz(path)
-                        cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
-                        if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
-                            raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
-                        if not patch_intersects_z_roi(patch, z_begin, z_end):
-                            raise RuntimeError(
-                                f'Patch {input_id!r} does not intersect the fitted z range '
-                                f'[{z_begin}, {z_end})')
-                        patch.release_derived_caches()
-                        new_patches[input_id] = patch
-                    elif kind == 'fiber':
-                        pcl = load_fiber_point_collection(
-                            path, self.next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
-                        if pcl is None:
-                            raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
-                        pcl['source_file'] = path
-                        pcl.setdefault('metadata', {})['winding_is_absolute'] = False
-                        pcl['metadata']['input_role'] = 'fiber'
-                        hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
-                        pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
-                        new_collections[self.next_id] = pcl
-                        self.next_id += 1
-                    elif kind == 'pcl':
-                        role = record.get('role')
-                        loaded = load_point_collection(path) or {}
-                        if not loaded:
-                            raise RuntimeError(f'PCL document {input_id!r} contains no collections')
-                        for pcl in loaded.values():
-                            pcl['source_file'] = path
-                            pcl['sampling_group'] = path
-                            pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
-                            pcl['metadata']['input_role'] = role
-                            new_collections[self.next_id] = pcl
-                            self.next_id += 1
-                    else:
-                        raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
-
-                # Weighted sampling intentionally requires every group to be named.
-                # Validate uploaded groups before mutating any resident patch/PCL pools,
-                # so a missing weight cannot leave a half-incorporated session behind.
-                if new_collections and cfg['pcl_sampling_weights'] is not None:
-                    build_pcl_sampling_strata(
-                        pcl['sampling_group'] for pcl in new_collections.values())
-
-                # ---- Patches: sampling caches, probabilities, atlas append ----
-                if new_patches:
-                    for patch in new_patches.values():
-                        self._prepare_patch_sampling_cache([patch])
-                    self.verified_patches.update(new_patches)
-                    self.verified_patches_list.extend(new_patches.values())
-                    areas = np.array([float(p.area) for p in self.verified_patches_list],
-                                     dtype=np.float32)
-                    inv_weights = areas ** 0.5
-                    self.patch_sampling_probabilities = inv_weights / inv_weights.sum()
-                    self.patch_atlas.append_patches(new_patches)
-                    if cfg['dt_target_mode'] == 'whole_object_quantile':
-                        prepare_patch_dt_target_samples(
-                            list(new_patches.values()),
-                            cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
-                        )
-
-                # ---- Point collections: link, classify, strip-materialise ----
-                if new_collections:
-                    for pcl in new_collections.values():
-                        for point in pcl['points'].values():
-                            point['zyx'] = np.array(
-                                [point['p'][2], point['p'][1], point['p'][0]],
-                                dtype=np.float32)
-                    link_points_to_patches(
-                        self.verified_patches,
-                        new_collections,
-                        tolerance=self.link_distance_tolerance,
-                        surface_index_tolerance=self.link_distance_tolerance,
-                        distance_scale=1.0,
-                        general_hit_policy='largest_area',
-                    )
-                    new_cross_patch = {}
-                    new_unattached = {}
-                    for pid, pcl in new_collections.items():
-                        num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
-                        num_unattached = len(pcl['points']) - num_attached
-                        if pcl.get('metadata', {}).get('winding_is_absolute', False):
-                            attached_points = [point for point in pcl['points'].values()
-                                               if 'on_patch' in point]
-                            if any(not np.isfinite(point['winding_annotation'])
-                                   or point['winding_annotation'] <= 0
-                                   for point in attached_points):
-                                raise RuntimeError(
-                                    f'Absolute-winding pcl {pcl.get("name")!r} must annotate every '
-                                    f'attached point with a positive winding number')
-                            new_cross_patch[pid] = pcl
-                            continue
-                        if num_attached >= 2:
-                            new_cross_patch[pid] = pcl
-                        if num_unattached >= 1:
-                            new_unattached[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
-
-                    z_margin = cfg['patch_loss_z_margin']
-                    for pid in list(new_unattached.keys()):
-                        pcl = new_unattached[pid]
-                        sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-                        best_start, best_end = 0, 0
-                        run_start = 0
-                        for i, (_, point) in enumerate(sorted_items):
-                            z = point['zyx'][0]
-                            if z_begin - z_margin <= z < z_end + z_margin:
-                                if i + 1 - run_start > best_end - best_start:
-                                    best_start, best_end = run_start, i + 1
-                            else:
-                                run_start = i + 1
-                        kept_items = sorted_items[best_start:best_end]
-                        if len(kept_items) < 2:
-                            del new_unattached[pid]
-                        else:
-                            pcl['points'] = dict(kept_items)
-
-                    normalise_pcl_winding_annotations(new_cross_patch)
-                    normalise_pcl_winding_annotations(new_unattached)
-
-                    for pcl in new_cross_patch.values():
-                        points_by_patch = {}
-                        for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
-                            if 'on_patch' not in point:
-                                continue
-                            pid = point['on_patch']['id']
-                            if pid not in self.verified_patches:
-                                continue
-                            points_by_patch.setdefault(pid, []).append(point)
-                        pcl['points_by_patch'] = points_by_patch
-                        self.cross_patch_pcls.append(pcl)
-
-                    min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
-                    for pcl_id, pcl in new_unattached.items():
-                        sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-                        if len(sorted_items) < 2:
-                            continue
-                        zyxs = np.stack([point['zyx'] for _, point in sorted_items],
-                                        axis=0).astype(np.float32)
-                        windings = np.array(
-                            [point['winding_annotation'] for _, point in sorted_items],
-                            dtype=np.float32)
-                        if min_point_spacing > 0 and len(zyxs) > 2:
-                            keep = [0]
-                            last_kept = zyxs[0]
-                            for i in range(1, len(zyxs) - 1):
-                                if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
-                                    keep.append(i)
-                                    last_kept = zyxs[i]
-                            keep.append(len(zyxs) - 1)
-                            zyxs = zyxs[keep]
-                            windings = windings[keep]
-                        self.unattached_pcl_strips.append({
-                            'id': pcl_id,
-                            'name': pcl.get('name'),
-                            'source_file': pcl.get('source_file'),
-                            'zyxs': zyxs,
-                            'windings': windings,
-                        })
-                        self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
-                    # The flat GPU bundle is derived from the strip list; drop it so
-                    # the next consumer rebuilds it including the appended strips.
-                    self.unattached_pcl_strips.flat = None
-                    # Sampling strata index into the (now longer) pools.
-                    self._rebuild_pcl_sampling_strata()
-
-                if new_patches or new_collections:
-                    # Whole-object DT target caches index the (now longer) object
-                    # pools; force recomputation on next use.
-                    self.dt_target_cache_manager.reset()
-
-                if run_cfg['influence_enabled'] and (new_patches or new_collections):
-                    self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
-                    self.influence_state.activate_or_extend_(
-                        new_patches=new_patches,
-                        new_collections=new_collections,
-                        spiral_and_transform=self.spiral_and_transform,
-                        optimiser=self.optimiser,
-                        cfg=run_cfg,
-                        z_begin=z_begin,
-                        z_end=z_end,
-                        anchor_geometry_zyx=self.influence_anchor_geometry,
-                    )
-                    self.interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
-                    self.interactive_influence_anchor_samples = int(
-                        run_cfg['sample_count_influence_anchor_samples_per_step'])
-
-                # run() sets the target before this callback is drained at the
-                # pause boundary, so this is exactly the iteration window requested
-                # alongside the new inputs. Do not let a later incorporation
-                # shorten an already-active DT-free window.
-                interactive_status = interactive_driver.status()
-                dt_resume_iteration = get_interactive_dt_resume_iteration(
-                    interactive_status['current_iteration'],
-                    interactive_status['target_iteration'],
-                    run_cfg['influence_disable_dt_frac'],
-                )
-                self.interactive_dt_resume_iteration = dt_resume_iteration
-
-                print(f'incorporated {len(new_patches)} patches and '
-                      f'{len(new_collections)} point collections into the resident session; '
-                      f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
-            finally:
-                np.random.set_state(numpy_state)
-                torch.random.set_rng_state(torch_state)
-                torch.cuda.set_rng_state_all(cuda_states)
-
         if interactive_driver is not None:
-            def configure_interactive_run(config, path_changes=None):
-                """Apply Run-scoped settings without replacing the resident fit."""
-                global shell_path
-
-                path_changes = dict(path_changes or {})
-                changed = set(config)
-                old_values = {key: cfg[key] for key in config}
-                cfg.update(config, allow_val_change=True)
-                try:
-                    shell_changed = (
-                        bool(changed & {
-                            key for key in cfg.keys()
-                            if str(key).startswith('shell_')
-                        })
-                        or 'outer_shell' in path_changes
-                    )
-                    rebuilt_tracks = None
-                    replace_prepared_tracks = False
-                    rebuilt_track_rows = self.tracks
-                    rebuilt_families = self.track_families
-                    rebuilt_source_ids = self.track_source_ids
-                    rebuilt_shell_patch = self.shell_patch
-                    rebuilt_shell_map = self.shell_map
-                    rebuilt_shell_envelope = self.shell_envelope
-                    rebuilt_shell_outer = self.shell_outer_winding_idx
-                    rebuilt_shell_valid = self.shell_valid_zyxs_gpu
-                    requested_shell_path = str(
-                        path_changes.get('outer_shell', shell_path) or '')
-
-                    if shell_changed:
-                        if not requested_shell_path:
-                            raise ValueError(
-                                'shell configuration requires an outer shell path')
-                        rebuilt_shell_patch = load_tifxyz(requested_shell_path)
-                        rebuilt_shell_envelope = (
-                            ShellPolarMap(
-                                rebuilt_shell_patch, self.umbilicus,
-                                z_min=z_begin - cfg['model_flow_bounds_z_margin'],
-                                z_max=z_end + cfg['model_flow_bounds_z_margin'],
-                                num_theta_bins=cfg['shell_num_theta_bins'],
-                                device='cpu')
-                            if self.filter_tracks_by_shell else None
-                        )
-                        if self.filter_tracks_by_shell and self.track_reload_source is not None:
-                            (rebuilt_track_rows, rebuilt_families,
-                             kept_track_indices) = filter_tracks_to_outer_shell(
-                                self.track_reload_source, rebuilt_shell_envelope,
-                                self.track_reload_families, return_indices=True)
-                            rebuilt_source_ids = (
-                                self.track_reload_source_ids[kept_track_indices]
-                                if self.track_reload_source_ids is not None else None)
-                            rebuilt_tracks = prepare_main_phase_tracks(
-                                rebuilt_track_rows, None,
-                                float(cfg['track_exclusion_radius']), self.device,
-                                anchor_tree=self.trusted_geometry_tree,
-                                sampling_config=validate_track_sampling_config(cfg),
-                                track_families=rebuilt_families,
-                                track_source_ids=rebuilt_source_ids,
-                                crossing_cache=self.track_crossing_cache,
-                                track_graph=self.track_graph)
-                            replace_prepared_tracks = True
-
-                        rebuilt_shell_map = (
-                            ShellPolarMap(
-                                rebuilt_shell_patch, self.umbilicus,
-                                z_min=z_begin - cfg['model_flow_bounds_z_margin'],
-                                z_max=z_end + cfg['model_flow_bounds_z_margin'],
-                                num_theta_bins=cfg['shell_num_theta_bins'],
-                                device=self.device)
-                            if cfg['loss_weight_shell_outer'] > 0 else None
-                        )
-                        rebuilt_shell_valid = (
-                            self._subsample_shell_radius_pool(rebuilt_shell_patch)
-                            if cfg['loss_weight_shell_patch_radius'] > 0 else None
-                        )
-                        rebuilt_shell_outer = int(cfg['shell_outer_winding_idx'])
-
-                    reprepare_tracks = bool(changed & {
-                        'track_max_tortuosity',
-                        'track_exclusion_radius',
-                    })
-                    if reprepare_tracks and rebuilt_tracks is None and self.tracks:
-                        rebuilt_tracks = prepare_main_phase_tracks(
-                            self.tracks, None, float(cfg['track_exclusion_radius']),
-                            self.device, anchor_tree=self.trusted_geometry_tree,
-                            sampling_config=validate_track_sampling_config(cfg),
-                            track_families=self.track_families,
-                            track_source_ids=self.track_source_ids,
-                            crossing_cache=self.track_crossing_cache,
-                            track_graph=self.track_graph)
-                        replace_prepared_tracks = True
-
-                    target_tracks = (
-                        rebuilt_tracks
-                        if replace_prepared_tracks else self.prepared_main_tracks)
-                    if ({'track_length_bin_weights',
-                         'track_max_track_crossing_per_step',
-                         'track_min_walk_steps_per_track',
-                         'track_max_walk_steps_per_track',
-                         'track_min_walks_per_track',
-                         'track_max_walks_per_track',
-                         'track_walk_minimum_cycle_travel'}
-                            & changed):
-                        configure_prepared_track_sampling(target_tracks, config)
-
-                    if 'patch_loss_z_margin' in changed:
-                        self.patch_sampling_probabilities = \
-                            self._prepare_patch_sampling_cache(self.verified_patches_list)
-                        if self.unverified_patches_list:
-                            self.unverified_patch_sampling_probabilities = \
-                                self._prepare_patch_sampling_cache(
-                                    self.unverified_patches_list)
-                    if 'patch_unverified_patch_exclusion_radius' in changed:
-                        (rebuilt_unverified, rebuilt_unverified_list,
-                         rebuilt_unverified_probabilities,
-                         rebuilt_unverified_atlas) = \
-                            rebuild_unverified_patch_inputs(float(
-                                cfg['patch_unverified_patch_exclusion_radius']))
-                    else:
-                        rebuilt_unverified = self.unverified_patches
-                        rebuilt_unverified_list = self.unverified_patches_list
-                        rebuilt_unverified_probabilities = \
-                            self.unverified_patch_sampling_probabilities
-                        rebuilt_unverified_atlas = self.unverified_patch_atlas
-
-                    dt_preparation_changed = bool(changed & {
-                        'dt_target_mode', 'dt_target_max_stride',
-                        'sample_count_patch_dt_target_points',
-                    })
-                    if dt_preparation_changed:
-                        self.dt_target_whole_object = (
-                            cfg['dt_target_mode'] == 'whole_object_quantile')
-                        if self.dt_target_whole_object:
-                            prepare_patch_dt_target_samples(
-                                self.verified_patches_list,
-                                cfg['sample_count_patch_dt_target_points'],
-                                cfg['dt_target_max_stride'])
-                            if self.unverified_patches_list:
-                                prepare_patch_dt_target_samples(
-                                    self.unverified_patches_list,
-                                    cfg['sample_count_patch_dt_target_points'],
-                                    cfg['dt_target_max_stride'])
-                    if any(key.startswith('dt_') for key in changed) \
-                            or dt_preparation_changed:
-                        self.dt_target_cache_manager.update_interval = max(
-                            1, int(cfg['dt_target_update_interval']))
-                        self.dt_target_cache_manager.reset()
-                    if changed & {
-                            'optimizer_exp_lr_schedule',
-                            'optimizer_learning_rate',
-                            'optimizer_lr_final_factor',
-                            'optimizer_num_training_steps',
-                    }:
-                        self._realign_lr_schedule(
-                            interactive_driver.status()['current_iteration'])
-                except Exception:
-                    cfg.update(old_values, allow_val_change=True)
-                    raise
-
-                if shell_changed:
-                    shell_path = requested_shell_path
-                    self.shell_patch = rebuilt_shell_patch
-                    self.shell_map = rebuilt_shell_map
-                    self.shell_envelope = rebuilt_shell_envelope
-                    self.shell_outer_winding_idx = rebuilt_shell_outer
-                    self.shell_valid_zyxs_gpu = rebuilt_shell_valid
-                    self.tracks = rebuilt_track_rows
-                    self.track_families = rebuilt_families
-                    self.track_source_ids = rebuilt_source_ids
-                if replace_prepared_tracks:
-                    self.prepared_main_tracks = rebuilt_tracks
-                    self.preview_extent_tracks = (
-                        (self.prepared_main_tracks['flat_zyx_cpu'],)
-                        if self.prepared_main_tracks is not None else ())
-                self.unverified_patches = rebuilt_unverified
-                self.unverified_patches_list = rebuilt_unverified_list
-                self.unverified_patch_sampling_probabilities = \
-                    rebuilt_unverified_probabilities
-                self.unverified_patch_atlas = rebuilt_unverified_atlas
-
             # In the usual zero-exclusion case preview bounds reuse the prepared
             # flat tensor, so the original list of per-track arrays is no longer
             # needed after setup.
@@ -2677,11 +2683,11 @@ class FitContext:
             interactive_driver.on_ready(
                 completed_iterations=self.start_iteration,
                 output_path=self.out_path,
-                save_checkpoint=self._save_model_to,
-                export_preview=export_interactive_preview,
-                incorporate_inputs=incorporate_interactive_inputs,
-                finish_run=clear_interactive_influence,
-                configure_run=configure_interactive_run,
+                save_checkpoint=self.save_checkpoint,
+                export_preview=self.export_preview,
+                incorporate_inputs=self.incorporate_interactive_inputs,
+                finish_run=self._clear_interactive_influence,
+                configure_run=self.apply_config,
             )
 
         # ==========================================================================
@@ -3153,7 +3159,7 @@ class FitContext:
                     scroll_slices_for_visualisation,
                     prediction_slices_for_visualisation,
                     quad_label_map,
-                ) = prepare_png_visualization_inputs()
+                ) = self._prepare_png_visualization_inputs()
             else:
                 zs_for_visualisation = None
                 slice_yx = None
