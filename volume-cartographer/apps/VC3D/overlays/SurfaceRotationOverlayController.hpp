@@ -40,6 +40,8 @@ private:
     void clearWidgets();
     void positionWidget(ViewerEntry& entry) const;
     void setAngle(double angleDeg);
+    bool setHorizontalFlip(bool enabled);
+    bool synchronizeTransformPersistenceCompatibility();
     void updatePreview();
     void applyRotation();
     static std::shared_ptr<QuadSurface> cloneSurface(const std::shared_ptr<QuadSurface>& surface);
@@ -53,6 +55,7 @@ private:
 
     bool _rotateActive{false};
     double _angleDeg{0.0};
+    bool _horizontalFlip{false};
     std::shared_ptr<QuadSurface> _sourceSurface;
     std::shared_ptr<QuadSurface> _previewSurface;
 
