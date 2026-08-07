@@ -9411,6 +9411,11 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                           static_cast<float>(volume->sliceHeight()) * 0.5f};
     }
 
+    // Pass 1: chain signs along the line. Each valid normal is aligned to
+    // the previous valid one, so a local sign flip -- whether from the field
+    // itself or from any per-point orientation test -- is structurally
+    // impossible, and the displayed frame cannot mirror mid-line.
+    cv::Vec3f previousNormal{kNan, kNan, kNan};
     for (const auto& point : session.optimizedLine.points) {
         const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
         if (!point.sampledNormal.valid || !finiteDirection(sampled)) {
@@ -9418,7 +9423,31 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             continue;
         }
         cv::Vec3f normal = toVec3f(sampled);
-        const cv::Vec3f position = toVec3f(point.position);
+        if (std::isfinite(previousNormal[0]) &&
+            normal.dot(previousNormal) < 0.0f) {
+            normal = -normal;
+        }
+        previousNormal = normal;
+        normals.push_back(normal);
+    }
+
+    // Pass 2: one global majority vote decides the whole line's sign, so a
+    // noisy or imperfect center reference cannot flip individual stretches.
+    // The reference only needs to get the hemisphere right on balance; its z
+    // component is zeroed because orientation is radial-only (z is the
+    // scroll axis) and because stored umbilicus files may live in another
+    // volume's coordinate frame, where the z term is meaningless.
+    // Sign convention: normals point away from the scroll center. The dialog
+    // uses them directly as the cut view's up hint, and the viewer's scene y
+    // renders downward, so this puts the fiber's center-facing surface at
+    // the top of the view.
+    double awayScore = 0.0;
+    for (size_t index = 0; index < normals.size(); ++index) {
+        if (!std::isfinite(normals[index][0])) {
+            continue;
+        }
+        const cv::Vec3f position =
+            toVec3f(session.optimizedLine.points[index].position);
         cv::Vec3f towardCenter{kNan, kNan, kNan};
         if (_scrollUmbilicus) {
             try {
@@ -9431,14 +9460,18 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             volumeCenterXY[1] - position[1],
                             0.0f};
         }
-        // Sign convention: normals point away from the scroll center. The
-        // dialog uses them directly as the cut view's up hint, and the
-        // viewer's scene y renders downward, so this puts the fiber's
-        // center-facing surface at the top of the view.
-        if (std::isfinite(towardCenter[0]) && normal.dot(towardCenter) > 0.0f) {
-            normal = -normal;
+        if (!std::isfinite(towardCenter[0])) {
+            continue;
         }
-        normals.push_back(normal);
+        towardCenter[2] = 0.0f;
+        awayScore -= static_cast<double>(normals[index].dot(towardCenter));
+    }
+    if (awayScore < 0.0) {
+        for (cv::Vec3f& normal : normals) {
+            if (std::isfinite(normal[0])) {
+                normal = -normal;
+            }
+        }
     }
     return normals;
 }
