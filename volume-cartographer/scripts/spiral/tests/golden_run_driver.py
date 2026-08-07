@@ -52,7 +52,7 @@ Z_RANGE_SCALED_COUNT_KEYS = (
     'sample_count_regularisation_points',
     'sample_count_shell_samples',
 )
-REFERENCE_Z_RANGE_NUM_SLICES = 9500
+REFERENCE_Z_RANGE_NUM_SLICES = 9500  # mirrors spiral_helpers.REFERENCE_Z_RANGE_NUM_SLICES
 
 
 def derive_module_globals(spec):

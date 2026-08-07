@@ -57,6 +57,31 @@ SAMPLING_COUNT_FLOORS = {
     'sample_count_dense_spacing_density_extra_pairs': 16_000,
 }
 
+# All per-step sample-count defaults are tuned for a 9500-slice z-range;
+# scale_counts_for_z_range() scales them relative to this reference.
+REFERENCE_Z_RANGE_NUM_SLICES = 9500
+
+
+def scale_and_split_counts(config, z_begin, z_end, count_keys):
+    """Scale per-step counts for the z-range, then split them across ranks.
+
+    The shared scale-then-split sequence used by both the headless CLI
+    (fit_spiral.__main__) and the interactive runtime (spiral_runtime).
+    The callers pass their own key sets: the CLI keeps its historical
+    tuple while the runtime derives keys from the Config catalog's
+    scale_with_z fields. Returns (scale, num_slices, split_divisor) for
+    caller-side reporting.
+    """
+    from ddp_helpers import split_counts_across_ranks
+
+    scale, num_slices = scale_counts_for_z_range(
+        config, z_begin, z_end,
+        REFERENCE_Z_RANGE_NUM_SLICES, count_keys,
+        floors=SAMPLING_COUNT_FLOORS,
+    )
+    split_divisor = split_counts_across_ranks(config, count_keys)
+    return scale, num_slices, split_divisor
+
 
 def _decimate_ordered_points_min_spacing(points, min_spacing):
     if min_spacing <= 0 or len(points) <= 1:

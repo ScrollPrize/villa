@@ -34,7 +34,6 @@ from ddp_helpers import (
     is_main_process,
     maybe_destroy_distributed,
     maybe_init_distributed,
-    split_counts_across_ranks,
 )
 from config import Config
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
@@ -92,12 +91,12 @@ from sdt_losses import (
     phase_bundle_component_weights,
 )
 from spiral_helpers import (
-    SAMPLING_COUNT_FLOORS,
+    REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
-    scale_counts_for_z_range,
+    scale_and_split_counts,
     _infer_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
     resolve_outer_winding_idx_and_notes,
@@ -3229,15 +3228,11 @@ def main(interactive_driver=None, progress=None):
 
 
 if __name__ == '__main__':
-    cli_progress = (
-        ProgressReporter(stream=sys.stderr)
-        if int(os.environ.get('RANK', '0')) == 0 else None
-    )
+    cli_progress = ProgressReporter(stream=sys.stderr) if is_main_process() else None
     maybe_init_distributed()
     try:
         config = Config().as_dict()
         config.update(get_env_config_overrides())
-        reference_z_range_num_slices = 9500
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
@@ -3254,17 +3249,13 @@ if __name__ == '__main__':
             'sample_count_regularisation_points',
             'sample_count_shell_samples',
         )
-        z_range_scale, z_range_num_slices = scale_counts_for_z_range(
-            config, z_begin, z_end,
-            reference_z_range_num_slices, z_range_scaled_count_keys,
-            floors=SAMPLING_COUNT_FLOORS,
-        )
-        split_divisor = split_counts_across_ranks(config, z_range_scaled_count_keys)
+        z_range_scale, z_range_num_slices, split_divisor = scale_and_split_counts(
+            config, z_begin, z_end, z_range_scaled_count_keys)
         if is_main_process():
             print(
                 f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
                 f'z-range [{z_begin}, {z_end}) '
-                f'(reference {reference_z_range_num_slices} slices):\n  '
+                f'(reference {REFERENCE_Z_RANGE_NUM_SLICES} slices):\n  '
                 + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
             )
             if is_distributed():
@@ -3277,7 +3268,8 @@ if __name__ == '__main__':
         wandb.init(project='scrolls', config=config, mode=wandb_mode)
         cfg = wandb.config
         configure_losses(cfg, z_begin, z_end)
-        main(progress=cli_progress)
+        context = FitContext(progress=cli_progress)
+        context.run()
     finally:
         if cli_progress is not None:
             cli_progress.close()

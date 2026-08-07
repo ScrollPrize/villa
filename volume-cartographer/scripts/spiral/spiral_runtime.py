@@ -137,10 +137,8 @@ class InteractiveFitSession:
             import wandb
             import fit_spiral as fitter
             from ddp_helpers import (maybe_destroy_distributed,
-                                     maybe_init_distributed,
-                                     split_counts_across_ranks)
-            from spiral_helpers import (
-                SAMPLING_COUNT_FLOORS, scale_counts_for_z_range)
+                                     maybe_init_distributed)
+            from spiral_helpers import scale_and_split_counts
 
             maybe_init_distributed()
             distributed_initialized = True
@@ -196,16 +194,13 @@ class InteractiveFitSession:
             fields = Config.catalog()["schema"]["fields"]
             count_keys = tuple(
                 key for key, spec in fields.items() if spec.get("scale_with_z"))
-            scale_counts_for_z_range(
+            scale_and_split_counts(
                 config, self.run_config.z_begin, self.run_config.z_end,
-                9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
-            split_counts_across_ranks(config, count_keys)
+                count_keys)
             if checkpoint_profile_config is None:
-                scale_counts_for_z_range(
+                scale_and_split_counts(
                     default_advanced_config, self.run_config.z_begin,
-                    self.run_config.z_end, 9500, count_keys,
-                    floors=SAMPLING_COUNT_FLOORS)
-                split_counts_across_ranks(default_advanced_config, count_keys)
+                    self.run_config.z_end, count_keys)
             config.update(explicit_sampling_counts)
             self.requested_config = dict(config)
             with self._condition:
