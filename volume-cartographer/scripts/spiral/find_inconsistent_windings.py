@@ -180,6 +180,13 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     )
     # We don't compute shell losses; stop prepare_patches from loading the shell.
     fs.shell_losses_enabled = lambda: False
+    # This analysis needs no scroll volume, track store, or outer shell:
+    # keep load_host_inputs() from touching those training-only inputs
+    # (the old load_only_patches_and_point_collections early return
+    # skipped them implicitly).
+    fs.scroll_zarr_path = None
+    fs.tracks_dbm_path = None
+    fs.shell_path = None
     return int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
@@ -934,14 +941,13 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         )
 
     print('loading + z-filtering patches and point-collections')
-    patches, _unverified, _shell, cross_patch_pcls, _unattached = fs.main(
-        load_only_patches_and_point_collections=True
-    )
-    if isinstance(cross_patch_pcls, list):
-        # fit_spiral now returns the cross-patch pcls as a list; this tool's
-        # vote/edge builders key their reports by pcl id. Per-file collection
-        # ids collide across json files, so key by list position instead.
-        cross_patch_pcls = dict(enumerate(cross_patch_pcls))
+    context = fs.FitContext()
+    context.load_host_inputs()
+    patches = context.verified_patches
+    # fit_spiral holds the cross-patch pcls as a list; this tool's
+    # vote/edge builders key their reports by pcl id. Per-file collection
+    # ids collide across json files, so key by list position instead.
+    cross_patch_pcls = dict(enumerate(context.cross_patch_pcls))
     if patch_id not in patches:
         raise SystemExit(
             f'patch id {patch_id!r} not among {len(patches)} loaded patches (after z-filtering); '

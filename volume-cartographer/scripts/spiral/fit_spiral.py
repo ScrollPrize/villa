@@ -294,7 +294,7 @@ class ShellPolarMap:
         return target_radius, radius, confidence, valid
 
 
-class PatchGpuAtlas:
+class PatchAtlas:
     """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
     per lookup instead of per-patch dispatch. The packed grids stay resident in
     host memory: the (i, j) samples are drawn on the CPU anyway, so the
@@ -587,6 +587,128 @@ def realign_optimizer_lr_schedule(
     return lr_scheduler, horizon
 
 
+def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
+    # Returns True for each point with at least one trusted-geometry anchor
+    # within `threshold`. query returns dist == inf for misses.
+    points_np = np.ascontiguousarray(points_np, dtype=np.float32)
+    dist, _ = trusted_geometry_tree.query(
+        points_np,
+        k=1,
+        distance_upper_bound=float(threshold),
+        workers=-1,
+    )
+    return np.isfinite(dist)
+
+
+def _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate):
+    if not vertices_to_invalidate.any():
+        return 0, False
+
+    invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
+    patch.zyxs[invalid_mask_2d] = -1.0
+    n_masked = int(vertices_to_invalidate.sum())
+
+    new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
+    new_valid_quad_mask = (
+        new_valid_vertex_mask[:-1, :-1]
+        & new_valid_vertex_mask[1:, :-1]
+        & new_valid_vertex_mask[:-1, 1:]
+        & new_valid_vertex_mask[1:, 1:]
+    )
+
+    if not bool(new_valid_quad_mask.any()):
+        return n_masked, True
+
+    patch.__post_init__()
+    return n_masked, False
+
+
+def _mask_unverified_patches_near_trusted_geometry(
+    unverified_patches,
+    trusted_geometry_tree,
+    threshold,
+    max_query_points=2_000_000,
+):
+    if threshold <= 0 or trusted_geometry_tree is None:
+        return dict(unverified_patches), 0, 0
+
+    kept_unverified_patches = {}
+    n_masked_vertices = 0
+    n_dropped_patches = 0
+
+    batch_entries = []
+    batch_points = []
+    batch_total = 0
+
+    def flush_batch():
+        nonlocal batch_entries, batch_points, batch_total
+        nonlocal n_masked_vertices, n_dropped_patches
+
+        if batch_total == 0:
+            return
+
+        points_np = batch_points[0] if len(batch_points) == 1 else np.concatenate(batch_points, axis=0)
+        near_trusted = _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold)
+
+        offset = 0
+        for patch_id, patch, valid_indices in batch_entries:
+            n_valid = len(valid_indices)
+            patch_near_trusted = near_trusted[offset:offset + n_valid]
+            offset += n_valid
+
+            vertices_to_invalidate = np.zeros(patch.zyxs.shape[0] * patch.zyxs.shape[1], dtype=bool)
+            vertices_to_invalidate[valid_indices[patch_near_trusted]] = True
+            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
+            n_masked_vertices += n_masked
+            if dropped:
+                n_dropped_patches += 1
+            else:
+                kept_unverified_patches[patch_id] = patch
+
+        batch_entries = []
+        batch_points = []
+        batch_total = 0
+
+    for patch_id, patch in unverified_patches.items():
+        zyxs_flat = patch.zyxs.reshape(-1, 3).cpu().numpy()
+        valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
+        valid_indices = np.flatnonzero(valid_flat)
+
+        if len(valid_indices) == 0:
+            kept_unverified_patches[patch_id] = patch
+            continue
+
+        if len(valid_indices) > max_query_points:
+            flush_batch()
+            vertices_to_invalidate = np.zeros(len(valid_flat), dtype=bool)
+            for start in range(0, len(valid_indices), max_query_points):
+                chunk_indices = valid_indices[start:start + max_query_points]
+                near_trusted = _query_near_trusted_geometry(
+                    zyxs_flat[chunk_indices],
+                    trusted_geometry_tree,
+                    threshold,
+                )
+                vertices_to_invalidate[chunk_indices[near_trusted]] = True
+
+            n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
+            n_masked_vertices += n_masked
+            if dropped:
+                n_dropped_patches += 1
+            else:
+                kept_unverified_patches[patch_id] = patch
+            continue
+
+        if batch_total + len(valid_indices) > max_query_points:
+            flush_batch()
+
+        batch_entries.append((patch_id, patch, valid_indices))
+        batch_points.append(zyxs_flat[valid_indices])
+        batch_total += len(valid_indices)
+
+    flush_batch()
+    return kept_unverified_patches, n_masked_vertices, n_dropped_patches
+
+
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -608,51 +730,150 @@ class FitContext:
         self._lasagna_store = None
         self._scalar_stores = []
 
-    def run(self, load_only_patches_and_point_collections=False):
-        interactive_driver = self.interactive_driver
-        progress = self.progress
-        has_progress = progress is not None
-        progress = progress_or_null(progress)
+    def _load_patches_from_dir(self, path, label='patches'):
+        progress = progress_or_null(self.progress)
+        patches = {}
+        entries = sorted(os.listdir(path))
+        progress.begin(
+            'loading', f'Loading {label}',
+            step=0, total_steps=len(entries), unit='patches')
+        for entry_number, entry in enumerate(entries, start=1):
+            segment_path = os.path.join(path, entry)
+            try:
+                patches[entry] = load_tifxyz(segment_path)
+            except Exception as e:
+                print(f'Failed to load segment {entry}: {e}')
+            progress.update(
+                entry_number, detail=f'{len(patches):,} loaded')
+        return patches
+
+    def _prepare_patch_sampling_cache(self, patches):
+        progress = progress_or_null(self.progress)
+        progress.begin(
+            'loading', 'Preparing patch sampling',
+            step=0, total_steps=len(patches), unit='patches')
+        native_sampling_available = load_native_spiral_sampling() is not None
+        patch_areas = np.empty(len(patches), dtype=np.float32)
+        for patch_idx, patch in enumerate(patches):
+            # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
+            # is well-defined for di, dj in [0, 1).
+            valid_quad_mask_np = patch.valid_quad_mask.cpu().numpy()
+            # Restrict sampling to quads whose representative z is in [z_begin, z_end),
+            # so patch-loss tracks don't waste samples outside the optimisation ROI.
+            zyxs_z_np = patch.zyxs[..., 0].cpu().numpy()
+            quad_zs_np = (zyxs_z_np[:-1, :-1] + zyxs_z_np[1:, :-1] + zyxs_z_np[:-1, 1:] + zyxs_z_np[1:, 1:]) / 4
+            z_in_roi_np = (
+                    (quad_zs_np >= z_begin - cfg['patch_loss_z_margin'])
+                    & (quad_zs_np < z_end + cfg['patch_loss_z_margin'])
+            )
+            in_roi_quad_mask_np = valid_quad_mask_np & z_in_roi_np
+            if not in_roi_quad_mask_np.any():
+                # Fallback if no quad falls in the ROI; should be rare since patches
+                # entirely outside the z-ROI are dropped earlier.
+                in_roi_quad_mask_np = valid_quad_mask_np
+            patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
+            if not native_sampling_available:
+                patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
+                patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
+
+                # Python fallback: precompute, per row and per column, the
+                # contiguous valid-quad runs. The native atlas owns an equivalent
+                # packed representation and avoids these many small Python arrays.
+                def _runs_per_line(mask_np, fixed_axis, valid_lines):
+                    # Returns parallel lists indexed by valid line.
+
+                    def _build_line_runs(line_valid):
+                        padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
+                        diff = np.diff(padded)
+                        los = np.where(diff == 1)[0].astype(np.int64)
+                        his = np.where(diff == -1)[0].astype(np.int64)
+                        return los, his
+
+                    los_list, his_list, cum_list = [], [], []
+                    for r in valid_lines:
+                        line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
+                        los, his = _build_line_runs(line)
+                        los_list.append(los)
+                        his_list.append(his)
+                        cum_list.append(np.cumsum(his - los))
+                    return los_list, his_list, cum_list
+
+                patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
+                    in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
+                )
+                patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
+                    in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
+                )
+
+            patch_areas[patch_idx] = float(patch.area)
+            progress.update(patch_idx + 1)
+
+        inv_weights = patch_areas ** 0.5
+        return inv_weights / inv_weights.sum()
+
+    def _rebuild_pcl_sampling_strata(self):
+        """Rebuild the per-family sampling strata in place.
+
+        Mutates self.pcl_sampling_strata (never rebinds it) so every
+        holder of the dict observes the rebuilt strata; called again by
+        the interactive path whenever it appends pcls.
+        """
+        self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
+            pcl['sampling_group'] if len(pcl['points']) > 1 else None
+            for pcl in self.cross_patch_pcls
+        )
+        self.pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
+            self.unattached_strip_sampling_groups)
+
+    def load_host_inputs(self):
+        """Load and prepare every host-side input for a fit.
+
+        Seeds the host RNG streams, then loads patches, point collections,
+        fibers, tracks, and the outer shell; links and classifies PCLs;
+        builds the sampling caches, the host-resident patch atlases, and
+        the trusted-geometry index. Requires no device state: the patch
+        atlases are host-resident (their `device` only selects where each
+        lookup's interpolated points are delivered), and the CUDA stores,
+        model, and optimiser are built later by run().
+
+        The loaded inputs stay readable as attributes afterwards, so
+        analysis tools can construct a context, call this, and read:
+
+        - patches: verified_patches (+ verified_patches_list,
+          num_verified_patches), unverified_patches
+          (+ unverified_patches_list), shell_patch
+        - point collections: cross_patch_pcls, unattached_pcl_strips,
+          unattached_strip_sampling_groups, pcl_sampling_strata, next_id,
+          link_distance_tolerance
+        - sampling: patch_sampling_probabilities, patch_atlas,
+          unverified_patch_sampling_probabilities, unverified_patch_atlas
+        - trusted geometry: verified_patches_and_pcls_cpu / _np,
+          trusted_geometry_tree
+        - tracks: tracks, track_families, track_source_ids,
+          track_crossing_cache, track_graph, track_reload_source /
+          _families / _source_ids, track_sampling_config, using_tracks,
+          filter_tracks_by_shell
+        - misc: umbilicus, scroll_zarr, shell_envelope,
+          dense_spacing_mode, phase_mode, grad_mag_spacing_enabled
+        """
+        progress = progress_or_null(self.progress)
 
         np.random.seed(cfg['optimizer_random_seed'])
         torch.random.manual_seed(cfg['optimizer_random_seed'])
-        if load_only_patches_and_point_collections:
-            scroll_zarr = None
+        progress.begin('loading', 'Loading umbilicus')
+        umbilicus = umbilicus_z_to_yx()
+        if scroll_zarr_path:
+            progress.begin('loading', 'Opening scroll volume')
+            print('loading volume zarr')
+            scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
         else:
-            progress.begin('loading', 'Loading umbilicus')
-            umbilicus = umbilicus_z_to_yx()
-            if scroll_zarr_path:
-                progress.begin('loading', 'Opening scroll volume')
-                print('loading volume zarr')
-                scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
-            else:
-                scroll_zarr = None
+            scroll_zarr = None
 
         # ==========================================================================
         # Patch loading and ROI filtering
         # ==========================================================================
 
-        def load_patches_from_dir(path, label='patches'):
-            patches = {}
-            entries = sorted(os.listdir(path))
-            progress.begin(
-                'loading', f'Loading {label}',
-                step=0, total_steps=len(entries), unit='patches')
-            for entry_number, entry in enumerate(entries, start=1):
-                segment_path = os.path.join(path, entry)
-                try:
-                    patches[entry] = load_tifxyz(segment_path)
-                except Exception as e:
-                    print(f'Failed to load segment {entry}: {e}')
-                progress.update(
-                    entry_number, detail=f'{len(patches):,} loaded')
-            return patches
-
-        filter_tracks_by_shell = (
-            not load_only_patches_and_point_collections
-            and bool(tracks_dbm_path)
-            and bool(shell_path)
-        )
+        filter_tracks_by_shell = bool(tracks_dbm_path) and bool(shell_path)
         shell_patch = None
         if shell_losses_enabled() or filter_tracks_by_shell:
             if not shell_path:
@@ -670,12 +891,12 @@ class FitContext:
             # An empty verified dir is allowed when unverified patches are supplied
             # (unverified-only ablations); both empty is a configuration error.
             verified_patches = (
-                load_patches_from_dir(verified_patches_path, 'verified patches')
+                self._load_patches_from_dir(verified_patches_path, 'verified patches')
                 if use_verified_patches and verified_patches_path else {}
             )
             unverified_patches = {}
             if use_unverified_patches and unverified_patches_path:
-                unverified_patches = load_patches_from_dir(
+                unverified_patches = self._load_patches_from_dir(
                     unverified_patches_path, 'unverified patches')
 
         if (not verified_patches and not unverified_patches
@@ -962,8 +1183,6 @@ class FitContext:
                 return ', '.join(entries)
             print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
             print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
-        if load_only_patches_and_point_collections:
-            return verified_patches, unverified_patches, shell_patch, cross_patch_pcls, unattached_pcl_strips
 
         # Per-step sampling pools for the rel-winding and unattached-strip losses:
         # pool indices grouped into strata by sampling group (see
@@ -971,18 +1190,12 @@ class FitContext:
         # boolean or the weighted config). Single-point pcls (possible only for
         # winding_is_absolute pcls) can't form a cross-patch pair, so they are
         # excluded from the rel-winding pool. Rebuilt whenever the interactive
-        # path appends pcls (see rebuild_pcl_sampling_strata).
-        pcl_sampling_strata = {}
-
-        def rebuild_pcl_sampling_strata():
-            pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
-                pcl['sampling_group'] if len(pcl['points']) > 1 else None
-                for pcl in cross_patch_pcls
-            )
-            pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
-                unattached_strip_sampling_groups)
-
-        rebuild_pcl_sampling_strata()
+        # path appends pcls (see _rebuild_pcl_sampling_strata).
+        self.cross_patch_pcls = cross_patch_pcls
+        self.unattached_pcl_strips = unattached_pcl_strips
+        self.unattached_strip_sampling_groups = unattached_strip_sampling_groups
+        self.pcl_sampling_strata = {}
+        self._rebuild_pcl_sampling_strata()
 
         # The strip arrays and cross-patch list are the compact training forms.
         # Drop the JSON-shaped source containers, especially the independent deep
@@ -991,7 +1204,7 @@ class FitContext:
         del unattached_point_collections, cross_patch_point_collections
 
         # ==========================================================================
-        # lasagna and tracks loading
+        # dense-spacing mode, shell envelope, and tracks
         # ==========================================================================
 
         # The two-mode dense-spacing contract: 'phase' (production bundle) or
@@ -1018,74 +1231,6 @@ class FitContext:
                 num_theta_bins=cfg['shell_num_theta_bins'],
                 device='cpu',
             )
-
-        lasagna_volume = prepare_lasagna_volume(
-            scroll_zarr,
-            use_normals=(cfg['loss_weight_dense_normals'] > 0 or phase_mode),
-            use_spacing=grad_mag_spacing_enabled,
-            normal_nx_zarr_path=normal_nx_zarr_path,
-            normal_ny_zarr_path=normal_ny_zarr_path,
-            grad_mag_zarr_path=grad_mag_zarr_path,
-            normal_zarr_group=normal_zarr_group,
-            z_begin=z_begin,
-            z_end=z_end,
-            lasagna_scale=lasagna_scale,
-            storage_backend=lasagna_storage_backend,
-            cache_directory=cache_path,
-            progress=progress,
-        )
-        if interactive_driver is not None and lasagna_volume:
-            self._lasagna_store = lasagna_volume['store']
-
-        # Surf-SDT store: a core input of the whole phase bundle (registration,
-        # count, attachment), required in phase mode even when individual
-        # sub-weights are zero so run-mutable weights can be adjusted (or zeroed
-        # and re-raised) at run boundaries without a session reload.
-        sdt_volume = None
-        if phase_mode:
-            if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the surf-SDT store: "
-                    f'{surf_sdt_zarr_path!r}')
-            if lasagna_volume is None:
-                raise RuntimeError(
-                    "dense_spacing_mode='phase' requires the dense normal stores "
-                    'for band incidence/fragment handling')
-            sdt_volume = prepare_surf_sdt_volume(
-                surf_sdt_zarr_path,
-                surf_sdt_zarr_group,
-                z_begin=z_begin,
-                z_end=z_end,
-                cache_directory=cache_path,
-                storage_backend=lasagna_storage_backend,
-                progress=progress,
-            )
-            if interactive_driver is not None:
-                self._scalar_stores.append(sdt_volume['store'])
-
-        def phase_mode_active():
-            return phase_mode and sdt_volume is not None and lasagna_volume is not None
-
-        def grad_mag_mode_active():
-            return grad_mag_spacing_enabled and lasagna_volume is not None
-
-        sdt_inactive_warned = set()
-
-        def warn_if_sdt_loss_inactive():
-            # Run-mutable weights are read afresh every step, but the SDT-backed
-            # components only exist in phase mode; make a grad_mag session's
-            # nonzero SDT-backed weights a visible no-op. The native min-spacing
-            # barrier is asset-independent and remains active in either mode.
-            if phase_mode:
-                return
-            for weight_key in ('loss_weight_dense_spacing_count',
-                               'loss_weight_dense_spacing_density',
-                               'loss_weight_dense_attachment'):
-                if cfg[weight_key] > 0 and weight_key not in sdt_inactive_warned:
-                    sdt_inactive_warned.add(weight_key)
-                    print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
-                          f'{dense_spacing_mode!r}; this component runs only as '
-                          "part of the 'phase' bundle and is INACTIVE.")
 
         track_sampling_config = validate_track_sampling_config(cfg)
         track_families = None
@@ -1135,94 +1280,20 @@ class FitContext:
         # patch cache / atlas construction
         # ==========================================================================
 
-        def prepare_patch_sampling_cache(patches):
-            progress.begin(
-                'loading', 'Preparing patch sampling',
-                step=0, total_steps=len(patches), unit='patches')
-            native_sampling_available = load_native_spiral_sampling() is not None
-            patch_areas = np.empty(len(patches), dtype=np.float32)
-            for patch_idx, patch in enumerate(patches):
-                # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
-                # is well-defined for di, dj in [0, 1).
-                valid_quad_mask_np = patch.valid_quad_mask.cpu().numpy()
-                # Restrict sampling to quads whose representative z is in [z_begin, z_end),
-                # so patch-loss tracks don't waste samples outside the optimisation ROI.
-                zyxs_z_np = patch.zyxs[..., 0].cpu().numpy()
-                quad_zs_np = (zyxs_z_np[:-1, :-1] + zyxs_z_np[1:, :-1] + zyxs_z_np[:-1, 1:] + zyxs_z_np[1:, 1:]) / 4
-                z_in_roi_np = (
-                        (quad_zs_np >= z_begin - cfg['patch_loss_z_margin'])
-                        & (quad_zs_np < z_end + cfg['patch_loss_z_margin'])
-                )
-                in_roi_quad_mask_np = valid_quad_mask_np & z_in_roi_np
-                if not in_roi_quad_mask_np.any():
-                    # Fallback if no quad falls in the ROI; should be rare since patches
-                    # entirely outside the z-ROI are dropped earlier.
-                    in_roi_quad_mask_np = valid_quad_mask_np
-                patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
-                if not native_sampling_available:
-                    patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
-                    patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
-
-                    # Python fallback: precompute, per row and per column, the
-                    # contiguous valid-quad runs. The native atlas owns an equivalent
-                    # packed representation and avoids these many small Python arrays.
-                    def _runs_per_line(mask_np, fixed_axis, valid_lines):
-                        # Returns parallel lists indexed by valid line.
-
-                        def _build_line_runs(line_valid):
-                            padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
-                            diff = np.diff(padded)
-                            los = np.where(diff == 1)[0].astype(np.int64)
-                            his = np.where(diff == -1)[0].astype(np.int64)
-                            return los, his
-
-                        los_list, his_list, cum_list = [], [], []
-                        for r in valid_lines:
-                            line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
-                            los, his = _build_line_runs(line)
-                            los_list.append(los)
-                            his_list.append(his)
-                            cum_list.append(np.cumsum(his - los))
-                        return los_list, his_list, cum_list
-
-                    patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
-                        in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
-                    )
-                    patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
-                        in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
-                    )
-
-                patch_areas[patch_idx] = float(patch.area)
-                progress.update(patch_idx + 1)
-
-            inv_weights = patch_areas ** 0.5
-            return inv_weights / inv_weights.sum()
-
         verified_patches_list = list(verified_patches.values())
-        patch_sampling_probabilities = prepare_patch_sampling_cache(verified_patches_list)
+        patch_sampling_probabilities = self._prepare_patch_sampling_cache(verified_patches_list)
         num_verified_patches = len(verified_patches_list)
         print(f'fitting {num_verified_patches} patches')
-
-        out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-        out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{num_verified_patches}-patch'
-        if not wandb.run.name.startswith('dummy-'):
-            out_path += '_' + wandb.run.name
-        if run_tag:
-            out_path += f'_{run_tag}'
-        os.makedirs(out_path, exist_ok=True)
 
         progress.begin(
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(verified_patches):,} patches')
-        patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
+        patch_atlas = PatchAtlas(verified_patches, device='cuda')
         print(f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
 
         # ==========================================================================================
         # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
         # ==========================================================================================
-
-        num_slices_for_visualisation = cfg.get('output_num_slices_for_visualization', 20)
-        device = torch.device('cuda')
 
         # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
         # on CPU instead of storing it in the atlas on CUDA, concatenating it again on
@@ -1253,6 +1324,7 @@ class FitContext:
             and bool(tracks)
         )
         trusted_geometry_tree = None
+        verified_patches_and_pcls_np = None
 
         # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
         # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
@@ -1267,125 +1339,6 @@ class FitContext:
                     'loading', 'Building trusted-geometry index',
                     detail=f'{len(verified_patches_and_pcls_np):,} points')
                 trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
-
-        def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
-            # Returns True for each point with at least one trusted-geometry anchor
-            # within `threshold`. query returns dist == inf for misses.
-            points_np = np.ascontiguousarray(points_np, dtype=np.float32)
-            dist, _ = trusted_geometry_tree.query(
-                points_np,
-                k=1,
-                distance_upper_bound=float(threshold),
-                workers=-1,
-            )
-            return np.isfinite(dist)
-
-        def _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate):
-            if not vertices_to_invalidate.any():
-                return 0, False
-
-            invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
-            patch.zyxs[invalid_mask_2d] = -1.0
-            n_masked = int(vertices_to_invalidate.sum())
-
-            new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
-            new_valid_quad_mask = (
-                new_valid_vertex_mask[:-1, :-1]
-                & new_valid_vertex_mask[1:, :-1]
-                & new_valid_vertex_mask[:-1, 1:]
-                & new_valid_vertex_mask[1:, 1:]
-            )
-
-            if not bool(new_valid_quad_mask.any()):
-                return n_masked, True
-
-            patch.__post_init__()
-            return n_masked, False
-
-        def _mask_unverified_patches_near_trusted_geometry(
-            unverified_patches,
-            trusted_geometry_tree,
-            threshold,
-            max_query_points=2_000_000,
-        ):
-            if threshold <= 0 or trusted_geometry_tree is None:
-                return dict(unverified_patches), 0, 0
-
-            kept_unverified_patches = {}
-            n_masked_vertices = 0
-            n_dropped_patches = 0
-
-            batch_entries = []
-            batch_points = []
-            batch_total = 0
-
-            def flush_batch():
-                nonlocal batch_entries, batch_points, batch_total
-                nonlocal n_masked_vertices, n_dropped_patches
-
-                if batch_total == 0:
-                    return
-
-                points_np = batch_points[0] if len(batch_points) == 1 else np.concatenate(batch_points, axis=0)
-                near_trusted = _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold)
-
-                offset = 0
-                for patch_id, patch, valid_indices in batch_entries:
-                    n_valid = len(valid_indices)
-                    patch_near_trusted = near_trusted[offset:offset + n_valid]
-                    offset += n_valid
-
-                    vertices_to_invalidate = np.zeros(patch.zyxs.shape[0] * patch.zyxs.shape[1], dtype=bool)
-                    vertices_to_invalidate[valid_indices[patch_near_trusted]] = True
-                    n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-                    n_masked_vertices += n_masked
-                    if dropped:
-                        n_dropped_patches += 1
-                    else:
-                        kept_unverified_patches[patch_id] = patch
-
-                batch_entries = []
-                batch_points = []
-                batch_total = 0
-
-            for patch_id, patch in unverified_patches.items():
-                zyxs_flat = patch.zyxs.reshape(-1, 3).cpu().numpy()
-                valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
-                valid_indices = np.flatnonzero(valid_flat)
-
-                if len(valid_indices) == 0:
-                    kept_unverified_patches[patch_id] = patch
-                    continue
-
-                if len(valid_indices) > max_query_points:
-                    flush_batch()
-                    vertices_to_invalidate = np.zeros(len(valid_flat), dtype=bool)
-                    for start in range(0, len(valid_indices), max_query_points):
-                        chunk_indices = valid_indices[start:start + max_query_points]
-                        near_trusted = _query_near_trusted_geometry(
-                            zyxs_flat[chunk_indices],
-                            trusted_geometry_tree,
-                            threshold,
-                        )
-                        vertices_to_invalidate[chunk_indices[near_trusted]] = True
-
-                    n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
-                    n_masked_vertices += n_masked
-                    if dropped:
-                        n_dropped_patches += 1
-                    else:
-                        kept_unverified_patches[patch_id] = patch
-                    continue
-
-                if batch_total + len(valid_indices) > max_query_points:
-                    flush_batch()
-
-                batch_entries.append((patch_id, patch, valid_indices))
-                batch_points.append(zyxs_flat[valid_indices])
-                batch_total += len(valid_indices)
-
-            flush_batch()
-            return kept_unverified_patches, n_masked_vertices, n_dropped_patches
 
         if unverified_patches:
             # For each unverified patch, invalidate (set zyxs -> -1) every currently-valid vertex
@@ -1412,14 +1365,141 @@ class FitContext:
 
         if unverified_patches:
             unverified_patches_list = list(unverified_patches.values())
-            unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
-            unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
+            unverified_patch_sampling_probabilities = self._prepare_patch_sampling_cache(unverified_patches_list)
+            unverified_patch_atlas = PatchAtlas(unverified_patches, device='cuda')
+
+        # Loaded host inputs, kept as inspectable attributes (ownership
+        # class (b): host-prepared inputs and caches). cross_patch_pcls,
+        # unattached_pcl_strips, unattached_strip_sampling_groups, and
+        # pcl_sampling_strata were assigned above, before the strata build.
+        self.umbilicus = umbilicus
+        self.scroll_zarr = scroll_zarr
+        self.filter_tracks_by_shell = filter_tracks_by_shell
+        self.shell_patch = shell_patch
+        self.shell_envelope = shell_envelope
+        self.verified_patches = verified_patches
+        self.unverified_patches = unverified_patches
+        self.next_id = next_id
+        self.link_distance_tolerance = link_distance_tolerance
+        self.dense_spacing_mode = dense_spacing_mode
+        self.phase_mode = phase_mode
+        self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
+        self.track_sampling_config = track_sampling_config
+        self.tracks = tracks
+        self.track_families = track_families
+        self.track_source_ids = track_source_ids
+        self.track_crossing_cache = track_crossing_cache
+        self.track_graph = track_graph
+        self.track_reload_source = track_reload_source
+        self.track_reload_families = track_reload_families
+        self.track_reload_source_ids = track_reload_source_ids
+        self.verified_patches_list = verified_patches_list
+        self.patch_sampling_probabilities = patch_sampling_probabilities
+        self.num_verified_patches = num_verified_patches
+        self.patch_atlas = patch_atlas
+        self.using_tracks = using_tracks
+        self.verified_patches_and_pcls_cpu = verified_patches_and_pcls_cpu
+        self.verified_patches_and_pcls_np = verified_patches_and_pcls_np
+        self.trusted_geometry_tree = trusted_geometry_tree
+        self.unverified_patches_list = unverified_patches_list
+        self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
+        self.unverified_patch_atlas = unverified_patch_atlas
+
+    def run(self):
+        interactive_driver = self.interactive_driver
+        progress = progress_or_null(self.progress)
+        has_progress = self.progress is not None
+
+        self.load_host_inputs()
+
+        # ==========================================================================
+        # lasagna and SDT stores
+        # ==========================================================================
+
+        lasagna_volume = prepare_lasagna_volume(
+            self.scroll_zarr,
+            use_normals=(cfg['loss_weight_dense_normals'] > 0 or self.phase_mode),
+            use_spacing=self.grad_mag_spacing_enabled,
+            normal_nx_zarr_path=normal_nx_zarr_path,
+            normal_ny_zarr_path=normal_ny_zarr_path,
+            grad_mag_zarr_path=grad_mag_zarr_path,
+            normal_zarr_group=normal_zarr_group,
+            z_begin=z_begin,
+            z_end=z_end,
+            lasagna_scale=lasagna_scale,
+            storage_backend=lasagna_storage_backend,
+            cache_directory=cache_path,
+            progress=progress,
+        )
+        if interactive_driver is not None and lasagna_volume:
+            self._lasagna_store = lasagna_volume['store']
+
+        # Surf-SDT store: a core input of the whole phase bundle (registration,
+        # count, attachment), required in phase mode even when individual
+        # sub-weights are zero so run-mutable weights can be adjusted (or zeroed
+        # and re-raised) at run boundaries without a session reload.
+        sdt_volume = None
+        if self.phase_mode:
+            if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
+                raise RuntimeError(
+                    "dense_spacing_mode='phase' requires the surf-SDT store: "
+                    f'{surf_sdt_zarr_path!r}')
+            if lasagna_volume is None:
+                raise RuntimeError(
+                    "dense_spacing_mode='phase' requires the dense normal stores "
+                    'for band incidence/fragment handling')
+            sdt_volume = prepare_surf_sdt_volume(
+                surf_sdt_zarr_path,
+                surf_sdt_zarr_group,
+                z_begin=z_begin,
+                z_end=z_end,
+                cache_directory=cache_path,
+                storage_backend=lasagna_storage_backend,
+                progress=progress,
+            )
+            if interactive_driver is not None:
+                self._scalar_stores.append(sdt_volume['store'])
+
+        def phase_mode_active():
+            return self.phase_mode and sdt_volume is not None and lasagna_volume is not None
+
+        def grad_mag_mode_active():
+            return self.grad_mag_spacing_enabled and lasagna_volume is not None
+
+        sdt_inactive_warned = set()
+
+        def warn_if_sdt_loss_inactive():
+            # Run-mutable weights are read afresh every step, but the SDT-backed
+            # components only exist in phase mode; make a grad_mag session's
+            # nonzero SDT-backed weights a visible no-op. The native min-spacing
+            # barrier is asset-independent and remains active in either mode.
+            if self.phase_mode:
+                return
+            for weight_key in ('loss_weight_dense_spacing_count',
+                               'loss_weight_dense_spacing_density',
+                               'loss_weight_dense_attachment'):
+                if cfg[weight_key] > 0 and weight_key not in sdt_inactive_warned:
+                    sdt_inactive_warned.add(weight_key)
+                    print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
+                          f'{self.dense_spacing_mode!r}; this component runs only as '
+                          "part of the 'phase' bundle and is INACTIVE.")
+
+        out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
+        out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{self.num_verified_patches}-patch'
+        if not wandb.run.name.startswith('dummy-'):
+            out_path += '_' + wandb.run.name
+        if run_tag:
+            out_path += f'_{run_tag}'
+        os.makedirs(out_path, exist_ok=True)
+
+        num_slices_for_visualisation = cfg.get('output_num_slices_for_visualization', 20)
+        device = torch.device('cuda')
 
         def rebuild_unverified_patch_inputs(exclusion_radius):
             """Reload only the unverified-patch pool for a Run-boundary mask edit."""
             if not unverified_patches_path:
                 return {}, [], None, None
-            candidates = load_patches_from_dir(unverified_patches_path)
+            candidates = self._load_patches_from_dir(unverified_patches_path)
             for patch_id, patch in list(candidates.items()):
                 cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
                 if (cells_to_erode > 0
@@ -1432,17 +1512,17 @@ class FitContext:
                 patch.release_derived_caches()
             candidates, n_masked, n_dropped = \
                 _mask_unverified_patches_near_trusted_geometry(
-                    candidates, trusted_geometry_tree, exclusion_radius)
+                    candidates, self.trusted_geometry_tree, exclusion_radius)
             print(
                 f'unverified patches: remasked {n_masked} vertices near trusted '
                 f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
                 f'{len(candidates)} remain')
             candidate_list = list(candidates.values())
             probabilities = (
-                prepare_patch_sampling_cache(candidate_list)
+                self._prepare_patch_sampling_cache(candidate_list)
                 if candidate_list else None)
             atlas = (
-                PatchGpuAtlas(candidates, device='cuda')
+                PatchAtlas(candidates, device='cuda')
                 if candidate_list else None)
             return candidates, candidate_list, probabilities, atlas
 
@@ -1450,7 +1530,7 @@ class FitContext:
         # are prepared lazily at final export, and never in a resident VC3D session.
         all_zs = np.arange(z_begin, z_end)
         umbilicus_zyx = torch.from_numpy(
-            np.concatenate([all_zs[:, None], umbilicus(all_zs)], axis=-1).astype(np.float32)).to(device)
+            np.concatenate([all_zs[:, None], self.umbilicus(all_zs)], axis=-1).astype(np.float32)).to(device)
         all_zs = torch.from_numpy(all_zs).to(device)
 
         def prepare_png_visualization_inputs():
@@ -1460,13 +1540,13 @@ class FitContext:
                 min(num_slices_for_visualisation, z_end - 1 - z_begin),
                 dtype=np.int64,
             )
-            if scroll_zarr is not None:
-                subvolume_shape = (z_end - z_begin, *scroll_zarr.shape[1:])
+            if self.scroll_zarr is not None:
+                subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
                 print('loading slices for visualisation')
                 vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
                 scroll_slices = (
-                    torch.from_numpy(scroll_zarr[vis_zs]).to(torch.float32)
-                    / np.iinfo(scroll_zarr.dtype).max * 0.75 * 255
+                    torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
+                    / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
                 ).to(torch.uint8)
             else:
                 subvolume_shape = (
@@ -1477,7 +1557,7 @@ class FitContext:
                 scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
 
             prediction_slices, quad_labels, _ = overlay_patches_on_slices(
-                verified_patches_list,
+                self.verified_patches_list,
                 zs,
                 subvolume_shape[1:],
                 cache_path,
@@ -1533,7 +1613,7 @@ class FitContext:
                 # (--resume extension of an ROI-first build), so only the
                 # content-identity fields compare - 'created'/'git_commit' are
                 # stamped once at store creation and anchor the identity.
-                if phase_mode:
+                if self.phase_mode:
                     coverage_and_location_keys = (
                         'path', 'source', 'complete',
                         'z_range_working', 'built_z_ranges_working',
@@ -1620,26 +1700,26 @@ class FitContext:
                 patch.valid_zyxs, int(cfg['sample_count_shell_samples']), pool_generator,
             ).to(device=device, dtype=torch.float32)
 
-        shell_active = shell_patch is not None and shell_losses_enabled()
+        shell_active = self.shell_patch is not None and shell_losses_enabled()
         if shell_active:
             if cfg['loss_weight_shell_outer'] > 0:
                 shell_map = ShellPolarMap(
-                    shell_patch,
-                    umbilicus,
+                    self.shell_patch,
+                    self.umbilicus,
                     z_min=z_begin - cfg['model_flow_bounds_z_margin'],
                     z_max=z_end + cfg['model_flow_bounds_z_margin'],
                     num_theta_bins=cfg['shell_num_theta_bins'],
                     device=device,
                 )
             if cfg['loss_weight_shell_patch_radius'] > 0:
-                shell_valid_zyxs_gpu = subsample_shell_radius_pool(shell_patch)
+                shell_valid_zyxs_gpu = subsample_shell_radius_pool(self.shell_patch)
 
         def infer_outer_winding_idx_for_this_run():
             return _infer_shell_outer_winding_idx(
                 spiral_and_transform.get_slice_to_spiral_transform(),
                 spiral_and_transform.get_dr_per_winding(),
-                verified_patches_list,
-                unattached_pcl_strips,
+                self.verified_patches_list,
+                self.unattached_pcl_strips,
                 cfg,
                 z_begin,
                 z_end,
@@ -1882,36 +1962,36 @@ class FitContext:
         # ==========================================================================
 
         prepared_main_tracks = None
-        preview_extent_tracks = tracks
-        if using_tracks:
+        preview_extent_tracks = self.tracks
+        if self.using_tracks:
             progress.begin(
                 'loading', 'Preparing tracks for optimization',
-                detail=f'{len(tracks):,} tracks')
+                detail=f'{len(self.tracks):,} tracks')
             prepared_main_tracks = prepare_main_phase_tracks(
-                tracks,
+                self.tracks,
                 None,
                 float(cfg['track_exclusion_radius']),
                 device,
-                anchor_tree=trusted_geometry_tree,
-                sampling_config=track_sampling_config,
-                track_families=track_families,
-                track_source_ids=track_source_ids,
-                crossing_cache=track_crossing_cache,
-                track_graph=track_graph,
+                anchor_tree=self.trusted_geometry_tree,
+                sampling_config=self.track_sampling_config,
+                track_families=self.track_families,
+                track_source_ids=self.track_source_ids,
+                crossing_cache=self.track_crossing_cache,
+                track_graph=self.track_graph,
             )
             # The sidecar CSR is setup-only. The prepared bundle now owns only its
             # fixed-width training tables, so release the whole-DB graph promptly.
             if interactive_driver is None:
-                track_crossing_cache = None
-                track_graph = None
+                self.track_crossing_cache = None
+                self.track_graph = None
             # With the usual zero exclusion radius, the training bundle already
             # contains every authoritative track point as one flat CPU tensor.  Reuse it
             # for preview bounds instead of walking millions of short NumPy tracks.
             if prepared_main_tracks is not None:
                 input_track_points = (
-                    int(tracks.selected_lengths.sum())
-                    if isinstance(tracks, PackedTrackCollection)
-                    else sum(len(track) for track in tracks))
+                    int(self.tracks.selected_lengths.sum())
+                    if isinstance(self.tracks, PackedTrackCollection)
+                    else sum(len(track) for track in self.tracks))
                 if prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                     preview_extent_tracks = (prepared_main_tracks['flat_zyx_cpu'],)
 
@@ -1923,7 +2003,7 @@ class FitContext:
             stash_generator = torch.Generator()
             stash_generator.manual_seed(int(cfg['optimizer_random_seed']))
             influence_anchor_geometry = subsample_rows(
-                verified_patches_and_pcls_cpu,
+                self.verified_patches_and_pcls_cpu,
                 int(cfg['sample_count_influence_anchor_geometry_points']),
                 stash_generator,
             ).clone()
@@ -1931,9 +2011,9 @@ class FitContext:
         # The trusted cloud and its double-precision cKDTree are setup-only data.
         # Track sampling retains its own compact offsets and coordinates.
         if interactive_driver is None:
-            trusted_geometry_tree = None
-        verified_patches_and_pcls_cpu = None
-        verified_patches_and_pcls_np = None
+            self.trusted_geometry_tree = None
+        self.verified_patches_and_pcls_cpu = None
+        self.verified_patches_and_pcls_np = None
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1949,14 +2029,14 @@ class FitContext:
             progress.begin(
                 'loading', 'Preparing distance-target samples',
                 detail=(
-                    f'{len(verified_patches_list) + len(unverified_patches_list):,} '
+                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
                     'patches'))
             prepare_patch_dt_target_samples(
-                verified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
+                self.verified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
             )
-            if unverified_patches_list:
+            if self.unverified_patches_list:
                 prepare_patch_dt_target_samples(
-                    unverified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
+                    self.unverified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
                 )
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -2023,8 +2103,8 @@ class FitContext:
                 manifest = save_combined_preview(
                     spiral_and_transform.get_slice_to_spiral_transform(),
                     spiral_and_transform.get_dr_per_winding(),
-                    verified_patches_list,
-                    unattached_pcl_strips,
+                    self.verified_patches_list,
+                    self.unattached_pcl_strips,
                     generation_path,
                     cfg,
                     z_begin,
@@ -2068,39 +2148,39 @@ class FitContext:
                         transform, dr,
                         cfg['sample_count_patches_per_step'],
                         cfg['sample_count_patches_per_step_for_dt'],
-                        verified_patches_list, patch_atlas,
-                        patch_sampling_probabilities, umbilicus_zyx,
+                        self.verified_patches_list, self.patch_atlas,
+                        self.patch_sampling_probabilities, umbilicus_zyx,
                         compute_dt=cfg['loss_weight_patch_dt'] > 0,
                         shell_valid_zyxs=shell_valid_zyxs_gpu,
                         shell_outer_winding_idx=shell_outer_winding_idx,
                     )
-                    if unverified_patch_atlas is not None:
+                    if self.unverified_patch_atlas is not None:
                         get_unverified_patch_losses(
                             transform, dr,
                             cfg['sample_count_unverified_patches_per_step'],
                             cfg['sample_count_unverified_patches_per_step_for_dt'],
-                            unverified_patches_list, unverified_patch_atlas,
-                            unverified_patch_sampling_probabilities,
+                            self.unverified_patches_list, self.unverified_patch_atlas,
+                            self.unverified_patch_sampling_probabilities,
                             compute_dt=cfg['loss_weight_unverified_patch_dt'] > 0,
                         )
                     if cfg['loss_weight_sym_dirichlet'] > 0:
                         get_symmetric_dirichlet_loss(
                             transform, dr, shell_outer_winding_idx,
                             cfg['sample_count_regularisation_points'])
-                    if cfg['loss_weight_rel_winding'] > 0 and cross_patch_pcls:
+                    if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                         get_patch_rel_winding_loss(
-                            transform, dr, verified_patches, patch_atlas,
-                            cross_patch_pcls, pcl_sampling_strata['cross_patch'])
-                    if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
+                            transform, dr, self.verified_patches, self.patch_atlas,
+                            self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'])
+                    if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                         get_patch_abs_winding_loss(
-                            transform, dr, verified_patches, patch_atlas,
-                            cross_patch_pcls)
+                            transform, dr, self.verified_patches, self.patch_atlas,
+                            self.cross_patch_pcls)
                     if lasagna_volume is not None:
                         for _loss_name, _loss_value in iter_lasagna_losses(
                                 transform, dr, lasagna_volume,
                                 shell_outer_winding_idx,
                                 cfg['sample_count_dense_normal_points'],
-                                compute_spacing=grad_mag_spacing_enabled):
+                                compute_spacing=self.grad_mag_spacing_enabled):
                             pass
                     if phase_mode_active():
                         preview_generator = torch.Generator(device=dr.device)
@@ -2110,10 +2190,10 @@ class FitContext:
                                 lasagna_volume, shell_outer_winding_idx, cfg,
                                 z_begin, z_end, generator=preview_generator):
                             pass
-                    if unattached_pcl_strips:
+                    if self.unattached_pcl_strips:
                         get_unattached_pcl_strip_losses(
-                            transform, dr, unattached_pcl_strips,
-                            pcl_sampling_strata['unattached'],
+                            transform, dr, self.unattached_pcl_strips,
+                            self.pcl_sampling_strata['unattached'],
                             get_or_build_unattached_pcl_flat,
                             cfg['sample_count_unattached_pcls_per_step'],
                             cfg['sample_count_unattached_pcl_points_per_step'],
@@ -2170,7 +2250,7 @@ class FitContext:
             service's deterministic order, so a multi-rank session would append the
             same items in the same order on every rank.
             """
-            nonlocal patch_sampling_probabilities, next_id, influence_state
+            nonlocal influence_state
             nonlocal interactive_influence_loss_weight, interactive_influence_anchor_samples
             nonlocal interactive_dt_resume_iteration
             # Incorporation has its own saved RNG envelope so adding inputs does
@@ -2194,7 +2274,7 @@ class FitContext:
                     if kind == 'patch':
                         if cfg['input_disable_patches']:
                             raise RuntimeError('disable_patches=True: this session takes no patches')
-                        if input_id in verified_patches or input_id in new_patches:
+                        if input_id in self.verified_patches or input_id in new_patches:
                             raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                         patch = load_tifxyz(path)
                         cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
@@ -2208,7 +2288,7 @@ class FitContext:
                         new_patches[input_id] = patch
                     elif kind == 'fiber':
                         pcl = load_fiber_point_collection(
-                            path, next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
+                            path, self.next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
                         if pcl is None:
                             raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
                         pcl['source_file'] = path
@@ -2216,8 +2296,8 @@ class FitContext:
                         pcl['metadata']['input_role'] = 'fiber'
                         hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
                         pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
-                        new_collections[next_id] = pcl
-                        next_id += 1
+                        new_collections[self.next_id] = pcl
+                        self.next_id += 1
                     elif kind == 'pcl':
                         role = record.get('role')
                         loaded = load_point_collection(path) or {}
@@ -2228,8 +2308,8 @@ class FitContext:
                             pcl['sampling_group'] = path
                             pcl.setdefault('metadata', {})['winding_is_absolute'] = role == 'absolute'
                             pcl['metadata']['input_role'] = role
-                            new_collections[next_id] = pcl
-                            next_id += 1
+                            new_collections[self.next_id] = pcl
+                            self.next_id += 1
                     else:
                         raise RuntimeError(f'Unknown ephemeral input kind {kind!r}')
 
@@ -2243,14 +2323,14 @@ class FitContext:
                 # ---- Patches: sampling caches, probabilities, atlas append ----
                 if new_patches:
                     for patch in new_patches.values():
-                        prepare_patch_sampling_cache([patch])
-                    verified_patches.update(new_patches)
-                    verified_patches_list.extend(new_patches.values())
-                    areas = np.array([float(p.area) for p in verified_patches_list],
+                        self._prepare_patch_sampling_cache([patch])
+                    self.verified_patches.update(new_patches)
+                    self.verified_patches_list.extend(new_patches.values())
+                    areas = np.array([float(p.area) for p in self.verified_patches_list],
                                      dtype=np.float32)
                     inv_weights = areas ** 0.5
-                    patch_sampling_probabilities = inv_weights / inv_weights.sum()
-                    patch_atlas.append_patches(new_patches)
+                    self.patch_sampling_probabilities = inv_weights / inv_weights.sum()
+                    self.patch_atlas.append_patches(new_patches)
                     if cfg['dt_target_mode'] == 'whole_object_quantile':
                         prepare_patch_dt_target_samples(
                             list(new_patches.values()),
@@ -2265,10 +2345,10 @@ class FitContext:
                                 [point['p'][2], point['p'][1], point['p'][0]],
                                 dtype=np.float32)
                     link_points_to_patches(
-                        verified_patches,
+                        self.verified_patches,
                         new_collections,
-                        tolerance=link_distance_tolerance,
-                        surface_index_tolerance=link_distance_tolerance,
+                        tolerance=self.link_distance_tolerance,
+                        surface_index_tolerance=self.link_distance_tolerance,
                         distance_scale=1.0,
                         general_hit_policy='largest_area',
                     )
@@ -2321,11 +2401,11 @@ class FitContext:
                             if 'on_patch' not in point:
                                 continue
                             pid = point['on_patch']['id']
-                            if pid not in verified_patches:
+                            if pid not in self.verified_patches:
                                 continue
                             points_by_patch.setdefault(pid, []).append(point)
                         pcl['points_by_patch'] = points_by_patch
-                        cross_patch_pcls.append(pcl)
+                        self.cross_patch_pcls.append(pcl)
 
                     min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
                     for pcl_id, pcl in new_unattached.items():
@@ -2347,19 +2427,19 @@ class FitContext:
                             keep.append(len(zyxs) - 1)
                             zyxs = zyxs[keep]
                             windings = windings[keep]
-                        unattached_pcl_strips.append({
+                        self.unattached_pcl_strips.append({
                             'id': pcl_id,
                             'name': pcl.get('name'),
                             'source_file': pcl.get('source_file'),
                             'zyxs': zyxs,
                             'windings': windings,
                         })
-                        unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
+                        self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
                     # The flat GPU bundle is derived from the strip list; drop it so
                     # the next consumer rebuilds it including the appended strips.
-                    unattached_pcl_strips.flat = None
+                    self.unattached_pcl_strips.flat = None
                     # Sampling strata index into the (now longer) pools.
-                    rebuild_pcl_sampling_strata()
+                    self._rebuild_pcl_sampling_strata()
 
                 if new_patches or new_collections:
                     # Whole-object DT target caches index the (now longer) object
@@ -2408,13 +2488,8 @@ class FitContext:
                 global shell_path
                 nonlocal dt_target_whole_object, prepared_main_tracks
                 nonlocal lr_scheduler, num_training_steps
-                nonlocal patch_sampling_probabilities
-                nonlocal unverified_patch_sampling_probabilities
-                nonlocal unverified_patches, unverified_patches_list
-                nonlocal unverified_patch_atlas
-                nonlocal shell_patch, shell_map, shell_envelope
+                nonlocal shell_map
                 nonlocal shell_outer_winding_idx, shell_valid_zyxs_gpu
-                nonlocal tracks, track_families, track_source_ids
                 nonlocal preview_extent_tracks
 
                 path_changes = dict(path_changes or {})
@@ -2431,12 +2506,12 @@ class FitContext:
                     )
                     rebuilt_tracks = None
                     replace_prepared_tracks = False
-                    rebuilt_track_rows = tracks
-                    rebuilt_families = track_families
-                    rebuilt_source_ids = track_source_ids
-                    rebuilt_shell_patch = shell_patch
+                    rebuilt_track_rows = self.tracks
+                    rebuilt_families = self.track_families
+                    rebuilt_source_ids = self.track_source_ids
+                    rebuilt_shell_patch = self.shell_patch
                     rebuilt_shell_map = shell_map
-                    rebuilt_shell_envelope = shell_envelope
+                    rebuilt_shell_envelope = self.shell_envelope
                     rebuilt_shell_outer = shell_outer_winding_idx
                     rebuilt_shell_valid = shell_valid_zyxs_gpu
                     requested_shell_path = str(
@@ -2449,35 +2524,35 @@ class FitContext:
                         rebuilt_shell_patch = load_tifxyz(requested_shell_path)
                         rebuilt_shell_envelope = (
                             ShellPolarMap(
-                                rebuilt_shell_patch, umbilicus,
+                                rebuilt_shell_patch, self.umbilicus,
                                 z_min=z_begin - cfg['model_flow_bounds_z_margin'],
                                 z_max=z_end + cfg['model_flow_bounds_z_margin'],
                                 num_theta_bins=cfg['shell_num_theta_bins'],
                                 device='cpu')
-                            if filter_tracks_by_shell else None
+                            if self.filter_tracks_by_shell else None
                         )
-                        if filter_tracks_by_shell and track_reload_source is not None:
+                        if self.filter_tracks_by_shell and self.track_reload_source is not None:
                             (rebuilt_track_rows, rebuilt_families,
                              kept_track_indices) = filter_tracks_to_outer_shell(
-                                track_reload_source, rebuilt_shell_envelope,
-                                track_reload_families, return_indices=True)
+                                self.track_reload_source, rebuilt_shell_envelope,
+                                self.track_reload_families, return_indices=True)
                             rebuilt_source_ids = (
-                                track_reload_source_ids[kept_track_indices]
-                                if track_reload_source_ids is not None else None)
+                                self.track_reload_source_ids[kept_track_indices]
+                                if self.track_reload_source_ids is not None else None)
                             rebuilt_tracks = prepare_main_phase_tracks(
                                 rebuilt_track_rows, None,
                                 float(cfg['track_exclusion_radius']), device,
-                                anchor_tree=trusted_geometry_tree,
+                                anchor_tree=self.trusted_geometry_tree,
                                 sampling_config=validate_track_sampling_config(cfg),
                                 track_families=rebuilt_families,
                                 track_source_ids=rebuilt_source_ids,
-                                crossing_cache=track_crossing_cache,
-                                track_graph=track_graph)
+                                crossing_cache=self.track_crossing_cache,
+                                track_graph=self.track_graph)
                             replace_prepared_tracks = True
 
                         rebuilt_shell_map = (
                             ShellPolarMap(
-                                rebuilt_shell_patch, umbilicus,
+                                rebuilt_shell_patch, self.umbilicus,
                                 z_min=z_begin - cfg['model_flow_bounds_z_margin'],
                                 z_max=z_end + cfg['model_flow_bounds_z_margin'],
                                 num_theta_bins=cfg['shell_num_theta_bins'],
@@ -2494,15 +2569,15 @@ class FitContext:
                         'track_max_tortuosity',
                         'track_exclusion_radius',
                     })
-                    if reprepare_tracks and rebuilt_tracks is None and tracks:
+                    if reprepare_tracks and rebuilt_tracks is None and self.tracks:
                         rebuilt_tracks = prepare_main_phase_tracks(
-                            tracks, None, float(cfg['track_exclusion_radius']),
-                            device, anchor_tree=trusted_geometry_tree,
+                            self.tracks, None, float(cfg['track_exclusion_radius']),
+                            device, anchor_tree=self.trusted_geometry_tree,
                             sampling_config=validate_track_sampling_config(cfg),
-                            track_families=track_families,
-                            track_source_ids=track_source_ids,
-                            crossing_cache=track_crossing_cache,
-                            track_graph=track_graph)
+                            track_families=self.track_families,
+                            track_source_ids=self.track_source_ids,
+                            crossing_cache=self.track_crossing_cache,
+                            track_graph=self.track_graph)
                         replace_prepared_tracks = True
 
                     target_tracks = (
@@ -2519,12 +2594,12 @@ class FitContext:
                         configure_prepared_track_sampling(target_tracks, config)
 
                     if 'patch_loss_z_margin' in changed:
-                        patch_sampling_probabilities = \
-                            prepare_patch_sampling_cache(verified_patches_list)
-                        if unverified_patches_list:
-                            unverified_patch_sampling_probabilities = \
-                                prepare_patch_sampling_cache(
-                                    unverified_patches_list)
+                        self.patch_sampling_probabilities = \
+                            self._prepare_patch_sampling_cache(self.verified_patches_list)
+                        if self.unverified_patches_list:
+                            self.unverified_patch_sampling_probabilities = \
+                                self._prepare_patch_sampling_cache(
+                                    self.unverified_patches_list)
                     if 'patch_unverified_patch_exclusion_radius' in changed:
                         (rebuilt_unverified, rebuilt_unverified_list,
                          rebuilt_unverified_probabilities,
@@ -2532,11 +2607,11 @@ class FitContext:
                             rebuild_unverified_patch_inputs(float(
                                 cfg['patch_unverified_patch_exclusion_radius']))
                     else:
-                        rebuilt_unverified = unverified_patches
-                        rebuilt_unverified_list = unverified_patches_list
+                        rebuilt_unverified = self.unverified_patches
+                        rebuilt_unverified_list = self.unverified_patches_list
                         rebuilt_unverified_probabilities = \
-                            unverified_patch_sampling_probabilities
-                        rebuilt_unverified_atlas = unverified_patch_atlas
+                            self.unverified_patch_sampling_probabilities
+                        rebuilt_unverified_atlas = self.unverified_patch_atlas
 
                     dt_preparation_changed = bool(changed & {
                         'dt_target_mode', 'dt_target_max_stride',
@@ -2547,12 +2622,12 @@ class FitContext:
                             cfg['dt_target_mode'] == 'whole_object_quantile')
                         if dt_target_whole_object:
                             prepare_patch_dt_target_samples(
-                                verified_patches_list,
+                                self.verified_patches_list,
                                 cfg['sample_count_patch_dt_target_points'],
                                 cfg['dt_target_max_stride'])
-                            if unverified_patches_list:
+                            if self.unverified_patches_list:
                                 prepare_patch_dt_target_samples(
-                                    unverified_patches_list,
+                                    self.unverified_patches_list,
                                     cfg['sample_count_patch_dt_target_points'],
                                     cfg['dt_target_max_stride'])
                     if any(key.startswith('dt_') for key in changed) \
@@ -2574,30 +2649,30 @@ class FitContext:
 
                 if shell_changed:
                     shell_path = requested_shell_path
-                    shell_patch = rebuilt_shell_patch
+                    self.shell_patch = rebuilt_shell_patch
                     shell_map = rebuilt_shell_map
-                    shell_envelope = rebuilt_shell_envelope
+                    self.shell_envelope = rebuilt_shell_envelope
                     shell_outer_winding_idx = rebuilt_shell_outer
                     shell_valid_zyxs_gpu = rebuilt_shell_valid
-                    tracks = rebuilt_track_rows
-                    track_families = rebuilt_families
-                    track_source_ids = rebuilt_source_ids
+                    self.tracks = rebuilt_track_rows
+                    self.track_families = rebuilt_families
+                    self.track_source_ids = rebuilt_source_ids
                 if replace_prepared_tracks:
                     prepared_main_tracks = rebuilt_tracks
                     preview_extent_tracks = (
                         (prepared_main_tracks['flat_zyx_cpu'],)
                         if prepared_main_tracks is not None else ())
-                unverified_patches = rebuilt_unverified
-                unverified_patches_list = rebuilt_unverified_list
-                unverified_patch_sampling_probabilities = \
+                self.unverified_patches = rebuilt_unverified
+                self.unverified_patches_list = rebuilt_unverified_list
+                self.unverified_patch_sampling_probabilities = \
                     rebuilt_unverified_probabilities
-                unverified_patch_atlas = rebuilt_unverified_atlas
+                self.unverified_patch_atlas = rebuilt_unverified_atlas
 
             # In the usual zero-exclusion case preview bounds reuse the prepared
             # flat tensor, so the original list of per-track arrays is no longer
             # needed after setup.
-            if preview_extent_tracks is not tracks and track_reload_source is None:
-                tracks = None
+            if preview_extent_tracks is not self.tracks and self.track_reload_source is None:
+                self.tracks = None
             interactive_driver.on_ready(
                 completed_iterations=start_iteration,
                 output_path=out_path,
@@ -2693,18 +2768,18 @@ class FitContext:
             unattached_pcl_dt_target_cache = None
             track_dt_target_cache = None
             if dt_target_whole_object:
-                if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and verified_patches_list:
+                if compute_patch_dt and cfg['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
                     patch_dt_target_cache = dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                         slice_to_spiral_transform, dr_per_winding,
-                        verified_patches_list, patch_atlas, cfg['dt_target_floating_threshold'],
+                        self.verified_patches_list, self.patch_atlas, cfg['dt_target_floating_threshold'],
                     ))
-                if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and unverified_patch_atlas is not None:
+                if compute_unverified_patch_dt and cfg['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
                     unverified_patch_dt_target_cache = dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
                         slice_to_spiral_transform, dr_per_winding,
-                        unverified_patches_list, unverified_patch_atlas, cfg['dt_target_floating_threshold'],
+                        self.unverified_patches_list, self.unverified_patch_atlas, cfg['dt_target_floating_threshold'],
                     ))
-                if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and unattached_pcl_strips:
-                    pcl_flat = get_or_build_unattached_pcl_flat(unattached_pcl_strips, torch.device('cuda'))
+                if compute_patch_dt and cfg['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
+                    pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
                     if pcl_flat is not None:
                         unattached_pcl_dt_target_cache = dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
                             slice_to_spiral_transform, dr_per_winding,
@@ -2731,9 +2806,9 @@ class FitContext:
                 dr_per_winding,
                 cfg['sample_count_patches_per_step'],
                 cfg['sample_count_patches_per_step_for_dt'],
-                verified_patches_list,
-                patch_atlas,
-                patch_sampling_probabilities,
+                self.verified_patches_list,
+                self.patch_atlas,
+                self.patch_sampling_probabilities,
                 umbilicus_zyx,
                 compute_dt=compute_patch_dt,
                 shell_valid_zyxs=shell_valid_zyxs_gpu,
@@ -2751,7 +2826,7 @@ class FitContext:
             backward_family(patch_family)
             del patch_family, patch_loss_values
 
-            if unverified_patch_atlas is not None and (
+            if self.unverified_patch_atlas is not None and (
                 cfg['loss_weight_unverified_patch_radius'] > 0
                 or cfg['loss_weight_unverified_patch_dt'] > 0
             ):
@@ -2760,9 +2835,9 @@ class FitContext:
                     dr_per_winding,
                     cfg['sample_count_unverified_patches_per_step'],
                     cfg['sample_count_unverified_patches_per_step_for_dt'],
-                    unverified_patches_list,
-                    unverified_patch_atlas,
-                    unverified_patch_sampling_probabilities,
+                    self.unverified_patches_list,
+                    self.unverified_patch_atlas,
+                    self.unverified_patch_sampling_probabilities,
                     compute_dt=compute_unverified_patch_dt,
                     dt_max_winding=unverified_patch_dt_max_winding,
                     dt_target_cache=unverified_patch_dt_target_cache,
@@ -2783,31 +2858,31 @@ class FitContext:
                     ) * cfg['loss_weight_sym_dirichlet'],
                 })
 
-            if cfg['loss_weight_rel_winding'] > 0 and cross_patch_pcls:
+            if cfg['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                 backward_family({
                     'rel_winding': get_patch_rel_winding_loss(
                         slice_to_spiral_transform,
                         dr_per_winding,
-                        verified_patches,
-                        patch_atlas,
-                        cross_patch_pcls,
-                        pcl_sampling_strata['cross_patch'],
+                        self.verified_patches,
+                        self.patch_atlas,
+                        self.cross_patch_pcls,
+                        self.pcl_sampling_strata['cross_patch'],
                     ) * cfg['loss_weight_rel_winding'],
                 })
 
-            if cfg['loss_weight_abs_winding'] > 0 and cross_patch_pcls:
+            if cfg['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                 backward_family({
                     'abs_winding': get_patch_abs_winding_loss(
                         slice_to_spiral_transform,
                         dr_per_winding,
-                        verified_patches,
-                        patch_atlas,
-                        cross_patch_pcls,
+                        self.verified_patches,
+                        self.patch_atlas,
+                        self.cross_patch_pcls,
                     ) * cfg['loss_weight_abs_winding'],
                 })
 
             if (
-                (cfg['loss_weight_dense_normals'] > 0 or grad_mag_spacing_enabled)
+                (cfg['loss_weight_dense_normals'] > 0 or self.grad_mag_spacing_enabled)
                 and lasagna_volume is not None
             ):
                 for dense_loss_name, dense_loss_value in iter_lasagna_losses(
@@ -2816,7 +2891,7 @@ class FitContext:
                     lasagna_volume,
                     shell_outer_winding_idx,
                     cfg['sample_count_dense_normal_points'],
-                    compute_spacing=grad_mag_spacing_enabled,
+                    compute_spacing=self.grad_mag_spacing_enabled,
                 ):
                     weight = (
                         cfg['loss_weight_dense_normals']
@@ -2898,13 +2973,13 @@ class FitContext:
 
             if (
                 (cfg['loss_weight_unattached_pcl_radius'] > 0 or cfg['loss_weight_unattached_pcl_dt'] > 0)
-                and unattached_pcl_strips
+                and self.unattached_pcl_strips
             ):
                 unattached_loss_values = get_unattached_pcl_strip_losses(
                     slice_to_spiral_transform,
                     dr_per_winding,
-                    unattached_pcl_strips,
-                    pcl_sampling_strata['unattached'],
+                    self.unattached_pcl_strips,
+                    self.pcl_sampling_strata['unattached'],
                     get_or_build_unattached_pcl_flat,
                     cfg['sample_count_unattached_pcls_per_step'],
                     cfg['sample_count_unattached_pcl_points_per_step'],
@@ -3087,12 +3162,12 @@ class FitContext:
                 spiral_and_transform=spiral_and_transform,
                 slice_to_spiral_transform=slice_to_spiral_transform,
                 dr_per_winding=dr_per_winding,
-                patches_list=verified_patches_list,
-                patches_dict=verified_patches,
-                unattached_pcl_strips=unattached_pcl_strips,
-                tracks=tracks,
-                unverified_patches_list=unverified_patches_list,
-                unverified_patches_dict=unverified_patches,
+                patches_list=self.verified_patches_list,
+                patches_dict=self.verified_patches,
+                unattached_pcl_strips=self.unattached_pcl_strips,
+                tracks=self.tracks,
+                unverified_patches_list=self.unverified_patches_list,
+                unverified_patches_dict=self.unverified_patches,
                 out_path=out_path,
                 cfg=cfg,
                 z_begin=z_begin,
@@ -3105,7 +3180,7 @@ class FitContext:
                 scroll_slices_for_visualisation=scroll_slices_for_visualisation,
                 prediction_slices_for_visualisation=prediction_slices_for_visualisation,
                 quad_label_map=quad_label_map,
-                z_to_umbilicus_yx=umbilicus,
+                z_to_umbilicus_yx=self.umbilicus,
                 render_volume_scale=render_volume_scale,
                 voxel_size_um=voxel_size_um,
                 get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
@@ -3130,13 +3205,11 @@ class FitContext:
             self._scalar_stores.pop().close()
 
 
-def main(
-        load_only_patches_and_point_collections=False, interactive_driver=None,
-        progress=None):
+def main(interactive_driver=None, progress=None):
     global _active_context
     context = FitContext(interactive_driver=interactive_driver, progress=progress)
     _active_context = context
-    return context.run(load_only_patches_and_point_collections)
+    return context.run()
 
 
 if __name__ == '__main__':
