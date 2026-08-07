@@ -56,6 +56,20 @@ We've awarded <AwardedTotal /> in prizes and broken through twice: in 2023 the f
 Now we want to read them all — starting with the [2027 Grand Prize](prizes#2027-grand-prize).
 Join us to win prizes and be a part of history!
 
+### Why is there a Vesuvius Challenge team?
+
+Vesuvius Challenge runs an open competition and also employs an independent team that works on the same problems. This might look like we are competing against our own contest, but the team exists to make the community faster, not to race it.
+
+* **The current team is not eligible for prizes.**
+* **Everything the team does is open source.** Tools like [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) and the [`vesuvius`](https://github.com/ScrollPrize/villa/tree/main/vesuvius) library, data releases, labels, and trained models are published for everyone. When the team makes progress, it raises the baseline that every contestant builds from.
+* **The team keeps the competition moving.** Scanning new scrolls, releasing data, and maintaining infrastructure are ongoing work that has to happen between community breakthroughs.
+* **The team does the unglamorous manual work** that contestants are unlikely to take on, such as labeling, segmentation review, and data preparation, so that prize submissions can focus on breakthroughs.
+* **The team adjudicates prizes.** Judging submissions requires a deep technical background, and with many submissions each month it is a substantial amount of work.
+
+The project has settled into a rhythm: prizes spark breakthroughs from the community, and the team carries them forward between major prize offerings. The 2026 milestones, including [the first complete reading of a scroll](firstscroll), were almost entirely team driven, built directly on methods that contestants pioneered.
+
+Many of the team first arrived as contestants, won prizes, and [were then recruited](firstscroll). Hiring from the community is how the team was built.
+
 ### What dates do I need to know?
 
 The [2027 Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), and [PHerc. Paris 4's Title](prizes#first-title-prize) prizes all close on **June 25th, 2027 (11:59pm Pacific)**. [Progress Prizes](prizes#progress-prizes) are awarded every month — including \$20,000 guaranteed for the best submission. See [Open Prizes](prizes) for everything in one place, and [join the community](get_started) to stay tuned!
@@ -117,7 +131,7 @@ For a comprehensive overview of the field, see [this list by EduceLab](https://e
 * [Reading the Herculaneum Papyri: Yesterday, Today, and Tomorrow](https://www.youtube.com/watch?v=g-7-Xg75CCI&t=4928s)
 * [Digital Restoration Initiative: Reading the Invisible Library](https://www.youtube.com/watch?v=NPy0potyh4c)
 * [Reading the Invisible Library: Virtual Unwrapping and the Scroll from En-Gedi](https://www.youtube.com/watch?v=mwe9sHZ58A0)
-* [2023 symposium](https://www.herculaneum.ox.ac.uk/node/262)
+* The Digital Restoration of Herculaneum Papyri: [Day 1](https://www.youtube.com/live/bw34hAiTOO0), [Day 2](https://www.youtube.com/live/agw3axR9bYE)
 
 #### Books
 
@@ -150,10 +164,10 @@ Here are some other excellent books we recommend:
 
 #### Previous media coverage
 
-* Watch [this interview](https://drive.google.com/file/d/1QPYT0wJOBQEna7-Qo4EZQ-AXvm1UKs-V/view) with Dr. Brent Seales on 60 Minutes!
-* [The UnXplained](https://www.imdb.com/title/tt20234948/)
-* Great article by [Smithsonian Magazine](https://www.smithsonianmag.com/history/buried-ash-vesuvius-scrolls-are-being-read-new-xray-technique-180969358/)
-* More articles and videos on [this page](https://www2.cs.uky.edu/dri/news/)
+* [Mysterious Tombs](https://www.imdb.com/title/tt20234948/) — The UnXplained, 2022
+* [The Scrolls of Herculaneum](https://www.cbsnews.com/news/deciphering-the-ancient-scrolls-of-herculaneum-60-minutes-archive/) — 60 Minutes, 2018
+* [Buried by the Ash of Vesuvius](https://www.smithsonianmag.com/history/buried-ash-vesuvius-scrolls-are-being-read-new-xray-technique-180969358/) — Smithsonian Magazine, 2018
+* [More articles and videos](https://www2.cs.uky.edu/dri/news/) — Digital Restoration Initiative
 
 ### What if I would like to contribute, but don’t have time to compete for the Grand Prize?
 
@@ -178,7 +192,7 @@ This depends on the jurisdiction you live in, but generally yes, you do have to 
 
 <div>Generally <strong>yes</strong>, with the conditions that are specified in the <a href="https://forms.gle/HV1J6dJbmCB2z5QL8">Data Agreement</a>:</div>
 
-* Any publications and presentations must cite the dataset(s) used. See the <a href="/data#how-to-cite">How to Cite</a> section on the data page for the correct citation for EduceLab-Scrolls data versus newer Vesuvius Challenge scan releases.
+* Any publications and presentations must cite the dataset(s) used. See the <a href="/data#how-to-cite">How to Cite</a> section on the data page.
 * You won’t publish any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
 
 We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started).
@@ -265,7 +279,7 @@ There is also a growing body of open source software built by the community. To 
 
 ### Where can I find collaborators?
 
-In this [Discord thread](https://discord.com/channels/1079907749569237093/1085988126486437959).
+Join our [Discord](https://discord.gg/V4fJhvtaQn)!
 
 ### What would the papyrus scrolls look like when unrolled?
 
@@ -328,14 +342,13 @@ The resulting 3D volume is like a 3D image. Each unit is called a “voxel” (i
 ### How does CT reconstruction work?
 
 [Tomographic reconstruction](https://en.wikipedia.org/wiki/Tomographic_reconstruction) is used to convert the initial X-ray projection images into the cross-sections we are used to seeing from computed tomography (CT).
-In our case, filtered backprojection is used as the reconstruction algorithm.
-In the case of scrolls scanned in the parallel beam of a synchrotron, we also use a "grid scan" technique to tile high resolution projections together and scan objects larger than the sensor field of view.
+For the recent scroll scans on the BM18 beamline at the ESRF, projections are acquired in a helical trajectory at up to four laterally offset positions, tiling partially overlapping annular regions so that objects larger than the detector field of view can be covered.
+After flat-field, detector-distortion, and overlap-alignment corrections, single-distance Paganin phase retrieval is applied to enhance contrast, and the final volume is reconstructed with a GPU-accelerated hierarchical backprojection algorithm adapted to the helical geometry.
 
 For more information about the reconstruction method, check out:
 
-* Appendix A.1 of ["EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT"](https://arxiv.org/abs/2304.02084)
-* ["Data processing methods and data acquisition for samples larger than the field of view in parallel-beam tomography"](https://opg.optica.org/oe/fulltext.cfm?uri=oe-29-12-17849&id=451366)
-* The [algotom](https://github.com/algotom/algotom) reconstruction package
+* The tomographic reconstruction section in the Methods of ["Complete virtual unwrapping and reading of a rolled Herculaneum papyrus"](https://arxiv.org/abs/2606.29085)
+* The [night_rail_bm18](https://gitlab.esrf.fr/night_rail/applications/mirone/night_rail_bm18) reconstruction pipeline used for the BM18 scans
 
 Reconstruction methods are out of scope for Vesuvius Challenge, which focuses on processing the reconstructed images.
 That said, if you have specific ideas you would like to share with us, please do so by reaching out to team@scrollprize.org!
@@ -391,7 +404,7 @@ There may be other patterns present that are detectible by machine learning. We 
   <figcaption className="mt-0">Syrup filling in gaps in a waffle <a href="https://youtu.be/mwe9sHZ58A0?t=3168">(source)</a></figcaption>
 </figure>
 
-Ink might also be sitting on top of the papyrus, causing a slight bump on the surface. In [Tutorial 5](tutorial5) we show several examples of where the ink is directly visible in slices of 3D X-ray scans, which is promising. The talks at the top of this page also go into some details.
+Ink might also be sitting on top of the papyrus, causing a slight bump on the surface. In [Tutorial 5](tutorial5) we show several examples of where the ink is directly visible in slices of 3D X-ray scans, which is promising. The [talks](#talks) earlier on this page also go into some details.
 
 There might be some effect of indentation of the writing instrument, but it’s probably not very significant. The thought has generally been that any indentation effect would be even smaller than ink w.r.t. the scan resolution and maybe not significant when compared against the natural relief of the papyrus fibers. However, this has not been explored in detail on this type of material (look at the paper "Revisiting the Jerash Silver Scroll" for work on an etched metal scroll), so we don’t know for sure.
 
@@ -423,7 +436,7 @@ The orientation of Scroll 1 follows the above image. When viewing one of the TIF
 
 Based on the counterclockwise spiral direction in the middle of Scroll 1, the released scans are of the top of the scroll: Slice 0 is in the middle and Slice 14000+ is the top.
 
-Lastly, all of the Herculaneum papyri are known to be "volumen"/horizontal scrolls (see FAQ: https://scrollprize.org/faq#what-is-papyrus-and-how-is-it-made).
+Lastly, all of the Herculaneum papyri are known to be "volumen"/horizontal scrolls (see [What is papyrus and how is it made?](#what-is-papyrus-and-how-is-it-made)).
 
 Therefore, the direction of a given line of writing should be clockwise around the TIF cross-sections. The bottom of the letters should be on the lower-numbered images, and the top of the letters should be on the higher-numbered images.
 
