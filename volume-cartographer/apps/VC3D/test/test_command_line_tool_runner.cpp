@@ -1,6 +1,5 @@
-#include <csignal>
-
 #include <QApplication>
+#include <QDir>
 #include <QFile>
 #include <QScopeGuard>
 #include <QTemporaryFile>
@@ -76,8 +75,12 @@ int runChild(const QStringList& arguments)
         return 0;
     }
     if (mode == "crash") {
-        std::raise(SIGKILL);
-        return 1;
+        // std::abort() rather than raise(SIGKILL): SIGKILL is POSIX-only, so this
+        // file did not compile on Windows at all. It is also the only portable way
+        // to get QProcess::CrashExit on both platforms — under MinGW every
+        // raise(SIG*) returns through the default handler and exits normally, which
+        // QProcess reports as NormalExit.
+        std::abort();
     }
     if (mode == "write-omp" && marker + 2 < arguments.size()) {
         QFile output(arguments.at(marker + 2));
@@ -130,7 +133,13 @@ private slots:
 
     void failedStartFinishesOnce()
     {
-        QTemporaryFile invalidProgram;
+        // The name needs an executable suffix: QFileInfo::isExecutable() is
+        // extension-based on Windows, so an unsuffixed temporary is rejected by
+        // the runner before it ever tries to start a process - which is not the
+        // path this test is exercising. Harmless on POSIX, where the permission
+        // bit set below is what counts.
+        QTemporaryFile invalidProgram(QDir::tempPath()
+                                      + "/vc3d-failed-start-XXXXXX.exe");
         QVERIFY(invalidProgram.open());
         invalidProgram.write("#!/definitely/missing/command-runner-interpreter\n");
         invalidProgram.close();
@@ -168,6 +177,34 @@ private slots:
         QVERIFY(startHelper(runner, "success"));
         QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 2, 3000);
         QVERIFY(completionSucceeded(finished, 1));
+    }
+
+    void cancelDoesNotKillARunStartedRightAfterIt()
+    {
+        // cancel() schedules a deferred kill() as a fallback for platforms where
+        // terminate() does not stop a console process. The QProcess object is reused
+        // across runs, so that fallback must not land on whatever is running when it
+        // finally fires.
+        CommandLineToolRunner runner(nullptr, {});
+        QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
+
+        QVERIFY(startHelper(runner, "wait"));
+        QTRY_VERIFY_WITH_TIMEOUT(runner.isRunning(), 1000);
+        runner.cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 5000);
+
+        // The replacement has to still be running when the deferred kill fires, so
+        // start another long one and outlive the grace period before checking.
+        QVERIFY(startHelper(runner, "wait"));
+        QTRY_VERIFY_WITH_TIMEOUT(runner.isRunning(), 1000);
+        QTest::qWait(2000);
+
+        QVERIFY2(runner.isRunning(),
+                 "the deferred kill from the first cancel() reached the second run");
+        QCOMPARE(finished.count(), 1);
+
+        runner.cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 2, 5000);
     }
 
     void pendingProcessErrorOverridesCleanExit()
