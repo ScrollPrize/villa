@@ -88,31 +88,3 @@ def test_bundle_is_backend_neutral_and_self_contained_after_move(tmp_path: Path,
     validated = validate_portable_bundle(moved)
     assert validated["artifact_kind"] == artifact_kind
     assert all(not Path(item["path"]).is_absolute() for item in validated["artifacts"])
-
-
-def test_fiber_provenance_maps_to_checked_out_atlas_data_entry(tmp_path: Path, monkeypatch) -> None:
-    atlas_root = Path("/home/hendrik/vesuvius-atlas/vesuvius-atlas-py/src")
-    if not atlas_root.is_dir():
-        pytest.skip("checked-out vesuvius-atlas Python models are unavailable")
-    monkeypatch.syspath_prepend(str(atlas_root))
-    from vesuvius_atlas.models import DataEntry
-
-    portable = base_document(
-        artifact_kind="fiber3d-prediction",
-        context={
-            "run_uuid": "run-1",
-            "source": {"volume_id": "volume-1", "requested_group": 3},
-            "model": {"atlas_model_id": "20260806120000"},
-        },
-    )
-    entry = DataEntry.model_validate({
-        "type": portable["artifact_kind"],
-        "origins": [{
-            "path": "fiber/run-1/",
-            "access_roots": [{"type": "s3", "url": "s3://staging", "usage": "private-s3"}],
-        }],
-        "parameters": {"model_id": portable["model"]["atlas_model_id"], "level": portable["source"]["requested_group"]},
-        "creation_info": {"run_uuid": portable["run_uuid"]},
-    })
-    assert entry.type == "fiber3d-prediction"
-    assert entry.parameters == {"model_id": "20260806120000", "level": 3}

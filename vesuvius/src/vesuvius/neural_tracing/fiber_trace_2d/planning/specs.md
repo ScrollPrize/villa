@@ -2643,13 +2643,20 @@
   CC BY-NC 4.0 source license. Model identity is resolved automatically from a
   carried ID or a freshly rehashed checkpoint in configured snapshot roots;
   there is no normal upload-time model-ID argument.
-- Staging identity is the immutable run UUID plus the digest of the complete
-  path/size/SHA-256 manifest. `_INCOMPLETE` protects the final prefix; verified
-  `upload-manifest.json` is written last and marker removal commits it. Retry
-  reads only that manifest and refuses same-identity content collisions.
+- Staging uses the immutable run UUID and a fixed local file inventory.
+  `_INCOMPLETE` is the manager-side transaction guard: it is written before
+  rclone starts and removed only after rclone succeeds; failed staging never
+  invokes Atlas ingestion. Retry invokes rclone again and relies on its
+  configured comparison behavior. Completed run UUID/bundle contents are
+  immutable because `rclone copy --size-only` neither detects changed same-size
+  objects nor deletes stale destination objects. No manager upload manifest or
+  per-Zarr-chunk transaction hash is stored remotely.
 - Atlas maps both Fiber and Lasagna output to the existing `lasagna` copy-first
-  artifact. Canonical identity is volume, canonical model ID, and
-  source input level. Only validated provenance enters Atlas metadata.
+  artifact. Canonical identity is volume, canonical model ID, and source input
+  level. The data entry contains only its private origin and existing
+  `model_id`/`level` parameters; portable provenance remains in `inference.json`
+  and is not copied into Atlas `creation_info`. The origin path is relative to
+  its access-root URL and Atlas joins them to resolve the full data-sync source.
 - Missing models are registered automatically using an Atlas UTC datetime ID.
   Fiber uses the minimal Lasagna model record with architecture `fiber3d/unet`,
   task `lasagna`, process `model_training`, snapshot-root-relative checkpoint

@@ -477,7 +477,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "model_id": plan.model_id,
                     "staging_url": f"s3://{plan.bucket}/{plan.prefix}/",
                     "files": len(plan.files),
-                    "bundle_digest": plan.bundle_digest,
                     "atlas": atlas,
                 }, indent=2, sort_keys=True))
             else:

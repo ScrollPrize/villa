@@ -1,117 +1,152 @@
-# Plan: provenance-driven Atlas model registration
+# Plan: minimize manager staging and Atlas inference ingestion
 
-## Approved Atlas identity contract
+## Scope and invariants
 
-1. Keep the existing Atlas model shape minimal: `id`, `long_id`, `suffix`,
-   `creation`, `properties`, and `data`. Keep the Atlas-wide
-   `creation.process = "model_training"` convention and numeric model references.
-2. Register Fiber output as Lasagna data with
-   `properties.architecture = "fiber3d/unet"` and
-   `properties.task = "lasagna"`.
-3. Store the checkpoint path in `properties.snapshot`, relative to a configured
-   snapshot root and including the run and `snapshots/` directory, for example
-   `s1a_128_1_single_8x8_20260801_084232/snapshots/best91_5k.pt`. Add only
-   `properties.snapshot_sha256` beyond the current model conventions.
-4. Do not add a separate Atlas `run`, repository origin, inference commit,
-   training step, precision, patch size, metrics, backend, or output-schema
-   field. The same numeric model ID can later identify a Hugging Face model.
+1. Preserve the existing Atlas copy-first `lasagna` flow. The internal Atlas
+   entry stores a private S3 origin; data-sync resolves it, copies to the
+   canonical public Lasagna path, adds the public origin, and public metadata
+   export retains only `public-read` origins.
+2. Preserve the existing origin representation. `DataOrigin.path` is relative
+   to its `AccessRoot.url`; Atlas joins them as
+   `access_root.url.rstrip('/') + '/' + origin.path.lstrip('/')`. For the
+   current run this resolves
+   `s3://philodemos` plus
+   `hendrik/lasagna/inference/<run_uuid>/` to the complete private S3 URI.
+3. Keep the approved UUID staging layout, `_INCOMPLETE`, portable
+   `inference.json`, automatic model registration, `fiber3d/unet` model
+   architecture, snapshot path/SHA-256, numeric model references, and the
+   Lasagna 3--4 product validation requiring `nx` and `ny`.
+4. Remove only two unneeded extensions:
+   - remote `upload-manifest.json` and its manager bookkeeping;
+   - duplicated portable provenance in Atlas `DataEntry.creation_info`.
 
-## Resolution and automatic registration
+## Marker-only rclone staging
 
-5. Add one resolver shared by manager validation/upload. Use carried
-   `atlas_model_id` when present; otherwise match portable `model.sha256`
-   against configured snapshot directories. Rehash candidate checkpoint bytes
-   at decision time. Treat byte-identical copies with identical normalized
-   metadata as one identity and reject conflicting metadata for a hash.
-6. Resolve new Atlas identity from trusted snapshot metadata. Prefer embedded
-   `atlas_model_id` and model creation UTC. For legacy snapshots, accept exactly
-   one UTC `YYYYMMDD_HHMMSS` token in the actual run name. Query Atlas by the
-   canonical 14-digit ID and reject collisions with another checkpoint hash;
-   never invent an alternate timestamp.
-7. Remove the normal upload-time `--model-id` and `--register-model`
-   requirement. If the resolved model is absent, preflight prints the proposed
-   minimal record and upload registers it automatically. If present, compare
-   canonical/long ID, suffix where schema-required, task, architecture,
-   snapshot path, snapshot SHA-256, and creation date/process.
-8. Keep resolution and preflight read-only until upload ingestion. Stage only
-   after successful preflight and keep registration/upload idempotent. Never
-   permit two Atlas identities for one hash or one ID for different hashes.
+5. Keep the fixed local bundle inventory used for `rclone --files-from-raw`,
+   but reduce it to the information needed to name files. Do not recursively
+   hash every Zarr chunk for upload transaction metadata.
+6. Simplify manager staging to:
+   - put `<prefix>/_INCOMPLETE` before starting transfer;
+   - invoke the configured `rclone copy` over the fixed inventory;
+   - retain `_INCOMPLETE` on every failure or interruption;
+   - delete `_INCOMPLETE` only after rclone exits successfully.
+   `_INCOMPLETE` is a manager-side transaction/commit guard. Atlas data-sync
+   does not inspect it, so failed staging must never call the Atlas ingester.
+7. Let rclone provide retry/resume/idempotent transfer behavior. A repeated
+   manager upload runs rclone again; already transferred files are skipped by
+   the configured comparison flags. Do not add a second remote completion
+   record.
+8. Remove `UPLOAD_MANIFEST`, manifest put/get/verification, bundle-digest
+   calculation, per-file upload SHA-256, same-UUID manifest collision checks,
+   and manifest-specific reserved-name handling. Keep `_INCOMPLETE` reserved in
+   local bundles so artifact content cannot collide with the manager marker.
+   Retain checkpoint SHA-256 and
+   portable inference validation because those identify the model and bundle,
+   not the upload transaction.
+9. Remove `bundle_digest`, `manifest`, and the ambiguous `uploaded` boolean from
+   newly persisted manager upload metadata and from human/JSON validation
+   output. Keep staging URL and upload lifecycle; every upload command invokes
+   a resumable rclone transfer attempt.
+10. Document the deliberate marker-only limitation: `rclone copy --size-only`
+    neither detects changed same-size objects nor deletes stale destination
+    objects. This is safe only under the existing immutable run UUID/bundle
+    contract. Validate that completed bundle identity/content is immutable and
+    never reuse a run UUID for changed artifacts.
 
-## Inference provenance
+## Lean Atlas ingestion
 
-9. At manager launch, resolve and carry the exact snapshot-relative path, hash,
-   creation time, and Atlas identity through private and portable inference
-   metadata. In the shared Fiber/Lasagna inference metadata writer, resolve the
-   checked-out Villa Git commit used by the running code and store it as
-   `inference.code_commit` in portable `inference.json`. This must also work for
-   direct inference invocation; the manager is not the source of truth.
-   Preserve the existing dirty-worktree indicator, accept a packaged build
-   commit override, and use null rather than failing outside Git. Do not put the
-   commit in the Atlas model.
-10. Direct inference retains checkpoint-embedded identity and fails clearly at
-    Atlas resolution when configured snapshot directories are required but no
-    unique matching snapshot is available.
-11. Update Fiber and Lasagna training/checkpoint guidance, and checkpoint
-    writers where in scope, to store authoritative model creation UTC and
-    optional registered Atlas ID, avoiding legacy timestamp recovery.
+11. Parse and validate `inference.json` as before, but do not construct or pass
+    Atlas `creation_info` from schema version, run UUID, timestamps, catalog
+    hash, code commit, inference settings, or artifact inventory.
+12. Ingest exactly the existing `lasagna` data-entry shape:
 
-## Existing-run migration
+    ```json
+    {
+      "type": "lasagna",
+      "origins": [{
+        "path": "hendrik/lasagna/inference/<run_uuid>/",
+        "access_roots": [{
+          "type": "s3",
+          "url": "s3://philodemos",
+          "usage": "private-s3"
+        }]
+      }],
+      "parameters": {
+        "model_id": "<numeric-model-id>",
+        "level": "<input-OME-group>"
+      }
+    }
+    ```
 
-12. Perform a one-off, non-shipped migration for the two work-in-progress runs.
-    Rehash the matched snapshot, prepare updated private `metadata.json` and
-    portable `artifacts/inference.json`, preserve originals during the update,
-    replace each file atomically, cross-validate the pair, and roll back on
-    failure. Do not add a persistent manager migration command or module.
-13. Validate and then apply it to:
-    - `PHerc0332-20251211183505-las-sd1-84afaf75`
-    - `PHerc1299-20260309130042-las-sd1-aac02eb8`
-    Verify and preserve their existing run value
-    `s1a_128_1_single_8x8_20260801_084232`. Backfill resolved Atlas identity,
-    creation fields, snapshot-relative path, and the known working Villa commit
-    `70a63e29fbd2bec5a53aa86337511e887b250775` at
-    `inference.code_commit`. Do not substitute migration-time `HEAD`. Refuse
-    snapshot hash/run mismatches.
+13. Keep detailed provenance solely in staged `inference.json`. Keep the
+    separate approved minimal Atlas model record unchanged.
+14. Preserve strict idempotency for Atlas entries: an existing entry with the
+    same type and parameters must match the lean origin entry; conflicting
+    origins remain an error. Do not silently preserve obsolete
+    `creation_info` during re-ingestion.
 
-## Configuration
+## Existing-state cleanup
 
-14. Set the existing manager config fields to
-    `atlas_dir = "/home/hendrik/vesuvius-atlas"` and
-    `upload_staging_s3 = "s3://philodemos/hendrik/lasagna"`, preserving all
-    other keys. The manager appends `inference/<run_uuid>/`. Leave historical
-    `paul/...` origins unchanged and never stage directly to a public bucket.
+15. Discover every manager run whose local record references
+    `upload-manifest.json` and every configured staging prefix that contains
+    that sidecar. Report the exact set before mutation.
+16. Also inspect/report whether a transaction manifest was already copied to a
+    canonical or public destination. Do not mutate published data as part of
+    this cleanup without separate user direction.
+17. For private staged bundles that are otherwise complete, delete only the remote
+    `upload-manifest.json`; do not touch `inference.json`, Lasagna manifests,
+    OME-Zarr objects, or public destinations. `_INCOMPLETE` must remain absent
+    for completed uploads.
+18. Remove obsolete local `upload.manifest`, `upload.bundle_digest`, and
+    `upload.uploaded` fields
+    from affected run metadata atomically, preserving lifecycle and staging
+    URL.
+19. Remove only the newly copied `creation_info` from already ingested Fiber
+    Lasagna entries. Preserve type, origins, parameters, all legacy Lasagna
+    entries, models, and copy/publication information. Perform this as a
+    reported one-off cleanup rather than shipping a permanent migration CLI.
 
 ## Tests and validation
 
-15. Add Atlas schema and round-trip tests for the minimal model record,
-    `fiber3d/unet`, snapshot-relative paths and hashes, numeric model references,
-    duplicate checkpoint copies, fresh hashing, embedded and legacy identities,
-    missing/ambiguous metadata, ID collision, compatibility mismatch,
-    automatic registration, and idempotency.
-16. Add shared inference-writer and manager tests for canonical
-    `inference.code_commit` capture under both managed and direct Fiber/Lasagna
-    invocation, direct-inference fallback, bundle validity, and unchanged
-    non-target fields for Fiber and Lasagna artifacts.
-17. Validate the one-off transformation on copies of both runs, compare JSON,
-    then update the real metadata with backups and cross-file validation. Do not
-    upload unless separately requested.
-18. Run focused manager and Atlas inference-bundle suites, compilation, browser
-    typechecking/tests, full Atlas schema validation, and `git diff --check`.
+20. Manager unit tests must cover successful marker creation/removal, marker
+    retention on rclone failure, safe rerun through rclone, absence of manifest
+    reads/writes and digest fields, exact fixed file-list transfer, reserved
+    local `_INCOMPLETE`, failed staging never invoking Atlas ingestion, the
+    immutable run UUID/bundle invariant, and both Fiber and direct Lasagna
+    bundles.
+21. Atlas tests must assert that parsed portable provenance still validates,
+    model registration remains unchanged, and the ingested data entry has no
+    `creation_info`. Test full S3 source reconstruction from access root plus
+    relative origin and verify public export excludes the private origin.
+22. Validate cleanup on copies first. Then run focused Villa manager tests,
+    Atlas inference-bundle/model/config/export tests, `git diff --check`, and
+    compile/import smoke tests. No real inference or public data-sync is
+    required.
+23. Keep commits reviewable: one Villa commit for manager protocol changes and
+    one Atlas commit for lean ingestion/tests. Report remote and local one-off
+    cleanup separately from source commits.
 
 ## Spec update
 
-Specify the minimal Atlas identity record, numeric model references,
-`fiber3d/unet`, `model_training`, snapshot-relative path and SHA-256,
-inference-only Git commit, automatic idempotent registration,
-collision/mismatch rejection, one-off existing-run backfill, and Hendrik staging
-root.
+Replace the Atlas staging specification that currently defines immutable
+identity as run UUID plus a complete path/size/SHA-256 upload manifest. Specify
+marker-only rclone staging: `_INCOMPLETE` guards transfer, rclone owns resume,
+and successful marker removal commits the staging prefix. State explicitly
+that `inference.json` remains portable provenance and is not copied into Atlas
+`creation_info`. Specify the lean existing Lasagna data entry and relative
+origin/access-root resolution.
 
 ## Docs updates
 
-Document automatic model resolution/registration, snapshot-directory lookup,
-the minimal Atlas model fields, inference-only Git provenance, legacy failure
-modes, and private staging layout.
+Update `lasagna/docs/manager.md` and the Lasagna README where applicable:
+remove upload-manifest, digest, collision, and per-file hashing claims; document
+marker-only rclone retry behavior; explain relative Atlas origin paths; and
+state that detailed provenance remains in `inference.json`, not Atlas data
+entries.
 
 ## Changelog
 
-Add Lasagna/Vesuvius and Atlas changelog entries for provenance-driven model
-registration and completed-run migration.
+Add one concise changelog entry recording the removal of the manager upload
+manifest and the restoration of lean existing-schema Atlas Lasagna entries.
+Record exact cleanup commands/results in `task_log.md`, not in the durable
+specification.

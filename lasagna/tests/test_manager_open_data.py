@@ -9,7 +9,6 @@ from lasagna.manager.config import ManagerConfig
 from lasagna.manager.open_data import (
     INCOMPLETE_MARKER,
     S3ObjectStore,
-    UPLOAD_MANIFEST,
     stage_upload,
     upload_inference,
     validate_inference,
@@ -31,9 +30,6 @@ class FakeStore:
     def put_bytes(self, key: str, value: bytes) -> None:
         self.events.append(("bytes", key))
         self.objects[key] = value
-
-    def get_bytes(self, key: str) -> bytes | None:
-        return self.objects.get(key)
 
     def delete(self, key: str) -> None:
         self.events.append(("delete", key))
@@ -66,7 +62,7 @@ def test_s3_bulk_upload_uses_configured_rclone_params(
     )
     store.put_files(
         "root/inference/run", bundle,
-        ({"path": "a"}, {"path": "nested/b"}),
+        ("a", "nested/b"),
     )
     command, check, file_list = calls[0]
     assert command[:4] == ["rclone", "copy", str(bundle), ":s3:stage/root/inference/run/"]
@@ -245,7 +241,7 @@ def test_validate_requires_completed_cc_bundle_and_model(tmp_path: Path) -> None
     assert plan.prefix == "prefix/inference/run-uuid"
     assert plan.model_id == "20260806120000-lasagna"
     assert not (Path(config.cache_dir) / "snapshots" / "index.json").exists()
-    assert any(item["path"] == "presence.ome.zarr/3/.zarray" for item in plan.files)
+    assert "presence.ome.zarr/3/.zarray" in plan.files
 
     bad_config, _ = _completed_run(tmp_path / "bad", license_name="private")
     with pytest.raises(ValueError, match="CC BY-NC"):
@@ -258,31 +254,54 @@ def test_validate_accepts_lasagna_through_same_upload_path(tmp_path: Path) -> No
     assert plan.provenance["artifact_kind"] == "lasagna"
 
 
+def test_validate_rejects_reserved_incomplete_marker_in_bundle(tmp_path: Path) -> None:
+    config, run = _completed_run(tmp_path)
+    (run / "artifacts" / INCOMPLETE_MARKER).write_bytes(b"")
+    with pytest.raises(ValueError, match="reserved upload filename"):
+        validate_inference(config, "fiber-run")
+
+
 @pytest.mark.parametrize("artifact_kind", ["fiber3d-prediction", "lasagna"])
-def test_atomic_upload_marker_manifest_order_and_idempotency(
+def test_marker_guards_each_resumable_upload_attempt(
     tmp_path: Path, artifact_kind: str,
 ) -> None:
     config, _run = _completed_run(tmp_path, artifact_kind=artifact_kind)
     plan = validate_inference(config, "fiber-run")
     store = FakeStore()
-    url, uploaded = stage_upload(plan, store)
-    assert uploaded and url == "s3://stage/prefix/inference/run-uuid/"
+    url = stage_upload(plan, store)
+    assert url == "s3://stage/prefix/inference/run-uuid/"
     marker = f"{plan.prefix}/{INCOMPLETE_MARKER}"
-    manifest = f"{plan.prefix}/{UPLOAD_MANIFEST}"
     assert marker not in store.objects
     assert store.events[0] == ("bytes", marker)
-    assert store.events[-2:] == [("bytes", manifest), ("delete", marker)]
-    assert json.loads(store.objects[manifest])["bundle_digest"] == plan.bundle_digest
+    assert store.events[-1] == ("delete", marker)
 
     event_count = len(store.events)
-    assert stage_upload(plan, store) == (url, False)
-    assert len(store.events) == event_count
+    assert stage_upload(plan, store) == url
+    assert len(store.events) > event_count
+    assert store.events[event_count] == ("bytes", marker)
+    assert store.events[-1] == ("delete", marker)
 
-    remote = json.loads(store.objects[manifest])
-    remote["bundle_digest"] = "different"
-    store.objects[manifest] = json.dumps(remote).encode()
-    with pytest.raises(ValueError, match="collision"):
-        stage_upload(plan, store)
+
+def test_failed_upload_retains_marker_and_never_ingests(tmp_path: Path) -> None:
+    config, run = _completed_run(tmp_path)
+
+    class FailingStore(FakeStore):
+        def put_files(self, _prefix: str, _bundle: Path, _files) -> None:
+            raise RuntimeError("transfer failed")
+
+    store = FailingStore()
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        upload_inference(
+            config, "fiber-run", store=store,
+            validator=lambda **_kwargs: {"validated": True},
+            ingester=lambda **_kwargs: pytest.fail("ingest called after failed staging"),
+        )
+    plan = validate_inference(config, "fiber-run")
+    marker = f"{plan.prefix}/{INCOMPLETE_MARKER}"
+    assert marker in store.objects
+    persisted = json.loads((run / "metadata.json").read_text())
+    assert persisted["lifecycle"]["staging_upload"] == "failed"
+    assert persisted["lifecycle"]["atlas_ingest"] == "not_started"
 
 
 @pytest.mark.parametrize("artifact_kind", ["fiber3d-prediction", "lasagna"])
@@ -311,7 +330,9 @@ def test_upload_updates_independent_lifecycle_and_calls_ingester(
     assert ingested_provenance["artifact_kind"] == artifact_kind
     assert "register_model" not in calls[0]
     persisted = json.loads((run / "metadata.json").read_text())
-    assert persisted["upload"]["bundle_digest"]
+    assert persisted["upload"] == {
+        "staging_url": "s3://stage/prefix/inference/run-uuid/",
+    }
 
 
 def test_atlas_preflight_failure_happens_before_staging(tmp_path: Path) -> None:

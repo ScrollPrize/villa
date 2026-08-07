@@ -277,11 +277,12 @@ metadata; `repository.dirty` reports local modifications. Packaged deployments
 outside a Git checkout may supply `VILLA_CODE_COMMIT` and otherwise record
 `null`.
 
-Upload hashes files while reading them, writes `_INCOMPLETE` at the final
-run-UUID prefix, bulk-copies the fixed file inventory with `rclone`, then writes and verifies
-`upload-manifest.json` last, and removes the marker as the commit. Retry reads
-that manifest without recursively listing a remote Zarr and refuses a
-same-UUID/different-content collision.
+Upload writes `_INCOMPLETE` at the final run-UUID prefix, bulk-copies the fixed
+file inventory with `rclone`, and removes the marker only after rclone succeeds.
+Retry invokes rclone again so its configured comparison flags resume or skip
+existing objects. Completed run UUIDs and their artifact bundles are immutable:
+`rclone copy --size-only` does not detect changed same-size objects or remove
+stale destination objects.
 
 `rclone_params` is passed verbatim to `rclone copy`; edit the array to tune
 transfer concurrency, buffering, progress output, or S3 authentication for the
@@ -290,6 +291,9 @@ host. The default is optimized for many small Zarr objects and requires
 
 Atlas ingests both Fiber and Lasagna output as the existing copy-first
 `lasagna` entry with identity `(volume, model, input level)`. Portable
-provenance still records the producing backend. Publication remains an explicit
+provenance remains in `inference.json` and is not duplicated into the Atlas
+entry's `creation_info`. Atlas stores the private source as an access-root URL
+plus a relative origin path and joins them for data-sync; public metadata export
+keeps only the subsequently added `public-read` origin. Publication remains an explicit
 `vesuvius-atlas data-sync` operation; the manager never writes the public
 bucket and leaves `atlas_publication = not_started`.

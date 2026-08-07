@@ -1,15 +1,16 @@
-# Task: provenance-driven Atlas model registration
+# Task: minimize manager staging and Atlas inference ingestion
 
-Make Lasagna/Fiber Atlas integration resolve and automatically register a model
-from portable inference provenance plus configured snapshot directories. Use
-the approved minimal Atlas layout: numeric model references,
-`architecture = "fiber3d/unet"`, `task = "lasagna"`, the existing
-`model_training` process, a run-relative snapshot path, and its SHA-256. Store
-the Villa inference commit only in inference JSON metadata.
+Remove the manager-specific `upload-manifest.json` protocol. S3 staging must
+use rclone's normal resumable copy behavior with only `_INCOMPLETE` as the
+publication guard: create the marker before transfer and remove it only after
+rclone succeeds.
 
-Use Hendrik's private staging root rather than Paul's by setting the existing
-manager staging config to `s3://philodemos/hendrik/lasagna`.
+Keep portable `inference.json` and all previously approved model metadata.
+Do not copy portable inference provenance into an Atlas data entry's
+`creation_info`. Reuse the existing Atlas `lasagna` copy-first representation
+without extending its data-entry schema: store only the private origin and the
+existing `model_id` and `level` parameters.
 
-Repair the two existing completed inference records so they carry the resolved
-Atlas identity and current known inference commit. They already contain the
-correct portable/private run name; verify and preserve it.
+Clean the already staged/ingested work-in-progress runs consistently, without
+changing their artifacts, model identities, origins, parameters, or public
+publication state.

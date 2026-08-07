@@ -24,7 +24,6 @@ from .snapshots import SnapshotRecord, index_snapshots
 
 SUPPORTED_LICENSE = "CC BY-NC 4.0"
 SUPPORTED_ARTIFACTS = {"fiber3d-prediction", "lasagna"}
-UPLOAD_MANIFEST = "upload-manifest.json"
 INCOMPLETE_MARKER = "_INCOMPLETE"
 _RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
 
@@ -32,7 +31,6 @@ _RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
 class ObjectStore(Protocol):
     def put_file(self, key: str, path: Path) -> None: ...
     def put_bytes(self, key: str, value: bytes) -> None: ...
-    def get_bytes(self, key: str) -> bytes | None: ...
     def delete(self, key: str) -> None: ...
 
 
@@ -44,18 +42,7 @@ class UploadPlan:
     model_id: str
     bucket: str
     prefix: str
-    files: tuple[dict[str, Any], ...]
-    bundle_digest: str
-
-    @property
-    def manifest(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "run_uuid": self.provenance["run_uuid"],
-            "bundle_digest": self.bundle_digest,
-            "provenance_sha256": _sha256(self.bundle_dir / "inference.json"),
-            "files": list(self.files),
-        }
+    files: tuple[str, ...]
 
 
 class S3ObjectStore:
@@ -79,9 +66,9 @@ class S3ObjectStore:
     def put_file(self, key: str, path: Path) -> None:
         self.client.upload_file(str(path), self.bucket, key)
 
-    def put_files(self, prefix: str, bundle: Path, files: Iterable[dict[str, Any]]) -> None:
+    def put_files(self, prefix: str, bundle: Path, files: Iterable[str]) -> None:
         """Upload a fixed bundle inventory concurrently with rclone."""
-        paths = tuple(str(entry["path"]) for entry in files)
+        paths = tuple(files)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as file_list:
             file_list.write("\n".join(paths))
             file_list.write("\n")
@@ -97,17 +84,6 @@ class S3ObjectStore:
     def put_bytes(self, key: str, value: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=value)
 
-    def get_bytes(self, key: str) -> bytes | None:
-        try:
-            response = self.client.get_object(Bucket=self.bucket, Key=key)
-        except Exception as error:
-            response_data = getattr(error, "response", {})
-            code = str(response_data.get("Error", {}).get("Code", ""))
-            if code in {"404", "NoSuchKey", "NotFound"}:
-                return None
-            raise
-        return response["Body"].read()
-
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)
 
@@ -120,19 +96,14 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _manifest_files(bundle: Path) -> tuple[dict[str, Any], ...]:
-    files: list[dict[str, Any]] = []
+def _bundle_files(bundle: Path) -> tuple[str, ...]:
+    files: list[str] = []
     for path in sorted((item for item in bundle.rglob("*") if item.is_file()), key=lambda p: p.as_posix()):
         relative = path.relative_to(bundle).as_posix()
-        if relative in {INCOMPLETE_MARKER, UPLOAD_MANIFEST}:
+        if relative == INCOMPLETE_MARKER:
             raise ValueError(f"reserved upload filename in bundle: {relative}")
-        files.append({"path": relative, "size": path.stat().st_size, "sha256": _sha256(path)})
+        files.append(relative)
     return tuple(files)
-
-
-def _bundle_digest(files: Iterable[dict[str, Any]]) -> str:
-    encoded = json.dumps(list(files), sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _parse_staging(value: str, run_uuid: str) -> tuple[str, str]:
@@ -243,7 +214,7 @@ def validate_inference(
         raise ValueError(f"publication requires source license {SUPPORTED_LICENSE!r}")
     resolved_model = resolve_model_id(config, provenance)
     bucket, prefix = _parse_staging(config.upload_staging_s3, str(record["run_uuid"]))
-    files = _manifest_files(bundle)
+    files = _bundle_files(bundle)
     if not files:
         raise ValueError("portable artifact bundle is empty")
     return UploadPlan(
@@ -254,7 +225,6 @@ def validate_inference(
         bucket=bucket,
         prefix=prefix,
         files=files,
-        bundle_digest=_bundle_digest(files),
     )
 
 
@@ -265,32 +235,18 @@ def _key(plan: UploadPlan, relative: str) -> str:
     return f"{plan.prefix}/{safe.as_posix()}"
 
 
-def stage_upload(plan: UploadPlan, store: ObjectStore) -> tuple[str, bool]:
-    """Upload bundle, committing only after the verified manifest is present."""
-    manifest_key = _key(plan, UPLOAD_MANIFEST)
-    expected = plan.manifest
-    existing_raw = store.get_bytes(manifest_key)
-    if existing_raw is not None:
-        existing = json.loads(existing_raw)
-        if existing.get("run_uuid") != expected["run_uuid"] or existing.get("bundle_digest") != expected["bundle_digest"]:
-            raise ValueError("staging collision: run UUID already has different bundle content")
-        return f"s3://{plan.bucket}/{plan.prefix}/", False
-
+def stage_upload(plan: UploadPlan, store: ObjectStore) -> str:
+    """Upload through rclone, with a marker guarding manager-side commit."""
     marker_key = _key(plan, INCOMPLETE_MARKER)
     store.put_bytes(marker_key, b"")
     bulk_put = getattr(store, "put_files", None)
     if callable(bulk_put):
         bulk_put(plan.prefix, plan.bundle_dir, plan.files)
     else:
-        for entry in plan.files:
-            store.put_file(_key(plan, entry["path"]), plan.bundle_dir / entry["path"])
-    manifest_raw = (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode()
-    store.put_bytes(manifest_key, manifest_raw)
-    committed = store.get_bytes(manifest_key)
-    if committed is None or json.loads(committed) != expected:
-        raise RuntimeError("staging upload manifest verification failed")
+        for relative in plan.files:
+            store.put_file(_key(plan, relative), plan.bundle_dir / relative)
     store.delete(marker_key)
-    return f"s3://{plan.bucket}/{plan.prefix}/", True
+    return f"s3://{plan.bucket}/{plan.prefix}/"
 
 
 def _load_atlas_api(config: ManagerConfig):
@@ -335,7 +291,7 @@ def upload_inference(
     record["updated_at"] = utc_now()
     atomic_json(record_path, record)
     try:
-        staging_url, uploaded = stage_upload(
+        staging_url = stage_upload(
             plan,
             store or S3ObjectStore(
                 plan.bucket,
@@ -345,9 +301,6 @@ def upload_inference(
         lifecycle["staging_upload"] = "completed"
         record["upload"] = {
             "staging_url": staging_url,
-            "bundle_digest": plan.bundle_digest,
-            "manifest": UPLOAD_MANIFEST,
-            "uploaded": uploaded,
         }
         lifecycle["atlas_ingest"] = "ingesting"
         atomic_json(record_path, record)

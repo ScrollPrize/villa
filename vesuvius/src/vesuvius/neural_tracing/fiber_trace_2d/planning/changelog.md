@@ -1,3 +1,9 @@
+# 2026-08-07
+
+- Simplified manager S3 staging to marker-only resumable rclone transfer and
+  restored lean existing-schema Atlas Lasagna entries without duplicated
+  portable provenance.
+
 # 2026-08-06
 
 - Added path-aware per-user Bash completion installation for `las_manager`,
