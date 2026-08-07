@@ -100,6 +100,11 @@ class InferenceConfig:
 
     # Image processing / scaling
     max_clip_value: int = 200
+    # Divisor applied after the clip. Must match training, which uses
+    # A.Normalize(mean=0, std=1) and therefore albumentations' default
+    # max_pixel_value of 255. Tying it to max_clip_value instead fed the model
+    # inputs 255/200 = 1.275x larger than anything it saw while training.
+    normalize_divisor: float = 255.0
 
     # Blending
     use_hann_window: bool = True
@@ -350,7 +355,7 @@ def create_inference_dataloader(
         if CFG.tile_size != CFG.size:
             tfm_list.append(A.Resize(CFG.size, CFG.size))
         tfm_list += [
-            A.ToFloat(max_value=CFG.max_clip_value),
+            A.ToFloat(max_value=CFG.normalize_divisor),
             ToTensorV2(),
         ]
         transform = A.Compose(tfm_list)
