@@ -1352,22 +1352,25 @@ void LineAnnotationDialog::requestLinkedCursorMirror(CChunkedVolumeViewer* sourc
 {
     _linkedCursorSource = source;
     _pendingLinkedCursorPoint = point;
-    if (_linkedCursorMirrorPending) {
-        return;
-    }
-    _linkedCursorMirrorPending = true;
-    QTimer::singleShot(16, this, [this]() {
-        _linkedCursorMirrorPending = false;
-        if (_closing) {
-            return;
-        }
-        for (const auto& panePtr : _linkedCursorPanes) {
-            auto* pane = panePtr.data();
-            if (pane && pane != _linkedCursorSource.data()) {
-                pane->setLinkedCursorVolumePoint(_pendingLinkedCursorPoint);
+    if (!_linkedCursorMirrorTimer) {
+        _linkedCursorMirrorTimer = new QTimer(this);
+        _linkedCursorMirrorTimer->setSingleShot(true);
+        _linkedCursorMirrorTimer->setInterval(16);  // ~one global render tick
+        connect(_linkedCursorMirrorTimer, &QTimer::timeout, this, [this]() {
+            if (_closing) {
+                return;
             }
-        }
-    });
+            for (const auto& panePtr : _linkedCursorPanes) {
+                auto* pane = panePtr.data();
+                if (pane && pane != _linkedCursorSource.data()) {
+                    pane->setLinkedCursorVolumePoint(_pendingLinkedCursorPoint);
+                }
+            }
+        });
+    }
+    if (!_linkedCursorMirrorTimer->isActive()) {
+        _linkedCursorMirrorTimer->start();
+    }
 }
 
 void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
@@ -1376,6 +1379,15 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
         QObject::disconnect(connection);
     }
     _generatedOverlayRefreshConnections.clear();
+    // Drop any pending cursor mirror along with the connections that feed it,
+    // so it can't fire across a pane rebuild and stamp a pre-rebuild point
+    // onto the new panes.
+    if (_linkedCursorMirrorTimer) {
+        _linkedCursorMirrorTimer->stop();
+    }
+    _linkedCursorPanes.clear();
+    _linkedCursorSource.clear();
+    _pendingLinkedCursorPoint.reset();
     _generatedOverlayRefreshQueued = false;
 }
 
