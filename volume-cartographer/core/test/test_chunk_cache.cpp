@@ -486,11 +486,14 @@ TEST_CASE("ChunkCache: recently touched entries never exceed capacity")
     CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
 
-    // Strict LRU retains only the two most recent chunks.
+    // Strict LRU retains only the two most recent chunks. Probe the expected
+    // survivors BEFORE the evicted chunk: tryGetChunk on a missing entry
+    // queues a background re-fetch, and its store evicts exactly the entries
+    // asserted next (a race that flaked under parallel ctest load).
     CHECK(c->stats().decodedBytes <= 128);
-    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
 }
 
 TEST_CASE("ChunkCache: every store enforces the configured byte capacity")
