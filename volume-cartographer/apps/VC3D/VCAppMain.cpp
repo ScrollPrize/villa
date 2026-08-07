@@ -6,7 +6,11 @@
 #endif
 
 #include <qapplication.h>
+#include <QAbstractSpinBox>
 #include <QCommandLineParser>
+#include <QComboBox>
+#include <QEvent>
+#include <QImageReader>
 
 #include "CWindow.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
@@ -89,6 +93,50 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     }
     return false;
 }
+
+class WheelFocusFilter final : public QObject
+{
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        // Polish fires once per widget as it is styled, so this catches every
+        // combo/spinner app-wide, including ones created later. StrongFocus
+        // (vs the default WheelFocus) stops the wheel from focusing the
+        // widget as the cursor passes over it.
+        if (event->type() == QEvent::Polish) {
+            auto* widget = qobject_cast<QWidget*>(watched);
+            if (widget && (qobject_cast<QAbstractSpinBox*>(widget) ||
+                           qobject_cast<QComboBox*>(widget))) {
+                widget->setFocusPolicy(Qt::StrongFocus);
+            }
+            return QObject::eventFilter(watched, event);
+        }
+
+        if (event->type() != QEvent::Wheel)
+            return QObject::eventFilter(watched, event);
+
+        auto* widget = qobject_cast<QWidget*>(watched);
+        while (widget) {
+            if (auto* spinBox = qobject_cast<QAbstractSpinBox*>(widget)) {
+                if (!spinBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            if (auto* comboBox = qobject_cast<QComboBox*>(widget)) {
+                if (!comboBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            widget = widget->parentWidget();
+        }
+
+        return QObject::eventFilter(watched, event);
+    }
+};
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
@@ -200,6 +248,16 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
+    // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
+    // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
+    // after QApplication construction because Qt may cache the environment
+    // setting before VC3D's pre-main hook runs. Preserve an explicit user
+    // override and retain a finite allocation guard.
+    if (qEnvironmentVariableIsEmpty("QT_IMAGEIO_MAXALLOC")) {
+        QImageReader::setAllocationLimit(512);
+    }
+    WheelFocusFilter wheelFocusFilter;
+    app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));

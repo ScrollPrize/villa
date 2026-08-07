@@ -416,9 +416,10 @@ def compute_patch_dt_target_cache(slice_to_spiral_transform, dr_per_winding, pat
     if total > 0:
         ijs_np = np.concatenate([p._dt_target_ijs for p in patches], axis=0)
         patch_idx_np = np.repeat(np.arange(num_patches, dtype=np.int64), counts)
-        ijs_gpu = torch.from_numpy(ijs_np).to(device=device)
-        patch_idx_gpu = torch.from_numpy(patch_idx_np).to(device=device)
-        zyxs = patch_atlas.lookup(patch_idx_gpu, ijs_gpu)
+        # The atlas is host-resident: the gather runs on CPU and only the
+        # interpolated points land on the device.
+        zyxs = patch_atlas.lookup(
+            torch.from_numpy(patch_idx_np), torch.from_numpy(ijs_np))
         spiral_zyxs = _transform_in_chunks(slice_to_spiral_transform, zyxs, chunk_size)
         theta_t, _, shifted_t = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
         theta_np = theta_t.cpu().numpy()

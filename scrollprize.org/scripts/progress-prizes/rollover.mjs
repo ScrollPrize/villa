@@ -21,12 +21,22 @@ import {
   normalizePermissionForCreate,
   permissionIdentityKey,
 } from './google-api.mjs';
+import {
+  RESPONSE_SHEET_MIME_TYPE,
+  RESPONSE_SHEET_ROLE,
+  assertResponseSheetHeader,
+  quoteSheetTitle,
+  responseIdsFromValueRange,
+  responseSheetHeaders,
+  responseSheetRow,
+} from './response-sheets.mjs';
 
 export const ROLLOVER_MANAGED_BY = 'scrollprize-progress-prizes';
 
 export const ROLLOVER_FILE_ROLES = Object.freeze({
   SOURCE: 'source',
   TARGET: 'target',
+  RESPONSES: RESPONSE_SHEET_ROLE,
 });
 
 export const ROLLOVER_FILE_STATES = Object.freeze({
@@ -47,6 +57,7 @@ export const ROLLOVER_FAULTS = Object.freeze({
 const REQUIRED_GOOGLE_METHODS = Object.freeze([
   'getForm',
   'getFile',
+  'createFile',
   'listFilesByAppProperties',
   'copyFile',
   'updateFile',
@@ -55,10 +66,28 @@ const REQUIRED_GOOGLE_METHODS = Object.freeze([
   'deletePermission',
   'updateFormTitle',
   'setPublishState',
+  'listFormResponses',
+  'getSpreadsheet',
+  'getSheetValues',
+  'appendSheetValues',
 ]);
 
 const ALLOWED_EVENTS = new Set(['schedule', 'workflow_dispatch']);
 const ALLOWED_VERIFY_MODES = new Set(['prepared', 'active', 'cleaned']);
+const RECONCILABLE_SOURCE_STATES = new Set([
+  undefined,
+  ROLLOVER_FILE_STATES.COPIED,
+  ROLLOVER_FILE_STATES.PREPARED,
+  ROLLOVER_FILE_STATES.ACTIVATING,
+  ROLLOVER_FILE_STATES.ACTIVE,
+  ROLLOVER_FILE_STATES.CLOSED,
+]);
+const RECONCILABLE_TARGET_STATES = new Set([
+  ROLLOVER_FILE_STATES.COPIED,
+  ROLLOVER_FILE_STATES.PREPARED,
+  ROLLOVER_FILE_STATES.ACTIVATING,
+  ROLLOVER_FILE_STATES.ACTIVE,
+]);
 const GOOGLE_FORM_MIME_TYPE = 'application/vnd.google-apps.form';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 const INITIAL_EXPLICIT_SOURCE_CYCLE = '2026-07';
@@ -342,12 +371,6 @@ function publishState(form) {
     throw new Error('Form reports an invalid publishing state');
   }
   return state;
-}
-
-function assertNoLinkedSheet(form) {
-  if (hasValue(form?.linkedSheetId)) {
-    throw new Error('Form has a linked response Sheet; automatic rollover is intentionally disabled');
-  }
 }
 
 function canonicalize(value) {
@@ -771,6 +794,36 @@ function activationTransition(sourceSnapshot, targetSnapshot) {
   throw new Error('Forms are not in an allowed activation or recovery state');
 }
 
+function reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
+  sourceCycle,
+  targetCycle,
+} = {}) {
+  const sourceProperties = sourceSnapshot.file.appProperties ?? {};
+  const targetProperties = targetSnapshot.file.appProperties ?? {};
+  if (
+    !RECONCILABLE_SOURCE_STATES.has(sourceProperties.state)
+    || !RECONCILABLE_TARGET_STATES.has(targetProperties.state)
+  ) {
+    throw new Error('Drive state metadata is outside guarded active reconciliation');
+  }
+  if (
+    (hasValue(sourceProperties.targetCycle) && sourceProperties.targetCycle !== targetCycle)
+    || (hasValue(targetProperties.sourceCycle) && targetProperties.sourceCycle !== sourceCycle)
+  ) {
+    throw new Error('Drive cycle metadata is outside guarded active reconciliation');
+  }
+  return Object.freeze({
+    healthy: sourceProperties.state === ROLLOVER_FILE_STATES.CLOSED
+      && sourceProperties.targetCycle === targetCycle
+      && targetProperties.state === ROLLOVER_FILE_STATES.ACTIVE
+      && targetProperties.sourceCycle === sourceCycle,
+    sourceState: sourceProperties.state,
+    sourceTargetCycle: sourceProperties.targetCycle,
+    targetState: targetProperties.state,
+    targetSourceCycle: targetProperties.sourceCycle,
+  });
+}
+
 async function ensurePublishState(google, form, expected) {
   const actual = publishState(form);
   if (
@@ -864,6 +917,19 @@ function sourceFingerprint(runtime, sourceCycle, sourceFileId) {
     .digest('hex');
 }
 
+function responseSheetFingerprint(runtime, cycle, formFileId) {
+  return createHash('sha256')
+    .update(`${runtime.environment}\0${cycle}\0responses\0${formFileId}`)
+    .digest('hex');
+}
+
+function responseSheetTitle(runtime, clock, cycle) {
+  const deadline = getCycleDeadline(cycle);
+  const title = `${deadline.monthName} ${deadline.year} Progress Prize Responses`;
+  if (runtime.environment === AUTOMATION_ENVIRONMENTS.PRODUCTION) return title;
+  return `[SMOKE RESPONSES ${smokeDate(runtime, clock)}] ${title}`;
+}
+
 function assertSourceFingerprint(targetFile, sourceFile, runtime, sourceCycle) {
   const expected = sourceFingerprint(runtime, sourceCycle, sourceFile.id);
   if (targetFile?.appProperties?.sourceFingerprint !== expected) {
@@ -942,6 +1008,270 @@ export function createRolloverService({
       throw new Error(`Managed ${role} form is missing for cycle ${cycle}`);
     }
     return file;
+  }
+
+  function assertManagedResponseSheet(file, cycle, formFileId, {
+    state,
+    requireActiveFolder = true,
+  } = {}) {
+    if (
+      file?.mimeType !== RESPONSE_SHEET_MIME_TYPE
+      || file.trashed === true
+      || file.driveId !== runtime.driveId
+      || (requireActiveFolder && !file.parents?.includes(runtime.folderId))
+    ) {
+      throw new Error('Managed response Sheet is not in the configured Shared Drive folder');
+    }
+    const expected = {
+      ...managedQuery(runtime, RESPONSE_SHEET_ROLE, cycle),
+      formFingerprint: responseSheetFingerprint(runtime, cycle, formFileId),
+      ...(state === undefined ? {} : { state }),
+    };
+    if (Object.entries(expected).some(
+      ([key, value]) => file.appProperties?.[key] !== value,
+    )) {
+      throw new Error('Managed response Sheet metadata does not match its form cycle');
+    }
+    if (file.name !== responseSheetTitle(runtime, clock, cycle)) {
+      throw new Error('Managed response Sheet filename does not match its form cycle');
+    }
+    assertSourceCapabilities(file, ['canEdit', 'canShare']);
+  }
+
+  async function findResponseSheet(cycle, formFileId, options = {}) {
+    const files = await google.listFilesByAppProperties({
+      appProperties: managedQuery(runtime, RESPONSE_SHEET_ROLE, cycle),
+      driveId: runtime.driveId,
+    });
+    if (files.length > 1) {
+      throw new Error(`Multiple managed response Sheets exist for cycle ${cycle}; refusing to guess`);
+    }
+    if (files[0] !== undefined) {
+      assertManagedResponseSheet(files[0], cycle, formFileId, options);
+    }
+    return files[0];
+  }
+
+  function responseSheetPermissions(formPermissions) {
+    return uniquePermissions(
+      filterDirectCollaboratorPermissions(formPermissions).filter((permission) => (
+        !isGoogleServiceAccountIdentity(permission)
+        && !isAutomationIdentity(permission, runtime.serviceAccountEmail)
+        && !isDriveAdminIdentity(permission, runtime.driveAdminEmail)
+      )),
+    );
+  }
+
+  async function responseSheetTab(spreadsheetId) {
+    const spreadsheet = await google.getSpreadsheet({ spreadsheetId });
+    const first = spreadsheet?.sheets?.find(
+      (sheet) => (sheet?.properties?.index ?? 0) === 0,
+    );
+    if (
+      spreadsheet?.spreadsheetId !== spreadsheetId
+      || (first?.properties?.sheetType ?? 'GRID') !== 'GRID'
+      || first.properties.hidden === true
+      || typeof first.properties.title !== 'string'
+      || first.properties.title === ''
+    ) {
+      throw new Error('Managed response Sheet does not expose one usable primary grid');
+    }
+    return quoteSheetTitle(first.properties.title);
+  }
+
+  async function inspectResponseSheet({
+    cycle,
+    formSnapshot,
+    requireExisting = true,
+    expectedState,
+    inspectResponses = false,
+    requireActiveFolder = true,
+  }) {
+    const sheet = await findResponseSheet(cycle, formSnapshot.file.id, {
+      state: expectedState,
+      requireActiveFolder,
+    });
+    if (sheet === undefined) {
+      if (requireExisting) {
+        throw new Error(`Managed response Sheet is missing for cycle ${cycle}`);
+      }
+      return Object.freeze({ exists: false, pendingCount: undefined });
+    }
+    const expectedPermissions = responseSheetPermissions(formSnapshot.permissions);
+    const permissions = await google.getAllPermissions({ fileId: sheet.id });
+    assertPermissionsMatch(expectedPermissions, permissions, { runtime });
+
+    const tab = await responseSheetTab(sheet.id);
+    const headers = responseSheetHeaders(formSnapshot.form);
+    const header = await google.getSheetValues({
+      spreadsheetId: sheet.id,
+      range: `${tab}!1:1`,
+    });
+    assertResponseSheetHeader(header, headers);
+    const idColumn = await google.getSheetValues({
+      spreadsheetId: sheet.id,
+      range: `${tab}!A:A`,
+    });
+    const responseIds = responseIdsFromValueRange(idColumn);
+    let pendingCount;
+    if (inspectResponses) {
+      const responses = await google.listFormResponses({ formId: formSnapshot.form.formId });
+      const listedIds = new Set();
+      for (const response of responses) {
+        assertNonEmptyString(response?.responseId, 'response.responseId');
+        if (listedIds.has(response.responseId)) {
+          throw new Error('Forms API returned a duplicate response identifier');
+        }
+        listedIds.add(response.responseId);
+      }
+      pendingCount = responses.filter(({ responseId }) => !responseIds.has(responseId)).length;
+    }
+    return Object.freeze({
+      exists: true,
+      sheet,
+      tab,
+      headers,
+      responseIds,
+      pendingCount,
+    });
+  }
+
+  async function ensureResponseSheet({
+    cycle,
+    formSnapshot,
+    state,
+    dryRun = false,
+    sync = true,
+  }) {
+    let sheet = await findResponseSheet(cycle, formSnapshot.file.id);
+    if (sheet === undefined && dryRun) {
+      return Object.freeze({
+        exists: false,
+        created: false,
+        appendedCount: 0,
+        totalResponseCount: undefined,
+      });
+    }
+    let created = false;
+    if (sheet === undefined) {
+      sheet = await google.createFile({
+        name: responseSheetTitle(runtime, clock, cycle),
+        mimeType: RESPONSE_SHEET_MIME_TYPE,
+        parentId: runtime.folderId,
+        appProperties: {
+          ...managedProperties(runtime, RESPONSE_SHEET_ROLE, cycle, state),
+          formFingerprint: responseSheetFingerprint(runtime, cycle, formSnapshot.file.id),
+        },
+      });
+      assertNonEmptyString(sheet?.id, 'created response Sheet ID');
+      created = true;
+    }
+    assertManagedResponseSheet(sheet, cycle, formSnapshot.file.id);
+    const expectedPermissions = responseSheetPermissions(formSnapshot.permissions);
+    await ensurePermissions(google, sheet.id, expectedPermissions, { runtime });
+    const tab = await responseSheetTab(sheet.id);
+    const headers = responseSheetHeaders(formSnapshot.form);
+    let header = await google.getSheetValues({
+      spreadsheetId: sheet.id,
+      range: `${tab}!1:1`,
+    });
+    if (!Array.isArray(header?.values) || header.values.length === 0) {
+      const existingIds = await google.getSheetValues({
+        spreadsheetId: sheet.id,
+        range: `${tab}!A:A`,
+      });
+      if (Array.isArray(existingIds?.values) && existingIds.values.length > 0) {
+        throw new Error('Managed response Sheet contains data without its immutable header');
+      }
+      await google.appendSheetValues({
+        spreadsheetId: sheet.id,
+        range: `${tab}!A:ZZZ`,
+        rows: [headers],
+      });
+      header = await google.getSheetValues({
+        spreadsheetId: sheet.id,
+        range: `${tab}!1:1`,
+      });
+    }
+    assertResponseSheetHeader(header, headers);
+
+    let appendedCount = 0;
+    let totalResponseCount;
+    if (sync) {
+      const responses = await google.listFormResponses({ formId: formSnapshot.form.formId });
+      const listedIds = new Set();
+      for (const response of responses) {
+        assertNonEmptyString(response?.responseId, 'response.responseId');
+        if (listedIds.has(response.responseId)) {
+          throw new Error('Forms API returned a duplicate response identifier');
+        }
+        listedIds.add(response.responseId);
+      }
+      totalResponseCount = responses.length;
+      const idColumn = await google.getSheetValues({
+        spreadsheetId: sheet.id,
+        range: `${tab}!A:A`,
+      });
+      const existingIds = responseIdsFromValueRange(idColumn);
+      const pending = responses
+        .filter(({ responseId }) => !existingIds.has(responseId))
+        .sort((left, right) => (
+          String(left.createTime).localeCompare(String(right.createTime))
+          || left.responseId.localeCompare(right.responseId)
+        ));
+      for (let index = 0; index < pending.length; index += 200) {
+        const batch = pending.slice(index, index + 200);
+        await google.appendSheetValues({
+          spreadsheetId: sheet.id,
+          range: `${tab}!A:ZZZ`,
+          rows: batch.map((response) => responseSheetRow(formSnapshot.form, response)),
+        });
+        appendedCount += batch.length;
+      }
+      const finalIds = responseIdsFromValueRange(await google.getSheetValues({
+        spreadsheetId: sheet.id,
+        range: `${tab}!A:A`,
+      }));
+      if ([...listedIds].some((responseId) => !finalIds.has(responseId))) {
+        throw new Error('Managed response Sheet did not retain every listed response ID');
+      }
+    }
+    sheet = await markFile(sheet, state, {
+      formFingerprint: responseSheetFingerprint(runtime, cycle, formSnapshot.file.id),
+    });
+    assertManagedResponseSheet(sheet, cycle, formSnapshot.file.id, { state });
+    return Object.freeze({
+      exists: true,
+      created,
+      appendedCount,
+      totalResponseCount,
+    });
+  }
+
+  async function assertResponseCoverage({
+    cycle,
+    formSnapshot,
+    expectedState,
+    allowLegacy = false,
+    requireFullySynced = false,
+  }) {
+    const managed = await inspectResponseSheet({
+      cycle,
+      formSnapshot,
+      requireExisting: false,
+      expectedState,
+      inspectResponses: requireFullySynced,
+    });
+    if (!managed.exists) {
+      if (allowLegacy && hasValue(formSnapshot.form.linkedSheetId)) {
+        return Object.freeze({ mode: 'legacy-linked', pendingCount: undefined });
+      }
+      throw new Error(`Managed response Sheet is missing for cycle ${cycle}`);
+    }
+    if (requireFullySynced && managed.pendingCount !== 0) {
+      throw new Error('Closed form has responses missing from its managed response Sheet');
+    }
+    return Object.freeze({ mode: 'managed', pendingCount: managed.pendingCount });
   }
 
   function assertResolvedSourceLocation(resolution, file) {
@@ -1104,7 +1434,6 @@ export function createRolloverService({
       google.getForm({ formId: file.id }),
       google.getFile({ fileId: file.id }),
     ]);
-    assertNoLinkedSheet(form);
     publishState(form);
     assertPublicResponderUri(form.responderUri);
     return { form, file: currentFile };
@@ -1218,11 +1547,19 @@ export function createRolloverService({
     if (verifyPage) {
       await assertPageState(sourceCycle, snapshot.form.responderUri);
     }
+    const responseSheet = await inspectResponseSheet({
+      cycle: sourceCycle,
+      formSnapshot: snapshot,
+      requireExisting: false,
+      inspectResponses: true,
+    });
     return Object.freeze({
       action: 'validate',
       status: 'valid',
       ...publicSummary({ cycle: sourceCycle, title: expectedTitle, ...snapshot }),
-      hasLinkedSheet: false,
+      hasLinkedSheet: hasValue(snapshot.form.linkedSheetId),
+      hasManagedResponseSheet: responseSheet.exists,
+      pendingResponseCount: responseSheet.pendingCount,
     });
   }
 
@@ -1698,11 +2035,19 @@ export function createRolloverService({
       });
     }
 
+    const responseSheet = await ensureResponseSheet({
+      cycle: sourceCycle,
+      formSnapshot: stagedSnapshot,
+      state: ROLLOVER_FILE_STATES.ACTIVE,
+    });
+
     return Object.freeze({
       action: 'bootstrap',
       status: 'active',
       created,
       resumed: !created,
+      responseSheetCreated: responseSheet.created,
+      responsesAppended: responseSheet.appendedCount,
       ...publicSummary({ cycle: sourceCycle, title, ...stagedSnapshot }),
     });
   }
@@ -1870,6 +2215,11 @@ export function createRolloverService({
         existing.permissions,
         { runtime },
       );
+      const responseSheet = await inspectResponseSheet({
+        cycle: targetCycle,
+        formSnapshot: existing,
+        requireExisting: false,
+      });
       return Object.freeze({
         action: 'prepare',
         status: 'planned',
@@ -1878,6 +2228,7 @@ export function createRolloverService({
         title: managedTitle(runtime, clock, ROLLOVER_FILE_ROLES.TARGET, targetCycle),
         created: false,
         resumed: true,
+        hasManagedResponseSheet: responseSheet.exists,
         responderUri: assertPublicResponderUri(existing.form.responderUri),
       });
     }
@@ -1917,8 +2268,19 @@ export function createRolloverService({
       isPublished: true,
       isAcceptingResponses: false,
     });
-    await markFile(targetSnapshot.file, ROLLOVER_FILE_STATES.PREPARED, {
+    targetSnapshot.file = await markFile(targetSnapshot.file, ROLLOVER_FILE_STATES.PREPARED, {
       sourceCycle: rollover.sourceCycle,
+    });
+
+    const sourceResponseSheet = await ensureResponseSheet({
+      cycle: rollover.sourceCycle,
+      formSnapshot: sourceSnapshot,
+      state: ROLLOVER_FILE_STATES.ACTIVE,
+    });
+    const targetResponseSheet = await ensureResponseSheet({
+      cycle: targetCycle,
+      formSnapshot: targetSnapshot,
+      state: ROLLOVER_FILE_STATES.PREPARED,
     });
 
     const markdown = await page.read();
@@ -1955,11 +2317,13 @@ export function createRolloverService({
       created,
       resumed: !created,
       pageChanged: update.changed,
+      sourceResponsesAppended: sourceResponseSheet.appendedCount,
+      targetResponseSheetCreated: targetResponseSheet.created,
       ...publicSummary({ cycle: targetCycle, title, ...targetSnapshot }),
     });
   }
 
-  async function loadActivationState({
+  async function loadActivationPair({
     targetCycle,
     sourceFormId,
     collaboratorPermissions,
@@ -2008,7 +2372,14 @@ export function createRolloverService({
       source,
       sourceSnapshot,
       targetSnapshot,
-      transition: activationTransition(sourceSnapshot, targetSnapshot),
+    });
+  }
+
+  async function loadActivationState(options) {
+    const pair = await loadActivationPair(options);
+    return Object.freeze({
+      ...pair,
+      transition: activationTransition(pair.sourceSnapshot, pair.targetSnapshot),
     });
   }
 
@@ -2072,7 +2443,30 @@ export function createRolloverService({
       initialState.targetSnapshot.form.responderUri,
     );
 
+    await Promise.all([
+      inspectResponseSheet({
+        cycle: rollover.sourceCycle,
+        formSnapshot: currentState.sourceSnapshot,
+      }),
+      inspectResponseSheet({
+        cycle: targetCycle,
+        formSnapshot: currentState.targetSnapshot,
+      }),
+    ]);
+
     if (currentState.transition === 'active') {
+      const [sourceResponseSheet, targetResponseSheet] = await Promise.all([
+        ensureResponseSheet({
+          cycle: rollover.sourceCycle,
+          formSnapshot: currentState.sourceSnapshot,
+          state: ROLLOVER_FILE_STATES.CLOSED,
+        }),
+        ensureResponseSheet({
+          cycle: targetCycle,
+          formSnapshot: currentState.targetSnapshot,
+          state: ROLLOVER_FILE_STATES.ACTIVE,
+        }),
+      ]);
       return Object.freeze({
         action: 'activate',
         status: 'active',
@@ -2080,6 +2474,8 @@ export function createRolloverService({
         targetCycle,
         sourceAcceptingResponses: false,
         targetAcceptingResponses: true,
+        sourceResponsesAppended: sourceResponseSheet.appendedCount,
+        targetResponsesAppended: targetResponseSheet.appendedCount,
         responderUri: assertPublicResponderUri(currentState.targetSnapshot.form.responderUri),
       });
     }
@@ -2104,12 +2500,23 @@ export function createRolloverService({
       }
     }
 
+    const sourceResponseSheet = await ensureResponseSheet({
+      cycle: rollover.sourceCycle,
+      formSnapshot: { ...currentState.sourceSnapshot, form: sourceForm },
+      state: ROLLOVER_FILE_STATES.CLOSED,
+    });
+
     const targetForm = await ensurePublishState(google, currentState.targetSnapshot.form, {
       isPublished: true,
       isAcceptingResponses: true,
     });
     await markFile(currentState.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
       sourceCycle: rollover.sourceCycle,
+    });
+    const targetResponseSheet = await ensureResponseSheet({
+      cycle: targetCycle,
+      formSnapshot: { ...currentState.targetSnapshot, form: targetForm },
+      state: ROLLOVER_FILE_STATES.ACTIVE,
     });
 
     assertExpectedPublishing(sourceForm, {
@@ -2148,7 +2555,149 @@ export function createRolloverService({
       targetCycle,
       sourceAcceptingResponses: false,
       targetAcceptingResponses: true,
+      sourceResponsesAppended: sourceResponseSheet.appendedCount,
+      targetResponsesAppended: targetResponseSheet.appendedCount,
       responderUri: assertPublicResponderUri(finalState.targetSnapshot.form.responderUri),
+    });
+  }
+
+  async function syncResponses({
+    sourceCycle,
+    sourceFormId,
+    collaboratorPermissions = [],
+  } = {}) {
+    assertMutationContext(runtime);
+    parseCycle(sourceCycle);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
+    const source = await resolveSource({ sourceFormId, sourceCycle });
+    const snapshot = await loadSnapshot(source.file);
+    assertResolvedSourceAccess(source, snapshot);
+    assertRequiredSourcePermissions(snapshot.permissions, collaboratorPermissions);
+    assertTitle(
+      snapshot.form,
+      snapshot.file,
+      managedTitle(
+        runtime,
+        clock,
+        source.role ?? ROLLOVER_FILE_ROLES.SOURCE,
+        sourceCycle,
+      ),
+    );
+    assertExpectedPublishing(snapshot.form, {
+      isPublished: true,
+      isAcceptingResponses: true,
+    });
+    await assertPageState(sourceCycle, snapshot.form.responderUri);
+    const responseSheet = await ensureResponseSheet({
+      cycle: sourceCycle,
+      formSnapshot: snapshot,
+      state: ROLLOVER_FILE_STATES.ACTIVE,
+    });
+    return Object.freeze({
+      action: 'sync-responses',
+      status: 'synced',
+      sourceCycle,
+      responseSheetCreated: responseSheet.created,
+      responsesAppended: responseSheet.appendedCount,
+      totalResponseCount: responseSheet.totalResponseCount,
+      hasLinkedSheet: hasValue(snapshot.form.linkedSheetId),
+    });
+  }
+
+  async function reconcileActive({
+    targetCycle,
+    sourceFormId,
+    collaboratorPermissions = [],
+    copySourceCollaborators = true,
+  } = {}) {
+    if (runtime.eventName !== 'workflow_dispatch') {
+      throw new Error('Active-state reconciliation requires a manual workflow_dispatch event');
+    }
+    if (hasValue(runtime.simulatedNow)) {
+      throw new Error('Active-state reconciliation rejects simulated clocks');
+    }
+    assertMutationContext(runtime);
+    parseCycle(targetCycle);
+    const sourceCycle = previousCycle(targetCycle);
+    assertCollaboratorConfiguration(
+      collaboratorPermissions,
+      runtime.serviceAccountEmail,
+      runtime.driveAdminEmail,
+    );
+
+    const loadAudit = async () => {
+      const pair = await loadActivationPair({
+        targetCycle,
+        sourceFormId,
+        collaboratorPermissions,
+        copySourceCollaborators,
+        sourceCycle,
+      });
+      assertExpectedPublishing(pair.sourceSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: false,
+      });
+      assertExpectedPublishing(pair.targetSnapshot.form, {
+        isPublished: true,
+        isAcceptingResponses: true,
+      });
+      return Object.freeze({
+        ...pair,
+        markers: reconciliationMarkerState(pair.sourceSnapshot, pair.targetSnapshot, {
+          sourceCycle,
+          targetCycle,
+        }),
+      });
+    };
+
+    let audit = await loadAudit();
+    const reconciliationRequired = !audit.markers.healthy;
+    if (reconciliationRequired) {
+      if (
+        audit.markers.sourceState !== ROLLOVER_FILE_STATES.CLOSED
+        || audit.markers.sourceTargetCycle !== targetCycle
+      ) {
+        await markFile(audit.sourceSnapshot.file, ROLLOVER_FILE_STATES.CLOSED, {
+          targetCycle,
+        }, {
+          expectedAppProperties: {
+            state: audit.markers.sourceState,
+            targetCycle: audit.markers.sourceTargetCycle,
+          },
+        });
+      }
+      if (
+        audit.markers.targetState !== ROLLOVER_FILE_STATES.ACTIVE
+        || audit.markers.targetSourceCycle !== sourceCycle
+      ) {
+        await markFile(audit.targetSnapshot.file, ROLLOVER_FILE_STATES.ACTIVE, {
+          sourceCycle,
+        }, {
+          expectedAppProperties: {
+            state: audit.markers.targetState,
+            sourceCycle: audit.markers.targetSourceCycle,
+          },
+        });
+      }
+      audit = await loadAudit();
+      if (!audit.markers.healthy) {
+        throw new Error('Active-state reconciliation did not reach the exact managed marker state');
+      }
+    }
+
+    return Object.freeze({
+      action: 'reconcile-active',
+      status: 'active',
+      sourceCycle,
+      targetCycle,
+      reconciled: reconciliationRequired,
+      sourceAcceptingResponses: false,
+      targetAcceptingResponses: true,
+      responderUri: assertPublicResponderUri(audit.targetSnapshot.form.responderUri),
     });
   }
 
@@ -2239,6 +2788,19 @@ export function createRolloverService({
         isPublished: true,
         isAcceptingResponses: false,
       });
+      await Promise.all([
+        assertResponseCoverage({
+          cycle: sourceCycle,
+          formSnapshot: sourceSnapshot,
+          expectedState: ROLLOVER_FILE_STATES.ACTIVE,
+          allowLegacy: true,
+        }),
+        assertResponseCoverage({
+          cycle: targetCycle,
+          formSnapshot: targetSnapshot,
+          expectedState: ROLLOVER_FILE_STATES.PREPARED,
+        }),
+      ]);
     } else if (mode === 'active') {
       assertExpectedPublishing(sourceSnapshot.form, {
         isPublished: true,
@@ -2248,6 +2810,27 @@ export function createRolloverService({
         isPublished: true,
         isAcceptingResponses: true,
       });
+      const markers = reconciliationMarkerState(sourceSnapshot, targetSnapshot, {
+        sourceCycle,
+        targetCycle,
+      });
+      if (!markers.healthy) {
+        throw new Error('Active form pair has stale managed Drive state metadata');
+      }
+      await Promise.all([
+        assertResponseCoverage({
+          cycle: sourceCycle,
+          formSnapshot: sourceSnapshot,
+          expectedState: ROLLOVER_FILE_STATES.CLOSED,
+          allowLegacy: true,
+          requireFullySynced: true,
+        }),
+        assertResponseCoverage({
+          cycle: targetCycle,
+          formSnapshot: targetSnapshot,
+          expectedState: ROLLOVER_FILE_STATES.ACTIVE,
+        }),
+      ]);
     } else {
       assertStagingIdentity(runtime);
       assertNonEmptyString(runtime.archiveFolderId, 'archiveFolderId');
@@ -2274,6 +2857,27 @@ export function createRolloverService({
           throw new Error('Cleaned staging forms are not in the configured archive state');
         }
       }
+      for (const [cycle, snapshot] of [
+        [sourceCycle, sourceSnapshot],
+        [targetCycle, targetSnapshot],
+      ]) {
+        const responseSheet = await inspectResponseSheet({
+          cycle,
+          formSnapshot: snapshot,
+          requireExisting: false,
+          expectedState: ROLLOVER_FILE_STATES.ARCHIVED,
+          requireActiveFolder: false,
+        });
+        if (
+          responseSheet.exists
+          && (
+            !responseSheet.sheet.parents?.includes(runtime.archiveFolderId)
+            || responseSheet.sheet.parents?.includes(runtime.folderId)
+          )
+        ) {
+          throw new Error('Cleaned staging response Sheet is not in the configured archive state');
+        }
+      }
     }
 
     if (mode !== 'cleaned') {
@@ -2294,19 +2898,19 @@ export function createRolloverService({
     parseCycle(targetCycle);
     assertNonEmptyString(runtime.archiveFolderId, 'archiveFolderId');
     const sourceCycle = previousCycle(targetCycle);
-    const files = [
+    const formFiles = [
       await requireManagedFile(ROLLOVER_FILE_ROLES.SOURCE, sourceCycle, { inActiveFolder: false }),
       await requireManagedFile(ROLLOVER_FILE_ROLES.TARGET, targetCycle, { inActiveFolder: false }),
     ];
 
-    const permissionsByFile = new Map(await Promise.all(files.map(async (file) => {
+    const permissionsByFile = new Map(await Promise.all(formFiles.map(async (file) => {
       const permissions = await google.getAllPermissions({ fileId: file.id });
       assertSharedDriveManagerPermissions(permissions, runtime);
       assertNoInheritedOrAdministrativeFormCollaborators(permissions, runtime);
       return [file.id, permissions];
     })));
 
-    for (const file of files) {
+    for (const file of formFiles) {
       let form = await google.getForm({ formId: file.id });
       form = await ensurePublishState(google, form, {
         isPublished: false,
@@ -2352,12 +2956,40 @@ export function createRolloverService({
       });
     }
 
+    const formSnapshots = await Promise.all(formFiles.map((file) => loadSnapshot(file)));
+    const responseSheets = (await Promise.all([
+      findResponseSheet(sourceCycle, formSnapshots[0].file.id, { requireActiveFolder: false }),
+      findResponseSheet(targetCycle, formSnapshots[1].file.id, { requireActiveFolder: false }),
+    ])).filter(Boolean);
+    for (const sheet of responseSheets) {
+      const current = await google.getFile({ fileId: sheet.id });
+      const parents = current.parents ?? [];
+      const needsParentMove = !parents.includes(runtime.archiveFolderId)
+        || parents.includes(runtime.folderId);
+      const needsState = current.appProperties?.state !== ROLLOVER_FILE_STATES.ARCHIVED;
+      if (needsParentMove || needsState) {
+        await google.updateFile({
+          fileId: current.id,
+          appProperties: {
+            ...(current.appProperties ?? {}),
+            state: ROLLOVER_FILE_STATES.ARCHIVED,
+          },
+          addParentIds: parents.includes(runtime.archiveFolderId)
+            ? undefined
+            : [runtime.archiveFolderId],
+          removeParentIds: parents.includes(runtime.folderId)
+            ? [runtime.folderId]
+            : undefined,
+        });
+      }
+    }
+
     return Object.freeze({
       action: 'cleanup',
       status: 'archived',
       sourceCycle,
       targetCycle,
-      archivedCount: files.length,
+      archivedCount: formFiles.length + responseSheets.length,
     });
   }
 
@@ -2366,6 +2998,8 @@ export function createRolloverService({
     bootstrapStagingSource,
     prepare,
     activate,
+    syncResponses,
+    reconcileActive,
     verify,
     cleanup,
   });

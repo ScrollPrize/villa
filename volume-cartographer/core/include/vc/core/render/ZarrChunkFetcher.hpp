@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+namespace utils { class ZarrArray; }
+
 namespace vc::render {
 
 struct OpenedChunkedZarr {
@@ -47,5 +49,11 @@ std::unique_ptr<ChunkCache> createChunkCache(
     OpenedChunkedZarr opened,
     std::size_t decodedByteCapacity,
     std::size_t maxConcurrentReads = 16);
+
+// Wrap an already-open scalar 3D Zarr array in the same decoded cache and
+// process-wide threaded reader used by VC3D volume rendering.
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options = {});
 
 } // namespace vc::render

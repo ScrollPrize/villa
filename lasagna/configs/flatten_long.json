@@ -1,13 +1,14 @@
 {
 	"args": {
 		"model-init": "flatten",
-	    "flatten_solver": "forward"
+	    "flatten_solver": "forward",
+		"flatten_edge_step_global_scale": 100.0
 	},
 	"base": {
 		"flatten_sdir": 1.0,
-		"flatten_map_step": 0.1,
+		"flatten_edge_step": 1.0,
 		"flatten_avg_offset": 1.0,
-		"flatten_orient": 10.0
+		"flatten_orient": 2.0
 	},
 	"stages": [
 		{
@@ -19,7 +20,7 @@
 			"args": {
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,
@@ -40,7 +41,7 @@
 			"args": {
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,
@@ -61,7 +62,7 @@
 			"args": {
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": true,
 				"flatten_filter_angle_deg": 60.0,
 				"flatten_filter_radius": 2,

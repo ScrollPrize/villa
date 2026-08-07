@@ -9,6 +9,23 @@
 # in, keeping the test fast and self-contained.
 find_package(Qt6 REQUIRED COMPONENTS Core Test Widgets)
 
+add_executable(test_spiral_reload_comparison
+    test_spiral_reload_comparison.cpp)
+
+set_target_properties(test_spiral_reload_comparison PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_spiral_reload_comparison PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_reload_comparison PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
+vc_register_test_target(test_spiral_reload_comparison)
+vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
+
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)
@@ -27,7 +44,8 @@ target_link_libraries(test_seeding_batch_tracker PRIVATE
     Qt6::Test)
 
 add_test(NAME seeding_batch_tracker COMMAND test_seeding_batch_tracker)
-set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_seeding_batch_tracker)
+vc_register_test_target(test_seeding_batch_tracker)
+vc_register_ctest(seeding_batch_tracker test_seeding_batch_tracker)
 
 add_executable(test_fiber_save_batch_tracker
     test_fiber_save_batch_tracker.cpp
@@ -44,7 +62,8 @@ target_link_libraries(test_fiber_save_batch_tracker PRIVATE
     Qt6::Test)
 
 add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
-set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_fiber_save_batch_tracker)
+vc_register_test_target(test_fiber_save_batch_tracker)
+vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 
 add_executable(test_command_line_tool_runner
     test_command_line_tool_runner.cpp
@@ -67,6 +86,7 @@ target_link_libraries(test_command_line_tool_runner PRIVATE
     Qt6::Widgets)
 
 add_test(NAME command_line_tool_runner COMMAND test_command_line_tool_runner)
+vc_register_test_target(test_command_line_tool_runner)
+vc_register_ctest(command_line_tool_runner test_command_line_tool_runner)
 set_tests_properties(command_line_tool_runner PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
-set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_command_line_tool_runner)

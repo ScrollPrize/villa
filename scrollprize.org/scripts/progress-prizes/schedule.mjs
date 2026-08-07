@@ -13,9 +13,10 @@ import {
 
 export const SCHEDULE_CRONS = Object.freeze({
   PREPARE: '17 6 * * *',
+  SYNC_RESPONSES: '27 7 * * *',
   PRE_CUTOFF: '40 23 28-31 * *',
   EARLY_RECOVERY: '17 0 1 * *',
-  LATE_RECOVERY: '47 6 1 * *',
+  LATE_RECOVERY: '47 6 1-7 * *',
 });
 
 // Workflow-facing alias kept explicit so the public control contract reads as
@@ -26,6 +27,7 @@ export const SCHEDULE_OPERATIONS = Object.freeze({
   NONE: 'none',
   DRY_RUN: 'dry-run',
   PREPARE: 'prepare',
+  SYNC_RESPONSES: 'sync-responses',
   ACTIVATE: 'activate',
 });
 
@@ -35,6 +37,7 @@ export const SCHEDULE_REASONS = Object.freeze({
   SLOT_NOT_DUE: 'schedule-slot-not-due',
   MANUAL_DRY_RUN: 'manual-dry-run',
   PREPARATION: 'preparation-window',
+  RESPONSE_SYNC: 'response-sync',
   PRE_CUTOFF: 'pre-cutoff',
   EARLY_RECOVERY: 'early-recovery',
   LATE_RECOVERY: 'late-recovery',
@@ -69,12 +72,19 @@ function isFirstDay(parts) {
   return parts.day === 1;
 }
 
+function isLateRecoveryDay(parts) {
+  return parts.day >= 1 && parts.day <= 7;
+}
+
 function isLastDay(parts) {
   return parts.day === daysInMonth(parts.year, parts.month);
 }
 
 function cronWallTime(cron) {
   if (cron === SCHEDULE_CRONS.PREPARE) return Object.freeze({ hour: 6, minute: 17 });
+  if (cron === SCHEDULE_CRONS.SYNC_RESPONSES) {
+    return Object.freeze({ hour: 7, minute: 27 });
+  }
   if (cron === SCHEDULE_CRONS.PRE_CUTOFF) return Object.freeze({ hour: 23, minute: 40 });
   if (cron === SCHEDULE_CRONS.EARLY_RECOVERY) return Object.freeze({ hour: 0, minute: 17 });
   if (cron === SCHEDULE_CRONS.LATE_RECOVERY) return Object.freeze({ hour: 6, minute: 47 });
@@ -160,12 +170,22 @@ function dispatchPlan({
   });
 }
 
-function classifyObservedTime(observedAt, local) {
+function classifyObservedTime(observedAt, local, scheduledCron) {
   const localCycle = formatCycle(local.year, local.month);
 
-  // The whole first Pacific calendar day is reserved for bounded activation
-  // recovery. A run delayed into day two must never select the previous cycle.
-  if (isFirstDay(local)) {
+  const lateRecoveryOrigin = scheduledCron === SCHEDULE_CRONS.LATE_RECOVERY
+    ? scheduledOriginDate(observedAt, local, scheduledCron)
+    : undefined;
+  const delayedDaySevenRecovery = local.day === 8
+    && lateRecoveryOrigin !== undefined
+    && lateRecoveryOrigin.year === local.year
+    && lateRecoveryOrigin.month === local.month
+    && lateRecoveryOrigin.day === 7;
+
+  // The first seven Pacific calendar days are bounded recovery days for the
+  // previous month's rollover. A delayed day-seven 06:47 event may cross local
+  // midnight, but a true day-eight event must never select the previous cycle.
+  if (isLateRecoveryDay(local) || delayedDaySevenRecovery) {
     const sourceCycle = previousCycle(localCycle);
     const activationAt = getCycleDeadline(sourceCycle).cutoffAt;
     const lateRecoveryAt = pacificDateTimeToInstant({
@@ -234,7 +254,16 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
       || (isFirstDay(local) && isLastDay(previousCalendarDate(local)));
   }
   const origin = scheduledOriginDate(observedAt, local, scheduledCron);
-  return isFirstDay(origin) && isFirstDay(local);
+  if (scheduledCron === SCHEDULE_CRONS.EARLY_RECOVERY) {
+    return isFirstDay(origin) && isFirstDay(local);
+  }
+  return isLateRecoveryDay(origin)
+    && origin.year === local.year
+    && origin.month === local.month
+    && (
+      isLateRecoveryDay(local)
+      || (origin.day === 7 && local.day === 8)
+    );
 }
 
 /**
@@ -242,8 +271,9 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
  * instant and its trusted GitHub trigger context.
  *
  * Schedule slots are intentionally not interchangeable: only the daily 06:17
- * slot can prepare. The three activation slots may recover a delayed final-day
- * run during the first Pacific day, but never during day two.
+ * slot can prepare, and only the daily 07:27 slot can append responses. The
+ * pre-cutoff and 00:17 slots retain first-day recovery; the 06:47 slot retries
+ * the previous month's incomplete rollover on days 1–7.
  */
 export function planScheduleDispatch({
   now = new Date(),
@@ -276,7 +306,29 @@ export function planScheduleDispatch({
     });
   }
 
-  const classified = classifyObservedTime(observedAt, local);
+  // Response mirroring is deliberately independent of the preparation and
+  // activation windows. It targets the form that should be active for the
+  // observed Pacific month. Production workflow concurrency suppresses this
+  // dispatch while a rollover is nonterminal, and the Google operation fails
+  // closed if the website and form are not exactly active for this cycle.
+  if (trustedCron === SCHEDULE_CRONS.SYNC_RESPONSES) {
+    const sourceCycle = currentPacificCycle;
+    const targetCycle = nextCycle(sourceCycle);
+    const activationAt = getCycleDeadline(sourceCycle).cutoffAt;
+    return dispatchPlan({
+      operation: SCHEDULE_OPERATIONS.SYNC_RESPONSES,
+      reason: SCHEDULE_REASONS.RESPONSE_SYNC,
+      eventName,
+      scheduledCron: trustedCron,
+      observedAt,
+      sourceCycle,
+      targetCycle,
+      preparationOpensAt: subtractPacificCalendarDays(activationAt, PREPARATION_DAYS),
+      activationAt,
+    });
+  }
+
+  const classified = classifyObservedTime(observedAt, local, trustedCron);
 
   if (classified === undefined) {
     return noDispatch({
