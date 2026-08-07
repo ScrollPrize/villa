@@ -776,7 +776,7 @@ def test_runner_tees_inference_output_to_log_and_terminal(tmp_path, capfd):
     assert "progress\r42%" in capfd.readouterr().out
 
 
-def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monkeypatch):
+def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monkeypatch, capfd):
     run_dir = tmp_path / "detached"
     marker = run_dir / "prefetched"
     provenance = run_dir / "artifacts" / "inference.json"
@@ -793,6 +793,8 @@ def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monk
 
     def fake_prefetch(value):
         assert value == request
+        print("prefetch stdout progress", flush=True)
+        print("prefetch stderr progress", file=sys.stderr, flush=True)
         marker.write_text("ready", encoding="utf-8")
         return Path(value["destination"]) / str(value["scale"])
 
@@ -812,7 +814,13 @@ def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monk
     assert metadata["status"] == "completed"
     assert metadata["lifecycle"]["prefetch"] == "completed"
     assert metadata["prefetch"]["error"] is None
-    assert "prefetch completed" in (run_dir / "run.log").read_text()
+    log = (run_dir / "run.log").read_text()
+    assert "prefetch stdout progress" in log
+    assert "prefetch stderr progress" in log
+    assert "prefetch completed" in log
+    captured = capfd.readouterr()
+    assert "prefetch stdout progress" in captured.out
+    assert "prefetch stderr progress" in captured.err
 
 
 def test_runner_prefetch_failure_never_starts_inference(tmp_path, monkeypatch):

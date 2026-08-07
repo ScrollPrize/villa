@@ -18,6 +18,38 @@ class _RunInterrupted(BaseException):
     pass
 
 
+class _TeeText:
+    """Write authoritative output to a log and best-effort output to a pane."""
+
+    def __init__(self, log, pane) -> None:
+        self.log = log
+        self.pane = pane
+        self.encoding = getattr(pane, "encoding", None) or "utf-8"
+
+    def write(self, value: str) -> int:
+        written = self.log.write(value)
+        self.log.flush()
+        try:
+            self.pane.write(value)
+            self.pane.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        return written
+
+    def flush(self) -> None:
+        self.log.flush()
+        try:
+            self.pane.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def isatty(self) -> bool:
+        return bool(getattr(self.pane, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self.pane.fileno()
+
+
 def _load_completed_provenance(path: Path) -> tuple[list[object], str | None]:
     if not path.is_file():
         return [], f"portable provenance was not created: {path.name}"
@@ -63,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     command = command_record["resolved_argv"]
     prefetch_request = command_record.get("prefetch")
     log = (run_dir / "run.log").open("a", encoding="utf-8", buffering=1)
+    pane_stdout = _TeeText(log, sys.stdout)
+    pane_stderr = _TeeText(log, sys.stderr)
     interrupted = False
     child: subprocess.Popen[bytes] | None = None
 
@@ -96,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if prefetch_request is not None:
         try:
-            with redirect_stdout(log), redirect_stderr(log):
+            with redirect_stdout(pane_stdout), redirect_stderr(pane_stderr):
                 print("[las_manager] prefetch started", flush=True)
                 prefetched = execute_prefetch_request(prefetch_request)
                 print(f"[las_manager] prefetch completed: {prefetched}", flush=True)
@@ -108,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             log.close()
             return 128 + signal.SIGTERM
         except BaseException as error:
-            with redirect_stderr(log):
+            with redirect_stderr(pane_stderr):
                 print("[las_manager] prefetch failed", file=sys.stderr, flush=True)
                 traceback.print_exc()
             lifecycle["prefetch"] = "failed"
