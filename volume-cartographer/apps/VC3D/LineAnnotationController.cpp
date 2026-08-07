@@ -9395,28 +9395,15 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                 std::vector<cv::Vec3f> controlPoints;
                 for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
                     const fs::path candidate = volpkgRoot / name;
-                    if (!fs::exists(candidate)) {
-                        continue;
-                    }
-                    std::ifstream stream(candidate);
-                    const nlohmann::json parsed = nlohmann::json::parse(stream);
-                    for (const auto& entry : parsed.at("control_points")) {
-                        controlPoints.push_back({entry.at("x").get<float>(),
-                                                 entry.at("y").get<float>(),
-                                                 entry.at("z").get<float>()});
-                    }
-                    if (!controlPoints.empty()) {
+                    if (fs::exists(candidate)) {
+                        controlPoints =
+                            vc::core::util::Umbilicus::LoadControlPoints(candidate);
                         break;
                     }
                 }
 
-                // Stored umbilici may live in another volume's frame: the
-                // volpkg registration's fixed volume, reachable through
-                // transforms/transform.json (which maps session coordinates
-                // to that fixed frame, so its inverse places the umbilicus
-                // in the session frame). Decide by evidence which framing is
-                // right: score each candidate by how much of the session
-                // volume's z range it covers and take the best plausible one.
+                // Plausibility floor: once framed, an umbilicus should cover
+                // a sensible fraction of the session volume's z range.
                 const auto zCoverage = [&](const std::vector<cv::Vec3f>& points) {
                     float lo = std::numeric_limits<float>::infinity();
                     float hi = -std::numeric_limits<float>::infinity();
@@ -9430,30 +9417,50 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     return overlap > 0.0f ? overlap / slices : 0.0f;
                 };
                 constexpr float kMinPlausibleZCoverage = 0.25f;
+
                 if (!controlPoints.empty()) {
-                    std::vector<cv::Vec3f> best = controlPoints;
-                    float bestCoverage = zCoverage(controlPoints);
-                    const fs::path transformPath =
-                        volpkgRoot / "transforms" / "transform.json";
-                    if (fs::exists(transformPath)) {
-                        const cv::Matx44d toSession =
-                            vc::core::util::invertAffineTransformMatrix(
-                                vc::core::util::loadAffineTransformMatrix(
-                                    transformPath));
-                        std::vector<cv::Vec3f> transformed = controlPoints;
-                        for (auto& point : transformed) {
-                            point = vc::core::util::applyAffineTransform(
-                                point, toSession);
+                    // Stored umbilici live in the registration's fixed-volume
+                    // frame when the session volume carries a transform.json
+                    // (defined in native /0 coordinates, mapping session
+                    // coordinates to that fixed frame -- the same discovery
+                    // convention as SurfaceAffineTransformController, with
+                    // the volpkg-level transforms/ file as a fallback
+                    // location). Apply its inverse to place the umbilicus in
+                    // the session frame; on any transform problem or an
+                    // implausible result, fall back to the raw points rather
+                    // than discarding the umbilicus.
+                    std::optional<std::vector<cv::Vec3f>> framed;
+                    if (volume->baseScaleLevel() == 0) {
+                        fs::path transformPath = volume->path() / "transform.json";
+                        if (!fs::exists(transformPath)) {
+                            transformPath =
+                                volpkgRoot / "transforms" / "transform.json";
                         }
-                        const float coverage = zCoverage(transformed);
-                        if (coverage > bestCoverage) {
-                            best = std::move(transformed);
-                            bestCoverage = coverage;
+                        if (fs::exists(transformPath)) {
+                            try {
+                                const cv::Matx44d toSession =
+                                    vc::core::util::invertAffineTransformMatrix(
+                                        vc::core::util::loadAffineTransformMatrix(
+                                            transformPath));
+                                std::vector<cv::Vec3f> transformed = controlPoints;
+                                for (auto& point : transformed) {
+                                    point = vc::core::util::applyAffineTransform(
+                                        point, toSession);
+                                }
+                                if (zCoverage(transformed) >= kMinPlausibleZCoverage) {
+                                    framed = std::move(transformed);
+                                }
+                            } catch (...) {
+                            }
                         }
                     }
-                    if (bestCoverage >= kMinPlausibleZCoverage) {
+                    if (!framed &&
+                        zCoverage(controlPoints) >= kMinPlausibleZCoverage) {
+                        framed = std::move(controlPoints);
+                    }
+                    if (framed) {
                         _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
-                            std::move(best), volumeShape);
+                            std::move(*framed), volumeShape);
                     }
                 }
             }

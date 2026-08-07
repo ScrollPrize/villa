@@ -53,6 +53,11 @@ Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv:
     return Umbilicus(std::move(control_points), volume_shape);
 }
 
+std::vector<cv::Vec3f> Umbilicus::LoadControlPoints(const std::filesystem::path& path)
+{
+    return LoadFile(path);
+}
+
 const cv::Vec3i& Umbilicus::volume_shape() const noexcept
 {
     return volume_shape_;
@@ -269,8 +274,15 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
             throw std::runtime_error("'points' member in umbilicus json must be an array");
         }
         array = &candidate;
+    } else if (document.contains("control_points")) {
+        const auto& candidate = document.at("control_points");
+        if (!candidate.is_array()) {
+            throw std::runtime_error("'control_points' member in umbilicus json must be an array");
+        }
+        array = &candidate;
     } else {
-        throw std::runtime_error("Umbilicus json root must be an array or contain a 'points' array");
+        throw std::runtime_error(
+            "Umbilicus json root must be an array or contain a 'points' or 'control_points' array");
     }
 
     std::vector<cv::Vec3f> points;
