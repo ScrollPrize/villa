@@ -1128,11 +1128,6 @@ export function Landing() {
               <TeamGroup title="Tech Team" list={team.challenge} />
               <TeamGroup title="Papyrology Team" list={team.papyrology} />
               <TeamGroup title="Annotation Team" list={team.annotation} />
-              <TeamGroup
-                title="EduceLab Team (Partners)"
-                list={team.educe}
-                collapsible
-              />
               <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
               <TeamGroup
                 title="Papyrology Advisors"
@@ -1144,7 +1139,7 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
-            Partners — one monochrome logo row + EduceLab funders.
+            Partners — one monochrome logo row.
         ------------------------------------------------------------------ */}
         <section
           className="vc-section vc-section--last"
