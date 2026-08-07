@@ -310,11 +310,15 @@ private:
     cv::Vec3f interpolatedLinePoint(double linePosition) const;
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
+    // Interpolated sampled sheet normal (oriented away from the scroll
+    // center, see GeneratedViews::lineNormals). NaN when samples are missing.
+    cv::Vec3f interpolatedOrientedNormal(double linePosition) const;
+    // The same normal projected perpendicular to the tangent. NaN when the
+    // projection is unstable (normal nearly parallel to the tangent, i.e.
+    // extreme bends).
+    cv::Vec3f interpolatedLineNormal(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
-    bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition);
-    // Least-squares fit of the side-view plane orientation for the window centered on the given
-    // (integer) line index. Pure/cacheable: depends only on the static line geometry.
-    bool computeSideFit(int center, cv::Vec3f& normal, cv::Vec3f& upHint) const;
+    bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const;
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
@@ -417,21 +421,6 @@ private:
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
-    // Double-precision copy of _generatedViews.linePoints, built once when views are
-    // generated so the per-cursor-move side plane fit doesn't reconvert the whole polyline.
-    std::vector<cv::Vec3d> _linePointsd;
-    // Cached side-view best-fit plane orientations for the two integer window centers that
-    // straddle the current fractional position. The fit depends only on the (static) line
-    // geometry, so we recompute a center only when the straddling bracket shifts; between the
-    // two cached fits we interpolate by the fractional position so the side view re-orients
-    // continuously instead of snapping at discrete window centers.
-    struct SideFit {
-        int center = std::numeric_limits<int>::min();
-        cv::Vec3f normal{0.0f, 0.0f, 0.0f};
-        cv::Vec3f upHint{0.0f, 0.0f, 0.0f};
-        bool valid = false;
-    };
-    SideFit _sideFitBracket[2];
     bool _hasGeneratedViews = false;
     // Coalescing of the mouse-follow line-position updates onto a ~render-tick cadence.
     // requestCurrentLinePosition() stashes the latest position here and (re)arms the timer;
