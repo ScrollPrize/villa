@@ -479,7 +479,7 @@ If you want to contribute money to support our operational costs or to increase 
 
 ### I’m a journalist and I would like to interview someone from Vesuvius Challenge!
 
-Please email press@scrollprize.org.
+Please see our [Press page](/press).
 
 ### Do you have a scroll that looks like the Nintendo logo from GoldenEye N64?
 
