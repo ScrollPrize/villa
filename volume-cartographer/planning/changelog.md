@@ -2,6 +2,11 @@
 
 ## 2026-08-07
 
+- Made the synthetic rendering historical gate performance-only and one-sided.
+  Compiler, profiler, cache, workload, model, checksum, and other identity
+  changes remain diagnostic but cannot fail the reference comparison; only a
+  modeled score more than the configured tolerance slower than its case
+  reference fails.
 - Removed NumPy from the synthetic rendering gate's runtime path. Event-feature
   construction, per-thread cost scoring, and replay now run in the versioned
   C++ engine; standard-library Python only coordinates Valgrind and artifacts.

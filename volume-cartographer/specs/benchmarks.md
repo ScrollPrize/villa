@@ -133,21 +133,23 @@
   latency, and unit replay/dependency-excess scales. Process startup and native
   wall timing are excluded.
 - The relative modeled-runtime score is not a validated absolute runtime claim.
-  Each case must remain within the symmetric tolerance in its versioned
-  reference, initially 10% in either direction. CI may neither refit the model
-  nor rewrite references.
+  Each case may be at most the configured tolerance slower than its versioned
+  reference, initially 10%. Faster scores are accepted without a lower bound.
+  CI may neither refit the model nor rewrite references.
 - The checked reference's top-level `tolerance` is the sole normal CI source
-  for the symmetric acceptance width. Changing it is an explicit policy change
+  for the maximum accepted slowdown. Changing it is an explicit policy change
   independent of recalibrating the model or refreshing per-case scores.
-- Before comparing scores, CI must require exact model hash, checksum,
-  benchmark schema, compiler/version, architecture target, build type,
-  simulated cache geometry, fixture dimensions, repetitions, and worker count.
-  The reference and observed Valgrind versions must both be present and
-  recorded, but a version difference alone must not fail the gate; material
-  profiler changes are detected through the modeled-runtime tolerance. Paired
-  Callgrind and DRD artifacts from one run must use the same Valgrind version.
-  Parallel traces must have no unresolved happens-before edge or unmatched
-  blocking wait.
+- Historical reference acceptance must depend only on the case's finite,
+  positive modeled-runtime score and the one-sided slowdown tolerance. Model
+  hash, checksum, benchmark metadata, compiler/version, architecture target,
+  build type, simulated cache geometry, fixture dimensions, repetitions,
+  worker count, and profiler version are diagnostic-only and must not affect
+  reference pass/fail. The reference schema and case key remain required to
+  locate and interpret the score baseline.
+- Current-run artifact integrity remains mandatory. Paired Callgrind and DRD
+  artifacts must describe the same case and metadata and use the same Valgrind
+  version. Parallel traces must have no unresolved happens-before edge or
+  unmatched blocking wait.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,

@@ -1,6 +1,6 @@
 # Task
 
-Fix the synthetic rendering CI gate so it runs in the dependency container,
-which has no NumPy. Move deterministic event-feature and thread-cost scoring
-into the C++ replay engine; retain Python only for Valgrind orchestration and
-artifact parsing. Add a clean-Python/container dependency smoke check.
+Make the synthetic rendering CI reference gate test performance regression
+only. Reference-versus-observed compiler, profiler, cache, workload, model,
+checksum, and other identity changes must not fail the gate; retain them only
+as diagnostic output. Keep collection-time artifact consistency validation.

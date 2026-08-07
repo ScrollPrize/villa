@@ -13,15 +13,15 @@ Ninja to generate a fresh eight-case Valgrind graph:
 - complete DRD dependency graphs for the four parallel cases;
 - a relative modeled-runtime score and exact rendering checksum per case.
 
-Every score must remain within the symmetric tolerance stored in
-`core/test/data/render_valgrind_ci_reference.json`. This is a regression score,
-not estimated native wall time.
+Every score must stay at or below the reference plus the one-sided slowdown
+tolerance stored in `core/test/data/render_valgrind_ci_reference.json`. Faster
+scores pass. This is a regression score, not estimated native wall time.
 
 ## Running Locally
 
-The deterministic gate supports Linux amd64. Use the same compiler configuration
-recorded by the reference. The installed Valgrind version is recorded for
-diagnosis but is not pinned to the reference. Configure once:
+The deterministic gate supports Linux amd64. The CI configuration below is the
+normal local setup, but compiler and Valgrind versions are diagnostic metadata,
+not historical reference gates. Configure once:
 
 ```bash
 cmake -S volume-cartographer -B volume-cartographer/build/ci-render-benchmark \
@@ -66,15 +66,14 @@ Artifacts are under
 - `checked.json` after a passing comparison;
 - `checked.failed.json` after a failed comparison.
 
-Start failure diagnosis with `checked.failed.json`. A checksum failure is a
-rendering behavior change. An identity failure means compiler, model, cache,
-fixture, or repetition settings differ. The output records
+Start failure diagnosis with `checked.failed.json`. Historical compiler, model,
+checksum, cache, fixture, repetition, and profiler changes do not fail the
+reference gate. The output records
 `reference_valgrind_version`, `observed_valgrind_version`, and whether they
-changed. A profiler-version change alone is accepted; event-count or dependency
-changes still fail when they invalidate collection or move the modeled score
-outside tolerance. An incomplete DRD failure means the trace must be
-recollected. A score ratio outside the reported interval is a performance change
-requiring investigation or an intentional reference update.
+changed. Current-run artifact corruption or Callgrind/DRD inconsistency still
+fails because it prevents a valid score. An incomplete DRD failure means the
+trace must be recollected. A score above the allowed slowdown is a performance
+regression requiring investigation or an intentional reference update.
 
 ## CI Activation
 
@@ -180,8 +179,9 @@ sudo volume-cartographer/scripts/run_with_fixed_cpu_frequency.py restore
 trap - EXIT
 ```
 
-A model change changes its SHA-256 identity, so all eight references must then
-be refreshed. Never use renderer observations to fit these coefficients.
+A model change is recorded but does not fail by identity. Refresh all eight
+references only when an understood model change intentionally shifts the score
+baseline. Never use renderer observations to fit these coefficients.
 
 ## Refreshing Performance References
 
@@ -209,24 +209,23 @@ python3 volume-cartographer/scripts/run_render_valgrind_ci.py freeze-reference \
 cmake --build "$build" --target render_valgrind_ci --parallel "$jobs"
 ```
 
-The freeze command requires exactly all eight cases and records checksum,
-environment/workload identity, score, model hash, and tolerance. Review every
-old/new score ratio. Run a second fresh collection before accepting references
-when parallel DRD replay variation is close to the chosen tolerance.
+The freeze command requires exactly all eight cases and records score,
+checksum, environment/workload identity, model hash, and tolerance. Only score
+and tolerance affect historical pass/fail; the remaining fields are diagnostic.
+Review every old/new score ratio. Run a second fresh collection before accepting
+references when parallel DRD replay variation is close to the chosen tolerance.
 
 ## Tightening Or Loosening Tolerance
 
 Tolerance is a fraction in `[0, 1)` stored once at the top level of
-`render_valgrind_ci_reference.json`. The default `0.10` accepts ratios from
-`0.90` through `1.10`:
+`render_valgrind_ci_reference.json`. The default `0.10` accepts any finite,
+positive ratio at or below `1.10`:
 
-- lowering it to `0.05` tightens the gate to `[0.95, 1.05]`;
-- raising it to `0.15` loosens the gate to `[0.85, 1.15]`.
+- lowering it to `0.05` tightens the maximum accepted ratio to `1.05`;
+- raising it to `0.15` loosens the maximum accepted ratio to `1.15`.
 
-Both unexpected slowdowns and speedups fail because either can indicate changed
-work or a broken benchmark. A tolerance-only change must leave all eight scores,
-checksums, identities, and the model hash unchanged. Use the atomic policy-only
-command:
+Speedups do not fail the reference gate. A tolerance-only change must leave all
+eight scores and diagnostic fields unchanged. Use the atomic policy-only command:
 
 ```bash
 python3 volume-cartographer/scripts/run_render_valgrind_ci.py set-tolerance \
@@ -253,5 +252,6 @@ cmake --build volume-cartographer/build/ci-render-benchmark \
 git diff --check
 ```
 
-Model changes require fresh references. Reference-score changes require fresh
-collection. Tolerance-only changes require an otherwise unchanged reference.
+Reference-score changes require fresh collection. Model changes require fresh
+references only when their intended score shift should become the new baseline.
+Tolerance-only changes require an otherwise unchanged reference.

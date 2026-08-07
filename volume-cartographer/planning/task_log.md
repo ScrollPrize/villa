@@ -2,54 +2,40 @@
 
 ## Findings
 
-- GitHub Actions reached the matrix after the Valgrind-version fix, then every
-  collector failed while importing `passive_event_model.py` because the pinned
-  dependency image has no NumPy.
-- Local validation used the host Python environment, where NumPy was installed,
-  and therefore did not cover the actual container dependency surface.
-- Dependency replay is native C++, but per-thread event feature extraction and
-  cost calculation were still performed by the NumPy calibration helper before
-  costs were sent to the native engine.
-- `run_render_valgrind_ci.py` also imports DRD parsing from
-  `run_thread_sync_replay.py`, whose top-level calibration imports pull in
-  NumPy even before a command runs.
-- The local Docker socket is not accessible to this user, so exact pinned-image
-  execution requires either another rootless runtime or a GitHub Actions run.
+- The uploaded GitHub Actions artifact used GCC 15.2.0 and Valgrind 3.26.0,
+  while the historical reference recorded GCC 15.3.0 and Valgrind 3.25.1.
+- The renderer checksum was unchanged and the failing
+  `parallel/fallback_3` modeled score was only 0.97% above its reference, but
+  exact historical identity comparison failed before the 10% performance gate.
+- The current reference check also rejects model-hash and checksum changes,
+  making it broader than the requested performance-only regression check.
 
 ## Decisions
 
-- Do not install NumPy in the CI workflow.
-- Move runtime event-cost calculation into the existing shared C++ replay
-  implementation and expose it through the persistent protocol.
-- Lazy-load calibration-only Python dependencies.
-- Add a `python3 -S` smoke check to prevent undeclared site-package imports.
+- Historical reference comparison will gate only the modeled-runtime score.
+- Identity, model, checksum, and workload fields remain in artifacts for
+  diagnosis but will not affect pass/fail.
+- Same-run artifact integrity and Callgrind/DRD consistency checks remain;
+  removing them would allow malformed inputs to produce meaningless scores.
 
 ## Plan Review
 
-- The resulting gate has native model computation and replay, not literally
-  zero Python; Python remains a standard-library coordinator.
-- Extract the DRD parser structurally instead of relying only on lazy imports.
-- Bump the native protocol for the scoring command.
-- Define and test overflow safety, deterministic accumulation, finite input,
-  malformed profile/model rejection, and tight parity with the prior model.
-- Exercise parser and real native scoring under `python3 -S`; the full workflow
-  matrix remains the end-to-end test of all three commands.
+- Make the performance gate one-sided so improvements never fail.
+- Treat schema validation and case lookup as structural requirements for
+  reading the baseline, not as historical workload-identity gates.
+- Preserve profiler-version diagnostics without validating historical values.
+- Reject non-finite or non-positive scores before calculating the ratio.
 
 ## Validation
 
-- Configured a clean Release benchmark build with the workflow's GCC 15
-  toolchain and `VC_MARCH_NATIVE=OFF`, then built the benchmark, replay engine,
-  and native replay tests with 32 jobs.
-- Five focused CTests passed: fixture, native replay, CI driver, no-site import
-  and scoring, and replay-model compatibility.
-- The no-site test runs with `python3 -S`, imports the complete CI driver and
-  dependency-free DRD parser, and performs a real event-cost request against
-  the C++ replay process.
-- The complete fresh eight-case Callgrind/DRD gate passed. Serial ratios were
-  exactly 1.000; parallel ratios were 1.000, 1.006, 0.995, and 1.033.
-- All 102 benchmark Python unit tests passed with one expected skip.
-- Ruff formatting and lint, Clang formatting, workflow YAML parsing, and
-  `git diff --check` passed.
-- A direct pinned-container attempt could not access this session's Docker
-  daemon socket. The repository was therefore not claimed as container-tested;
-  the next GitHub Actions execution remains the exact-image confirmation.
+- All 19 focused `run_render_valgrind_ci` unit tests pass.
+- The `python3 -S` dependency-free scoring smoke test passes against the
+  existing GCC 15 native replay binary.
+- Re-evaluated every completed evaluation in the uploaded GitHub Actions
+  artifact. All six available cases pass, including the formerly failing
+  `parallel/fallback_3` case at 1.009663x reference. The two remaining parallel
+  evaluations were not produced because Ninja stopped after the original gate
+  failure; the next CI run remains the full eight-case confirmation.
+- Ruff check passes for the touched Python files when ignoring the branch's
+  pre-existing `EXE001` file-mode findings and existing `SIM117` nested-context
+  finding. Ruff format and `git diff --check` pass.

@@ -87,23 +87,23 @@ class RenderValgrindCiTest(unittest.TestCase):
         self.assertIn("--scheduling-quantum=10000", command)
         self.assertNotIn("--callgrind", command)
 
-    def test_reference_gate_accepts_both_ten_percent_bounds(self):
-        for score in (90.0, 110.0):
+    def test_reference_gate_accepts_improvements_and_upper_tolerance_bound(self):
+        for score in (0.01, 50.0, 90.0, 110.0):
             result = copy.deepcopy(self.result)
             result["modeled_runtime_score_ns"] = score
             DRIVER.check_reference(result, self.reference, 0.10)
 
     def test_reference_tolerance_is_authoritative_by_default(self):
         self.reference["tolerance"] = 0.05
-        self.result["modeled_runtime_score_ns"] = 94.9
+        self.result["modeled_runtime_score_ns"] = 105.1
         with self.assertRaisesRegex(RuntimeError, "required"):
             DRIVER.check_reference(self.result, self.reference)
-        self.result["modeled_runtime_score_ns"] = 95.0
+        self.result["modeled_runtime_score_ns"] = 105.0
         DRIVER.check_reference(self.result, self.reference)
 
     def test_explicit_diagnostic_tolerance_can_override_reference(self):
         self.reference["tolerance"] = 0.05
-        self.result["modeled_runtime_score_ns"] = 94.0
+        self.result["modeled_runtime_score_ns"] = 106.0
         DRIVER.check_reference(self.result, self.reference, 0.10)
 
     def test_invalid_tolerances_are_rejected(self):
@@ -112,25 +112,29 @@ class RenderValgrindCiTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "tolerance"):
                     DRIVER.validate_tolerance(tolerance)
 
-    def test_reference_gate_rejects_below_lower_bound(self):
-        self.result["modeled_runtime_score_ns"] = 89.9
-        with self.assertRaisesRegex(RuntimeError, "required"):
-            DRIVER.check_reference(self.result, self.reference, 0.10)
-
     def test_reference_gate_rejects_above_upper_bound(self):
         self.result["modeled_runtime_score_ns"] = 110.1
         with self.assertRaisesRegex(RuntimeError, "required"):
             DRIVER.check_reference(self.result, self.reference, 0.10)
 
-    def test_reference_gate_rejects_model_and_environment_changes(self):
-        changed_model = copy.deepcopy(self.result)
-        changed_model["model_sha256"] = "other"
-        with self.assertRaisesRegex(RuntimeError, "model hash"):
-            DRIVER.check_reference(changed_model, self.reference, 0.10)
-        changed_environment = copy.deepcopy(self.result)
-        changed_environment["identity"]["compiler_version"] = "15.0"
-        with self.assertRaisesRegex(RuntimeError, "environment"):
-            DRIVER.check_reference(changed_environment, self.reference, 0.10)
+    def test_reference_gate_ignores_all_non_performance_changes(self):
+        result = copy.deepcopy(self.result)
+        reference = copy.deepcopy(self.reference)
+        result["model_sha256"] = "different-model"
+        result["checksum"] = 999
+        result["identity"] = {
+            "compiler_id": "DifferentCompiler",
+            "fixture": "changed-fixture",
+            "valgrind_version": "changed-profiler",
+        }
+        reference["model_sha256"] = "historical-model"
+        reference["cases"]["serial/full_res"]["checksum"] = 456
+        reference["cases"]["serial/full_res"]["identity"] = {
+            "compiler_id": "HistoricalCompiler",
+            "fixture": "historical-fixture",
+            "valgrind_version": "historical-profiler",
+        }
+        DRIVER.check_reference(result, reference, 0.10)
 
     def test_reference_gate_accepts_valgrind_change_and_records_versions(self):
         result = copy.deepcopy(self.result)
@@ -152,19 +156,15 @@ class RenderValgrindCiTest(unittest.TestCase):
         self.assertEqual(result["observed_valgrind_version"], "valgrind-3.26.0")
         self.assertTrue(result["valgrind_version_changed"])
 
-    def test_reference_gate_requires_valgrind_metadata(self):
-        for source in ("reference", "observed"):
-            with self.subTest(source=source):
-                result = copy.deepcopy(self.result)
-                reference = copy.deepcopy(self.reference)
-                identity = (
-                    reference["cases"]["serial/full_res"]["identity"]
-                    if source == "reference"
-                    else result["identity"]
-                )
-                identity["valgrind_version"] = ""
-                with self.assertRaisesRegex(RuntimeError, "Valgrind version"):
-                    DRIVER.check_reference(result, reference, 0.10)
+    def test_reference_gate_does_not_require_identity_metadata(self):
+        result = copy.deepcopy(self.result)
+        reference = copy.deepcopy(self.reference)
+        result.pop("identity")
+        reference["cases"]["serial/full_res"].pop("identity")
+        DRIVER.check_reference(result, reference, 0.10)
+        self.assertIsNone(result["reference_valgrind_version"])
+        self.assertIsNone(result["observed_valgrind_version"])
+        self.assertFalse(result["valgrind_version_changed"])
 
     def test_pair_requires_matching_valgrind_versions(self):
         callgrind = {
@@ -187,10 +187,34 @@ class RenderValgrindCiTest(unittest.TestCase):
         ):
             DRIVER._validate_pair(callgrind, drd)
 
-    def test_reference_gate_checks_exact_checksum(self):
-        self.result["checksum"] = 124
-        with self.assertRaisesRegex(RuntimeError, "checksum"):
+    def test_reference_gate_rejects_missing_case(self):
+        self.result["case"] = "serial/new_case"
+        with self.assertRaisesRegex(RuntimeError, "reference has no case"):
             DRIVER.check_reference(self.result, self.reference, 0.10)
+
+    def test_reference_gate_rejects_invalid_scores(self):
+        invalid = (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0.0,
+            -1.0,
+            "not-a-score",
+            None,
+        )
+        for source in ("observed", "reference"):
+            for score in invalid:
+                with self.subTest(source=source, score=score):
+                    result = copy.deepcopy(self.result)
+                    reference = copy.deepcopy(self.reference)
+                    if source == "observed":
+                        result["modeled_runtime_score_ns"] = score
+                    else:
+                        reference["cases"]["serial/full_res"][
+                            "modeled_runtime_score_ns"
+                        ] = score
+                    with self.assertRaisesRegex(RuntimeError, "finite and positive"):
+                        DRIVER.check_reference(result, reference, 0.10)
 
     def test_trace_completeness_requires_all_dependencies(self):
         complete = SimpleNamespace(

@@ -1,12 +1,9 @@
 # Status
 
-- [x] Identify the container-only NumPy import failure.
-- [x] Trace the Python scoring and C++ replay boundary.
-- [x] Write the implementation and validation plan.
+- [x] Diagnose the CI failure from the uploaded Actions artifact.
+- [x] Write the performance-only reference-gate plan.
 - [x] Complete independent plan review.
-- [x] Implement native event-cost scoring and protocol support.
-- [x] Remove NumPy from the CI runtime import path.
-- [x] Add clean-environment and native parity tests.
+- [x] Update the reference gate and regression tests.
 - [x] Update specification and documentation.
-- [x] Run full validation and inspect the final diff.
+- [x] Re-evaluate the CI artifact and run focused validation.
 - [x] Update task log and changelog.
