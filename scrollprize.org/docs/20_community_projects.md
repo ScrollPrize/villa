@@ -85,6 +85,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
+- [CT support masking for surface predictions](https://github.com/ScrollPrize/villa/pull/1156) by BuraChuhadar. Adds opt-in support masking to standalone and fused finalization plus a repair CLI for existing Zarr surface predictions, preventing positive halos outside usable CT data. On four selected public PHerc0332 and PHerc1451 planes, 59.94%-68.10% of all positive voxels were outside the selected CT support and were removed; zero outside-support positives remained, and all supported values were preserved.
+
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
 - [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).

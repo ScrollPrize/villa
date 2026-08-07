@@ -4,7 +4,36 @@ import zarr
 import os
 from typing import Union, Dict, Any, Optional, Tuple
 
-_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
+def _normalize_zarr_creation_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Zarr 3 creation keywords for a Zarr 2 runtime."""
+    normalized = dict(kwargs)
+    if int(zarr.__version__.split('.', 1)[0]) >= 3:
+        return normalized
+
+    zarr_format = normalized.pop('zarr_format', None)
+    if zarr_format not in (None, 2):
+        raise ValueError(
+            f"zarr-python 2 cannot create Zarr format {zarr_format}"
+        )
+    if zarr_format == 2:
+        normalized.setdefault('zarr_version', 2)
+
+    config = normalized.pop('config', None)
+    if config is not None:
+        if not isinstance(config, dict):
+            raise TypeError("Zarr 2 compatibility requires config to be a dict")
+        config = dict(config)
+        if 'write_empty_chunks' in config:
+            normalized['write_empty_chunks'] = config.pop('write_empty_chunks')
+        if config:
+            unsupported = ', '.join(sorted(config))
+            raise TypeError(
+                f"Zarr 2 does not support array config options: {unsupported}"
+            )
+
+    return normalized
+
 
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
@@ -67,7 +96,7 @@ def open_zarr(path: str, mode: str = 'r',
         the numcodecs compressors used throughout this package (and the logits stores
         blend_logits validates) are v2 constructs: zarr 3 raises for `compressor=` on
         a v3 array. Pass None to accept zarr's own default. Ignored when the
-        installed zarr is 2.x, which only writes v2 and does not accept the argument.
+        installed zarr is 2.x, where it is translated to ``zarr_version``.
     **kwargs : Additional parameters passed to zarr.open
         
     Returns:
@@ -143,14 +172,14 @@ def open_zarr(path: str, mode: str = 'r',
             create_kwargs['fill_value'] = fill_value
         if order is not None:
             create_kwargs['order'] = order
-        # zarr 2 has no zarr_format argument: it warns "ignoring keyword
-        # argument 'zarr_format'" for every array and writes v2 regardless,
-        # which is already what this default asks for. Only zarr 3 needs telling.
-        if zarr_format is not None and _ZARR_V3:
+        # Zarr 2 calls this keyword zarr_version. Normalize below before the
+        # call so either supported runtime receives its native spelling.
+        if zarr_format is not None:
             create_kwargs['zarr_format'] = zarr_format
 
         # Add any other kwargs
         create_kwargs.update(kwargs)
+        create_kwargs = _normalize_zarr_creation_kwargs(create_kwargs)
 
         # zarr 3 derives `overwrite` from the mode, so passing it alongside
         # mode='w' raises "got multiple values for keyword argument 'overwrite'".
@@ -160,7 +189,6 @@ def open_zarr(path: str, mode: str = 'r',
             raise ValueError(
                 "open_zarr(mode='w') always truncates; overwrite=False is contradictory"
             )
-
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
