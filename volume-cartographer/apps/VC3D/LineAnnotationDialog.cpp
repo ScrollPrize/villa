@@ -508,7 +508,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // the main window's.
     auto* annotationMenuButton = new QToolButton(buttonRow);
     annotationMenuButton->setObjectName(QStringLiteral("lineAnnotationMenuButton"));
-    annotationMenuButton->setText(tr("Annotation"));
+    annotationMenuButton->setText(tr("Actions"));
     annotationMenuButton->setPopupMode(QToolButton::InstantPopup);
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);

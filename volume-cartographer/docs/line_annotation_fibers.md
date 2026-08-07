@@ -49,8 +49,8 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
-The Annotation popup owns Auto-reoptimize, Reinit reoptimization, and Show as
-mesh. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
+The Actions popup owns Auto-reoptimize, Reinit reoptimization, Show as mesh,
+and Reset views. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
 base-voxel extrapolation-distance control. Tag pills are edited directly from
 the same toolbar.
 
