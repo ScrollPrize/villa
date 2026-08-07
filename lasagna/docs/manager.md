@@ -251,6 +251,7 @@ Configure a local Atlas checkout and private staging prefix:
 ```toml
 atlas_dir = "/home/me/vesuvius-atlas"
 upload_staging_s3 = "s3://private-staging/my-inferences"
+rclone_params = ["--s3-provider", "AWS", "--s3-env-auth", "--transfers", "512", "--buffer-size", "2M", "--size-only", "--fast-list", "-P", "--stats-one-line"]
 ```
 
 Validate or upload a completed Fiber or Lasagna run:
@@ -277,10 +278,15 @@ outside a Git checkout may supply `VILLA_CODE_COMMIT` and otherwise record
 `null`.
 
 Upload hashes files while reading them, writes `_INCOMPLETE` at the final
-run-UUID prefix, uploads the bundle, writes and verifies
+run-UUID prefix, bulk-copies the fixed file inventory with `rclone`, then writes and verifies
 `upload-manifest.json` last, and removes the marker as the commit. Retry reads
 that manifest without recursively listing a remote Zarr and refuses a
 same-UUID/different-content collision.
+
+`rclone_params` is passed verbatim to `rclone copy`; edit the array to tune
+transfer concurrency, buffering, progress output, or S3 authentication for the
+host. The default is optimized for many small Zarr objects and requires
+`rclone` on `PATH` plus AWS credentials in the environment.
 
 Atlas ingests both Fiber and Lasagna output as the existing copy-first
 `lasagna` entry with identity `(volume, model, input level)`. Portable

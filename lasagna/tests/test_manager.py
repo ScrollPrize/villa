@@ -86,6 +86,11 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
         "--tile-size", "512", "--border", "32", "--overlap", "96",
         "--devices", "all",
     )
+    assert loaded.rclone_params == (
+        "--s3-provider", "AWS", "--s3-env-auth", "--transfers", "512",
+        "--buffer-size", "2M", "--size-only", "--fast-list", "-P",
+        "--stats-one-line",
+    )
     with pytest.raises(FileExistsError):
         initialize_config()
 
@@ -104,6 +109,13 @@ def test_config_params_are_string_array(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('params = ["--devices", 8]\n', encoding="utf-8")
     with pytest.raises(ValueError, match="params must be an array of strings"):
+        load_config(path)
+
+
+def test_config_rclone_params_are_string_array(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('rclone_params = ["--transfers", 512]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="rclone_params must be an array of strings"):
         load_config(path)
 
 

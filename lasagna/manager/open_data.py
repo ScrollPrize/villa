@@ -7,6 +7,8 @@ import importlib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
+import tempfile
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlparse
 
@@ -57,7 +59,13 @@ class UploadPlan:
 
 
 class S3ObjectStore:
-    def __init__(self, bucket: str, *, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        client: Any | None = None,
+        rclone_params: Iterable[str] = (),
+    ) -> None:
         if client is None:
             try:
                 import boto3
@@ -66,9 +74,25 @@ class S3ObjectStore:
             client = boto3.client("s3")
         self.bucket = bucket
         self.client = client
+        self.rclone_params = tuple(rclone_params)
 
     def put_file(self, key: str, path: Path) -> None:
         self.client.upload_file(str(path), self.bucket, key)
+
+    def put_files(self, prefix: str, bundle: Path, files: Iterable[dict[str, Any]]) -> None:
+        """Upload a fixed bundle inventory concurrently with rclone."""
+        paths = tuple(str(entry["path"]) for entry in files)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as file_list:
+            file_list.write("\n".join(paths))
+            file_list.write("\n")
+            file_list.flush()
+            destination = f":s3:{self.bucket}/{prefix.strip('/')}/"
+            command = [
+                "rclone", "copy", str(bundle), destination,
+                *self.rclone_params,
+                "--files-from-raw", file_list.name,
+            ]
+            subprocess.run(command, check=True)
 
     def put_bytes(self, key: str, value: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=value)
@@ -254,8 +278,12 @@ def stage_upload(plan: UploadPlan, store: ObjectStore) -> tuple[str, bool]:
 
     marker_key = _key(plan, INCOMPLETE_MARKER)
     store.put_bytes(marker_key, b"")
-    for entry in plan.files:
-        store.put_file(_key(plan, entry["path"]), plan.bundle_dir / entry["path"])
+    bulk_put = getattr(store, "put_files", None)
+    if callable(bulk_put):
+        bulk_put(plan.prefix, plan.bundle_dir, plan.files)
+    else:
+        for entry in plan.files:
+            store.put_file(_key(plan, entry["path"]), plan.bundle_dir / entry["path"])
     manifest_raw = (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode()
     store.put_bytes(manifest_key, manifest_raw)
     committed = store.get_bytes(manifest_key)
@@ -307,7 +335,13 @@ def upload_inference(
     record["updated_at"] = utc_now()
     atomic_json(record_path, record)
     try:
-        staging_url, uploaded = stage_upload(plan, store or S3ObjectStore(plan.bucket))
+        staging_url, uploaded = stage_upload(
+            plan,
+            store or S3ObjectStore(
+                plan.bucket,
+                rclone_params=config.rclone_params,
+            ),
+        )
         lifecycle["staging_upload"] = "completed"
         record["upload"] = {
             "staging_url": staging_url,

@@ -16,6 +16,16 @@ DEFAULT_INFERENCE_PARAMS = (
     "--tile-size", "512", "--border", "32", "--overlap", "96",
     "--devices", "all",
 )
+DEFAULT_RCLONE_PARAMS = (
+    "--s3-provider", "AWS",
+    "--s3-env-auth",
+    "--transfers", "512",
+    "--buffer-size", "2M",
+    "--size-only",
+    "--fast-list",
+    "-P",
+    "--stats-one-line",
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +40,7 @@ class ManagerConfig:
     upload_staging_s3: str = ""
     catalog_max_age_seconds: int = 3600
     params: tuple[str, ...] = DEFAULT_INFERENCE_PARAMS
+    rclone_params: tuple[str, ...] = DEFAULT_RCLONE_PARAMS
 
     def resolved_path(self, name: str, *, required: bool = False) -> Path | None:
         if name not in {"cache_dir", "output_dir", "venv", "atlas_dir"}:
@@ -65,7 +76,7 @@ def _validate(raw: dict[str, Any]) -> ManagerConfig:
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
-    for array_name in ("snapshot_dirs", "params"):
+    for array_name in ("snapshot_dirs", "params", "rclone_params"):
         if array_name not in raw:
             continue
         values = raw[array_name]
@@ -94,6 +105,7 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
     values = asdict(config)
     snapshots = ", ".join(_toml_string(v) for v in values.pop("snapshot_dirs"))
     params = ", ".join(_toml_string(v) for v in values.pop("params"))
+    rclone_params = ", ".join(_toml_string(v) for v in values.pop("rclone_params"))
     lines = [
         "# las_manager global configuration",
         "# Paths may contain ~ or environment variables; relative paths use this file's directory.",
@@ -108,6 +120,8 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
         f"catalog_max_age_seconds = {values['catalog_max_age_seconds']}",
         "# Default backend arguments; arguments after `inference run ... --` override these.",
         f"params = [{params}]",
+        "# Bulk staging-upload arguments passed to `rclone copy`.",
+        f"rclone_params = [{rclone_params}]",
         "",
     ]
     return "\n".join(lines)

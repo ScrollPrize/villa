@@ -8,6 +8,7 @@ import pytest
 from lasagna.manager.config import ManagerConfig
 from lasagna.manager.open_data import (
     INCOMPLETE_MARKER,
+    S3ObjectStore,
     UPLOAD_MANIFEST,
     stage_upload,
     upload_inference,
@@ -37,6 +38,41 @@ class FakeStore:
     def delete(self, key: str) -> None:
         self.events.append(("delete", key))
         self.objects.pop(key, None)
+
+
+class FakeS3Client:
+    def upload_file(self, *_args) -> None:
+        raise AssertionError("bulk upload must use rclone")
+
+
+def test_s3_bulk_upload_uses_configured_rclone_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "a").write_bytes(b"a")
+    (bundle / "nested").mkdir()
+    (bundle / "nested" / "b").write_bytes(b"b")
+    calls = []
+
+    def fake_run(command, *, check):
+        file_list = Path(command[command.index("--files-from-raw") + 1])
+        calls.append((command, check, file_list.read_text(encoding="utf-8")))
+
+    monkeypatch.setattr("lasagna.manager.open_data.subprocess.run", fake_run)
+    store = S3ObjectStore(
+        "stage", client=FakeS3Client(),
+        rclone_params=("--transfers", "512", "--buffer-size", "2M"),
+    )
+    store.put_files(
+        "root/inference/run", bundle,
+        ({"path": "a"}, {"path": "nested/b"}),
+    )
+    command, check, file_list = calls[0]
+    assert command[:4] == ["rclone", "copy", str(bundle), ":s3:stage/root/inference/run/"]
+    assert command[4:8] == ["--transfers", "512", "--buffer-size", "2M"]
+    assert check is True
+    assert file_list == "a\nnested/b\n"
 
 
 def _snapshot_record(path: Path, sha256: str) -> SnapshotRecord:
