@@ -518,24 +518,6 @@
   }
 }
 
-/* At >=768px the footer collapses into one row with its link list flush
-   against the container's right edge (chrome.css §12), which is exactly
-   where the trigger floats. --ifm-container-width is pinned to 1080px
-   (chrome.css), so on common desktop widths the container has little to no
-   natural side margin — reserve room explicitly so the last link is never
-   rendered underneath the trigger. Sized to each breakpoint's trigger
-   footprint (icon + label + padding + its own right offset) with margin. */
-@media (min-width: 768px) and (max-width: 996px) {
-  .footer .container {
-    padding-right: calc(140px + env(safe-area-inset-right));
-  }
-}
-@media (min-width: 997px) {
-  .footer .container {
-    padding-right: calc(260px + env(safe-area-inset-right));
-  }
-}
-
 /* ==========================================================================
    §11 Virtual Philodemus identity (avatar chip, header subtitle, trigger label)
    ========================================================================== */
