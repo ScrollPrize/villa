@@ -18,6 +18,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -9391,12 +9392,68 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                 const cv::Vec3i volumeShape{volume->numSlices(),
                                             volume->sliceHeight(),
                                             volume->sliceWidth()};
+                std::vector<cv::Vec3f> controlPoints;
                 for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
                     const fs::path candidate = volpkgRoot / name;
-                    if (fs::exists(candidate)) {
-                        _scrollUmbilicus =
-                            vc::core::util::Umbilicus::FromFile(candidate, volumeShape);
+                    if (!fs::exists(candidate)) {
+                        continue;
+                    }
+                    std::ifstream stream(candidate);
+                    const nlohmann::json parsed = nlohmann::json::parse(stream);
+                    for (const auto& entry : parsed.at("control_points")) {
+                        controlPoints.push_back({entry.at("x").get<float>(),
+                                                 entry.at("y").get<float>(),
+                                                 entry.at("z").get<float>()});
+                    }
+                    if (!controlPoints.empty()) {
                         break;
+                    }
+                }
+
+                // Stored umbilici may live in another volume's frame: the
+                // volpkg registration's fixed volume, reachable through
+                // transforms/transform.json (which maps session coordinates
+                // to that fixed frame, so its inverse places the umbilicus
+                // in the session frame). Decide by evidence which framing is
+                // right: score each candidate by how much of the session
+                // volume's z range it covers and take the best plausible one.
+                const auto zCoverage = [&](const std::vector<cv::Vec3f>& points) {
+                    float lo = std::numeric_limits<float>::infinity();
+                    float hi = -std::numeric_limits<float>::infinity();
+                    for (const auto& point : points) {
+                        lo = std::min(lo, point[2]);
+                        hi = std::max(hi, point[2]);
+                    }
+                    const float slices = static_cast<float>(volume->numSlices());
+                    const float overlap =
+                        std::min(hi, slices) - std::max(lo, 0.0f);
+                    return overlap > 0.0f ? overlap / slices : 0.0f;
+                };
+                constexpr float kMinPlausibleZCoverage = 0.25f;
+                if (!controlPoints.empty()) {
+                    std::vector<cv::Vec3f> best = controlPoints;
+                    float bestCoverage = zCoverage(controlPoints);
+                    const fs::path transformPath =
+                        volpkgRoot / "transforms" / "transform.json";
+                    if (fs::exists(transformPath)) {
+                        const cv::Matx44d toSession =
+                            vc::core::util::invertAffineTransformMatrix(
+                                vc::core::util::loadAffineTransformMatrix(
+                                    transformPath));
+                        std::vector<cv::Vec3f> transformed = controlPoints;
+                        for (auto& point : transformed) {
+                            point = vc::core::util::applyAffineTransform(
+                                point, toSession);
+                        }
+                        const float coverage = zCoverage(transformed);
+                        if (coverage > bestCoverage) {
+                            best = std::move(transformed);
+                            bestCoverage = coverage;
+                        }
+                    }
+                    if (bestCoverage >= kMinPlausibleZCoverage) {
+                        _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
+                            std::move(best), volumeShape);
                     }
                 }
             }
@@ -9435,8 +9492,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     // noisy or imperfect center reference cannot flip individual stretches.
     // The reference only needs to get the hemisphere right on balance; its z
     // component is zeroed because orientation is radial-only (z is the
-    // scroll axis) and because stored umbilicus files may live in another
-    // volume's coordinate frame, where the z term is meaningless.
+    // scroll axis).
     // Sign convention: normals point away from the scroll center. The dialog
     // uses them directly as the cut view's up hint, and the viewer's scene y
     // renders downward, so this puts the fiber's center-facing surface at
@@ -9463,8 +9519,17 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         if (!std::isfinite(towardCenter[0])) {
             continue;
         }
+        // Cosine-weighted vote: normalize the reference so each point's
+        // influence reflects only how well its normal aligns with the radial
+        // direction, not its distance from the center -- a few large-radius
+        // points must not outvote the rest of the line.
         towardCenter[2] = 0.0f;
-        awayScore -= static_cast<double>(normals[index].dot(towardCenter));
+        const float towardNorm = cv::norm(towardCenter);
+        if (!(towardNorm > 1.0e-3f)) {
+            continue;
+        }
+        awayScore -= static_cast<double>(
+            normals[index].dot(towardCenter) / towardNorm);
     }
     if (awayScore < 0.0) {
         for (cv::Vec3f& normal : normals) {
