@@ -508,7 +508,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // the main window's.
     auto* annotationMenuButton = new QToolButton(buttonRow);
     annotationMenuButton->setObjectName(QStringLiteral("lineAnnotationMenuButton"));
-    annotationMenuButton->setText(tr("Actions"));
+    // Classic hamburger glyph; the arrow-style menu indicator would be
+    // redundant next to it.
+    annotationMenuButton->setText(QStringLiteral("☰"));
+    annotationMenuButton->setToolTip(tr("Actions"));
+    annotationMenuButton->setStyleSheet(
+        QStringLiteral("QToolButton::menu-indicator { image: none; }"));
     annotationMenuButton->setPopupMode(QToolButton::InstantPopup);
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);
@@ -534,6 +539,15 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_showAsMeshAction, &QAction::triggered, this, [this]() {
         emit showAsMeshRequested();
     });
+    annotationMenu->addSeparator();
+    _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
+    _lasagnaDatasetMenu->setToolTipsVisible(true);
+    _lasagnaDatasetMenu->menuAction()->setToolTip(
+        tr("Select the Lasagna dataset used for line annotation."));
+    _fiberInferenceDatasetMenu = annotationMenu->addMenu(tr("Fiber dataset"));
+    _fiberInferenceDatasetMenu->setToolTipsVisible(true);
+    _fiberInferenceDatasetMenu->menuAction()->setToolTip(
+        tr("Select the fiber inference dataset used for line annotation."));
     annotationMenu->addSeparator();
     _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
     _resetViewsAction->setEnabled(false);
@@ -561,18 +575,6 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 emit fiberOptimizationModeChanged(fiberOptimizationMode());
             });
 
-    _datasetMenuButton = new QToolButton(buttonRow);
-    _datasetMenuButton->setObjectName(QStringLiteral("lineAnnotationDatasetMenuButton"));
-    _datasetMenuButton->setText(tr("Datasets"));
-    _datasetMenuButton->setPopupMode(QToolButton::InstantPopup);
-    _datasetMenuButton->setToolTip(tr("Select the Lasagna and fiber inference datasets used for line annotation."));
-    _datasetMenuButton->installEventFilter(this);
-    auto* datasetMenu = new QMenu(_datasetMenuButton);
-    datasetMenu->setToolTipsVisible(true);
-    _lasagnaDatasetMenu = datasetMenu->addMenu(tr("Lasagna dataset"));
-    _fiberInferenceDatasetMenu = datasetMenu->addMenu(tr("Fiber dataset"));
-    _datasetMenuButton->setMenu(datasetMenu);
-    buttonLayout->addWidget(_datasetMenuButton);
     rebuildDatasetMenus();
 
     auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
@@ -823,10 +825,6 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                  _fiberInferenceDatasetOptions,
                  _selectedFiberInferenceDatasetLocation,
                  true);
-    if (_datasetMenuButton) {
-        _datasetMenuButton->setEnabled(
-            !_lasagnaDatasetOptions.empty() || !_fiberInferenceDatasetOptions.empty());
-    }
 }
 
 int LineAnnotationDialog::maxControlPointDistanceVx() const

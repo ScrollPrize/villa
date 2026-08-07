@@ -37,7 +37,6 @@ class QHBoxLayout;
 class QMenu;
 class QResizeEvent;
 class QTimer;
-class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -347,7 +346,6 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
-    QToolButton* _datasetMenuButton = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
     std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
