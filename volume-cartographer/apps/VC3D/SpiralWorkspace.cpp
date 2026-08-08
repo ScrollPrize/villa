@@ -710,6 +710,11 @@ bool SpiralWorkspace::hasActiveSpiralSession() const
     return _service && _service->hasActiveSession();
 }
 
+bool SpiralWorkspace::supportsUnverifiedPatchUploads() const
+{
+    return _service && _service->supportsPatchClassification();
+}
+
 void SpiralWorkspace::addPatchToCurrentFit(
     const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
@@ -718,6 +723,26 @@ void SpiralWorkspace::addPatchToCurrentFit(
     registerPendingPatchSurface(inputId, surface);
     statusBar()->showMessage(tr("Uploading patch %1 to the Spiral session…").arg(inputId));
     _service->uploadPatch(tifxyzDirectory, inputId);
+}
+
+void SpiralWorkspace::addUnverifiedPatchToCurrentFit(
+    const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
+{
+    if (!_service) return;
+    const QString inputId = QFileInfo(tifxyzDirectory).fileName();
+    if (!_service->supportsPatchClassification()) {
+        statusBar()->showMessage(
+            tr("The connected Spiral service cannot preserve unverified patch classification; update it before adding %1")
+                .arg(inputId),
+            15000);
+        return;
+    }
+    registerPendingPatchSurface(inputId, surface);
+    statusBar()->showMessage(
+        tr("Uploading %1 as an unverified Spiral hint\u2026").arg(inputId));
+    _service->uploadPatch(
+        tifxyzDirectory, inputId,
+        SpiralServiceManager::PatchClassification::Unverified);
 }
 
 void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)

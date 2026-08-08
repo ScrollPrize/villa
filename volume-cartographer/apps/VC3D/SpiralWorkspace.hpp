@@ -46,8 +46,12 @@ public:
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;
+    bool supportsUnverifiedPatchUploads() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
+    void addUnverifiedPatchToCurrentFit(
+        const QString& tifxyzDirectory,
+        const std::shared_ptr<QuadSurface>& surface = {});
     void addFiberToCurrentFit(const QString& fiberJsonPath);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;

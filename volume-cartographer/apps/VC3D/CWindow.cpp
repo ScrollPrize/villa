@@ -2575,7 +2575,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         // The "Add to current spiral fit" context actions are greyed out
         // unless a Spiral session is active on the connected service.
         connect(_spiralWorkspace, &SpiralWorkspace::spiralSessionActiveChanged, this, [this](bool active) {
-            if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
+            if (_surfacePanel) {
+                _surfacePanel->setSpiralFitAvailable(active);
+                _surfacePanel->setUnverifiedSpiralHintAvailable(
+                    active && _spiralWorkspace
+                    && _spiralWorkspace->supportsUnverifiedPatchUploads());
+            }
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
     }
@@ -6984,7 +6989,7 @@ void CWindow::CreateWidgets(void)
                 showStatusBarMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::addSurfaceToSpiralFitRequested,
-            this, [this](const QString& segmentId) {
+            this, [this](const QString& segmentId, bool unverified) {
                 if (!_spiralWorkspace) {
                     return;
                 }
@@ -6996,8 +7001,11 @@ void CWindow::CreateWidgets(void)
                     showStatusBarMessage(tr("Cannot resolve an on-disk TIFXYZ directory for %1").arg(segmentId), 5000);
                     return;
                 }
-                _spiralWorkspace->addPatchToCurrentFit(
-                    QString::fromStdString(surf->path.string()), surf);
+                const QString path = QString::fromStdString(surf->path.string());
+                if (unverified)
+                    _spiralWorkspace->addUnverifiedPatchToCurrentFit(path, surf);
+                else
+                    _spiralWorkspace->addPatchToCurrentFit(path, surf);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {

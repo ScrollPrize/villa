@@ -193,6 +193,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _statusFailures = 0;
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
+    _supportsPatchClassification = false;
     _remoteLogsInFlight = false;
     _restartInProgress = false;
     _remoteLogFailures = 0;
@@ -351,6 +352,13 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
         return;
     }
     _serviceOwnsDataset = health.value(QStringLiteral("dataset_owned")).toBool();
+    _supportsPatchClassification = false;
+    for (const QJsonValue& value : health.value(QStringLiteral("capabilities")).toArray()) {
+        if (value.toString() == QStringLiteral("patch_classification")) {
+            _supportsPatchClassification = true;
+            break;
+        }
+    }
     _artifactCache->setEndpoint(endpointFingerprint(), _network,
                                 [this](const QString& path, int timeoutMs) {
                                     return makeRequest(path, timeoutMs);
@@ -403,6 +411,7 @@ void SpiralServiceManager::disconnectFromService()
     _statusInFlight = false;
     _remoteLogsInFlight = false;
     _restartInProgress = false;
+    _supportsPatchClassification = false;
     _artifactCache->clearEndpoint();
     _synchronizedSessionId.clear();
     _tunnel->stop();
@@ -907,9 +916,18 @@ void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QStri
     });
 }
 
-void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
+void SpiralServiceManager::uploadPatch(
+    const QString& directory, const QString& inputId,
+    PatchClassification classification)
 {
     if (!isReady()) { emit inputUploadFinished(inputId, tr("Spiral service is not connected")); return; }
+    if (classification == PatchClassification::Unverified
+        && !_supportsPatchClassification) {
+        emit inputUploadFinished(
+            inputId,
+            tr("The connected Spiral service cannot preserve unverified patch classification; update the service first"));
+        return;
+    }
     const quint64 generation = _connectionGeneration;
     auto* watcher = new QFutureWatcher<QJsonObject>(this);
     connect(watcher, &QFutureWatcher<QJsonObject>::finished, this,
@@ -933,7 +951,7 @@ void SpiralServiceManager::uploadPatch(const QString& directory, const QString& 
                          emit inputUploadFinished(inputId, error);
                      });
             });
-    watcher->setFuture(QtConcurrent::run([directory, inputId]() -> QJsonObject {
+    watcher->setFuture(QtConcurrent::run([directory, inputId, classification]() -> QJsonObject {
         QJsonArray files;
         QDirIterator it(directory, QDir::Files, QDirIterator::Subdirectories);
         const QDir base(directory);
@@ -952,9 +970,15 @@ void SpiralServiceManager::uploadPatch(const QString& directory, const QString& 
         }
         if (files.isEmpty())
             return {{QStringLiteral("error"), tr("The patch directory %1 is empty").arg(directory)}};
-        return {{QStringLiteral("kind"), QStringLiteral("patch")},
-                {QStringLiteral("id"), inputId},
-                {QStringLiteral("files"), files}};
+        QJsonObject request{{QStringLiteral("kind"), QStringLiteral("patch")},
+                            {QStringLiteral("id"), inputId},
+                            {QStringLiteral("files"), files}};
+        // Preserve the legacy verified request shape for older services.
+        // Unverified uploads have already passed the capability check above.
+        if (classification == PatchClassification::Unverified)
+            request.insert(QStringLiteral("classification"),
+                           QStringLiteral("unverified"));
+        return request;
     }));
 }
 

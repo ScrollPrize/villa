@@ -15,6 +15,7 @@
 #include <QDialog>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -29,6 +30,7 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -581,6 +583,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _ephemeralList->setObjectName(QStringLiteral("spiralEphemeralList"));
     _ephemeralList->setMaximumHeight(80);
     _ephemeralList->setSelectionMode(QAbstractItemView::SingleSelection);
+    _addUnverifiedHint = new QPushButton(tr("Add unverified hint\u2026"), runContents);
+    _addUnverifiedHint->setEnabled(false);
+    _addUnverifiedHint->setToolTip(
+        tr("Upload a local TIFXYZ directory, such as ScrollFiesta output, as low-trust evidence for the next run"));
     _commitInputs = new QPushButton(tr("Commit current inputs"), runContents);
     _commitInputs->setEnabled(false);
     _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
@@ -591,6 +597,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
+    commitRow->addWidget(_addUnverifiedHint);
     commitRow->addWidget(_commitInputs);
     commitRow->addWidget(_removeInput);
     commitRow->addStretch(1);
@@ -900,12 +907,64 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
         if (QMessageBox::question(this, tr("Commit inputs"),
                                   tr("Move the added inputs into the dataset? Patches go to "
-                                     "verified_patches/, fibers to fibers/, and PCL documents "
+                                     "their verified_patches/ or unverified_patches/ trust "
+                                     "pool, fibers to fibers/, and PCL documents "
                                      "merge into their conventional role file (control-point "
                                      "lines go to drawn_control_points.json; "
                                      "same-winding point collections go to same_windings.json)."))
             != QMessageBox::Yes) return;
         _service->commitInputs();
+    });
+    connect(_addUnverifiedHint, &QPushButton::clicked, this, [this]() {
+        if (!_service->supportsPatchClassification()) {
+            _warnings->setText(
+                tr("The connected Spiral service must be updated before it can preserve unverified hints."));
+            return;
+        }
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const QString initial = settings.value(
+            QStringLiteral("spiral/last_unverified_hint_directory"),
+            QDir::homePath()).toString();
+        const QString directory = QFileDialog::getExistingDirectory(
+            this, tr("Select an unverified TIFXYZ hint"), initial);
+        if (directory.isEmpty()) return;
+        const QDir hint(directory);
+        const QStringList required{
+            QStringLiteral("x.tif"), QStringLiteral("y.tif"),
+            QStringLiteral("z.tif"), QStringLiteral("meta.json")};
+        QStringList missing;
+        for (const QString& name : required)
+            if (!hint.exists(name)) missing.push_back(name);
+        if (!missing.isEmpty()) {
+            QMessageBox::warning(
+                this, tr("Invalid TIFXYZ hint"),
+                tr("The selected directory is missing: %1")
+                    .arg(missing.join(QStringLiteral(", "))));
+            return;
+        }
+        settings.setValue(
+            QStringLiteral("spiral/last_unverified_hint_directory"),
+            QFileInfo(directory).absolutePath());
+        QString inputId = QFileInfo(directory).fileName();
+        const QRegularExpression safeId(
+            QStringLiteral("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"));
+        if (!safeId.match(inputId).hasMatch()) {
+            bool accepted = false;
+            inputId = QInputDialog::getText(
+                this, tr("Name the unverified hint"),
+                tr("Dataset-safe id (letters, numbers, dot, underscore, hyphen):"),
+                QLineEdit::Normal, inputId, &accepted).trimmed();
+            if (!accepted || inputId.isEmpty()) return;
+            if (!safeId.match(inputId).hasMatch()) {
+                QMessageBox::warning(
+                    this, tr("Invalid hint id"),
+                    tr("The hint id must start with a letter or number and use only letters, numbers, dot, underscore, or hyphen (maximum 128 characters)."));
+                return;
+            }
+        }
+        _service->uploadPatch(
+            directory, inputId,
+            SpiralServiceManager::PatchClassification::Unverified);
     });
     connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
         const QListWidgetItem* item = _ephemeralList->currentItem();
@@ -1714,6 +1773,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
+    _addUnverifiedHint->setEnabled(
+        _connected && runnable && _service->supportsPatchClassification());
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
 
@@ -1747,6 +1808,10 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                 .arg(kind, id, input.value(QStringLiteral("state")).toString());
             if (input.value(QStringLiteral("committed")).toBool())
                 label += tr(", committed");
+            const QString classification =
+                input.value(QStringLiteral("classification")).toString();
+            if (!classification.isEmpty())
+                label += tr(" (%1)").arg(classification);
             const QString role = input.value(QStringLiteral("role")).toString();
             if (!role.isEmpty()) label += tr(" (%1)").arg(role);
             auto* item = new QListWidgetItem(label, _ephemeralList);

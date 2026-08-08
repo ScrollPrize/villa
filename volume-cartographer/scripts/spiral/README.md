@@ -48,6 +48,24 @@ resolution to clients. Remote clients can add ephemeral inputs, commit them,
 and change run parameters, but cannot repoint the session at different host
 paths.
 
+### Unverified TIFXYZ hints
+
+The running-fit panel can upload a local TIFXYZ directory, including a
+ScrollFiesta export, with **Add unverified hint...**. A local surface also has
+**Add as unverified Spiral hint** in its context menu. The upload protocol
+carries `classification: "unverified"` through staging, status, resident-fit
+incorporation, and commit; clients that omit the field retain the historical
+`verified` default.
+
+Unverified hints have a structural trust boundary. They use only Spiral's
+separate unverified radius/DT losses, are masked near trusted geometry, never
+join the verified atlas or interactive influence anchors, and commit only to
+`unverified_patches/`. Patch identifiers are checked against both trust pools,
+so a hint cannot shadow or overwrite verified geometry. VC3D enables these
+actions only when the service advertises the `patch_classification`
+capability, preventing an older service from silently treating a hint as
+verified.
+
 ### Creating the Spiral Python environment
 
 The service host needs the Spiral environment (a CUDA-capable PyTorch plus the

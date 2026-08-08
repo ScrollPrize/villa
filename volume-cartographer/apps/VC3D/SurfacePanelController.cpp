@@ -1251,8 +1251,26 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         ? tr("Upload this patch to the active Spiral session; it is used on the next run")
         : tr("No Spiral session is active on the connected service"));
     connect(addToSpiralAction, &QAction::triggered, this, [this, segmentId]() {
-        emit addSurfaceToSpiralFitRequested(segmentId);
+        emit addSurfaceToSpiralFitRequested(segmentId, false);
     });
+
+    QAction* addUnverifiedHintAction =
+        contextMenu.addAction(tr("Add as unverified Spiral hint"));
+    addUnverifiedHintAction->setEnabled(
+        selectedSegmentIds.size() <= 1 && isLocal
+        && _unverifiedSpiralHintAvailable);
+    addUnverifiedHintAction->setToolTip(
+        !_spiralFitAvailable
+            ? tr("No Spiral session is active on the connected service")
+        : !_unverifiedSpiralHintAvailable
+            ? tr("The connected Spiral service must be updated to preserve unverified classification")
+            : !isLocal
+                ? tr("Materialize the TIFXYZ surface locally before uploading it")
+                : tr("Upload low-trust TIFXYZ evidence, such as ScrollFiesta output, for the next run; Spiral masks it near trusted geometry and never promotes it to verified"));
+    connect(addUnverifiedHintAction, &QAction::triggered, this,
+            [this, segmentId]() {
+                emit addSurfaceToSpiralFitRequested(segmentId, true);
+            });
 
     QMenu* maskMenu = contextMenu.addMenu(tr("Mask"));
     maskMenu->setEnabled(isCurrentFolderSegment);

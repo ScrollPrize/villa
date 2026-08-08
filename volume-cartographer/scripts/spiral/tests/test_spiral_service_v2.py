@@ -167,7 +167,7 @@ def _digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _upload_input(state, kind, input_id, files, role=None):
+def _upload_input(state, kind, input_id, files, role=None, classification=None):
     request = {
         "kind": kind, "id": input_id,
         "files": [{"name": name, "size": len(data), "sha256": _digest(data)}
@@ -175,6 +175,8 @@ def _upload_input(state, kind, input_id, files, role=None):
     }
     if role:
         request["role"] = role
+    if classification is not None:
+        request["classification"] = classification
     upload_id = state.begin_upload(request)["upload_id"]
     for name, data in files.items():
         state.receive_upload_file(upload_id, name, io.BytesIO(data), len(data))
@@ -337,6 +339,7 @@ class AuthenticationTests(HttpServiceFixture):
         health = json.loads(payload)
         self.assertEqual(health["api_version"], API_VERSION)
         self.assertIn("service_version", health)
+        self.assertIn("patch_classification", health["capabilities"])
         self.assertIn("service_name", health)
         self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
@@ -745,6 +748,7 @@ class UploadTests(unittest.TestCase):
         response = self.state.finalize_upload(upload_id)
         record = response["input"]
         self.assertEqual(record["state"], "pending")
+        self.assertEqual(record["classification"], "verified")
         published = Path(record["path"])
         self.assertTrue((published / "meta.json").is_file())
         self.assertIn(".spiral-ephemeral", str(published))
@@ -755,6 +759,42 @@ class UploadTests(unittest.TestCase):
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
                          "patch-1")
+
+    def test_unverified_patch_classification_survives_into_the_next_run(self):
+        session = self._session()
+        upload_id = _upload_input(
+            self.state, "patch", "scrollfiesta-hint", PATCH_FILES,
+            classification="unverified")
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["classification"], "unverified")
+        self.assertEqual(
+            self.state.status()["ephemeral_inputs"][0]["classification"],
+            "unverified")
+
+        _planned_run(self.state, {"iterations": 2})
+        _, pending, _, _, _ = session.run_calls[-1]
+        self.assertEqual(pending[0]["classification"], "unverified")
+
+    def test_invalid_or_misplaced_patch_classification_is_rejected_before_staging(self):
+        self._session()
+        manifest = [{"name": "meta.json", "size": 1, "sha256": "0" * 64}]
+        for classification in (None, "", "trusted", "UNVERIFIED", 1, ["unverified"]):
+            with self.subTest(classification=classification):
+                with self.assertRaisesRegex(ApiError, "classification") as caught:
+                    self.state.begin_upload({
+                        "kind": "patch", "id": "hint", "files": manifest,
+                        "classification": classification,
+                    })
+                self.assertEqual(caught.exception.status, 400)
+        with self.assertRaisesRegex(ApiError, "Only patch uploads") as caught:
+            self.state.begin_upload({
+                "kind": "fiber", "id": "fiber", "files": manifest,
+                "classification": "unverified",
+            })
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.state.uploads, {})
+        staging = self.output / ".spiral-upload-staging"
+        self.assertFalse(staging.exists())
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -1220,8 +1260,10 @@ class CommitTests(unittest.TestCase):
         os.chmod(self.dataset, 0o755)
         self.temporary.cleanup()
 
-    def _finalize(self, kind, input_id, files, role=None):
-        upload_id = _upload_input(self.state, kind, input_id, files, role=role)
+    def _finalize(self, kind, input_id, files, role=None, classification=None):
+        upload_id = _upload_input(
+            self.state, kind, input_id, files, role=role,
+            classification=classification)
         return self.state.finalize_upload(upload_id)["input"]
 
     def test_commit_publishes_patches_fibers_and_merges_role_pcls(self):
@@ -1248,6 +1290,43 @@ class CommitTests(unittest.TestCase):
                          {"patch-9", "fiber-9", "pcl-9"})
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
+
+    def test_unverified_patch_commits_only_to_the_unverified_pool(self):
+        record = self._finalize(
+            "patch", "scrollfiesta-hint", PATCH_FILES,
+            classification="unverified")
+        self.assertEqual(record["classification"], "unverified")
+
+        self.state.commit_inputs()
+
+        self.assertTrue((self.dataset / "unverified_patches" /
+                         "scrollfiesta-hint" / "meta.json").is_file())
+        self.assertFalse((self.dataset / "verified_patches" /
+                          "scrollfiesta-hint").exists())
+        pending = self.state.status()["ephemeral_inputs"][0]
+        self.assertTrue(pending["committed"])
+        self.assertEqual(pending["classification"], "unverified")
+
+    def test_incorporated_unverified_patch_keeps_pristine_session_source_for_remasking(self):
+        record = self._finalize(
+            "patch", "scrollfiesta-hint", PATCH_FILES,
+            classification="unverified")
+        staged = Path(record["path"])
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        mark(pending)
+
+        self.state.commit_inputs()
+
+        self.assertTrue(staged.is_dir())
+        self.assertTrue((staged / "meta.json").is_file())
+        self.assertTrue((self.dataset / "unverified_patches" /
+                         "scrollfiesta-hint" / "meta.json").is_file())
+        retained = self.state.status()["ephemeral_inputs"]
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["state"], "incorporated")
+        self.assertTrue(retained[0]["committed"])
+        self.assertEqual(retained[0]["classification"], "unverified")
 
     def test_concurrent_service_commits_serialize_pcl_merges(self):
         output_b = self.root / "output-b"
@@ -1438,6 +1517,29 @@ class CommitTests(unittest.TestCase):
         self.assertEqual((existing / "meta.json").read_text(), "original")
         # The ephemeral input is untouched and still usable.
         self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"], "pending")
+
+    def test_patch_identifier_cannot_shadow_the_other_trust_pool(self):
+        existing = self.dataset / "verified_patches" / "shared-id"
+        existing.mkdir()
+        (existing / "meta.json").write_text("verified original")
+        self._finalize(
+            "patch", "shared-id", PATCH_FILES, classification="unverified")
+        with self.assertRaisesRegex(ApiError, "already exists") as caught:
+            self.state.commit_inputs()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual((existing / "meta.json").read_text(), "verified original")
+        self.assertFalse((self.dataset / "unverified_patches" / "shared-id").exists())
+
+    def test_verified_patch_cannot_shadow_an_unverified_patch(self):
+        existing = self.dataset / "unverified_patches" / "shared-id"
+        existing.mkdir(parents=True)
+        (existing / "meta.json").write_text("unverified original")
+        self._finalize("patch", "shared-id", PATCH_FILES)
+        with self.assertRaisesRegex(ApiError, "already exists") as caught:
+            self.state.commit_inputs()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual((existing / "meta.json").read_text(), "unverified original")
+        self.assertFalse((self.dataset / "verified_patches" / "shared-id").exists())
 
     def test_commit_on_read_only_dataset_is_reported_unavailable(self):
         self._finalize("patch", "patch-2", PATCH_FILES)

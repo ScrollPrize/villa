@@ -152,6 +152,12 @@ public:
     // Enables the "Add to current spiral fit" context action while a Spiral
     // session is active on the connected service.
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
+    // Fail closed when connected to an older service that cannot preserve the
+    // unverified trust classification.
+    void setUnverifiedSpiralHintAvailable(bool available)
+    {
+        _unverifiedSpiralHintAvailable = available;
+    }
 
     /// Outcome of an asynchronous single-segment fetch request. Only `Started`
     /// implies the completion callback will fire later (on the main thread);
@@ -182,7 +188,7 @@ signals:
     void filtersApplied(int hiddenCount);
     void surfaceActivated(const QString& id, QuadSurface* surface);
     void copySegmentPathRequested(const QString& segmentId);
-    void addSurfaceToSpiralFitRequested(const QString& segmentId);
+    void addSurfaceToSpiralFitRequested(const QString& segmentId, bool unverified);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
@@ -272,6 +278,7 @@ private:
     QMetaObject::Connection _pointSetModelConnection;
     bool _configuringFilters{false};
     bool _spiralFitAvailable{false};
+    bool _unverifiedSpiralHintAvailable{false};
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};

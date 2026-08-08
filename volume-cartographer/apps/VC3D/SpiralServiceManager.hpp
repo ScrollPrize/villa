@@ -37,6 +37,9 @@ public:
                                  Reconnecting, Failed };
     Q_ENUM(ConnectionState)
 
+    enum class PatchClassification { Verified, Unverified };
+    Q_ENUM(PatchClassification)
+
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
 
@@ -54,6 +57,7 @@ public:
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
     bool serviceOwnsDataset() const { return _serviceOwnsDataset; }
+    bool supportsPatchClassification() const { return _supportsPatchClassification; }
     QJsonObject advertisedDataset() const { return _advertisedDataset; }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
@@ -71,7 +75,9 @@ public:
     void downloadCheckpoint(const QString& localPath);
     void deleteSession();
     void commitInputs();
-    void uploadPatch(const QString& directory, const QString& inputId);
+    void uploadPatch(
+        const QString& directory, const QString& inputId,
+        PatchClassification classification = PatchClassification::Verified);
     void uploadJsonInput(const QString& kind, const QString& filePath,
                          const QString& inputId, const QString& role = {});
     // Remove an added input that has not joined the resident fit yet.
@@ -173,6 +179,7 @@ private:
     int _statusFailures = 0;
     bool _hasActiveSession = false;
     bool _serviceOwnsDataset = false;
+    bool _supportsPatchClassification = false;
     bool _remoteLogsInFlight = false;
     bool _restartInProgress = false;
     QElapsedTimer _restartElapsed;

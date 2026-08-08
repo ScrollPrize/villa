@@ -41,6 +41,10 @@ from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
 from native_spiral import load_native_spiral_sampling
+from interactive_patch_trust import (
+    collect_trusted_collection_points,
+    select_interactive_patch_pool,
+)
 from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
@@ -657,6 +661,12 @@ def main(
             unverified_patches = load_patches_from_dir(
                 unverified_patches_path, 'unverified patches')
 
+    # Keep source identities even when erosion, ROI filtering, or later trusted
+    # remasking removes a patch from a resident training pool. Reusing such an
+    # id for an interactive patch would make a later reload ambiguous.
+    known_verified_patch_ids = set(verified_patches)
+    known_unverified_patch_ids = set(unverified_patches)
+
     if (not verified_patches and not unverified_patches
             and (use_verified_patches or use_unverified_patches)):
         raise RuntimeError('No patches could be loaded')
@@ -1227,6 +1237,7 @@ def main(
     unverified_patches_list = []
     unverified_patch_sampling_probabilities = None
     unverified_patch_atlas = None
+    interactive_unverified_patch_paths = {}
     using_tracks = (
         (cfg['loss_weight_track_radius'] > 0 or cfg['loss_weight_track_dt'] > 0)
         and bool(tracks)
@@ -1236,7 +1247,7 @@ def main(
     # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
     # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
     # build their own sampling cache + GPU atlas. They feed only their own radius/DT losses.
-    if unverified_patches or using_tracks:
+    if unverified_patches or using_tracks or interactive_driver is not None:
         # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
         # nearest-neighbour queries.
         verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
@@ -1394,11 +1405,24 @@ def main(
         unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
         unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
 
-    def rebuild_unverified_patch_inputs(exclusion_radius):
+    def rebuild_unverified_patch_inputs(
+            exclusion_radius, geometry_tree=None, include_ids=None):
         """Reload only the unverified-patch pool for a Run-boundary mask edit."""
-        if not unverified_patches_path:
+        if not unverified_patches_path and not interactive_unverified_patch_paths:
             return {}, [], None, None
-        candidates = load_patches_from_dir(unverified_patches_path)
+        candidates = (
+            load_patches_from_dir(unverified_patches_path)
+            if unverified_patches_path else {})
+        if include_ids is not None:
+            candidates = {
+                patch_id: patch for patch_id, patch in candidates.items()
+                if patch_id in include_ids}
+        for patch_id, path in interactive_unverified_patch_paths.items():
+            # A committed hint may now also be visible under the dataset's
+            # unverified directory; do not load the same id twice.
+            if (include_ids is None or patch_id in include_ids) \
+                    and patch_id not in candidates:
+                candidates[patch_id] = load_tifxyz(path)
         for patch_id, patch in list(candidates.items()):
             cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
             if (cells_to_erode > 0
@@ -1411,7 +1435,9 @@ def main(
             patch.release_derived_caches()
         candidates, n_masked, n_dropped = \
             _mask_unverified_patches_near_trusted_geometry(
-                candidates, trusted_geometry_tree, exclusion_radius)
+                candidates,
+                trusted_geometry_tree if geometry_tree is None else geometry_tree,
+                exclusion_radius)
         print(
             f'unverified patches: remasked {n_masked} vertices near trusted '
             f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
@@ -2150,6 +2176,11 @@ def main(
         same items in the same order on every rank.
         """
         nonlocal patch_sampling_probabilities, next_id, influence_state
+        nonlocal unverified_patch_sampling_probabilities
+        nonlocal unverified_patches, unverified_patches_list
+        nonlocal unverified_patch_atlas, trusted_geometry_tree
+        nonlocal interactive_unverified_patch_paths
+        nonlocal known_verified_patch_ids, known_unverified_patch_ids
         nonlocal interactive_influence_loss_weight, interactive_influence_anchor_samples
         nonlocal interactive_dt_resume_iteration
         # Incorporation has its own saved RNG envelope so adding inputs does
@@ -2164,7 +2195,13 @@ def main(
             clear_interactive_influence()
             run_cfg = dict(cfg)
             run_cfg.update(dict(influence_config or {}))
-            new_patches = {}
+            # Preserve identity even if a prior boundary was interrupted after
+            # changing a resident dictionary but before its final bookkeeping.
+            known_verified_patch_ids.update(verified_patches)
+            known_unverified_patch_ids.update(unverified_patches)
+            new_verified_patches = {}
+            new_unverified_patches = {}
+            new_unverified_patch_paths = {}
             new_collections = {}
             for record in records:
                 kind = record.get('kind')
@@ -2173,8 +2210,10 @@ def main(
                 if kind == 'patch':
                     if cfg['input_disable_patches']:
                         raise RuntimeError('disable_patches=True: this session takes no patches')
-                    if input_id in verified_patches or input_id in new_patches:
-                        raise RuntimeError(f'Patch {input_id!r} is already part of this session')
+                    classification, target_pool = select_interactive_patch_pool(
+                        record,
+                        known_verified_patch_ids, known_unverified_patch_ids,
+                        new_verified_patches, new_unverified_patches)
                     patch = load_tifxyz(path)
                     cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
@@ -2184,7 +2223,9 @@ def main(
                             f'Patch {input_id!r} does not intersect the fitted z range '
                             f'[{z_begin}, {z_end})')
                     patch.release_derived_caches()
-                    new_patches[input_id] = patch
+                    target_pool[input_id] = patch
+                    if classification == 'unverified':
+                        new_unverified_patch_paths[input_id] = path
                 elif kind == 'fiber':
                     pcl = load_fiber_point_collection(
                         path, next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
@@ -2219,32 +2260,21 @@ def main(
                 build_pcl_sampling_strata(
                     pcl['sampling_group'] for pcl in new_collections.values())
 
-            # ---- Patches: sampling caches, probabilities, atlas append ----
-            if new_patches:
-                for patch in new_patches.values():
-                    prepare_patch_sampling_cache([patch])
-                verified_patches.update(new_patches)
-                verified_patches_list.extend(new_patches.values())
-                areas = np.array([float(p.area) for p in verified_patches_list],
-                                 dtype=np.float32)
-                inv_weights = areas ** 0.5
-                patch_sampling_probabilities = inv_weights / inv_weights.sum()
-                patch_atlas.append_patches(new_patches)
-                if cfg['dt_target_mode'] == 'whole_object_quantile':
-                    prepare_patch_dt_target_samples(
-                        list(new_patches.values()),
-                        cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
-                    )
-
             # ---- Point collections: link, classify, strip-materialise ----
+            new_cross_patch_values = []
+            new_unattached_strips = []
+            new_unattached_sampling_groups = []
+            new_unattached = {}
             if new_collections:
                 for pcl in new_collections.values():
                     for point in pcl['points'].values():
                         point['zyx'] = np.array(
                             [point['p'][2], point['p'][1], point['p'][0]],
                             dtype=np.float32)
+                candidate_verified_patches = dict(verified_patches)
+                candidate_verified_patches.update(new_verified_patches)
                 link_points_to_patches(
-                    verified_patches,
+                    candidate_verified_patches,
                     new_collections,
                     tolerance=link_distance_tolerance,
                     surface_index_tolerance=link_distance_tolerance,
@@ -2252,7 +2282,6 @@ def main(
                     general_hit_policy='largest_area',
                 )
                 new_cross_patch = {}
-                new_unattached = {}
                 for pid, pcl in new_collections.items():
                     num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
                     num_unattached = len(pcl['points']) - num_attached
@@ -2300,11 +2329,11 @@ def main(
                         if 'on_patch' not in point:
                             continue
                         pid = point['on_patch']['id']
-                        if pid not in verified_patches:
+                        if pid not in candidate_verified_patches:
                             continue
                         points_by_patch.setdefault(pid, []).append(point)
                     pcl['points_by_patch'] = points_by_patch
-                    cross_patch_pcls.append(pcl)
+                    new_cross_patch_values.append(pcl)
 
                 min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
                 for pcl_id, pcl in new_unattached.items():
@@ -2326,29 +2355,157 @@ def main(
                         keep.append(len(zyxs) - 1)
                         zyxs = zyxs[keep]
                         windings = windings[keep]
-                    unattached_pcl_strips.append({
+                    new_unattached_strips.append({
                         'id': pcl_id,
                         'name': pcl.get('name'),
                         'source_file': pcl.get('source_file'),
                         'zyxs': zyxs,
                         'windings': windings,
                     })
-                    unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
-                # The flat GPU bundle is derived from the strip list; drop it so
-                # the next consumer rebuilds it including the appended strips.
+                    new_unattached_sampling_groups.append(
+                        pcl.get('sampling_group'))
+
+            # New trusted inputs immediately extend the exclusion cloud used
+            # to protect trusted geometry from an unverified hint arriving in
+            # the same boundary. Only materialised unattached PCL strips are
+            # added; attached PCL points are already represented by verified
+            # patch geometry.
+            updated_trusted_geometry_tree = trusted_geometry_tree
+            rebuilt_existing_unverified = None
+            trusted_additions = []
+            for patch in new_verified_patches.values():
+                z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+                valid_flat = patch.valid_vertex_mask.reshape(-1)
+                z_in_roi = (z_flat[:, 0] >= z_begin) & (z_flat[:, 0] < z_end)
+                if (valid_flat & z_in_roi).any():
+                    trusted_additions.append(z_flat[valid_flat & z_in_roi].numpy())
+            collection_points = collect_trusted_collection_points(
+                new_unattached, z_begin, z_end)
+            if len(collection_points):
+                trusted_additions.append(collection_points)
+
+            if trusted_additions:
+                additions = np.ascontiguousarray(
+                    np.concatenate(trusted_additions, axis=0), dtype=np.float32)
+                if trusted_geometry_tree is not None:
+                    additions = np.concatenate(
+                        [trusted_geometry_tree.data, additions], axis=0)
+                updated_trusted_geometry_tree = cKDTree(additions)
+
+                # A newly trusted patch or point collection also has authority
+                # over unverified geometry that was already resident. Reload
+                # those patches from pristine sources and remask them against
+                # the enlarged trusted cloud before replacing their atlas.
+                if unverified_patches:
+                    rebuilt_existing_unverified = \
+                        rebuild_unverified_patch_inputs(
+                            float(cfg['patch_unverified_patch_exclusion_radius']),
+                            updated_trusted_geometry_tree,
+                            include_ids=set(unverified_patches))
+
+            if new_unverified_patches:
+                exclusion_radius = float(
+                    cfg['patch_unverified_patch_exclusion_radius'])
+                (masked_unverified_patches, n_masked_vertices,
+                 n_dropped_patches) = _mask_unverified_patches_near_trusted_geometry(
+                    new_unverified_patches, updated_trusted_geometry_tree,
+                    exclusion_radius)
+                if n_dropped_patches:
+                    raise RuntimeError(
+                        f'{n_dropped_patches} unverified patch(es) have no valid quads '
+                        'after trusted-geometry exclusion')
+                if n_masked_vertices:
+                    print(
+                        f'interactive unverified patches: masked {n_masked_vertices} '
+                        f'vertices near trusted geometry (radius {exclusion_radius:.1f})')
+                new_unverified_patches = masked_unverified_patches
+
+            # ---- Patches: sampling caches, probabilities, atlas append ----
+            if new_verified_patches:
+                for patch in new_verified_patches.values():
+                    prepare_patch_sampling_cache([patch])
+                verified_patches.update(new_verified_patches)
+                verified_patches_list.extend(new_verified_patches.values())
+                areas = np.array([float(p.area) for p in verified_patches_list],
+                                 dtype=np.float32)
+                inv_weights = areas ** 0.5
+                patch_sampling_probabilities = inv_weights / inv_weights.sum()
+                patch_atlas.append_patches(new_verified_patches)
+                if cfg['dt_target_mode'] == 'whole_object_quantile':
+                    prepare_patch_dt_target_samples(
+                        list(new_verified_patches.values()),
+                        cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
+                    )
+
+            if new_collections:
+                cross_patch_pcls.extend(new_cross_patch_values)
+                unattached_pcl_strips.extend(new_unattached_strips)
+                unattached_strip_sampling_groups.extend(
+                    new_unattached_sampling_groups)
+                # The flat GPU bundle is derived from the strip list; drop it
+                # so the next consumer includes the appended strips.
                 unattached_pcl_strips.flat = None
-                # Sampling strata index into the (now longer) pools.
                 rebuild_pcl_sampling_strata()
 
-            if new_patches or new_collections:
+            # Publish the new trust boundary only after the point collections
+            # have passed their linking and annotation validation. Existing
+            # unverified inputs are replaced before new hints are appended, so
+            # both groups use the same enlarged exclusion cloud.
+            trusted_geometry_tree = updated_trusted_geometry_tree
+            if rebuilt_existing_unverified is not None:
+                (unverified_patches, unverified_patches_list,
+                 unverified_patch_sampling_probabilities,
+                 unverified_patch_atlas) = rebuilt_existing_unverified
+                if (cfg['dt_target_mode'] == 'whole_object_quantile'
+                        and unverified_patches_list):
+                    prepare_patch_dt_target_samples(
+                        unverified_patches_list,
+                        cfg['sample_count_patch_dt_target_points'],
+                        cfg['dt_target_max_stride'])
+
+            if new_unverified_patches:
+                for patch in new_unverified_patches.values():
+                    prepare_patch_sampling_cache([patch])
+                if unverified_patch_atlas is None:
+                    unverified_patch_atlas = PatchGpuAtlas(
+                        new_unverified_patches, device='cuda')
+                else:
+                    unverified_patch_atlas.append_patches(
+                        new_unverified_patches)
+                unverified_patches.update(new_unverified_patches)
+                unverified_patches_list.extend(new_unverified_patches.values())
+                interactive_unverified_patch_paths.update(
+                    new_unverified_patch_paths)
+                areas = np.array(
+                    [float(p.area) for p in unverified_patches_list],
+                    dtype=np.float32)
+                inv_weights = areas ** 0.5
+                unverified_patch_sampling_probabilities = \
+                    inv_weights / inv_weights.sum()
+                if cfg['dt_target_mode'] == 'whole_object_quantile':
+                    prepare_patch_dt_target_samples(
+                        list(new_unverified_patches.values()),
+                        cfg['sample_count_patch_dt_target_points'],
+                        cfg['dt_target_max_stride'],
+                    )
+
+            known_verified_patch_ids.update(new_verified_patches)
+            known_unverified_patch_ids.update(new_unverified_patches)
+
+            if (new_verified_patches or new_unverified_patches
+                    or new_collections):
                 # Whole-object DT target caches index the (now longer) object
                 # pools; force recomputation on next use.
                 dt_target_cache_manager.reset()
 
-            if run_cfg['influence_enabled'] and (new_patches or new_collections):
+            # Influence anchors are a trusted correction channel. Unverified
+            # hints deliberately stay out of it and affect only their existing
+            # low-trust radius/DT losses.
+            if run_cfg['influence_enabled'] and (
+                    new_verified_patches or new_collections):
                 influence_state = make_influence_state(run_cfg, torch.device('cuda'))
                 influence_state.activate_or_extend_(
-                    new_patches=new_patches,
+                    new_patches=new_verified_patches,
                     new_collections=new_collections,
                     spiral_and_transform=spiral_and_transform,
                     optimiser=optimiser,
@@ -2373,7 +2530,8 @@ def main(
             )
             interactive_dt_resume_iteration = dt_resume_iteration
 
-            print(f'incorporated {len(new_patches)} patches and '
+            print(f'incorporated {len(new_verified_patches)} verified patches, '
+                  f'{len(new_unverified_patches)} unverified patches, and '
                   f'{len(new_collections)} point collections into the resident session; '
                   f'DT losses disabled until iteration {interactive_dt_resume_iteration}')
         finally:

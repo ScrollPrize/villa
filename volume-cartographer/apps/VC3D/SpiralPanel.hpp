@@ -165,6 +165,7 @@ private:
 
     // Ephemeral inputs
     QListWidget* _ephemeralList = nullptr;
+    QPushButton* _addUnverifiedHint = nullptr;
     QPushButton* _commitInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;

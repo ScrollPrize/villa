@@ -53,7 +53,7 @@ from fit_session import (API_VERSION, PclRole, parse_session_request,
 from config import Config
 
 
-SERVICE_VERSION = "6.1.0"
+SERVICE_VERSION = "6.2.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -90,6 +90,8 @@ _PCL_ROLE_FILES = {
     PclRole.SAME_WINDING.value: "same_windings.json",
     PclRole.DRAWN_CONTROL_POINTS.value: "drawn_control_points.json",
 }
+
+_PATCH_CLASSIFICATIONS = frozenset(("verified", "unverified"))
 
 # Base input paths are owned by the service when it was launched with
 # --dataset; a load request may then only choose among service-advertised
@@ -531,16 +533,17 @@ class ArtifactRegistry:
 
 
 class Upload:
-    __slots__ = ("upload_id", "session_id", "kind", "role", "input_id",
+    __slots__ = ("upload_id", "session_id", "kind", "role", "classification", "input_id",
                  "manifest", "staging_dir", "received", "record", "created",
                  "lock")
 
-    def __init__(self, upload_id, session_id, kind, role, input_id, manifest,
-                 staging_dir):
+    def __init__(self, upload_id, session_id, kind, role, classification,
+                 input_id, manifest, staging_dir):
         self.upload_id = upload_id
         self.session_id = session_id
         self.kind = kind
         self.role = role
+        self.classification = classification
         self.input_id = input_id
         self.manifest = manifest
         self.staging_dir = staging_dir
@@ -1148,6 +1151,7 @@ class ServiceState:
         return {
             "api_version": API_VERSION,
             "service_version": SERVICE_VERSION,
+            "capabilities": ["patch_classification"],
             "service_name": self.service_name,
             "session_name": self.session_name,
             "session_id": self.session_id,
@@ -1232,7 +1236,9 @@ class ServiceState:
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
                  "bytes": record["bytes"],
-                 "committed": bool(record.get("committed"))}
+                 "committed": bool(record.get("committed")),
+                 **({"classification": record.get("classification", "verified")}
+                    if record["kind"] == "patch" else {})}
                 for record in self.ephemeral_records
             ]
             available, reason = self._commit_availability()
@@ -2216,6 +2222,18 @@ class ServiceState:
         if kind not in ("patch", "fiber", "pcl", "checkpoint"):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Input kind must be one of patch, fiber, pcl, checkpoint")
+        classification = None
+        if kind == "patch":
+            classification = request.get("classification", "verified")
+            if not isinstance(classification, str) \
+                    or classification not in _PATCH_CLASSIFICATIONS:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Patch classification must be verified or unverified")
+        elif "classification" in request:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Only patch uploads may declare a classification")
         role = request.get("role")
         if kind == "pcl":
             if role not in _PCL_ROLE_FILES:
@@ -2292,8 +2310,8 @@ class ServiceState:
                                    "The ephemeral input quota is exhausted")
             upload_id = secrets.token_hex(16)
             staging = self._staging_root() / upload_id
-            upload = Upload(upload_id, self.session_id, kind, role, input_id,
-                            manifest, staging)
+            upload = Upload(upload_id, self.session_id, kind, role,
+                            classification, input_id, manifest, staging)
             self.uploads[upload_id] = upload
         staging.mkdir(parents=True, exist_ok=True)
         return {**self._base(), "upload_id": upload_id, "accepted": True}
@@ -2393,6 +2411,8 @@ class ServiceState:
                 "state": "pending",
                 "upload_id": upload.upload_id,
             }
+            if upload.kind == "patch":
+                record["classification"] = upload.classification
             upload.record = record
         with self.lock:
             self.ephemeral_records.append(record)
@@ -2500,17 +2520,32 @@ class ServiceState:
                            and not record.get("committed")]
                 paths = self.session_paths
             dataset_root = Path(paths.dataset_root)
-            patches_dir = Path(paths.verified_patches) if paths.verified_patches \
+            verified_patches_dir = Path(paths.verified_patches) if paths.verified_patches \
                 else dataset_root / "verified_patches"
+            unverified_patches_dir = Path(paths.unverified_patches) if paths.unverified_patches \
+                else dataset_root / "unverified_patches"
             fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
+
+            def patch_destination(record):
+                classification = record.get("classification", "verified")
+                if classification == "verified":
+                    return verified_patches_dir / record["id"]
+                if classification == "unverified":
+                    return unverified_patches_dir / record["id"]
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"Patch {record['id']!r} has an invalid classification")
 
             # Collision checks and publications share the same dataset lock, so
             # cooperating service processes cannot race an existence check.
             for record in records:
-                if record["kind"] == "patch" and (patches_dir / record["id"]).exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"A patch named {record['id']!r} already exists in the dataset")
+                if record["kind"] == "patch":
+                    patch_id = record["id"]
+                    if (verified_patches_dir / patch_id).exists() \
+                            or (unverified_patches_dir / patch_id).exists():
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            f"A patch named {patch_id!r} already exists in the dataset")
                 if record["kind"] == "fiber" and \
                         (fibers_dir / f"{record['id']}.json").exists():
                     raise ApiError(
@@ -2522,10 +2557,16 @@ class ServiceState:
                 source = Path(record["path"])
                 # A still-pending record keeps its staged copy: it remains the
                 # incorporation source for the next run, so committing never
-                # removes an input from the live session's queue.
-                keep_source = record["state"] == "pending"
+                # removes an input from the live session's queue. Incorporated
+                # unverified patches also keep their pristine session copy so
+                # the fitter can safely remask them if the trusted-exclusion
+                # radius changes. Session teardown removes the ephemeral tree.
+                keep_source = (
+                    record["state"] == "pending"
+                    or (record["kind"] == "patch"
+                        and record.get("classification") == "unverified"))
                 if record["kind"] == "patch":
-                    _copy_publish(source, patches_dir / record["id"], keep_source)
+                    _copy_publish(source, patch_destination(record), keep_source)
                 elif record["kind"] == "fiber":
                     _copy_publish(source, fibers_dir / f"{record['id']}.json", keep_source)
                 else:
@@ -2554,11 +2595,17 @@ class ServiceState:
                 for record in records:
                     record["committed"] = True
                 # Committed records that already joined the resident fit are
-                # done; pending ones stay queued for the next run.
+                # done; pending ones stay queued for the next run. An
+                # unverified patch retains its record and pristine staged
+                # source for live exclusion-radius remasking. Keeping the
+                # record also keeps those bytes inside the ephemeral quota.
                 self.ephemeral_records = [
                     record for record in self.ephemeral_records
                     if not (record.get("committed")
-                            and record["state"] == "incorporated")
+                            and record["state"] == "incorporated"
+                            and not (record["kind"] == "patch"
+                                     and record.get("classification")
+                                     == "unverified"))
                 ]
                 if self.dataset_resolution is not None:
                     self.dataset_resolution = resolve_dataset_root(
