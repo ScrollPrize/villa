@@ -228,7 +228,6 @@ class RegressionPLModel(pl.LightningModule):
 def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
     mask_pred = np.zeros(pred_shape)
     mask_count = np.zeros(pred_shape)
-    mask_count_kernel = np.ones((CFG.size, CFG.size))
     kernel = gkern(CFG.size, 1)
     kernel = kernel / kernel.max()
     model.eval()
@@ -255,7 +254,7 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
         # Update mask_pred and mask_count in a batch manner
         for i, (x1, y1, x2, y2) in enumerate(xys):
             mask_pred[y1:y2, x1:x2] += y_preds_multiplied_cpu[i]
-            mask_count[y1:y2, x1:x2] += mask_count_kernel
+            mask_count[y1:y2, x1:x2] += kernel
 
     mask_pred /= np.clip(mask_count, a_min=1, a_max=None)
     return mask_pred
