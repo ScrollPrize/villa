@@ -91,6 +91,16 @@ int main(int argc, char *argv[])
     Volume volume(vol_path);
     volume.setCacheBudget(size_t(10e9));
     constexpr int renderLevel = 1;
+    if (!volume.hasScaleLevel(renderLevel)) {
+        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
+        // through one silently yields fill value instead of failing.
+        std::cerr << "Error: render level " << renderLevel
+                  << " is not present in this volume; present levels:";
+        for (int level : volume.presentScaleLevels())
+            std::cerr << " " << level;
+        std::cerr << std::endl;
+        return 1;
+    }
     auto* chunk_cache = volume.chunkedCache();
 
     std::cout << "zarr dataset size for scale group " << renderLevel
