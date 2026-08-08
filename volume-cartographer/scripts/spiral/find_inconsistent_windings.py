@@ -156,17 +156,24 @@ def _to_py(x):
 
 
 def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path):
-    """Point fit_spiral's module globals at the checkpoint's cfg and the
-    user-supplied patches/pcls/filter-z-range so its loaders behave identically.
-    Returns the checkpoint's model z-range, which shapes the transform's flow
-    field independently of the filtering z-range."""
+    """Point fit_spiral's dataset-path module globals at the user-supplied
+    patches/pcls/filter-z-range so its loaders behave identically, and build
+    the explicit FitConfig from the checkpoint's cfg.
+    Returns (fit_config, model_z_begin, model_z_end); the model z-range shapes
+    the transform's flow field independently of the filtering z-range."""
     cfg = fs.Config().as_dict()
     cfg.update(checkpoint['cfg'])
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    fs.cfg = cfg
+    # We compute no shell losses; zero their weights so the context's
+    # shell_losses_enabled() gate stops load_host_inputs() from loading the
+    # shell (replacing the old fs.shell_losses_enabled = lambda: False
+    # override). Nothing else in the host-loading path reads these weights.
+    cfg['loss_weight_shell_outer'] = 0.0
+    cfg['loss_weight_shell_patch_radius'] = 0.0
+    fit_config = fs.FitConfig(cfg)
     fs.verified_patches_path = patches_dir
     # Attachment is over the verified patch set only, so skip the (slow, unrelated)
     # unverified patches; they don't change the cross-patch / attached pcl set.
@@ -178,8 +185,6 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     fs.umbilicus_z_to_yx = (
         lambda path=umbilicus_path: fs.json_umbilicus_z_to_yx(path, coordinate_scale=1.0)
     )
-    # We don't compute shell losses; stop prepare_patches from loading the shell.
-    fs.shell_losses_enabled = lambda: False
     # This analysis needs no scroll volume, track store, or outer shell:
     # keep load_host_inputs() from touching those training-only inputs
     # (the old load_only_patches_and_point_collections early return
@@ -187,15 +192,14 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     fs.scroll_zarr_path = None
     fs.tracks_dbm_path = None
     fs.shell_path = None
-    return int(checkpoint['z_begin']), int(checkpoint['z_end'])
+    return fit_config, int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
-def build_transform(checkpoint, model_z_begin, model_z_end):
+def build_transform(checkpoint, cfg, model_z_begin, model_z_end):
     """Reconstruct the slice->spiral transform and dr_per_winding from the
     checkpoint, using fit_spiral's own model class. The flow field is shaped by
     the checkpoint's (model) z-range, not the filtering z-range."""
     device = torch.device('cuda')
-    cfg = fs.cfg
 
     all_zs = np.arange(model_z_begin, model_z_end)
     umbilicus_fn = fs.umbilicus_z_to_yx()
@@ -929,7 +933,7 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     print(f'loading checkpoint {checkpoint}')
     from checkpoint_io import load_checkpoint_cpu
     ckpt = load_checkpoint_cpu(checkpoint)
-    model_z_begin, model_z_end = install_globals(
+    fit_config, model_z_begin, model_z_end = install_globals(
         ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
     )
     print(f'checkpoint (model) z-range: [{model_z_begin}, {model_z_end}); '
@@ -941,7 +945,7 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         )
 
     print('loading + z-filtering patches and point-collections')
-    context = fs.FitContext()
+    context = fs.FitContext(fit_config)
     context.load_host_inputs()
     patches = context.verified_patches
     # fit_spiral holds the cross-patch pcls as a list; this tool's
@@ -956,7 +960,7 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     patch = patches[patch_id]
 
     print('rebuilding spiral transform from checkpoint')
-    transform, dr = build_transform(ckpt, model_z_begin, model_z_end)
+    transform, dr = build_transform(ckpt, fit_config, model_z_begin, model_z_end)
     dr_value = float(dr.item())
     print(f'dr_per_winding = {dr_value:.4f}')
 

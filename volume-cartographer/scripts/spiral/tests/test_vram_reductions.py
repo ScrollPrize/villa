@@ -306,16 +306,13 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         atlas = self.PatchAtlas(patches, device='cuda')
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
-        previous_cfg = losses_module.cfg
-        losses_module.cfg = {'patch_strip_sampling': 'straight'}
-        try:
-            np.random.seed(0)
-            probabilities = np.full(3, 1 / 3, dtype=np.float64)
-            ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
-                'test_patches', list(patches.values()), probabilities,
-                num_to_sample=4, num_points_per_direction=6, patch_atlas=atlas)
-        finally:
-            losses_module.cfg = previous_cfg
+        cfg = {'patch_strip_sampling': 'straight'}
+        np.random.seed(0)
+        probabilities = np.full(3, 1 / 3, dtype=np.float64)
+        ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
+            'test_patches', list(patches.values()), probabilities,
+            num_to_sample=4, num_points_per_direction=6, cfg=cfg,
+            patch_atlas=atlas)
         self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
         self.assertTrue(zyxs_gpu.is_cuda)
         idx_cpu = idx_gpu.cpu()
@@ -332,8 +329,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         atlas = self.PatchAtlas(patches, device='cuda')
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
-        previous_cfg = losses_module.cfg
-        losses_module.cfg = {'patch_strip_sampling': 'straight'}
+        cfg = {'patch_strip_sampling': 'straight'}
         os.environ['FIT_SPIRAL_PREFETCH'] = '1'
         try:
             probabilities = np.full(3, 1 / 3, dtype=np.float64)
@@ -342,14 +338,14 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
             for _ in range(2):
                 ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
                     'test_prefetch_patches', list(patches.values()), probabilities,
-                    num_to_sample=4, num_points_per_direction=6, patch_atlas=atlas)
+                    num_to_sample=4, num_points_per_direction=6, cfg=cfg,
+                    patch_atlas=atlas)
                 self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
                 expected = atlas.lookup(
                     idx_gpu.cpu()[None, :, None].expand(2, 4, 6), ijs_gpu.cpu())
                 torch.testing.assert_close(zyxs_gpu, expected)
         finally:
             os.environ.pop('FIT_SPIRAL_PREFETCH', None)
-            losses_module.cfg = previous_cfg
             prefetch_module.get_prefetcher().drop(
                 ('test_prefetch_patches', 4, 6))
 

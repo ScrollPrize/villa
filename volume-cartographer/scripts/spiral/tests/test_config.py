@@ -2,7 +2,21 @@ import json
 
 import pytest
 
-from config import Config
+from config import Config, FitConfig
+
+
+def test_fit_config_wraps_a_resolved_mapping_with_dict_style_access():
+    values = Config().as_dict()
+    fit_config = FitConfig(values)
+    assert fit_config["optimizer_random_seed"] == values["optimizer_random_seed"]
+    assert fit_config.get("missing_key", 42) == 42
+    assert "optimizer_random_seed" in fit_config
+    assert dict(fit_config) == values
+
+    fit_config.update({"optimizer_random_seed": 7})
+    assert fit_config["optimizer_random_seed"] == 7
+    # Construction copied the mapping: the caller's dict is untouched.
+    assert values["optimizer_random_seed"] == 1
 
 
 def test_catalog_is_complete_and_presets_are_resolved():

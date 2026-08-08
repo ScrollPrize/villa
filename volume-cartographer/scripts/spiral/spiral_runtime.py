@@ -22,7 +22,7 @@ import uuid
 
 from fit_session import (SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig,
                          run_mutable_config)
-from config import Config
+from config import Config, FitConfig
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -129,13 +129,11 @@ class InteractiveFitSession:
         self._publish_status()
 
     def _fit_main(self):
-        wandb = None
         context = None
         distributed_initialized = False
         try:
             self._progress_reporter().begin("loading", "Importing Torch and fitter")
             self._set_state("Loading", "Importing Torch and fitter")
-            import wandb
             import fit_spiral as fitter
             from ddp_helpers import (maybe_destroy_distributed,
                                      maybe_init_distributed)
@@ -238,26 +236,25 @@ class InteractiveFitSession:
             fitter.lasagna_storage_backend = self.run_config.storage_backend
             fitter.cache_path = self.paths.cache_directory
             fitter.render_volume_scale = self.run_config.render_volume_scale
-            fitter.run_tag = self.run_config.run_tag or None
             fitter.umbilicus_z_to_yx = lambda: fitter.json_umbilicus_z_to_yx(
                 self.paths.umbilicus, coordinate_scale=1.0)
-            os.environ['FIT_SPIRAL_OUT_DIR'] = self.paths.output_directory
-            if self.paths.checkpoint:
-                os.environ['FIT_SPIRAL_RESUME_PATH'] = self.paths.checkpoint
-                os.environ['FIT_SPIRAL_RESUME_STEP'] = str(self.run_config.legacy_checkpoint_step)
-            else:
-                os.environ.pop('FIT_SPIRAL_RESUME_PATH', None)
-                os.environ.pop('FIT_SPIRAL_RESUME_STEP', None)
 
-            wandb.init(project='scrolls', config=config, mode='disabled')
-            fitter.cfg = wandb.config
-            fitter.configure_losses(fitter.cfg, fitter.z_begin, fitter.z_end)
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._set_state("Loading", "Loading fit inputs and model")
             # The runtime is the execution owner of the context: it constructs
             # it, drives every phase on this fitter thread, and closes it.
+            # Configuration and the fit controls (resume, output directory,
+            # run tag) are passed explicitly; no module-global cfg, no
+            # FIT_SPIRAL_* environment variables, and no wandb run.
             context = fitter.FitContext(
-                interactive_driver=self, progress=self.progress)
+                FitConfig(config),
+                interactive_driver=self,
+                progress=self.progress,
+                resume_path=self.paths.checkpoint or None,
+                resume_step=(self.run_config.legacy_checkpoint_step
+                             if self.paths.checkpoint else 0),
+                out_base_dir=self.paths.output_directory,
+                run_tag=self.run_config.run_tag or None)
             context.load_host_inputs()
             context.resolve_output_path()
             context.build_device_state()
@@ -278,8 +275,6 @@ class InteractiveFitSession:
             if context is not None:
                 # Resource release runs here, on the owning fitter thread.
                 context.close()
-            if wandb is not None:
-                wandb.finish(quiet=True)
             if distributed_initialized:
                 maybe_destroy_distributed()
             self._progress_reporter().close()

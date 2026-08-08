@@ -207,7 +207,6 @@ def run(spec_path, result_path, out_dir):
         spec = json.load(spec_file)
 
     os.makedirs(out_dir, exist_ok=True)
-    os.environ['FIT_SPIRAL_OUT_DIR'] = out_dir
     # Mesh export is slow and exercises no fitting behavior; keep the golden
     # run focused on the training loop and checkpoint.
     os.environ.setdefault('FIT_SPIRAL_SKIP_SAVE_MESH', '1')
@@ -218,7 +217,7 @@ def run(spec_path, result_path, out_dir):
     import wandb
 
     import fit_spiral as fs
-    from config import Config
+    from config import Config, FitConfig
     from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
 
     module_globals = derive_module_globals(spec)
@@ -230,7 +229,9 @@ def run(spec_path, result_path, out_dir):
         f'{dataset}/umbilicus.json', coordinate_scale=1.0)
 
     # Mirror fit_spiral.__main__ (single process, no DDP): resolve config,
-    # scale per-step counts for the z-range, then hand wandb.config to main().
+    # scale per-step counts for the z-range, then hand an explicit FitConfig
+    # to main(). wandb stays exactly as the CLI uses it: an optional
+    # (disabled) logging sink, never a source of configuration.
     config = Config().as_dict()
     config.update(spec.get('config_overrides', {}))
     config['optimizer_num_training_steps'] = spec['iterations']
@@ -239,10 +240,9 @@ def run(spec_path, result_path, out_dir):
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
         floors=SAMPLING_COUNT_FLOORS,
     )
+    fit_config = FitConfig(config)
 
     wandb.init(project='scrolls', config=config, mode='disabled')
-    fs.cfg = wandb.config
-    fs.configure_losses(fs.cfg, fs.z_begin, fs.z_end)
 
     # The training loop reports per-loss-family values through wandb.log every
     # 200 iterations; capture those payloads instead of parsing stdout.
@@ -257,7 +257,12 @@ def run(spec_path, result_path, out_dir):
 
     wandb.log = capture_log
 
-    fs.main(progress=None)
+    fs.main(
+        fit_config,
+        progress=None,
+        out_base_dir=out_dir,
+        run_name=wandb.run.name if wandb.run is not None else None,
+    )
 
     checkpoints = glob.glob(f'{out_dir}/*/checkpoint_fitted.ckpt')
     assert len(checkpoints) == 1, f'expected one final checkpoint, found {checkpoints}'
@@ -270,7 +275,7 @@ def run(spec_path, result_path, out_dir):
 
     result = {
         'spec': spec,
-        'resolved_config': dict(fs.cfg),
+        'resolved_config': dict(fit_config),
         'metrics': [
             {'iteration': index * 200, 'values': values}
             for index, values in enumerate(logged)

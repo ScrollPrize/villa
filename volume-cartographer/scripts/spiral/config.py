@@ -401,3 +401,51 @@ class Config:
             },
             "presets": presets,
         }
+
+
+class FitConfig:
+    """The one explicit fitter configuration: a resolved key -> value mapping.
+
+    A thin dict-style wrapper handed to FitContext, replacing the module
+    global `wandb.config` object the fitter used to read. Values must
+    already be fully resolved (Config defaults + overrides + any z-range
+    scaling); FitConfig performs no resolution of its own because the
+    resolution policies legitimately differ per entry point (the CLI
+    scales-and-splits for DDP, the interactive runtime round-trips
+    checkpoint counts, the golden driver scales without splitting).
+
+    Construction copies the mapping. update() mutates in place, so every
+    holder of the same FitConfig (the context, its losses call sites, a
+    driver that recorded it) observes run-boundary configuration changes,
+    matching the former shared-wandb.config semantics.
+    """
+
+    def __init__(self, values):
+        self._values = dict(values)
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __contains__(self, key):
+        return key in self._values
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+    def keys(self):
+        return self._values.keys()
+
+    def items(self):
+        return self._values.items()
+
+    def update(self, values):
+        self._values.update(values)
+
+    def __repr__(self):
+        return f"FitConfig({self._values!r})"
