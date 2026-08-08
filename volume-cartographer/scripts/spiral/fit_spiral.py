@@ -3298,7 +3298,8 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
 if __name__ == '__main__':
     import argparse
 
-    from fit_session import conventional_input_paths, load_scroll_spec
+    from fit_session import (conventional_input_paths, default_user_cache_dir,
+                             load_scroll_spec)
 
     parser = argparse.ArgumentParser(
         description='Headless Spiral fit over one dataset root.')
@@ -3310,6 +3311,11 @@ if __name__ == '__main__':
         '--scroll-spec', default=None,
         help='Explicit scroll specification file '
              '(default: <dataset>/spiral-scroll.json)')
+    parser.add_argument(
+        '--cache', default=None,
+        help='Directory for derived host caches, shared with the interactive '
+             'service (default: $FIT_SPIRAL_CACHE_DIR if set, else '
+             '$XDG_CACHE_HOME/vc3d/spiral, i.e. ~/.cache/vc3d/spiral)')
     cli_args = parser.parse_args()
 
     scroll_spec = load_scroll_spec(cli_args.dataset, cli_args.scroll_spec)
@@ -3369,7 +3375,9 @@ if __name__ == '__main__':
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),
             run_name=wandb.run.name if wandb.run is not None else None,
-            cache_dir=os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache'),
+            cache_dir=(cli_args.cache
+                       or os.environ.get('FIT_SPIRAL_CACHE_DIR')
+                       or default_user_cache_dir()),
             render_volume_scale=int(
                 os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '16')),
         )

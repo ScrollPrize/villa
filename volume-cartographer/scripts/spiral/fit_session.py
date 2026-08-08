@@ -19,11 +19,12 @@ import zipfile
 from config import Config
 
 
-# Version 16 introduces the versioned scroll specification
-# (spiral-scroll.json): outward sense is a scroll property and no longer part
-# of the load request, and z_begin/z_end are Config keys stored in
-# checkpoint configurations.
-API_VERSION = 16
+# Version 17 binds dataset/output/cache to the service connection: --dataset
+# and --output are required startup arguments, dataset resolution describes
+# inputs only (the service injects the startup-resolved output/cache into the
+# /dataset advertisement), and the /dataset/resolve browse endpoint is
+# removed — resolution happens once at startup.
+API_VERSION = 17
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -619,10 +620,19 @@ def _dbm_candidates(root: Path) -> list[str]:
     return sorted(logical)
 
 
+def default_user_cache_dir() -> str:
+    """The one documented user cache location, outside any dataset.
+
+    ``$XDG_CACHE_HOME/vc3d/spiral`` (``~/.cache/vc3d/spiral`` by default).
+    Cache entries are content-addressed, so one shared directory serves every
+    dataset; ``--cache`` overrides it per service or CLI run.
+    """
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    return _normalise_path(base / "vc3d" / "spiral")
+
+
 def resolve_dataset_root(
     root_value: str | os.PathLike[str],
-    *,
-    session_name: str = "",
 ) -> SpiralDatasetResolution:
     root = Path(_normalise_path(root_value))
     result = SpiralDatasetResolution(root=str(root))
@@ -687,19 +697,10 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append("tracks_dbm")
 
-    output_directory = root / "spiral_output"
-    if session_name:
-        output_directory /= session_name
-    result.resolved["output_directory"] = _normalise_path(output_directory)
-    local_cache = root / ".spiral-cache"
-    parent_writable = os.access(root, os.W_OK)
-    if local_cache.is_dir() or parent_writable:
-        result.resolved["cache_directory"] = _normalise_path(local_cache)
-    else:
-        fallback = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "vc3d" / "spiral"
-        result.resolved["cache_directory"] = _normalise_path(fallback)
-        result.warnings.append("Dataset root is not writable; using the user Spiral cache")
-
+    # Dataset resolution describes inputs only. The service binds the
+    # startup-resolved --output/--cache into the advertised resolution
+    # (spiral_service.bind_service_paths); nothing generated lives under
+    # the dataset root.
     checkpoints = sorted(
         _normalise_path(path)
         for path in root.glob("*.ckpt")

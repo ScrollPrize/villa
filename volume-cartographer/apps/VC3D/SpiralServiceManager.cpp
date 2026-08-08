@@ -42,8 +42,21 @@ constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 16;
+constexpr int kSupportedApiVersion = 17;
 constexpr int kPreviewCacheKept = 3;
+
+// Deterministic per-dataset default output root, outside the dataset: the
+// service requires --output and rejects a location under --dataset.
+QString defaultLocalOutputRoot(const QString& datasetRoot)
+{
+    const QString canonical = QFileInfo(datasetRoot).absoluteFilePath();
+    const QString digest = QString::fromLatin1(
+        QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256)
+            .toHex().left(8));
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + QStringLiteral("/spiral-output/%1-%2")
+              .arg(QFileInfo(canonical).fileName(), digest);
+}
 
 QString stateName(SpiralServiceManager::ConnectionState state)
 {
@@ -254,10 +267,34 @@ void SpiralServiceManager::startTunnel()
 
 void SpiralServiceManager::startLocalProcess()
 {
-    if (ownsProcess()) {
-        // Reuse the already-running owned service.
-        beginHandshake();
+    // The owned service is bound to one dataset/output/cache triple at
+    // startup; a different selection is a different service instance.
+    if (_profile.datasetRoot.trimmed().isEmpty()) {
+        const QString message = tr("The local Spiral service needs a dataset root. "
+                                   "Set it in the Spiral Service connection panel.");
+        setConnectionState(ConnectionState::Failed, message);
+        emit errorOccurred(message);
         return;
+    }
+    QString outputRoot = _profile.outputRoot.trimmed();
+    if (outputRoot.isEmpty())
+        outputRoot = defaultLocalOutputRoot(_profile.datasetRoot.trimmed());
+    QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
+                        QStringLiteral("--output"), outputRoot};
+    if (!_profile.cacheRoot.trimmed().isEmpty())
+        binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
+
+    if (ownsProcess()) {
+        if (binding == _ownedLaunchBinding) {
+            // Reuse the already-running owned service: same bound instance.
+            beginHandshake();
+            return;
+        }
+        // A different dataset/output/cache selection restarts the owned
+        // process with the new binding.
+        emit logMessage(tr("Restarting the local Spiral service for a different "
+                           "dataset binding"));
+        stopService();
     }
     const QString python = findPython();
     const QString service = findService();
@@ -310,8 +347,11 @@ void SpiralServiceManager::startLocalProcess()
     environment.insert(QStringLiteral("PYTHONUNBUFFERED"), QStringLiteral("1"));
     _process->setProcessEnvironment(environment);
     setConnectionState(ConnectionState::Starting);
-    _process->start(python, {service, QStringLiteral("--nonce"), _credential,
-                             QStringLiteral("--parent-pid"), QString::number(QCoreApplication::applicationPid())});
+    _ownedLaunchBinding = binding;
+    _process->start(python, QStringList{service, QStringLiteral("--nonce"), _credential,
+                                        QStringLiteral("--parent-pid"),
+                                        QString::number(QCoreApplication::applicationPid())}
+                                + binding);
 }
 
 void SpiralServiceManager::beginHandshake()
@@ -506,7 +546,11 @@ void SpiralServiceManager::ensureStarted()
     if (_connectionState == ConnectionState::Ready
         || _connectionState == ConnectionState::Starting
         || _connectionState == ConnectionState::Connecting) return;
-    if (_profile.id.isEmpty()) _profile = SpiralServiceProfile::localhostProfile();
+    if (_profile.id.isEmpty()) {
+        // Pick up the persisted local launch binding (dataset/output/cache).
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _profile = SpiralServiceProfile::localhostProfile(&settings);
+    }
     connectToService(_profile);
 }
 
@@ -541,14 +585,6 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     request.setRawHeader("X-Spiral-Client", _clientId.toUtf8());
     request.setTransferTimeout(timeoutMs);
     return request;
-}
-
-void SpiralServiceManager::resolveDataset(const QString& root)
-{
-    if (!isReady()) { ensureStarted(); emit errorOccurred(tr("Spiral service is not connected; retry dataset resolution when Ready.")); return; }
-    post(QStringLiteral("/dataset/resolve"), {{QStringLiteral("dataset_root"), root}},
-         Timeout::Command,
-         [this](const QJsonObject& value) { emit datasetResolved(value); });
 }
 
 void SpiralServiceManager::loadSession(QJsonObject request)

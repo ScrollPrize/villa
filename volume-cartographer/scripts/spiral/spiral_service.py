@@ -5,6 +5,12 @@ The service binds to loopback by default. Non-loopback binds are explicit and
 always carry bearer authentication; every client — including VC3D talking to a
 process it launched itself — uses the same authenticated HTTP protocol.
 
+Every service is bound to one dataset at startup: ``--dataset`` (inputs,
+resolved once and advertised through ``/dataset``) and ``--output`` (all
+generated state) are required; ``--cache`` defaults to the documented user
+cache (``$XDG_CACHE_HOME/vc3d/spiral``). Both --output and --cache must
+resolve outside the dataset root — the dataset holds inputs only.
+
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
@@ -48,9 +54,10 @@ from vc3d_fiber_format_adapter import (
 )
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS,
-                         ScrollSpecError, fit_input, input_change_impact,
-                         load_scroll_spec, parse_session_request,
-                         resolve_dataset_root, validate_checkpoint_container,
+                         ScrollSpecError, default_user_cache_dir, fit_input,
+                         input_change_impact, load_scroll_spec,
+                         parse_session_request, resolve_dataset_root,
+                         validate_checkpoint_container,
                          validate_session_request)
 from config import Config
 
@@ -90,9 +97,9 @@ _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _PCL_ROLE_FILES = {
     role.value: filename for role, filename, _ in PCL_ROLE_CONVENTIONS}
 
-# Base input paths are owned by the service when it was launched with
-# --dataset; a load request may then only choose among service-advertised
-# values for these keys.
+# Base input paths are owned by the service (every launch carries --dataset);
+# a load request may only choose among service-advertised values for these
+# keys.
 _DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm")
 
 
@@ -131,6 +138,19 @@ def parse_session_name(value):
             "--session-name must be 1-64 characters, start with a letter or "
             "digit, and contain only letters, digits, '.', '_', or '-'")
     return name
+
+
+def bind_service_paths(resolution, output_directory, cache_directory):
+    """Attach the startup-resolved output/cache roots to the advertisement.
+
+    Dataset resolution describes inputs only; where generated state lives
+    (--output) and where derived host caches live (--cache) are service
+    startup decisions. /dataset advertises the bound result so clients see
+    one immutable set of paths.
+    """
+    resolution.resolved["output_directory"] = str(output_directory)
+    resolution.resolved["cache_directory"] = str(cache_directory)
+    return resolution
 
 
 class FileLockUnavailable(RuntimeError):
@@ -1259,20 +1279,6 @@ class ServiceState:
             raise ApiError(HTTPStatus.NOT_FOUND,
                            "This service was not launched with --dataset")
         return {**self._base(), **self.dataset_resolution.to_dict()}
-
-    def resolve(self, root_value):
-        if self.dataset_resolution is not None:
-            requested = str(root_value or "").strip()
-            if requested and Path(requested).resolve(strict=False) != \
-                    Path(self.dataset_root).resolve(strict=False):
-                raise ApiError(HTTPStatus.FORBIDDEN,
-                               "This service resolves only the dataset it was launched with")
-            return self.dataset()
-        return {
-            **self._base(),
-            **resolve_dataset_root(
-                root_value, session_name=self.session_name).to_dict(),
-        }
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -2568,8 +2574,14 @@ class ServiceState:
                             and record["state"] == "incorporated")
                 ]
                 if self.dataset_resolution is not None:
-                    self.dataset_resolution = resolve_dataset_root(
-                        self.dataset_root, session_name=self.session_name)
+                    # Re-advertise the dataset with the committed inputs, but
+                    # keep the startup-bound output/cache roots: deployment
+                    # paths never change after launch.
+                    previous = self.dataset_resolution.resolved
+                    self.dataset_resolution = bind_service_paths(
+                        resolve_dataset_root(self.dataset_root),
+                        previous.get("output_directory", ""),
+                        previous.get("cache_directory", ""))
                 self.status_generation += 1
             return {**self.status(), "committed": committed, "accepted": True}
         finally:
@@ -2832,8 +2844,6 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.finalize_upload(match.group(1))
             body = self._body()
             command_id = body.get("command_id")
-            if path == "/dataset/resolve":
-                return state.resolve(body.get("dataset_root", ""))
             if path == "/service/restart":
                 return state.deduplicated(command_id, self.server.request_restart)
             if path == "/session/inputs":
@@ -2947,13 +2957,25 @@ def main(argv=None):
     parser.add_argument("--nonce", default=None,
                         help="Ephemeral credential for a VC3D-owned local process")
     parser.add_argument("--parent-pid", type=int, default=0)
-    parser.add_argument("--dataset", default=None,
-                        help="Dataset root owned by this service; required for a "
-                             "non-loopback bind. Clients cannot repoint base inputs.")
+    parser.add_argument("--dataset", required=True,
+                        help="Dataset root owned by this service (inputs only; "
+                             "resolved once at startup and advertised through "
+                             "/dataset). Clients cannot repoint base inputs.")
+    parser.add_argument("--output", required=True,
+                        help="Root for all generated state (run directories, "
+                             "autosaves, previews, ephemeral inputs, upload "
+                             "staging, uploaded checkpoints). Must resolve "
+                             "outside the dataset root.")
+    parser.add_argument("--cache", default=None,
+                        help="Directory for derived host caches; must resolve "
+                             "outside the dataset root (default: "
+                             "$XDG_CACHE_HOME/vc3d/spiral, i.e. "
+                             "~/.cache/vc3d/spiral)")
     parser.add_argument("--service-name", default=None)
     parser.add_argument(
         "--session-name", type=parse_session_name, default=None, metavar="NAME",
-        help="Stable output namespace under <dataset>/spiral_output; requires --dataset")
+        help="Stable output namespace: generated state moves to "
+             "<output>/NAME, held under an exclusive lease")
     parser.add_argument(
         "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
         help="Physical CUDA device indices to use (default: 0; example: 0,1,2,3)")
@@ -2965,14 +2987,25 @@ def main(argv=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in args.gpus)
 
     loopback = _is_loopback(args.bind)
-    if not loopback and not args.dataset:
-        parser.error("--dataset is required for a non-loopback bind: remote "
-                     "clients never supply host paths")
     if not loopback and args.nonce:
         parser.error("--nonce is only for VC3D-owned loopback processes; use the "
                      "API key file for network binds")
-    if args.session_name and not args.dataset:
-        parser.error("--session-name requires --dataset")
+
+    # Deployment roots are bound once at startup. --output owns every piece
+    # of generated state; the dataset root holds inputs only, so both the
+    # output and cache roots must resolve (realpath) outside it.
+    dataset_root = Path(args.dataset).expanduser().resolve(strict=False)
+    output_root = Path(args.output).expanduser().resolve(strict=False)
+    if output_root == dataset_root or output_root.is_relative_to(dataset_root):
+        parser.error(f"--output must resolve outside the dataset root: "
+                     f"{output_root} is inside {dataset_root}")
+    if args.session_name:
+        output_root = output_root / args.session_name
+    cache_root = Path(args.cache).expanduser().resolve(strict=False) \
+        if args.cache else Path(default_user_cache_dir())
+    if cache_root == dataset_root or cache_root.is_relative_to(dataset_root):
+        parser.error(f"--cache must resolve outside the dataset root: "
+                     f"{cache_root} is inside {dataset_root}")
 
     credentials = []
     if args.nonce:
@@ -2986,48 +3019,46 @@ def main(argv=None):
         print(f"Spiral API key ({'generated' if created else 'reused'}; copy "
               f"into VC3D): {key}", flush=True)
 
-    dataset_resolution = None
     session_lease = None
-    if args.dataset:
-        dataset_resolution = resolve_dataset_root(
-            args.dataset, session_name=args.session_name or "")
-        if not dataset_resolution.ok:
-            print("Refusing to start: the launch dataset is incomplete.",
+    dataset_resolution = resolve_dataset_root(args.dataset)
+    if not dataset_resolution.ok:
+        print("Refusing to start: the launch dataset is incomplete.",
+              file=sys.stderr, flush=True)
+        for key in dataset_resolution.missing_required:
+            print(f"  missing required: {key}", file=sys.stderr, flush=True)
+        for key, options in dataset_resolution.ambiguities.items():
+            print(f"  ambiguous {key}: {', '.join(options)}",
                   file=sys.stderr, flush=True)
-            for key in dataset_resolution.missing_required:
-                print(f"  missing required: {key}", file=sys.stderr, flush=True)
-            for key, options in dataset_resolution.ambiguities.items():
-                print(f"  ambiguous {key}: {', '.join(options)}",
-                      file=sys.stderr, flush=True)
+        return 2
+    for warning in dataset_resolution.warnings:
+        print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
+    bind_service_paths(dataset_resolution, output_root, cache_root)
+    if args.session_name:
+        # The named-session exclusive lease lives under the corresponding
+        # output namespace (<output>/<session-name>).
+        try:
+            output_root.mkdir(parents=True, exist_ok=True)
+            session_lease = ExclusiveFileLock(
+                output_root / ".spiral-service.lock")
+            session_lease.acquire()
+        except FileLockUnavailable:
+            print(
+                f"Refusing to start: Spiral session {args.session_name!r} "
+                "is already owned by another service process.",
+                file=sys.stderr, flush=True)
             return 2
-        for warning in dataset_resolution.warnings:
-            print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
-        if args.session_name:
-            output_directory = Path(
-                dataset_resolution.resolved["output_directory"])
-            try:
-                output_directory.mkdir(parents=True, exist_ok=True)
-                session_lease = ExclusiveFileLock(
-                    output_directory / ".spiral-service.lock")
-                session_lease.acquire()
-            except FileLockUnavailable:
-                print(
-                    f"Refusing to start: Spiral session {args.session_name!r} "
-                    "is already owned by another service process.",
-                    file=sys.stderr, flush=True)
-                return 2
-            except OSError as exc:
-                print(
-                    f"Refusing to start: cannot create or lock named session "
-                    f"output {output_directory}: {exc}",
-                    file=sys.stderr, flush=True)
-                return 2
+        except OSError as exc:
+            print(
+                f"Refusing to start: cannot create or lock named session "
+                f"output {output_root}: {exc}",
+                file=sys.stderr, flush=True)
+            return 2
 
     logs = ServiceLogBuffer()
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(original_stdout, logs, "stdout")
     sys.stderr = _TeeStream(original_stderr, logs, "stderr")
-    state = ServiceState(dataset_root=args.dataset,
+    state = ServiceState(dataset_root=str(dataset_root),
                          dataset_resolution=dataset_resolution,
                          service_name=args.service_name,
                          session_name=args.session_name or "",
@@ -3063,6 +3094,9 @@ def main(argv=None):
     # remote attach validate compatibility through one code path.
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
+    print(f"Spiral dataset root: {dataset_root}", flush=True)
+    print(f"Spiral output root: {output_root}", flush=True)
+    print(f"Spiral cache root: {cache_root}", flush=True)
     if args.session_name:
         print(f"Spiral session name: {args.session_name}", flush=True)
     print(f"SPIRAL_SERVICE_READY port={server.server_port}", flush=True)

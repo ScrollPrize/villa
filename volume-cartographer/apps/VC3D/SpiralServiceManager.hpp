@@ -58,7 +58,6 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    void resolveDataset(const QString& root);
     void loadSession(QJsonObject request);
     void runIterations(int iterations, const QJsonObject& influenceConfig,
                        const QJsonObject& runConfig,
@@ -159,6 +158,7 @@ private:
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
+    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache of _process
     QNetworkAccessManager* _network = nullptr;
     SpiralSshTunnel* _tunnel = nullptr;
     SpiralArtifactCache* _artifactCache = nullptr;

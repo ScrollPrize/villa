@@ -258,23 +258,33 @@ class NamedSessionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_session_name(value)
 
-    def test_named_resolution_isolates_output_but_shares_cache(self):
+    def test_resolution_describes_inputs_only_until_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary) / "dataset"
+            root.mkdir()
             _write_scroll_spec(root)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
-            unnamed = resolve_dataset_root(root)
-            alice = resolve_dataset_root(root, session_name="alice")
-            bob = resolve_dataset_root(root, session_name="bob")
-            self.assertEqual(unnamed.resolved["output_directory"],
-                             str(root / "spiral_output"))
-            self.assertEqual(alice.resolved["output_directory"],
-                             str(root / "spiral_output" / "alice"))
-            self.assertEqual(bob.resolved["output_directory"],
-                             str(root / "spiral_output" / "bob"))
-            self.assertEqual(alice.resolved["cache_directory"],
-                             bob.resolved["cache_directory"])
+            resolution = resolve_dataset_root(root)
+            self.assertNotIn("output_directory", resolution.resolved)
+            self.assertNotIn("cache_directory", resolution.resolved)
+            output = Path(temporary) / "output" / "alice"
+            cache = Path(temporary) / "cache"
+            spiral_service.bind_service_paths(resolution, output, cache)
+            self.assertEqual(resolution.resolved["output_directory"], str(output))
+            self.assertEqual(resolution.resolved["cache_directory"], str(cache))
+
+    def test_default_user_cache_dir_honours_xdg_and_is_stable(self):
+        from fit_session import default_user_cache_dir
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": temporary}):
+                self.assertEqual(default_user_cache_dir(),
+                                 str(Path(temporary).resolve() / "vc3d" / "spiral"))
+            with mock.patch.dict(os.environ, clear=True):
+                os.environ["HOME"] = temporary
+                self.assertEqual(
+                    default_user_cache_dir(),
+                    str(Path(temporary).resolve() / ".cache" / "vc3d" / "spiral"))
 
     def test_exclusive_lock_rejects_duplicate_live_owner_and_releases(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -557,12 +567,17 @@ class ArtifactHttpTests(HttpServiceFixture):
 class DatasetOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        base = Path(self.temporary.name)
+        self.root = base / "dataset"
+        self.root.mkdir()
         _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
-        (self.root / "spiral_output").mkdir()
-        self.resolution = resolve_dataset_root(self.root)
+        self.output = base / "output"
+        self.output.mkdir()
+        self.cache = base / "cache"
+        self.resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
                                   dataset_resolution=self.resolution)
@@ -574,9 +589,15 @@ class DatasetOwnershipTests(unittest.TestCase):
         response = self.state.dataset()
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
+        # The startup-bound deployment roots are part of the advertisement.
+        self.assertEqual(response["resolved"]["output_directory"],
+                         str(self.output))
+        self.assertEqual(response["resolved"]["cache_directory"],
+                         str(self.cache))
 
     def test_dataset_endpoint_advertises_named_session(self):
-        resolution = resolve_dataset_root(self.root, session_name="alice")
+        resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output / "alice", self.cache)
         state = ServiceState(
             dataset_root=str(self.root), dataset_resolution=resolution,
             session_name="alice")
@@ -584,7 +605,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["session_name"], "alice")
         self.assertEqual(
             response["resolved"]["output_directory"],
-            str(self.root / "spiral_output" / "alice"))
+            str(self.output / "alice"))
 
     def test_dataset_resolution_discovers_drawn_control_points(self):
         drawn = self.root / "drawn_control_points.json"
@@ -612,13 +633,18 @@ class DatasetOwnershipTests(unittest.TestCase):
             "path": str(same_winding), "role": "same_winding", "required": False,
         }])
 
-    def test_arbitrary_root_resolution_is_refused(self):
-        with self.assertRaises(ApiError) as caught:
-            self.state.resolve("/somewhere/else")
-        self.assertEqual(caught.exception.status, 403)
-        # The launch dataset itself (or an empty root) returns the resolution.
-        self.assertEqual(self.state.resolve("")["root"], str(self.root))
-        self.assertEqual(self.state.resolve(str(self.root))["root"], str(self.root))
+    def test_generated_state_roots_live_under_the_output_root(self):
+        # Every generated-state family hangs off the bound --output root and
+        # never off the dataset.
+        self.assertEqual(self.state._output_root(), self.output)
+        self.assertEqual(self.state._staging_root(),
+                         self.output / ".spiral-upload-staging")
+        self.assertEqual(self.state._checkpoint_upload_root(),
+                         self.output / "uploaded-checkpoints")
+        _attach_fake_session(self.state, self.output, self.root)
+        ephemeral = self.state._session_ephemeral_dir()
+        self.assertTrue(ephemeral.is_relative_to(self.output))
+        self.assertFalse(ephemeral.is_relative_to(self.root))
 
     def test_load_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
@@ -704,12 +730,12 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertIsNone(status["session_request"])
 
     def test_save_checkpoint_is_constrained_to_output_directory(self):
-        _attach_fake_session(self.state, self.root / "spiral_output", self.root)
+        _attach_fake_session(self.state, self.output, self.root)
         with self.assertRaises(ApiError) as caught:
             self.state.save_checkpoint({"path": str(self.root / "elsewhere.ckpt")})
         self.assertEqual(caught.exception.status, 400)
         response = self.state.save_checkpoint(
-            {"path": str(self.root / "spiral_output" / "manual.ckpt")})
+            {"path": str(self.output / "manual.ckpt")})
         self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
 
 
@@ -1017,12 +1043,16 @@ def _zip_checkpoint_bytes(payload=b"payload"):
 class CheckpointUploadTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        base = Path(self.temporary.name)
+        self.root = base / "dataset"
+        self.root.mkdir()
         _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
-        (self.root / "spiral_output").mkdir()
-        self.resolution = resolve_dataset_root(self.root)
+        self.output = base / "output"
+        self.output.mkdir()
+        self.resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, base / "cache")
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
                                   dataset_resolution=self.resolution)
@@ -1076,8 +1106,8 @@ class CheckpointUploadTests(unittest.TestCase):
                                   {"bad.ckpt": b"not a torch archive"})
         with self.assertRaisesRegex(ApiError, "Invalid checkpoint"):
             self.state.finalize_upload(upload_id)
-        self.assertFalse(any((self.root / "spiral_output" / "uploaded-checkpoints").glob("*"))
-                         if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
+        self.assertFalse(any((self.output / "uploaded-checkpoints").glob("*"))
+                         if (self.output / "uploaded-checkpoints").exists()
                          else False)
 
     def test_identical_checkpoint_is_reused_without_an_upload(self):
@@ -1124,7 +1154,7 @@ class CheckpointUploadTests(unittest.TestCase):
         self.assertEqual(begin["input"]["path"], first["path"])
 
     def test_legacy_named_checkpoint_is_found_by_digest(self):
-        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root = self.output / "uploaded-checkpoints"
         root.mkdir()
         data = _zip_checkpoint_bytes()
         legacy = root / "resume-before-v7.ckpt"
@@ -1160,7 +1190,7 @@ class CheckpointUploadTests(unittest.TestCase):
         first = self.state.finalize_upload(first_id)["input"]
         second = self.state.finalize_upload(second_id)["input"]
         self.assertEqual(first["path"], second["path"])
-        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root = self.output / "uploaded-checkpoints"
         self.assertEqual([Path(first["path"])], list(root.iterdir()))
 
     def test_reusing_a_checkpoint_refreshes_retention_recency(self):
@@ -1712,12 +1742,32 @@ class LasagnaSurfaceCleanupTests(unittest.TestCase):
 class ServiceProcessTests(unittest.TestCase):
     """End-to-end launch of the real service process (no torch import)."""
 
-    def _launch(self, arguments, temporary):
+    def _launch(self, arguments, temporary, env=None):
         script = Path(__file__).resolve().parents[1] / "spiral_service.py"
+        merged_env = None
+        if env is not None:
+            merged_env = dict(os.environ)
+            merged_env.update(env)
         return subprocess.Popen(
             [sys.executable, str(script)] + arguments,
-            cwd=str(script.parent),
+            cwd=str(script.parent), env=merged_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    @staticmethod
+    def _make_dataset(temporary):
+        """A minimal valid dataset plus a sibling output root."""
+        dataset = Path(temporary) / "dataset"
+        dataset.mkdir(exist_ok=True)
+        _write_scroll_spec(dataset)
+        (dataset / "umbilicus.json").write_text("{}")
+        (dataset / "verified_patches").mkdir(exist_ok=True)
+        output = Path(temporary) / "output"
+        output.mkdir(exist_ok=True)
+        return dataset, output
+
+    def _dataset_arguments(self, temporary):
+        dataset, output = self._make_dataset(temporary)
+        return ["--dataset", str(dataset), "--output", str(output)]
 
     def _read_until_ready(self, process, deadline=30.0):
         lines = []
@@ -1734,7 +1784,8 @@ class ServiceProcessTests(unittest.TestCase):
     def test_ready_line_is_version_agnostic_and_health_negotiates(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            process = self._launch(["--port", "0", "--api-key-file", str(key_file)],
+            process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
+                                   + self._dataset_arguments(temporary),
                                    temporary)
             try:
                 lines = self._read_until_ready(process)
@@ -1769,7 +1820,8 @@ class ServiceProcessTests(unittest.TestCase):
                 reservation.bind(("127.0.0.1", 0))
                 port = reservation.getsockname()[1]
             process = self._launch(
-                ["--port", str(port), "--api-key-file", str(key_file)],
+                ["--port", str(port), "--api-key-file", str(key_file)]
+                + self._dataset_arguments(temporary),
                 temporary)
             try:
                 self._read_until_ready(process)
@@ -1805,7 +1857,7 @@ class ServiceProcessTests(unittest.TestCase):
             process = self._launch([
                 "--port", "0", "--api-key-file", str(key_file),
                 "--gpus", "3,1",
-            ], temporary)
+            ] + self._dataset_arguments(temporary), temporary)
             try:
                 lines = self._read_until_ready(process)
                 ready = next(line for line in lines
@@ -1826,8 +1878,9 @@ class ServiceProcessTests(unittest.TestCase):
     def test_explicit_port_can_be_rebound_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            process = self._launch(["--port", "0", "--api-key-file", str(key_file)],
-                                   temporary)
+            arguments = self._dataset_arguments(temporary)
+            process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
+                                   + arguments, temporary)
             try:
                 ready = [line for line in self._read_until_ready(process)
                          if line.startswith("SPIRAL_SERVICE_READY")][0]
@@ -1837,7 +1890,8 @@ class ServiceProcessTests(unittest.TestCase):
                 process.wait(10)
             # Restart on the same, now-explicit port straight away.
             process = self._launch(["--port", str(port),
-                                    "--api-key-file", str(key_file)], temporary)
+                                    "--api-key-file", str(key_file)]
+                                   + arguments, temporary)
             try:
                 self._read_until_ready(process)
             finally:
@@ -1849,24 +1903,106 @@ class ServiceProcessTests(unittest.TestCase):
             key_file = Path(temporary) / "key"
             empty = Path(temporary) / "empty-dataset"
             empty.mkdir()
+            output_root = Path(temporary) / "output"
             process = self._launch(["--port", "0", "--api-key-file", str(key_file),
-                                    "--dataset", str(empty)], temporary)
+                                    "--dataset", str(empty),
+                                    "--output", str(output_root)], temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
             self.assertIn("missing required", output)
 
+    def test_dataset_and_output_are_required_arguments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = self._launch(["--port", "0"], temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--dataset", output)
+            self.assertIn("--output", output)
+
+            dataset, _ = self._make_dataset(temporary)
+            process = self._launch(["--port", "0", "--dataset", str(dataset)],
+                                   temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--output", output)
+
+    def test_output_inside_the_dataset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset, _ = self._make_dataset(temporary)
+            for inside in (dataset, dataset / "spiral_output"):
+                process = self._launch(["--port", "0",
+                                        "--dataset", str(dataset),
+                                        "--output", str(inside)], temporary)
+                output, _ = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 2)
+                self.assertIn("--output must resolve outside the dataset root",
+                              output)
+
+    def test_cache_inside_the_dataset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset, output_root = self._make_dataset(temporary)
+            process = self._launch(["--port", "0",
+                                    "--dataset", str(dataset),
+                                    "--output", str(output_root),
+                                    "--cache", str(dataset / ".spiral-cache")],
+                                   temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--cache must resolve outside the dataset root",
+                          output)
+
+    def test_dataset_advertises_bound_output_and_default_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            dataset, output_root = self._make_dataset(temporary)
+            xdg_cache = Path(temporary) / "xdg-cache"
+            process = self._launch(
+                ["--port", "0", "--api-key-file", str(key_file),
+                 "--dataset", str(dataset), "--output", str(output_root)],
+                temporary, env={"XDG_CACHE_HOME": str(xdg_cache)})
+            try:
+                lines = self._read_until_ready(process)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/dataset",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    advertised = json.loads(response.read())
+                resolved = advertised["resolved"]
+                self.assertEqual(resolved["output_directory"],
+                                 str(output_root.resolve()))
+                self.assertEqual(
+                    resolved["cache_directory"],
+                    str(xdg_cache.resolve() / "vc3d" / "spiral"))
+                # The browse endpoint is gone: resolution happens once at
+                # startup and /dataset advertises the result.
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/dataset/resolve",
+                    method="POST",
+                    data=json.dumps({"dataset_root": str(dataset)}).encode(),
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=10)
+                self.assertEqual(caught.exception.code, 404)
+                caught.exception.close()
+            finally:
+                process.terminate()
+                process.wait(10)
+                process.stdout.close()
+
     def test_named_dataset_service_has_exclusive_restartable_ownership(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            dataset = root / "dataset"
-            dataset.mkdir()
-            _write_scroll_spec(dataset)
-            (dataset / "umbilicus.json").write_text("{}")
-            (dataset / "verified_patches").mkdir()
+            dataset, output_root = self._make_dataset(temporary)
             key_file = root / "key"
             arguments = [
                 "--port", "0", "--api-key-file", str(key_file),
-                "--dataset", str(dataset), "--session-name", "alice",
+                "--dataset", str(dataset), "--output", str(output_root),
+                "--session-name", "alice",
             ]
             first = self._launch(arguments, temporary)
             try:
@@ -1882,6 +2018,9 @@ class ServiceProcessTests(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=10) as response:
                     health = json.loads(response.read())
                 self.assertEqual(health["session_name"], "alice")
+                # The exclusive lease lives under the named output namespace.
+                self.assertTrue(
+                    (output_root / "alice" / ".spiral-service.lock").is_file())
 
                 duplicate = self._launch(arguments, temporary)
                 output, _ = duplicate.communicate(timeout=30)
@@ -1899,15 +2038,6 @@ class ServiceProcessTests(unittest.TestCase):
                 restarted.terminate()
                 restarted.wait(10)
                 restarted.stdout.close()
-
-    def test_non_loopback_bind_requires_dataset(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "key"
-            process = self._launch(["--bind", "0.0.0.0", "--port", "0",
-                                    "--api-key-file", str(key_file)], temporary)
-            output, _ = process.communicate(timeout=30)
-            self.assertNotEqual(process.returncode, 0)
-            self.assertIn("--dataset", output)
 
 
 if __name__ == "__main__":
