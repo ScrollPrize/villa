@@ -572,7 +572,7 @@ def _convert_tiled_tiff(
     )
 
 
-def _write_image_level_zero(
+def _write_label_slice(
     image_2d: np.ndarray,
     dataset: zarr.Array,
 ) -> None:
@@ -589,6 +589,32 @@ def _write_image_level_zero(
         ]
 
 
+def _downsample_image_2d(
+    image_2d: np.ndarray,
+    *,
+    downsample_mode: Literal["nearest", "mean"],
+    band_rows: int = STREAM_BLOCK_SIZE,
+) -> np.ndarray:
+    if downsample_mode == "nearest":
+        return np.ascontiguousarray(image_2d[::2, ::2])
+
+    # Averaging in bands rather than in one pass: the accumulator _downsample_mean
+    # allocates is float64, eight times the output, which for a full-size label
+    # level is several GiB. Each output pixel still comes from the same four
+    # source pixels through the same code, so the result is unchanged -- bands
+    # start on even source rows precisely so that stays true.
+    out_height = (int(image_2d.shape[0]) + 1) // 2
+    out_width = (int(image_2d.shape[1]) + 1) // 2
+    out = np.empty((out_height, out_width), dtype=image_2d.dtype)
+
+    for y_start in range(0, out_height, band_rows):
+        y_stop = min(y_start + band_rows, out_height)
+        band = image_2d[2 * y_start : 2 * y_stop]
+        out[y_start:y_stop] = _downsample_mean(band[np.newaxis])[0]
+
+    return out
+
+
 def _convert_untiled_image(
     input_path: Path,
     output_path: Path,
@@ -596,13 +622,14 @@ def _convert_untiled_image(
     levels: int,
     overwrite: bool,
     downsample_mode: Literal["nearest", "mean"],
-    chunk_workers: int,
     use_compression: bool,
 ) -> None:
-    # Only the 2D image is held in memory; the label volume and its pyramid are
-    # written through zarr. Building them in memory instead costs DEFAULT_DEPTH
-    # times the image per level, which is tens of GiB for a full-size segment
-    # label even though 64 of the 65 slices are zeros.
+    # The pyramid is built in 2D and each level written straight to its label
+    # slice. Embedding the image in the volume first, as build_pyramid_with_mode
+    # does, costs DEFAULT_DEPTH times the image per level -- tens of GiB for a
+    # full-size segment label, even though 64 of the 65 slices are zeros.
+    # Successive 2D levels quarter in size, so the whole pyramid is about 1.33x
+    # the source image and never touches disk twice.
     image = load_image(input_path)
     datasets = _create_ome_zarr_datasets(
         output_path,
@@ -612,13 +639,11 @@ def _convert_untiled_image(
         overwrite=overwrite,
         use_compression=use_compression,
     )
-    _write_image_level_zero(image, datasets[0])
-    del image
-    _build_downsample_levels_from_zarr(
-        datasets,
-        downsample_mode=downsample_mode,
-        chunk_workers=chunk_workers,
-    )
+
+    for index, dataset in enumerate(datasets):
+        if index:
+            image = _downsample_image_2d(image, downsample_mode=downsample_mode)
+        _write_label_slice(image, dataset)
 
 
 def convert_image(
@@ -662,7 +687,6 @@ def convert_image(
                 levels=levels,
                 overwrite=overwrite,
                 downsample_mode=downsample_mode,
-                chunk_workers=chunk_workers,
                 use_compression=use_compression,
             )
         wrote_primary = True
