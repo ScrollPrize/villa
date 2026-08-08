@@ -594,6 +594,10 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _initialCenterlineLengthSpin->setToolTip(
         tr("Total length of a newly generated centerline, split equally around the seed."));
     _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
+    // Read back rather than trusting the setting: a stale or hand-edited value
+    // outside the spinbox range would otherwise reach the optimizer unclamped
+    // while the row displayed the clamped one.
+    _appliedInitialCenterlineLengthVx = _initialCenterlineLengthSpin->value();
     auto* lengthApply = addSpinBoxMenuRow(tr("Length"), _initialCenterlineLengthSpin);
     connect(_initialCenterlineLengthSpin,
             qOverload<int>(&QSpinBox::valueChanged),
@@ -617,6 +621,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _extrapolationDistanceSpin->setToolTip(
         tr("Distance generated beyond each outer control point."));
     _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+    _appliedExtrapolationDistanceVx = _extrapolationDistanceSpin->value();
     auto* extrapolationApply =
         addSpinBoxMenuRow(tr("Extrapolation"), _extrapolationDistanceSpin);
     connect(_extrapolationDistanceSpin,
