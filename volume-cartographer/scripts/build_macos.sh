@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR]
+                         [--jobs N] [--tests] [--check]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
@@ -14,6 +15,16 @@ Options:
   --sccache        Enable sccache (installed when combined with --install-deps).
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
+  --tests          Configure with VC_TESTING=ON and build the unit tests
+                   alongside the apps. The macos-homebrew-llvm preset pins
+                   VC_TESTING=OFF, so without this flag the test targets do
+                   not exist in the build tree at all. Uses its own build
+                   directory (build-macos-tests) unless --build-dir says
+                   otherwise: VC_TESTING is not test-only, it also adds a
+                   compile definition to vc_fiber_tracer, so sharing a tree
+                   with the packaging build would rebuild targets on every
+                   switch and could package test-instrumented binaries.
+  --check          Implies --tests, then runs ctest on the result.
 USAGE
 }
 
@@ -30,7 +41,9 @@ cd "$script_dir/.."
 install_deps=0
 use_ccache=0
 use_sccache=0
-build_dir="build-macos"
+build_tests=0
+run_check=0
+build_dir=""
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +58,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sccache)
       use_sccache=1
+      shift
+      ;;
+    --tests)
+      build_tests=1
+      shift
+      ;;
+    --check)
+      build_tests=1
+      run_check=1
       shift
       ;;
     --build-dir)
@@ -70,6 +92,20 @@ done
 if (( use_ccache && use_sccache )); then
   echo "--ccache and --sccache are mutually exclusive" >&2
   exit 2
+fi
+
+# VC_TESTING is not confined to the test targets: core/CMakeLists.txt also puts
+# it on vc_fiber_tracer as a compile definition, guarding code in FiberTrace and
+# InkDetectionOverlayController. Alternating a plain build and a --tests build in
+# one tree therefore rebuilds those targets each way, and packaging out of a tree
+# last configured with --tests would ship test-instrumented binaries. Give the
+# test configuration its own directory unless the caller named one.
+if [[ -z "$build_dir" ]]; then
+  if (( build_tests )); then
+    build_dir="build-macos-tests"
+  else
+    build_dir="build-macos"
+  fi
 fi
 
 if ! command -v brew >/dev/null 2>&1; then
@@ -215,11 +251,30 @@ else
   exit 1
 fi
 
+# The preset pins VC_TESTING=OFF so the packaging workflow never pays for the
+# test targets. An explicit -D on the command line outranks a preset cache
+# variable, which is what makes the opt-in possible without a second preset.
+if (( build_tests )); then
+  extra_cmake_args+=("-DVC_TESTING=ON")
+fi
+
 cmake --preset macos-homebrew-llvm \
   -B "$build_dir" \
   "${extra_cmake_args[@]}"
 
 cmake --build "$build_dir" -j "$jobs"
+
+if (( run_check )); then
+  # Mirror the two Linux CI shards (vc-core and vc-specialized) rather than a
+  # bare `ctest`, so a macOS run is comparable with what the Ubuntu jobs report.
+  # --no-tests=error because ctest exits 0 when a label matches nothing, which
+  # would turn a renamed label or a misconfigured tree into a silent green run.
+  # CMakePresets.json already sets noTestsAction=error on its test presets.
+  ctest --test-dir "$build_dir" --output-on-failure --parallel "$jobs" \
+    --no-tests=error -L '^vc-core$'
+  ctest --test-dir "$build_dir" --output-on-failure --parallel "$jobs" \
+    --no-tests=error -L '^vc-specialized$'
+fi
 
 if (( use_ccache )); then
   ccache --show-stats
