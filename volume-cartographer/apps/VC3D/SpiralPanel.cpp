@@ -1673,8 +1673,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             progress.value(QStringLiteral("detail")).toString();
         const double elapsed =
             progress.value(QStringLiteral("elapsed_seconds")).toDouble();
-        const QJsonValue etaValue =
-            progress.value(QStringLiteral("eta_seconds"));
+        // The service publishes raw progress fields only; the ETA is a
+        // client-side presentation value derived from them.
+        double eta = -1.0;
+        if (step > 0 && total > step && elapsed >= 2.0)
+            eta = elapsed * double(total - step) / double(step);
+        else if (total > 0 && step >= total)
+            eta = 0.0;
         const auto durationText = [](double value) {
             const qint64 seconds = qMax<qint64>(
                 0, qRound64(value));
@@ -1693,9 +1698,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         if (!detail.isEmpty())
             progressText += QStringLiteral(" — ") + detail;
         progressText += tr(" — elapsed %1").arg(durationText(elapsed));
-        if (etaValue.isDouble())
-            progressText += tr(" — ETA %1")
-                .arg(durationText(etaValue.toDouble()));
+        if (eta >= 0.0)
+            progressText += tr(" — ETA %1").arg(durationText(eta));
         stateText += QStringLiteral("\n") + progressText;
         _previewProgress->setVisible(true);
         if (total > 0) {

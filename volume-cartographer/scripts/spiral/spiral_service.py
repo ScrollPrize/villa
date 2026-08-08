@@ -445,12 +445,6 @@ class ServiceLogBuffer:
             for line in parts:
                 if not line:
                     continue
-                # These high-frequency access lines are still written to the
-                # service terminal, but keeping them out of the relay leaves
-                # the bounded buffer for useful fitter output.
-                if line.startswith('SPIRAL_HTTP "GET /session/status HTTP/') \
-                        or line.startswith('SPIRAL_HTTP "GET /logs?after='):
-                    continue
                 if len(line) > MAX_LOG_ENTRY_CHARS:
                     line = line[:MAX_LOG_ENTRY_CHARS] + " … [truncated]"
                 self._entries.append({
@@ -1359,6 +1353,14 @@ class ServiceState:
                 "progress": None,
             })
             response.setdefault("progress", None)
+            # The status snapshot carries raw progress facts only. ETA is a
+            # presentation value clients derive from step/total/elapsed.
+            if isinstance(response.get("progress"), dict):
+                response["progress"] = {
+                    key: value
+                    for key, value in response["progress"].items()
+                    if key != "eta_seconds"
+                }
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
             response["preview_publish"] = (
@@ -1379,16 +1381,6 @@ class ServiceState:
                             - self._preview_progress_started)
                         if self._preview_progress_started is not None
                         else 0.0)
-                    eta = None
-                    if (step is not None and total is not None
-                            and int(step) > 0 and int(total) > int(step)
-                            and elapsed >= 2.0):
-                        eta = elapsed * (
-                            int(total) - int(step)) / int(step)
-                    elif (step is not None and total is not None
-                          and int(total) > 0
-                          and int(step) >= int(total)):
-                        eta = 0.0
                     response["progress"] = {
                         "operation": "publishing_preview",
                         "stage_name": stage_name,
@@ -1398,7 +1390,6 @@ class ServiceState:
                             int(total) if total is not None else None),
                         "unit": "steps",
                         "elapsed_seconds": elapsed,
-                        "eta_seconds": eta,
                     }
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
@@ -2911,6 +2902,23 @@ class SpiralHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         print("SPIRAL_HTTP " + (fmt % args), file=sys.stderr, flush=True)
+
+    def log_request(self, code="-", size="-"):
+        """Suppress successful polling requests at the source.
+
+        Status, log, and event reads arrive several times a second from
+        every connected client; logging them would drown the terminal and
+        the relay buffers in access lines. Failed polls still log.
+        """
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            status = 0
+        if self.command == "GET" and 200 <= status < 400:
+            path = urlparse(self.path).path.rstrip("/")
+            if path in ("/session/status", "/logs", "/events"):
+                return
+        super().log_request(code, size)
 
     def _authorise(self):
         header = self.headers.get("Authorization", "")

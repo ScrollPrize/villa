@@ -170,18 +170,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // available alongside the live fit-stage bar.
     _pythonOutput->setMaximumBlockCount(100000);
     pythonOutputLayout->addWidget(_pythonOutput);
+    // The service suppresses successful polling access lines at the source
+    // (SpiralHandler.log_request), so every relayed message is worth showing.
     connect(_service, &SpiralServiceManager::logMessage, _pythonOutput,
             [this](const QString& message) {
-                const QString line = message.trimmed();
-                const bool routineStatusPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /session/status HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                const bool routineLogPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /logs?after="))
-                    && line.contains(QStringLiteral(" HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                if (!routineStatusPoll && !routineLogPoll)
-                    _pythonOutput->appendOutput(message);
+                _pythonOutput->appendOutput(message);
             });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);

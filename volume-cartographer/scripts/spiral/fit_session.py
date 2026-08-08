@@ -24,7 +24,10 @@ from config import Config
 # inputs only (the service injects the startup-resolved output/cache into the
 # /dataset advertisement), and the /dataset/resolve browse endpoint is
 # removed — resolution happens once at startup.
-API_VERSION = 17
+# Version 18 adds the structured /events stream and stops synthesizing
+# eta_seconds inside the /session/status progress snapshot: clients derive
+# the ETA from the raw step/total/elapsed fields.
+API_VERSION = 18
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:

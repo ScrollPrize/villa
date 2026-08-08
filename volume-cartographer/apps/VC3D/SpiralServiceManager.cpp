@@ -35,14 +35,14 @@ namespace {
 constexpr int kPollMs = 500;
 constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
-// Keep remote stdout/stderr close to the locally launched service experience.
-// In particular, tqdm redraws its loading and fit bars several times a second;
-// a long polling interval turns those redraws into delayed bursts.
-constexpr int kRemoteLogPollMs = 500;
+// One structured event subscriber covers every connection (local and
+// remote). The service coalesces high-frequency records server-side, so a
+// short poll interval keeps the panel live without flooding it.
+constexpr int kEventPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 17;
+constexpr int kSupportedApiVersion = 18;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -56,6 +56,46 @@ QString defaultLocalOutputRoot(const QString& datasetRoot)
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
         + QStringLiteral("/spiral-output/%1-%2")
               .arg(QFileInfo(canonical).fileName(), digest);
+}
+
+// One panel line per structured event record. Log-kind records stay as raw
+// text (the panel keeps its old /logs relay look); the other kinds carry a
+// kind prefix, and child-rank records name their rank.
+QString formatEventRecord(const QJsonObject& event)
+{
+    const QString kind = event.value(QStringLiteral("kind")).toString();
+    const QString text = event.value(QStringLiteral("text")).toString();
+    const QJsonValue rankValue = event.value(QStringLiteral("rank"));
+    const QString rankSuffix = (rankValue.isDouble() && rankValue.toInt() > 0)
+        ? QStringLiteral(" [rank %1]").arg(rankValue.toInt()) : QString();
+    if (kind == QLatin1String("log")) return text + rankSuffix;
+    const QJsonObject payload = event.value(QStringLiteral("payload")).toObject();
+    if (kind == QLatin1String("progress")) {
+        QString line = QStringLiteral("[progress] ") + text;
+        const qint64 step = payload.value(QStringLiteral("step")).toInteger(-1);
+        const qint64 total = payload.value(QStringLiteral("total_steps")).toInteger(-1);
+        if (step >= 0 && total > 0) {
+            line += QStringLiteral(" — %1/%2").arg(step).arg(total);
+            const QString unit = payload.value(QStringLiteral("unit")).toString();
+            if (!unit.isEmpty()) line += QLatin1Char(' ') + unit;
+        }
+        const QString detail = payload.value(QStringLiteral("detail")).toString();
+        if (!detail.isEmpty()) line += QStringLiteral(" — ") + detail;
+        return line + rankSuffix;
+    }
+    if (kind == QLatin1String("metric")) {
+        QString line = QStringLiteral("[metric] ") + text;
+        const QJsonValue loss = payload.value(QStringLiteral("total_loss"));
+        if (loss.isDouble())
+            line += QStringLiteral(" — loss %1").arg(loss.toDouble(), 0, 'g', 6);
+        const QJsonValue lr = payload.value(QStringLiteral("learning_rate"));
+        if (lr.isDouble())
+            line += QStringLiteral(" — lr %1").arg(lr.toDouble(), 0, 'g', 4);
+        return line + rankSuffix;
+    }
+    if (kind == QLatin1String("error"))
+        return QStringLiteral("[error] ") + text + rankSuffix;
+    return text + rankSuffix;
 }
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -81,10 +121,10 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
     _poll = new QTimer(this);
     _poll->setInterval(kPollMs);
     connect(_poll, &QTimer::timeout, this, &SpiralServiceManager::pollStatus);
-    _remoteLogPoll = new QTimer(this);
-    _remoteLogPoll->setInterval(kRemoteLogPollMs);
-    connect(_remoteLogPoll, &QTimer::timeout, this,
-            &SpiralServiceManager::pollRemoteLogs);
+    _eventPoll = new QTimer(this);
+    _eventPoll->setInterval(kEventPollMs);
+    connect(_eventPoll, &QTimer::timeout, this,
+            &SpiralServiceManager::pollEvents);
     connect(_artifactCache, &SpiralArtifactCache::fetchProgress, this,
             [this](const QString& artifactId, const QString& phase,
                    const QString& fileName, int filesComplete, int totalFiles,
@@ -206,10 +246,10 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _statusFailures = 0;
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
-    _remoteLogsInFlight = false;
+    _eventsInFlight = false;
     _restartInProgress = false;
-    _remoteLogFailures = 0;
-    _lastRemoteLogSequence = 0;
+    _eventFailures = 0;
+    _lastEventCursor = 0;
     _advertisedDataset = {};
 
     _credential = profile.apiKey;
@@ -310,7 +350,11 @@ void SpiralServiceManager::startLocalProcess()
         connect(_process, &QProcess::readyReadStandardOutput, this, [this]() {
             const QString output = QString::fromUtf8(_process->readAllStandardOutput());
             for (const QString& line : output.split('\n', Qt::SkipEmptyParts)) {
-                emit logMessage(line);
+                // Once the connection is Ready the structured event stream
+                // delivers the service's console lines; relaying stdout as
+                // well would duplicate them. Before that, stdout is the only
+                // startup diagnostic channel.
+                if (_connectionState != ConnectionState::Ready) emit logMessage(line);
                 // The ready line carries only the port; API compatibility is
                 // validated through the authenticated /health handshake.
                 const QRegularExpressionMatch match = QRegularExpression(
@@ -323,7 +367,8 @@ void SpiralServiceManager::startLocalProcess()
         });
         connect(_process, &QProcess::readyReadStandardError, this, [this]() {
             const QString output = QString::fromUtf8(_process->readAllStandardError());
-            for (const QString& line : output.split('\n', Qt::SkipEmptyParts)) emit logMessage(line);
+            for (const QString& line : output.split('\n', Qt::SkipEmptyParts))
+                if (_connectionState != ConnectionState::Ready) emit logMessage(line);
         });
         connect(_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
             emit errorOccurred(_process->errorString());
@@ -331,6 +376,15 @@ void SpiralServiceManager::startLocalProcess()
         connect(_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int code, QProcess::ExitStatus) {
                     _poll->stop();
+                    _eventPoll->stop();
+                    // A dead service can no longer serve /events; surface any
+                    // console tail (crash tracebacks) that was suppressed
+                    // while the event stream was authoritative.
+                    const QString tail =
+                        QString::fromUtf8(_process->readAllStandardOutput())
+                        + QString::fromUtf8(_process->readAllStandardError());
+                    for (const QString& line : tail.split('\n', Qt::SkipEmptyParts))
+                        emit logMessage(line);
                     if (_profile.autoLaunch
                         && _connectionState != ConnectionState::Disconnected) {
                         setConnectionState(ConnectionState::Failed, tr("The local Spiral service stopped"));
@@ -408,12 +462,6 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
-    if (!ownsProcess()) {
-        _remoteLogPoll->start();
-        pollRemoteLogs();
-    } else {
-        _remoteLogPoll->stop();
-    }
     if (_serviceOwnsDataset) fetchAdvertisedDataset();
     get(QStringLiteral("/configuration"), Timeout::Quick,
         [this](const QJsonObject& catalog) {
@@ -421,7 +469,11 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
                 catalog.value(QStringLiteral("defaults")).toObject();
             emit configurationCatalogChanged(catalog);
         });
+    // Reconnect protocol: read the durable status snapshot first, then
+    // subscribe to the bounded event stream from the persisted cursor.
     pollStatus();
+    _eventPoll->start();
+    pollEvents();
 }
 
 void SpiralServiceManager::fetchAdvertisedDataset()
@@ -439,9 +491,9 @@ void SpiralServiceManager::disconnectFromService()
 {
     ++_connectionGeneration;
     _poll->stop();
-    _remoteLogPoll->stop();
+    _eventPoll->stop();
     _statusInFlight = false;
-    _remoteLogsInFlight = false;
+    _eventsInFlight = false;
     _restartInProgress = false;
     _artifactCache->clearEndpoint();
     _synchronizedSessionId.clear();
@@ -481,17 +533,17 @@ void SpiralServiceManager::restartRemoteService()
              // the replacement. The SSH tunnel itself remains alive.
              ++_connectionGeneration;
              _poll->stop();
-             _remoteLogPoll->stop();
+             _eventPoll->stop();
              _statusInFlight = false;
-             _remoteLogsInFlight = false;
+             _eventsInFlight = false;
              _statusFailures = 0;
-             _remoteLogFailures = 0;
+             _eventFailures = 0;
              _lastStatusGeneration = -1;
              _installedPreviewArtifact.clear();
              _installedPreviewSession.clear();
              _fetchingPreviewArtifact.clear();
              _synchronizedSessionId.clear();
-             _lastRemoteLogSequence = 0;
+             _lastEventCursor = 0;
              _serviceOwnsDataset = false;
              _advertisedDataset = {};
              _artifactCache->clearEndpoint();
@@ -1201,41 +1253,52 @@ void SpiralServiceManager::pollStatus()
         });
 }
 
-void SpiralServiceManager::pollRemoteLogs()
+void SpiralServiceManager::pollEvents()
 {
-    if (_remoteLogsInFlight || ownsProcess()
-        || _connectionState != ConnectionState::Ready)
-        return;
-    _remoteLogsInFlight = true;
+    if (_eventsInFlight || _connectionState != ConnectionState::Ready) return;
+    _eventsInFlight = true;
     const quint64 generation = _connectionGeneration;
-    get(QStringLiteral("/logs?after=%1").arg(_lastRemoteLogSequence), Timeout::Quick,
+    get(QStringLiteral("/events?cursor=%1").arg(_lastEventCursor), Timeout::Quick,
         [this, generation](const QJsonObject& response) {
-            _remoteLogsInFlight = false;
+            _eventsInFlight = false;
             if (generation != _connectionGeneration) return;
-            _remoteLogFailures = 0;
+            _eventFailures = 0;
             if (response.value(QStringLiteral("cursor_reset")).toBool())
-                _lastRemoteLogSequence = 0;
+                _lastEventCursor = 0;
             const qint64 dropped = response.value(QStringLiteral("dropped")).toInteger();
-            if (dropped > 0)
-                emit logMessage(tr("Remote Python log buffer dropped %1 older line(s).")
-                                    .arg(dropped));
-            const QJsonArray entries = response.value(QStringLiteral("entries")).toArray();
-            for (const QJsonValue& value : entries) {
-                const QJsonObject entry = value.toObject();
-                const qint64 sequence = entry.value(QStringLiteral("sequence")).toInteger();
-                const QString message = entry.value(QStringLiteral("text")).toString();
-                if (sequence <= _lastRemoteLogSequence || message.isEmpty()) continue;
-                _lastRemoteLogSequence = sequence;
-                emit logMessage(message);
+            if (dropped > 0 && _lastEventCursor > 0) {
+                // The bounded event ring overran this client's cursor: the
+                // stream is history, not reconnect state, so refresh the
+                // durable view from the status snapshot and continue from
+                // the cursor the service reports.
+                emit logMessage(tr("Spiral event stream dropped %1 older record(s); "
+                                   "refreshing session status.").arg(dropped));
+                pollStatus();
             }
-            _lastRemoteLogSequence = response.value(QStringLiteral("next_sequence"))
-                                         .toInteger(_lastRemoteLogSequence);
+            const QJsonArray events = response.value(QStringLiteral("events")).toArray();
+            for (const QJsonValue& value : events) {
+                const QJsonObject event = value.toObject();
+                const qint64 sequence = event.value(QStringLiteral("sequence")).toInteger();
+                if (sequence <= _lastEventCursor) continue;
+                _lastEventCursor = sequence;
+                if (event.value(QStringLiteral("severity")).toString()
+                        == QLatin1String("error")) {
+                    // Popups are reserved for error severity; the handler
+                    // also appends the message to the panel.
+                    emit errorOccurred(event.value(QStringLiteral("text")).toString());
+                    continue;
+                }
+                const QString line = formatEventRecord(event);
+                if (!line.isEmpty()) emit logMessage(line);
+            }
+            _lastEventCursor = response.value(QStringLiteral("next_cursor"))
+                                   .toInteger(_lastEventCursor);
         },
         [this, generation](const QString& error) {
-            _remoteLogsInFlight = false;
+            _eventsInFlight = false;
             if (generation != _connectionGeneration) return;
-            if (++_remoteLogFailures == 1)
-                emit logMessage(tr("Remote Python log polling failed: %1").arg(error));
+            if (++_eventFailures == 1)
+                emit logMessage(tr("Spiral event polling failed: %1").arg(error));
         });
 }
 

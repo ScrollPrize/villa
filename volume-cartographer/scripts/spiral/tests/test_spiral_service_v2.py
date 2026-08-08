@@ -153,8 +153,35 @@ class ProgressStatusTests(unittest.TestCase):
 
         status = state.status()
 
-        self.assertEqual(status["progress"], session.progress)
+        # The snapshot carries the raw progress facts; eta_seconds is a
+        # presentation value the client derives, never served.
+        expected = {key: value for key, value in session.progress.items()
+                    if key != "eta_seconds"}
+        self.assertEqual(status["progress"], expected)
         self.assertEqual(status["progress"]["stage_name"], "Loading tracks")
+
+    def test_status_never_synthesizes_eta(self):
+        state = spiral_service.ServiceState()
+        session = _attach_fake_session(state, "/tmp/spiral-progress-test")
+        session.progress = {
+            "operation": "optimizing", "stage_name": "Optimizing",
+            "detail": None, "step": 5, "total_steps": 10,
+            "unit": "iterations", "elapsed_seconds": 30.0,
+            "eta_seconds": 30.0,
+        }
+        self.assertNotIn("eta_seconds", state.status()["progress"])
+
+        # The preview-publication progress block is also served raw.
+        state._publishing_preview_generation = 2
+        state._preview_publish = {
+            "generation": 2, "state": "running",
+            "stage_name": "Flattening preview surface",
+            "step": 5, "total_steps": 10,
+        }
+        state._preview_progress_started = None
+        progress = state.status()["progress"]
+        self.assertEqual(progress["operation"], "publishing_preview")
+        self.assertNotIn("eta_seconds", progress)
 
     def test_empty_status_has_explicit_null_progress(self):
         self.assertIsNone(spiral_service.ServiceState().status()["progress"])
@@ -435,13 +462,37 @@ class LogStreamingTests(HttpServiceFixture):
         self.assertEqual([entry["text"] for entry in restarted_client["entries"]],
                          ["two", "three"])
 
-    def test_routine_poll_access_lines_do_not_fill_the_log_buffer(self):
+    def test_successful_polling_requests_are_suppressed_at_the_source(self):
+        # The handler's log_request override keeps successful status, log,
+        # and event polls out of the terminal (and therefore out of every
+        # relay); failed polls and other requests still log.
+        handler = spiral_service.SpiralHandler.__new__(
+            spiral_service.SpiralHandler)
+        logged = []
+        handler.log_message = lambda fmt, *args: logged.append(fmt % args)
+        handler.requestline = "GET /session/status HTTP/1.1"
+
+        def probe(command, path, code):
+            handler.command = command
+            handler.path = path
+            handler.log_request(code)
+
+        probe("GET", "/session/status", 200)
+        probe("GET", "/logs?after=4", 200)
+        probe("GET", "/events?cursor=9", 200)
+        self.assertEqual(logged, [])
+        probe("GET", "/session/status", 401)
+        probe("GET", "/health", 200)
+        probe("POST", "/session/run", 200)
+        self.assertEqual(len(logged), 3)
+
+    def test_log_buffer_no_longer_string_filters_access_lines(self):
         logs = ServiceLogBuffer()
-        logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 200 -\n')
-        logs.write("stderr", 'SPIRAL_HTTP "GET /logs?after=4 HTTP/1.1" 200 -\n')
+        logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -\n')
         logs.write("stderr", "useful fitter warning\n")
         self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
-                         ["useful fitter warning"])
+                         ['SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -',
+                          "useful fitter warning"])
 
     def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
         logs = ServiceLogBuffer()
