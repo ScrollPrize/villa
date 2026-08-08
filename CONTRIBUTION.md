@@ -1,7 +1,9 @@
 Thank you for your interest in contributing to villa! 
 
 This codebase is an open research project and thus the code within it is highly research focused and/or experimental. We try and share as much of our experiment-related code as we can, and as a result there are many things in this 
-codebase which may be infrequently used or never intended to be "productionized". We expect as people interact with our codebase in pursuit of the goal of unrolling the scrolls, they are going to encounter bugs or other issues, or have ideas of their own which would improve the codebase. 
+codebase which may be infrequently used or never intended to be "productionized". 
+
+We expect as people interact with our codebase in pursuit of the goal of unrolling the scrolls, they are going to encounter bugs or other issues, or have ideas of their own which would improve the codebase. 
 We appreciate attempts to implement fixes or improvements in the form of PRs. 
 ___
 
