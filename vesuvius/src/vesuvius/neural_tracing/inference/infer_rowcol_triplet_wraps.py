@@ -31,7 +31,12 @@ from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
     TTA_TRANSFORM_MODES,
 )
-from vesuvius.neural_tracing.inference.displacement_helpers import load_model, predict_displacement
+from vesuvius.neural_tracing.inference.displacement_helpers import (
+    is_auto_displacement_scale,
+    load_model,
+    predict_displacement,
+    resolve_displacement_scale,
+)
 from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _generate_segment_cover_records,
     _serialize_bbox_record,
@@ -72,6 +77,7 @@ _COPY_ARG_TO_CLI = {
     "tta_outlier_drop_thresh": "--tta-outlier-drop-thresh",
     "tta_outlier_drop_min_keep": "--tta-outlier-drop-min-keep",
     "tta_batch_size": "--tta-batch-size",
+    "displacement_scale": "--displacement-scale",
     "disp_sample_radius": "--disp-sample-radius",
     "disp_sample_spacing": "--disp-sample-spacing",
     "disp_sample_min_count": "--disp-sample-min-count",
@@ -201,6 +207,15 @@ def _scale_to_subsample_stride(scale):
     return max(1, int(round(1.0 / scale)))
 
 
+def _read_volume_voxel_size_um(volume_path):
+    """Read the level-0 voxel size (um) from the volume's meta.json, or None if unknown."""
+    meta_path = os.path.join(str(volume_path), "meta.json")
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path, "rt") as meta_fp:
+        return json.load(meta_fp).get("voxelsize", None)
+
+
 def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
     tifxyz_step_size = args.tifxyz_step_size
     tifxyz_voxel_size_um = args.tifxyz_voxel_size_um
@@ -231,10 +246,7 @@ def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
             tifxyz_step_size = 10
 
     if tifxyz_voxel_size_um is None:
-        meta_path = os.path.join(args.volume_path, "meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, "rt") as meta_fp:
-                tifxyz_voxel_size_um = json.load(meta_fp).get("voxelsize", None)
+        tifxyz_voxel_size_um = _read_volume_voxel_size_um(args.volume_path)
     if tifxyz_voxel_size_um is None:
         tifxyz_voxel_size_um = 8.24
 
@@ -782,6 +794,17 @@ def parse_args(argv=None):
     parser.add_argument("--tta-outlier-drop-min-keep", type=int, default=4)
     parser.add_argument("--tta-batch-size", type=int, default=2)
     parser.add_argument(
+        "--displacement-scale",
+        default=None,
+        help=(
+            "Opt-in factor applied to predicted displacement vectors before they are added to "
+            "surface points, for running a checkpoint on a volume resolution it was not trained at "
+            "(training voxel size / inference voxel size). Pass a positive number, or 'auto' to "
+            "derive it from the checkpoint's 'training_voxel_size_um'. Omitted, displacements are "
+            "applied unscaled, which is the existing behavior. See issue #1149."
+        ),
+    )
+    parser.add_argument(
         "--disp-sample-radius",
         type=float,
         default=1.0,
@@ -863,6 +886,13 @@ def parse_args(argv=None):
         parser.error("--volume-cache-retry-seconds must be >= 0")
     if args.volume_chunk_cache_gb < 0.0:
         parser.error("--volume-chunk-cache-gb must be >= 0")
+    if args.displacement_scale is not None and not is_auto_displacement_scale(args.displacement_scale):
+        try:
+            args.displacement_scale = float(args.displacement_scale)
+        except (TypeError, ValueError):
+            parser.error("--displacement-scale must be a positive finite number or 'auto'")
+        if not np.isfinite(args.displacement_scale) or args.displacement_scale <= 0.0:
+            parser.error("--displacement-scale must be a positive finite number or 'auto'")
     if args.disp_sample_radius < 0.0:
         parser.error("--disp-sample-radius must be >= 0")
     if args.disp_sample_spacing <= 0.0:
@@ -1750,8 +1780,10 @@ def _run_triplet_inference(
     shape_hw,
     input_normals,
     input_normals_valid,
+    displacement_scale=1.0,
 ):
     h, w = int(shape_hw[0]), int(shape_hw[1])
+    displacement_scale = float(displacement_scale)
     sum_back = np.zeros((h, w, 3), dtype=np.float32)
     sum_front = np.zeros((h, w, 3), dtype=np.float32)
     count_back = np.zeros((h, w), dtype=np.uint32)
@@ -1859,6 +1891,8 @@ def _run_triplet_inference(
                 disp_pred[:real_batch_size].detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
             )
             _split_triplet_displacement_channels(disp_pred_np)
+            if displacement_scale != 1.0:
+                disp_pred_np[:, :6] *= np.float32(displacement_scale)
             merger.accumulate_batch(disp_pred_np[:, :6], items)
 
             del batch_cpu
@@ -1979,6 +2013,7 @@ def _run_triplet_inference(
         "disp_sample_spacing": float(args.disp_sample_spacing),
         "disp_sample_min_count": int(args.disp_sample_min_count),
         "disp_sample_reduce": str(args.disp_sample_reduce),
+        "displacement_scale": float(displacement_scale),
     }
 
 
@@ -2398,6 +2433,8 @@ def _run_single_iteration(
     tifxyz_step_size,
     tifxyz_voxel_size_um,
     stored_scale_rc,
+    displacement_scale,
+    displacement_scale_source,
     save_scale_factor,
     iteration_index,
     iterations_requested,
@@ -2443,6 +2480,7 @@ def _run_single_iteration(
         shape_hw=input_valid.shape,
         input_normals=input_normals,
         input_normals_valid=input_normals_valid,
+        displacement_scale=displacement_scale,
     )
 
     back_merged, back_merged_valid = _merge_with_original(
@@ -2497,6 +2535,8 @@ def _run_single_iteration(
         "disp_sample_spacing": float(infer_out.get("disp_sample_spacing", args.disp_sample_spacing)),
         "disp_sample_min_count": int(infer_out.get("disp_sample_min_count", args.disp_sample_min_count)),
         "disp_sample_reduce": str(infer_out.get("disp_sample_reduce", args.disp_sample_reduce)),
+        "displacement_scale": float(infer_out.get("displacement_scale", displacement_scale)),
+        "displacement_scale_source": str(displacement_scale_source),
         "save_coordinate_scale_factor": int(save_scale_factor),
         "stored_scale_rc": None if stored_scale_rc is None else [float(stored_scale_rc[0]), float(stored_scale_rc[1])],
         "effective_step_size_used": int(tifxyz_step_size),
@@ -2600,6 +2640,21 @@ def run(args):
         args.volume_scale,
         input_scale=surface.get_scale_tuple(),
     )
+    volume_voxel_size_um = args.tifxyz_voxel_size_um
+    if volume_voxel_size_um is None:
+        volume_voxel_size_um = _read_volume_voxel_size_um(args.volume_path)
+    inference_voxel_size_um = (
+        None if volume_voxel_size_um is None else float(volume_voxel_size_um) * retarget_factor
+    )
+    displacement_scale, displacement_scale_source = resolve_displacement_scale(
+        args.displacement_scale,
+        model_config,
+        inference_voxel_size_um,
+    )
+    _log(
+        args.verbose,
+        f"displacement scale: {displacement_scale:.6g} (source={displacement_scale_source})",
+    )
     if stored_scale_rc is not None:
         step_y = _scale_to_subsample_stride(stored_scale_rc[0])
         step_x = _scale_to_subsample_stride(stored_scale_rc[1])
@@ -2651,6 +2706,8 @@ def run(args):
             tifxyz_step_size=tifxyz_step_size,
             tifxyz_voxel_size_um=tifxyz_voxel_size_um,
             stored_scale_rc=stored_scale_rc,
+            displacement_scale=displacement_scale,
+            displacement_scale_source=displacement_scale_source,
             save_scale_factor=save_scale_factor,
             iteration_index=iteration_index,
             iterations_requested=iterations_requested,
