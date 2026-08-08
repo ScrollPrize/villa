@@ -24,6 +24,11 @@
 
 namespace vc::render {
 
+// Upper bound on physical pyramid levels considered when probing a remote
+// store, and on the level number accepted from a numeric multiscale dataset
+// path — the two must agree or discovery and binding drift apart.
+inline constexpr int kMaxProbedRemoteLevels = 32;
+
 namespace {
 
 class HttpStatusError final : public std::runtime_error {
@@ -538,6 +543,21 @@ std::vector<int> localLevelNumbers(const std::filesystem::path& root)
     return levels;
 }
 
+
+void addRemoteLevelFromKey(
+    OpenedChunkedZarr& opened,
+    const std::shared_ptr<utils::Store>& store,
+    const std::string& key,
+    int physicalLevel)
+{
+    auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
+    if (array.metadata().dtype == utils::ZarrDtype::uint16)
+        array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
+    addPhysicalLevel(opened, physicalLevel, std::move(array));
+}
+
+} // namespace
+
 std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,
     int firstLevel)
@@ -569,26 +589,48 @@ std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
             path.erase(path.begin());
         while (!path.empty() && path.back() == '/')
             path.pop_back();
-        if (!path.empty() && datasetIndex >= firstLevel)
+        if (!path.empty())
             keys.emplace_back(datasetIndex, std::move(path));
         ++datasetIndex;
     }
+
+    // Physical levels come from the dataset paths when every path is a small
+    // decimal number: exporters that publish only levels >= first_level (e.g.
+    // lasagna/tiled_predict3d.py) advertise datasets like ["3","4"], and
+    // binding those by array position would register the coarse array as full
+    // resolution. Non-numeric dataset names carry no level number, so they
+    // keep the positional binding.
+    const auto numericLevel = [](const std::string& path) -> std::optional<int> {
+        if (path.empty() || path.size() > 2)
+            return std::nullopt;
+        for (const char c : path) {
+            if (std::isdigit(static_cast<unsigned char>(c)) == 0)
+                return std::nullopt;
+        }
+        const int level = std::stoi(path);
+        if (level >= kMaxProbedRemoteLevels)
+            return std::nullopt;
+        return level;
+    };
+    bool allNumericPaths = !keys.empty();
+    for (const auto& [index, path] : keys) {
+        if (!numericLevel(path)) {
+            allNumericPaths = false;
+            break;
+        }
+    }
+    if (allNumericPaths) {
+        for (auto& [level, path] : keys)
+            level = *numericLevel(path);
+    }
+
+    keys.erase(std::remove_if(keys.begin(), keys.end(),
+                              [&](const auto& entry) {
+                                  return entry.first < firstLevel;
+                              }),
+               keys.end());
     return keys;
 }
-
-void addRemoteLevelFromKey(
-    OpenedChunkedZarr& opened,
-    const std::shared_ptr<utils::Store>& store,
-    const std::string& key,
-    int physicalLevel)
-{
-    auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
-    if (array.metadata().dtype == utils::ZarrDtype::uint16)
-        array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
-    addPhysicalLevel(opened, physicalLevel, std::move(array));
-}
-
-} // namespace
 
 OpenedChunkedZarr validateAndRebaseVcPyramid(
     OpenedChunkedZarr opened,
@@ -707,7 +749,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
             }
         } else {
             bool sawGap = false;
-            for (int physicalLevel = 0; physicalLevel < 32; ++physicalLevel) {
+            for (int physicalLevel = 0; physicalLevel < kMaxProbedRemoteLevels; ++physicalLevel) {
                 const auto key = std::to_string(physicalLevel);
                 const bool present = store->exists(key + "/.zarray") ||
                                      store->exists(key + "/zarr.json");
@@ -736,7 +778,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
         return opened;
     }
 
-    for (int physicalLevel = firstPhysicalLevel; physicalLevel < 32; ++physicalLevel) {
+    for (int physicalLevel = firstPhysicalLevel; physicalLevel < kMaxProbedRemoteLevels; ++physicalLevel) {
         const auto key = std::to_string(physicalLevel);
         try {
             addRemoteLevelFromKey(opened, store, key, physicalLevel);

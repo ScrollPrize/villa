@@ -1441,11 +1441,22 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
         }
-        const double voxelSizeAtRenderLevelUm = ds_scale > 0
-            ? voxelSizeUm / double(ds_scale)
+        // TIFF resolution describes output *pixels*: one pixel spans
+        // 1/tgt_scale level-g voxels (--scale is pixels per level-g voxel).
+        const double umPerOutputPixel = (ds_scale > 0 && tgt_scale > 0)
+            ? voxelSizeUm / double(ds_scale) / double(tgt_scale)
             : voxelSizeUm;
-        tifDpi = voxelSizeToDpi(voxelSizeAtRenderLevelUm);
+        tifDpi = voxelSizeToDpi(umPerOutputPixel);
     }
+
+    // Physical size of one *level-g* voxel, in voxel_unit. The output raster
+    // is not necessarily isotropic in it: in-plane, one output pixel spans
+    // 1/tgt_scale level-g voxels (--scale), and through-plane, adjacent
+    // layers sit --slice-step level-g voxels apart (buildOffsetList).
+    // writeZarrAttrs derives the per-axis .zattrs scale from this base value.
+    const double render_level_voxel_size = ds_scale > 0
+        ? base_voxel_size / double(ds_scale)
+        : base_voxel_size;
 
     int rotQuadGlobal = -1;
     if (std::abs(rotate_angle) > 1e-6) {
@@ -1600,7 +1611,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               base_voxel_size, voxel_unit);
+                               render_level_voxel_size, voxel_unit, tgt_scale);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1802,7 +1813,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               base_voxel_size, voxel_unit);
+                               render_level_voxel_size, voxel_unit, tgt_scale);
             }
         }
         return true;

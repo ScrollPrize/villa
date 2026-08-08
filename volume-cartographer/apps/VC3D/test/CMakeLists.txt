@@ -7,7 +7,31 @@
 # so we compile its source straight into the test and link just Qt6::Core (for
 # QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
 # in, keeping the test fast and self-contained.
-find_package(Qt6 REQUIRED COMPONENTS Core Test Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+
+add_executable(test_unified_browser_dialog
+    test_unified_browser_dialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.hpp)
+
+set_target_properties(test_unified_browser_dialog PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_unified_browser_dialog PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_unified_browser_dialog PRIVATE
+    vc_core
+    Qt6::Concurrent
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME unified_browser_dialog COMMAND test_unified_browser_dialog)
+vc_register_test_target(test_unified_browser_dialog)
+vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
+set_tests_properties(unified_browser_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_reload_comparison
     test_spiral_reload_comparison.cpp)

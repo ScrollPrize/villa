@@ -53,6 +53,7 @@ private:
     QString currentUri() const;
     QString itemUri(const QListWidgetItem* item) const;
     bool isAcceptableUri(const QString& uri, bool isFile) const;
+    void handleTypedPath(const QString& typed, bool acceptDirectories);
 
     Mode _mode = Mode::Local;
     bool _acceptsFiles = true;
@@ -62,6 +63,7 @@ private:
 
     QString _currentLocalDir;
     QString _currentRemoteUrl;
+    bool _pathBarEdited = false;
 
     vc::HttpAuth _auth;
     bool _authResolved = false;

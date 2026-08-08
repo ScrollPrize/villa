@@ -318,30 +318,67 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
         return scale;
     };
 
+    // The caller's metadata may be a partial override (second constructor), so
+    // fall back to the on-disk meta.json for missing fields lazily if needed.
+    std::optional<utils::Json> diskMetadataStorage;
+    auto diskMetadata = [&]() -> const utils::Json& {
+        if (!diskMetadataStorage) {
+            diskMetadataStorage = vc::json::load_json_file(path / "meta.json");
+        }
+        return *diskMetadataStorage;
+    };
+
     std::optional<cv::Vec2f> scale = readScale(metadata);
     if (!scale) {
-        const auto diskMetadata =
-            vc::json::load_json_file(path / "meta.json");
-        scale = readScale(diskMetadata);
+        scale = readScale(diskMetadata());
     }
     if (!scale) {
         throw std::runtime_error("Missing or invalid surface scale in: " +
                                  (path / "meta.json").string());
     }
 
-    const auto xPath = path / "x.tif";
-    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
-    if (!tif) {
-        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
-    }
+    auto readDimensions =
+        [](const utils::Json& json) -> std::optional<std::pair<uint32_t, uint32_t>> {
+        if (!json.contains("tiff_dimensions") ||
+            !json["tiff_dimensions"].is_array() ||
+            json["tiff_dimensions"].size() < 2) {
+            return std::nullopt;
+        }
+        const auto w = json["tiff_dimensions"][0].get_int();
+        const auto h = json["tiff_dimensions"][1].get_int();
+        if (w <= 0 || h <= 0) {
+            return std::nullopt;
+        }
+        return std::make_pair(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    };
+
     uint32_t width = 0;
     uint32_t height = 0;
-    const bool haveGeometry =
-        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
-        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
-    TIFFClose(tif);
-    if (!haveGeometry || width == 0 || height == 0) {
-        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+    const auto xPath = path / "x.tif";
+    if (std::filesystem::exists(xPath)) {
+        TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
+        if (!tif) {
+            throw std::runtime_error("Failed to open TIFF: " + xPath.string());
+        }
+        const bool haveGeometry =
+            TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
+            TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+        TIFFClose(tif);
+        if (!haveGeometry || width == 0 || height == 0) {
+            throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+        }
+    } else {
+        // Metadata-only surfaces (open-data lazy placeholders) carry the grid
+        // size in meta.json; the TIFFs only exist after materialization.
+        std::optional<std::pair<uint32_t, uint32_t>> dims = readDimensions(metadata);
+        if (!dims) {
+            dims = readDimensions(diskMetadata());
+        }
+        if (!dims) {
+            throw std::runtime_error("Failed to open TIFF: " + xPath.string() + " and no dimensions metadata available");
+        }
+        width = dims->first;
+        height = dims->second;
     }
 
     LazySurfaceGeometry result;

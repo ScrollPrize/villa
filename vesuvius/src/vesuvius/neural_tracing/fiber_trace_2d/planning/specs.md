@@ -19,11 +19,35 @@
 - Resume state is durable output chunks only. Done markers are not allowed.
   Scratch mmap/temporary files are not resume state and may be deleted on
   startup/resume or finish.
-- Neural accumulation uses a fixed-depth circular float32 mmap per raw product
-  and one geometric weight mmap per distinct source-relative inference scale.
+- Neural accumulation uses a fixed-depth circular mmap per raw product,
+  float32 by default and optionally float16 for memory-constrained experiments, and one
+  float32 geometric weight mmap per distinct source-relative inference scale.
+  Flush reads widen bounded product chunks to float32 before normalization and
+  finalization. FP16 assumes finite, model-bounded raw products; unbounded
+  custom adapters must select float32 to avoid overflow.
   Ring depth is derived from the actual canonical Z tile positions, nonzero
   tile support, flush opportunities, and output chunk alignment. Mmap shape and
   logical file size must be independent of full output Z.
+- Ring planning keeps the chunk-aligned `flushed` frontier separate from the
+  physical ring origin and follows runtime write-before-post-row-flush order.
+  The initial prefix from logical plane zero remains live when a computed
+  frontier merely equals `output_begin`; only a strictly advancing runtime
+  flush releases it.
+- Flush overlaps inference through the same circular mmap, enlarged only for
+  the exact maximum span produced by one frozen finalized interval plus the
+  following active canonical Z row. There is one runner-wide flush future,
+  including across inference scales. No live overlap, finalized band, or full
+  mmap region is copied to another mmap or a band-sized RAM buffer.
+- Submitted/frozen, completed/written, and released/origin frontiers are
+  distinct. At the next advancing frontier the coordinator waits for the
+  previous combined flush, clears its exact dirty rectangles, releases its
+  generations, and only then submits the next combined interval. User-visible
+  finalized Z advances only after successful output writes.
+- The flush worker receives immutable chunk descriptors and reads frozen mmap
+  regions one output chunk at a time. Temporary denominator, stacked raw, and
+  finalized channel arrays remain bounded by one output chunk. A failed flush
+  never clears or reuses its frozen slots, and all exit paths wait for the
+  non-cancellable reader thread before mmap cleanup.
 - Completed output is normalized, finalized, written, and cleared one globally
   anchored output chunk at a time. Denominator and wrap scratch are bounded by
   one output chunk; no full-XY or full-band normalization/finalization
@@ -107,6 +131,65 @@
   determinism remain required, and performance changes must report the
   representative whole-fiber restart metric so numeric changes cannot silently
   degrade trace quality.
+- Multi-GPU tiled inference exists only in the shared runner and is therefore
+  identical for Lasagna predict3d and Fiber 3D inference. It uses one
+  persistent spawn-context model worker per selected CUDA device, without DDP
+  or GPU collectives.
+- The canonical tile stream materializes only independent Z/Y/X axis lattices
+  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
+  execution, result completion, and ordered commit use fixed bounded windows.
+- Input reads happen outside GPU workers. The default local Zarr-v2 backend is
+  one asynchronously polled TensorStore driver/context created only after all
+  spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
+  Resume/skipped work is rejected before read submission. The lazy prefetch
+  window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
+  counts as one) and is independent of GPU shared-memory slots.
+- Every outstanding TensorStore read may own a full padded input tile. Input
+  memory is bounded by that window times tile bytes, plus the separately bounded
+  TensorStore cache, existing input/result shared memory, and request/cache
+  overhead. A ready tile enters shared memory only when input/result slots and a
+  GPU queue are available. Existing clipped bounds, source dtype, uint16
+  conversion timing, fully-outside uint8 behavior, and NumPy reflect-padding
+  semantics are preserved exactly.
+- Input slots cannot be reused until H2D completion, and results cannot be
+  published until D2H completion. The coordinator alone unlinks shared memory;
+  workers only attach and close it.
+- CUDA input transfer preserves compact uint8/uint16 source dtype. UInt16 is
+  converted through int32 floor division by 257; normalization and adapter
+  preprocessing are CUDA FP32. CPU fallback preserves historical NumPy
+  conversion. Fiber model autocast follows checkpoint training-policy metadata
+  by default, with explicit precision override and all-device validation;
+  shared product arithmetic, filtering, D2H, and accumulation remain FP32.
+- Opt-in multi-device pipeline profiling uses bounded streaming aggregates,
+  preserves the disabled worker/message path, distinguishes summed concurrent
+  service from wall span, and directly reports reader throughput and effective
+  outstanding-request concurrency, queue delays, CPU conversion,
+  CUDA/transfer/model/output, and commit stages.
+- GPU results may finish out of order, but accumulation remains in canonical
+  tile order. A Z row flushes only after all preceding canonical events,
+  including skips, commit. The coordinator solely owns circular accumulators,
+  resume state, progress, and output writes.
+- Output adapters must permit completeness checks for future, disjoint chunks
+  while the flush worker writes a frozen chunk. Model adapters must permit
+  inference to overlap their stateless raw-product finalization callback.
+- Sparse/resume-complete work is rejected before prefetch. Workers calculate
+  only the union of raw products required by incomplete output chunks; the
+  coordinator retains chunk masks and adds shared geometric weight once.
+- Worker exceptions, hard exits, CUDA failures, interrupts, and coordinator
+  errors cancel prefetch, stop workers, and close shared resources rather than
+  waiting indefinitely.
+- `--devices all` selects all visible CUDA devices and a comma-separated list
+  selects a subset. Existing singular `--device` and CPU behavior remain
+  supported; conflicting or invalid selections fail before model construction.
+- Automatic OME-Zarr download uses `--download-workers` independently of
+  inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
+  must be positive even when automatic download is disabled.
+- `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
+  malformed, or schema-invalid cache data warns and behaves as an empty set;
+  it must never abort inference or suppress remote validation. Saves snapshot
+  Stats under lock, include empty sets, and use same-directory unique temporary
+  files plus atomic replace. Save failures warn, retain the previous valid
+  target when possible, clean temporary files, and do not fail the download.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.
@@ -127,6 +210,11 @@
   and untouched chunks produce neither output chunks nor mmap zero-writes.
   Only dirty product and shared-weight regions are flushed and cleared before
   circular-slot reuse.
+- Sparse source support is evaluated on the global output lattice: each global
+  output-chunk footprint is clipped to the product's full output shape and only
+  then mapped into selected-input coordinates. Crop-local padded ring
+  dimensions must never clip this global footprint. Products sharing an
+  inference-scale accumulator must share the same full output shape.
 - Output products are independently resumable. For Lasagna, missing `pred_dt`
   chunks schedule only derived distance-transform generation; they must not
   schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
@@ -191,6 +279,23 @@
   `fiber_trace_3d_inference.json`, no raw seven-channel persisted bundle, no
   directory-style `--output`, no duplicate fiber output adapter, and no public
   exports for removed V0 symbols.
+- Shared multi-device Fiber/Lasagna inference accumulates output chunks in
+  persistent spawned CPU processes. A stable integer mapping gives each
+  `(scale, chunk_z, chunk_y, chunk_x)` exactly one FIFO owner, so overlapping
+  tile updates need no locks and retain canonical per-chunk order. GPU result
+  slots remain live until every referenced accumulation task acknowledges.
+- Accumulation queues are bounded and a new Z row cannot reserve circular-ring
+  generations until the preceding row is committed. Flush frontiers therefore
+  observe only acknowledged tasks and retain the rolling-memory bound.
+- Product rings default to float16 while the shared weight ring remains
+  float32. Each product update widens the stored half to float32, adds the
+  float32 tile contribution, and rounds to nearest-even back to binary16.
+  This reduced-precision accumulation is explicitly not bitwise equivalent to
+  float32; `--product-accumulator-dtype float32` restores float32 accumulation.
+- The optional native accumulator extension must retain a portable scalar
+  implementation. On supported x86 GCC/Clang builds it may runtime-dispatch to
+  an isolated AVX-512F+F16C kernel; the package must not require AVX-512
+  globally and unsupported CPUs/platforms must continue through the fallback.
 
 ## 3D CP-Centered Fiber Model Variant
 
@@ -454,8 +559,21 @@
   Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
   not receive a DDP `module.` prefix.
 - DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
-  dense test evaluation, Trace2CP metrics, and train/test visualization. Scalar
-  training losses are averaged across ranks before rank-0 logging.
+  Trace2CP metrics, and train/test visualization. Dense test model evaluation
+  is deterministically distributed across all ranks; scalar training losses
+  are averaged across ranks before rank-0 logging.
+- Dense DDP tests partition global batch IDs as `rank, rank + WORLD_SIZE, ...`.
+  The configured test start is a literal sample offset, including when it is
+  not batch-aligned; every global batch is evaluated exactly once and only the
+  final global batch is sliced. Per-batch float metric rows are gathered to
+  rank 0, restored to global batch order, and combined with the historical
+  unweighted Python per-batch mean so metric and best-snapshot semantics remain
+  unchanged. Ranks with no assigned batch still enter the gather.
+- Each rank retains a separate persistent test DataLoader worker pool using the
+  same worker count, prefetch factor, worker device, and multiprocessing context
+  as training. Rank 0 reuses its already evaluated global batch zero for the
+  test sample sheet instead of synchronously loading it again. The train and
+  test pools coexist and are both released before distributed teardown.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -581,6 +699,21 @@
   as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
   run over tiled axis-aligned blocks covering the requested 2D strip
   coordinates plus configured context, then sampled/projected back to 2D.
+- Hang diagnostics are disabled by default. Setting the JSON boolean
+  `training.test_hang_diagnostics_enabled: true` or passing
+  `--test-hang-diagnostics` during normal training enables append-only per-rank
+  diagnostic logs, `SIGUSR2` manual dumps, detailed test phase markers, and a
+  rank-0 pre-NCCL-timeout watchdog. The watchdog defaults to 480 seconds through
+  `training.test_watchdog_seconds`, which must be positive and below the
+  600-second process-group timeout when diagnostics are enabled. Disabled mode
+  creates no files or handlers, arms no timer, polls no resources, and performs
+  no diagnostic CUDA synchronization. The CLI flag is invalid in auxiliary
+  prefetch, benchmark, and Trace2CP visualization modes.
+- Rank 0 prints `test_timing step=... total_seconds=...` for the complete test
+  routine through distributed dense evaluation, visualization, and Trace2CP,
+  excluding the subsequent TensorBoard flush, and logs the same duration as
+  `timing/test_total_seconds`. Rank-0-only post-dense phases must remain below
+  the process-group timeout while other ranks wait at the result broadcast.
 - When a 3D config defines `test_datasets` and `test_trace2cp_enabled` is
   false, test evaluation runs ordinary 3D sparse direction/presence loss on the
   held-out CP-centered 3D samples. It must not require Trace2CP geometry or
@@ -2338,3 +2471,16 @@
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
+# Process-parallel 3D flush
+
+- Fiber and Lasagna inference use the same shared rolling-mmap flush engine.
+- Positive `flush_workers` use persistent spawn processes with bounded
+  descriptor-only queues. Workers read frozen mmap regions directly and own
+  distinct scale/chunk writes; ndarray payloads never cross IPC.
+- Exactly one frozen batch may overlap the following inference band. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch.
+- Each worker limits native CPU libraries to one thread and allocates at most
+  one chunk's denominator/raw/finalized arrays.
+- `flush_workers=0` is the synchronous baseline and uses immediate ring release;
+  both inference CLIs default to the available CPU count capped at 64 process
+  workers.

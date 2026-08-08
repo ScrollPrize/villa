@@ -28,6 +28,38 @@ QPointF generatedStripControlPointToScene(
     QuadSurface* surface,
     const GeneratedOverlay::ControlPointMarker& control)
 {
+    // The strip surface is parameterized by line position, so the O(1)
+    // mapping is exact for control points ON the centerline — the common
+    // case. volumeToScene runs QuadSurface::pointTo — an O(strip length)
+    // gradient descent from the strip center — which made every overlay
+    // rebuild cost O(controlPoints x lineLength) and dominated zoom/pan
+    // lag on many-control-point fibers; keep it only for points that are
+    // genuinely off the centerline: manual/no-reoptimization edits retain
+    // the clicked off-line volume position until the next optimization,
+    // and their markers (and hit tests) must show the true position, not
+    // the centerline. Preconditions are re-checked here because the O(1)
+    // helper reports failure as a default (finite) QPointF, which must
+    // not shadow the fallback.
+    if (viewer && surface && std::isfinite(control.linePosition)) {
+        const auto* points = surface->rawPointsPtr();
+        const cv::Vec2f scale = surface->scale();
+        const int column = static_cast<int>(std::lround(control.linePosition));
+        if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f &&
+            column >= 0 && column < points->cols) {
+            const cv::Vec3f centerlinePoint = (*points)(points->rows / 2, column);
+            constexpr float kOnCenterlineToleranceVx = 1.0e-3f;
+            const bool onCenterline = !finiteGeneratedPoint(control.point) ||
+                (finiteGeneratedPoint(centerlinePoint) &&
+                 cv::norm(control.point - centerlinePoint) <= kOnCenterlineToleranceVx);
+            if (onCenterline) {
+                const QPointF positionScene = generatedStripLinePositionToScene(
+                    viewer, surface, control.linePosition);
+                if (finiteScenePoint(positionScene)) {
+                    return positionScene;
+                }
+            }
+        }
+    }
     if (viewer && finiteGeneratedPoint(control.point)) {
         const QPointF pointScene = viewer->volumeToScene(control.point);
         if (finiteScenePoint(pointScene)) {
@@ -243,21 +275,40 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     pendingBranchControlPointStyle.brushColor = QColor(80, 150, 255, 175);
     pendingBranchControlPointStyle.z = 162.5;
 
+    ViewerOverlayControllerBase::OverlayStyle sameHvBranchControlPointStyle = branchControlPointStyle;
+    sameHvBranchControlPointStyle.penColor = QColor(255, 140, 0, 245);
+    sameHvBranchControlPointStyle.brushColor = QColor(255, 140, 0, 175);
+
+    ViewerOverlayControllerBase::OverlayStyle sameHvPendingBranchControlPointStyle =
+        pendingBranchControlPointStyle;
+    sameHvPendingBranchControlPointStyle.penColor = QColor(255, 190, 120, 245);
+    sameHvPendingBranchControlPointStyle.brushColor = QColor(255, 190, 120, 175);
+
     ViewerOverlayControllerBase::OverlayStyle linkCandidateControlPointStyle = branchControlPointStyle;
     linkCandidateControlPointStyle.penColor = QColor(60, 235, 120, 245);
     linkCandidateControlPointStyle.brushColor = QColor(60, 235, 120, 175);
     linkCandidateControlPointStyle.z = 163.0;
 
+    ViewerOverlayControllerBase::OverlayStyle splitCandidateControlPointStyle = branchControlPointStyle;
+    splitCandidateControlPointStyle.penColor = QColor(235, 60, 60, 245);
+    splitCandidateControlPointStyle.brushColor = QColor(235, 60, 60, 175);
+    splitCandidateControlPointStyle.z = 163.5;
+
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
         -> const ViewerOverlayControllerBase::OverlayStyle& {
+        if (control.isSplitCandidate) {
+            return splitCandidateControlPointStyle;
+        }
         if (control.isLinkCandidate) {
             return linkCandidateControlPointStyle;
         }
         if (control.hasPendingLinks) {
-            return pendingBranchControlPointStyle;
+            return control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
+                                                 : pendingBranchControlPointStyle;
         }
         if (control.hasBranches) {
-            return branchControlPointStyle;
+            return control.hasSameHvBranches ? sameHvBranchControlPointStyle
+                                             : branchControlPointStyle;
         }
         return control.isSeed ? seedStyle : controlPointStyle;
     };
@@ -578,17 +629,34 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
         const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
+        // Consecutive non-tail segments accumulate into one polyline
+        // primitive per run (same pattern as the branch lines above): a
+        // primitive per segment meant one QGraphicsPathItem per segment,
+        // and rebuilding thousands of scene items per overlay refresh
+        // dominated zoom/pan lag on long fibers.
+        std::vector<QPointF> run;
+        const auto flushRun = [&]() {
+            if (run.size() >= 2) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    std::move(run),
+                    false,
+                    lineStyle});
+            }
+            run = {};
+        };
         for (size_t i = 1; i < sceneLine.size(); ++i) {
             const auto& previous = sceneLine[i - 1];
             const auto& current = sceneLine[i];
             if (generatedLineSegmentIsTail(previous.second, current.second, controlRange)) {
+                flushRun();
                 continue;
             }
-            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                {previous.first, current.first},
-                false,
-                lineStyle});
+            if (run.empty()) {
+                run.push_back(previous.first);
+            }
+            run.push_back(current.first);
         }
+        flushRun();
     }
 
     if (finiteGeneratedPoint(overlay.pointMarker)) {
@@ -814,6 +882,15 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
     }
+    // Linked CPs are legal split points (their links are remapped onto the
+    // halves), so unlike the link candidate there is no hasBranches gate.
+    QAction* designateSplitCandidateAction = nullptr;
+    if (options.designateSplitCandidate) {
+        designateSplitCandidateAction =
+            menu.addAction(QWidget::tr("Designate as split candidate"));
+        designateSplitCandidateAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
     if (!selectedControl.branchLinks.empty()) {
         QMenu* branchMenu = menu.addMenu(QWidget::tr("Go to linked annotation"));
@@ -911,6 +988,31 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
     }
+    // No hasBranches gate: the merge consumes the very pending link the two
+    // endpoint CPs typically already carry.
+    QAction* mergeWithCandidateAction = nullptr;
+    if (options.mergeWithCandidate && !options.mergeWithCandidateLabel.isEmpty()) {
+        mergeWithCandidateAction = menu.addAction(options.mergeWithCandidateLabel);
+        mergeWithCandidateAction->setEnabled(
+            options.mergeWithCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
+    QAction* splitFromCandidateAction = nullptr;
+    if (options.splitFromCandidate && !options.splitFromCandidateLabel.isEmpty()) {
+        splitFromCandidateAction = menu.addAction(options.splitFromCandidateLabel);
+        splitFromCandidateAction->setEnabled(
+            options.splitFromCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
+    QAction* splitFromCandidateAndLinkAction = nullptr;
+    if (options.splitFromCandidateAndLink &&
+        !options.splitFromCandidateAndLinkLabel.isEmpty()) {
+        splitFromCandidateAndLinkAction =
+            menu.addAction(options.splitFromCandidateAndLinkLabel);
+        splitFromCandidateAndLinkAction->setEnabled(
+            options.splitFromCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     QAction* openNearbyAnnotationAction = nullptr;
     if (options.openNearbyAnnotation && nearbyIntersection) {
         openNearbyAnnotationAction = menu.addAction(
@@ -985,6 +1087,30 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         selected == linkWithCandidateAction &&
         linkWithCandidateAction->isEnabled()) {
         options.linkWithCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (mergeWithCandidateAction &&
+        selected == mergeWithCandidateAction &&
+        mergeWithCandidateAction->isEnabled()) {
+        options.mergeWithCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (designateSplitCandidateAction &&
+        selected == designateSplitCandidateAction &&
+        designateSplitCandidateAction->isEnabled()) {
+        options.designateSplitCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitFromCandidateAction &&
+        selected == splitFromCandidateAction &&
+        splitFromCandidateAction->isEnabled()) {
+        options.splitFromCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitFromCandidateAndLinkAction &&
+        selected == splitFromCandidateAndLinkAction &&
+        splitFromCandidateAndLinkAction->isEnabled()) {
+        options.splitFromCandidateAndLink(selectedControlIndex, selectedControl.point);
         return GeneratedControlPointContextResult::Handled;
     }
     if (openNearbyAnnotationAction && selected == openNearbyAnnotationAction) {

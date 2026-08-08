@@ -79,6 +79,11 @@ ext_modules = [
         "monotone_norm",
         ["monotone_norm.cpp"],
     ),
+    Pybind11Extension(
+        "accumulator_add",
+        ["accumulator_add.cpp"],
+        cxx_std=17,
+    ),
 ]
 
 setup(
