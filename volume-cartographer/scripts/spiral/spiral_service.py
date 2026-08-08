@@ -22,11 +22,8 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
 import errno
-import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -35,51 +32,43 @@ import shutil
 import signal
 import socket
 import stat
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-import numpy as np
-from PIL import Image
-import scipy.ndimage
-from vc3d_fiber_format_adapter import (
-    parse_vc3d_fiber_format,
-)
-
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS,
-                         ScrollSpecError, default_user_cache_dir, fit_input,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG, ScrollSpecError,
+                         SpiralInputPaths, default_user_cache_dir, fit_input,
                          input_change_impact, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
-                         validate_checkpoint_container,
                          validate_session_request)
 from config import Config
+from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
+                          is_safe_relative_name)
+from service_artifacts import ArtifactRegistry
+from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_KEPT,
+                             UPLOAD_GC_SECONDS, UploadEnvironment,
+                             UploadManager, _copy_publish,
+                             _merge_pcl_documents, _utc_stamp)
+from lasagna_publish import LasagnaPublisher, stop_process_group
+# Re-exported for the service's own test surface, which addresses the preview
+# mapping helpers through this module.
+from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
+                             _mapped_winding_ids,
+                             _prepare_cleaned_lasagna_surface,
+                             _raw_run_diff_rgba, _sample_rgba_through_map,
+                             _validate_tifxyz_output_step)
 
 
 SERVICE_VERSION = "6.1.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
-TRANSFER_CHUNK_BYTES = 1024 * 1024
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
-LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
-MAX_ARTIFACT_FILES = 4096
-MAX_UPLOAD_FILES = 256
-UPLOAD_GC_SECONDS = 3600.0
 EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
                                            4 * 1024 * 1024 * 1024))
-# Uploaded resume checkpoints are service-scoped (usable by future sessions),
-# exempt from the ephemeral quota, and bounded by retention instead.
-UPLOADED_CHECKPOINTS_KEPT = 3
-MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
-    "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
-UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 # This buffer is also the reconnect/late-attach history for a remote VC3D
 # client.  tqdm produces one entry for each carriage-return redraw, so leave
 # enough room for the loading bars and a substantial portion of a long fit.
@@ -97,27 +86,12 @@ MAX_EVENT_READ_ENTRIES = 1000
 EVENT_COALESCE_SECONDS = 1.0
 DATASET_COMMIT_LOCK_TIMEOUT_SECONDS = 20.0
 
-_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-# Role -> conventional filename for ephemeral PCL uploads, from the
-# declarative fit-input catalog.
-_PCL_ROLE_FILES = {
-    role.value: filename for role, filename, _ in PCL_ROLE_CONVENTIONS}
 
 # Base input paths are owned by the service (every launch carries --dataset);
 # a load request may only choose among service-advertised values for these
 # keys.
 _DATASET_CLIENT_SELECTABLE = ("checkpoint", "tracks_dbm")
-
-
-class ApiError(Exception):
-    def __init__(self, status, message, details=None):
-        super().__init__(message)
-        self.status = int(status)
-        self.message = message
-        self.details = details
 
 
 def parse_gpu_ids(value):
@@ -497,763 +471,6 @@ class _TeeStream:
         return getattr(self._stream, name)
 
 
-def _utc_stamp():
-    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-
-
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        while True:
-            block = stream.read(TRANSFER_CHUNK_BYTES)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _is_safe_relative_name(name):
-    """Accept forward-slash relative names made of safe components only."""
-    if not isinstance(name, str) or not name or len(name) > 1024:
-        return False
-    if "\\" in name or name.startswith("/"):
-        return False
-    parts = name.split("/")
-    if len(parts) > 8:
-        return False
-    for part in parts:
-        if part in ("", ".", "..") or not _SAFE_COMPONENT.match(part):
-            return False
-    return True
-
-
-def _resolve_inside(root, relative_name):
-    """Resolve ``relative_name`` under ``root`` refusing symlink/`..` escapes."""
-    root = Path(root).resolve(strict=True)
-    candidate = (root / relative_name).resolve(strict=True)
-    if not candidate.is_relative_to(root):
-        raise ApiError(HTTPStatus.FORBIDDEN, "Path escapes the artifact root")
-    if candidate.is_symlink() or not candidate.is_file():
-        raise ApiError(HTTPStatus.FORBIDDEN, "Not a regular file")
-    return candidate
-
-
-class Artifact:
-    __slots__ = ("artifact_id", "kind", "session_id", "generation", "root",
-                 "files", "entry_point", "inflight", "pruned",
-                 "delete_root_on_prune", "created")
-
-    def __init__(self, artifact_id, kind, session_id, generation, root,
-                 files, entry_point, delete_root_on_prune):
-        self.artifact_id = artifact_id
-        self.kind = kind
-        self.session_id = session_id
-        self.generation = generation
-        self.root = root
-        self.files = files
-        self.entry_point = entry_point
-        self.inflight = 0
-        self.pruned = False
-        self.delete_root_on_prune = delete_root_on_prune
-        self.created = time.time()
-
-    def ref(self):
-        return {"id": self.artifact_id, "kind": self.kind,
-                "generation": self.generation}
-
-    def manifest(self):
-        return {
-            "schema_version": 1,
-            "id": self.artifact_id,
-            "kind": self.kind,
-            "session_id": self.session_id,
-            "generation": self.generation,
-            "entry_point": self.entry_point,
-            "files": [
-                {"name": name, "size": info["size"], "sha256": info["sha256"]}
-                for name, info in sorted(self.files.items())
-            ],
-        }
-
-
-class ArtifactRegistry:
-    """Immutable generated-data directories addressed by opaque IDs.
-
-    Files are digested once at registration (inside the fitter's pause/export
-    window). Pruning never removes an artifact while a download holds an
-    in-flight reference; a pruned ID answers ``410 Gone``.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._artifacts = OrderedDict()
-        self._pruned_ids = OrderedDict()
-
-    def register_directory(self, kind, session_id, generation, root,
-                           entry_point, *, delete_root_on_prune=False,
-                           progress=None, hash_workers=1):
-        root = Path(root).resolve(strict=True)
-        paths = []
-        for directory, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames.sort()
-            for filename in sorted(filenames):
-                path = Path(directory) / filename
-                if path.is_symlink() or not path.is_file():
-                    continue
-                paths.append(path)
-                if len(paths) > MAX_ARTIFACT_FILES:
-                    raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
-                                   "Artifact has too many files to register")
-
-        def digest(path):
-            return path, path.stat().st_size, _sha256_file(path)
-
-        files = {}
-        workers = max(1, min(int(hash_workers), len(paths) or 1))
-        with ThreadPoolExecutor(max_workers=workers,
-                                thread_name_prefix="spiral-artifact-hash") as executor:
-            for index, (path, size, sha256) in enumerate(
-                    executor.map(digest, paths), start=1):
-                relative = path.relative_to(root).as_posix()
-                files[relative] = {"size": size, "sha256": sha256}
-                if progress is not None:
-                    progress(index, len(paths), relative)
-        if entry_point not in files:
-            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
-                           f"Artifact entry point {entry_point!r} was not found")
-        artifact_id = f"{kind}-{generation}-{secrets.token_hex(8)}"
-        artifact = Artifact(artifact_id, kind, session_id, generation, root,
-                            files, entry_point, delete_root_on_prune)
-        with self._lock:
-            self._artifacts[artifact_id] = artifact
-        return artifact.ref()
-
-    def _get(self, artifact_id):
-        artifact = self._artifacts.get(artifact_id)
-        if artifact is None:
-            if artifact_id in self._pruned_ids:
-                raise ApiError(HTTPStatus.GONE, "Artifact has been pruned")
-            raise ApiError(HTTPStatus.NOT_FOUND, "Unknown artifact")
-        return artifact
-
-    def manifest(self, artifact_id):
-        with self._lock:
-            return self._get(artifact_id).manifest()
-
-    def acquire_file(self, artifact_id, relative_name):
-        """Return ``(artifact, path, info)`` holding an in-flight reference."""
-        with self._lock:
-            artifact = self._get(artifact_id)
-            info = artifact.files.get(relative_name)
-            if info is None:
-                raise ApiError(HTTPStatus.NOT_FOUND,
-                               "The artifact does not contain this file")
-            artifact.inflight += 1
-        try:
-            path = _resolve_inside(artifact.root, relative_name)
-        except BaseException:
-            self.release(artifact)
-            raise
-        return artifact, path, info
-
-    def release(self, artifact):
-        delete_root = None
-        with self._lock:
-            artifact.inflight -= 1
-            if artifact.pruned and artifact.inflight == 0 and artifact.delete_root_on_prune:
-                delete_root = artifact.root
-        if delete_root is not None:
-            shutil.rmtree(delete_root, ignore_errors=True)
-
-    def prune(self, kind, session_id, keep):
-        """Prune all but the newest ``keep`` artifacts of one kind."""
-        to_delete = []
-        with self._lock:
-            matching = [a for a in self._artifacts.values()
-                        if a.kind == kind and a.session_id == session_id]
-            matching.sort(key=lambda a: a.generation)
-            for artifact in matching[:-keep] if keep else matching:
-                del self._artifacts[artifact.artifact_id]
-                self._pruned_ids[artifact.artifact_id] = True
-                while len(self._pruned_ids) > 4096:
-                    self._pruned_ids.popitem(last=False)
-                artifact.pruned = True
-                if artifact.delete_root_on_prune and artifact.inflight == 0:
-                    to_delete.append(artifact.root)
-        for root in to_delete:
-            shutil.rmtree(root, ignore_errors=True)
-
-
-class Upload:
-    __slots__ = ("upload_id", "session_id", "kind", "role", "input_id",
-                 "manifest", "staging_dir", "received", "record", "created",
-                 "lock")
-
-    def __init__(self, upload_id, session_id, kind, role, input_id, manifest,
-                 staging_dir):
-        self.upload_id = upload_id
-        self.session_id = session_id
-        self.kind = kind
-        self.role = role
-        self.input_id = input_id
-        self.manifest = manifest
-        self.staging_dir = staging_dir
-        self.received = {}
-        self.record = None
-        self.created = time.time()
-        self.lock = threading.Lock()
-
-    def declared_bytes(self):
-        return sum(entry["size"] for entry in self.manifest.values())
-
-
-def _validate_upload_manifest(value):
-    files = value.get("files")
-    if not isinstance(files, list) or not files:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Upload manifest lists no files")
-    if len(files) > MAX_UPLOAD_FILES:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Upload manifest lists too many files")
-    manifest = {}
-    for entry in files:
-        if not isinstance(entry, dict):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Malformed upload manifest entry")
-        name = entry.get("name")
-        if not _is_safe_relative_name(name):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Unsafe upload file name: {name!r}")
-        try:
-            size = int(entry.get("size"))
-            digest = str(entry.get("sha256", "")).lower()
-        except (TypeError, ValueError):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Malformed upload manifest entry")
-        if size < 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Malformed upload manifest entry")
-        if name in manifest:
-            raise ApiError(HTTPStatus.BAD_REQUEST, f"Duplicate upload file name: {name}")
-        manifest[name] = {"size": size, "sha256": digest}
-    return manifest
-
-
-def _validate_patch_content(directory):
-    meta_path = directory / "meta.json"
-    if not meta_path.is_file():
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Patch upload is missing meta.json")
-    try:
-        with meta_path.open("r", encoding="utf-8") as stream:
-            meta = json.load(stream)
-    except Exception as exc:
-        raise ApiError(HTTPStatus.BAD_REQUEST, f"Patch meta.json is invalid JSON: {exc}")
-    if meta.get("format") != "tifxyz":
-        raise ApiError(HTTPStatus.BAD_REQUEST, "Patch meta.json format must be 'tifxyz'")
-    for raster in ("x.tif", "y.tif", "z.tif"):
-        if not (directory / raster).is_file():
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Patch upload is missing raster file {raster}")
-
-
-def _load_single_json(directory, kind):
-    json_files = [p for p in directory.rglob("*") if p.is_file()]
-    if len(json_files) != 1 or json_files[0].suffix.lower() != ".json":
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"A {kind} upload must contain exactly one JSON file")
-    try:
-        with json_files[0].open("r", encoding="utf-8") as stream:
-            return json.load(stream), json_files[0]
-    except Exception as exc:
-        raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
-
-
-def _validate_upload_content(kind, role, directory):
-    if kind == "patch":
-        _validate_patch_content(directory)
-        return
-    if kind == "checkpoint":
-        files = [p for p in directory.rglob("*") if p.is_file()]
-        if len(files) != 1:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "A checkpoint upload must contain exactly one file")
-        try:
-            validate_checkpoint_container(files[0])
-        except (OSError, ValueError) as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid checkpoint: {exc}")
-        return
-    document, _ = _load_single_json(directory, kind)
-    if kind == "fiber":
-        if not isinstance(document, dict) or document.get("type") != "vc3d_fiber":
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Fiber uploads must be JSON documents with type 'vc3d_fiber'")
-        if document.get("version", 1) == 1:
-            return
-        try:
-            parse_vc3d_fiber_format(document)
-        except ValueError as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Invalid fiber upload: {exc}") from exc
-        return
-    if kind == "pcl":
-        if not isinstance(document, dict) \
-                or document.get("vc_pointcollections_json_version") != "1":
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "PCL uploads must be vc_pointcollections_json_version 1 documents")
-        if not isinstance(document.get("collections"), dict) or not document["collections"]:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "PCL upload contains no collections")
-        if role not in _PCL_ROLE_FILES:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "PCL uploads must declare a valid role")
-        return
-    raise ApiError(HTTPStatus.BAD_REQUEST, f"Unknown input kind {kind!r}")
-
-
-def _merge_pcl_documents(existing, incoming):
-    """Merge the incoming multi-collection document into the existing one."""
-    merged = dict(existing)
-    collections = dict(existing.get("collections", {}))
-    next_id = max((int(key) for key in collections), default=-1) + 1
-    for _, collection in sorted(incoming.get("collections", {}).items(),
-                                key=lambda item: int(item[0])):
-        collections[str(next_id)] = collection
-        next_id += 1
-    merged["collections"] = collections
-    return merged
-
-
-def _copy_publish(source, destination, keep_source=False):
-    """Publish across filesystems: copy to a temp sibling, rename, and unless
-    keep_source is set delete the source (a move)."""
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temp = destination.parent / f".{destination.name}.incoming-{secrets.token_hex(4)}"
-    try:
-        if Path(source).is_dir():
-            shutil.copytree(source, temp, symlinks=False)
-        else:
-            shutil.copy2(source, temp)
-        os.replace(temp, destination)
-    except BaseException:
-        if temp.is_dir():
-            shutil.rmtree(temp, ignore_errors=True)
-        elif temp.exists():
-            temp.unlink(missing_ok=True)
-        raise
-    if keep_source:
-        return
-    if Path(source).is_dir():
-        shutil.rmtree(source, ignore_errors=True)
-    else:
-        Path(source).unlink(missing_ok=True)
-
-
-def _find_lasagna_service():
-    configured = str(os.environ.get("LASAGNA_SERVICE_PATH") or "").strip()
-    candidates = [Path(configured).expanduser()] if configured else []
-    here = Path(__file__).resolve()
-    candidates.extend([
-        here.parents[3] / "lasagna" / "fit_service.py",
-        Path.home() / "villa" / "lasagna" / "fit_service.py",
-    ])
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise RuntimeError(
-        "Cannot find Lasagna fit_service.py on the Spiral host; "
-        "set LASAGNA_SERVICE_PATH")
-
-
-def _md5_file(path):
-    digest = hashlib.md5(usedforsecurity=False)
-    with Path(path).open("rb") as stream:
-        while True:
-            block = stream.read(TRANSFER_CHUNK_BYTES)
-            if not block:
-                break
-            digest.update(block)
-    return f"md5:{digest.hexdigest()}"
-
-
-def _prepare_cleaned_lasagna_surface(surface_dir, destination,
-                                     erosion_cells=3):
-    """Stage a Lasagna-only TIFXYZ with ragged/disconnected support removed."""
-    surface_dir = Path(surface_dir).resolve(strict=True)
-    destination = Path(destination)
-    required = ("meta.json", "x.tif", "y.tif", "z.tif")
-    missing = [name for name in required if not (surface_dir / name).is_file()]
-    if missing:
-        raise RuntimeError(
-            f"Spiral preview is missing: {', '.join(missing)}")
-
-    coordinates = []
-    shape = None
-    valid = None
-    for name in ("x.tif", "y.tif", "z.tif"):
-        with Image.open(surface_dir / name) as image:
-            coordinate = np.asarray(image, dtype=np.float32)
-        if coordinate.ndim != 2:
-            raise RuntimeError(
-                f"Spiral preview {name} must be a two-dimensional TIFF")
-        if shape is None:
-            shape = coordinate.shape
-        elif coordinate.shape != shape:
-            raise RuntimeError(
-                "Spiral preview coordinate TIFF dimensions do not match")
-        coordinate = coordinate.copy()
-        coordinates.append(coordinate)
-        coordinate_valid = coordinate != -1.0
-        valid = (coordinate_valid if valid is None
-                 else valid | coordinate_valid)
-
-    cleaned = scipy.ndimage.binary_erosion(
-        valid, iterations=int(erosion_cells), border_value=0)
-    labels, component_count = scipy.ndimage.label(
-        cleaned, structure=scipy.ndimage.generate_binary_structure(2, 1))
-    if component_count == 0:
-        raise RuntimeError(
-            f"Lasagna input cleanup removed every valid TIFXYZ vertex "
-            f"after {int(erosion_cells)}-cell erosion")
-    component_sizes = np.bincount(labels.ravel())
-    component_sizes[0] = 0
-    cleaned = labels == int(np.argmax(component_sizes))
-
-    shutil.copytree(surface_dir, destination)
-    for coordinate, name in zip(coordinates, ("x.tif", "y.tif", "z.tif")):
-        coordinate[~cleaned] = -1.0
-        Image.fromarray(coordinate).save(destination / name)
-
-    metadata_path = destination / "meta.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["bbox"] = [
-        [float(coordinate[cleaned].min()) for coordinate in coordinates],
-        [float(coordinate[cleaned].max()) for coordinate in coordinates],
-    ]
-    valid_quad = (
-        cleaned[:-1, :-1]
-        & cleaned[1:, :-1]
-        & cleaned[:-1, 1:]
-        & cleaned[1:, 1:]
-    )
-    scale = metadata.get("scale")
-    if (isinstance(scale, list) and len(scale) >= 2
-            and all(isinstance(value, (int, float)) and value > 0
-                    for value in scale[:2])):
-        area_vx2 = float(valid_quad.sum()) / (
-            float(scale[0]) * float(scale[1]))
-        old_area_vx2 = metadata.get("area_vx2")
-        old_area_cm2 = metadata.get("area_cm2")
-        metadata["area_vx2"] = area_vx2
-        if (isinstance(old_area_vx2, (int, float))
-                and old_area_vx2 > 0
-                and isinstance(old_area_cm2, (int, float))):
-            metadata["area_cm2"] = (
-                area_vx2 * float(old_area_cm2) / float(old_area_vx2))
-    metadata["lasagna_input_cleanup"] = {
-        "erosion_cells": int(erosion_cells),
-        "component_connectivity": 4,
-        "components_after_erosion": int(component_count),
-    }
-    metadata_path.write_text(
-        json.dumps(metadata, indent=4) + "\n", encoding="utf-8")
-    return destination
-
-
-def _prepare_lasagna_surface_object(surface_dir, object_store):
-    surface_dir = Path(surface_dir).resolve(strict=True)
-    required = ("meta.json", "x.tif", "y.tif", "z.tif")
-    missing = [name for name in required if not (surface_dir / name).is_file()]
-    if missing:
-        raise RuntimeError(
-            f"Spiral preview is missing: {', '.join(missing)}")
-    lines = []
-    for path in sorted(p for p in surface_dir.rglob("*") if p.is_file()):
-        relative = path.relative_to(surface_dir).as_posix()
-        lines.append(f"{relative}\t{_md5_file(path)}\n")
-    manifest = hashlib.md5(
-        "".join(lines).encode("utf-8"), usedforsecurity=False).hexdigest()
-    ref = {"type": "tifxyz_segment", "name": surface_dir.name,
-           "hash": f"md5:{manifest}"}
-    destination = (Path(object_store) / ref["type"] / manifest
-                   / quote(ref["name"], safe=""))
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "segment").symlink_to(surface_dir, target_is_directory=True)
-    (destination / "object.json").write_text(
-        json.dumps(ref, indent=2) + "\n", encoding="utf-8")
-    return ref
-
-
-def _surface_xyz(surface_dir):
-    """Load one TIFXYZ grid as HxWx3 float32 plus its validity mask."""
-    coordinates = []
-    for name in ("x.tif", "y.tif", "z.tif"):
-        with Image.open(Path(surface_dir) / name) as image:
-            coordinates.append(np.asarray(image, dtype=np.float32).copy())
-    if not coordinates or any(value.shape != coordinates[0].shape
-                              for value in coordinates[1:]):
-        raise RuntimeError("TIFXYZ coordinate TIFF dimensions do not match")
-    xyz = np.stack(coordinates, axis=-1)
-    valid = np.isfinite(xyz).all(axis=-1) & ~np.all(xyz == -1.0, axis=-1)
-    return xyz, valid
-
-
-def _validate_tifxyz_output_step(metadata, expected_step):
-    """Require exported TIFXYZ scale to match the requested grid step."""
-    expected = float(expected_step)
-    scale = metadata.get("scale") if isinstance(metadata, dict) else None
-    if (not math.isfinite(expected) or expected <= 0.0
-            or not isinstance(scale, list) or len(scale) < 2):
-        raise RuntimeError(
-            "Lasagna output metadata has no valid two-axis scale")
-    expected_scale = 1.0 / expected
-    values = []
-    for raw in scale[:2]:
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            raise RuntimeError(
-                "Lasagna output metadata has a non-numeric scale") from None
-        if (not math.isfinite(value) or value <= 0.0
-                or not math.isclose(
-                    value, expected_scale, rel_tol=1.0e-6, abs_tol=1.0e-9)):
-            raise RuntimeError(
-                "Lasagna output scale does not match requested preview step "
-                f"{expected:g}")
-        values.append(value)
-    return values
-
-
-def _load_flatten_correspondence(checkpoint_path=None, map_path=None):
-    """Read Lasagna's flattened-output -> Spiral-source grid map."""
-    if map_path is not None and Path(map_path).is_file():
-        mapping = np.load(str(map_path), mmap_mode="r", allow_pickle=False)
-        mapping = np.asarray(mapping, dtype=np.float32)
-        if mapping.ndim != 3 or mapping.shape[-1] != 2:
-            raise RuntimeError(
-                "Lasagna output-to-source map must have shape (rows, columns, 2)")
-        if not np.isfinite(mapping).all():
-            raise RuntimeError(
-                "Lasagna output-to-source map contains non-finite values")
-        return mapping
-
-    if checkpoint_path is None:
-        raise RuntimeError("Lasagna produced no flatten correspondence")
-    import torch
-
-    state = torch.load(
-        str(checkpoint_path), map_location="cpu", weights_only=False)
-    if not isinstance(state, dict) or "flatten_map_flat" not in state:
-        raise RuntimeError(
-            "Lasagna flatten checkpoint contains no output-to-source map")
-    value = state["flatten_map_flat"]
-    if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
-    mapping = np.asarray(value, dtype=np.float32)
-    if mapping.ndim != 3 or mapping.shape[-1] != 2:
-        raise RuntimeError(
-            "Lasagna output-to-source map must have shape (rows, columns, 2)")
-    if not np.isfinite(mapping).all():
-        raise RuntimeError("Lasagna output-to-source map contains non-finite values")
-    return mapping
-
-
-def _sample_rgba_through_map(source_rgba, source_yx, output_valid, *,
-                             executor=None):
-    """Bilinearly warp RGBA using premultiplied alpha."""
-    source = np.asarray(source_rgba, dtype=np.float32) / 255.0
-    if source.ndim != 3 or source.shape[-1] != 4:
-        raise RuntimeError("Mapped preview overlay must be RGBA")
-    alpha = source[..., 3]
-    premultiplied = source[..., :3] * alpha[..., None]
-    coordinates = [source_yx[..., 0], source_yx[..., 1]]
-
-    def sample(channel):
-        values = alpha if channel == 3 else premultiplied[..., channel]
-        return scipy.ndimage.map_coordinates(
-            values, coordinates, order=1, mode="constant", cval=0.0,
-            prefilter=False)
-
-    if executor is None:
-        sampled = [sample(channel) for channel in range(4)]
-    else:
-        # Each channel is independent and scipy releases the GIL here.  Mapping
-        # them concurrently preserves the exact interpolation and output bytes.
-        sampled = list(executor.map(sample, range(4)))
-    sampled_alpha = sampled[3]
-    sampled_rgb = np.stack(sampled[:3], axis=-1)
-    nonzero = sampled_alpha > 1.0e-8
-    sampled_rgb[nonzero] /= sampled_alpha[nonzero, None]
-    sampled_rgb[~nonzero] = 0.0
-    sampled_alpha = np.where(output_valid, sampled_alpha, 0.0)
-    sampled_rgb = np.where(output_valid[..., None], sampled_rgb, 0.0)
-    result = np.empty((*sampled_alpha.shape, 4), dtype=np.uint8)
-    result[..., :3] = np.clip(
-        np.rint(sampled_rgb * 255.0), 0, 255).astype(np.uint8)
-    result[..., 3] = np.clip(
-        np.rint(sampled_alpha * 255.0), 0, 255).astype(np.uint8)
-    return result
-
-
-def _mapped_winding_ids(source_manifest, source_shape, source_yx,
-                        output_valid):
-    """Categorically map source winding membership onto a flattened grid."""
-    ranges = source_manifest.get("winding_column_ranges")
-    windings = source_manifest.get("winding_ids")
-    if (not isinstance(ranges, list) or not isinstance(windings, list)
-            or len(ranges) != len(windings) or not ranges):
-        raise RuntimeError("Spiral source preview has no winding mapping")
-    winding_values = sorted({int(winding) for winding in windings})
-    winding_to_dense = {
-        winding: index + 1 for index, winding in enumerate(winding_values)
-    }
-    source_labels = np.zeros(source_shape, dtype=np.int32)
-    for bounds, winding in zip(ranges, windings):
-        if not isinstance(bounds, list) or len(bounds) != 2:
-            raise RuntimeError("Malformed Spiral winding column range")
-        begin, end = int(bounds[0]), int(bounds[1])
-        if begin < 0 or end <= begin or end > source_shape[1]:
-            raise RuntimeError("Spiral winding column range is out of bounds")
-        source_labels[:, begin:end] = winding_to_dense[int(winding)]
-
-    rows = np.rint(source_yx[..., 0]).astype(np.int64)
-    columns = np.rint(source_yx[..., 1]).astype(np.int64)
-    in_bounds = (
-        output_valid
-        & (rows >= 0) & (rows < source_shape[0])
-        & (columns >= 0) & (columns < source_shape[1])
-    )
-    dense_result = np.zeros(output_valid.shape, dtype=np.int32)
-    dense_result[in_bounds] = source_labels[
-        rows[in_bounds], columns[in_bounds]]
-    bounds = []
-    objects = scipy.ndimage.find_objects(
-        dense_result, max_label=len(winding_values))
-    for dense_label, slices in enumerate(objects, start=1):
-        if slices is None:
-            continue
-        row_slice, column_slice = slices
-        winding = winding_values[dense_label - 1]
-        bounds.append({
-            "winding": winding,
-            "row_begin": int(row_slice.start),
-            "row_end": int(row_slice.stop),
-            "column_begin": int(column_slice.start),
-            "column_end": int(column_slice.stop),
-        })
-    if not bounds:
-        raise RuntimeError("Lasagna correspondence mapped no preview windings")
-    lookup = np.asarray([-1, *winding_values], dtype=np.int32)
-    result = lookup[dense_result]
-    return result, bounds
-
-
-def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
-                       current_surface_data=None):
-    """Build a current-source-grid displacement overlay by winding identity."""
-    if current_surface_data is None:
-        current_surface = Path(current_manifest["surface_path"])
-        current_xyz, current_valid = _surface_xyz(current_surface)
-    else:
-        current_xyz, current_valid = current_surface_data
-    rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
-    if previous_manifest is None:
-        return rgba, 0
-    previous_xyz, previous_valid = _surface_xyz(
-        Path(previous_manifest["surface_path"]))
-    previous_by_winding = {
-        int(winding): bounds
-        for winding, bounds in zip(
-            previous_manifest.get("winding_ids", []),
-            previous_manifest.get("winding_column_ranges", []))
-    }
-    magnitudes = np.full(current_valid.shape, np.nan, dtype=np.float32)
-    for winding, current_bounds in zip(
-            current_manifest.get("winding_ids", []),
-            current_manifest.get("winding_column_ranges", [])):
-        previous_bounds = previous_by_winding.get(int(winding))
-        if previous_bounds is None:
-            continue
-        current_begin, current_end = map(int, current_bounds)
-        previous_begin, previous_end = map(int, previous_bounds)
-        rows = min(current_xyz.shape[0], previous_xyz.shape[0])
-        width = min(current_end - current_begin,
-                    previous_end - previous_begin)
-        if rows <= 0 or width <= 0:
-            continue
-        current_region = current_xyz[:rows, current_begin:current_begin + width]
-        previous_region = previous_xyz[
-            :rows, previous_begin:previous_begin + width]
-        valid = (
-            current_valid[:rows, current_begin:current_begin + width]
-            & previous_valid[:rows, previous_begin:previous_begin + width]
-        )
-        delta = np.linalg.norm(current_region - previous_region, axis=-1)
-        target = magnitudes[:rows, current_begin:current_begin + width]
-        target[valid] = delta[valid]
-    finite = np.isfinite(magnitudes) & (magnitudes > 1.0e-6)
-    if not finite.any():
-        return rgba, 0
-    display_maximum = float(np.percentile(magnitudes[finite], 95))
-    if not math.isfinite(display_maximum) or display_maximum <= 0.0:
-        display_maximum = float(np.nanmax(magnitudes))
-    intensity = np.zeros_like(magnitudes)
-    intensity[finite] = np.clip(
-        magnitudes[finite] / display_maximum, 0.0, 1.0)
-    # Match VC3D's blue/cyan/yellow/red diagnostic palette closely.
-    stops = np.asarray(
-        [[32, 64, 220], [20, 210, 235], [255, 220, 35], [255, 45, 20]],
-        dtype=np.float32)
-    scaled = intensity * (len(stops) - 1)
-    lower = np.minimum(scaled.astype(np.int32), len(stops) - 2)
-    fraction = (scaled - lower)[..., None]
-    rgba[..., :3] = np.clip(
-        stops[lower] * (1.0 - fraction)
-        + stops[lower + 1] * fraction,
-        0, 255).astype(np.uint8)
-    rgba[..., 3] = np.where(
-        finite,
-        np.clip(28.0 + 207.0 * np.sqrt(intensity), 0, 235),
-        0).astype(np.uint8)
-    return rgba, int(finite.sum())
-
-
-def _fit_service_json(port, path, body=None, timeout=30):
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{int(port)}{path}", data=data,
-        method="GET" if body is None else "POST",
-        headers={"X-Fit-Service-API-Version": "2",
-                 "Content-Type": "application/json",
-                 "X-VC3D-Source": "Spiral host service"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            payload = {}
-        raise RuntimeError(
-            str(payload.get("error") or f"Lasagna HTTP {exc.code}")) from exc
-    if isinstance(payload, dict) and payload.get("error"):
-        raise RuntimeError(str(payload["error"]))
-    return payload
-
-
-def _stop_process_group(process):
-    if process is None or process.poll() is not None:
-        return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-        process.wait(timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-            process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
                  service_name=None, session_name="", logs=None, events=None,
@@ -1290,7 +507,7 @@ class ServiceState:
         self._event_errors = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
-        self.uploads = {}
+        self.uploads_manager = UploadManager(self._upload_environment())
         self.ephemeral_records = []
         self._registered_preview_generation = 0
         self._processed_preview_generation = 0
@@ -1557,7 +774,7 @@ class ServiceState:
         self._event_metric_iterations = {}
         self._event_errors = {}
         self.ephemeral_records = []
-        self.uploads = {}
+        self.uploads_manager.reset()
         self._registered_preview_generation = 0
         self._processed_preview_generation = 0
         self._publishing_preview_generation = 0
@@ -2000,370 +1217,67 @@ class ServiceState:
 
     def _publish_flattened_preview(
             self, session_id, generation, preview_manifest_path):
-        process = None
-        publish_root = None
-        timing_stage = None
-        timing_started = time.perf_counter()
+        """Run one Lasagna preview publication for this session.
 
-        def start_stage(state, stage_name, **values):
-            nonlocal timing_stage, timing_started
-            now = time.perf_counter()
-            if timing_stage is not None:
-                print(
-                    "SPIRAL_PREVIEW_TIMING "
-                    f"generation={generation} stage={timing_stage!r} "
-                    f"seconds={now - timing_started:.6f}",
-                    flush=True)
-            timing_stage = stage_name
-            timing_started = now
-            self._update_preview_publish(
-                generation, state=state, stage_name=stage_name, **values)
+        The publisher owns the whole operation; this method only binds it to
+        the current session: one progress path into
+        ``_update_preview_publish``, the subprocess handle the service kills
+        on shutdown, the session-validity check, and the previous raw
+        generation the run-difference overlay is built against.
+        """
+        with self.lock:
+            output_directory = self.session_paths.output_directory
+            voxel_size_um = (
+                (self.session_request or {}).get("run") or {}
+            ).get("voxel_size_um")
 
-        try:
-            fit_service = _find_lasagna_service()
-            config_path = fit_service.parent / "configs" / "flatten_fast_nofilter.json"
-            if not config_path.is_file():
-                raise RuntimeError(
-                    f"Cannot find Lasagna flatten config: {config_path}")
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            manifest = json.loads(preview_manifest_path.read_text(encoding="utf-8"))
-            surface_path = Path(str(manifest.get("surface_path") or ""))
-            if not surface_path.is_dir():
-                raise RuntimeError(
-                    f"Spiral preview surface does not exist: {surface_path}")
+        def attach_process(process):
+            with self.lock:
+                if (self.session_id == session_id
+                        and self._publishing_preview_generation == generation):
+                    self._preview_process = process
 
-            args = config.get("args")
-            if not isinstance(args, dict):
-                args = {}
-            args["flatten_output_step"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
-            args["flatten_output_margin"] = 0.0
-            config["args"] = args
-            run_request = (self.session_request or {}).get("run") or {}
-            voxel_size = run_request.get("voxel_size_um")
-            if isinstance(voxel_size, (int, float)) and float(voxel_size) > 0.0:
-                config["voxel_size_um"] = float(voxel_size)
-
-            output_root = Path(self.session_paths.output_directory).resolve()
-            output_root.mkdir(parents=True, exist_ok=True)
-            publish_parent = output_root / ".spiral-published" / session_id
-            publish_parent.mkdir(parents=True, exist_ok=True)
-            final_root = publish_parent / f"generation-{generation}"
-            if final_root.exists():
-                raise RuntimeError(
-                    f"Refusing to overwrite published preview: {final_root}")
-            publish_root = publish_parent / (
-                f".generation-{generation}.incoming-{secrets.token_hex(5)}")
-            publish_root.mkdir(parents=True, exist_ok=False)
-            source_id = str(manifest.get("surface_id") or "")
-            if not source_id:
-                raise RuntimeError("Spiral preview manifest has no surface id")
-            surface_id = f"{source_id}-lasagna.tifxyz"
-            flattened_surface = publish_root / surface_id
-            model_output = publish_root / "flatten-model.pt"
-
-            with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
-                temporary = Path(temporary)
-                object_store = temporary / "objects"
-                start_stage(
-                    "preparing", "Preparing Lasagna input surface",
-                    output_step_vx=LASAGNA_PREVIEW_OUTPUT_STEP_VX)
-                metadata = json.loads(
-                    (surface_path / "meta.json").read_text(encoding="utf-8"))
-                cleanup = metadata.get("lasagna_input_cleanup")
-                if (not isinstance(cleanup, dict)
-                        or cleanup.get("erosion_cells") != 3
-                        or cleanup.get("component_connectivity") != 4
-                        or not isinstance(cleanup.get("components_after_erosion"), int)
-                        or cleanup["components_after_erosion"] < 1
-                        or manifest.get("schema_version") != 2
-                        or "components" in metadata):
-                    raise RuntimeError(
-                        "Spiral preview was not published with authoritative "
-                        "connected-surface cleanup")
-                surface_ref = _prepare_lasagna_surface_object(
-                    surface_path, object_store)
-                ready = threading.Event()
-                port_holder = {}
-
-                process = subprocess.Popen(
-                    [sys.executable, str(fit_service), "--port", "0",
-                     "--allow-no-data-dir", "--object-store-dir",
-                     str(object_store)],
-                    cwd=str(fit_service.parent),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, start_new_session=(os.name == "posix"))
-                with self.lock:
-                    if (self.session_id == session_id
-                            and self._publishing_preview_generation == generation):
-                        self._preview_process = process
-
-                def relay_output():
-                    pattern = re.compile(r"listening on http://[^:]+:(\d+)")
-                    assert process.stdout is not None
-                    for line in process.stdout:
-                        text = line.rstrip()
-                        if text:
-                            print(f"SPIRAL_LASAGNA {text}", flush=True)
-                        match = pattern.search(text)
-                        if match:
-                            port_holder["port"] = int(match.group(1))
-                            ready.set()
-                        if "[fit] peak GPU memory:" in text:
-                            self._update_preview_publish(
-                                generation, state="saving",
-                                stage_name="Saving optimized flatten model",
-                                step=0, total_steps=0,
-                                overall_progress=0.0)
-
-                relay = threading.Thread(
-                    target=relay_output, name="spiral-lasagna-log",
-                    daemon=True)
-                relay.start()
-                if not ready.wait(60):
-                    code = process.poll()
-                    raise RuntimeError(
-                        "Temporary Lasagna service failed to start"
-                        + (f" (exit {code})" if code is not None else ""))
-                port = port_holder["port"]
-                config["external_surfaces"] = [surface_ref]
-                request_body = {
-                    "config": config,
-                    "job_spec": {
-                        "config": config,
-                        "linked_surfaces": [surface_ref],
-                    },
-                    "single_segment": True,
-                    "config_name": "flatten_fast_nofilter.json",
-                    "output_name": surface_id,
-                    "output_dir": str(publish_root),
-                    "model_output": str(model_output),
-                    "embed_job_metadata": False,
-                    "omit_model": True,
-                    "export_flatten_map": True,
-                    "source": "Spiral host service",
-                }
-                accepted = _fit_service_json(
-                    port, "/optimize", request_body, timeout=60)
-                fit_job_id = str(accepted.get("job_id") or "")
-                if not fit_job_id:
-                    raise RuntimeError(
-                        "Temporary Lasagna service returned no job id")
-                start_stage(
-                    "running", "Flattening preview surface",
-                    step=0, total_steps=0, overall_progress=0.0)
-
-                while True:
-                    with self.lock:
-                        if self.session_id != session_id:
-                            raise RuntimeError(
-                                "The Spiral session changed while publishing its preview")
-                    fit_status = _fit_service_json(
-                        port, f"/jobs/{fit_job_id}", timeout=15)
-                    state = str(fit_status.get("state") or "")
-                    self._update_preview_publish(
-                        generation, state=state or "running",
-                        stage_name=str(
-                            fit_status.get("stage_name")
-                            or fit_status.get("stage") or "Flattening"),
-                        step=int(fit_status.get("step") or 0),
-                        total_steps=int(fit_status.get("total_steps") or 0),
-                        overall_progress=float(
-                            fit_status.get("overall_progress") or 0.0),
-                        loss=fit_status.get("loss"))
-                    if state == "finished":
-                        break
-                    if state == "cancelled":
-                        raise RuntimeError("Lasagna preview flatten was cancelled")
-                    if state == "error":
-                        raise RuntimeError(
-                            str(fit_status.get("error")
-                                or "Lasagna flatten failed"))
-                    time.sleep(0.5)
-
-                flattened_metadata_path = flattened_surface / "meta.json"
-                if not flattened_metadata_path.is_file():
-                    raise RuntimeError(
-                        "Lasagna reported success but produced no tifxyz output")
-                flatten_map_output = publish_root / ".flatten-map.npy"
-                start_stage(
-                    "loading", "Loading flattened preview output",
-                    step=0, total_steps=0, overall_progress=0.0)
-                correspondence = _load_flatten_correspondence(
-                    model_output, flatten_map_output)
-                flattened_xyz, flattened_valid = _surface_xyz(flattened_surface)
-                if correspondence.shape[:2] != flattened_xyz.shape[:2]:
-                    raise RuntimeError(
-                        "Lasagna correspondence dimensions do not match "
-                        "the flattened surface")
-                source_xyz, source_valid = _surface_xyz(surface_path)
-                start_stage(
-                    "mapping", "Mapping preview winding membership",
-                    step=0, total_steps=0, overall_progress=0.0)
-                winding_ids, winding_bounds = _mapped_winding_ids(
-                    manifest, source_xyz.shape[:2],
-                    correspondence, flattened_valid)
-                winding_map_name = "winding-ids.tif"
-                # OpenCV/Qt do not portably decode signed-int TIFF samples.
-                # IEEE float32 represents every supported winding id exactly
-                # and is converted back to int32 after validation in VC3D.
-                Image.fromarray(
-                    winding_ids.astype(np.float32), mode="F").save(
-                    publish_root / winding_map_name)
-
-                mapped_loss_maps = []
-                loss_output = publish_root / "loss-maps"
-                loss_output.mkdir(exist_ok=True)
-                loss_entries = [
-                    entry for entry in manifest.get("loss_maps", [])
-                    if isinstance(entry, dict)
-                    and (preview_manifest_path.parent
-                         / str(entry.get("path") or "")).is_file()
-                ]
-                remap_total = len(loss_entries)
-                start_stage(
-                    "mapping", (
-                        f"Remapping preview loss maps (0/{remap_total})"
-                        if remap_total else "No preview loss maps to remap"),
-                    step=0, total_steps=remap_total,
-                    overall_progress=0.0)
-                with ThreadPoolExecutor(
-                        max_workers=4,
-                        thread_name_prefix="spiral-overlay-channel") as remap_executor:
-                    for loss_index, entry in enumerate(loss_entries, start=1):
-                        relative = str(entry.get("path") or "")
-                        self._update_preview_publish(
-                            generation, state="mapping",
-                            stage_name=(
-                                f"Remapping preview loss maps "
-                                f"({loss_index}/{remap_total}): "
-                                f"{Path(relative).name}"),
-                            step=loss_index - 1, total_steps=remap_total,
-                            overall_progress=(
-                                float(loss_index - 1) / float(remap_total)
-                                if remap_total else 1.0))
-                        source_overlay = preview_manifest_path.parent / relative
-                        with Image.open(source_overlay) as image:
-                            source_rgba = np.asarray(
-                                image.convert("RGBA"), dtype=np.uint8)
-                        mapped = _sample_rgba_through_map(
-                            source_rgba, correspondence, flattened_valid,
-                            executor=remap_executor)
-                        destination = loss_output / Path(relative).name
-                        Image.fromarray(mapped, mode="RGBA").save(destination)
-                        mapped_entry = dict(entry)
-                        mapped_entry["path"] = (
-                            Path("loss-maps") / destination.name).as_posix()
-                        mapped_entry["supported_pixels"] = int(
-                            np.count_nonzero(mapped[..., 3]))
-                        mapped_loss_maps.append(mapped_entry)
-
-                    start_stage(
-                        "mapping", "Building preview run difference",
-                        step=0, total_steps=0, overall_progress=0.0)
-                    previous_manifest = None
-                    with self.lock:
-                        previous_path = self._previous_raw_preview_manifest
-                    if previous_path and Path(previous_path).is_file():
-                        previous_manifest = json.loads(
-                            Path(previous_path).read_text(encoding="utf-8"))
-                    raw_diff, changed_pixels = _raw_run_diff_rgba(
-                        previous_manifest, manifest,
-                        current_surface_data=(source_xyz, source_valid))
-                    mapped_diff = _sample_rgba_through_map(
-                        raw_diff, correspondence, flattened_valid,
-                        executor=remap_executor)
-                run_diff = None
-                if changed_pixels:
-                    run_diff_name = "run-diff.png"
-                    Image.fromarray(mapped_diff, mode="RGBA").save(
-                        publish_root / run_diff_name)
-                    run_diff = {
-                        "path": run_diff_name,
-                        "changed_source_pixels": changed_pixels,
-                        "supported_pixels": int(
-                            np.count_nonzero(mapped_diff[..., 3])),
-                    }
-
-                start_stage(
-                    "finalizing", "Finalizing preview metadata",
-                    step=0, total_steps=0, overall_progress=0.0)
-                flattened_metadata = json.loads(
-                    flattened_metadata_path.read_text(encoding="utf-8"))
-                _validate_tifxyz_output_step(
-                    flattened_metadata, LASAGNA_PREVIEW_OUTPUT_STEP_VX)
-                flattened_metadata.pop("components", None)
-                flattened_metadata.pop("winding_column_ranges", None)
-                flattened_metadata.pop("model_source", None)
-                flattened_metadata["uuid"] = surface_id
-                flattened_metadata["name"] = surface_id
-                flattened_metadata["grid_shape"] = [
-                    int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
-                flattened_metadata["output_step_vx"] = (
-                    LASAGNA_PREVIEW_OUTPUT_STEP_VX)
-                flattened_metadata["winding_id_map"] = winding_map_name
-                flattened_metadata["winding_id_dtype"] = "float32_integer"
-                flattened_metadata["winding_bounds"] = winding_bounds
-                flattened_metadata["component_winding_ids"] = [
-                    item["winding"] for item in winding_bounds]
-                flattened_metadata_path.write_text(
-                    json.dumps(flattened_metadata, indent=4) + "\n",
-                    encoding="utf-8")
-
-                published = dict(manifest)
-                published["schema_version"] = 3
-                published["surface_id"] = surface_id
-                published["surface_path"] = str(final_root / surface_id)
-                published["manifest_path"] = str(final_root / "manifest.json")
-                published["output_step_vx"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
-                published["grid_shape"] = [
-                    int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
-                published["winding_ids"] = [
-                    item["winding"] for item in winding_bounds]
-                published["winding_id_map"] = winding_map_name
-                published["winding_id_dtype"] = "float32_integer"
-                published["winding_bounds"] = winding_bounds
-                published["loss_maps"] = mapped_loss_maps
-                published.pop("winding_column_ranges", None)
-                published.pop("components", None)
-                if run_diff is None:
-                    published.pop("run_diff", None)
-                else:
-                    published["run_diff"] = run_diff
-                (publish_root / "manifest.json").write_text(
-                    json.dumps(published, indent=2) + "\n",
-                    encoding="utf-8")
-
-                # These are transient transport files.  The interactive Spiral
-                # preview never exposes a Lasagna model to VC3D.
-                del correspondence
-                model_output.unlink(missing_ok=True)
-                flatten_map_output.unlink(missing_ok=True)
-                (flattened_surface / "model.pt").unlink(missing_ok=True)
-                os.replace(publish_root, final_root)
-                publish_root = None
-
-                with self.lock:
-                    old_raw = self._previous_raw_preview_manifest
-                    self._previous_raw_preview_manifest = str(
-                        preview_manifest_path)
-                if old_raw and old_raw != str(preview_manifest_path):
-                    shutil.rmtree(Path(old_raw).parent, ignore_errors=True)
-                start_stage(
-                    "finalizing", "Preparing preview artifact index",
-                    step=0, total_steps=0, overall_progress=0.0)
-                return final_root / "manifest.json"
-        finally:
-            _stop_process_group(process)
-            if publish_root is not None:
-                shutil.rmtree(publish_root, ignore_errors=True)
+        def detach_process(process):
             with self.lock:
                 if self._preview_process is process:
                     self._preview_process = None
                 self.status_generation += 1
 
+        def session_valid():
+            with self.lock:
+                return self.session_id == session_id
+
+        def previous_raw_manifest():
+            with self.lock:
+                return self._previous_raw_preview_manifest
+
+        def adopt_raw_manifest(path):
+            with self.lock:
+                old_raw = self._previous_raw_preview_manifest
+                self._previous_raw_preview_manifest = path
+            return old_raw
+
+        publisher = LasagnaPublisher(
+            progress=lambda **values: self._update_preview_publish(
+                generation, **values),
+            attach_process=attach_process,
+            detach_process=detach_process,
+            session_valid=session_valid,
+            previous_raw_manifest=previous_raw_manifest,
+            adopt_raw_manifest=adopt_raw_manifest)
+        return publisher.publish(
+            preview_manifest_path, session_id=session_id,
+            generation=generation, output_directory=output_directory,
+            voxel_size_um=voxel_size_um)
+
     # ------------------------------------------------------------------
     # Session input uploads
     # ------------------------------------------------------------------
+
+    @property
+    def uploads(self):
+        """Uploads in flight, keyed by upload ID (owned by the manager)."""
+        return self.uploads_manager.uploads
 
     def _output_root(self):
         """Output directory known before any session in dataset mode."""
@@ -2379,323 +1293,69 @@ class ServiceState:
         return Path(self.session_paths.output_directory) / ".spiral-ephemeral" / self.session_id
 
     def _staging_root(self):
-        return self._output_root() / ".spiral-upload-staging"
+        return self.uploads_manager.staging_root()
 
     def _checkpoint_upload_root(self):
-        return self._output_root() / UPLOADED_CHECKPOINTS_DIRNAME
+        return self.uploads_manager.checkpoint_root()
 
-    @staticmethod
-    def _checkpoint_digest_path(root, digest):
-        return root / f"{digest}.ckpt"
+    def _upload_environment(self):
+        """The whole of what the upload manager may ask this service."""
+        return UploadEnvironment(
+            lock=self.lock,
+            output_root=self._output_root,
+            session_id=lambda: self.session_id,
+            ephemeral_dir=self._session_ephemeral_dir,
+            require_session=self._require_session,
+            active_checkpoint=self._active_checkpoint,
+            reserve_ephemeral=self._reserve_ephemeral)
 
-    @staticmethod
-    def _file_sha256(path):
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            while True:
-                block = stream.read(TRANSFER_CHUNK_BYTES)
-                if not block:
-                    break
-                digest.update(block)
-        return digest.hexdigest()
+    def _active_checkpoint(self):
+        with self.lock:
+            return self.session_paths.checkpoint if self.session_paths else ""
 
-    def _find_uploaded_checkpoint(self, root, digest, size):
-        """Find retained checkpoint content, including pre-v7 named uploads."""
-        canonical = self._checkpoint_digest_path(root, digest)
-        try:
-            if canonical.is_file() and canonical.stat().st_size == size:
-                return canonical
-        except OSError:
-            pass
-        if not root.is_dir():
-            return None
-        for candidate in root.iterdir():
-            if candidate == canonical:
-                continue
-            try:
-                if not candidate.is_file() or candidate.stat().st_size != size:
-                    continue
-                if self._file_sha256(candidate) == digest:
-                    return candidate
-            except OSError:
-                continue
-        return None
+    def _reserve_ephemeral(self, kind, input_id, declared):
+        """Admit one new ephemeral input, or refuse it.
 
-    @staticmethod
-    def _checkpoint_record(input_id, path, size, upload_id=None):
-        record = {
-            "id": input_id,
-            "kind": "checkpoint",
-            "role": None,
-            "path": str(path),
-            "bytes": size,
-            "state": "uploaded",
-        }
-        if upload_id is not None:
-            record["upload_id"] = upload_id
-        return record
+        Duplicate identities and the ephemeral quota are ledger questions,
+        not transfer questions, so the upload manager delegates them here.
+        """
+        with self.lock:
+            if any(record["id"] == input_id and record["kind"] == kind
+                   for record in self.ephemeral_records):
+                raise ApiError(HTTPStatus.CONFLICT,
+                               f"An ephemeral {kind} named {input_id!r} already exists")
+            if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
+                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                               "The ephemeral input quota is exhausted")
 
     def _ephemeral_bytes_in_use(self):
         total = sum(record["bytes"] for record in self.ephemeral_records)
-        total += sum(upload.declared_bytes() for upload in self.uploads.values()
-                     if upload.record is None and upload.kind != "checkpoint")
-        return total
+        return total + self.uploads_manager.staged_ephemeral_bytes()
 
     def begin_upload(self, request):
-        kind = str(request.get("kind") or "").strip()
-        if kind not in ("patch", "fiber", "pcl", "checkpoint"):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Input kind must be one of patch, fiber, pcl, checkpoint")
-        role = request.get("role")
-        if kind == "pcl":
-            if role not in _PCL_ROLE_FILES:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "A PCL upload must declare its role")
-        else:
-            role = None
-        input_id = str(request.get("id") or "").strip()
-        if not _SAFE_ID.match(input_id):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "The input id must be a single safe path component")
-        manifest = _validate_upload_manifest(request)
-        declared = sum(entry["size"] for entry in manifest.values())
-        if kind == "checkpoint":
-            with self.lock:
-                # Resume checkpoints are needed before a session exists, so
-                # they are service-scoped: allowed whenever an output
-                # directory is known (a --dataset launch or a live session).
-                output_root = self._output_root()
-                if output_root is None:
-                    raise ApiError(HTTPStatus.CONFLICT,
-                                   "Checkpoint uploads need a --dataset service "
-                                   "or an active session")
-                if len(manifest) != 1:
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   "A checkpoint upload must declare exactly one file")
-                if declared > MAX_CHECKPOINT_UPLOAD_BYTES:
-                    raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                                   "The checkpoint exceeds the upload size limit")
-            entry = next(iter(manifest.values()))
-            checkpoint_root = output_root / UPLOADED_CHECKPOINTS_DIRNAME
-            existing = self._find_uploaded_checkpoint(
-                checkpoint_root, entry["sha256"], entry["size"])
-            if existing is not None:
-                try:
-                    os.utime(existing, None)
-                except OSError:
-                    pass
-                record = self._checkpoint_record(
-                    input_id, existing, entry["size"])
-                return {
-                    **self._base(),
-                    "accepted": True,
-                    "deduplicated": True,
-                    "input": record,
-                }
-        with self.lock:
-            if kind == "checkpoint":
-                current_output_root = self._output_root()
-                if current_output_root is None or current_output_root != output_root:
-                    raise ApiError(HTTPStatus.CONFLICT,
-                                   "The checkpoint upload destination changed")
-                # Close the race with another request that finalized this
-                # digest while the legacy-file scan ran without the state lock.
-                canonical = self._checkpoint_digest_path(
-                    checkpoint_root, entry["sha256"])
-                if canonical.is_file() and canonical.stat().st_size == entry["size"]:
-                    os.utime(canonical, None)
-                    return {
-                        **self._base(),
-                        "accepted": True,
-                        "deduplicated": True,
-                        "input": self._checkpoint_record(
-                            input_id, canonical, entry["size"]),
-                    }
-            else:
-                self._require_session()
-                if any(record["id"] == input_id and record["kind"] == kind
-                       for record in self.ephemeral_records):
-                    raise ApiError(HTTPStatus.CONFLICT,
-                                   f"An ephemeral {kind} named {input_id!r} already exists")
-                if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
-                    raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                                   "The ephemeral input quota is exhausted")
-            upload_id = secrets.token_hex(16)
-            staging = self._staging_root() / upload_id
-            upload = Upload(upload_id, self.session_id, kind, role, input_id,
-                            manifest, staging)
-            self.uploads[upload_id] = upload
-        staging.mkdir(parents=True, exist_ok=True)
-        return {**self._base(), "upload_id": upload_id, "accepted": True}
-
-    def _get_upload(self, upload_id):
-        with self.lock:
-            upload = self.uploads.get(upload_id)
-            # Checkpoint uploads are service-scoped; the ephemeral kinds are
-            # bound to the session they were started for.
-            if upload is None or (upload.kind != "checkpoint"
-                                  and upload.session_id != self.session_id):
-                raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
-            return upload
+        return {**self._base(), **self.uploads_manager.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length):
-        if not _is_safe_relative_name(relative_name):
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Unsafe upload file name")
-        upload = self._get_upload(upload_id)
-        entry = upload.manifest.get(relative_name)
-        if entry is None:
-            raise ApiError(HTTPStatus.NOT_FOUND,
-                           "The upload manifest does not declare this file")
-        if upload.record is not None:
-            raise ApiError(HTTPStatus.CONFLICT, "The upload is already finalized")
-        if length != entry["size"]:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"Declared size is {entry['size']} bytes but the request "
-                           f"body is {length} bytes")
-        destination = upload.staging_dir / relative_name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        temp = destination.parent / f".{destination.name}.part-{secrets.token_hex(4)}"
-        try:
-            with temp.open("wb") as sink:
-                remaining = length
-                while remaining > 0:
-                    block = stream.read(min(TRANSFER_CHUNK_BYTES, remaining))
-                    if not block:
-                        raise ApiError(HTTPStatus.BAD_REQUEST,
-                                       "The request body ended early")
-                    digest.update(block)
-                    sink.write(block)
-                    remaining -= len(block)
-            if digest.hexdigest() != entry["sha256"]:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "The uploaded bytes do not match the declared SHA-256")
-            os.replace(temp, destination)
-        finally:
-            temp.unlink(missing_ok=True)
-        with upload.lock:
-            upload.received[relative_name] = True
-        return {**self._base(), "received": relative_name, "accepted": True}
+        received = self.uploads_manager.receive(
+            upload_id, relative_name, stream, length)
+        return {**self._base(), "received": received, "accepted": True}
 
     def finalize_upload(self, upload_id):
-        upload = self._get_upload(upload_id)
-        with upload.lock:
-            if upload.record is not None:
-                # Finalize is idempotent per upload ID.
-                return {**self.status(), "input": dict(upload.record), "accepted": True}
-            missing = sorted(set(upload.manifest) - set(upload.received))
-            if missing:
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "The upload is missing declared files",
-                               [{"field": name, "message": "File was not uploaded"}
-                                for name in missing])
-            _validate_upload_content(upload.kind, upload.role, upload.staging_dir)
-            if upload.kind == "checkpoint":
-                record = self._publish_checkpoint_upload(upload)
-                upload.record = record
-                with self.lock:
-                    self.status_generation += 1
-                return {**self.status(), "input": dict(record), "accepted": True}
+        finalized = self.uploads_manager.finalize(upload_id)
+        if not finalized.replayed:
             with self.lock:
-                self._require_session()
-                ephemeral_root = self._session_ephemeral_dir()
-            kind_dir = ephemeral_root / f"{upload.kind}s"
-            kind_dir.mkdir(parents=True, exist_ok=True)
-            if upload.kind == "patch":
-                published = kind_dir / upload.input_id
-            else:
-                published = kind_dir / f"{upload.input_id}.json"
-                single = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
-            if published.exists():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "An ephemeral input with this id already exists")
-            if upload.kind == "patch":
-                os.replace(upload.staging_dir, published)
-            else:
-                os.replace(single, published)
-                shutil.rmtree(upload.staging_dir, ignore_errors=True)
-            record = {
-                "id": upload.input_id,
-                "kind": upload.kind,
-                "role": upload.role,
-                "path": str(published),
-                "bytes": upload.declared_bytes(),
-                "state": "pending",
-                "upload_id": upload.upload_id,
-            }
-            upload.record = record
-        with self.lock:
-            self.ephemeral_records.append(record)
-            self.status_generation += 1
-        return {**self.status(), "input": dict(record), "accepted": True}
-
-    def _publish_checkpoint_upload(self, upload):
-        """Move a finalized checkpoint into the service's upload directory.
-
-        The published path lies under the output directory, which the
-        dataset-mode load validation already accepts for resume checkpoints.
-        """
-        root = self._checkpoint_upload_root()
-        if root is None:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "The service no longer has an output directory for "
-                           "uploaded checkpoints")
-        root.mkdir(parents=True, exist_ok=True)
-        source = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
-        entry = next(iter(upload.manifest.values()))
-        destination = self._checkpoint_digest_path(root, entry["sha256"])
-        with self.lock:
-            # A concurrent upload of the same content may have finalized after
-            # begin_upload checked the content-addressed destination.
-            if destination.is_file() and destination.stat().st_size == entry["size"]:
-                source.unlink(missing_ok=True)
-                os.utime(destination, None)
-            else:
-                os.replace(source, destination)
-        shutil.rmtree(upload.staging_dir, ignore_errors=True)
-        self._prune_uploaded_checkpoints(destination)
-        return self._checkpoint_record(
-            upload.input_id, destination, upload.declared_bytes(),
-            upload.upload_id)
-
-    def _prune_uploaded_checkpoints(self, just_published):
-        root = self._checkpoint_upload_root()
-        if root is None or not root.is_dir():
-            return
-        with self.lock:
-            active = self.session_paths.checkpoint if self.session_paths else ""
-        entries = sorted((path for path in root.iterdir() if path.is_file()),
-                         key=lambda path: path.stat().st_mtime, reverse=True)
-        kept = 0
-        for path in entries:
-            protected = path == Path(just_published) or str(path) == active
-            if protected or kept < UPLOADED_CHECKPOINTS_KEPT:
-                kept += 1
-                continue
-            path.unlink(missing_ok=True)
+                if finalized.kind != "checkpoint":
+                    self.ephemeral_records.append(finalized.record)
+                self.status_generation += 1
+        return {**self.status(), "input": dict(finalized.record),
+                "accepted": True}
 
     def delete_upload(self, upload_id):
-        with self.lock:
-            upload = self.uploads.get(upload_id)
-            if upload is None:
-                raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
-            if upload.record is not None:
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "The upload is finalized; it is now a session input")
-            del self.uploads[upload_id]
-        shutil.rmtree(upload.staging_dir, ignore_errors=True)
+        self.uploads_manager.delete(upload_id)
         return {**self._base(), "deleted": True}
 
     def gc_uploads(self):
-        expired = []
-        now = time.time()
-        with self.lock:
-            for upload_id, upload in list(self.uploads.items()):
-                if upload.record is None and now - upload.created > UPLOAD_GC_SECONDS:
-                    expired.append(upload)
-                    del self.uploads[upload_id]
-        for upload in expired:
-            shutil.rmtree(upload.staging_dir, ignore_errors=True)
+        self.uploads_manager.collect_garbage()
 
     def commit_inputs(self):
         with self.lock:
@@ -2759,7 +1419,7 @@ class ServiceState:
                 elif record["kind"] == "fiber":
                     _copy_publish(source, fibers_dir / f"{record['id']}.json", keep_source)
                 else:
-                    target = dataset_root / _PCL_ROLE_FILES[record["role"]]
+                    target = dataset_root / PCL_ROLE_FILES[record["role"]]
                     with source.open("r", encoding="utf-8") as stream:
                         incoming = json.load(stream)
                     if target.exists():
@@ -2864,7 +1524,7 @@ class ServiceState:
             session = self.session
             self.session = None
             process = self._preview_process
-        _stop_process_group(process)
+        stop_process_group(process)
         if session:
             session.close()
 
@@ -3056,7 +1716,7 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.artifacts.manifest(match.group(1))
             match = re.fullmatch(r"/artifacts/([A-Za-z0-9._-]+)/files/(.+)", path)
             if match:
-                if not _is_safe_relative_name(match.group(2)):
+                if not is_safe_relative_name(match.group(2)):
                     raise ApiError(HTTPStatus.FORBIDDEN, "Unsafe artifact file name")
                 self._send_artifact_file(match.group(1), match.group(2))
                 return None
