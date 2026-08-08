@@ -4,6 +4,7 @@ import queue
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -223,7 +224,7 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 30_000
         session._pending = 0
         session._target = 30_000
-        session._configure_run = lambda *_: None
+        session._context = object()
         session._idle_actions = []
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
@@ -248,7 +249,7 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 100
         session._pending = 0
         session._target = 100
-        session._configure_run = lambda *_: None
+        session._context = object()
         session._idle_actions = []
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
@@ -268,7 +269,7 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 29_750
         session._pending = 0
         session._target = 29_750
-        session._configure_run = lambda *_: None
+        session._context = object()
         session._idle_actions = []
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
@@ -289,7 +290,7 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 29_751
         session._pending = 0
         session._target = 29_751
-        session._configure_run = lambda *_: None
+        session._context = object()
         session._idle_actions = []
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
@@ -314,8 +315,12 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 10
         session._pending = 0
         session._target = 10
-        session._incorporate_inputs = lambda *_: None
+        session._context = object()
         session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
         pending = [{"id": "new-patch"}]
         influence = {"influence_theta_frac": 0.25}
 
@@ -333,8 +338,7 @@ class ProtocolTests(unittest.TestCase):
         session._completed = 10
         session._pending = 0
         session._target = 10
-        session._incorporate_inputs = lambda *_: None
-        session._configure_run = lambda *_: None
+        session._context = object()
         session._idle_actions = []
         session.requested_config = {"loss_weight_patch_radius": 8.0}
         session._run_config = {"loss_weight_patch_radius": 8.0}
@@ -351,7 +355,16 @@ class ProtocolTests(unittest.TestCase):
 
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
-        session._configure_run = lambda config: setattr(session, "applied", config)
+        session._condition = threading.Condition()
+        session._completed = 7
+        applied = {}
+
+        def apply_config(config, path_changes=None, *, current_iteration):
+            applied["config"] = config
+            applied["path_changes"] = path_changes
+            applied["current_iteration"] = current_iteration
+
+        session._context = SimpleNamespace(apply_config=apply_config)
 
         session._run_configuration({
             "sample_count_patches_per_step": 101,
@@ -359,11 +372,13 @@ class ProtocolTests(unittest.TestCase):
             "loss_start_patch_dt": 123,
         })
 
-        self.assertEqual(session.applied, {
+        self.assertEqual(applied["config"], {
             "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })
+        self.assertEqual(applied["path_changes"], {})
+        self.assertEqual(applied["current_iteration"], 7)
 
     def test_run_finish_callback_precedes_autosave(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
@@ -377,8 +392,9 @@ class ProtocolTests(unittest.TestCase):
         session._output_path = "/tmp"
         session._status_callback = None
         calls = []
-        session._finish_run = lambda: calls.append("finish")
-        session._save_checkpoint = lambda *_: calls.append("save")
+        session._context = SimpleNamespace(
+            clear_interactive_influence=lambda: calls.append("finish"),
+            save_checkpoint=lambda *_: calls.append("save"))
         session._publish_preview = lambda: calls.append("preview")
 
         session.iteration_completed(
@@ -397,9 +413,10 @@ class ProtocolTests(unittest.TestCase):
                 "Paths", (), {"output_directory": temporary})()
             states = []
             session._state = "ExportingPreview"
-            session._export_preview = lambda destination, surface_id: {
-                "manifest_path": str(Path(destination) / "manifest.json"),
-            }
+            session._context = SimpleNamespace(
+                export_preview=lambda destination, surface_id: {
+                    "manifest_path": str(Path(destination) / "manifest.json"),
+                })
             session._publish_status = lambda: states.append((
                 session._state,
                 session._preview_generation,
@@ -427,8 +444,9 @@ class ProtocolTests(unittest.TestCase):
         session._status_callback = None
         session.publishes_outputs = False
         calls = []
-        session._finish_run = lambda: calls.append("finish")
-        session._save_checkpoint = lambda *_: calls.append("save")
+        session._context = SimpleNamespace(
+            clear_interactive_influence=lambda: calls.append("finish"),
+            save_checkpoint=lambda *_: calls.append("save"))
         session._publish_preview = lambda: calls.append("preview")
 
         session.iteration_completed(

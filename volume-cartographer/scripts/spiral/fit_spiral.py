@@ -9,7 +9,6 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
-import itertools
 import json
 import glob
 import zarr
@@ -154,20 +153,6 @@ lasagna_scale = 4
 # pools loaded from pack_resident_pools.py sidecars next to the source zarrs.
 lasagna_storage_backend = 'sparse_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
-_active_context = None
-
-
-def release_interactive_resources():
-    """Release sparse volume stores owned by the resident session.
-
-    Thin compatibility shim: closes the active FitContext (which owns the
-    stores) and clears the module-level reference.
-    """
-    global _active_context
-    context, _active_context = _active_context, None
-    if context is not None:
-        context.close()
-
 
 
 cfg = None
@@ -724,6 +709,12 @@ class FitContext:
     """
 
     def __init__(self, interactive_driver=None, progress=None):
+        # interactive_driver marks a resident (interactive) session. The
+        # setup/step paths read it for retention decisions (trusted-tree and
+        # crossing-cache retention, store registration, interactive DT gating)
+        # and checkpoint payloads read its requested_config/input_manifest.
+        # The runtime drives the context itself; it never hands control back
+        # through this reference. PR 3 replaces it with explicit session flags.
         self.interactive_driver = interactive_driver
         self.progress = progress
         self._lasagna_store = None
@@ -2077,8 +2068,12 @@ class FitContext:
         ), axis=-1).to(self.device) * render_volume_scale
         return zs, yx, scroll_slices, prediction_slices, quad_labels
 
-    def _clear_interactive_influence(self):
-        """End the current Run request's influence window."""
+    def clear_interactive_influence(self):
+        """End the current Run request's influence window.
+
+        Called by the runtime when an interactive Run reaches its target, and
+        defensively before a new incorporation begins.
+        """
         self.interactive_dt_resume_iteration = None
         if self.influence_state is None:
             self.interactive_influence_loss_weight = 0.0
@@ -2236,8 +2231,13 @@ class FitContext:
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
-    def incorporate_interactive_inputs(self, records, influence_config=None):
+    def incorporate_interactive_inputs(self, records, influence_config=None, *,
+                                       current_iteration, target_iteration):
         """Append uploaded ephemeral inputs to the resident fit structures.
+
+        current_iteration/target_iteration describe the Run request queued
+        alongside the new inputs (the runtime sets the target before this
+        method runs at the pause boundary); they size the DT-free window.
 
         Runs on the fitter thread at a pause boundary. Incorporation is
         append-only: only the new items are loaded and validated, and they are
@@ -2256,7 +2256,7 @@ class FitContext:
         try:
             # Be defensive about a previously interrupted boundary: a new
             # batch must never union with an earlier Run request's masks.
-            self._clear_interactive_influence()
+            self.clear_interactive_influence()
             run_cfg = dict(cfg)
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
@@ -2456,14 +2456,13 @@ class FitContext:
                 self.interactive_influence_anchor_samples = int(
                     run_cfg['sample_count_influence_anchor_samples_per_step'])
 
-            # run() sets the target before this callback is drained at the
+            # The runtime sets the target before this method is drained at the
             # pause boundary, so this is exactly the iteration window requested
             # alongside the new inputs. Do not let a later incorporation
             # shorten an already-active DT-free window.
-            interactive_status = self.interactive_driver.status()
             dt_resume_iteration = get_interactive_dt_resume_iteration(
-                interactive_status['current_iteration'],
-                interactive_status['target_iteration'],
+                current_iteration,
+                target_iteration,
                 run_cfg['influence_disable_dt_frac'],
             )
             self.interactive_dt_resume_iteration = dt_resume_iteration
@@ -2476,8 +2475,12 @@ class FitContext:
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
 
-    def apply_config(self, config, path_changes=None):
-        """Apply Run-scoped settings without replacing the resident fit."""
+    def apply_config(self, config, path_changes=None, *, current_iteration):
+        """Apply Run-scoped settings without replacing the resident fit.
+
+        current_iteration is the session's durable completed-iteration count;
+        an LR-schedule change is realigned at that step.
+        """
         global shell_path  # module-global mutation kept as-is (PR 2 revisits)
 
         path_changes = dict(path_changes or {})
@@ -2629,8 +2632,7 @@ class FitContext:
                     'optimizer_lr_final_factor',
                     'optimizer_num_training_steps',
             }:
-                self._realign_lr_schedule(
-                    self.interactive_driver.status()['current_iteration'])
+                self._realign_lr_schedule(current_iteration)
         except Exception:
             cfg.update(old_values, allow_val_change=True)
             raise
@@ -3050,13 +3052,13 @@ class FitContext:
 
         return loss, losses, log_metrics, shell_metrics
 
-    def run(self):
-        interactive_driver = self.interactive_driver
-        progress = progress_or_null(self.progress)
-        has_progress = self.progress is not None
+    def resolve_output_path(self):
+        """Derive and create this run's output directory.
 
-        self.load_host_inputs()
-
+        Requires load_host_inputs() (the directory name records the verified
+        patch count). Both drivers call this between load_host_inputs() and
+        build_device_state().
+        """
         out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
         self.out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{self.num_verified_patches}-patch'
         if not wandb.run.name.startswith('dummy-'):
@@ -3064,89 +3066,78 @@ class FitContext:
         if run_tag:
             self.out_path += f'_{run_tag}'
         os.makedirs(self.out_path, exist_ok=True)
+        return self.out_path
 
+    def release_setup_only_tracks(self):
+        """Drop the per-track input arrays a resident session no longer needs.
+
+        In the usual zero-exclusion case preview bounds reuse the prepared
+        flat tensor, so the original list of per-track arrays is no longer
+        needed after setup. Interactive-session memory policy; the headless
+        driver keeps self.tracks for the final outputs.
+        """
+        if self.preview_extent_tracks is not self.tracks and self.track_reload_source is None:
+            self.tracks = None
+
+    def log_step_metrics(self, iteration, loss, losses, log_metrics, shell_metrics):
+        """Print and wandb-log the per-loss-family values every 200 iterations.
+
+        Shared by both drivers; in an interactive session wandb runs disabled,
+        so only the print is observable there.
+        """
+        if iteration % 200 == 0:
+            # Only sync to CPU and log when we actually print, avoiding a per-iter
+            # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
+            if is_main_process():
+                print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
+                n_sanitised = int(self.nonfinite_grad_steps.item())
+                if n_sanitised > 0:
+                    per_param = sorted(
+                        ((name, int(count.item())) for name, count in self.nonfinite_grad_by_param.items() if count.item() > 0),
+                        key=lambda name_count: -name_count[1],
+                    )
+                    by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
+                    print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                wandb.log({
+                    'total_loss': loss.item(),
+                    'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
+                    **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
+                    **{name + '_loss': value for name, value in losses.items()},
+                    **shell_metrics,
+                    **log_metrics,
+                })
+
+    def run(self):
+        """Drive one complete headless fit to the configured horizon.
+
+        Interactive sessions are not driven here: spiral_runtime owns the
+        context, its ready signal, and the resident optimizer loop.
+        """
+        progress = progress_or_null(self.progress)
+        has_progress = self.progress is not None
+
+        self.load_host_inputs()
+        self.resolve_output_path()
         self.build_device_state()
-
-        if interactive_driver is not None:
-            # In the usual zero-exclusion case preview bounds reuse the prepared
-            # flat tensor, so the original list of per-track arrays is no longer
-            # needed after setup.
-            if self.preview_extent_tracks is not self.tracks and self.track_reload_source is None:
-                self.tracks = None
-            interactive_driver.on_ready(
-                completed_iterations=self.start_iteration,
-                output_path=self.out_path,
-                save_checkpoint=self.save_checkpoint,
-                export_preview=self.export_preview,
-                incorporate_inputs=self.incorporate_interactive_inputs,
-                finish_run=self._clear_interactive_influence,
-                configure_run=self.apply_config,
-            )
 
         # ==========================================================================
         # Training loop
         # ==========================================================================
 
-        # Interactive fits are resident sessions: self.num_training_steps still defines
-        # the learning-rate schedule, but it must not cap how long the user can
-        # continue optimizing (especially after restoring a completed checkpoint).
-        iteration_sequence = (
-            itertools.count(self.start_iteration)
-            if interactive_driver is not None
-            else range(self.start_iteration, self.num_training_steps)
-        )
-        if interactive_driver is None:
-            progress.begin(
-                'optimizing', 'Optimizing',
-                step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
-                unit='iterations')
+        progress.begin(
+            'optimizing', 'Optimizing',
+            step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
+            unit='iterations')
         for iteration in tqdm(
-                iteration_sequence,
+                range(self.start_iteration, self.num_training_steps),
                 disable=not is_main_process() or has_progress):
-            if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
-                break
             loss, losses, log_metrics, shell_metrics = self.step(iteration)
-
-            if interactive_driver is not None:
-                interactive_driver.iteration_completed(
-                    completed_iterations=iteration + 1,
-                    total_loss=float(loss.detach().item()),
-                    losses={name: float(value.detach().item()) for name, value in losses.items()},
-                    learning_rate=float(self.optimiser.param_groups[0]['lr']),
-                    metrics={name: float(value) for name, value in log_metrics.items()},
-                )
-            else:
-                progress.update(iteration - self.start_iteration + 1)
-
-            if iteration % 200 == 0:
-                # Only sync to CPU and log when we actually print, avoiding a per-iter
-                # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
-                if is_main_process():
-                    print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
-                    n_sanitised = int(self.nonfinite_grad_steps.item())
-                    if n_sanitised > 0:
-                        per_param = sorted(
-                            ((name, int(count.item())) for name, count in self.nonfinite_grad_by_param.items() if count.item() > 0),
-                            key=lambda name_count: -name_count[1],
-                        )
-                        by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
-                        print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
-                    wandb.log({
-                        'total_loss': loss.item(),
-                        'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
-                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
-                        **{name + '_loss': value for name, value in losses.items()},
-                        **shell_metrics,
-                        **log_metrics,
-                    })
+            progress.update(iteration - self.start_iteration + 1)
+            self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
 
         # ==========================================================================
         # Final outputs
         # ==========================================================================
-
-        if interactive_driver is not None:
-            interactive_driver.session_finished()
-            return
 
         suffix = 'fitted'
         if is_main_process():
@@ -3209,9 +3200,9 @@ class FitContext:
     def close(self):
         """Release the sparse volume stores this context owns.
 
-        close() owns resource release, replacing the former
-        release_interactive_resources module globals, and runs on the
-        fitter thread for this rank.
+        close() owns resource release and runs on the fitter thread for
+        this rank (the runtime calls it when its session ends; the CLI
+        process simply exits).
         """
         store, self._lasagna_store = self._lasagna_store, None
         if store is not None:
@@ -3220,11 +3211,9 @@ class FitContext:
             self._scalar_stores.pop().close()
 
 
-def main(interactive_driver=None, progress=None):
-    global _active_context
-    context = FitContext(interactive_driver=interactive_driver, progress=progress)
-    _active_context = context
-    return context.run()
+def main(progress=None):
+    """Run one headless fit over a fresh context (library entry point)."""
+    return FitContext(progress=progress).run()
 
 
 if __name__ == '__main__':
