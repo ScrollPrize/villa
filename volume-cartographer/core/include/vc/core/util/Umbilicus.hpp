@@ -22,6 +22,10 @@ namespace vc::core::util {
                                   const cv::Vec3i& volume_shape);
         static Umbilicus FromPoints(std::vector<cv::Vec3f> control_points,
                                     const cv::Vec3i& volume_shape);
+        // The raw control points of an umbilicus file (same formats as
+        // FromFile), for callers that need to reframe them before building.
+        static std::vector<cv::Vec3f> LoadControlPoints(
+            const std::filesystem::path& path);
 
         const cv::Vec3i& volume_shape() const noexcept;
         const std::vector<cv::Vec3f>& centers() const noexcept;

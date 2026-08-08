@@ -459,7 +459,10 @@ private:
     std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
     QPointer<CChunkedVolumeViewer> _linkedCursorSource;
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
-    bool _linkedCursorMirrorPending = false;
+    // Owned single-shot coalescing timer (like _lineUpdateTimer); stopped on
+    // pane teardown so a pending mirror can't stamp a pre-rebuild point onto
+    // freshly built panes.
+    QTimer* _linkedCursorMirrorTimer = nullptr;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _restoredWindowGeometry = false;

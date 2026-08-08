@@ -18,6 +18,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -9391,12 +9392,75 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                 const cv::Vec3i volumeShape{volume->numSlices(),
                                             volume->sliceHeight(),
                                             volume->sliceWidth()};
+                std::vector<cv::Vec3f> controlPoints;
                 for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
                     const fs::path candidate = volpkgRoot / name;
                     if (fs::exists(candidate)) {
-                        _scrollUmbilicus =
-                            vc::core::util::Umbilicus::FromFile(candidate, volumeShape);
+                        controlPoints =
+                            vc::core::util::Umbilicus::LoadControlPoints(candidate);
                         break;
+                    }
+                }
+
+                // Plausibility floor: once framed, an umbilicus should cover
+                // a sensible fraction of the session volume's z range.
+                const auto zCoverage = [&](const std::vector<cv::Vec3f>& points) {
+                    float lo = std::numeric_limits<float>::infinity();
+                    float hi = -std::numeric_limits<float>::infinity();
+                    for (const auto& point : points) {
+                        lo = std::min(lo, point[2]);
+                        hi = std::max(hi, point[2]);
+                    }
+                    const float slices = static_cast<float>(volume->numSlices());
+                    const float overlap =
+                        std::min(hi, slices) - std::max(lo, 0.0f);
+                    return overlap > 0.0f ? overlap / slices : 0.0f;
+                };
+                constexpr float kMinPlausibleZCoverage = 0.25f;
+
+                if (!controlPoints.empty()) {
+                    // Stored umbilici live in the registration's fixed-volume
+                    // frame when the session volume carries a transform.json
+                    // (defined in native /0 coordinates, mapping session
+                    // coordinates to that fixed frame -- the same discovery
+                    // convention as SurfaceAffineTransformController, with
+                    // the volpkg-level transforms/ file as a fallback
+                    // location). Apply its inverse to place the umbilicus in
+                    // the session frame; on any transform problem or an
+                    // implausible result, fall back to the raw points rather
+                    // than discarding the umbilicus.
+                    std::optional<std::vector<cv::Vec3f>> framed;
+                    if (volume->baseScaleLevel() == 0) {
+                        fs::path transformPath = volume->path() / "transform.json";
+                        if (!fs::exists(transformPath)) {
+                            transformPath =
+                                volpkgRoot / "transforms" / "transform.json";
+                        }
+                        if (fs::exists(transformPath)) {
+                            try {
+                                const cv::Matx44d toSession =
+                                    vc::core::util::invertAffineTransformMatrix(
+                                        vc::core::util::loadAffineTransformMatrix(
+                                            transformPath));
+                                std::vector<cv::Vec3f> transformed = controlPoints;
+                                for (auto& point : transformed) {
+                                    point = vc::core::util::applyAffineTransform(
+                                        point, toSession);
+                                }
+                                if (zCoverage(transformed) >= kMinPlausibleZCoverage) {
+                                    framed = std::move(transformed);
+                                }
+                            } catch (...) {
+                            }
+                        }
+                    }
+                    if (!framed &&
+                        zCoverage(controlPoints) >= kMinPlausibleZCoverage) {
+                        framed = std::move(controlPoints);
+                    }
+                    if (framed) {
+                        _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
+                            std::move(*framed), volumeShape);
                     }
                 }
             }
@@ -9411,6 +9475,11 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                           static_cast<float>(volume->sliceHeight()) * 0.5f};
     }
 
+    // Pass 1: chain signs along the line. Each valid normal is aligned to
+    // the previous valid one, so a local sign flip -- whether from the field
+    // itself or from any per-point orientation test -- is structurally
+    // impossible, and the displayed frame cannot mirror mid-line.
+    cv::Vec3f previousNormal{kNan, kNan, kNan};
     for (const auto& point : session.optimizedLine.points) {
         const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
         if (!point.sampledNormal.valid || !finiteDirection(sampled)) {
@@ -9418,7 +9487,30 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             continue;
         }
         cv::Vec3f normal = toVec3f(sampled);
-        const cv::Vec3f position = toVec3f(point.position);
+        if (std::isfinite(previousNormal[0]) &&
+            normal.dot(previousNormal) < 0.0f) {
+            normal = -normal;
+        }
+        previousNormal = normal;
+        normals.push_back(normal);
+    }
+
+    // Pass 2: one global majority vote decides the whole line's sign, so a
+    // noisy or imperfect center reference cannot flip individual stretches.
+    // The reference only needs to get the hemisphere right on balance; its z
+    // component is zeroed because orientation is radial-only (z is the
+    // scroll axis).
+    // Sign convention: normals point away from the scroll center. The dialog
+    // uses them directly as the cut view's up hint, and the viewer's scene y
+    // renders downward, so this puts the fiber's center-facing surface at
+    // the top of the view.
+    double awayScore = 0.0;
+    for (size_t index = 0; index < normals.size(); ++index) {
+        if (!std::isfinite(normals[index][0])) {
+            continue;
+        }
+        const cv::Vec3f position =
+            toVec3f(session.optimizedLine.points[index].position);
         cv::Vec3f towardCenter{kNan, kNan, kNan};
         if (_scrollUmbilicus) {
             try {
@@ -9431,14 +9523,27 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             volumeCenterXY[1] - position[1],
                             0.0f};
         }
-        // Sign convention: normals point away from the scroll center. The
-        // dialog uses them directly as the cut view's up hint, and the
-        // viewer's scene y renders downward, so this puts the fiber's
-        // center-facing surface at the top of the view.
-        if (std::isfinite(towardCenter[0]) && normal.dot(towardCenter) > 0.0f) {
-            normal = -normal;
+        if (!std::isfinite(towardCenter[0])) {
+            continue;
         }
-        normals.push_back(normal);
+        // Cosine-weighted vote: normalize the reference so each point's
+        // influence reflects only how well its normal aligns with the radial
+        // direction, not its distance from the center -- a few large-radius
+        // points must not outvote the rest of the line.
+        towardCenter[2] = 0.0f;
+        const float towardNorm = cv::norm(towardCenter);
+        if (!(towardNorm > 1.0e-3f)) {
+            continue;
+        }
+        awayScore -= static_cast<double>(
+            normals[index].dot(towardCenter) / towardNorm);
+    }
+    if (awayScore < 0.0) {
+        for (cv::Vec3f& normal : normals) {
+            if (std::isfinite(normal[0])) {
+                normal = -normal;
+            }
+        }
     }
     return normals;
 }
