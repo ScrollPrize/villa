@@ -630,9 +630,10 @@ def predict_fn(test_loader, model, device, test_xyxys,pred_shape):
         for i, (x1, y1, x2, y2) in enumerate(xys):
             mask_pred[y1:y2, x1:x2] += np.multiply(F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy(),kernel)
             # mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
-            mask_count[y1:y2, x1:x2] += np.ones((CFG.size, CFG.size))
+            mask_count[y1:y2, x1:x2] += kernel
 
-    mask_pred /= mask_count
+    mask_pred = np.divide(mask_pred, mask_count,
+                          out=np.zeros_like(mask_pred), where=mask_count > 0)
     # mask_pred/=mask_pred.max()
     return mask_pred
     # return losses.avg,[]
