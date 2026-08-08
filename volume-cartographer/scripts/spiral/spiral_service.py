@@ -86,6 +86,15 @@ UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 MAX_LOG_ENTRIES = 20000
 MAX_LOG_READ_ENTRIES = 1000
 MAX_LOG_ENTRY_CHARS = 8192
+# Structured event ring served through /events. Sized like the log relay so
+# a reconnecting client can recover a comparable window of history.
+MAX_EVENT_ENTRIES = 20000
+MAX_EVENT_READ_ENTRIES = 1000
+# High-frequency event kinds (per-iteration metrics, progress redraws)
+# coalesce to at most ~one record per key per interval. The interval matches
+# the ProgressReporter publish interval, so the event stream carries the same
+# cadence a status poller already observes.
+EVENT_COALESCE_SECONDS = 1.0
 DATASET_COMMIT_LOCK_TIMEOUT_SECONDS = 20.0
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
@@ -286,14 +295,143 @@ def _validate_run_influence_config(value):
     return result
 
 
-class ServiceLogBuffer:
-    """Bounded, incremental copy of the service's stdout and stderr lines."""
+# Console lines whose information is already published as structured
+# /events records: ProgressReporter console snapshots and the fitter's
+# periodic step-metric prints. They stay on the terminal and in the /logs
+# compatibility relay, but the event stream must not double-report them as
+# log records next to the structured progress/metric records.
+_STRUCTURED_CONSOLE_LINE = re.compile(r"^(?:PROGRESS |step \d+: loss = )")
 
-    def __init__(self, max_entries=MAX_LOG_ENTRIES):
+
+class ServiceEventBuffer:
+    """Bounded ring of structured service events served through ``/events``.
+
+    Every record carries a monotonically increasing ``sequence``;
+    ``GET /events?cursor=N`` returns records with ``sequence > N`` plus
+    ``next_cursor`` for the following read. Cursor semantics:
+
+    * A cursor newer than the newest record (a cursor kept across a service
+      restart) answers ``cursor_reset`` true and the read restarts from the
+      beginning of the retained ring.
+    * A cursor older than the ring start answers ``overrun`` true with
+      ``dropped``/``dropped_from`` describing the gap. The event stream is
+      bounded history, not reconnect state: an overrun client refreshes its
+      durable view from ``/session/status`` and continues from
+      ``next_cursor``.
+
+    Reconnect protocol: read the ``/session/status`` snapshot first, then
+    subscribe from the cursor position the first ``/events`` read reports.
+
+    Records submitted with a ``coalesce_key`` are rate limited: while a
+    record with the same key was emitted less than ``coalesce_seconds`` ago,
+    the newest record is parked in a per-key pending slot (replacing any
+    older pending record) and flushed on the next append or read once the
+    interval has elapsed. The ring therefore stores at most ~one record per
+    key per interval while the latest values still reach clients.
+    """
+
+    def __init__(self, max_entries=MAX_EVENT_ENTRIES,
+                 coalesce_seconds=EVENT_COALESCE_SECONDS,
+                 clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._entries = deque(maxlen=max_entries)
+        self._next_sequence = 1
+        self._coalesce_seconds = float(coalesce_seconds)
+        self._clock = clock
+        self._pending = {}
+        self._last_emit = {}
+        # Stamps records that do not carry an explicit session generation.
+        # Must never take another lock: it is called under this buffer's own.
+        self.session_generation_provider = None
+
+    def append(self, kind, text="", *, severity="info", source="service",
+               rank=None, session_generation=None, operation=None,
+               payload=None, coalesce_key=None, force=False):
+        now = self._clock()
+        with self._lock:
+            if session_generation is None \
+                    and self.session_generation_provider is not None:
+                try:
+                    session_generation = self.session_generation_provider()
+                except Exception:
+                    session_generation = None
+            record = {
+                "timestamp": time.time(),
+                "severity": str(severity),
+                "kind": str(kind),
+                "source": str(source),
+                "rank": rank,
+                "session_generation": session_generation,
+                "operation": operation,
+                "text": str(text or ""),
+                "payload": payload,
+            }
+            self._flush_due(now)
+            if coalesce_key is None:
+                self._append(record)
+                return
+            last = self._last_emit.get(coalesce_key)
+            if force or last is None or now - last >= self._coalesce_seconds:
+                self._pending.pop(coalesce_key, None)
+                self._last_emit[coalesce_key] = now
+                self._append(record)
+            else:
+                self._pending[coalesce_key] = record
+
+    def _append(self, record):
+        record["sequence"] = self._next_sequence
+        self._next_sequence += 1
+        self._entries.append(record)
+
+    def _flush_due(self, now):
+        for key in list(self._pending):
+            if now - self._last_emit.get(key, float("-inf")) \
+                    >= self._coalesce_seconds:
+                self._last_emit[key] = now
+                self._append(self._pending.pop(key))
+
+    def read_after(self, cursor, limit=MAX_EVENT_READ_ENTRIES):
+        limit = max(1, min(int(limit), MAX_EVENT_READ_ENTRIES))
+        cursor = int(cursor)
+        with self._lock:
+            self._flush_due(self._clock())
+            latest = self._next_sequence - 1
+            cursor_reset = cursor > latest
+            if cursor_reset:
+                cursor = 0
+            oldest = (self._entries[0]["sequence"] if self._entries
+                      else self._next_sequence)
+            dropped = max(0, oldest - max(0, cursor + 1))
+            events = [dict(record) for record in self._entries
+                      if record["sequence"] > cursor][:limit]
+            next_cursor = events[-1]["sequence"] if events \
+                else min(cursor, latest)
+        return {
+            "events": events,
+            "next_cursor": next_cursor,
+            "latest_sequence": latest,
+            "dropped": dropped,
+            "dropped_from": (cursor + 1) if dropped else None,
+            "overrun": dropped > 0,
+            "cursor_reset": cursor_reset,
+        }
+
+
+class ServiceLogBuffer:
+    """Bounded, incremental copy of the service's stdout and stderr lines.
+
+    When an event buffer is attached, every complete non-structured console
+    line is also published as a ``log``-kind event record; lines already
+    covered by structured progress/metric events are kept out of the event
+    stream so the same information is never double-reported.
+    """
+
+    def __init__(self, max_entries=MAX_LOG_ENTRIES, events=None):
         self._lock = threading.Lock()
         self._entries = deque(maxlen=max_entries)
         self._pending = {"stdout": "", "stderr": ""}
         self._next_sequence = 1
+        self._events = events
 
     def write(self, stream, text):
         if not text:
@@ -321,6 +459,9 @@ class ServiceLogBuffer:
                     "text": line,
                 })
                 self._next_sequence += 1
+                if self._events is not None \
+                        and not _STRUCTURED_CONSOLE_LINE.match(line):
+                    self._events.append("log", line, source=stream)
 
     def read_after(self, after):
         with self._lock:
@@ -1121,7 +1262,8 @@ def _stop_process_group(process):
 
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
-                 service_name=None, session_name="", logs=None, gpu_ids=(0,)):
+                 service_name=None, session_name="", logs=None, events=None,
+                 gpu_ids=(0,)):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -1141,6 +1283,17 @@ class ServiceState:
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.logs = logs if logs is not None else ServiceLogBuffer()
+        self.events = events if events is not None else ServiceEventBuffer()
+        # Log-kind records produced by the console tee carry the current
+        # session generation. Reading the attribute is lock-free by design;
+        # the provider runs under the event buffer's own lock.
+        self.events.session_generation_provider = \
+            lambda: self.session_generation
+        # Per-rank change trackers so repeated status snapshots do not
+        # re-emit identical structured events.
+        self._event_progress_signatures = {}
+        self._event_metric_iterations = {}
+        self._event_errors = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
         self.uploads = {}
@@ -1392,7 +1545,8 @@ class ServiceState:
                 try:
                     self.session = create_session(
                         paths, run, preview, scroll, self._status_changed,
-                        gpu_ids=self.gpu_ids)
+                        gpu_ids=self.gpu_ids,
+                        event_callback=self._session_event)
                 except BaseException:
                     self.session_id = None
                     self.session_paths = None
@@ -1408,6 +1562,9 @@ class ServiceState:
 
     def _reset_session_scope(self):
         previous_raw = self._previous_raw_preview_manifest
+        self._event_progress_signatures = {}
+        self._event_metric_iterations = {}
+        self._event_errors = {}
         self.ephemeral_records = []
         self.uploads = {}
         self._registered_preview_generation = 0
@@ -1447,6 +1604,66 @@ class ServiceState:
                 self.session_revision += 1
                 self.pending_revision_target = None
             self.status_generation += 1
+
+    def _session_event(self, rank, status):
+        """Derive structured event records from one rank's status snapshot.
+
+        The single-GPU runtime reports as rank 0; child ranks of a
+        distributed session publish their snapshots through the parent
+        queue and arrive here tagged with their originating rank, so every
+        record names the process that produced it.
+        """
+        if not isinstance(status, dict):
+            return
+        generation = self.session_generation
+        progress = status.get("progress")
+        if isinstance(progress, dict):
+            # Elapsed time changes on every snapshot; only a change in the
+            # underlying stage/step content is a new progress event.
+            signature = {key: value for key, value in progress.items()
+                         if key not in ("elapsed_seconds", "eta_seconds")}
+            with self.lock:
+                changed = self._event_progress_signatures.get(rank) != signature
+                if changed:
+                    self._event_progress_signatures[rank] = signature
+            if changed:
+                step = progress.get("step")
+                total = progress.get("total_steps")
+                finished = (isinstance(step, int) and isinstance(total, int)
+                            and total > 0 and step >= total)
+                self.events.append(
+                    "progress", str(progress.get("stage_name") or ""),
+                    source="fitter", rank=rank,
+                    session_generation=generation,
+                    operation=progress.get("operation"),
+                    payload={key: value for key, value in progress.items()
+                             if key != "eta_seconds"},
+                    coalesce_key=("progress", rank), force=finished)
+        metrics = status.get("latest_metrics")
+        iteration = status.get("current_iteration")
+        if metrics and isinstance(iteration, int):
+            with self.lock:
+                emit = iteration > self._event_metric_iterations.get(rank, -1)
+                if emit:
+                    self._event_metric_iterations[rank] = iteration
+            if emit:
+                self.events.append(
+                    "metric", f"iteration {iteration}",
+                    source="fitter", rank=rank,
+                    session_generation=generation,
+                    operation="optimizing",
+                    payload={"iteration": iteration, **dict(metrics)},
+                    coalesce_key=("metric", rank))
+        error = status.get("error")
+        if status.get("state") == "Error" and error:
+            with self.lock:
+                emit = self._event_errors.get(rank) != error
+                if emit:
+                    self._event_errors[rank] = error
+            if emit:
+                self.events.append(
+                    "error", str(error), severity="error", source="fitter",
+                    rank=rank, session_generation=generation)
 
     def _maybe_register_artifacts(self, status):
         with self.lock:
@@ -1503,6 +1720,10 @@ class ServiceState:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
+            self.events.append(
+                "error", f"Preview publication failed: {error}",
+                severity="error", source="service",
+                operation="publishing_preview")
             # A failed raw generation is never exposed or retried. Keep only
             # the previous successful raw generation, which is needed to map
             # the next run-difference overlay.
@@ -1539,6 +1760,11 @@ class ServiceState:
             current["generation"] = generation
             self._preview_publish = current
             self.status_generation += 1
+            snapshot = dict(current)
+        self.events.append(
+            "progress", str(snapshot.get("stage_name") or ""),
+            source="service", operation="publishing_preview",
+            payload=snapshot, coalesce_key=("preview-publish",))
 
     def run(self, request):
         token = request.get("plan_token")
@@ -2801,6 +3027,20 @@ class SpiralHandler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.BAD_REQUEST,
                                    "The log cursor must not be negative")
                 return state.logs.read_after(after)
+            if path == "/events":
+                query = parse_qs(parsed_url.query)
+                try:
+                    cursor = int(query.get("cursor", ["0"])[-1])
+                    limit = int(query.get(
+                        "limit", [str(MAX_EVENT_READ_ENTRIES)])[-1])
+                except (TypeError, ValueError):
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "The event cursor and limit must be integers")
+                if cursor < 0 or limit < 1:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "The event cursor must not be negative and "
+                                   "the limit must be at least 1")
+                return state.events.read_after(cursor, limit)
             if path == "/dataset":
                 return state.dataset()
             match = re.fullmatch(r"/artifacts/([A-Za-z0-9._-]+)/manifest", path)
@@ -3054,7 +3294,8 @@ def main(argv=None):
                 file=sys.stderr, flush=True)
             return 2
 
-    logs = ServiceLogBuffer()
+    events = ServiceEventBuffer()
+    logs = ServiceLogBuffer(events=events)
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(original_stdout, logs, "stdout")
     sys.stderr = _TeeStream(original_stderr, logs, "stderr")
@@ -3063,6 +3304,7 @@ def main(argv=None):
                          service_name=args.service_name,
                          session_name=args.session_name or "",
                          logs=logs,
+                         events=events,
                          gpu_ids=args.gpus)
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.

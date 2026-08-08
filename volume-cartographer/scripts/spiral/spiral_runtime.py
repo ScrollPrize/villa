@@ -37,7 +37,8 @@ class _SessionShutdown(BaseException):
 class InteractiveFitSession:
     def __init__(self, paths: SpiralInputPaths, run: SpiralRunConfig,
                  preview: SpiralPreviewConfig, scroll: ScrollSpec,
-                 status_callback=None, publishes_outputs=True) -> None:
+                 status_callback=None, publishes_outputs=True,
+                 event_callback=None) -> None:
         self.paths = paths
         self.run_config = run
         self.scroll = scroll
@@ -49,6 +50,8 @@ class InteractiveFitSession:
         self._run_config_limits = None
         self._default_advanced_config = None
         self._status_callback = status_callback
+        # Receives (rank, status) pairs; the in-process session is rank 0.
+        self._event_callback = event_callback
         self.publishes_outputs = publishes_outputs
         self._condition = threading.Condition()
         self._state = "Loading"
@@ -111,8 +114,17 @@ class InteractiveFitSession:
             return result
 
     def _publish_status(self):
+        event_callback = getattr(self, "_event_callback", None)
+        if self._status_callback is None and event_callback is None:
+            return
+        status = self.status()
+        if event_callback is not None:
+            try:
+                event_callback(0, status)
+            except Exception:
+                traceback.print_exc(limit=4)
         if self._status_callback is not None:
-            self._status_callback(self.status())
+            self._status_callback(status)
 
     def _progress_reporter(self):
         return getattr(self, "progress", _NO_PROGRESS)
@@ -718,9 +730,13 @@ class DistributedInteractiveFitSession:
     """Parent-process proxy for one resident fitter process per selected GPU."""
 
     def __init__(self, paths, run, preview, scroll, gpu_ids,
-                 status_callback=None):
+                 status_callback=None, event_callback=None):
         self._gpu_ids = tuple(gpu_ids)
         self._status_callback = status_callback
+        # Receives (rank, status) pairs. Child ranks publish their status
+        # snapshots through the parent event queue; this routes them onward
+        # tagged with the originating rank.
+        self._event_callback = event_callback
         self._condition = threading.Condition()
         self._status = {
             "state": "Loading", "phase": "Starting GPU workers",
@@ -784,6 +800,15 @@ class DistributedInteractiveFitSession:
         with self._condition:
             return copy.deepcopy(self._status)
 
+    def _publish_rank_event(self, rank, status):
+        callback = getattr(self, "_event_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(rank, status)
+        except Exception:
+            traceback.print_exc(limit=4)
+
     def _listen(self):
         while True:
             event = self._events.get()
@@ -794,6 +819,7 @@ class DistributedInteractiveFitSession:
             snapshot = None
             if kind == "status":
                 _, rank, status = event
+                self._publish_rank_event(rank, status)
                 with self._condition:
                     self._rank_statuses[rank] = status
                     if self._failed_error is not None and status.get("state") != "Error":
@@ -874,6 +900,8 @@ class DistributedInteractiveFitSession:
                 continue
             elif kind == "worker_error":
                 _, rank, error, trace = event
+                self._publish_rank_event(rank, {
+                    "state": "Error", "error": error, "warnings": [trace]})
                 with self._condition:
                     warnings = list(self._status.get("warnings", []))
                     warnings.append(f"GPU worker rank {rank} failed:\n{trace}")
@@ -982,10 +1010,12 @@ class DistributedInteractiveFitSession:
 
 
 def create_session(paths, run, preview, scroll, status_callback=None,
-                   gpu_ids=(0,)):
+                   gpu_ids=(0,), event_callback=None):
     gpu_ids = tuple(gpu_ids)
     if len(gpu_ids) == 1:
         return InteractiveFitSession(paths, run, preview, scroll,
-                                     status_callback)
+                                     status_callback,
+                                     event_callback=event_callback)
     return DistributedInteractiveFitSession(
-        paths, run, preview, scroll, gpu_ids, status_callback)
+        paths, run, preview, scroll, gpu_ids, status_callback,
+        event_callback=event_callback)
