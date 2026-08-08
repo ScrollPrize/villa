@@ -19,8 +19,11 @@ import zipfile
 from config import Config
 
 
-# Version 15 adds structured, stage-local operation progress.
-API_VERSION = 15
+# Version 16 introduces the versioned scroll specification
+# (spiral-scroll.json): outward sense is a scroll property and no longer part
+# of the load request, and z_begin/z_end are Config keys stored in
+# checkpoint configurations.
+API_VERSION = 16
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -40,7 +43,9 @@ class PclRole(str, Enum):
 @dataclass(frozen=True)
 class PclInputSpec:
     path: str
-    role: PclRole
+    # None marks a legacy role-less input: fit_spiral then infers
+    # winding_is_absolute from the file's basename, as the historical CLI did.
+    role: PclRole | None
     required: bool = False
 
     @classmethod
@@ -88,7 +93,9 @@ class SpiralInputPaths:
     def manifest(self) -> dict[str, Any]:
         result = asdict(self)
         result["pcls"] = [
-            {"path": item.path, "role": item.role.value, "required": item.required}
+            {"path": item.path,
+             "role": item.role.value if item.role is not None else None,
+             "required": item.required}
             for item in self.pcls
         ]
         return result
@@ -99,7 +106,6 @@ class SpiralRunConfig:
     z_begin: int
     z_end: int
     scroll_name: str = "scroll"
-    outward_sense: str = "CW"
     voxel_size_um: float = 9.6
     lasagna_group: str = "4"
     lasagna_scale: int = 4
@@ -115,7 +121,6 @@ class SpiralRunConfig:
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
             scroll_name=str(value.get("scroll_name", "scroll")),
-            outward_sense=str(value.get("outward_sense", "CW")).upper(),
             voxel_size_um=float(value.get("voxel_size_um", 9.6)),
             lasagna_group=str(value.get("lasagna_group", "4")),
             lasagna_scale=int(value.get("lasagna_scale", 4)),
@@ -151,6 +156,10 @@ class SpiralDatasetResolution:
     ambiguities: dict[str, list[str]] = field(default_factory=dict)
     detected_checkpoints: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Parsed spiral-scroll.json manifest (see ScrollSpec.manifest()); None when
+    # the specification is missing or invalid, which is a missing_required
+    # condition ("scroll_spec").
+    scroll_spec: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -160,6 +169,241 @@ class SpiralDatasetResolution:
         result = asdict(self)
         result["ok"] = self.ok
         return result
+
+
+# ---------------------------------------------------------------------------
+# Versioned scroll specification (spiral-scroll.json)
+# ---------------------------------------------------------------------------
+
+SCROLL_SPEC_FILENAME = "spiral-scroll.json"
+SCROLL_SPEC_SCHEMA_VERSION = 1
+
+# Input keys whose paths may depart from the directory conventions. Values in
+# the spec file are resolved relative to the dataset root; conventional paths
+# need no entry at all.
+SCROLL_SPEC_PATH_OVERRIDE_KEYS = (
+    "umbilicus", "fibers", "verified_patches", "unverified_patches",
+    "outer_shell", "tracks_dbm", "normal_x", "normal_y",
+    "gradient_magnitude", "surf_sdt",
+)
+
+_SCROLL_SPEC_TOP_LEVEL_KEYS = (
+    "schema_version", "name", "voxel_size_um", "spiral_outward_sense",
+    "umbilicus", "normal_zarr_group", "surf_sdt_zarr_group", "lasagna_scale",
+    "paths",
+)
+
+# Conventional dataset layout for the headless CLI, mirroring the historical
+# fit_spiral module-global defaults. resolve_dataset_root() shares the same
+# relative paths for the entries it discovers.
+_CONVENTIONAL_INPUT_RELATIVES = {
+    "umbilicus": "umbilicus.json",
+    "fibers": "fibers",
+    "verified_patches": "verified_patches",
+    "outer_shell": "outer_shell",
+    "tracks_dbm": "tracks/2um_ds2_ps256_surf_v2.dbm",
+    "normal_x": "lasagna_inputs/las_008_nx.ome.zarr",
+    "normal_y": "lasagna_inputs/las_008_ny.ome.zarr",
+    "gradient_magnitude": "lasagna_inputs/las_008_grad_mag.ome.zarr",
+    "surf_sdt": "lasagna_inputs/las_008_surf_sdt.ome.zarr",
+}
+
+_CONVENTIONAL_PCL_INPUTS = (
+    ("abs_winding.json", PclRole.ABSOLUTE),
+    ("patch-overlap-pcls.json", PclRole.PATCH_OVERLAP),
+    ("relative_windings.json", PclRole.RELATIVE),
+    ("same_windings.json", PclRole.SAME_WINDING),
+    ("drawn_control_points.json", PclRole.DRAWN_CONTROL_POINTS),
+)
+
+
+class ScrollSpecError(ValueError):
+    """A missing, malformed, or out-of-contract spiral-scroll.json."""
+
+
+@dataclass(frozen=True)
+class ScrollSpec:
+    """Physical/dataset facts of one scroll, parsed from spiral-scroll.json.
+
+    Torch-free and frozen: safe to resolve in the VC3D-facing service process
+    and to pickle into GPU worker processes. Deployment and presentation
+    values (output/cache roots, run tags, storage backend, render scale) are
+    deliberately not part of the scroll file.
+    """
+
+    name: str
+    voxel_size_um: float
+    spiral_outward_sense: str
+    umbilicus_coordinate_scale: float = 1.0
+    normal_zarr_group: str = "4"
+    surf_sdt_zarr_group: str = "1"
+    lasagna_scale: int = 4
+    # Allow-listed absolute-path overrides, (key, resolved path) pairs.
+    path_overrides: tuple[tuple[str, str], ...] = ()
+
+    def path_override(self, key: str) -> str:
+        return dict(self.path_overrides).get(key, "")
+
+    def manifest(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["path_overrides"] = dict(self.path_overrides)
+        return result
+
+
+def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
+                      *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
+    """Validate a spiral-scroll.json document strictly and freeze it.
+
+    Unknown keys are errors (named), schema_version is required, and path
+    overrides are resolved relative to the dataset root.
+    """
+    if not isinstance(document, Mapping):
+        raise ScrollSpecError(f"{source}: the scroll specification must be a JSON object")
+    unknown = sorted(set(document) - set(_SCROLL_SPEC_TOP_LEVEL_KEYS))
+    if unknown:
+        raise ScrollSpecError(f"{source}: unknown keys: {unknown}")
+    if "schema_version" not in document:
+        raise ScrollSpecError(f"{source}: schema_version is required")
+    if document["schema_version"] != SCROLL_SPEC_SCHEMA_VERSION:
+        raise ScrollSpecError(
+            f"{source}: unsupported schema_version {document['schema_version']!r} "
+            f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
+    missing = sorted(
+        key for key in ("name", "voxel_size_um", "spiral_outward_sense")
+        if key not in document)
+    if missing:
+        raise ScrollSpecError(f"{source}: missing required keys: {missing}")
+
+    name = str(document["name"]).strip()
+    if not name:
+        raise ScrollSpecError(f"{source}: name must be a non-empty string")
+    try:
+        voxel_size_um = float(document["voxel_size_um"])
+    except (TypeError, ValueError):
+        raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
+    if not voxel_size_um > 0:
+        raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
+    sense = str(document["spiral_outward_sense"]).upper()
+    if sense not in ("CW", "ACW"):
+        raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
+
+    umbilicus = document.get("umbilicus", {})
+    if not isinstance(umbilicus, Mapping):
+        raise ScrollSpecError(f"{source}: umbilicus must be an object")
+    unknown = sorted(set(umbilicus) - {"coordinate_scale"})
+    if unknown:
+        raise ScrollSpecError(f"{source}: unknown umbilicus keys: {unknown}")
+    try:
+        coordinate_scale = float(umbilicus.get("coordinate_scale", 1.0))
+    except (TypeError, ValueError):
+        raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
+
+    lasagna_scale = document.get("lasagna_scale", 4)
+    if type(lasagna_scale) is not int or lasagna_scale <= 0:
+        raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
+
+    paths = document.get("paths", {})
+    if not isinstance(paths, Mapping):
+        raise ScrollSpecError(f"{source}: paths must be an object")
+    unknown = sorted(set(paths) - set(SCROLL_SPEC_PATH_OVERRIDE_KEYS))
+    if unknown:
+        raise ScrollSpecError(
+            f"{source}: unknown path override keys: {unknown} "
+            f"(allowed: {sorted(SCROLL_SPEC_PATH_OVERRIDE_KEYS)})")
+    root = Path(_normalise_path(dataset_root))
+    overrides = []
+    for key in sorted(paths):
+        value = paths[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ScrollSpecError(f"{source}: path override {key!r} must be a non-empty string")
+        overrides.append((key, _normalise_path(value, base=root)))
+
+    return ScrollSpec(
+        name=name,
+        voxel_size_um=voxel_size_um,
+        spiral_outward_sense=sense,
+        umbilicus_coordinate_scale=coordinate_scale,
+        normal_zarr_group=str(document.get("normal_zarr_group", "4")),
+        surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
+        lasagna_scale=lasagna_scale,
+        path_overrides=tuple(overrides),
+    )
+
+
+def load_scroll_spec(dataset_root: str | os.PathLike[str],
+                     spec_path: str | os.PathLike[str] | None = None) -> ScrollSpec:
+    """Load the scroll specification for a dataset.
+
+    Discovers the single conventional file <dataset_root>/spiral-scroll.json
+    unless an explicit spec_path is given. A missing or invalid file raises
+    ScrollSpecError with instructions.
+    """
+    root = Path(_normalise_path(dataset_root)) if str(dataset_root or "").strip() else None
+    if spec_path is not None:
+        path = Path(_normalise_path(spec_path))
+    elif root is not None:
+        path = root / SCROLL_SPEC_FILENAME
+    else:
+        raise ScrollSpecError(
+            "No dataset root given: cannot discover the scroll specification "
+            f"({SCROLL_SPEC_FILENAME})")
+    if not path.is_file():
+        raise ScrollSpecError(
+            f"No scroll specification found at {path}. Create {SCROLL_SPEC_FILENAME} "
+            "in the dataset root with schema_version, name, voxel_size_um, and "
+            "spiral_outward_sense (plus any non-conventional path overrides).")
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ScrollSpecError(f"{path}: invalid scroll specification: {exc}") from exc
+    return parse_scroll_spec(document, root if root is not None else path.parent,
+                             source=str(path))
+
+
+def conventional_input_paths(
+        dataset_root: str | os.PathLike[str], spec: ScrollSpec, *,
+        output_directory: str = "", cache_directory: str = "",
+        checkpoint: str = "") -> SpiralInputPaths:
+    """Resolve the conventional dataset layout (plus spec overrides) for the
+    headless CLI, mirroring the historical fit_spiral module-global defaults.
+
+    Unlike resolve_dataset_root() this performs no existence probing: the CLI
+    fails on the specific missing input during loading, exactly as the module
+    globals did. The dataset root is kept verbatim (no symlink resolution) so
+    conventional paths read exactly as the caller spelled the root; explicit
+    spec overrides are already normalised against the root at parse time.
+    """
+    root = str(dataset_root)
+
+    def resolve(key):
+        override = spec.path_override(key)
+        if override:
+            return override
+        relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
+        return f"{root}/{relative}" if relative else ""
+
+    pcls = tuple(
+        PclInputSpec(path=f"{root}/{relative}", role=role)
+        for relative, role in _CONVENTIONAL_PCL_INPUTS
+    )
+    return SpiralInputPaths(
+        dataset_root=str(root),
+        umbilicus=resolve("umbilicus"),
+        pcls=pcls,
+        fibers=resolve("fibers"),
+        tracks_dbm=resolve("tracks_dbm"),
+        verified_patches=resolve("verified_patches"),
+        unverified_patches=spec.path_override("unverified_patches"),
+        outer_shell=resolve("outer_shell"),
+        normal_x=resolve("normal_x"),
+        normal_y=resolve("normal_y"),
+        gradient_magnitude=resolve("gradient_magnitude"),
+        surf_sdt=resolve("surf_sdt"),
+        checkpoint=_normalise_path(checkpoint) if checkpoint else "",
+        output_directory=_normalise_path(output_directory) if output_directory else "",
+        cache_directory=_normalise_path(cache_directory) if cache_directory else "",
+    )
 
 
 _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
@@ -247,8 +491,20 @@ def resolve_dataset_root(
         result.warnings.append(f"Dataset root is not a readable directory: {root}")
         return result
 
+    # The scroll specification is the dataset's one required source of
+    # physical facts; a dataset without it does not resolve.
+    try:
+        spec = load_scroll_spec(root)
+    except ScrollSpecError as exc:
+        spec = None
+        result.missing_required.append("scroll_spec")
+        result.warnings.append(str(exc))
+    else:
+        result.scroll_spec = spec.manifest()
+
     for key, relative, kind, required in _CONVENTIONAL_ENTRIES:
-        candidate = root / relative
+        override = spec.path_override(key) if spec is not None else ""
+        candidate = Path(override) if override else root / relative
         found = candidate.is_file() if kind == "file" else candidate.is_dir()
         if found and os.access(candidate, os.R_OK):
             result.resolved[key] = _normalise_path(candidate)
@@ -270,7 +526,9 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append(f"pcl:{role.value}")
 
-    preferred = root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
+    tracks_override = spec.path_override("tracks_dbm") if spec is not None else ""
+    preferred = Path(tracks_override) if tracks_override \
+        else root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
     preferred_logical = resolve_logical_dbm(preferred)
     if preferred_logical:
         result.resolved["tracks_dbm"] = preferred_logical
@@ -403,8 +661,6 @@ def validate_session_request(
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
-    if run.outward_sense not in {"CW", "ACW"}:
-        errors.append({"field": "outward_sense", "message": "Must be CW or ACW"})
     if run.lasagna_scale <= 0:
         errors.append({"field": "lasagna_scale", "message": "Must be positive"})
     if run.storage_backend != "sparse_cuda":

@@ -108,6 +108,15 @@ class FakeSession:
         self.closed = True
 
 
+def _write_scroll_spec(root):
+    (Path(root) / "spiral-scroll.json").write_text(json.dumps({
+        "schema_version": 1,
+        "name": "s1",
+        "voxel_size_um": 9.6,
+        "spiral_outward_sense": "CW",
+    }))
+
+
 def _attach_fake_session(state, output_directory, dataset_root=""):
     state.session = FakeSession()
     state.session_generation += 1
@@ -252,6 +261,7 @@ class NamedSessionTests(unittest.TestCase):
     def test_named_resolution_isolates_output_but_shares_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            _write_scroll_spec(root)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
             unnamed = resolve_dataset_root(root)
@@ -548,6 +558,7 @@ class DatasetOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
         (self.root / "spiral_output").mkdir()
@@ -1007,6 +1018,7 @@ class CheckpointUploadTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
         (self.root / "spiral_output").mkdir()
@@ -1848,6 +1860,7 @@ class ServiceProcessTests(unittest.TestCase):
             root = Path(temporary)
             dataset = root / "dataset"
             dataset.mkdir()
+            _write_scroll_spec(dataset)
             (dataset / "umbilicus.json").write_text("{}")
             (dataset / "verified_patches").mkdir()
             key_file = root / "key"

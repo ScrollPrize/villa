@@ -47,7 +47,8 @@ from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
 
-from fit_session import (API_VERSION, PclRole, parse_session_request,
+from fit_session import (API_VERSION, PclRole, ScrollSpecError,
+                         load_scroll_spec, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
 from config import Config
@@ -1333,6 +1334,14 @@ class ServiceState:
             request = self._dataset_session_request(request)
         paths, run, preview = parse_session_request(request)
         errors = validate_session_request(paths, run)
+        # The scroll specification is resolved from the dataset root; it
+        # carries the physical scroll facts (including the outward sense,
+        # which is not part of the load request).
+        scroll = None
+        try:
+            scroll = load_scroll_spec(paths.dataset_root)
+        except ScrollSpecError as exc:
+            errors.append({"field": "scroll_spec", "message": str(exc)})
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         with self.lock:
@@ -1378,7 +1387,7 @@ class ServiceState:
                 self._reset_session_scope()
                 try:
                     self.session = create_session(
-                        paths, run, preview, self._status_changed,
+                        paths, run, preview, scroll, self._status_changed,
                         gpu_ids=self.gpu_ids)
                 except BaseException:
                     self.session_id = None

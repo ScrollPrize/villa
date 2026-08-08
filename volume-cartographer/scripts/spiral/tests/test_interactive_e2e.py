@@ -5,9 +5,9 @@ FitContext on the fitter thread) against the local Scroll1 dataset over a
 small z-range, waits for Ready, runs two iterations, and checks the pause
 protocol outputs (autosave checkpoint + published preview manifest).
 
-Gated behind SPIRAL_INTERACTIVE_E2E=1: it needs a GPU and the local dataset,
-takes minutes, and mutates fit_spiral module globals, so it must run in its
-own interpreter, not as part of the default suite:
+Gated behind SPIRAL_INTERACTIVE_E2E=1: it needs a GPU and the local dataset
+and takes minutes, so it must run in its own interpreter, not as part of the
+default suite:
 
     SPIRAL_INTERACTIVE_E2E=1 uv run python -m pytest tests/test_interactive_e2e.py -q
 """
@@ -24,13 +24,13 @@ DATASET = "/home/paul/projects/vesuvius-scrolls/spiral/dataset"
 @unittest.skipUnless(
     os.environ.get("SPIRAL_INTERACTIVE_E2E") == "1",
     "set SPIRAL_INTERACTIVE_E2E=1 (needs a GPU and the local dataset; "
-    "mutates fit_spiral module state, run in a dedicated interpreter)")
+    "run in a dedicated interpreter)")
 class InteractiveEndToEndTests(unittest.TestCase):
     def test_session_reaches_ready_runs_and_pauses_with_outputs(self):
         import tempfile
 
         from fit_session import (SpiralInputPaths, SpiralPreviewConfig,
-                                 SpiralRunConfig)
+                                 SpiralRunConfig, load_scroll_spec)
         from spiral_runtime import InteractiveFitSession
 
         with tempfile.TemporaryDirectory(prefix="spiral-e2e-") as work:
@@ -65,7 +65,6 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 "z_begin": 10_000,
                 "z_end": 11_000,
                 "scroll_name": "s1",
-                "outward_sense": "CW",
                 "config": {
                     "dense_spacing_mode": "grad_mag",
                     "loss_weight_dense_spacing_density": 0.0,
@@ -74,7 +73,8 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 },
             })
             session = InteractiveFitSession(
-                paths, run, SpiralPreviewConfig(), status_callback=None)
+                paths, run, SpiralPreviewConfig(), load_scroll_spec(DATASET),
+                status_callback=None)
             try:
                 deadline = time.monotonic() + 900
                 while (session.status()["state"] not in {"Ready", "Error"}

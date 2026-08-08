@@ -8,6 +8,7 @@ through a condition variable and consume copied status snapshots.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import itertools
 import multiprocessing
 import os
@@ -20,9 +21,9 @@ import traceback
 from typing import Mapping
 import uuid
 
-from fit_session import (SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig,
-                         run_mutable_config)
-from config import Config, FitConfig
+from fit_session import (ScrollSpec, SpiralInputPaths, SpiralPreviewConfig,
+                         SpiralRunConfig, run_mutable_config)
+from config import Config, FitConfig, durable_config
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -35,10 +36,11 @@ class _SessionShutdown(BaseException):
 
 class InteractiveFitSession:
     def __init__(self, paths: SpiralInputPaths, run: SpiralRunConfig,
-                 preview: SpiralPreviewConfig, status_callback=None,
-                 publishes_outputs=True) -> None:
+                 preview: SpiralPreviewConfig, scroll: ScrollSpec,
+                 status_callback=None, publishes_outputs=True) -> None:
         self.paths = paths
         self.run_config = run
+        self.scroll = scroll
         self.preview_config = preview
         self.input_manifest = paths.manifest()
         self.requested_config = dict(run.config)
@@ -155,10 +157,41 @@ class InteractiveFitSession:
                             checkpoint_config.get('cfg'), Mapping):
                         raise ValueError("Checkpoint has no current Spiral configuration")
                     durable = dict(checkpoint_config['cfg'])
-                    if set(durable) != set(config):
+                    # Checkpoints store the durable subset of the schema
+                    # (see config.durable_config), so key sets compare
+                    # against that subset. z_begin/z_end joined the schema
+                    # after many checkpoints were written: a stored cfg
+                    # lacking exactly those keys is accepted with defaults
+                    # from the session request; every other key-set
+                    # mismatch stays a strict error.
+                    durable_schema = set(durable_config(config))
+                    missing = durable_schema - set(durable)
+                    if set(durable) - durable_schema or missing - {"z_begin", "z_end"}:
                         raise ValueError(
                             "Checkpoint configuration does not match the current schema")
+                    if missing:
+                        assumed = {
+                            "z_begin": int(self.run_config.z_begin),
+                            "z_end": int(self.run_config.z_end),
+                        }
+                        durable.update(
+                            {key: assumed[key] for key in missing})
+                        warning = (
+                            f"Checkpoint {self.paths.checkpoint} predates "
+                            "z_begin/z_end in the stored configuration; "
+                            "assuming "
+                            + ", ".join(f"{key}={assumed[key]}"
+                                        for key in sorted(missing))
+                            + " from the session request")
+                        print(warning)
+                        with self._condition:
+                            self._warnings.append(warning)
                     durable = Config(durable).as_dict()
+                    # The optimisation z window is owned by the session
+                    # request; the checkpoint's stored range only documents
+                    # what it trained with.
+                    durable["z_begin"] = int(self.run_config.z_begin)
+                    durable["z_end"] = int(self.run_config.z_end)
                     config.update(durable)
                     # The session-scoped profile initially reproduces the
                     # checkpoint without applying scaling twice.
@@ -168,6 +201,10 @@ class InteractiveFitSession:
                     # not retain a complete model + optimiser checkpoint for the
                     # lifetime of the resident fitter thread.
                     del checkpoint_config
+            # The session request's z window is authoritative for this fit,
+            # both for the applied configuration and the Default profile.
+            config["z_begin"] = int(self.run_config.z_begin)
+            config["z_end"] = int(self.run_config.z_end)
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
@@ -190,6 +227,8 @@ class InteractiveFitSession:
                 if key.startswith("sample_count_")
             })
             config.update(self.run_config.config)
+            config["z_begin"] = int(self.run_config.z_begin)
+            config["z_end"] = int(self.run_config.z_end)
             fields = Config.catalog()["schema"]["fields"]
             count_keys = tuple(
                 key for key, spec in fields.items() if spec.get("scale_with_z"))
@@ -213,48 +252,38 @@ class InteractiveFitSession:
                 self._default_advanced_config = default_advanced_config
             self._publish_status()
 
-            fitter.dataset_path = self.paths.dataset_root
-            fitter.normal_nx_zarr_path = self.paths.normal_x or None
-            fitter.normal_ny_zarr_path = self.paths.normal_y or None
-            fitter.grad_mag_zarr_path = self.paths.gradient_magnitude or None
-            fitter.surf_sdt_zarr_path = self.paths.surf_sdt or None
-            fitter.normal_zarr_group = self.run_config.lasagna_group
-            fitter.pcl_input_specs = [(spec.path, spec.role.value) for spec in self.paths.pcls]
-            fitter.pcl_json_paths = [spec.path for spec in self.paths.pcls]
-            fitter.fibers_path = self.paths.fibers or None
-            fitter.verified_patches_path = self.paths.verified_patches or None
-            fitter.unverified_patches_path = self.paths.unverified_patches or None
-            fitter.shell_path = self.paths.outer_shell or None
-            fitter.tracks_dbm_path = self.paths.tracks_dbm or None
-            fitter.scroll_zarr_path = self.paths.scroll_zarr or None
-            fitter.spiral_outward_sense = self.run_config.outward_sense
-            fitter.scroll_name = self.run_config.scroll_name
-            fitter.z_begin = self.run_config.z_begin
-            fitter.z_end = self.run_config.z_end
-            fitter.voxel_size_um = self.run_config.voxel_size_um
-            fitter.lasagna_scale = self.run_config.lasagna_scale
-            fitter.lasagna_storage_backend = self.run_config.storage_backend
-            fitter.cache_path = self.paths.cache_directory
-            fitter.render_volume_scale = self.run_config.render_volume_scale
-            fitter.umbilicus_z_to_yx = lambda: fitter.json_umbilicus_z_to_yx(
-                self.paths.umbilicus, coordinate_scale=1.0)
-
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._set_state("Loading", "Loading fit inputs and model")
+            # The scroll specification supplies the physical facts (including
+            # the outward sense, which is not part of the load request). The
+            # session request may still override the request-carried scroll
+            # values it historically owned.
+            scroll = dataclasses.replace(
+                self.scroll,
+                name=self.run_config.scroll_name,
+                voxel_size_um=self.run_config.voxel_size_um,
+                normal_zarr_group=self.run_config.lasagna_group,
+                lasagna_scale=self.run_config.lasagna_scale,
+            )
             # The runtime is the execution owner of the context: it constructs
             # it, drives every phase on this fitter thread, and closes it.
-            # Configuration and the fit controls (resume, output directory,
-            # run tag) are passed explicitly; no module-global cfg, no
-            # FIT_SPIRAL_* environment variables, and no wandb run.
+            # Configuration, the scroll facts, the resolved input paths, and
+            # the fit controls (resume, output directory, run tag) are passed
+            # explicitly; fit_spiral holds no module-global dataset state.
             context = fitter.FitContext(
                 FitConfig(config),
+                scroll=scroll,
+                paths=self.paths,
                 interactive_driver=self,
                 progress=self.progress,
                 resume_path=self.paths.checkpoint or None,
                 resume_step=(self.run_config.legacy_checkpoint_step
                              if self.paths.checkpoint else 0),
                 out_base_dir=self.paths.output_directory,
-                run_tag=self.run_config.run_tag or None)
+                run_tag=self.run_config.run_tag or None,
+                cache_dir=self.paths.cache_directory,
+                storage_backend=self.run_config.storage_backend,
+                render_volume_scale=self.run_config.render_volume_scale)
             context.load_host_inputs()
             context.resolve_output_path()
             context.build_device_state()
@@ -617,7 +646,7 @@ def _free_loopback_port():
 
 
 def _distributed_session_worker(rank, world_size, gpu_id, master_port,
-                                paths, run, preview, commands, events):
+                                paths, run, preview, scroll, commands, events):
     """Own one CUDA rank and adapt queue commands to InteractiveFitSession."""
     os.environ.update({
         # Give each rank a one-device CUDA namespace. This prevents checkpoint
@@ -638,7 +667,8 @@ def _distributed_session_worker(rank, world_size, gpu_id, master_port,
     closed = False
     try:
         session = InteractiveFitSession(
-            paths, run, preview, publish_status, publishes_outputs=(rank == 0))
+            paths, run, preview, scroll, publish_status,
+            publishes_outputs=(rank == 0))
         while True:
             command_id, name, arguments = commands.get()
             try:
@@ -687,7 +717,8 @@ def _distributed_session_worker(rank, world_size, gpu_id, master_port,
 class DistributedInteractiveFitSession:
     """Parent-process proxy for one resident fitter process per selected GPU."""
 
-    def __init__(self, paths, run, preview, gpu_ids, status_callback=None):
+    def __init__(self, paths, run, preview, scroll, gpu_ids,
+                 status_callback=None):
         self._gpu_ids = tuple(gpu_ids)
         self._status_callback = status_callback
         self._condition = threading.Condition()
@@ -722,7 +753,8 @@ class DistributedInteractiveFitSession:
             context.Process(
                 target=_distributed_session_worker,
                 args=(rank, len(self._gpu_ids), gpu_id, master_port,
-                      paths, run, preview, self._commands[rank], self._events),
+                      paths, run, preview, scroll,
+                      self._commands[rank], self._events),
                 name=f"spiral-gpu-{gpu_id}",
             )
             for rank, gpu_id in enumerate(self._gpu_ids)
@@ -949,9 +981,11 @@ class DistributedInteractiveFitSession:
             self._listener.join(5.0)
 
 
-def create_session(paths, run, preview, status_callback=None, gpu_ids=(0,)):
+def create_session(paths, run, preview, scroll, status_callback=None,
+                   gpu_ids=(0,)):
     gpu_ids = tuple(gpu_ids)
     if len(gpu_ids) == 1:
-        return InteractiveFitSession(paths, run, preview, status_callback)
+        return InteractiveFitSession(paths, run, preview, scroll,
+                                     status_callback)
     return DistributedInteractiveFitSession(
-        paths, run, preview, gpu_ids, status_callback)
+        paths, run, preview, scroll, gpu_ids, status_callback)

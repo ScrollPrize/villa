@@ -310,7 +310,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
     _scrollName = new QLineEdit(QStringLiteral("s1"), outputContents);
-    _outwardSense = new QComboBox(outputContents); _outwardSense->addItems({QStringLiteral("CW"), QStringLiteral("ACW")});
     _voxelSize = new QDoubleSpinBox(outputContents); _voxelSize->setRange(0.001, 10000); _voxelSize->setDecimals(4); _voxelSize->setValue(9.6);
     _legacyCheckpointStep = new QSpinBox(outputContents); _legacyCheckpointStep->setRange(0, 1000000000);
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
@@ -347,7 +346,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
     outputForm->addRow(tr("Scroll name"), _scrollName);
-    outputForm->addRow(tr("Outward sense"), _outwardSense);
     outputForm->addRow(tr("Voxel size (µm)"), _voxelSize);
     outputForm->addRow(tr("Legacy checkpoint step"), _legacyCheckpointStep);
     outputForm->addRow(tr("Run tag"), _runTag);
@@ -928,8 +926,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 [this](double) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
-    connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
@@ -1290,7 +1286,7 @@ QJsonObject SpiralPanel::sessionRequest() const
     paths["pcls"] = pcls;
     QJsonObject config = sessionAdvancedConfig();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
-                    {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
+                    {"scroll_name", _scrollName->text()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
                     {"lasagna_scale", _lasagnaScale->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -1512,9 +1508,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
     _scrollName->setText(
         run.value(QStringLiteral("scroll_name")).toString(_scrollName->text()));
-    _outwardSense->setCurrentText(
-        run.value(QStringLiteral("outward_sense")).toString(
-            _outwardSense->currentText()));
     _voxelSize->setValue(
         run.value(QStringLiteral("voxel_size_um")).toDouble(_voxelSize->value()));
     _lasagnaGroup->setText(
@@ -1812,7 +1805,6 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
     settings.setValue(prefix + "scroll_name", _scrollName->text());
-    settings.setValue(prefix + "outward_sense", _outwardSense->currentText());
     settings.setValue(prefix + "voxel_size_um", _voxelSize->value());
     settings.setValue(prefix + "lasagna_group", _lasagnaGroup->text());
     settings.setValue(prefix + "lasagna_scale", _lasagnaScale->value());
@@ -1871,7 +1863,6 @@ void SpiralPanel::restore()
     _zBegin->setValue(settings.value(valuePrefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(valuePrefix + "z_end", 17000).toInt());
     _scrollName->setText(settings.value(valuePrefix + "scroll_name", "s1").toString());
-    _outwardSense->setCurrentText(settings.value(valuePrefix + "outward_sense", "CW").toString());
     _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
     _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
     _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());

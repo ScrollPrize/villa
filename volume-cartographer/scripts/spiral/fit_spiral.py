@@ -34,7 +34,7 @@ from ddp_helpers import (
     maybe_destroy_distributed,
     maybe_init_distributed,
 )
-from config import Config, FitConfig
+from config import Config, FitConfig, durable_config
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
@@ -114,43 +114,6 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
-
-
-# PHercParis4
-dataset_path = '/ephemeral/paul/spiral/dataset'
-scroll_zarr_path = None
-normal_nx_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_nx.ome.zarr'
-normal_ny_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_ny.ome.zarr'
-grad_mag_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_grad_mag.ome.zarr'
-normal_zarr_group = '4'
-# Wide-range capped signed-distance store of the binarized surface prediction
-# (docs/spiral_surf_sdt_generation.md). Its group/scale/encoding are read from
-# the store's own metadata, never from normal_zarr_group/lasagna_scale.
-surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
-surf_sdt_zarr_group = '1'
-pcl_json_paths = [
-    f'{dataset_path}/abs_winding.json',
-    f'{dataset_path}/relative_windings.json',
-]
-# The interactive session API supplies explicit roles.  The legacy CLI leaves
-# this as None and retains the historical abs_winding.json basename behavior.
-pcl_input_specs = None
-fibers_path = f'{dataset_path}/fibers'
-verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = None
-shell_path = f'{dataset_path}/outer_shell'
-tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
-spiral_outward_sense = 'CW'  # CW | ACW
-umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', coordinate_scale=1.0)
-scroll_name = 's1'
-z_begin, z_end = 4000, 17000
-voxel_size_um = 9.6
-cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
-lasagna_scale = 4
-# Normals, grad magnitude, and SDT are served by fully-resident sparse brick
-# pools loaded from pack_resident_pools.py sidecars next to the source zarrs.
-lasagna_storage_backend = 'sparse_cuda'
-render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 
 
 def get_env_config_overrides():
@@ -691,13 +654,29 @@ class FitContext:
     commands instead of calling the context directly.
     """
 
-    def __init__(self, config, *, interactive_driver=None, progress=None,
-                 resume_path=None, resume_step=0, out_base_dir=None,
-                 run_tag=None, run_name=None):
+    def __init__(self, config, *, scroll, paths, interactive_driver=None,
+                 progress=None, resume_path=None, resume_step=0,
+                 out_base_dir=None, run_tag=None, run_name=None,
+                 cache_dir=None, storage_backend='sparse_cuda',
+                 render_volume_scale=16):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
-        # fallback. The fit controls that used to arrive through
-        # FIT_SPIRAL_* environment variables are constructor arguments now:
+        # fallback. The optimisation z window is Config's z_begin/z_end.
+        #
+        # scroll is the frozen ScrollSpec: physical facts of the scanned
+        # scroll (name, voxel size, outward sense, umbilicus coordinate
+        # scale, Lasagna/SDT groups and scale). paths is the resolved
+        # SpiralInputPaths for this fit: the interactive runtime passes the
+        # service's per-session selection; the CLI resolves the conventional
+        # dataset layout (fit_session.conventional_input_paths).
+        #
+        # cache_dir / storage_backend / render_volume_scale are deployment
+        # and presentation values, deliberately not part of the scroll file:
+        # the CLI parses their FIT_SPIRAL_* environment defaults at its own
+        # boundary, and the interactive runtime passes the service's values.
+        #
+        # The fit controls that used to arrive through FIT_SPIRAL_*
+        # environment variables are constructor arguments now:
         #   resume_path / resume_step - checkpoint to restore and its legacy
         #     explicit step (the checkpoint's own completed_iterations wins);
         #   out_base_dir - parent directory for resolve_output_path();
@@ -713,6 +692,8 @@ class FitContext:
         # The runtime drives the context itself; it never hands control back
         # through this reference. PR 3 replaces it with explicit session flags.
         self.config = config
+        self.scroll = scroll
+        self.paths = paths
         self.interactive_driver = interactive_driver
         self.progress = progress
         self.resume_path = resume_path or None
@@ -720,12 +701,59 @@ class FitContext:
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_tag = run_tag or None
         self.run_name = run_name
+
+        # Scroll physical facts.
+        self.scroll_name = scroll.name
+        self.voxel_size_um = float(scroll.voxel_size_um)
+        self.spiral_outward_sense = scroll.spiral_outward_sense
+        self.normal_zarr_group = scroll.normal_zarr_group
+        # The surf-SDT store's scale/encoding are read from the store's own
+        # metadata, never from normal_zarr_group/lasagna_scale.
+        self.surf_sdt_zarr_group = scroll.surf_sdt_zarr_group
+        self.lasagna_scale = int(scroll.lasagna_scale)
+        umbilicus_path = paths.umbilicus
+        umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
+        self.umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(
+            umbilicus_path, coordinate_scale=umbilicus_scale)
+
+        # Resolved input paths ('' means absent).
+        self.scroll_zarr_path = paths.scroll_zarr or None
+        self.normal_nx_zarr_path = paths.normal_x or None
+        self.normal_ny_zarr_path = paths.normal_y or None
+        self.grad_mag_zarr_path = paths.gradient_magnitude or None
+        self.surf_sdt_zarr_path = paths.surf_sdt or None
+        self.fibers_path = paths.fibers or None
+        self.verified_patches_path = paths.verified_patches or None
+        self.unverified_patches_path = paths.unverified_patches or None
+        self.shell_path = paths.outer_shell or None
+        self.tracks_dbm_path = paths.tracks_dbm or None
+        self.pcl_input_specs = [
+            (spec.path, spec.role.value if spec.role is not None else None)
+            for spec in paths.pcls
+        ]
+
+        # Deployment/presentation values.
+        self.cache_path = cache_dir if cache_dir is not None else (paths.cache_directory or None)
+        self.lasagna_storage_backend = storage_backend
+        self.render_volume_scale = int(render_volume_scale)
+
         self._lasagna_store = None
         self._scalar_stores = []
         # configure_losses() used to warm the geodesic strip-path worker
         # pool as an import-time side effect of installing the config.
         if config['patch_strip_sampling'] == 'dijkstra':
             strip_path_pools.warm_workers()
+
+    # The optimisation z window lives in the fit configuration (its catalog
+    # metadata records the full effect list); these properties are the one
+    # reading point for the many z-window consumers below.
+    @property
+    def z_begin(self):
+        return int(self.config['z_begin'])
+
+    @property
+    def z_end(self):
+        return int(self.config['z_end'])
 
     def shell_losses_enabled(self):
         return (
@@ -766,8 +794,8 @@ class FitContext:
             zyxs_z_np = patch.zyxs[..., 0].cpu().numpy()
             quad_zs_np = (zyxs_z_np[:-1, :-1] + zyxs_z_np[1:, :-1] + zyxs_z_np[:-1, 1:] + zyxs_z_np[1:, 1:]) / 4
             z_in_roi_np = (
-                    (quad_zs_np >= z_begin - self.config['patch_loss_z_margin'])
-                    & (quad_zs_np < z_end + self.config['patch_loss_z_margin'])
+                    (quad_zs_np >= self.z_begin - self.config['patch_loss_z_margin'])
+                    & (quad_zs_np < self.z_end + self.config['patch_loss_z_margin'])
             )
             in_roi_quad_mask_np = valid_quad_mask_np & z_in_roi_np
             if not in_roi_quad_mask_np.any():
@@ -865,11 +893,11 @@ class FitContext:
         np.random.seed(self.config['optimizer_random_seed'])
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
-        umbilicus = umbilicus_z_to_yx()
-        if scroll_zarr_path:
+        umbilicus = self.umbilicus_z_to_yx()
+        if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
-            scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
+            scroll_zarr = zarr.open(self.scroll_zarr_path, mode='r')
         else:
             scroll_zarr = None
 
@@ -877,16 +905,16 @@ class FitContext:
         # Patch loading and ROI filtering
         # ==========================================================================
 
-        filter_tracks_by_shell = bool(tracks_dbm_path) and bool(shell_path)
+        filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
         shell_patch = None
         if self.shell_losses_enabled() or filter_tracks_by_shell:
-            if not shell_path:
+            if not self.shell_path:
                 raise RuntimeError('shell losses are enabled, but no outer shell path is set')
             progress.begin('loading', 'Loading outer shell')
-            shell_patch = load_tifxyz(shell_path)
+            shell_patch = load_tifxyz(self.shell_path)
 
-        use_verified_patches = bool(verified_patches_path) and not self.config['input_disable_patches']
-        use_unverified_patches = bool(unverified_patches_path) and not self.config['input_disable_patches']
+        use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
+        use_unverified_patches = bool(self.unverified_patches_path) and not self.config['input_disable_patches']
         if not use_verified_patches and not use_unverified_patches:
             verified_patches = {}
             unverified_patches = {}
@@ -895,13 +923,13 @@ class FitContext:
             # An empty verified dir is allowed when unverified patches are supplied
             # (unverified-only ablations); both empty is a configuration error.
             verified_patches = (
-                self._load_patches_from_dir(verified_patches_path, 'verified patches')
-                if use_verified_patches and verified_patches_path else {}
+                self._load_patches_from_dir(self.verified_patches_path, 'verified patches')
+                if use_verified_patches and self.verified_patches_path else {}
             )
             unverified_patches = {}
-            if use_unverified_patches and unverified_patches_path:
+            if use_unverified_patches and self.unverified_patches_path:
                 unverified_patches = self._load_patches_from_dir(
-                    unverified_patches_path, 'unverified patches')
+                    self.unverified_patches_path, 'unverified patches')
 
         if (not verified_patches and not unverified_patches
                 and (use_verified_patches or use_unverified_patches)):
@@ -927,7 +955,7 @@ class FitContext:
                             continue
 
                     # remove any patches which do not intersect with the roi we are fitting
-                    if not patch_intersects_z_roi(patch, z_begin, z_end):
+                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
                         del patches[patch_id]
                         continue
                     # ROI testing may materialise the compact valid-coordinate view.
@@ -947,9 +975,7 @@ class FitContext:
         # be filtered to the z-roi.
         point_collections = {}
         next_id = 0
-        input_specs = pcl_input_specs
-        if input_specs is None:
-            input_specs = [(pattern, None) for pattern in pcl_json_paths]
+        input_specs = self.pcl_input_specs
         progress.begin(
             'loading', 'Loading point collections',
             step=0, total_steps=len(input_specs), unit='inputs')
@@ -978,7 +1004,7 @@ class FitContext:
 
         progress.begin('loading', 'Loading fiber point collections')
         fiber_point_collections, next_id = load_fiber_point_collections(
-            fibers_path,
+            self.fibers_path,
             next_id,
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
         )
@@ -1002,7 +1028,7 @@ class FitContext:
         def pcl_intersects_z_roi(pcl):
             for point in pcl['points'].values():
                 z = point['zyx'][0]
-                if z_begin <= z < z_end:
+                if self.z_begin <= z < self.z_end:
                     return True
             return False
 
@@ -1099,7 +1125,7 @@ class FitContext:
             run_start = 0
             for i, (_, point) in enumerate(sorted_items):
                 z = point['zyx'][0]
-                if z_begin - z_margin <= z < z_end + z_margin:
+                if self.z_begin - z_margin <= z < self.z_end + z_margin:
                     if i + 1 - run_start > best_end - best_start:
                         best_start, best_end = run_start, i + 1
                 else:
@@ -1230,8 +1256,8 @@ class FitContext:
             shell_envelope = ShellPolarMap(
                 shell_patch,
                 umbilicus,
-                z_min=z_begin - self.config['model_flow_bounds_z_margin'],
-                z_max=z_end + self.config['model_flow_bounds_z_margin'],
+                z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                 num_theta_bins=self.config['shell_num_theta_bins'],
                 device='cpu',
                 config=self.config,
@@ -1245,14 +1271,14 @@ class FitContext:
         track_reload_source = None
         track_reload_families = None
         track_reload_source_ids = None
-        if tracks_dbm_path is not None:
+        if self.tracks_dbm_path is not None:
             progress.begin(
                 'loading', 'Resolving track store',
-                detail=os.path.basename(tracks_dbm_path))
-            print(f'loading tracks from {tracks_dbm_path}')
+                detail=os.path.basename(self.tracks_dbm_path))
+            print(f'loading tracks from {self.tracks_dbm_path}')
             if (track_sampling_config['crossing_precompute_max'] > 0
                     or track_sampling_config['crossing_mode'] == 'track_walk'):
-                track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
+                track_crossing_cache = load_track_crossing_cache(self.tracks_dbm_path)
                 if track_crossing_cache is not None:
                     track_graph = TrackGraph(track_crossing_cache)
                     print(
@@ -1261,11 +1287,11 @@ class FitContext:
                         f'{track_graph.build_seconds:.1f}s')
                     track_crossing_cache = None
                 tracks, track_families, track_source_ids = load_tracks_from_dbm(
-                    tracks_dbm_path, z_begin, z_end, return_families=True,
+                    self.tracks_dbm_path, self.z_begin, self.z_end, return_families=True,
                     return_source_ids=True, progress=progress)
             else:
                 tracks = load_tracks_from_dbm(
-                    tracks_dbm_path, z_begin, z_end, progress=progress)
+                    self.tracks_dbm_path, self.z_begin, self.z_end, progress=progress)
             track_reload_source = tracks
             track_reload_families = track_families
             track_reload_source_ids = track_source_ids
@@ -1277,7 +1303,7 @@ class FitContext:
                     tracks, shell_envelope, track_families, return_indices=True)
                 if track_source_ids is not None:
                     track_source_ids = track_source_ids[kept_track_indices]
-            print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
+            print(f'loaded {len(tracks)} tracks within z-roi [{self.z_begin}, {self.z_end})')
         else:
             tracks = None
 
@@ -1307,12 +1333,12 @@ class FitContext:
         for patch in verified_patches_list:
             z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
             valid_flat = patch.valid_vertex_mask.reshape(-1)
-            z_in_roi = (z_flat[:, 0] >= z_begin) & (z_flat[:, 0] < z_end)
+            z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
             if (valid_flat & z_in_roi).any():
                 verified_patches_and_pcls_cpu.append(z_flat[valid_flat & z_in_roi])
         for strip in unattached_pcl_strips:
             zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-            in_roi = (zyxs[..., 0] >= z_begin) & (zyxs[..., 0] < z_end)
+            in_roi = (zyxs[..., 0] >= self.z_begin) & (zyxs[..., 0] < self.z_end)
             if in_roi.any():
                 verified_patches_and_pcls_cpu.append(zyxs[in_roi])
         verified_patches_and_pcls_cpu = (
@@ -1448,8 +1474,8 @@ class FitContext:
             self.verified_patches_list,
             self.unattached_pcl_strips,
             self.config,
-            z_begin,
-            z_end,
+            self.z_begin,
+            self.z_end,
             get_or_build_unattached_pcl_flat,
         )
 
@@ -1517,15 +1543,15 @@ class FitContext:
             self.scroll_zarr,
             use_normals=(self.config['loss_weight_dense_normals'] > 0 or self.phase_mode),
             use_spacing=self.grad_mag_spacing_enabled,
-            normal_nx_zarr_path=normal_nx_zarr_path,
-            normal_ny_zarr_path=normal_ny_zarr_path,
-            grad_mag_zarr_path=grad_mag_zarr_path,
-            normal_zarr_group=normal_zarr_group,
-            z_begin=z_begin,
-            z_end=z_end,
-            lasagna_scale=lasagna_scale,
-            storage_backend=lasagna_storage_backend,
-            cache_directory=cache_path,
+            normal_nx_zarr_path=self.normal_nx_zarr_path,
+            normal_ny_zarr_path=self.normal_ny_zarr_path,
+            grad_mag_zarr_path=self.grad_mag_zarr_path,
+            normal_zarr_group=self.normal_zarr_group,
+            z_begin=self.z_begin,
+            z_end=self.z_end,
+            lasagna_scale=self.lasagna_scale,
+            storage_backend=self.lasagna_storage_backend,
+            cache_directory=self.cache_path,
             progress=progress,
         )
         if interactive_driver is not None and self.lasagna_volume:
@@ -1537,21 +1563,21 @@ class FitContext:
         # and re-raised) at run boundaries without a session reload.
         self.sdt_volume = None
         if self.phase_mode:
-            if not surf_sdt_zarr_path or not os.path.exists(surf_sdt_zarr_path):
+            if not self.surf_sdt_zarr_path or not os.path.exists(self.surf_sdt_zarr_path):
                 raise RuntimeError(
                     "dense_spacing_mode='phase' requires the surf-SDT store: "
-                    f'{surf_sdt_zarr_path!r}')
+                    f'{self.surf_sdt_zarr_path!r}')
             if self.lasagna_volume is None:
                 raise RuntimeError(
                     "dense_spacing_mode='phase' requires the dense normal stores "
                     'for band incidence/fragment handling')
             self.sdt_volume = prepare_surf_sdt_volume(
-                surf_sdt_zarr_path,
-                surf_sdt_zarr_group,
-                z_begin=z_begin,
-                z_end=z_end,
-                cache_directory=cache_path,
-                storage_backend=lasagna_storage_backend,
+                self.surf_sdt_zarr_path,
+                self.surf_sdt_zarr_group,
+                z_begin=self.z_begin,
+                z_end=self.z_end,
+                cache_directory=self.cache_path,
+                storage_backend=self.lasagna_storage_backend,
                 progress=progress,
             )
             if interactive_driver is not None:
@@ -1564,7 +1590,7 @@ class FitContext:
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
-        all_zs = np.arange(z_begin, z_end)
+        all_zs = np.arange(self.z_begin, self.z_end)
         self.umbilicus_zyx = torch.from_numpy(
             np.concatenate([all_zs[:, None], self.umbilicus(all_zs)], axis=-1).astype(np.float32)).to(self.device)
         all_zs = torch.from_numpy(all_zs).to(self.device)
@@ -1582,28 +1608,28 @@ class FitContext:
         resume_path = self.resume_path
         self.start_iteration = int(self.resume_step)
         resume_checkpoint = None
-        self.model_z_begin, self.model_z_end = z_begin, z_end
+        self.model_z_begin, self.model_z_end = self.z_begin, self.z_end
         if resume_path:
             progress.begin(
                 'loading', 'Loading fit checkpoint',
                 detail=os.path.basename(resume_path))
             resume_checkpoint = load_checkpoint_cpu(resume_path)
             checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
-            if checkpoint_lasagna_scale != lasagna_scale:
+            if checkpoint_lasagna_scale != self.lasagna_scale:
                 raise RuntimeError(
                     f'checkpoint {resume_path} has lasagna_scale={checkpoint_lasagna_scale!r}; '
-                    f'this run uses lasagna_scale={lasagna_scale!r}'
+                    f'this run uses lasagna_scale={self.lasagna_scale!r}'
                 )
             if isinstance(resume_checkpoint, dict) and resume_checkpoint.get('schema_version', 1) >= 2:
-                if resume_checkpoint.get('lasagna_group') != normal_zarr_group:
+                if resume_checkpoint.get('lasagna_group') != self.normal_zarr_group:
                     raise RuntimeError(
                         f'checkpoint Lasagna group {resume_checkpoint.get("lasagna_group")!r} '
-                        f'does not match requested group {normal_zarr_group!r}'
+                        f'does not match requested group {self.normal_zarr_group!r}'
                     )
-                if resume_checkpoint.get('spiral_outward_sense') != spiral_outward_sense:
+                if resume_checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
                     raise RuntimeError(
                         f'checkpoint outward sense {resume_checkpoint.get("spiral_outward_sense")!r} '
-                        f'does not match requested sense {spiral_outward_sense!r}'
+                        f'does not match requested sense {self.spiral_outward_sense!r}'
                     )
                 # The SDT store is an independent input: the Lasagna group/scale
                 # checks above do not cover it. Reject an unexpected change in its
@@ -1648,11 +1674,11 @@ class FitContext:
                     raise RuntimeError(f'checkpoint model-shaping config mismatch: {incompatible}')
             if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
                 self.model_z_begin, self.model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
-                if (self.model_z_begin, self.model_z_end) != (z_begin, z_end):
+                if (self.model_z_begin, self.model_z_end) != (self.z_begin, self.z_end):
                     print(
-                        f'using checkpoint z-range [{self.model_z_begin}, {self.model_z_end}) for model parameter shapes (optimisation z-range is [{z_begin}, {z_end}))')
-                    assert z_begin >= self.model_z_begin and z_end <= self.model_z_end, (
-                        f'optimisation z-range [{z_begin}, {z_end}) extends beyond the checkpoint '
+                        f'using checkpoint z-range [{self.model_z_begin}, {self.model_z_end}) for model parameter shapes (optimisation z-range is [{self.z_begin}, {self.z_end}))')
+                    assert self.z_begin >= self.model_z_begin and self.z_end <= self.model_z_end, (
+                        f'optimisation z-range [{self.z_begin}, {self.z_end}) extends beyond the checkpoint '
                         f"model z-range [{self.model_z_begin}, {self.model_z_end}); the flow field has no "
                         'parameters outside its domain. Narrow z_begin/z_end to fit within the '
                         'checkpoint range, or train from scratch with the wider range.'
@@ -1680,7 +1706,7 @@ class FitContext:
             flow_min_corner_zyx=self.flow_min_corner_spiral_zyx,
             flow_max_corner_zyx=self.flow_max_corner_spiral_zyx,
             config=self.config,
-            spiral_outward_sense=spiral_outward_sense,
+            spiral_outward_sense=self.spiral_outward_sense,
         )
         self.spiral_and_transform.to(self.device)
 
@@ -1697,8 +1723,8 @@ class FitContext:
                 self.shell_map = ShellPolarMap(
                     self.shell_patch,
                     self.umbilicus,
-                    z_min=z_begin - self.config['model_flow_bounds_z_margin'],
-                    z_max=z_end + self.config['model_flow_bounds_z_margin'],
+                    z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                    z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                     num_theta_bins=self.config['shell_num_theta_bins'],
                     device=self.device,
                     config=self.config,
@@ -1940,13 +1966,6 @@ class FitContext:
     # ==========================================================================
 
     def _checkpoint_payload(self, completed_iterations):
-        def durable_config(value):
-            return {
-                key: item for key, item in dict(value).items()
-                if not key.startswith('interactive_influence_')
-                and key != 'loss_weight_anchor'
-            }
-
         return {
             'schema_version': 2,
             'completed_iterations': int(completed_iterations),
@@ -1957,8 +1976,8 @@ class FitContext:
             'requested_config': durable_config(
                 getattr(self.interactive_driver, 'requested_config', dict(self.config))),
             'resolved_config': durable_config(self.config),
-            'lasagna_scale': lasagna_scale,
-            'lasagna_group': normal_zarr_group,
+            'lasagna_scale': self.lasagna_scale,
+            'lasagna_group': self.normal_zarr_group,
             'surf_sdt_fingerprint': (
                 self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
             # The model z-range, not the run window: a resumed session may
@@ -1966,7 +1985,7 @@ class FitContext:
             # resume rebuilds parameter shapes from these values.
             'z_begin': self.model_z_begin,
             'z_end': self.model_z_end,
-            'spiral_outward_sense': spiral_outward_sense,
+            'spiral_outward_sense': self.spiral_outward_sense,
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
@@ -2018,16 +2037,16 @@ class FitContext:
 
     def _rebuild_unverified_patch_inputs(self, exclusion_radius):
         """Reload only the unverified-patch pool for a Run-boundary mask edit."""
-        if not unverified_patches_path:
+        if not self.unverified_patches_path:
             return {}, [], None, None
-        candidates = self._load_patches_from_dir(unverified_patches_path)
+        candidates = self._load_patches_from_dir(self.unverified_patches_path)
         for patch_id, patch in list(candidates.items()):
             cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
             if (cells_to_erode > 0
                     and not erode_patch_valid_region(patch, cells_to_erode)):
                 del candidates[patch_id]
                 continue
-            if not patch_intersects_z_roi(patch, z_begin, z_end):
+            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
                 del candidates[patch_id]
                 continue
             patch.release_derived_caches()
@@ -2049,24 +2068,24 @@ class FitContext:
 
     def _prepare_png_visualization_inputs(self):
         zs = np.linspace(
-            z_begin,
-            z_end - 1,
-            min(self.num_slices_for_visualisation, z_end - 1 - z_begin),
+            self.z_begin,
+            self.z_end - 1,
+            min(self.num_slices_for_visualisation, self.z_end - 1 - self.z_begin),
             dtype=np.int64,
         )
         if self.scroll_zarr is not None:
-            subvolume_shape = (z_end - z_begin, *self.scroll_zarr.shape[1:])
+            subvolume_shape = (self.z_end - self.z_begin, *self.scroll_zarr.shape[1:])
             print('loading slices for visualisation')
-            vis_zs = np.floor(zs / render_volume_scale).astype(np.int64)
+            vis_zs = np.floor(zs / self.render_volume_scale).astype(np.int64)
             scroll_slices = (
                 torch.from_numpy(self.scroll_zarr[vis_zs]).to(torch.float32)
                 / np.iinfo(self.scroll_zarr.dtype).max * 0.75 * 255
             ).to(torch.uint8)
         else:
             subvolume_shape = (
-                z_end - z_begin,
-                int(np.ceil(32693 / render_volume_scale)),
-                int(np.ceil(32693 / render_volume_scale)),
+                self.z_end - self.z_begin,
+                int(np.ceil(32693 / self.render_volume_scale)),
+                int(np.ceil(32693 / self.render_volume_scale)),
             )
             scroll_slices = torch.zeros([len(zs), *subvolume_shape[1:]])
 
@@ -2074,14 +2093,14 @@ class FitContext:
             self.verified_patches_list,
             zs,
             subvolume_shape[1:],
-            cache_path,
-            canvas_scale=render_volume_scale,
+            self.cache_path,
+            canvas_scale=self.render_volume_scale,
         )
         yx = torch.stack(torch.meshgrid(
             torch.arange(subvolume_shape[1], dtype=torch.float32),
             torch.arange(subvolume_shape[2], dtype=torch.float32),
             indexing='ij',
-        ), axis=-1).to(self.device) * render_volume_scale
+        ), axis=-1).to(self.device) * self.render_volume_scale
         return zs, yx, scroll_slices, prediction_slices, quad_labels
 
     def clear_interactive_influence(self):
@@ -2115,9 +2134,9 @@ class FitContext:
                 self.unattached_pcl_strips,
                 generation_path,
                 self.config,
-                z_begin,
-                z_end,
-                voxel_size_um,
+                self.z_begin,
+                self.z_end,
+                self.voxel_size_um,
                 get_or_build_unattached_pcl_flat,
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
@@ -2146,7 +2165,7 @@ class FitContext:
             recorder = LossMapRecorder(
                 manifest,
                 generation_path,
-                z0=z_begin - int(self.config['model_flow_bounds_z_margin']),
+                z0=self.z_begin - int(self.config['model_flow_bounds_z_margin']),
                 grid_spacing=int(self.config['output_step_size']),
                 dr_per_winding=dr,
                 weights=diagnostic_weights,
@@ -2177,24 +2196,24 @@ class FitContext:
                     get_symmetric_dirichlet_loss(
                         transform, dr, self.shell_outer_winding_idx,
                         self.config['sample_count_regularisation_points'],
-                        cfg=self.config, z_begin=z_begin, z_end=z_end)
+                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
                     get_patch_rel_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'],
-                        cfg=self.config, z_begin=z_begin, z_end=z_end)
+                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                     get_patch_abs_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls,
-                        cfg=self.config, z_begin=z_begin, z_end=z_end)
+                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.lasagna_volume is not None:
                     for _loss_name, _loss_value in iter_lasagna_losses(
                             transform, dr, self.lasagna_volume,
                             self.shell_outer_winding_idx,
                             self.config['sample_count_dense_normal_points'],
                             compute_spacing=self.grad_mag_spacing_enabled,
-                            cfg=self.config, z_begin=z_begin, z_end=z_end):
+                            cfg=self.config, z_begin=self.z_begin, z_end=self.z_end):
                         pass
                 if self._phase_mode_active():
                     preview_generator = torch.Generator(device=dr.device)
@@ -2202,7 +2221,7 @@ class FitContext:
                     for _loss_name, _loss_value, _metrics in iter_phase_bundle_losses(
                             self.spiral_and_transform, transform, dr, self.sdt_volume,
                             self.lasagna_volume, self.shell_outer_winding_idx, self.config,
-                            z_begin, z_end, generator=preview_generator):
+                            self.z_begin, self.z_end, generator=preview_generator):
                         pass
                 if self.unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
@@ -2228,7 +2247,7 @@ class FitContext:
                     with torch.no_grad():
                         pair_rows = aggregate_pair_counts(
                             transform, dr, self.sdt_volume,
-                            self.shell_outer_winding_idx, self.config, z_begin, z_end)
+                            self.shell_outer_winding_idx, self.config, self.z_begin, self.z_end)
                     pair_table_name = 'dense_spacing_pair_counts.json'
                     with open(os.path.join(generation_path, pair_table_name),
                               'w', encoding='utf-8') as stream:
@@ -2297,10 +2316,10 @@ class FitContext:
                     cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
-                    if not patch_intersects_z_roi(patch, z_begin, z_end):
+                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
                         raise RuntimeError(
                             f'Patch {input_id!r} does not intersect the fitted z range '
-                            f'[{z_begin}, {z_end})')
+                            f'[{self.z_begin}, {self.z_end})')
                     patch.release_derived_caches()
                     new_patches[input_id] = patch
                 elif kind == 'fiber':
@@ -2399,7 +2418,7 @@ class FitContext:
                     run_start = 0
                     for i, (_, point) in enumerate(sorted_items):
                         z = point['zyx'][0]
-                        if z_begin - z_margin <= z < z_end + z_margin:
+                        if self.z_begin - z_margin <= z < self.z_end + z_margin:
                             if i + 1 - run_start > best_end - best_start:
                                 best_start, best_end = run_start, i + 1
                         else:
@@ -2472,8 +2491,8 @@ class FitContext:
                     spiral_and_transform=self.spiral_and_transform,
                     optimiser=self.optimiser,
                     cfg=run_cfg,
-                    z_begin=z_begin,
-                    z_end=z_end,
+                    z_begin=self.z_begin,
+                    z_end=self.z_end,
                     anchor_geometry_zyx=self.influence_anchor_geometry,
                 )
                 self.interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
@@ -2505,8 +2524,6 @@ class FitContext:
         current_iteration is the session's durable completed-iteration count;
         an LR-schedule change is realigned at that step.
         """
-        global shell_path  # module-global mutation kept as-is (PR 2 revisits)
-
         path_changes = dict(path_changes or {})
         changed = set(config)
         old_values = {key: self.config[key] for key in config}
@@ -2530,7 +2547,7 @@ class FitContext:
             rebuilt_shell_outer = self.shell_outer_winding_idx
             rebuilt_shell_valid = self.shell_valid_zyxs_gpu
             requested_shell_path = str(
-                path_changes.get('outer_shell', shell_path) or '')
+                path_changes.get('outer_shell', self.shell_path) or '')
 
             if shell_changed:
                 if not requested_shell_path:
@@ -2540,8 +2557,8 @@ class FitContext:
                 rebuilt_shell_envelope = (
                     ShellPolarMap(
                         rebuilt_shell_patch, self.umbilicus,
-                        z_min=z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=z_end + self.config['model_flow_bounds_z_margin'],
+                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                         num_theta_bins=self.config['shell_num_theta_bins'],
                         device='cpu', config=self.config)
                     if self.filter_tracks_by_shell else None
@@ -2568,8 +2585,8 @@ class FitContext:
                 rebuilt_shell_map = (
                     ShellPolarMap(
                         rebuilt_shell_patch, self.umbilicus,
-                        z_min=z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=z_end + self.config['model_flow_bounds_z_margin'],
+                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                         num_theta_bins=self.config['shell_num_theta_bins'],
                         device=self.device, config=self.config)
                     if self.config['loss_weight_shell_outer'] > 0 else None
@@ -2662,7 +2679,7 @@ class FitContext:
             raise
 
         if shell_changed:
-            shell_path = requested_shell_path
+            self.shell_path = requested_shell_path
             self.shell_patch = rebuilt_shell_patch
             self.shell_map = rebuilt_shell_map
             self.shell_envelope = rebuilt_shell_envelope
@@ -2839,7 +2856,7 @@ class FitContext:
                     self.dr_per_winding,
                     self.shell_outer_winding_idx,
                     self.config['sample_count_regularisation_points'],
-                    cfg=self.config, z_begin=z_begin, z_end=z_end,
+                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_sym_dirichlet'],
             })
 
@@ -2852,7 +2869,7 @@ class FitContext:
                     self.patch_atlas,
                     self.cross_patch_pcls,
                     self.pcl_sampling_strata['cross_patch'],
-                    cfg=self.config, z_begin=z_begin, z_end=z_end,
+                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_rel_winding'],
             })
 
@@ -2864,7 +2881,7 @@ class FitContext:
                     self.verified_patches,
                     self.patch_atlas,
                     self.cross_patch_pcls,
-                    cfg=self.config, z_begin=z_begin, z_end=z_end,
+                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_abs_winding'],
             })
 
@@ -2879,7 +2896,7 @@ class FitContext:
                 self.shell_outer_winding_idx,
                 self.config['sample_count_dense_normal_points'],
                 compute_spacing=self.grad_mag_spacing_enabled,
-                cfg=self.config, z_begin=z_begin, z_end=z_end,
+                cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
             ):
                 weight = (
                     self.config['loss_weight_dense_normals']
@@ -2927,8 +2944,8 @@ class FitContext:
                         self.lasagna_volume,
                         self.shell_outer_winding_idx,
                         self.config,
-                        z_begin,
-                        z_end,
+                        self.z_begin,
+                        self.z_end,
                         attachment_ramp=attachment_ramp,
                     ):
                 weighted = (
@@ -3009,7 +3026,7 @@ class FitContext:
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
                 self.shell_outer_winding_idx,
-                cfg=self.config, z_begin=z_begin, z_end=z_end,
+                cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
             )
             backward_family({
                 'shell_outer': shell_outer_loss * self.config['loss_weight_shell_outer'],
@@ -3092,7 +3109,7 @@ class FitContext:
         build_device_state().
         """
         out_base_dir = self.out_base_dir
-        self.out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{self.num_verified_patches}-patch'
+        self.out_path = f'{out_base_dir}/{datetime.date.today()}_{self.scroll_name}_slice-{self.z_begin}-{self.z_end}_{self.num_verified_patches}-patch'
         if self.run_name is not None and not self.run_name.startswith('dummy-'):
             self.out_path += '_' + self.run_name
         if self.run_tag:
@@ -3212,8 +3229,8 @@ class FitContext:
                 unverified_patches_dict=self.unverified_patches,
                 out_path=self.out_path,
                 cfg=self.config,
-                z_begin=z_begin,
-                z_end=z_end,
+                z_begin=self.z_begin,
+                z_end=self.z_end,
                 flow_field_radius=self.flow_field_radius,
                 flow_min_corner_spiral_zyx=self.flow_min_corner_spiral_zyx,
                 flow_max_corner_spiral_zyx=self.flow_max_corner_spiral_zyx,
@@ -3223,8 +3240,8 @@ class FitContext:
                 prediction_slices_for_visualisation=prediction_slices_for_visualisation,
                 quad_label_map=quad_label_map,
                 z_to_umbilicus_yx=self.umbilicus,
-                render_volume_scale=render_volume_scale,
-                voxel_size_um=voxel_size_um,
+                render_volume_scale=self.render_volume_scale,
+                voxel_size_um=self.voxel_size_um,
                 get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
                 run_tag=self.run_tag,
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
@@ -3247,25 +3264,52 @@ class FitContext:
             self._scalar_stores.pop().close()
 
 
-def main(config, *, progress=None, resume_path=None, resume_step=0,
-         out_base_dir=None, run_tag=None, run_name=None):
+def main(config, *, scroll, paths, progress=None, resume_path=None,
+         resume_step=0, out_base_dir=None, run_tag=None, run_name=None,
+         cache_dir=None, storage_backend='sparse_cuda',
+         render_volume_scale=16):
     """Run one headless fit over a fresh context (library entry point).
 
-    config is the resolved FitConfig; the remaining keywords mirror the
-    FitContext constructor's explicit fit controls.
+    config is the resolved FitConfig; scroll/paths are the ScrollSpec and
+    resolved SpiralInputPaths; the remaining keywords mirror the FitContext
+    constructor's explicit fit controls.
     """
     return FitContext(
         config,
+        scroll=scroll,
+        paths=paths,
         progress=progress,
         resume_path=resume_path,
         resume_step=resume_step,
         out_base_dir=out_base_dir,
         run_tag=run_tag,
         run_name=run_name,
+        cache_dir=cache_dir,
+        storage_backend=storage_backend,
+        render_volume_scale=render_volume_scale,
     ).run()
 
 
 if __name__ == '__main__':
+    import argparse
+
+    from fit_session import conventional_input_paths, load_scroll_spec
+
+    parser = argparse.ArgumentParser(
+        description='Headless Spiral fit over one dataset root.')
+    parser.add_argument(
+        '--dataset', required=True,
+        help='Dataset root holding the conventional Spiral layout and the '
+             'spiral-scroll.json scroll specification')
+    parser.add_argument(
+        '--scroll-spec', default=None,
+        help='Explicit scroll specification file '
+             '(default: <dataset>/spiral-scroll.json)')
+    cli_args = parser.parse_args()
+
+    scroll_spec = load_scroll_spec(cli_args.dataset, cli_args.scroll_spec)
+    input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)
+
     cli_progress = ProgressReporter(stream=sys.stderr) if is_main_process() else None
     maybe_init_distributed()
     try:
@@ -3288,11 +3332,12 @@ if __name__ == '__main__':
             'sample_count_shell_samples',
         )
         z_range_scale, z_range_num_slices, split_divisor = scale_and_split_counts(
-            config, z_begin, z_end, z_range_scaled_count_keys)
+            config, config['z_begin'], config['z_end'],
+            z_range_scaled_count_keys)
         if is_main_process():
             print(
                 f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
-                f'z-range [{z_begin}, {z_end}) '
+                f'z-range [{config["z_begin"]}, {config["z_end"]}) '
                 f'(reference {REFERENCE_Z_RANGE_NUM_SLICES} slices):\n  '
                 + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
             )
@@ -3311,12 +3356,17 @@ if __name__ == '__main__':
         # FitContext itself no longer reads them.
         main(
             FitConfig(config),
+            scroll=scroll_spec,
+            paths=input_paths,
             progress=cli_progress,
             resume_path=os.environ.get('FIT_SPIRAL_RESUME_PATH'),
             resume_step=int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0')),
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),
             run_name=wandb.run.name if wandb.run is not None else None,
+            cache_dir=os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache'),
+            render_volume_scale=int(
+                os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '16')),
         )
     finally:
         if cli_progress is not None:
