@@ -49,11 +49,11 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
-The Actions popup, presented as a hamburger menu button, owns Auto-reoptimize,
-Reinit reoptimization, Show as mesh, the Lasagna/Fiber dataset submenus, and
-Reset views. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
-base-voxel extrapolation-distance control. Tag pills are edited directly from
-the same toolbar.
+The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
+Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
+the initial centerline length and the base-voxel extrapolation distance, and
+Reset views. The toolbar retains the fiber-global Lasagna/Fiber model
+selector. Tag pills are edited directly from the same toolbar.
 
 Switching the fiber-global mode asks for confirmation before it re-optimizes,
 because the switch overwrites the current line: to Fiber model it re-traces

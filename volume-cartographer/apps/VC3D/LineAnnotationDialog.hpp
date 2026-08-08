@@ -282,6 +282,11 @@ private:
                                                 const char* renderReason);
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
+    // "B": zero every accumulated normal offset — the side cut plane's and
+    // both strips' surface offsets. The current cut cannot accumulate one
+    // (Shift-scroll steps along the line there) but is reset with the side
+    // cut for symmetry.
+    void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
     cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
@@ -371,6 +376,10 @@ private:
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _extrapolationDistanceSpin = nullptr;
+    // Values committed via the menu rows' Apply buttons; the spinboxes hold
+    // uncommitted edits until then (and revert when the menu reopens).
+    int _appliedInitialCenterlineLengthVx = 0;
+    int _appliedExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
