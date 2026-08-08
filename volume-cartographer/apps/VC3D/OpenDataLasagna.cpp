@@ -494,9 +494,16 @@ std::filesystem::path prepareOpenDataLasagna(
             marker["source_to_base"] = *info.sourceToBase;
         if (info.baseShapeZYX)
             marker["base_shape_zyx"] = *info.baseShapeZYX;
-        validatePrepared(info, cached.path);
+        // The marker must exist before validation: LasagnaDataset::open reads
+        // it (loadRemoteMarker) to resolve the manifest's relative zarr keys
+        // against the remote artifact instead of this cache directory, which
+        // holds only the manifest. Validating first therefore always failed
+        // and the marker was never written. If validation fails now, the
+        // marker still correctly describes the staged artifact and the
+        // warm-cache path re-validates on every open.
         detail::writeStringAtomic(
             finalDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
+        validatePrepared(info, cached.path);
         return cached.path;
     } catch (const std::exception& e) {
         if (errorOut) *errorOut = e.what();
