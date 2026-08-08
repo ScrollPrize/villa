@@ -1,0 +1,21 @@
+{
+
+"datasets": [
+      {
+          "volume_path": "/mnt/bigpc/intersection_addtl_train_data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+          "volume_scale": 2,
+          "segments_path": "/mnt/bigpc/intersection_addtl_train_data/PHerc0139/segments"
+      },
+      {
+          "volume_path": "/mnt/bigpc/intersection_addtl_train_data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+          "volume_scale": 2,
+          "segments_path": "/mnt/bigpc/intersection_addtl_train_data/PHerc1667/segments"
+      },
+      {
+          "volume_path": "/mnt/bigpc/intersection_addtl_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
+          "volume_scale": 0,
+          "segments_path": "/mnt/bigpc/intersection_addtl_train_data/PHercParis4/segments"
+      }
+    ]
+
+ }
