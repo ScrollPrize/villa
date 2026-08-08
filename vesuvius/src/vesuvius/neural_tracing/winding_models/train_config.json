@@ -1,0 +1,68 @@
+{
+  "out_dir": "runs/winding_model",
+  "seed": 42,
+  "num_iterations": 100000,
+  "batch_size": 16,
+  "num_workers": 8,
+  "val_num_workers": 2,
+  "val_batches_per_log": 8,
+  "log_frequency": 500,
+  "ckpt_frequency": 5000,
+  "mixed_precision": "bf16",
+  "grad_acc_steps": 1,
+  "grad_clip": 0.0,
+  "optimizer": "adamw",
+  "learning_rate": 3e-4,
+  "weight_decay": 0.01,
+  "scheduler": "diffusers_cosine_warmup",
+  "scheduler_kwargs": {},
+
+  "lambda_phase": 1.0,
+  "lambda_crossing": 1.0,
+  "phase_huber_delta": 0.25,
+  "crossing_sigma_wv": 1.0,
+  "crossing_peak_threshold": 0.3,
+  "crossing_match_tolerance_wv": 2.0,
+
+  "model": {
+    "encoder_channels": [32, 64, 96, 128],
+    "transformer_dim": 192,
+    "transformer_layers": 4,
+    "transformer_heads": 6,
+    "max_relative_distance": 128,
+    "monotone_phase": true
+  },
+
+  "num_samples": 500000,
+  "ray_length": 384,
+  "plane_height": 256,
+  "plane_spacing": 1.0,
+  "num_planes": 2,
+  "plane_sampling": "trilinear",
+  "plane_tile_size": 16,
+  "volume_io_threads": 32,
+  "datasets": [
+    {
+      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "volume_id": "20260102150214",
+      "volume_scale": 2,
+      "segment_volume_id": "20260102150214",
+      "segment_downscale": 4,
+      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc0139/segments"
+    },
+    {
+      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+      "volume_id": "20251217075048",
+      "volume_scale": 2,
+      "segment_volume_id": "20251217075048",
+      "segment_downscale": 1,
+      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc1667/segments"
+    },
+    {
+      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
+      "volume_scale": 0,
+      "segment_downscale": 1,
+      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHercParis4/segments"
+    }
+  ]
+}
