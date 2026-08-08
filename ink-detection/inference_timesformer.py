@@ -256,7 +256,8 @@ def predict_fn(test_loader, model, device, test_xyxys, pred_shape):
             mask_pred[y1:y2, x1:x2] += y_preds_multiplied_cpu[i]
             mask_count[y1:y2, x1:x2] += kernel
 
-    mask_pred /= np.clip(mask_count, a_min=1, a_max=None)
+    mask_pred = np.divide(mask_pred, mask_count,
+                          out=np.zeros_like(mask_pred), where=mask_count > 0)
     return mask_pred
 import gc
 
