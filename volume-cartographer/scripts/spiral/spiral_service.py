@@ -47,7 +47,8 @@ from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
 
-from fit_session import (API_VERSION, PclRole, ScrollSpecError,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS,
+                         ScrollSpecError, fit_input, input_change_impact,
                          load_scroll_spec, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
@@ -84,13 +85,10 @@ _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+# Role -> conventional filename for ephemeral PCL uploads, from the
+# declarative fit-input catalog.
 _PCL_ROLE_FILES = {
-    PclRole.ABSOLUTE.value: "abs_winding.json",
-    PclRole.PATCH_OVERLAP.value: "patch-overlap-pcls.json",
-    PclRole.RELATIVE.value: "relative_windings.json",
-    PclRole.SAME_WINDING.value: "same_windings.json",
-    PclRole.DRAWN_CONTROL_POINTS.value: "drawn_control_points.json",
-}
+    role.value: filename for role, filename, _ in PCL_ROLE_CONVENTIONS}
 
 # Base input paths are owned by the service when it was launched with
 # --dataset; a load request may then only choose among service-advertised
@@ -1297,9 +1295,9 @@ class ServiceState:
                 [{"field": key, "message": "Base input paths are owned by the service"}
                  for key in offending])
         paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
-        for key in ("umbilicus", "fibers", "verified_patches", "unverified_patches",
-                    "outer_shell", "normal_x", "normal_y", "gradient_magnitude",
-                    "surf_sdt", "tracks_dbm", "output_directory", "cache_directory"):
+        for key in (*(spec.key for spec in FIT_INPUT_CATALOG
+                      if spec.kind != "pcl-set"),
+                    "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
         paths["pcls"] = resolution["pcl_inputs"]
 
@@ -1645,32 +1643,32 @@ class ServiceState:
             for key in set(current_manifest) | set(input_manifest)
             if input_manifest.get(key) != current_manifest.get(key)
         }
-        path_specs = self.config_catalog["schema"].get("paths", {})
         input_changes = []
         for key, value in sorted(path_changes.items()):
-            spec = path_specs.get(key)
-            impact = (
-                spec["runtime_impact"] if spec is not None
-                else "prepared_input_rebuild")
+            impact, path_dependencies = input_change_impact(key)
             impacts.add(impact)
-            dependencies.extend(
-                spec.get("dependencies", []) if spec is not None else [
-                    "dense_stores", "patch_pcl", "tracks", "shell",
-                    "preview_output",
-                ])
+            dependencies.extend(path_dependencies)
             input_changes.append({
                 "key": key,
                 "before": current_manifest.get(key),
                 "after": value,
                 "runtime_impact": impact,
             })
-        if "outer_shell" in path_changes:
-            outer_shell = str(path_changes["outer_shell"] or "").strip()
-            if not outer_shell or not Path(outer_shell).is_dir():
+        # Path changes a resident session takes live (without a session
+        # reload) are validated eagerly against their catalog kind; changes
+        # that force a reload are validated when the session reloads.
+        for key in sorted(path_changes):
+            spec = fit_input(key)
+            if spec is None or spec.runtime_impact == "prepared_input_rebuild":
+                continue
+            value = str(path_changes[key] or "").strip()
+            if spec.kind in ("directory", "zarr-group") and (
+                    not value or not Path(value).is_dir()):
+                label = spec.key.replace("_", " ").capitalize()
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "Outer shell path is not a readable directory",
-                    [{"field": "outer_shell",
+                    f"{label} path is not a readable directory",
+                    [{"field": spec.key,
                       "message": "Path is not a directory"}])
         dependencies = sorted(set(dependencies))
         token = secrets.token_urlsafe(24)

@@ -429,15 +429,16 @@ class Config:
             path.stem: cls(path).as_dict()
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
+        # The advertised path entries derive from the declarative fit-input
+        # catalog (imported lazily: fit_session imports Config). Only inputs
+        # a resident session can take live appear; every other path change
+        # implies the prepared-input-rebuild default.
+        from fit_session import input_path_schema
+
         return {
             "defaults": defaults,
             "schema": {
-                "paths": {
-                    "outer_shell": {
-                        "runtime_impact": "shell_reload",
-                        "dependencies": ["shell"],
-                    },
-                },
+                "paths": input_path_schema(),
                 "fields": fields,
             },
             "presets": presets,

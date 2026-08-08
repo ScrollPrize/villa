@@ -13,7 +13,7 @@ import glob
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
 from config import Config
@@ -38,6 +38,178 @@ class PclRole(str, Enum):
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
     DRAWN_CONTROL_POINTS = "drawn_control_points"
+
+
+# ---------------------------------------------------------------------------
+# Declarative fit-input catalog
+# ---------------------------------------------------------------------------
+#
+# One description of every fit input, consumed by request validation
+# (validate_session_request), dataset resolution (resolve_dataset_root /
+# conventional_input_paths), run planning (spiral_service.plan_run), and the
+# resident fitter's impact analysis (FitContext.apply_config). Each entry
+# records the input's path kind, its enabling/required predicates over the
+# run configuration, what must be rebuilt when the path changes, and whether
+# a change breaks checkpoint compatibility.
+
+# A path change whose input has no specific rebuild scope invalidates every
+# prepared-input family: the session must be reloaded with fresh host inputs.
+FULL_REBUILD_DEPENDENCIES = (
+    "dense_stores", "patch_pcl", "tracks", "shell", "preview_output")
+
+
+def _always(config: Mapping[str, Any]) -> bool:
+    return True
+
+
+def _never(config: Mapping[str, Any]) -> bool:
+    return False
+
+
+def _patches_enabled(config: Mapping[str, Any]) -> bool:
+    return not bool(config.get("input_disable_patches", False))
+
+
+def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
+    return (
+        float(config.get("loss_weight_shell_outer", 1.0)) > 0
+        or float(config.get("loss_weight_shell_patch_radius", 0)) > 0
+    )
+
+
+def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
+    # An invalid mode is reported as its own validation error; the
+    # mode-derived asset predicates then all read as disabled so the invalid
+    # mode never masquerades as missing-file errors.
+    mode = str(config.get("dense_spacing_mode", "phase"))
+    return mode if mode in ("phase", "grad_mag") else None
+
+
+def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
+    return _dense_spacing_mode(config) == "phase"
+
+
+def _normals_required(config: Mapping[str, Any]) -> bool:
+    # The phase bundle requires both normal channels (band incidence
+    # handling) even when individual sub-weights are zero, so run-mutable
+    # weights can be raised at run boundaries.
+    return (float(config.get("loss_weight_dense_normals", 100.0)) > 0
+            or _phase_bundle_enabled(config))
+
+
+def _grad_mag_required(config: Mapping[str, Any]) -> bool:
+    return (_dense_spacing_mode(config) == "grad_mag"
+            and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
+
+
+@dataclass(frozen=True)
+class FitInputSpec:
+    """Declarative description of one fit input."""
+
+    # SpiralInputPaths field name (and manifest/path-change key).
+    key: str
+    # "file" | "directory" | "zarr-group" | "dbm" | "pcl-set".
+    kind: str
+    # File contents must parse as JSON.
+    json_content: bool = False
+    # Conventional dataset-relative location ("" = none: the input is only
+    # reached through an explicit path or a scroll-spec override).
+    conventional_relative: str = ""
+    # A missing conventional path is missing_required at dataset resolution.
+    resolve_required: bool = False
+    # enabled(config): the input participates at all; inactive inputs are
+    # not validated even when a path is set.
+    enabled: Callable[[Mapping[str, Any]], bool] = _always
+    # required(config): the input must exist for this configuration.
+    required: Callable[[Mapping[str, Any]], bool] = _never
+    # What a path change invalidates on a resident session:
+    # "prepared_input_rebuild" reloads host inputs (session reload);
+    # "shell_reload" rebuilds device shell state at a run boundary.
+    runtime_impact: str = "prepared_input_rebuild"
+    dependencies: tuple[str, ...] = FULL_REBUILD_DEPENDENCIES
+    # Whether changing the input breaks checkpoint compatibility. No fit
+    # input does today: the checkpoint domain is set by "new_fit" config
+    # keys (z-range, model shape, optimizer seed), never by an input path.
+    checkpoint_domain: bool = False
+
+
+# Entries are ordered as validate_session_request reports them.
+FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
+    FitInputSpec("umbilicus", "file", json_content=True,
+                 conventional_relative="umbilicus.json",
+                 resolve_required=True, required=_always),
+    FitInputSpec("verified_patches", "directory",
+                 conventional_relative="verified_patches",
+                 resolve_required=True, required=_patches_enabled),
+    FitInputSpec("unverified_patches", "directory",
+                 enabled=_patches_enabled),
+    FitInputSpec("fibers", "directory", conventional_relative="fibers"),
+    FitInputSpec("outer_shell", "directory",
+                 conventional_relative="outer_shell",
+                 required=_shell_losses_enabled,
+                 runtime_impact="shell_reload", dependencies=("shell",)),
+    FitInputSpec("tracks_dbm", "dbm",
+                 conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm"),
+    FitInputSpec("pcls", "pcl-set", json_content=True),
+    FitInputSpec("normal_x", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
+                 required=_normals_required),
+    FitInputSpec("normal_y", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_ny.ome.zarr",
+                 required=_normals_required),
+    FitInputSpec("gradient_magnitude", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_grad_mag.ome.zarr",
+                 required=_grad_mag_required),
+    FitInputSpec("surf_sdt", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
+                 required=_phase_bundle_enabled),
+)
+
+_FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
+
+
+def fit_input(key: str) -> FitInputSpec | None:
+    return _FIT_INPUTS_BY_KEY.get(key)
+
+
+def input_change_impact(key: str) -> tuple[str, list[str]]:
+    """Rebuild scope of changing one input path on a resident session.
+
+    Unknown keys get the conservative full-rebuild scope, exactly as run
+    planning has always treated paths it had no specific knowledge of.
+    """
+    spec = _FIT_INPUTS_BY_KEY.get(key)
+    if spec is None:
+        return "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES)
+    return spec.runtime_impact, list(spec.dependencies)
+
+
+def input_path_schema() -> dict[str, dict[str, Any]]:
+    """Path entries advertised in the configuration catalog schema.
+
+    Only inputs a resident session can take live (without a session reload)
+    are advertised; everything else uses the implicit
+    prepared-input-rebuild default.
+    """
+    return {
+        spec.key: {"runtime_impact": spec.runtime_impact,
+                   "dependencies": list(spec.dependencies)}
+        for spec in FIT_INPUT_CATALOG
+        if spec.runtime_impact != "prepared_input_rebuild"
+    }
+
+
+# PCL point-collection inputs: (role, conventional filename, discovered).
+# "discovered" = resolve_dataset_root probes for the file; patch-overlap
+# collections are conventional for the headless CLI but are not advertised
+# by dataset resolution (matching the historical maps).
+PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str, bool], ...] = (
+    (PclRole.ABSOLUTE, "abs_winding.json", True),
+    (PclRole.PATCH_OVERLAP, "patch-overlap-pcls.json", False),
+    (PclRole.RELATIVE, "relative_windings.json", True),
+    (PclRole.SAME_WINDING, "same_windings.json", True),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", True),
+)
 
 
 @dataclass(frozen=True)
@@ -180,12 +352,10 @@ SCROLL_SPEC_SCHEMA_VERSION = 1
 
 # Input keys whose paths may depart from the directory conventions. Values in
 # the spec file are resolved relative to the dataset root; conventional paths
-# need no entry at all.
-SCROLL_SPEC_PATH_OVERRIDE_KEYS = (
-    "umbilicus", "fibers", "verified_patches", "unverified_patches",
-    "outer_shell", "tracks_dbm", "normal_x", "normal_y",
-    "gradient_magnitude", "surf_sdt",
-)
+# need no entry at all. PCL collections are per-role request entries, not
+# single overridable paths.
+SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(
+    spec.key for spec in FIT_INPUT_CATALOG if spec.kind != "pcl-set")
 
 _SCROLL_SPEC_TOP_LEVEL_KEYS = (
     "schema_version", "name", "voxel_size_um", "spiral_outward_sense",
@@ -197,24 +367,13 @@ _SCROLL_SPEC_TOP_LEVEL_KEYS = (
 # fit_spiral module-global defaults. resolve_dataset_root() shares the same
 # relative paths for the entries it discovers.
 _CONVENTIONAL_INPUT_RELATIVES = {
-    "umbilicus": "umbilicus.json",
-    "fibers": "fibers",
-    "verified_patches": "verified_patches",
-    "outer_shell": "outer_shell",
-    "tracks_dbm": "tracks/2um_ds2_ps256_surf_v2.dbm",
-    "normal_x": "lasagna_inputs/las_008_nx.ome.zarr",
-    "normal_y": "lasagna_inputs/las_008_ny.ome.zarr",
-    "gradient_magnitude": "lasagna_inputs/las_008_grad_mag.ome.zarr",
-    "surf_sdt": "lasagna_inputs/las_008_surf_sdt.ome.zarr",
+    spec.key: spec.conventional_relative
+    for spec in FIT_INPUT_CATALOG
+    if spec.conventional_relative and spec.kind != "pcl-set"
 }
 
-_CONVENTIONAL_PCL_INPUTS = (
-    ("abs_winding.json", PclRole.ABSOLUTE),
-    ("patch-overlap-pcls.json", PclRole.PATCH_OVERLAP),
-    ("relative_windings.json", PclRole.RELATIVE),
-    ("same_windings.json", PclRole.SAME_WINDING),
-    ("drawn_control_points.json", PclRole.DRAWN_CONTROL_POINTS),
-)
+_CONVENTIONAL_PCL_INPUTS = tuple(
+    (filename, role) for role, filename, _ in PCL_ROLE_CONVENTIONS)
 
 
 class ScrollSpecError(ValueError):
@@ -406,25 +565,6 @@ def conventional_input_paths(
     )
 
 
-_CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
-    ("umbilicus", "umbilicus.json", "file", True),
-    ("fibers", "fibers", "directory", False),
-    ("verified_patches", "verified_patches", "directory", True),
-    ("outer_shell", "outer_shell", "directory", False),
-    ("normal_x", "lasagna_inputs/las_008_nx.ome.zarr", "directory", False),
-    ("normal_y", "lasagna_inputs/las_008_ny.ome.zarr", "directory", False),
-    ("gradient_magnitude", "lasagna_inputs/las_008_grad_mag.ome.zarr", "directory", False),
-    ("surf_sdt", "lasagna_inputs/las_008_surf_sdt.ome.zarr", "directory", False),
-)
-
-_PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
-    (PclRole.ABSOLUTE, "abs_winding.json", False),
-    (PclRole.RELATIVE, "relative_windings.json", False),
-    (PclRole.SAME_WINDING, "same_windings.json", False),
-    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", False),
-)
-
-
 def _normalise_path(value: Any, base: Path | None = None) -> str:
     if value is None or str(value).strip() == "":
         return ""
@@ -502,27 +642,33 @@ def resolve_dataset_root(
     else:
         result.scroll_spec = spec.manifest()
 
-    for key, relative, kind, required in _CONVENTIONAL_ENTRIES:
-        override = spec.path_override(key) if spec is not None else ""
-        candidate = Path(override) if override else root / relative
-        found = candidate.is_file() if kind == "file" else candidate.is_dir()
+    for input_spec in FIT_INPUT_CATALOG:
+        # DBM inputs need backing-file probing (below) and PCL collections
+        # are per-role files; neither is a plain path probe.
+        if input_spec.kind in ("dbm", "pcl-set") or not input_spec.conventional_relative:
+            continue
+        override = spec.path_override(input_spec.key) if spec is not None else ""
+        candidate = Path(override) if override \
+            else root / input_spec.conventional_relative
+        found = candidate.is_file() if input_spec.kind == "file" \
+            else candidate.is_dir()
         if found and os.access(candidate, os.R_OK):
-            result.resolved[key] = _normalise_path(candidate)
-        elif required:
-            result.missing_required.append(key)
+            result.resolved[input_spec.key] = _normalise_path(candidate)
+        elif input_spec.resolve_required:
+            result.missing_required.append(input_spec.key)
         else:
-            result.missing_optional.append(key)
+            result.missing_optional.append(input_spec.key)
 
-    for role, relative, required in _PCL_ENTRIES:
+    for role, relative, discovered in PCL_ROLE_CONVENTIONS:
+        if not discovered:
+            continue
         candidate = root / relative
         if candidate.is_file() and os.access(candidate, os.R_OK):
             result.pcl_inputs.append({
                 "path": _normalise_path(candidate),
                 "role": role.value,
-                "required": required,
+                "required": False,
             })
-        elif required:
-            result.missing_required.append(f"pcl:{role.value}")
         else:
             result.missing_optional.append(f"pcl:{role.value}")
 
@@ -605,59 +751,48 @@ def validate_session_request(
         elif not os.access(path, os.R_OK):
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
-    require_file(paths.umbilicus, "umbilicus", json_file=True)
-    disable_patches = bool(run.config.get("input_disable_patches", False))
-    optional_dir(paths.verified_patches, "verified_patches",
-                 required=not disable_patches)
-    if not disable_patches:
-        optional_dir(paths.unverified_patches, "unverified_patches")
-    optional_dir(paths.fibers, "fibers")
+    def check_catalog_input(spec: FitInputSpec) -> None:
+        if not spec.enabled(run.config):
+            return
+        if spec.kind == "file":
+            require_file(getattr(paths, spec.key), spec.key,
+                         json_file=spec.json_content)
+        elif spec.kind in ("directory", "zarr-group"):
+            optional_dir(getattr(paths, spec.key), spec.key,
+                         required=spec.required(run.config))
+        elif spec.kind == "dbm":
+            value = getattr(paths, spec.key)
+            if value and not resolve_logical_dbm(value):
+                errors.append({"field": spec.key, "message": "DBM logical base or backing file was not found"})
+        elif spec.kind == "pcl-set":
+            for index, pcl in enumerate(paths.pcls):
+                expanded = _expand_pcl(pcl)
+                if pcl.required and not expanded:
+                    errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
+                for expanded_path in expanded:
+                    path = Path(expanded_path)
+                    if not path.is_file():
+                        errors.append({"field": f"pcls[{index}]", "message": f"PCL file does not exist: {path}"})
+                    else:
+                        _validate_json_file(path, f"pcls[{index}]", errors)
 
-    shell_enabled = (
-        float(run.config.get("loss_weight_shell_outer", 1.0)) > 0
-        or float(run.config.get("loss_weight_shell_patch_radius", 0)) > 0
-    )
-    optional_dir(paths.outer_shell, "outer_shell", required=shell_enabled)
+    # The Lasagna store requirements (see the catalog's predicates: the
+    # phase bundle needs SDT and both normal channels even at zero
+    # sub-weights; grad_mag never needs the SDT) are checked after the
+    # dense-spacing mode below, so an invalid mode errors as itself rather
+    # than as missing-file errors.
+    for spec in FIT_INPUT_CATALOG:
+        if spec.kind != "zarr-group":
+            check_catalog_input(spec)
 
-    if paths.tracks_dbm and not resolve_logical_dbm(paths.tracks_dbm):
-        errors.append({"field": "tracks_dbm", "message": "DBM logical base or backing file was not found"})
-
-    for index, spec in enumerate(paths.pcls):
-        expanded = _expand_pcl(spec)
-        if spec.required and not expanded:
-            errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
-        for expanded_path in expanded:
-            path = Path(expanded_path)
-            if not path.is_file():
-                errors.append({"field": f"pcls[{index}]", "message": f"PCL file does not exist: {path}"})
-            else:
-                _validate_json_file(path, f"pcls[{index}]", errors)
-
-    # The dense-spacing mode is checked before any asset-path requirements
-    # so an invalid mode errors as itself, not as a missing-file error.
     spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
     if spacing_mode not in ("phase", "grad_mag"):
         errors.append({"field": "dense_spacing_mode",
                        "message": "Must be phase or grad_mag"})
-        spacing_mode = None
 
-    use_normals = float(
-        run.config.get("loss_weight_dense_normals", 100.0)) > 0
-    spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
-    use_phase = spacing_mode == "phase"
-    use_grad_mag = spacing_mode == "grad_mag" and spacing_enabled
-    # The phase bundle requires its core inputs (SDT for phase, count, and
-    # attachment; both normal channels for band incidence handling) even when
-    # individual sub-weights are zero, so run-mutable weights can be raised
-    # at run boundaries. grad_mag never requires the SDT; normals are needed
-    # only for the independent dense-normal loss.
-    for value, label, required in (
-        (paths.normal_x, "normal_x", use_normals or use_phase),
-        (paths.normal_y, "normal_y", use_normals or use_phase),
-        (paths.gradient_magnitude, "gradient_magnitude", use_grad_mag),
-        (paths.surf_sdt, "surf_sdt", use_phase),
-    ):
-        optional_dir(value, label, required=required)
+    for spec in FIT_INPUT_CATALOG:
+        if spec.kind == "zarr-group":
+            check_catalog_input(spec)
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
@@ -681,7 +816,10 @@ def validate_session_request(
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
 
-    if (use_normals or use_phase or use_grad_mag) and not paths.cache_directory:
+    lasagna_inputs_enabled = any(
+        spec.required(run.config) for spec in FIT_INPUT_CATALOG
+        if spec.kind == "zarr-group")
+    if lasagna_inputs_enabled and not paths.cache_directory:
         errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():

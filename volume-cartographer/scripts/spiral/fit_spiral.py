@@ -35,6 +35,7 @@ from ddp_helpers import (
     maybe_init_distributed,
 )
 from config import Config, FitConfig, durable_config
+from fit_session import fit_input, input_change_impact
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
@@ -756,10 +757,9 @@ class FitContext:
         return int(self.config['z_end'])
 
     def shell_losses_enabled(self):
-        return (
-            self.config['loss_weight_shell_outer'] > 0
-            or self.config['loss_weight_shell_patch_radius'] > 0
-        )
+        # The outer-shell enabling predicate is fit-input catalog data,
+        # shared with request validation and run planning.
+        return fit_input('outer_shell').required(self.config)
 
     def _load_patches_from_dir(self, path, label='patches'):
         progress = progress_or_null(self.progress)
@@ -2529,12 +2529,17 @@ class FitContext:
         old_values = {key: self.config[key] for key in config}
         self.config.update(config)
         try:
+            # The fit-input catalog names which path changes rebuild device
+            # shell state (today: exactly the outer-shell input).
+            shell_path_key = next(
+                (key for key in path_changes
+                 if input_change_impact(key)[0] == 'shell_reload'), None)
             shell_changed = (
                 bool(changed & {
                     key for key in self.config.keys()
                     if str(key).startswith('shell_')
                 })
-                or 'outer_shell' in path_changes
+                or shell_path_key is not None
             )
             rebuilt_tracks = None
             replace_prepared_tracks = False
@@ -2547,7 +2552,7 @@ class FitContext:
             rebuilt_shell_outer = self.shell_outer_winding_idx
             rebuilt_shell_valid = self.shell_valid_zyxs_gpu
             requested_shell_path = str(
-                path_changes.get('outer_shell', self.shell_path) or '')
+                path_changes.get(shell_path_key, self.shell_path) or '')
 
             if shell_changed:
                 if not requested_shell_path:
