@@ -1491,33 +1491,45 @@ class ServiceState:
         return {**self.status(), "removed": input_id, "accepted": True}
 
     # ------------------------------------------------------------------
-    # Command deduplication
+    # Command-ID replay
     # ------------------------------------------------------------------
 
-    def deduplicated(self, command_id, operation):
+    def replay_command(self, operation_name, command_id, operation):
+        """Run a logical mutation at most once per (operation, command ID).
+
+        The replay cache is namespaced by operation: a client that reuses one
+        command ID for two different operations gets both operations, not the
+        first one's response twice. A concurrent duplicate waits for the
+        in-flight original and receives its response.
+        """
         if not isinstance(command_id, str) or not command_id.strip():
             raise ApiError(HTTPStatus.BAD_REQUEST, "A non-empty command_id is required")
+        key = (operation_name, command_id)
         with self.lock:
-            while command_id in self.inflight_commands:
+            while key in self.inflight_commands:
                 self.command_condition.wait()
-            if command_id in self.commands:
-                cached = self.commands[command_id]
-                self.commands.move_to_end(command_id)
+            if key in self.commands:
+                cached = self.commands[key]
+                self.commands.move_to_end(key)
                 return cached
-            self.inflight_commands.add(command_id)
+            self.inflight_commands.add(key)
         try:
             response = operation()
             with self.lock:
                 self.command_generation += 1
                 response["command_generation"] = self.command_generation
-                self.commands[command_id] = response
+                self.commands[key] = response
                 while len(self.commands) > MAX_DEDUPLICATED_COMMANDS:
                     self.commands.popitem(last=False)
             return response
         finally:
             with self.lock:
-                self.inflight_commands.discard(command_id)
+                self.inflight_commands.discard(key)
                 self.command_condition.notify_all()
+
+    def deduplicated(self, command_id, operation):
+        """Replay an unnamed command; kept for callers outside the routes."""
+        return self.replay_command("command", command_id, operation)
 
     def close(self):
         with self.lock:
@@ -1552,6 +1564,217 @@ class SpiralServer(ThreadingHTTPServer):
                 timer.daemon = True
                 timer.start()
         return {**self.state._base(), "restarting": True}
+
+
+class Idempotency:
+    """How a route survives being retried.
+
+    A single ``needs_dedup`` flag cannot describe this surface: the three
+    mutating families are safe for different reasons.
+
+    ``NONE``
+        Reads, and allocations whose result is a fresh identifier. Retrying
+        is either free (reads) or deliberately produces a new resource.
+    ``COMMAND_ID``
+        Logical mutations. The client stamps the request with a command ID
+        and a repeat of that (operation, command ID) replays the first
+        response instead of acting twice.
+    ``CONTENT``
+        Upload PUTs. There is no command ID: the declared offset (the whole
+        file), size and SHA-256 in the upload manifest decide the outcome, so
+        any number of retries converges on exactly the declared bytes.
+    ``UPLOAD_ID``
+        Finalize. Naturally idempotent per upload ID — the first call records
+        the published input on the upload and every later call returns it.
+    """
+
+    NONE = "none"
+    COMMAND_ID = "command_id"
+    CONTENT = "content"
+    UPLOAD_ID = "upload_id"
+
+
+class RouteContext:
+    """Everything a route handler is allowed to look at."""
+
+    __slots__ = ("handler", "state", "args", "query", "body")
+
+    def __init__(self, handler, state, args, query, body):
+        self.handler = handler
+        self.state = state
+        #: Captured path groups, in pattern order.
+        self.args = args
+        #: Parsed query string, as returned by ``parse_qs``.
+        self.query = query
+        #: Decoded JSON request body, or None for methods that do not read one.
+        self.body = body
+
+
+class Route:
+    """One method/path pair, its handler, and its retry semantics."""
+
+    __slots__ = ("method", "path", "pattern", "operation", "handler",
+                 "idempotency", "reads_body")
+
+    def __init__(self, method, path, operation, handler, idempotency,
+                 reads_body=False):
+        self.method = method
+        #: Literal path, or None when this route matches by pattern.
+        self.path = path if not hasattr(path, "fullmatch") else None
+        #: Compiled pattern, or None for a literal route.
+        self.pattern = path if hasattr(path, "fullmatch") else None
+        #: Stable operation name; also the command-ID replay namespace.
+        self.operation = operation
+        self.handler = handler
+        self.idempotency = idempotency
+        self.reads_body = reads_body
+
+
+def _route_logs(ctx):
+    values = ctx.query.get("after", ["0"])
+    try:
+        after = int(values[-1])
+    except (TypeError, ValueError):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The log cursor must be an integer")
+    if after < 0:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The log cursor must not be negative")
+    return ctx.state.logs.read_after(after)
+
+
+def _route_events(ctx):
+    try:
+        cursor = int(ctx.query.get("cursor", ["0"])[-1])
+        limit = int(ctx.query.get(
+            "limit", [str(MAX_EVENT_READ_ENTRIES)])[-1])
+    except (TypeError, ValueError):
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The event cursor and limit must be integers")
+    if cursor < 0 or limit < 1:
+        raise ApiError(HTTPStatus.BAD_REQUEST,
+                       "The event cursor must not be negative and "
+                       "the limit must be at least 1")
+    return ctx.state.events.read_after(cursor, limit)
+
+
+def _route_artifact_file(ctx):
+    if not is_safe_relative_name(ctx.args[1]):
+        raise ApiError(HTTPStatus.FORBIDDEN, "Unsafe artifact file name")
+    ctx.handler._send_artifact_file(ctx.args[0], ctx.args[1])
+    return None
+
+
+def _route_upload_file(ctx):
+    handler = ctx.handler
+    try:
+        length = int(handler.headers.get("Content-Length", "-1"))
+    except ValueError:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
+    if length < 0:
+        raise ApiError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
+    return ctx.state.receive_upload_file(
+        ctx.args[0], ctx.args[1], handler.rfile, length)
+
+
+def _route_export_full(_ctx):
+    raise ApiError(HTTPStatus.NOT_IMPLEMENTED,
+                   "Full diagnostic export is not implemented by the "
+                   "interactive service")
+
+
+_UPLOAD_ID = r"[0-9a-f]{32}"
+
+# The whole HTTP surface, declared once. Dispatch walks this table; there is
+# no hand-written if-ladder, so a route's method, path, handler and retry
+# semantics are visible in one place.
+ROUTES = (
+    Route("GET", "/health", "health",
+          lambda ctx: ctx.state.health(), Idempotency.NONE),
+    Route("GET", "/configuration", "configuration",
+          lambda ctx: ctx.state.configuration_catalog(), Idempotency.NONE),
+    Route("GET", "/session/status", "session_status",
+          lambda ctx: ctx.state.status(), Idempotency.NONE),
+    Route("GET", "/logs", "logs", _route_logs, Idempotency.NONE),
+    Route("GET", "/events", "events", _route_events, Idempotency.NONE),
+    Route("GET", "/dataset", "dataset",
+          lambda ctx: ctx.state.dataset(), Idempotency.NONE),
+    Route("GET", re.compile(r"/artifacts/([A-Za-z0-9._-]+)/manifest"),
+          "artifact_manifest",
+          lambda ctx: ctx.state.artifacts.manifest(ctx.args[0]),
+          Idempotency.NONE),
+    Route("GET", re.compile(r"/artifacts/([A-Za-z0-9._-]+)/files/(.+)"),
+          "artifact_file", _route_artifact_file, Idempotency.NONE),
+
+    Route("PUT", re.compile(rf"/session/inputs/({_UPLOAD_ID})/files/(.+)"),
+          "upload_file", _route_upload_file, Idempotency.CONTENT),
+
+    Route("DELETE", "/session", "session_delete",
+          lambda ctx: ctx.state.delete(), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("DELETE", "/session/ephemeral-inputs", "ephemeral_input_remove",
+          lambda ctx: ctx.state.remove_input(ctx.body), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("DELETE", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
+          "upload_delete", lambda ctx: ctx.state.delete_upload(ctx.args[0]),
+          Idempotency.NONE),
+
+    Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
+          "upload_finalize",
+          lambda ctx: ctx.state.finalize_upload(ctx.args[0]),
+          Idempotency.UPLOAD_ID, reads_body=True),
+    Route("POST", "/service/restart", "service_restart",
+          lambda ctx: ctx.handler.server.request_restart(),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/inputs", "upload_begin",
+          lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
+          reads_body=True),
+    Route("POST", "/session/load", "session_load",
+          lambda ctx: ctx.state.load(ctx.body), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/run/plan", "run_plan",
+          lambda ctx: ctx.state.plan_run(ctx.body), Idempotency.NONE,
+          reads_body=True),
+    Route("POST", "/session/run", "session_run",
+          lambda ctx: ctx.state.run(ctx.body), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/stop", "session_stop",
+          lambda ctx: ctx.state.stop(), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/save-checkpoint", "save_checkpoint",
+          lambda ctx: ctx.state.save_checkpoint(ctx.body),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/download-checkpoint", "download_checkpoint",
+          lambda ctx: ctx.state.download_checkpoint(),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/commit-inputs", "commit_inputs",
+          lambda ctx: ctx.state.commit_inputs(), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/export-full", "export_full", _route_export_full,
+          Idempotency.NONE, reads_body=True),
+)
+
+# Methods whose body is read before the route is resolved, so a malformed or
+# oversized body is reported as such even on an unknown path.
+_BODY_BEFORE_MATCH = frozenset({"POST"})
+
+_LITERAL_ROUTES = {(route.method, route.path): route for route in ROUTES
+                   if route.path is not None}
+_PATTERN_ROUTES = tuple(route for route in ROUTES if route.pattern is not None)
+
+
+def resolve_route(method, path):
+    """Return ``(route, captured groups)`` or ``(None, ())``."""
+    route = _LITERAL_ROUTES.get((method, path))
+    if route is not None:
+        return route, ()
+    for route in _PATTERN_ROUTES:
+        if route.method != method:
+            continue
+        match = route.pattern.fullmatch(path)
+        if match:
+            return route, match.groups()
+    return None, ()
 
 
 class SpiralHandler(BaseHTTPRequestHandler):
@@ -1670,6 +1893,7 @@ class SpiralHandler(BaseHTTPRequestHandler):
             registry.release(artifact)
 
     def _dispatch(self):
+        """Authorise, resolve one route, and apply its retry semantics."""
         self._authorise()
         parsed_url = urlparse(self.path)
         path = unquote(parsed_url.path).rstrip("/") or "/"
@@ -1677,102 +1901,21 @@ class SpiralHandler(BaseHTTPRequestHandler):
             raise ApiError(HTTPStatus.FORBIDDEN, "Malformed request path")
         state = self.server.state
 
-        if self.command == "GET":
-            if path == "/health":
-                return state.health()
-            if path == "/configuration":
-                return state.configuration_catalog()
-            if path == "/session/status":
-                return state.status()
-            if path == "/logs":
-                values = parse_qs(parsed_url.query).get("after", ["0"])
-                try:
-                    after = int(values[-1])
-                except (TypeError, ValueError):
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   "The log cursor must be an integer")
-                if after < 0:
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   "The log cursor must not be negative")
-                return state.logs.read_after(after)
-            if path == "/events":
-                query = parse_qs(parsed_url.query)
-                try:
-                    cursor = int(query.get("cursor", ["0"])[-1])
-                    limit = int(query.get(
-                        "limit", [str(MAX_EVENT_READ_ENTRIES)])[-1])
-                except (TypeError, ValueError):
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   "The event cursor and limit must be integers")
-                if cursor < 0 or limit < 1:
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   "The event cursor must not be negative and "
-                                   "the limit must be at least 1")
-                return state.events.read_after(cursor, limit)
-            if path == "/dataset":
-                return state.dataset()
-            match = re.fullmatch(r"/artifacts/([A-Za-z0-9._-]+)/manifest", path)
-            if match:
-                return state.artifacts.manifest(match.group(1))
-            match = re.fullmatch(r"/artifacts/([A-Za-z0-9._-]+)/files/(.+)", path)
-            if match:
-                if not is_safe_relative_name(match.group(2)):
-                    raise ApiError(HTTPStatus.FORBIDDEN, "Unsafe artifact file name")
-                self._send_artifact_file(match.group(1), match.group(2))
-                return None
-
-        if self.command == "PUT":
-            match = re.fullmatch(r"/session/inputs/([0-9a-f]{32})/files/(.+)", path)
-            if match:
-                try:
-                    length = int(self.headers.get("Content-Length", "-1"))
-                except ValueError:
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
-                if length < 0:
-                    raise ApiError(HTTPStatus.LENGTH_REQUIRED, "Content-Length is required")
-                return state.receive_upload_file(match.group(1), match.group(2),
-                                                 self.rfile, length)
-
-        if self.command == "DELETE":
-            if path == "/session":
-                body = self._body()
-                return state.deduplicated(body.get("command_id"), state.delete)
-            if path == "/session/ephemeral-inputs":
-                body = self._body()
-                return state.deduplicated(body.get("command_id"),
-                                          lambda: state.remove_input(body))
-            match = re.fullmatch(r"/session/inputs/([0-9a-f]{32})", path)
-            if match:
-                return state.delete_upload(match.group(1))
-
-        if self.command == "POST":
-            match = re.fullmatch(r"/session/inputs/([0-9a-f]{32})/finalize", path)
-            if match:
-                self._body()
-                return state.finalize_upload(match.group(1))
+        body = self._body() if self.command in _BODY_BEFORE_MATCH else None
+        route, args = resolve_route(self.command, path)
+        if route is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+        if body is None and route.reads_body:
             body = self._body()
-            command_id = body.get("command_id")
-            if path == "/service/restart":
-                return state.deduplicated(command_id, self.server.request_restart)
-            if path == "/session/inputs":
-                return state.begin_upload(body)
-            if path == "/session/load":
-                return state.deduplicated(command_id, lambda: state.load(body))
-            if path == "/session/run/plan":
-                return state.plan_run(body)
-            if path == "/session/run":
-                return state.deduplicated(command_id, lambda: state.run(body))
-            if path == "/session/stop":
-                return state.deduplicated(command_id, state.stop)
-            if path == "/session/save-checkpoint":
-                return state.deduplicated(command_id, lambda: state.save_checkpoint(body))
-            if path == "/session/download-checkpoint":
-                return state.deduplicated(command_id, state.download_checkpoint)
-            if path == "/session/commit-inputs":
-                return state.deduplicated(command_id, state.commit_inputs)
-            if path == "/session/export-full":
-                raise ApiError(HTTPStatus.NOT_IMPLEMENTED, "Full diagnostic export is not implemented by the interactive service")
-        raise ApiError(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+        context = RouteContext(self, state, args,
+                               parse_qs(parsed_url.query), body)
+        if route.idempotency == Idempotency.COMMAND_ID:
+            return state.replay_command(
+                route.operation, (body or {}).get("command_id"),
+                lambda: route.handler(context))
+        # CONTENT and UPLOAD_ID routes carry their own retry semantics
+        # (declared digest, published upload record); NONE routes have none.
+        return route.handler(context)
 
     def _handle(self):
         try:

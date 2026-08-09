@@ -417,6 +417,105 @@ class RestartTests(HttpServiceFixture):
         self.assertTrue(self.server.restart_requested.wait(2))
 
 
+class RouteTableTests(HttpServiceFixture):
+    def test_routes_resolve_from_the_declarative_table(self):
+        route, args = spiral_service.resolve_route("GET", "/session/status")
+        self.assertEqual((route.operation, args), ("session_status", ()))
+        self.assertEqual(route.idempotency, spiral_service.Idempotency.NONE)
+
+        route, args = spiral_service.resolve_route("POST", "/session/stop")
+        self.assertEqual((route.operation, args), ("session_stop", ()))
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.COMMAND_ID)
+        self.assertTrue(route.reads_body)
+
+        upload_id = "a" * 32
+        route, args = spiral_service.resolve_route(
+            "PUT", f"/session/inputs/{upload_id}/files/meta.json")
+        self.assertEqual((route.operation, args),
+                         ("upload_file", (upload_id, "meta.json")))
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.CONTENT)
+
+        route, _ = spiral_service.resolve_route(
+            "POST", f"/session/inputs/{upload_id}/finalize")
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.UPLOAD_ID)
+
+        # A path is only reachable through the method that declares it.
+        self.assertEqual(spiral_service.resolve_route("GET", "/session/stop"),
+                         (None, ()))
+        self.assertEqual(spiral_service.resolve_route("GET", "/nope"),
+                         (None, ()))
+        for route in spiral_service.ROUTES:
+            self.assertIn(route.idempotency,
+                          {spiral_service.Idempotency.NONE,
+                           spiral_service.Idempotency.COMMAND_ID,
+                           spiral_service.Idempotency.CONTENT,
+                           spiral_service.Idempotency.UPLOAD_ID},
+                          route.operation)
+
+    def test_dispatch_serves_read_and_mutating_routes_unchanged(self):
+        status, payload, _ = self.request("GET", "/session/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
+
+        # A command-ID route still refuses an unstamped request, and reaches
+        # the operation (which has no session) when it is stamped.
+        status, payload, _ = self.request("POST", "/session/stop", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("command_id", json.loads(payload)["error"])
+        status, payload, _ = self.request("POST", "/session/stop",
+                                          body={"command_id": "stop-1"})
+        self.assertEqual(status, 409)
+        self.assertIn("No fit session", json.loads(payload)["error"])
+
+        status, _, _ = self.request("GET", "/nonexistent")
+        self.assertEqual(status, 404)
+
+    def test_malformed_post_body_is_reported_before_the_route_is_known(self):
+        request = urllib.request.Request(self.base + "/nonexistent",
+                                         method="POST")
+        request.add_header("Authorization", "Bearer secret-key")
+        request.add_header("Content-Type", "application/json")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, data=b"{not json", timeout=10)
+        self.assertEqual(caught.exception.code, 400)
+
+
+class CommandReplayTests(unittest.TestCase):
+    def test_replay_is_namespaced_per_operation(self):
+        state = ServiceState()
+        calls = []
+
+        def action(name):
+            def run():
+                calls.append(name)
+                return {"accepted": True, "operation": name}
+            return run
+
+        first = state.replay_command("session_stop", "shared-id",
+                                     action("stop"))
+        repeat = state.replay_command("session_stop", "shared-id",
+                                      action("stop-again"))
+        self.assertEqual(repeat, first)
+        self.assertEqual(calls, ["stop"])
+
+        # A different operation carrying the same command ID is its own
+        # command; it must not replay the first operation's response.
+        other = state.replay_command("session_load", "shared-id",
+                                     action("load"))
+        self.assertEqual(other["operation"], "load")
+        self.assertEqual(calls, ["stop", "load"])
+
+    def test_command_id_is_required(self):
+        state = ServiceState()
+        for command_id in (None, "", "   ", 7):
+            with self.assertRaisesRegex(ApiError, "command_id"):
+                state.replay_command("session_stop", command_id,
+                                     lambda: {"accepted": True})
+
+
 class LogStreamingTests(HttpServiceFixture):
     def test_authenticated_log_reads_are_incremental(self):
         self.state.logs.write("stdout", "loading inputs\n")
@@ -843,6 +942,61 @@ class UploadTests(unittest.TestCase):
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
                          "patch-1")
+
+    def test_upload_put_retries_are_content_addressed(self):
+        self._session()
+        data = PATCH_FILES["meta.json"]
+        upload_id = self.state.begin_upload({
+            "kind": "patch", "id": "retried", "files": [
+                {"name": name, "size": len(payload),
+                 "sha256": _digest(payload)}
+                for name, payload in PATCH_FILES.items()],
+        })["upload_id"]
+        staging = self.output / ".spiral-upload-staging" / upload_id
+
+        # An upload PUT carries no command ID: the manifest's size and digest
+        # decide the outcome, so repeating one is safe and converges.
+        for _ in range(3):
+            response = self.state.receive_upload_file(
+                upload_id, "meta.json", io.BytesIO(data), len(data))
+            self.assertEqual(response["received"], "meta.json")
+        self.assertEqual((staging / "meta.json").read_bytes(), data)
+
+        # A retry that delivers different bytes is refused and never replaces
+        # the staged copy that already matched the manifest.
+        corrupted = b"!" * len(data)
+        with self.assertRaisesRegex(ApiError, "SHA-256"):
+            self.state.receive_upload_file(
+                upload_id, "meta.json", io.BytesIO(corrupted), len(corrupted))
+        self.assertEqual((staging / "meta.json").read_bytes(), data)
+        self.assertEqual([path.name for path in staging.iterdir()],
+                         ["meta.json"])
+
+        for name in ("x.tif", "y.tif", "z.tif"):
+            payload = PATCH_FILES[name]
+            self.state.receive_upload_file(
+                upload_id, name, io.BytesIO(payload), len(payload))
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["id"], "retried")
+
+    def test_finalize_is_idempotent_per_upload_id(self):
+        self._session()
+        upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
+        first = self.state.finalize_upload(upload_id)["input"]
+        second = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(first, second)
+        # The replay publishes nothing a second time.
+        self.assertEqual(
+            [record["id"] for record in self.state.status()["ephemeral_inputs"]],
+            ["fiber-1"])
+        # A finalized upload is a session input, not a transfer any more.
+        with self.assertRaisesRegex(ApiError, "already finalized"):
+            self.state.receive_upload_file(
+                upload_id, "fiber.json",
+                io.BytesIO(FIBER_FILES["fiber.json"]),
+                len(FIBER_FILES["fiber.json"]))
+        with self.assertRaisesRegex(ApiError, "finalized"):
+            self.state.delete_upload(upload_id)
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
