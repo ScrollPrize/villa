@@ -33,7 +33,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
+from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
+                            ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _mapped_winding_ids,
                             _load_flatten_correspondence,
@@ -1449,6 +1450,87 @@ class CheckpointUploadTests(unittest.TestCase):
             spiral_service.EPHEMERAL_QUOTA_BYTES = original
 
 
+class EphemeralLedgerTests(unittest.TestCase):
+    """Incorporation and persistence are independent, typed states."""
+
+    def _ledger(self):
+        ledger = EphemeralLedger(threading.RLock())
+        ledger.add({"id": "patch-1", "kind": "patch", "role": None,
+                    "path": "/staged/patch-1", "bytes": 12,
+                    "upload_id": "a" * 32})
+        return ledger
+
+    def test_new_input_is_pending_and_ephemeral(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("pending", "ephemeral"))
+        self.assertEqual(ledger.pending(), [record])
+        self.assertEqual(ledger.uncommitted(), [record])
+        self.assertEqual(ledger.committed_not_incorporated(), [])
+        self.assertEqual(ledger.bytes_in_use(), 12)
+        self.assertEqual(record.status_entry(), {
+            "id": "patch-1", "kind": "patch", "role": None,
+            "state": "pending", "bytes": 12, "committed": False})
+
+    def test_the_two_states_move_independently(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+
+        ledger.mark_committed([record])
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("pending", "committed"))
+        # Committed but not yet part of the fit: still queued for the run,
+        # no longer a commit candidate, and called out as such.
+        self.assertEqual(ledger.pending(), [record])
+        self.assertEqual(ledger.uncommitted(), [])
+        self.assertEqual(ledger.committed_not_incorporated(), [record])
+
+        # Incorporating it settles both states, so it leaves the ledger.
+        ledger.mark_incorporated([record])
+        self.assertEqual(ledger.records, [])
+
+    def test_incorporation_can_precede_persistence(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        ledger.mark_incorporated([record])
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("incorporated", "ephemeral"))
+        self.assertEqual(ledger.pending(), [])
+        self.assertEqual(ledger.uncommitted(), [record])
+        ledger.mark_committed([record])
+        self.assertEqual(ledger.records, [])
+
+    def test_incorporation_failure_keeps_the_record_with_its_error(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        ledger.mark_incorporated([record], error="RuntimeError: boom")
+        self.assertEqual(record.incorporation, "error")
+        self.assertEqual(record.error, "RuntimeError: boom")
+        # An errored input is neither queued for the fit nor committable.
+        self.assertEqual(ledger.pending(), [])
+        self.assertEqual(ledger.uncommitted(), [])
+        self.assertEqual(record.status_entry()["state"], "error")
+
+    def test_fitter_payloads_resolve_back_to_their_records(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        payload = record.payload()
+        self.assertEqual(payload["path"], "/staged/patch-1")
+        self.assertEqual(payload["state"], "pending")
+        # The fitter (and its DDP children) hand back plain records.
+        self.assertEqual(ledger.resolve([dict(payload)]), [record])
+        ledger.mark_incorporated(ledger.resolve([dict(payload)]))
+        self.assertTrue(record.incorporated)
+
+    def test_removal_and_reset_clear_the_ledger(self):
+        ledger = self._ledger()
+        ledger.remove(ledger.find("patch", "patch-1"))
+        self.assertEqual(ledger.records, [])
+        self.assertFalse(ledger.contains("patch", "patch-1"))
+        self._ledger().clear()
+
+
 class CommitTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1495,6 +1577,48 @@ class CommitTests(unittest.TestCase):
                          {"patch-9", "fiber-9", "pcl-9"})
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
+
+    def test_status_names_committed_but_not_incorporated_inputs(self):
+        self._finalize("patch", "patch-9", PATCH_FILES)
+        self._finalize("fiber", "fiber-9", FIBER_FILES)
+        status = self.state.status()
+        self.assertEqual(status["committed_not_incorporated"], [])
+
+        self.state.commit_inputs()
+        status = self.state.status()
+        # The dataset holds both, but the resident fit has taken neither.
+        self.assertEqual(
+            sorted(record["id"]
+                   for record in status["committed_not_incorporated"]),
+            ["fiber-9", "patch-9"])
+        self.assertEqual(
+            {record["kind"]
+             for record in status["committed_not_incorporated"]},
+            {"patch", "fiber"})
+        self.assertFalse(status["commit_available"])
+        self.assertIn("already committed", status["commit_unavailable_reason"])
+
+        # Running incorporates them; a committed and incorporated input is
+        # fully settled and drops out of the ephemeral bookkeeping.
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        self.assertEqual(sorted(record["id"] for record in pending),
+                         ["fiber-9", "patch-9"])
+        mark(pending)
+        status = self.state.status()
+        self.assertEqual(status["committed_not_incorporated"], [])
+        self.assertEqual(status["ephemeral_inputs"], [])
+
+    def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
+        record = self._finalize("patch", "patch-9", PATCH_FILES)
+        shutil.rmtree(record["path"])
+        with self.assertRaisesRegex(ApiError, "staged copy"):
+            self.state.commit_inputs()
+        # Validation happens before anything is published, so the dataset is
+        # untouched and the record keeps its ephemeral state.
+        self.assertFalse((self.dataset / "verified_patches" / "patch-9").exists())
+        self.assertEqual(self.state.status()["ephemeral_inputs"][0]["committed"],
+                         False)
 
     def test_concurrent_service_commits_serialize_pcl_merges(self):
         output_b = self.root / "output-b"

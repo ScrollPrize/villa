@@ -213,6 +213,193 @@ def _copy_publish(source, destination, keep_source=False):
         Path(source).unlink(missing_ok=True)
 
 
+# ----------------------------------------------------------------------
+# Ephemeral input ledger
+#
+# Owned by the lifecycle orchestrator, not by the upload manager: finalize
+# produces one record and hands it over, and everything after that (whether
+# the fit has taken the input, whether the dataset has a copy of it, when the
+# staged bytes may go) is bookkeeping the orchestrator does through here.
+# ----------------------------------------------------------------------
+
+#: Has the resident fit taken this input yet?
+INCORPORATION_STATES = ("pending", "incorporated", "error")
+#: Does the dataset hold a copy of it yet?
+PERSISTENCE_STATES = ("ephemeral", "committed")
+
+
+@dataclass
+class EphemeralInput:
+    """One uploaded session input, with its two independent states.
+
+    Incorporation and persistence are not stages of one enum: an input can be
+    committed to the dataset before the fit has taken it (commit early, run
+    later), and can be incorporated long before anyone commits it. Every
+    combination is legal and the pair is what the transitions below move.
+    """
+
+    id: str
+    kind: str
+    role: Optional[str]
+    path: str
+    bytes: int
+    upload_id: Optional[str] = None
+    incorporation: str = "pending"
+    persistence: str = "ephemeral"
+    error: Optional[str] = None
+
+    @classmethod
+    def from_record(cls, record):
+        return cls(
+            id=record["id"], kind=record["kind"], role=record.get("role"),
+            path=record["path"], bytes=record["bytes"],
+            upload_id=record.get("upload_id"))
+
+    @property
+    def committed(self):
+        return self.persistence == "committed"
+
+    @property
+    def incorporated(self):
+        return self.incorporation == "incorporated"
+
+    @property
+    def settled(self):
+        """Committed and incorporated: nothing is left to do with it."""
+        return self.committed and self.incorporated
+
+    def payload(self):
+        """The plain record the fitter (and its DDP children) receive."""
+        record = {
+            "id": self.id, "kind": self.kind, "role": self.role,
+            "path": self.path, "bytes": self.bytes,
+            "state": self.incorporation,
+        }
+        if self.upload_id is not None:
+            record["upload_id"] = self.upload_id
+        return record
+
+    def status_entry(self):
+        return {"id": self.id, "kind": self.kind, "role": self.role,
+                "state": self.incorporation, "bytes": self.bytes,
+                "committed": self.committed}
+
+
+class EphemeralLedger:
+    """The session's ephemeral inputs and every transition they can make.
+
+    All state changes go through this object under the service lock, so
+    "committed", "incorporated" and "removed" cannot be spelled three
+    different ways in three different call sites.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        self._records = []
+
+    def __iter__(self):
+        return iter(list(self._records))
+
+    def __len__(self):
+        return len(self._records)
+
+    def __eq__(self, other):
+        # Convenience for callers (and tests) comparing against a plain list.
+        if isinstance(other, list):
+            return list(self._records) == other
+        return NotImplemented
+
+    @property
+    def records(self):
+        with self._lock:
+            return list(self._records)
+
+    def clear(self):
+        with self._lock:
+            self._records = []
+
+    def add(self, record):
+        """Register a freshly finalized upload as a pending, ephemeral input."""
+        entry = (record if isinstance(record, EphemeralInput)
+                 else EphemeralInput.from_record(record))
+        with self._lock:
+            self._records.append(entry)
+        return entry
+
+    def find(self, kind, input_id):
+        with self._lock:
+            return next((record for record in self._records
+                         if record.id == input_id and record.kind == kind),
+                        None)
+
+    def contains(self, kind, input_id):
+        return self.find(kind, input_id) is not None
+
+    def remove(self, record):
+        with self._lock:
+            if record in self._records:
+                self._records.remove(record)
+
+    def bytes_in_use(self):
+        with self._lock:
+            return sum(record.bytes for record in self._records)
+
+    # -- transitions ---------------------------------------------------
+
+    def pending(self):
+        """Inputs the next run must incorporate."""
+        with self._lock:
+            return [record for record in self._records
+                    if record.incorporation == "pending"]
+
+    def uncommitted(self):
+        """Inputs the dataset has no copy of yet."""
+        with self._lock:
+            return [record for record in self._records
+                    if not record.committed
+                    and record.incorporation in ("pending", "incorporated")]
+
+    def committed_not_incorporated(self):
+        """Committed inputs the resident fit has not taken yet."""
+        with self._lock:
+            return [record for record in self._records
+                    if record.committed and not record.incorporated]
+
+    def resolve(self, payloads):
+        """Map payload dicts handed to the fitter back to their records."""
+        wanted = {(payload.get("kind"), payload.get("id"))
+                  for payload in payloads}
+        with self._lock:
+            return [record for record in self._records
+                    if (record.kind, record.id) in wanted]
+
+    def mark_incorporated(self, records, error=None):
+        """Record the outcome of one incorporation attempt."""
+        with self._lock:
+            for record in records:
+                record.incorporation = "error" if error else "incorporated"
+                record.error = error
+            if error is None:
+                self._drop_settled()
+
+    def mark_committed(self, records):
+        with self._lock:
+            for record in records:
+                record.persistence = "committed"
+            self._drop_settled()
+
+    def _drop_settled(self):
+        """Fully persisted, fully incorporated inputs leave the ledger."""
+        self._records = [record for record in self._records
+                         if not record.settled]
+
+    # -- presentation --------------------------------------------------
+
+    def status_entries(self):
+        with self._lock:
+            return [record.status_entry() for record in self._records]
+
+
 @dataclass(frozen=True)
 class UploadEnvironment:
     """Everything the upload manager may ask the orchestrator about.
