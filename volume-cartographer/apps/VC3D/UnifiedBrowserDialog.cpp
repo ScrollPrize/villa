@@ -39,6 +39,24 @@ bool stringStartsWithAny(const QString& s, std::initializer_list<const char*> ne
     return false;
 }
 
+bool isValidRemoteUri(const QString& uri)
+{
+    const QUrl parsed(uri, QUrl::StrictMode);
+    if (!parsed.isValid() || parsed.host().isEmpty()) return false;
+
+    const QString scheme = parsed.scheme().toLower();
+    return scheme == QLatin1String("s3")
+        || scheme.startsWith(QLatin1String("s3+"))
+        || scheme == QLatin1String("http")
+        || scheme == QLatin1String("https");
+}
+
+bool remoteUriLooksLikeDirectory(const QString& uri)
+{
+    const QString path = QUrl(uri).path();
+    return path.isEmpty() || path.endsWith('/');
+}
+
 QString withTrailingSlash(QString s)
 {
     if (!s.endsWith('/')) s += '/';
@@ -313,6 +331,12 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
             this, &UnifiedBrowserDialog::onUpClicked);
     _pathBar = new QLineEdit();
     _pathBar->setPlaceholderText(tr("Path or URL — paste anything"));
+    connect(_pathBar, &QLineEdit::textEdited, this, [this]() {
+        _pathBarEdited = true;
+        _selectedUri.clear();
+        _list->clearSelection();
+        _list->setCurrentItem(nullptr);
+    });
     connect(_pathBar, &QLineEdit::returnPressed,
             this, &UnifiedBrowserDialog::onPathBarReturn);
     navRow->addWidget(_upButton);
@@ -380,7 +404,7 @@ void UnifiedBrowserDialog::setStartUri(const QString& uri)
 
 UnifiedBrowserDialog::Mode UnifiedBrowserDialog::detectModeFromUri(const QString& uri)
 {
-    if (stringStartsWithAny(uri, {"s3://", "http://", "https://"})) return Mode::Remote;
+    if (stringStartsWithAny(uri, {"s3://", "s3+", "http://", "https://"})) return Mode::Remote;
     return Mode::Local;
 }
 
@@ -403,23 +427,7 @@ void UnifiedBrowserDialog::onPathBarReturn()
 {
     const QString text = _pathBar->text().trimmed();
     if (text.isEmpty()) return;
-    const Mode m = detectModeFromUri(text);
-    if (m == Mode::Remote) {
-        _remoteRadio->setChecked(true);
-        navigateRemote(withTrailingSlash(text));
-    } else {
-        _localRadio->setChecked(true);
-        QString p = fileUriToPath(text);
-        // Expand ~/...
-        if (p.startsWith(QLatin1String("~/"))) {
-            p.replace(0, 1, QDir::homePath());
-        } else if (p == QLatin1String("~")) {
-            p = QDir::homePath();
-        }
-        QFileInfo fi(p);
-        if (fi.isFile()) p = fi.absolutePath();
-        navigateLocal(p);
-    }
+    handleTypedPath(text, false);
 }
 
 void UnifiedBrowserDialog::onUpClicked()
@@ -445,6 +453,7 @@ void UnifiedBrowserDialog::navigateLocal(const QString& absDir)
 {
     _currentLocalDir = absDir;
     _pathBar->setText(absDir);
+    _pathBarEdited = false;
     _list->clear();
 
     QDir d(absDir);
@@ -514,6 +523,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
 
     _currentRemoteUrl = withTrailingSlash(urlPrefix);
     _pathBar->setText(_currentRemoteUrl);
+    _pathBarEdited = false;
     _list->clear();
     _status->setText(tr("Loading..."));
 
@@ -648,6 +658,7 @@ void UnifiedBrowserDialog::onItemSelectionChanged()
     auto* item = _list->currentItem();
     if (!item) return;
     _selectedUri = item->data(Qt::UserRole).toString();
+    _pathBarEdited = false;
 }
 
 QString UnifiedBrowserDialog::currentUri() const
@@ -670,10 +681,70 @@ bool UnifiedBrowserDialog::isAcceptableUri(const QString& uri, bool isFile) cons
     return true;
 }
 
+void UnifiedBrowserDialog::handleTypedPath(const QString& typed, bool acceptDirectories)
+{
+    const Mode mode = detectModeFromUri(typed);
+    if (mode == Mode::Remote) {
+        if (!isValidRemoteUri(typed)) {
+            _status->setText(tr("Need a valid remote host or S3 bucket"));
+            return;
+        }
+
+        _remoteRadio->setChecked(true);
+        const bool isDirectory = remoteUriLooksLikeDirectory(typed) || !_acceptsFiles;
+        if (isDirectory) {
+            if (acceptDirectories && _acceptsDirs) {
+                _selectedUri = withTrailingSlash(typed);
+                accept();
+            } else {
+                navigateRemote(withTrailingSlash(typed));
+            }
+            return;
+        }
+
+        if (!_acceptsFiles) {
+            _status->setText(tr("Select a directory to open."));
+            return;
+        }
+        _selectedUri = typed;
+        accept();
+        return;
+    }
+
+    _localRadio->setChecked(true);
+    QString path = fileUriToPath(typed);
+    if (path.startsWith(QLatin1String("~/"))) {
+        path.replace(0, 1, QDir::homePath());
+    } else if (path == QLatin1String("~")) {
+        path = QDir::homePath();
+    }
+
+    const QFileInfo info(path);
+    if (!info.exists()) {
+        _status->setText(tr("No such path: %1").arg(path));
+        return;
+    }
+    if (info.isDir()) {
+        if (acceptDirectories && _acceptsDirs) {
+            _selectedUri = pathToFileUri(info.absoluteFilePath(), true);
+            accept();
+        } else {
+            navigateLocal(info.absoluteFilePath());
+        }
+        return;
+    }
+    if (!_acceptsFiles) {
+        _status->setText(tr("Select a directory to open."));
+        return;
+    }
+    _selectedUri = pathToFileUri(info.absoluteFilePath(), false);
+    accept();
+}
+
 void UnifiedBrowserDialog::onOpenClicked()
 {
     auto* selected = _list->currentItem();
-    if (selected) {
+    if (selected && selected->isSelected()) {
         if (_mode == Mode::Remote && !selected->data(Qt::UserRole + 2).toString().isEmpty()) {
             onItemDoubleClicked(selected);
             return;
@@ -686,42 +757,16 @@ void UnifiedBrowserDialog::onOpenClicked()
             return;
         }
     }
-    if (!_acceptsDirs) {
-        QMessageBox::information(this, windowTitle(),
-            tr("Select an item to open."));
+    if (_pathBarEdited) {
+        const QString typed = _pathBar->text().trimmed();
+        if (!typed.isEmpty()) handleTypedPath(typed, true);
         return;
     }
-    // Fall back to the path bar — prefer what's typed there over the
-    // last-navigated location, since users often paste a URL and click Open
-    // without pressing Enter to navigate first.
-    const QString typed = _pathBar->text().trimmed();
-    if (typed.isEmpty()) {
+    if (_acceptsDirs) {
         _selectedUri = currentUri();
         accept();
         return;
     }
-    const Mode m = detectModeFromUri(typed);
-    if (m == Mode::Remote) {
-        const int schemeEnd = typed.indexOf(QStringLiteral("://"));
-        if (schemeEnd < 0 || typed.size() <= schemeEnd + 3) {
-            _status->setText(tr("Need a bucket/host (e.g. s3://your-bucket/)"));
-            return;
-        }
-        _selectedUri = withTrailingSlash(typed);
-    } else {
-        QString p = fileUriToPath(typed);
-        if (p.startsWith(QLatin1String("~/"))) {
-            p.replace(0, 1, QDir::homePath());
-        } else if (p == QLatin1String("~")) {
-            p = QDir::homePath();
-        }
-        QFileInfo fi(p);
-        const bool isDir = fi.isDir();
-        if (!fi.exists()) {
-            _status->setText(tr("No such path: %1").arg(p));
-            return;
-        }
-        _selectedUri = pathToFileUri(fi.absoluteFilePath(), isDir);
-    }
-    accept();
+    QMessageBox::information(this, windowTitle(),
+        tr("Select an item to open."));
 }
