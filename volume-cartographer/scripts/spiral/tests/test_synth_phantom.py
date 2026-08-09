@@ -161,6 +161,34 @@ def test_preset_texture_preserves_truth(tmp_path):
     assert sheets.std() > 20  # uint8 units; noise_std alone would be ~9
 
 
+def test_slip_phantom_out_of_family(tmp_path):
+    # Slips must (a) leave the truth self-consistent (identical candidate
+    # still scores exactly zero, i.e. the wrapper transform round-trips),
+    # and (b) actually cut the winding field: many more large neighbouring
+    # jumps than the smooth phantom generated from the same seed.
+    smooth_dir, slip_dir = str(tmp_path / 'smooth'), str(tmp_path / 'slip')
+    for out, extra in ((smooth_dir, []),
+                       (slip_dir, ['--num-slips', '3', '--slip-magnitude', '1.5'])):
+        result = CliRunner().invoke(synth_phantom.main,
+                                    ['--out', out, *PHANTOM_ARGS, *extra])
+        assert result.exit_code == 0, result.output
+
+    _, model, mask = load_phantom(slip_dir, torch.device('cpu'))
+    scored = evaluate(model, mask, ('model', model), num_points=10_000,
+                      cut_margin=0.1, seed=0, device=torch.device('cpu'))
+    assert scored['overall']['mae'] < 1e-5
+
+    def big_jumps(d):
+        w = tifffile.imread(os.path.join(d, 'winding.tif'))
+        m = tifffile.imread(os.path.join(d, 'mask.tif')) > 0
+        dy = np.abs(np.diff(w, axis=1))
+        both = m[:, :-1] & m[:, 1:]
+        return int(((dy > 0.4) & both).sum())
+
+    smooth_jumps, slip_jumps = big_jumps(smooth_dir), big_jumps(slip_dir)
+    assert slip_jumps > max(3 * smooth_jumps, 100), (smooth_jumps, slip_jumps)
+
+
 def test_shape_mismatch_rejected(phantom):
     with pytest.raises(Exception):
         bad = np.zeros((4, 4, 4), dtype=np.float32)

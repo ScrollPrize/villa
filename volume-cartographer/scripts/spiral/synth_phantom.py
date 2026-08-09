@@ -22,10 +22,11 @@ only users of transform.inv see numerical inversion error, which is measured
 and reported in meta.json ('roundtrip_*').
 
 Honest realism caveats, staged deliberately:
-  - Tears are signal dropout only (intensity set to background inside a random
-    box); the geometry stays a smooth diffeomorphism. Topological tears --
-    where the winding field itself is cut -- are NOT modelled, matching the
-    (known) limitation of the production transform.
+  - Tears (--num-tears) are signal dropout only; the geometry stays smooth.
+    Slips (--num-slips) DO cut the geometry: discontinuous slide along
+    vertical planes, provably outside the fitter's smooth transform family --
+    use them whenever in-family circularity would flatter the fit. Open tears
+    (material separation leaving a gap) are still not modelled.
   - Haze is a uniform Gaussian blur, not a physically-motivated decoherence
     model; compression-dependent haze is future work.
 A method that aces this phantom can still fail on real scrolls; the phantom
@@ -55,10 +56,82 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+import pyro.distributions
 import sample_spiral
 from config import Config
 from sample_spiral import get_theta_and_radii
 from transforms import SpiralAndTransform
+
+
+class SlipTransform(pyro.distributions.transforms.Transform):
+    """K slip dislocations: each cuts slice space along a vertical plane and
+    rigidly slides one side by a vector PARALLEL to the plane (so no gap and
+    no overlap -- exactly invertible). The resulting deformation is
+    DISCONTINUOUS across each plane, hence provably outside SpiralAndTransform's
+    smooth family -- the out-of-family phantom mode the in-family circularity
+    critique asks for. Because the slip vector is parallel to the plane, the
+    side test gives the same answer before and after slipping, which is what
+    makes the inverse exact."""
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, points_zyx, normals_zyx, slips_zyx, event_dim=0, cache_size=0):
+        super().__init__(cache_size=cache_size)
+        self.points = points_zyx      # [K, 3]
+        self.normals = normals_zyx    # [K, 3], unit, n . slip == 0
+        self.slips = slips_zyx        # [K, 3]
+
+    def _side(self, x, k):
+        return ((x - self.points[k]) * self.normals[k]).sum(-1, keepdim=True) > 0
+
+    def _call(self, x):
+        for k in range(len(self.points)):
+            x = x + self.slips[k] * self._side(x, k)
+        return x
+
+    def _inverse(self, y):
+        for k in reversed(range(len(self.points))):
+            y = y - self.slips[k] * self._side(y, k)
+        return y
+
+
+class SlippedModel:
+    """Wraps a SpiralAndTransform with a pre-composed SlipTransform, exposing
+    the two methods every consumer (renderer, exporter, winding_error) uses.
+    Fitters still construct plain in-family models -- slips exist only on the
+    truth side, which is the point."""
+
+    def __init__(self, model, slip):
+        self.model = model
+        self.slip = slip
+
+    def get_dr_per_winding(self):
+        return self.model.get_dr_per_winding()
+
+    def get_slice_to_spiral_transform(self):
+        return pyro.distributions.transforms.ComposeTransform(
+            [self.slip, self.model.get_slice_to_spiral_transform()])
+
+
+def sample_slips(num_slips, slip_magnitude_vox, centre_yx, radius_range, rng):
+    """Random vertical slip planes through the annulus; slip vectors mix the
+    in-plane tangential direction (winding-index dislocation) and z."""
+    points, normals, slips = [], [], []
+    for _ in range(num_slips):
+        phi = rng.uniform(0, 2 * np.pi)
+        r = rng.uniform(*radius_range)
+        points.append([0., centre_yx[0] + r * np.sin(phi), centre_yx[1] + r * np.cos(phi)])
+        psi = rng.uniform(0, 2 * np.pi)
+        n = np.array([0., np.sin(psi), np.cos(psi)])
+        tangent = np.array([0., np.cos(psi), -np.sin(psi)])
+        mix = rng.uniform(0.5, 1.0)  # mostly tangential (winding dislocation)
+        direction = mix * tangent + (1 - mix) * np.array([1., 0., 0.])
+        direction /= np.linalg.norm(direction)
+        normals.append(n)
+        slips.append(direction * slip_magnitude_vox)
+    to_t = lambda a: torch.tensor(np.array(a), dtype=torch.float32)
+    return SlipTransform(to_t(points), to_t(normals), to_t(slips))
 
 PHANTOM_SCHEMA_VERSION = 1
 
@@ -126,7 +199,9 @@ def build_model(cfg, z_begin, z_end, umbilicus_zyx, spiral_outward_sense, device
 
 
 def build_model_from_phantom_checkpoint(checkpoint, device):
-    """Rebuild the exact phantom transform from a phantom_checkpoint.pt payload."""
+    """Rebuild the exact phantom transform from a phantom_checkpoint.pt
+    payload; phantoms generated with --num-slips come back wrapped so their
+    out-of-family dislocations are part of the truth transform."""
     model = build_model(
         checkpoint['cfg'],
         int(checkpoint['z_begin']),
@@ -136,6 +211,10 @@ def build_model_from_phantom_checkpoint(checkpoint, device):
         device,
     )
     model.load_state_dict(checkpoint['spiral_and_transform'])
+    if checkpoint.get('slips') is not None:
+        s = checkpoint['slips']
+        return SlippedModel(model, SlipTransform(
+            s['points'].to(device), s['normals'].to(device), s['vectors'].to(device)))
     return model
 
 
@@ -359,12 +438,19 @@ def measure_roundtrip(model, valid, num_points, rng, device):
               help='Uniform Gaussian blur sigma in voxels (0 disables).')
 @click.option('--num-tears', default=0, type=int,
               help='Random signal-dropout tear boxes (geometry untouched).')
+@click.option('--num-slips', default=0, type=int,
+              help='OUT-OF-FAMILY slip dislocations: discontinuous slide '
+                   'along random vertical planes, provably outside the '
+                   "fitter's smooth transform family.")
+@click.option('--slip-magnitude', default=1.0, type=float,
+              help='Slip displacement in units of dr-per-winding.')
 @click.option('--spiral-outward-sense', default='CW', type=click.Choice(['CW', 'ACW']))
 @click.option('--device', default='cpu', help="torch device ('cpu', 'cuda', ...).")
 def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
          gap_log_std, linear_std, flow_smooth_sigma, umbilicus_amplitude,
          sheet_sigma, gap_level, sheet_level, fiber_amp, speckle_amp, preset,
-         noise_std, haze_sigma, num_tears, spiral_outward_sense, device):
+         noise_std, haze_sigma, num_tears, num_slips, slip_magnitude,
+         spiral_outward_sense, device):
     if preset is not None:
         source = click.get_current_context().get_parameter_source
         overrides = {name: value for name, value in PRESETS[preset].items()
@@ -395,6 +481,11 @@ def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
     umbilicus_zyx = make_umbilicus(0, z_size, z_margin, centre, umbilicus_amplitude, rng)
     model = build_model(cfg, 0, z_size, umbilicus_zyx, spiral_outward_sense, device)
     randomise_model(model, rng, flow_std, gap_log_std, linear_std, flow_smooth_sigma)
+    slip = None
+    if num_slips > 0:
+        slip = sample_slips(num_slips, slip_magnitude * dr_per_winding, centre,
+                            ((first_winding + 1) * dr_per_winding, max_radius), rng)
+        model = SlippedModel(model, slip)
 
     volume, winding, valid = render(
         model, z_size, yx_size, first_winding, last_winding, sheet_sigma,
@@ -427,11 +518,16 @@ def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
         'gap_level': gap_level, 'sheet_level': sheet_level,
         'fiber_amp': fiber_amp, 'speckle_amp': speckle_amp, 'preset': preset,
         'noise_std': noise_std, 'haze_sigma': haze_sigma, 'num_tears': num_tears,
+        'num_slips': num_slips, 'slip_magnitude': slip_magnitude,
     }
+    base_model = model.model if isinstance(model, SlippedModel) else model
     torch.save({
         'schema_version': 2,
         'phantom_schema_version': PHANTOM_SCHEMA_VERSION,
-        'spiral_and_transform': model.state_dict(),
+        'spiral_and_transform': base_model.state_dict(),
+        'slips': (None if slip is None else
+                  {'points': slip.points.cpu(), 'normals': slip.normals.cpu(),
+                   'vectors': slip.slips.cpu()}),
         'cfg': cfg,
         'z_begin': 0,
         'z_end': z_size,
