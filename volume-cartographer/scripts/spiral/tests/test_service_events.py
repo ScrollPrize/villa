@@ -225,7 +225,7 @@ class EventIngestTests(unittest.TestCase):
 
     def test_preview_publish_progress_is_published_as_service_events(self):
         state = ServiceState()
-        state._publishing_preview_generation = 3
+        state._preview.claim("spiral-test-1", 3)
         state._update_preview_publish(
             3, state="indexing", stage_name="Indexing preview files",
             step=0, total_steps=4, overall_progress=0.0)

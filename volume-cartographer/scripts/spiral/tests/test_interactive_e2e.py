@@ -33,7 +33,8 @@ class InteractiveEndToEndTests(unittest.TestCase):
 
         from fit_session import (SessionState, SpiralInputPaths,
                                  SpiralPreviewConfig, SpiralRunConfig,
-                                 load_scroll_spec)
+                                 load_scroll_spec, select_startup_autosave,
+                                 validate_autosave)
         from spiral_runtime import InteractiveFitSession
 
         with tempfile.TemporaryDirectory(prefix="spiral-e2e-") as work:
@@ -108,6 +109,16 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 autosaves = glob.glob(
                     f"{out_dir}/*/checkpoint_autosave.ckpt")
                 self.assertEqual(len(autosaves), 1, autosaves)
+                # The always-loaded service selects its startup autosave
+                # from the metadata the pause writes beside it, so the
+                # sidecar has to name this session's output namespace and
+                # dataset and survive container/identity validation.
+                selection = select_startup_autosave(
+                    out_dir, session_namespace=out_dir,
+                    dataset_root=DATASET)
+                self.assertEqual(selection.selected.checkpoint, autosaves[0])
+                self.assertEqual(selection.selected.completed_iterations, 2)
+                validate_autosave(selection.selected)
                 # Pausing writes the autosave and nothing else; a preview is
                 # exported only when a client asks for one.
                 self.assertIsNone(status["preview_manifest_path"])

@@ -63,7 +63,8 @@ from service_uploads import (EphemeralLedger, PCL_ROLE_FILES, UPLOADED_CHECKPOIN
                              UPLOAD_GC_SECONDS, UploadEnvironment,
                              UploadManager, _copy_publish,
                              _merge_pcl_documents, _utc_stamp)
-from lasagna_publish import LasagnaPublisher, stop_process_group
+from lasagna_publish import (LasagnaPublisher, PreviewPublication,
+                             stop_process_group)
 # Re-exported for the service's own test surface, which addresses the preview
 # mapping helpers through this module.
 from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
@@ -518,9 +519,7 @@ class ServiceState:
         self.session_id = None
         self.session_paths = None
         self.session_request = None
-        self.service_generation = 1
         self.session_generation = 0
-        self.command_generation = 0
         self.status_generation = 0
         self.commands = OrderedDict()
         self.inflight_commands = set()
@@ -555,15 +554,9 @@ class ServiceState:
         self.artifacts = ArtifactRegistry()
         self.uploads_manager = UploadManager(self._upload_environment())
         self.ephemeral_records = EphemeralLedger(self.lock)
-        self._registered_preview_generation = 0
-        self._processed_preview_generation = 0
-        self._publishing_preview_generation = 0
-        self._preview_artifact = None
-        self._preview_publish = None
-        self._preview_progress_started = None
-        self._preview_publish_error = None
-        self._preview_process = None
-        self._previous_raw_preview_manifest = None
+        # One record for the whole of preview publication (see
+        # LasagnaPublisher's PreviewPublication), guarded by self.lock.
+        self._preview = PreviewPublication()
         self.config_catalog = Config.catalog()
         self.session_revision = 0
         self.run_plans = {}
@@ -573,16 +566,36 @@ class ServiceState:
     # ------------------------------------------------------------------
 
     def _base(self):
+        """The counters every response carries, and nothing else.
+
+        Three survive, because each answers a question no other one can:
+
+        ``session_generation``
+            Which resident session this is. It advances on every rebuild,
+            stamps log and fitter event records, and is what a client uses
+            to notice that the session it adopted has been replaced.
+        ``session_revision``
+            Which configuration/input revision the session is at. Run plans
+            are computed against it and refused when it moves.
+        ``generation`` (the status revision)
+            Ordering for status snapshots, so a client can drop a reply that
+            overtook a newer one.
+
+        ``service_generation`` and ``command_generation`` used to be here.
+        The first was the constant 1 and identified nothing (process
+        identity is ``process_id`` on /health, and clients reset their
+        cursors per connection); the second counted replayed commands while
+        the replay cache is keyed by (operation, command ID). Nothing read
+        either.
+        """
         return {
             "api_version": API_VERSION,
             "service_version": SERVICE_VERSION,
             "service_name": self.service_name,
             "session_name": self.session_name,
             "session_id": self.session_id,
-            "service_generation": self.service_generation,
             "session_generation": self.session_generation,
             "session_revision": self.session_revision,
-            "command_generation": self.command_generation,
             "generation": self.status_generation,
             "gpus": list(self.gpu_ids),
         }
@@ -627,35 +640,15 @@ class ServiceState:
                     if key != "eta_seconds"
                 }
             response["session_request"] = self.session_request
-            response["preview_artifact"] = self._preview_artifact
+            response["preview_artifact"] = self._preview.artifact
             response["preview_publish"] = (
-                dict(self._preview_publish)
-                if self._preview_publish else None)
-            response["preview_publish_error"] = self._preview_publish_error
-            if self._preview_publish:
-                stage_name = str(
-                    self._preview_publish.get("stage_name") or "").strip()
-                if stage_name:
-                    response["phase"] = stage_name
-                    step = self._preview_publish.get("step")
-                    total = self._preview_publish.get("total_steps")
-                    elapsed = (
-                        max(
-                            0.0,
-                            time.monotonic()
-                            - self._preview_progress_started)
-                        if self._preview_progress_started is not None
-                        else 0.0)
-                    response["progress"] = {
-                        "operation": "publishing_preview",
-                        "stage_name": stage_name,
-                        "detail": None,
-                        "step": int(step) if step is not None else None,
-                        "total_steps": (
-                            int(total) if total is not None else None),
-                        "unit": "steps",
-                        "elapsed_seconds": elapsed,
-                    }
+                dict(self._preview.progress)
+                if self._preview.progress else None)
+            response["preview_publish_error"] = self._preview.error
+            publishing = self._preview.status_progress()
+            if publishing is not None:
+                response["phase"] = publishing["stage_name"]
+                response["progress"] = publishing
             response["ephemeral_inputs"] = self.ephemeral_records.status_entries()
             # Persistence and incorporation are independent: an input can be
             # in the user's dataset while the resident fit has not taken it
@@ -937,20 +930,12 @@ class ServiceState:
                            operation="building_session")
 
     def _reset_session_scope(self):
-        previous_raw = self._previous_raw_preview_manifest
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
         self.ephemeral_records.clear()
         self.uploads_manager.reset()
-        self._registered_preview_generation = 0
-        self._processed_preview_generation = 0
-        self._publishing_preview_generation = 0
-        self._preview_artifact = None
-        self._preview_publish = None
-        self._preview_progress_started = None
-        self._preview_publish_error = None
-        self._previous_raw_preview_manifest = None
+        previous_raw = self._preview.reset_session_scope()
         if previous_raw:
             shutil.rmtree(
                 Path(previous_raw).parent, ignore_errors=True)
@@ -1040,13 +1025,8 @@ class ServiceState:
             session_id = self.session_id
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
-            publish_preview = (
-                preview_manifest
-                and preview_generation > self._processed_preview_generation
-                and preview_generation != self._publishing_preview_generation)
-            if publish_preview:
-                self._publishing_preview_generation = preview_generation
-                self._preview_publish_error = None
+            publish_preview = bool(preview_manifest) and self._preview.claim(
+                session_id, preview_generation)
         if not publish_preview:
             return
 
@@ -1082,9 +1062,8 @@ class ServiceState:
                 flush=True)
             with self.lock:
                 if self.session_id == session_id:
-                    self._preview_artifact = ref
-                    self._registered_preview_generation = preview_generation
-                    self._preview_publish_error = None
+                    self._preview.artifact = ref
+                    self._preview.error = None
             self.artifacts.prune(
                 "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
         except Exception as exc:
@@ -1099,38 +1078,25 @@ class ServiceState:
             # the next run-difference overlay.
             failed_raw = Path(preview_manifest).parent
             with self.lock:
-                retained_raw = self._previous_raw_preview_manifest
+                retained_raw = self._preview.previous_raw_manifest
             if (not retained_raw
                     or failed_raw != Path(retained_raw).parent):
                 shutil.rmtree(failed_raw, ignore_errors=True)
             with self.lock:
                 if self.session_id == session_id:
-                    self._preview_publish_error = error
+                    self._preview.error = error
         finally:
             with self.lock:
                 if self.session_id == session_id:
-                    self._processed_preview_generation = max(
-                        self._processed_preview_generation,
-                        preview_generation)
-                    if self._publishing_preview_generation == preview_generation:
-                        self._publishing_preview_generation = 0
-                    self._preview_publish = None
-                    self._preview_progress_started = None
+                    self._preview.finish(preview_generation)
                     self.status_generation += 1
 
     def _update_preview_publish(self, generation, **values):
         with self.lock:
-            if self._publishing_preview_generation != generation:
+            snapshot = self._preview.record_progress(generation, values)
+            if snapshot is None:
                 return
-            current = dict(self._preview_publish or {})
-            next_stage = values.get("stage_name", current.get("stage_name"))
-            if next_stage != current.get("stage_name"):
-                self._preview_progress_started = time.monotonic()
-            current.update(values)
-            current["generation"] = generation
-            self._preview_publish = current
             self.status_generation += 1
-            snapshot = dict(current)
         self.events.append(
             "progress", str(snapshot.get("stage_name") or ""),
             source="service", operation="publishing_preview",
@@ -1481,13 +1447,13 @@ class ServiceState:
         def attach_process(process):
             with self.lock:
                 if (self.session_id == session_id
-                        and self._publishing_preview_generation == generation):
-                    self._preview_process = process
+                        and self._preview.owns(generation)):
+                    self._preview.process = process
 
         def detach_process(process):
             with self.lock:
-                if self._preview_process is process:
-                    self._preview_process = None
+                if self._preview.process is process:
+                    self._preview.process = None
                 self.status_generation += 1
 
         def session_valid():
@@ -1496,12 +1462,12 @@ class ServiceState:
 
         def previous_raw_manifest():
             with self.lock:
-                return self._previous_raw_preview_manifest
+                return self._preview.previous_raw_manifest
 
         def adopt_raw_manifest(path):
             with self.lock:
-                old_raw = self._previous_raw_preview_manifest
-                self._previous_raw_preview_manifest = path
+                old_raw = self._preview.previous_raw_manifest
+                self._preview.previous_raw_manifest = path
             return old_raw
 
         publisher = LasagnaPublisher(
@@ -1760,8 +1726,6 @@ class ServiceState:
         try:
             response = operation()
             with self.lock:
-                self.command_generation += 1
-                response["command_generation"] = self.command_generation
                 self.commands[key] = response
                 while len(self.commands) > MAX_DEDUPLICATED_COMMANDS:
                     self.commands.popitem(last=False)
@@ -1779,7 +1743,7 @@ class ServiceState:
         with self.lock:
             session = self.session
             self.session = None
-            process = self._preview_process
+            process = self._preview.process
         stop_process_group(process)
         if session:
             session.close()

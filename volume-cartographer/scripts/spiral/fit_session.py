@@ -56,6 +56,13 @@ from config import Config
 # from launch defaults, ignoring any autosave. A startup autosave is chosen
 # from explicit metadata sidecars (session namespace, dataset identity,
 # completed iterations), never from filename ordering.
+# Version 22 also drops the status fields nothing consumed:
+# service_generation (the constant 1; process identity is /health's
+# process_id), command_generation (replay is keyed by operation and command
+# ID), session_replacement_in_progress and replacement_old_session_released.
+# The counters that remain are session_generation (session identity),
+# session_revision (configuration/input revision) and generation (status
+# ordering).
 API_VERSION = 22
 
 

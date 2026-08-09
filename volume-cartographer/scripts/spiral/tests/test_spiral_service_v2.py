@@ -219,13 +219,13 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertNotIn("eta_seconds", state.status()["progress"])
 
         # The preview-publication progress block is also served raw.
-        state._publishing_preview_generation = 2
-        state._preview_publish = {
-            "generation": 2, "state": "running",
+        state._preview.claim("spiral-test-1", 2)
+        state._preview.record_progress(2, {
+            "state": "running",
             "stage_name": "Flattening preview surface",
             "step": 5, "total_steps": 10,
-        }
-        state._preview_progress_started = None
+        })
+        state._preview.stage_started = None
         progress = state.status()["progress"]
         self.assertEqual(progress["operation"], "publishing_preview")
         self.assertNotIn("eta_seconds", progress)
@@ -434,7 +434,11 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertIn("service_name", health)
         self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
-        self.assertIn("service_generation", health)
+        # Process identity is process_id; there is no service_generation
+        # counter (it was the constant 1 and nothing read it).
+        self.assertIn("process_id", health)
+        self.assertNotIn("service_generation", health)
+        self.assertNotIn("command_generation", health)
 
 
 class RestartTests(HttpServiceFixture):
@@ -553,6 +557,70 @@ class RouteTableTests(HttpServiceFixture):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request, data=b"{not json", timeout=10)
         self.assertEqual(caught.exception.code, 400)
+
+
+class CounterSurfaceTests(unittest.TestCase):
+    """What each surviving counter is for, and what no longer exists."""
+
+    def test_only_the_three_load_bearing_counters_are_published(self):
+        state = ServiceState()
+        base = state.status()
+        # Session identity, configuration/input revision, status ordering.
+        for key in ("session_generation", "session_revision", "generation"):
+            self.assertIn(key, base)
+        # Removed: nothing read them. Process identity is process_id.
+        for key in ("service_generation", "command_generation",
+                    "session_replacement_in_progress",
+                    "replacement_old_session_released"):
+            self.assertNotIn(key, base)
+        self.assertIn("process_id", state.health())
+
+    def test_command_replay_no_longer_stamps_a_counter(self):
+        state = ServiceState()
+        calls = []
+
+        def operation():
+            calls.append(1)
+            return {"ok": True}
+
+        first = state.replay_command("session_stop", "cmd-1", operation)
+        second = state.replay_command("session_stop", "cmd-1", operation)
+        # Deduplication is keyed by (operation, command ID); the counter it
+        # used to publish alongside the response was never a key.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        self.assertNotIn("command_generation", first)
+
+    def test_preview_publication_state_lives_in_one_record(self):
+        state = ServiceState()
+        for legacy in ("_registered_preview_generation",
+                       "_processed_preview_generation",
+                       "_publishing_preview_generation",
+                       "_preview_publish", "_preview_publish_error",
+                       "_preview_progress_started", "_preview_process",
+                       "_preview_artifact", "_previous_raw_preview_manifest"):
+            self.assertFalse(hasattr(state, legacy), legacy)
+
+        publication = state._preview
+        self.assertTrue(publication.claim("session-a", 4))
+        # One generation is published once: neither a replay of the same
+        # generation nor an older one claims it again.
+        self.assertFalse(publication.claim("session-a", 4))
+        self.assertFalse(publication.claim("session-a", 3))
+        self.assertEqual(state.status()["preview_publish"], None)
+        publication.record_progress(4, {"stage_name": "Flattening",
+                                        "step": 1, "total_steps": 4})
+        self.assertEqual(state.status()["preview_publish"]["generation"], 4)
+        self.assertEqual(state.status()["progress"]["operation"],
+                         "publishing_preview")
+        # A stale generation cannot write into the live record.
+        self.assertIsNone(publication.record_progress(3, {"step": 9}))
+
+        publication.finish(4)
+        self.assertEqual(publication.generation, 0)
+        self.assertEqual(publication.completed_generation, 4)
+        self.assertFalse(publication.claim("session-a", 4))
+        self.assertIsNone(state.status()["preview_publish"])
 
 
 class CommandReplayTests(unittest.TestCase):
@@ -2298,8 +2366,8 @@ class MappedPreviewArtifactTests(unittest.TestCase):
             current_manifest.write_text("{}")
             state = ServiceState()
             state.session_id = "session"
-            state._previous_raw_preview_manifest = str(previous_manifest)
-            state._preview_artifact = {"id": "previous-preview"}
+            state._preview.previous_raw_manifest = str(previous_manifest)
+            state._preview.artifact = {"id": "previous-preview"}
 
             with mock.patch.object(
                     state, "_publish_flattened_preview",
@@ -2310,10 +2378,17 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                 })
 
             self.assertEqual(
-                state._preview_artifact, {"id": "previous-preview"})
+                state._preview.artifact, {"id": "previous-preview"})
             self.assertTrue(previous.exists())
             self.assertFalse(current.exists())
-            self.assertIn("flatten failed", state._preview_publish_error)
+            self.assertIn("flatten failed", state._preview.error)
+            # One record holds the whole outcome: the failed generation is
+            # finished (never retried), nothing is in flight, and the
+            # previous successful raw generation is still the overlay base.
+            self.assertEqual(state._preview.generation, 0)
+            self.assertEqual(state._preview.completed_generation, 1)
+            self.assertEqual(state._preview.previous_raw_manifest,
+                             str(previous_manifest))
 
     def test_winding_membership_uses_flatten_correspondence(self):
         manifest = {
