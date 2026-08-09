@@ -160,6 +160,8 @@ class Volume:
                  path: Optional[str] = None,
                  download_only: bool = False,
                  anon: bool = False,
+                 cache: bool = False,
+                 cache_size_mb: int = 256,
                  read_retries: int = 4,
                  ):
 
@@ -202,6 +204,15 @@ class Volume:
         anon : bool, default = False
             If True, use anonymous (unsigned) requests for S3 access.
             Required for public S3 buckets when no AWS credentials are configured.
+        cache : bool, default = False
+            If True, keep an in-memory LRU cache of fetched chunks so repeated
+            reads of the same region (overlapping training patches, viewer
+            panning) are served locally instead of re-fetched from the remote
+            store. Byte-exact: the cache stores compressed chunks as-is, so
+            values are identical with or without it.
+        cache_size_mb : int, default = 256
+            Maximum size of the chunk cache in megabytes. Ignored unless
+            ``cache=True``.
         read_retries : int, default = 4
             Attempts per read in __getitem__. Transient remote failures — dropped
             connections, truncated payloads, 429/5xx — are retried with exponential
@@ -219,6 +230,8 @@ class Volume:
         self.return_as_tensor = return_as_tensor
         self.path = path
         self.verbose = verbose
+        self.cache = cache
+        self.cache_size_mb = cache_size_mb
         self.anon = anon
         self.read_retries = max(1, int(read_retries))
         self.inklabel = None  # Initialize inklabel
@@ -390,7 +403,9 @@ class Volume:
                 path=self.path,
                 mode='r',
                 storage_options=self._s3_storage_options(self.path),
-                verbose=self.verbose
+                verbose=self.verbose,
+                cache=self.cache,
+                cache_size_mb=self.cache_size_mb
             )
 
             # Get original dtype - handle both Array and Group cases
@@ -713,7 +728,9 @@ class Volume:
                 path=base_path,
                 mode='r',
                 storage_options=self._s3_storage_options(base_path),
-                verbose=self.verbose
+                verbose=self.verbose,
+                cache=self.cache,
+                cache_size_mb=self.cache_size_mb
             )
             
             if self.verbose:
