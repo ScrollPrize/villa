@@ -12,6 +12,10 @@ from numba import njit
 from scipy import ndimage
 from scipy.ndimage import distance_transform_edt
 from koine_machines.augmentation.translation import maybe_translate_normal_pooled_crop_bbox
+from koine_machines.augmentation.default_augmentations import (
+    create_spatial_intensity_no_clip_transforms,
+    create_spatial_only_transforms,
+)
 from koine_machines.common.common import (
     _read_bbox_with_padding,
     flat_patch_cache_path,
@@ -65,6 +69,8 @@ _IMAGE_NORMALIZATION_ALIASES = {
     "percentile_min_max": "percentile_minmax",
     "clipped_minmax": "percentile_minmax",
     "clipped_min_max": "percentile_minmax",
+    "divide": "divide",
+    "divide_255": "divide",
     "none": "none",
     "identity": "none",
 }
@@ -80,6 +86,81 @@ def _is_full_3d_like_mode(mode):
 
 def _includes_intersecting_segments_3d(mode):
     return str(mode).strip().lower() == "full_3d"
+
+
+def _flat_z_window_bbox(
+    bbox,
+    *,
+    config,
+    do_augmentations: bool,
+    is_validation: bool,
+):
+    """Shift a flat-mode Z window without padding or changing its depth."""
+    bbox = tuple(int(value) for value in bbox)
+    cfg = config.get("flat_z_window_jitter") or {}
+    enabled = bool(cfg.get("enabled", False))
+    max_offset = int(cfg.get("max_offset", 0))
+    base_depth = bbox[3] - bbox[0]
+    window_depth = int(cfg.get("window_depth", base_depth))
+    probability = float(cfg.get("probability", 1.0))
+    padding = str(cfg.get("padding", "forbidden")).strip().lower()
+    if max_offset < 0:
+        raise ValueError(f"flat_z_window_jitter.max_offset must be >= 0, got {max_offset}")
+    if window_depth <= 0 or window_depth > base_depth:
+        raise ValueError(
+            f"flat_z_window_jitter.window_depth must be in [1, {base_depth}], "
+            f"got {window_depth}"
+        )
+    depth_reduction = base_depth - window_depth
+    if depth_reduction % 2:
+        raise ValueError(
+            "flat_z_window_jitter requires a symmetric canonical crop; "
+            f"base depth {base_depth} minus window depth {window_depth} must be even"
+        )
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(
+            "flat_z_window_jitter.probability must be in [0, 1], "
+            f"got {probability}"
+        )
+    if padding != "forbidden":
+        raise ValueError(
+            "flat_z_window_jitter.padding must be 'forbidden'; this augmentation "
+            "uses real neighboring layers only"
+        )
+    trim = depth_reduction // 2
+    z0, y0, x0, z1, y1, x1 = bbox
+    canonical_bbox = (
+        z0 + trim,
+        y0,
+        x0,
+        z1 - trim,
+        y1,
+        x1,
+    )
+    if (
+        not enabled
+        or max_offset == 0
+        or not do_augmentations
+        or is_validation
+        or random.random() >= probability
+    ):
+        return canonical_bbox, 0
+    offset = random.randint(-max_offset, max_offset)
+    z0, y0, x0, z1, y1, x1 = canonical_bbox
+    return (z0 + offset, y0, x0, z1 + offset, y1, x1), offset
+
+
+def _require_z_bbox_inside(array, bbox, *, name: str) -> None:
+    z0, y0, x0, z1, y1, x1 = (int(value) for value in bbox)
+    shape = tuple(int(value) for value in array.shape)
+    if (
+        z0 < 0
+        or z1 > shape[0]
+    ):
+        raise ValueError(
+            f"{name} bbox {tuple(bbox)!r} exceeds array shape {shape!r}; "
+            "real-layer Z jitter forbids Z padding"
+        )
 
 
 def _uses_surface_mask_channel(mode):
@@ -116,7 +197,16 @@ def _image_normalization_config(config):
 
     normalized_mode = str(mode).strip().lower()
     normalized_mode = _IMAGE_NORMALIZATION_ALIASES.get(normalized_mode, normalized_mode)
-    if normalized_mode not in {"robust_mad", "robust_percentile_span", "minmax", "percentile_minmax", "none"}:
+    if normalized_mode not in {
+        "robust_mad",
+        "robust_percentile_span",
+        "minmax",
+        "percentile_minmax",
+        "clip_divide",
+        "clip_zscore",
+        "divide",
+        "none",
+    }:
         allowed = ", ".join(sorted(_IMAGE_NORMALIZATION_ALIASES))
         raise ValueError(f"Unsupported image_normalization mode {mode!r}; allowed: {allowed}")
     return normalized_mode, options
@@ -177,6 +267,49 @@ def _normalize_image_crop(image, config):
     mode, options = _image_normalization_config(config)
     if mode == "none":
         return np.asarray(image).astype(np.float32, copy=False)
+    if mode == "divide":
+        arr = np.asarray(image).astype(np.float32, copy=False)
+        divisor = float(options.get("divisor", 255.0))
+        if divisor <= 0:
+            raise ValueError(f"divide requires divisor > 0, got {divisor!r}")
+        arr /= divisor
+        return arr
+    if mode == "clip_divide":
+        arr = np.asarray(image).astype(np.float32, copy=False)
+        clip_min = float(options.get("clip_min", 0.0))
+        clip_max = float(options.get("clip_max", 200.0))
+        divisor = float(options.get("divisor", 255.0))
+        if not clip_min < clip_max:
+            raise ValueError(
+                "clip_divide requires clip_min < clip_max, "
+                f"got {clip_min!r} and {clip_max!r}"
+            )
+        if divisor <= 0:
+            raise ValueError(
+                f"clip_divide requires divisor > 0, got {divisor!r}"
+            )
+        np.clip(arr, clip_min, clip_max, out=arr)
+        arr /= divisor
+        np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return arr
+    if mode == "clip_zscore":
+        arr = np.asarray(image).astype(np.float32, copy=False)
+        clip_min = float(options["clip_min"])
+        clip_max = float(options["clip_max"])
+        mean = float(options["mean"])
+        std = float(options["std"])
+        if not clip_min < clip_max:
+            raise ValueError(
+                "clip_zscore requires clip_min < clip_max, "
+                f"got {clip_min!r} and {clip_max!r}"
+            )
+        if std <= 0:
+            raise ValueError(f"clip_zscore requires std > 0, got {std!r}")
+        np.clip(arr, clip_min, clip_max, out=arr)
+        arr -= mean
+        arr /= std
+        np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return arr
 
     percentile_lower, percentile_upper = _normalization_percentiles(options)
     if mode == "robust_mad":
@@ -1104,8 +1237,35 @@ class InkDataset(Dataset):
         self._segments_by_native_volume_key = {}
   
 
-        if self.do_augmentations:
-            self.augmentations = create_training_transforms(self.patch_size)
+        augmentation_preset = str(config.get("augmentation_preset", "default")).strip().lower()
+        if augmentation_preset not in {
+            "default",
+            "spatial_only",
+            "spatial_intensity_no_clip",
+            "none",
+        }:
+            raise ValueError(
+                "augmentation_preset must be one of "
+                "{'default', 'spatial_only', 'spatial_intensity_no_clip', 'none'}, "
+                f"got {config.get('augmentation_preset')!r}"
+            )
+        if (
+            self.do_augmentations
+            and not bool(config.get("disable_augmentations", False))
+            and augmentation_preset != "none"
+        ):
+            if augmentation_preset == "spatial_only":
+                self.augmentations = create_spatial_only_transforms(
+                    tuple(int(value) for value in self.patch_size),
+                    allowed_rotation_axes=config.get("augmentation_rotation_axes"),
+                )
+            elif augmentation_preset == "spatial_intensity_no_clip":
+                self.augmentations = create_spatial_intensity_no_clip_transforms(
+                    tuple(int(value) for value in self.patch_size),
+                    allowed_rotation_axes=config.get("augmentation_rotation_axes"),
+                )
+            else:
+                self.augmentations = create_training_transforms(self.patch_size)
         else:
             self.augmentations = None
 
@@ -1324,15 +1484,53 @@ class InkDataset(Dataset):
         for dataset_idx, ds in enumerate(self.datasets):
 
             seg_path = Path(ds['segments_path'])
+            segment_allowlist = {
+                str(name) for name in (ds.get("segments") or ds.get("segment_names") or [])
+            }
 
             for tifxyz_folder in sorted(seg_path.iterdir()):
                 if not tifxyz_folder.is_dir() or tifxyz_folder.name == 'unused':
                     continue
-                if not any(tifxyz_folder.rglob('x.tif')):
+                if segment_allowlist and tifxyz_folder.name not in segment_allowlist:
+                    continue
+                has_explicit_surface_volume = bool(
+                    ds.get("surface_volume_paths")
+                    or ds.get("surface_volume_path") not in (None, "")
+                )
+                needs_tifxyz_coordinates = (
+                    _is_native_3d_mode(self.mode)
+                    or not has_explicit_surface_volume
+                )
+                if needs_tifxyz_coordinates and not any(tifxyz_folder.rglob('x.tif')):
                     continue
 
+                segment_relpath = tifxyz_folder.relative_to(seg_path).as_posix()
                 if _is_native_3d_mode(self.mode):
                     image_volume = _coerce_volume_path(ds['volume_path'])
+                elif ds.get("surface_volume_paths"):
+                    volume_paths = ds["surface_volume_paths"]
+                    if not isinstance(volume_paths, dict):
+                        raise TypeError(
+                            "surface_volume_paths must be an object keyed by "
+                            "segment name or relative path"
+                        )
+                    explicit_path = volume_paths.get(
+                        segment_relpath, volume_paths.get(tifxyz_folder.name)
+                    )
+                    if explicit_path in (None, ""):
+                        raise KeyError(
+                            "surface_volume_paths has no entry for "
+                            f"segment {segment_relpath!r}"
+                        )
+                    image_volume = _coerce_volume_path(explicit_path)
+                elif ds.get("surface_volume_path") not in (None, ""):
+                    if len(segment_allowlist) != 1:
+                        raise ValueError(
+                            "surface_volume_path is only unambiguous with exactly "
+                            "one allowlisted segment; use surface_volume_paths for "
+                            "multiple segments"
+                        )
+                    image_volume = _coerce_volume_path(ds["surface_volume_path"])
                 else:
                     image_volume = Path(str(tifxyz_folder) + "/" + tifxyz_folder.name + '.zarr')
 
@@ -1341,7 +1539,7 @@ class InkDataset(Dataset):
                     image_volume=image_volume,
                     scale=ds['volume_scale'],
                     dataset_idx=dataset_idx,
-                    segment_relpath=tifxyz_folder.relative_to(seg_path).as_posix(),
+                    segment_relpath=segment_relpath,
                     segment_dir=tifxyz_folder,
                     segment_name=tifxyz_folder.name,
                 )
@@ -1752,27 +1950,45 @@ class InkDataset(Dataset):
 
             # for pooled 2d, this is the only block that applies (outside of potential resampling)
             else:
+                flat_bbox, _z_window_offset = _flat_z_window_bbox(
+                    patch.bbox,
+                    config=self.config,
+                    do_augmentations=self.do_augmentations,
+                    is_validation=patch.is_validation,
+                )
+                require_real_z = bool(
+                    (self.config.get("flat_z_window_jitter") or {}).get(
+                        "enabled", False
+                    )
+                )
                 image_vol = self._get_cached_zarr(patch.image_volume, resolution=patch.segment.scale)
-                image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, patch.bbox, fill_value=0)
+                if require_real_z:
+                    _require_z_bbox_inside(image_vol, flat_bbox, name="image")
+                image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, flat_bbox, fill_value=0)
                 if getattr(patch, 'is_unlabeled', False):
                     supervision_crop = np.zeros(expected_shape, dtype=np.uint8)
                     inklabels_crop = np.zeros(expected_shape, dtype=np.uint8)
                 else:
                     supervision_mask = self._get_cached_zarr(patch.supervision_mask, resolution=patch.segment.scale)
                     inklabels = self._get_cached_zarr(patch.inklabels, resolution=patch.segment.scale)
+                    if require_real_z:
+                        _require_z_bbox_inside(supervision_mask, flat_bbox, name="supervision")
+                        _require_z_bbox_inside(inklabels, flat_bbox, name="inklabels")
                     validation_mask = None
                     if (not patch.is_validation) and patch.segment.validation_mask is not None:
                         validation_mask = self._get_cached_zarr(patch.segment.validation_mask,resolution=patch.segment.scale)
                         
-                    supervision_crop, _ = _read_bbox_with_padding(supervision_mask, patch.bbox, fill_value=0)
+                    supervision_crop, _ = _read_bbox_with_padding(supervision_mask, flat_bbox, fill_value=0)
                     if validation_mask is not None:
-                        validation_crop, _ = _read_bbox_with_padding(validation_mask, patch.bbox, fill_value=0)
+                        if require_real_z:
+                            _require_z_bbox_inside(validation_mask, flat_bbox, name="validation")
+                        validation_crop, _ = _read_bbox_with_padding(validation_mask, flat_bbox, fill_value=0)
                         supervision_crop = _exclude_validation_voxels_from_training_supervision(
                             supervision_crop,
                             validation_crop,
                             is_validation_patch=patch.is_validation,
                         )
-                    inklabels_crop, _ = _read_bbox_with_padding(inklabels, patch.bbox, fill_value=0)
+                    inklabels_crop, _ = _read_bbox_with_padding(inklabels, flat_bbox, fill_value=0)
 
             if resample_idx is None:
                 image_crop = image_crop.astype(np.float32, copy=False)

@@ -8,7 +8,7 @@ import zarr
 
 from koine_machines.common.disk_cache import wrap_store_with_disk_cache
 
-_FLAT_PATCH_FINDING_CACHE_VERSION = "v4"
+_FLAT_PATCH_FINDING_CACHE_VERSION = "v6"
 _PUBLIC_S3_VOLUME_SUBSTRINGS = ("vesuvius-challenge-open-data",)
 
 
@@ -68,7 +68,12 @@ def flat_patch_finding_cache_token(config):
             f"-mdc-{config.get('unlabeled_patch_min_data_coverage', 0.15)}"
             f"-pfs-{pfs}"
         )
-    return f"labeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}-po-{config.get('patch_overlap', '')}-pfs-{pfs}"
+    return (
+        f"labeled-default-{_FLAT_PATCH_FINDING_CACHE_VERSION}"
+        f"-po-{config.get('patch_overlap', '')}"
+        f"-mlc-{config.get('patch_min_labeled_coverage', 0.0)}"
+        f"-pfs-{pfs}"
+    )
 
 
 def save_flat_patch_cache(path, patches):

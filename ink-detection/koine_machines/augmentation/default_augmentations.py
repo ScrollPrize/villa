@@ -102,6 +102,78 @@ def _coarse_dropout_size_ranges(
     )
 
 
+def create_spatial_only_transforms(
+    patch_size: Tuple[int, ...],
+    allowed_rotation_axes: Optional[List[int]] = None,
+) -> ComposeTransforms:
+    """Create label-safe in-plane flips and rotations without intensity edits."""
+    dimension = len(patch_size)
+    if dimension not in (2, 3):
+        raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3.")
+
+    transforms = [
+        MirrorTransform(allowed_axes=_mirror_axes_for_dimension(dimension)),
+    ]
+    rot90_allowed_axes = _rot90_allowed_axes_for_patch(
+        tuple(int(value) for value in patch_size),
+        allowed_rotation_axes,
+    )
+    if rot90_allowed_axes is not None:
+        transforms.append(
+            RandomTransform(
+                Rot90Transform(
+                    num_axis_combinations=1,
+                    num_rot_per_combination=(1, 2, 3),
+                    allowed_axes=rot90_allowed_axes,
+                ),
+                apply_probability=0.3,
+            )
+        )
+    return ComposeTransforms(transforms)
+
+
+def create_spatial_intensity_no_clip_transforms(
+    patch_size: Tuple[int, ...],
+    allowed_rotation_axes: Optional[List[int]] = None,
+) -> ComposeTransforms:
+    """Spatial transforms plus bounded intensity edits that never clamp."""
+    spatial = create_spatial_only_transforms(
+        patch_size,
+        allowed_rotation_axes=allowed_rotation_axes,
+    )
+    transforms = list(spatial.transforms)
+    transforms.extend(
+        [
+            RandomTransform(
+                InvertImageTransform(
+                    p_invert_image=1.0,
+                    p_synchronize_channels=1.0,
+                    p_per_channel=1.0,
+                ),
+                apply_probability=0.2,
+            ),
+            RandomTransform(
+                BrightnessAdditiveTransform(
+                    mu=(-0.15, 0.15),
+                    sigma=0.0,
+                    synchronize_channels=True,
+                    p_per_channel=1.0,
+                ),
+                apply_probability=0.3,
+            ),
+            RandomTransform(
+                GaussianNoiseTransform(
+                    noise_variance=(0.005, 0.03),
+                    p_per_channel=1.0,
+                    synchronize_channels=True,
+                ),
+                apply_probability=0.25,
+            ),
+        ]
+    )
+    return ComposeTransforms(transforms)
+
+
 def create_training_transforms(
     patch_size: Tuple[int, ...],
     no_spatial: bool = False,
