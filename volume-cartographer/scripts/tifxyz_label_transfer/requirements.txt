@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.11
+tifffile>=2024.8.30
+imagecodecs>=2024.6.1
+numcodecs>=0.13,<0.16
+Pillow>=10
+zarr>=2.17,<3
