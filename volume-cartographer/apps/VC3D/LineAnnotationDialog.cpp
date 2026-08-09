@@ -33,7 +33,6 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QProgressBar>
-#include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
 #include <QSignalBlocker>
@@ -41,7 +40,9 @@
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
+#include <QPushButton>
 #include <QSpinBox>
+#include <QWidgetAction>
 #include <QVariant>
 #include <QTimer>
 #include <QToolButton>
@@ -509,7 +510,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // the main window's.
     auto* annotationMenuButton = new QToolButton(buttonRow);
     annotationMenuButton->setObjectName(QStringLiteral("lineAnnotationMenuButton"));
-    annotationMenuButton->setText(tr("Annotation"));
+    // Classic hamburger glyph; the arrow-style menu indicator would be
+    // redundant next to it.
+    annotationMenuButton->setText(QStringLiteral("☰"));
+    annotationMenuButton->setToolTip(tr("Menu"));
+    annotationMenuButton->setStyleSheet(
+        QStringLiteral("QToolButton::menu-indicator { image: none; }"));
     annotationMenuButton->setPopupMode(QToolButton::InstantPopup);
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);
@@ -535,8 +541,126 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_showAsMeshAction, &QAction::triggered, this, [this]() {
         emit showAsMeshRequested();
     });
+    annotationMenu->addSeparator();
+    _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
+    _lasagnaDatasetMenu->setToolTipsVisible(true);
+    _lasagnaDatasetMenu->menuAction()->setToolTip(
+        tr("Select the Lasagna dataset used for line annotation."));
+    _fiberInferenceDatasetMenu = annotationMenu->addMenu(tr("Fiber dataset"));
+    _fiberInferenceDatasetMenu->setToolTipsVisible(true);
+    _fiberInferenceDatasetMenu->menuAction()->setToolTip(
+        tr("Select the fiber inference dataset used for line annotation."));
+    annotationMenu->addSeparator();
+    // Length / Extrapolation live in the menu as embedded label+spinbox rows
+    // (QWidgetAction); editing them does not close the menu. Spinbox edits are
+    // uncommitted until the row's Apply button: the getters return the applied
+    // values, and reopening the menu reverts any abandoned edit.
+    const auto addSpinBoxMenuRow = [annotationMenu](const QString& label,
+                                                    QSpinBox* spin) -> QPushButton* {
+        auto* row = new QWidget(annotationMenu);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(28, 3, 12, 3);
+        rowLayout->setSpacing(8);
+        rowLayout->addWidget(new QLabel(label, row));
+        rowLayout->addStretch(1);
+        spin->setParent(row);
+        rowLayout->addWidget(spin);
+        auto* apply = new QPushButton(QObject::tr("Apply"), row);
+        apply->setEnabled(false);
+        rowLayout->addWidget(apply);
+        auto* action = new QWidgetAction(annotationMenu);
+        action->setDefaultWidget(row);
+        annotationMenu->addAction(action);
+        return apply;
+    };
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _appliedInitialCenterlineLengthVx =
+            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
+                .toInt();
+        _appliedExtrapolationDistanceVx =
+            settings.value(
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
+                .toInt();
+    }
+    _initialCenterlineLengthSpin = new QSpinBox;
+    _initialCenterlineLengthSpin->setObjectName(
+        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
+    _initialCenterlineLengthSpin->setRange(100, 1000000);
+    _initialCenterlineLengthSpin->setSingleStep(100);
+    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
+    _initialCenterlineLengthSpin->setToolTip(
+        tr("Total length of a newly generated centerline, split equally around the seed."));
+    _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
+    // Read back rather than trusting the setting: a stale or hand-edited value
+    // outside the spinbox range would otherwise reach the optimizer unclamped
+    // while the row displayed the clamped one.
+    _appliedInitialCenterlineLengthVx = _initialCenterlineLengthSpin->value();
+    auto* lengthApply = addSpinBoxMenuRow(tr("Length"), _initialCenterlineLengthSpin);
+    connect(_initialCenterlineLengthSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this, lengthApply](int value) {
+                lengthApply->setEnabled(value != _appliedInitialCenterlineLengthVx);
+            });
+    connect(lengthApply, &QPushButton::clicked, this, [this, lengthApply]() {
+        _appliedInitialCenterlineLengthVx = _initialCenterlineLengthSpin->value();
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                          _appliedInitialCenterlineLengthVx);
+        lengthApply->setEnabled(false);
+    });
+    _extrapolationDistanceSpin = new QSpinBox;
+    _extrapolationDistanceSpin->setObjectName(
+        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
+    _extrapolationDistanceSpin->setRange(0, 1000000);
+    _extrapolationDistanceSpin->setSingleStep(100);
+    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
+    _extrapolationDistanceSpin->setToolTip(
+        tr("Distance generated beyond each outer control point."));
+    _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+    _appliedExtrapolationDistanceVx = _extrapolationDistanceSpin->value();
+    auto* extrapolationApply =
+        addSpinBoxMenuRow(tr("Extrapolation"), _extrapolationDistanceSpin);
+    connect(_extrapolationDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this, extrapolationApply](int value) {
+                extrapolationApply->setEnabled(value != _appliedExtrapolationDistanceVx);
+            });
+    connect(extrapolationApply, &QPushButton::clicked, this, [this, extrapolationApply]() {
+        _appliedExtrapolationDistanceVx = _extrapolationDistanceSpin->value();
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                          _appliedExtrapolationDistanceVx);
+        extrapolationApply->setEnabled(false);
+        emit extrapolationDistanceChanged(_appliedExtrapolationDistanceVx);
+    });
+    // Reopening the menu discards uncommitted edits (setValue back to the
+    // applied values also re-disables the Apply buttons via valueChanged).
+    connect(annotationMenu, &QMenu::aboutToShow, this, [this, lengthApply, extrapolationApply]() {
+        _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
+        _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+        lengthApply->setEnabled(false);
+        extrapolationApply->setEnabled(false);
+    });
+    annotationMenu->addSeparator();
+    _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
+    _resetViewsAction->setEnabled(false);
+    connect(_resetViewsAction, &QAction::triggered, this, [this]() {
+        resetGeneratedViews();
+    });
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
+
+    if (volumeSelectorFactory) {
+        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
+            volumeSelector->installEventFilter(this);
+            buttonLayout->addWidget(volumeSelector);
+        }
+    }
 
     _fiberOptimizationCombo = new QComboBox(buttonRow);
     _fiberOptimizationCombo->setObjectName(
@@ -556,78 +680,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 emit fiberOptimizationModeChanged(fiberOptimizationMode());
             });
 
-    _datasetMenuButton = new QToolButton(buttonRow);
-    _datasetMenuButton->setObjectName(QStringLiteral("lineAnnotationDatasetMenuButton"));
-    _datasetMenuButton->setText(tr("Datasets"));
-    _datasetMenuButton->setPopupMode(QToolButton::InstantPopup);
-    _datasetMenuButton->setToolTip(tr("Select the Lasagna and fiber inference datasets used for line annotation."));
-    _datasetMenuButton->installEventFilter(this);
-    auto* datasetMenu = new QMenu(_datasetMenuButton);
-    datasetMenu->setToolTipsVisible(true);
-    _lasagnaDatasetMenu = datasetMenu->addMenu(tr("Lasagna dataset"));
-    _fiberInferenceDatasetMenu = datasetMenu->addMenu(tr("Fiber dataset"));
-    _datasetMenuButton->setMenu(datasetMenu);
-    buttonLayout->addWidget(_datasetMenuButton);
     rebuildDatasetMenus();
 
-    auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
-    centerlineLengthLabel->installEventFilter(this);
-    buttonLayout->addWidget(centerlineLengthLabel);
-    _initialCenterlineLengthSpin = new QSpinBox(buttonRow);
-    _initialCenterlineLengthSpin->setObjectName(
-        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
-    _initialCenterlineLengthSpin->setRange(100, 1000000);
-    _initialCenterlineLengthSpin->setSingleStep(100);
-    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
-    _initialCenterlineLengthSpin->setToolTip(
-        tr("Total length of a newly generated centerline, split equally around the seed."));
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        _initialCenterlineLengthSpin->setValue(
-            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
-                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
-                .toInt());
-    }
-    _initialCenterlineLengthSpin->installEventFilter(this);
-    buttonLayout->addWidget(_initialCenterlineLengthSpin);
-    connect(_initialCenterlineLengthSpin,
-            qOverload<int>(&QSpinBox::valueChanged),
-            this,
-            [](int value) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(
-                    vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
-            });
-    _extrapolationDistanceSpin = new QSpinBox(buttonRow);
-    _extrapolationDistanceSpin->setObjectName(
-        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
-    _extrapolationDistanceSpin->setRange(0, 1000000);
-    _extrapolationDistanceSpin->setSingleStep(100);
-    _extrapolationDistanceSpin->setKeyboardTracking(false);
-    _extrapolationDistanceSpin->setPrefix(tr("Extrapolation "));
-    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
-    _extrapolationDistanceSpin->setToolTip(
-        tr("Distance generated beyond each outer control point."));
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        _extrapolationDistanceSpin->setValue(
-            settings.value(
-                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
-                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
-                .toInt());
-    }
-    _extrapolationDistanceSpin->installEventFilter(this);
-    buttonLayout->addWidget(_extrapolationDistanceSpin);
-    connect(_extrapolationDistanceSpin,
-            qOverload<int>(&QSpinBox::valueChanged),
-            this,
-            [this](int value) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(
-                    vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
-                    value);
-                emit extrapolationDistanceChanged(value);
-            });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
     buttonLayout->addWidget(maxDistanceLabel);
@@ -655,12 +709,6 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                                   value);
                 updateGeneratedDynamicOverlaysFast(false, false);
             });
-    if (volumeSelectorFactory) {
-        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
-            volumeSelector->installEventFilter(this);
-            buttonLayout->addWidget(volumeSelector);
-        }
-    }
     auto* tagsLabel = new QLabel(tr("Tags:"), buttonRow);
     tagsLabel->installEventFilter(this);
     buttonLayout->addWidget(tagsLabel);
@@ -690,15 +738,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setMinimumWidth(0);
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
-    _resetViewsButton = new QPushButton(tr("Reset views"), buttonRow);
-    _resetViewsButton->setEnabled(false);
-    _resetViewsButton->installEventFilter(this);
-    buttonLayout->addWidget(_resetViewsButton);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
-    connect(_resetViewsButton, &QPushButton::clicked, this, [this]() {
-        resetGeneratedViews();
-    });
     installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
@@ -732,16 +773,12 @@ LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMod
 
 int LineAnnotationDialog::initialCenterlineLengthVx() const
 {
-    return _initialCenterlineLengthSpin
-        ? _initialCenterlineLengthSpin->value()
-        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+    return _appliedInitialCenterlineLengthVx;
 }
 
 int LineAnnotationDialog::extrapolationDistanceVx() const
 {
-    return _extrapolationDistanceSpin
-        ? _extrapolationDistanceSpin->value()
-        : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
+    return _appliedExtrapolationDistanceVx;
 }
 
 vc3d::line_annotation::FiberOptimizationMode
@@ -825,10 +862,6 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                  _fiberInferenceDatasetOptions,
                  _selectedFiberInferenceDatasetLocation,
                  true);
-    if (_datasetMenuButton) {
-        _datasetMenuButton->setEnabled(
-            !_lasagnaDatasetOptions.empty() || !_fiberInferenceDatasetOptions.empty());
-    }
 }
 
 int LineAnnotationDialog::maxControlPointDistanceVx() const
@@ -1186,8 +1219,8 @@ bool LineAnnotationDialog::setGeneratedRows(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     clearGeneratedOverlayRefreshConnections();
@@ -1576,8 +1609,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         if (_fullOptimizationAction) {
             _fullOptimizationAction->setEnabled(true);
         }
-        if (_resetViewsButton) {
-            _resetViewsButton->setEnabled(true);
+        if (_resetViewsAction) {
+            _resetViewsAction->setEnabled(true);
         }
         return true;
     }
@@ -1588,8 +1621,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     const bool replacingGeneratedViews = _hasGeneratedViews;
@@ -1968,8 +2001,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _fullOptimizationAction->setEnabled(true);
     }
     captureInitialGeneratedViewState();
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(true);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(true);
     }
     return true;
 }
@@ -2478,6 +2511,23 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
     }
 }
 
+void LineAnnotationDialog::resetGeneratedNormalOffsets()
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    resetGeneratedCutNormalOffsets(true);
+    for (const auto& strip : _stripViewers) {
+        if (!strip) {
+            continue;
+        }
+        const float offset = strip->normalOffset();
+        if (offset != 0.0f) {
+            strip->adjustSurfaceOffset(-offset);
+        }
+    }
+}
+
 void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
 {
     // Programmatic twin of the private toggle.
@@ -2636,6 +2686,7 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
     bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::snapPanesToOverviewCursor);
     bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
+    bindNavigationShortcut(Qt::Key_B, &LineAnnotationDialog::resetGeneratedNormalOffsets);
 
     auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
     spaceShortcut->setContext(Qt::WindowShortcut);
@@ -3749,6 +3800,12 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
         (void)toggleCurrentCutFollowFromKeyboard();
+        event->accept();
+        return true;
+    }
+    if (event->key() == Qt::Key_B && event->modifiers() == Qt::NoModifier &&
+        !event->isAutoRepeat()) {
+        resetGeneratedNormalOffsets();
         event->accept();
         return true;
     }
