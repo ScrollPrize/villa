@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+import dataclasses
 import errno
 import json
 import os
@@ -1170,6 +1171,82 @@ class ServiceState:
         saved = session.save_checkpoint(str(resolved))
         return {**self.status(), "checkpoint_path": saved}
 
+    def _resolve_loadable_checkpoint(self, path):
+        """Where an in-session load may read a checkpoint from.
+
+        The same rule the session-load request uses: a checkpoint this
+        service advertises, or one under the session output directory (which
+        is where uploaded checkpoints and autosaves land).
+        """
+        if not path:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Checkpoint path is required")
+        resolved = Path(path).expanduser().resolve(strict=False)
+        if not resolved.is_file():
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Checkpoint does not exist on the service host",
+                           [{"field": "path", "message": "No such file"}])
+        if self.dataset_resolution is not None:
+            advertised = set(
+                self.dataset_resolution.to_dict().get("detected_checkpoints", []))
+            output_root = Path(
+                self.session_paths.output_directory).resolve(strict=False)
+            if (str(resolved) not in advertised
+                    and not resolved.is_relative_to(output_root)):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Checkpoint must be one the service advertises or one "
+                    "under the session output directory",
+                    [{"field": "path",
+                      "message": "Not a service-advertised checkpoint"}])
+        return str(resolved)
+
+    def load_checkpoint(self, request):
+        """Load a checkpoint into the resident model, strictly.
+
+        The session keeps its model, its inputs and its identity: this verb
+        only replaces model/optimiser/scheduler/RNG state, and only when the
+        checkpoint matches the live model exactly. A checkpoint describing a
+        different model domain or structure is refused here rather than
+        rebuilt behind the client's back; that is what a new fit is for.
+        """
+        session = self._require_session()
+        path = self._resolve_loadable_checkpoint(request.get("path"))
+        state = session.status().get("state")
+        if state != SessionState.Idle:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"Loading a checkpoint requires an idle session (state is "
+                f"{SessionState(state).name})")
+        try:
+            result = session.load_checkpoint(path)
+        except ApiError:
+            raise
+        except BaseException as exc:
+            if session.status().get("state") == SessionState.Error:
+                # The failure happened while the checkpoint was being applied.
+                # The session is gone, not merely unchanged; say so.
+                raise ApiError(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"Checkpoint load failed after preflight: {exc}") from exc
+            raise ApiError(HTTPStatus.CONFLICT,
+                           f"Checkpoint refused: {exc}") from exc
+        with self.lock:
+            if self.session_paths is not None:
+                self.session_paths = dataclasses.replace(
+                    self.session_paths, checkpoint=path)
+            if self.session_request:
+                paths = dict(self.session_request.get("paths") or {})
+                paths["checkpoint"] = path
+                self.session_request = {**self.session_request, "paths": paths}
+            # Plans computed against the replaced model are stale.
+            self.run_plans.clear()
+            self.session_revision += 1
+            self.status_generation += 1
+        return {**self.status(), "loaded": True, "checkpoint_path": path,
+                "restored_iteration": result.get("completed_iterations"),
+                "config_revision": result.get("config_revision")}
+
     def download_checkpoint(self):
         """Create a checkpoint and publish it as a downloadable artifact."""
         session = self._require_session()
@@ -1745,6 +1822,9 @@ ROUTES = (
           reads_body=True),
     Route("POST", "/session/save-checkpoint", "save_checkpoint",
           lambda ctx: ctx.state.save_checkpoint(ctx.body),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/load-checkpoint", "load_checkpoint",
+          lambda ctx: ctx.state.load_checkpoint(ctx.body),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/download-checkpoint", "download_checkpoint",
           lambda ctx: ctx.state.download_checkpoint(),

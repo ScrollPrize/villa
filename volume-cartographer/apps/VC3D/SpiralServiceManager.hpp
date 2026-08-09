@@ -68,6 +68,10 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
+    // Load a checkpoint into the resident session without replacing it. The
+    // service refuses anything that is not an exact match for the live model;
+    // a client-local file is uploaded first.
+    void loadCheckpointIntoSession(const QString& checkpoint);
     void deleteSession();
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
@@ -103,6 +107,8 @@ signals:
                                     qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
+    // A checkpoint was loaded into the live session at the given iteration.
+    void checkpointLoaded(const QString& hostPath, qint64 restoredIteration);
     void inputUploadFinished(const QString& inputId, const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);

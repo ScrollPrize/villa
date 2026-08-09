@@ -132,6 +132,7 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    QPushButton* _loadCheckpoint = nullptr;
     QLineEdit* _datasetRoot = nullptr;
     QLineEdit* _outputRoot = nullptr;
     QLineEdit* _cacheRoot = nullptr;

@@ -11,6 +11,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import copy
 import json
 import glob
+from collections.abc import Mapping
 import zarr
 import torch
 import wandb
@@ -114,6 +115,70 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
+
+
+# Configuration keys that shape the model's parameter tensors. A checkpoint
+# whose stored value for any of them differs describes a different model, and
+# is refused rather than reshaped: a domain/structure change is the explicit
+# rebuild path's job.
+CHECKPOINT_MODEL_SHAPE_KEYS = (
+    'model_num_flow_integration_steps', 'model_flow_integration_solver',
+    'model_num_flow_timesteps', 'model_flow_bounds_z_margin',
+    'model_flow_bounds_radius', 'model_flow_voxel_resolution',
+    'model_flow_field_type', 'model_gap_expander_logit_resolution',
+    'model_gap_expander_num_windings', 'model_linear_z_resolution',
+)
+
+# Fields of a surf-SDT fingerprint that describe where the store lives and how
+# much of it has been built, rather than what it contains.
+_SDT_COVERAGE_AND_LOCATION_KEYS = (
+    'path', 'source', 'complete', 'z_range_working', 'built_z_ranges_working',
+)
+
+
+def comparable_sdt_fingerprint(fingerprint):
+    """The content-identity subset of a surf-SDT fingerprint."""
+    if not fingerprint:
+        return None
+    return {key: value for key, value in fingerprint.items()
+            if key not in _SDT_COVERAGE_AND_LOCATION_KEYS}
+
+
+class CheckpointVerdict:
+    """The result of one CPU-side checkpoint preflight.
+
+    A verdict is a value, not an exception: an all-rank load has to collect
+    one from every rank and only then decide, so phase 1 must be able to
+    refuse without unwinding anything.
+    """
+
+    __slots__ = ('accepted', 'reasons', 'completed_iterations', 'source')
+
+    def __init__(self, accepted, reasons=(), completed_iterations=None,
+                 source=''):
+        self.accepted = bool(accepted)
+        self.reasons = tuple(reasons)
+        self.completed_iterations = completed_iterations
+        self.source = source
+
+    def message(self):
+        source = f' {self.source}' if self.source else ''
+        if self.accepted:
+            return f'checkpoint{source} is compatible with this fit'
+        return (f'checkpoint{source} is not compatible with this fit:\n  - '
+                + '\n  - '.join(self.reasons))
+
+    def to_dict(self):
+        return {
+            'accepted': self.accepted,
+            'reasons': list(self.reasons),
+            'completed_iterations': self.completed_iterations,
+            'source': self.source,
+        }
+
+    def __repr__(self):
+        return (f'CheckpointVerdict(accepted={self.accepted!r}, '
+                f'reasons={self.reasons!r})')
 
 
 def get_env_config_overrides():
@@ -1619,64 +1684,13 @@ class FitContext:
                 'loading', 'Loading fit checkpoint',
                 detail=os.path.basename(resume_path))
             resume_checkpoint = load_checkpoint_cpu(resume_path)
-            checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
-            if checkpoint_lasagna_scale != self.lasagna_scale:
-                raise RuntimeError(
-                    f'checkpoint {resume_path} has lasagna_scale={checkpoint_lasagna_scale!r}; '
-                    f'this run uses lasagna_scale={self.lasagna_scale!r}'
-                )
-            if isinstance(resume_checkpoint, dict) and resume_checkpoint.get('schema_version', 1) >= 2:
-                if resume_checkpoint.get('lasagna_group') != self.normal_zarr_group:
-                    raise RuntimeError(
-                        f'checkpoint Lasagna group {resume_checkpoint.get("lasagna_group")!r} '
-                        f'does not match requested group {self.normal_zarr_group!r}'
-                    )
-                if resume_checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
-                    raise RuntimeError(
-                        f'checkpoint outward sense {resume_checkpoint.get("spiral_outward_sense")!r} '
-                        f'does not match requested sense {self.spiral_outward_sense!r}'
-                    )
-                # The SDT store is an independent input: the Lasagna group/scale
-                # checks above do not cover it. Reject an unexpected change in its
-                # content fingerprint whenever an SDT-driven loss is enabled.
-                # Paths may legitimately move and coverage may legitimately grow
-                # (--resume extension of an ROI-first build), so only the
-                # content-identity fields compare - 'created'/'git_commit' are
-                # stamped once at store creation and anchor the identity.
-                if self.phase_mode:
-                    coverage_and_location_keys = (
-                        'path', 'source', 'complete',
-                        'z_range_working', 'built_z_ranges_working',
-                    )
-
-                    def _comparable_sdt_fingerprint(fingerprint):
-                        if not fingerprint:
-                            return None
-                        return {key: value for key, value in fingerprint.items()
-                                if key not in coverage_and_location_keys}
-                    checkpoint_fingerprint = _comparable_sdt_fingerprint(
-                        resume_checkpoint.get('surf_sdt_fingerprint'))
-                    current_fingerprint = _comparable_sdt_fingerprint(
-                        self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None)
-                    if (checkpoint_fingerprint is not None
-                            and checkpoint_fingerprint != current_fingerprint):
-                        raise RuntimeError(
-                            'checkpoint surf-SDT fingerprint does not match the resolved store '
-                            f'while an SDT-driven loss is enabled:\n  checkpoint: '
-                            f'{checkpoint_fingerprint}\n  current:    {current_fingerprint}')
-                checkpoint_cfg = resume_checkpoint.get('cfg', {})
-                shape_keys = (
-                    'model_num_flow_integration_steps', 'model_flow_integration_solver', 'model_num_flow_timesteps',
-                    'model_flow_bounds_z_margin', 'model_flow_bounds_radius', 'model_flow_voxel_resolution',
-                    'model_flow_field_type', 'model_gap_expander_logit_resolution',
-                    'model_gap_expander_num_windings', 'model_linear_z_resolution',
-                )
-                incompatible = [
-                    key for key in shape_keys
-                    if key in checkpoint_cfg and checkpoint_cfg[key] != self.config[key]
-                ]
-                if incompatible:
-                    raise RuntimeError(f'checkpoint model-shaping config mismatch: {incompatible}')
+            # Only the model's parameter domain is read before construction: it
+            # decides the parameter shapes, so it cannot wait for the preflight.
+            # Every other invariant this checkpoint must satisfy is checked by
+            # inspect_checkpoint() once the model, optimiser and scheduler
+            # exist - the same implementation an in-session load-checkpoint
+            # runs, against a model deliberately built to be exactly compatible
+            # with the checkpoint's own domain.
             if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
                 self.model_z_begin, self.model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
                 if (self.model_z_begin, self.model_z_end) != (self.z_begin, self.z_end):
@@ -1796,33 +1810,25 @@ class FitContext:
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimiser, lambda step: 1.)
 
         if resume_path:
-            embedded_iteration = resume_checkpoint.get('completed_iterations') if isinstance(resume_checkpoint, dict) else None
-            if embedded_iteration is not None:
-                self.start_iteration = int(embedded_iteration)
-            print(f'resuming from {resume_path} at iteration {self.start_iteration}')
+            # Phase 1 of the same two-phase load an in-session checkpoint
+            # request uses: inspect on the CPU and refuse before anything
+            # resident is touched. Checkpoints written before schema version 2
+            # predate several identity fields and are still accepted here, on
+            # the CLI/startup path that has no live state to protect; an
+            # in-session load refuses them.
+            verdict = self.inspect_checkpoint(
+                resume_checkpoint, source=resume_path, allow_legacy_schema=True)
+            if not verdict.accepted:
+                raise RuntimeError(verdict.message())
+            print(f'resuming from {resume_path} at iteration '
+                  f'{verdict.completed_iterations if verdict.completed_iterations is not None else self.start_iteration}')
             progress.begin(
                 'loading', 'Restoring model and optimizer',
                 detail=os.path.basename(resume_path))
-            self.load_checkpoint(resume_checkpoint)
-            if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
-                for _ in range(self.start_iteration):
-                    self.lr_scheduler.step()
-            if isinstance(resume_checkpoint, dict):
-                if resume_checkpoint.get('numpy_rng_state') is not None:
-                    np.random.set_state(resume_checkpoint['numpy_rng_state'])
-                if resume_checkpoint.get('torch_cpu_rng_state') is not None:
-                    torch.random.set_rng_state(resume_checkpoint['torch_cpu_rng_state'])
-                if resume_checkpoint.get('torch_cuda_rng_states') is not None:
-                    # The checkpoint holds one state per GPU on the machine that
-                    # saved it, which may not match this machine's device count.
-                    saved_cuda_states = resume_checkpoint['torch_cuda_rng_states']
-                    local_device_count = torch.cuda.device_count()
-                    if len(saved_cuda_states) != local_device_count:
-                        print(f'checkpoint has {len(saved_cuda_states)} CUDA RNG states but '
-                              f'{local_device_count} device(s) are visible; restoring the first '
-                              f'{min(len(saved_cuda_states), local_device_count)}')
-                    for device_index, state in enumerate(saved_cuda_states[:local_device_count]):
-                        torch.cuda.set_rng_state(state, device_index)
+            # Phase 2: apply. The LR realignment for a resident session is the
+            # unconditional one below, so it is not requested twice here.
+            self.apply_checkpoint(resume_checkpoint,
+                                  fallback_iteration=self.start_iteration)
             # load_state_dict has moved the model and optimiser state to their
             # destination tensors.  Release the CPU-side archive mappings before
             # entering the resident training loop.
@@ -2025,6 +2031,249 @@ class FitContext:
         if completed_iterations is None:
             completed_iterations = self._initial_num_training_steps
         return self.save_checkpoint(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
+
+    def inspect_checkpoint(self, checkpoint, *, source='',
+                           allow_legacy_schema=False):
+        """Decide, on the CPU and without mutating anything, whether this
+        checkpoint may be applied to this live fit.
+
+        Phase 1 of the two-phase load. It reads only the CPU-side checkpoint
+        mapping and the live context's already-constructed model, optimiser,
+        scheduler and configuration; it writes nothing, so a refusal leaves
+        the session exactly as it was. Every invariant is reported, not just
+        the first, because the caller has to explain a refusal to a user who
+        picked the wrong file.
+
+        The rule is strict refusal over implicit rebuilding: a checkpoint that
+        does not match the live model domain and structural configuration is
+        refused here, and the explicit rebuild/new-fit path is what changes a
+        model domain.
+
+        ``allow_legacy_schema`` admits pre-v2 checkpoints, which do not carry
+        the Lasagna group, outward sense, SDT fingerprint or model z-domain
+        fields. Only the startup/CLI restore passes it: there is no live
+        session to protect there, and the model is built from the checkpoint.
+        """
+        reasons = []
+        if not isinstance(checkpoint, dict):
+            return CheckpointVerdict(
+                False, ('checkpoint is not a state dictionary',), source=source)
+
+        # --- schema -------------------------------------------------------
+        schema_version = int(checkpoint.get('schema_version', 1) or 1)
+        modern = schema_version >= 2
+        if not modern and not allow_legacy_schema:
+            reasons.append(
+                f'checkpoint schema version {schema_version} predates the '
+                'identity fields an in-session load verifies (expected >= 2)')
+        for key in ('spiral_and_transform', 'optimiser', 'cfg'):
+            if checkpoint.get(key) is None:
+                reasons.append(f'checkpoint has no {key!r} entry')
+
+        # --- scroll / dataset identity ------------------------------------
+        if checkpoint.get('lasagna_scale') != self.lasagna_scale:
+            reasons.append(
+                f'checkpoint lasagna_scale={checkpoint.get("lasagna_scale")!r} '
+                f'does not match this fit ({self.lasagna_scale!r})')
+        if modern:
+            if checkpoint.get('lasagna_group') != self.normal_zarr_group:
+                reasons.append(
+                    f'checkpoint Lasagna group '
+                    f'{checkpoint.get("lasagna_group")!r} does not match '
+                    f'requested group {self.normal_zarr_group!r}')
+            if checkpoint.get('spiral_outward_sense') != self.spiral_outward_sense:
+                reasons.append(
+                    f'checkpoint outward sense '
+                    f'{checkpoint.get("spiral_outward_sense")!r} does not '
+                    f'match requested sense {self.spiral_outward_sense!r}')
+        checkpoint_dataset = str(
+            (checkpoint.get('input_manifest') or {}).get('dataset_root') or '')
+        dataset_root = str(getattr(self.paths, 'dataset_root', '') or '')
+        if checkpoint_dataset and dataset_root and checkpoint_dataset != dataset_root:
+            reasons.append(
+                f'checkpoint was written against dataset {checkpoint_dataset!r}, '
+                f'not {dataset_root!r}')
+
+        # --- Lasagna / SDT store identity ---------------------------------
+        # The SDT store is an independent input: the Lasagna group/scale checks
+        # above do not cover it. Reject an unexpected change in its content
+        # fingerprint whenever an SDT-driven loss is enabled. Paths may
+        # legitimately move and coverage may legitimately grow (--resume
+        # extension of an ROI-first build), so only the content-identity fields
+        # compare - 'created'/'git_commit' are stamped once at store creation
+        # and anchor the identity.
+        if modern and self.phase_mode:
+            checkpoint_fingerprint = comparable_sdt_fingerprint(
+                checkpoint.get('surf_sdt_fingerprint'))
+            current_fingerprint = comparable_sdt_fingerprint(
+                self.sdt_volume['fingerprint']
+                if self.sdt_volume is not None else None)
+            if (checkpoint_fingerprint is not None
+                    and checkpoint_fingerprint != current_fingerprint):
+                reasons.append(
+                    'checkpoint surf-SDT fingerprint does not match the '
+                    'resolved store while an SDT-driven loss is enabled:'
+                    f'\n      checkpoint: {checkpoint_fingerprint}'
+                    f'\n      current:    {current_fingerprint}')
+
+        # --- structural configuration -------------------------------------
+        checkpoint_cfg = checkpoint.get('cfg')
+        if isinstance(checkpoint_cfg, Mapping):
+            # Checkpoints store the durable subset of the schema, so the key
+            # set compares against that subset. z_begin/z_end joined the schema
+            # after many checkpoints were written and are owned by the session
+            # request either way, so exactly those two may be absent.
+            durable_schema = set(durable_config(dict(self.config)))
+            unknown = set(checkpoint_cfg) - durable_schema
+            missing = durable_schema - set(checkpoint_cfg) - {'z_begin', 'z_end'}
+            if unknown or missing:
+                reasons.append(
+                    'checkpoint configuration does not match the current '
+                    f'schema (unknown: {sorted(unknown)}, '
+                    f'missing: {sorted(missing)})')
+            incompatible = [
+                key for key in CHECKPOINT_MODEL_SHAPE_KEYS
+                if key in checkpoint_cfg and checkpoint_cfg[key] != self.config[key]
+            ]
+            if incompatible:
+                reasons.append(
+                    'checkpoint model-shaping config mismatch: '
+                    + ', '.join(
+                        f'{key}={checkpoint_cfg[key]!r} != {self.config[key]!r}'
+                        for key in incompatible))
+        elif checkpoint_cfg is not None:
+            reasons.append('checkpoint configuration is not a mapping')
+
+        # --- model z-domain ------------------------------------------------
+        if 'z_begin' in checkpoint and 'z_end' in checkpoint:
+            domain = (int(checkpoint['z_begin']), int(checkpoint['z_end']))
+            if domain != (int(self.model_z_begin), int(self.model_z_end)):
+                reasons.append(
+                    f'checkpoint model z-domain [{domain[0]}, {domain[1]}) is '
+                    f'not the live model domain [{self.model_z_begin}, '
+                    f'{self.model_z_end}); rebuild the fit to change the model '
+                    'domain')
+        elif not allow_legacy_schema:
+            reasons.append(
+                'checkpoint does not record a model z-domain, so it cannot be '
+                'shown to match the live model')
+
+        # --- model keys and tensor geometry --------------------------------
+        model_state = checkpoint.get('spiral_and_transform')
+        if isinstance(model_state, Mapping):
+            live_state = self.spiral_and_transform.state_dict()
+            unexpected = sorted(set(model_state) - set(live_state))
+            absent = sorted(set(live_state) - set(model_state))
+            if unexpected or absent:
+                reasons.append(
+                    f'checkpoint model keys differ (unexpected: {unexpected}, '
+                    f'missing: {absent})')
+            geometry = []
+            for key in sorted(set(model_state) & set(live_state)):
+                saved, live = model_state[key], live_state[key]
+                saved_shape = tuple(getattr(saved, 'shape', ()))
+                live_shape = tuple(live.shape)
+                if saved_shape != live_shape:
+                    geometry.append(f'{key} {saved_shape} != {live_shape}')
+                elif getattr(saved, 'dtype', live.dtype) != live.dtype:
+                    geometry.append(
+                        f'{key} dtype {saved.dtype} != {live.dtype}')
+            if geometry:
+                reasons.append(
+                    'checkpoint tensor geometry differs: ' + ', '.join(geometry))
+        elif model_state is not None:
+            reasons.append('checkpoint model state is not a mapping')
+
+        # --- optimiser and scheduler compatibility -------------------------
+        optimiser_state = checkpoint.get('optimiser')
+        if isinstance(optimiser_state, Mapping):
+            live_optimiser = self.optimiser.state_dict()
+            saved_groups = list(optimiser_state.get('param_groups') or [])
+            live_groups = list(live_optimiser.get('param_groups') or [])
+            if len(saved_groups) != len(live_groups):
+                reasons.append(
+                    f'checkpoint optimiser has {len(saved_groups)} parameter '
+                    f'groups, this fit has {len(live_groups)}')
+            else:
+                mismatched = [
+                    index for index, (saved, live) in enumerate(
+                        zip(saved_groups, live_groups))
+                    if list(saved.get('params') or []) != list(live.get('params') or [])
+                ]
+                if mismatched:
+                    reasons.append(
+                        'checkpoint optimiser parameter groups do not cover '
+                        f'the same parameters (groups {mismatched})')
+        elif optimiser_state is not None:
+            reasons.append('checkpoint optimiser state is not a mapping')
+
+        scheduler_state = checkpoint.get('scheduler')
+        if scheduler_state is not None:
+            if not isinstance(scheduler_state, Mapping):
+                reasons.append('checkpoint scheduler state is not a mapping')
+            else:
+                live_scheduler = self.lr_scheduler.state_dict()
+                if set(scheduler_state) != set(live_scheduler):
+                    reasons.append(
+                        'checkpoint scheduler is a different kind of schedule '
+                        f'(fields {sorted(scheduler_state)} != '
+                        f'{sorted(live_scheduler)})')
+                else:
+                    saved_base = list(scheduler_state.get('base_lrs') or [])
+                    live_base = list(live_scheduler.get('base_lrs') or [])
+                    if len(saved_base) != len(live_base):
+                        reasons.append(
+                            f'checkpoint scheduler tracks {len(saved_base)} '
+                            f'parameter groups, this fit has {len(live_base)}')
+
+        completed = checkpoint.get('completed_iterations')
+        return CheckpointVerdict(
+            not reasons, tuple(reasons),
+            completed_iterations=(None if completed is None else int(completed)),
+            source=source)
+
+    def apply_checkpoint(self, checkpoint, *, fallback_iteration=0,
+                         realign_lr=False):
+        """Phase 2: move a preflighted checkpoint into the live fit.
+
+        Only ever called after :meth:`inspect_checkpoint` accepted this exact
+        payload on every participating rank. It mutates model, optimiser,
+        scheduler, RNG and iteration state; a failure here leaves a partially
+        loaded optimiser, which is why callers treat it as fatal to the
+        session rather than as a refusal.
+
+        ``completed_iterations`` comes from the checkpoint - the durable step
+        the fit actually reached - and the LR schedule is realigned to it
+        rather than reset to zero.
+        """
+        embedded = checkpoint.get('completed_iterations')
+        completed = int(fallback_iteration if embedded is None else embedded)
+        self.start_iteration = completed
+        self.load_checkpoint(checkpoint)
+        if checkpoint.get('scheduler') is None:
+            for _ in range(completed):
+                self.lr_scheduler.step()
+        self._restore_rng_state(checkpoint)
+        if realign_lr:
+            self._realign_lr_schedule(completed)
+        return completed
+
+    def _restore_rng_state(self, checkpoint):
+        if checkpoint.get('numpy_rng_state') is not None:
+            np.random.set_state(checkpoint['numpy_rng_state'])
+        if checkpoint.get('torch_cpu_rng_state') is not None:
+            torch.random.set_rng_state(checkpoint['torch_cpu_rng_state'])
+        if checkpoint.get('torch_cuda_rng_states') is not None:
+            # The checkpoint holds one state per GPU on the machine that saved
+            # it, which may not match this machine's device count.
+            saved_cuda_states = checkpoint['torch_cuda_rng_states']
+            local_device_count = torch.cuda.device_count()
+            if len(saved_cuda_states) != local_device_count:
+                print(f'checkpoint has {len(saved_cuda_states)} CUDA RNG states but '
+                      f'{local_device_count} device(s) are visible; restoring the first '
+                      f'{min(len(saved_cuda_states), local_device_count)}')
+            for device_index, state in enumerate(saved_cuda_states[:local_device_count]):
+                torch.cuda.set_rng_state(state, device_index)
 
     def load_checkpoint(self, checkpoint):
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']

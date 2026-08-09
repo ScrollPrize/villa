@@ -567,8 +567,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _save = new QPushButton(tr("Save Checkpoint on Service"), runContents); _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download Checkpoint…"), runContents);
     _downloadCheckpoint->setEnabled(false);
+    _loadCheckpoint = new QPushButton(tr("Load Checkpoint into Fit…"), runContents);
+    _loadCheckpoint->setEnabled(false);
+    _loadCheckpoint->setToolTip(
+        tr("Replace the resident model's weights, optimiser and RNG state "
+           "from a checkpoint. The service refuses any checkpoint that is not "
+           "an exact match for the live model; use Start Fit to change the "
+           "model domain or structure."));
     checkpointControls->addWidget(_save);
     checkpointControls->addWidget(_downloadCheckpoint);
+    checkpointControls->addWidget(_loadCheckpoint);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
     _checkpointDownloadStatus = new QLabel(runContents);
@@ -721,6 +729,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _stop->setEnabled(false);
                     _save->setEnabled(false);
                     _downloadCheckpoint->setEnabled(false);
+                    _loadCheckpoint->setEnabled(false);
                     _removeInput->setEnabled(false);
                     if (_checkpointDownloadActive) {
                         _checkpointDownloadActive = false;
@@ -934,6 +943,29 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _warnings->setText(tr("Preparing checkpoint download…"));
         _service->downloadCheckpoint(path);
     });
+    connect(_loadCheckpoint, &QPushButton::clicked, this, [this]() {
+        const QString initial = _paths[QStringLiteral("checkpoint")]->text().isEmpty()
+            ? _paths[QStringLiteral("output_directory")]->text()
+            : _paths[QStringLiteral("checkpoint")]->text();
+        const QString path = _remoteMode
+            ? QInputDialog::getText(
+                  this, tr("Load Spiral checkpoint into the resident fit"),
+                  tr("Service-host checkpoint path:"), QLineEdit::Normal, initial)
+            : QFileDialog::getOpenFileName(this, tr("Load Spiral checkpoint into the fit"),
+                                           initial, tr("Checkpoint (*.ckpt)"));
+        if (path.isEmpty()) return;
+        _loadCheckpoint->setEnabled(false);
+        _warnings->setText(tr("Loading checkpoint into the resident fit…"));
+        _service->loadCheckpointIntoSession(path);
+    });
+    connect(_service, &SpiralServiceManager::checkpointLoaded, this,
+            [this](const QString& hostPath, qint64 iteration) {
+                _paths[QStringLiteral("checkpoint")]->setText(hostPath);
+                _warnings->setText(
+                    tr("Loaded %1 into the resident fit at iteration %2")
+                        .arg(hostPath)
+                        .arg(iteration));
+            });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
         if (QMessageBox::question(this, tr("Commit inputs"),
                                   tr("Move the added inputs into the dataset? Patches go to "
@@ -1767,6 +1799,9 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _save->setEnabled(_connected && runnable);
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
+    // An in-session load replaces resident model state, so it needs the same
+    // idle session a run does.
+    _loadCheckpoint->setEnabled(_connected && runnable);
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();

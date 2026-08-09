@@ -76,6 +76,8 @@ class FakeSession:
             "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
+        self.loaded = []
+        self.load_refusal = None
         self.closed = False
         self.path_change_calls = []
         self.progress = None
@@ -106,6 +108,13 @@ class FakeSession:
         Path(path).write_bytes(b"PK\x03\x04checkpoint")
         self.saved.append(path)
         return path
+
+    def load_checkpoint(self, path, timeout=600.0):
+        if self.load_refusal is not None:
+            raise RuntimeError(self.load_refusal)
+        self.loaded.append(path)
+        return {"completed_iterations": 4200, "config_revision": 1,
+                "path": path}
 
     def close(self):
         self.closed = True
@@ -428,6 +437,15 @@ class RouteTableTests(HttpServiceFixture):
 
         route, args = spiral_service.resolve_route("POST", "/session/stop")
         self.assertEqual((route.operation, args), ("session_stop", ()))
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.COMMAND_ID)
+        self.assertTrue(route.reads_body)
+
+        # A logical mutation of resident model state: command-ID idempotent,
+        # so a retried load replays instead of loading twice.
+        route, args = spiral_service.resolve_route(
+            "POST", "/session/load-checkpoint")
+        self.assertEqual((route.operation, args), ("load_checkpoint", ()))
         self.assertEqual(route.idempotency,
                          spiral_service.Idempotency.COMMAND_ID)
         self.assertTrue(route.reads_body)
@@ -890,6 +908,61 @@ class DatasetOwnershipTests(unittest.TestCase):
         response = self.state.save_checkpoint(
             {"path": str(self.output / "manual.ckpt")})
         self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
+
+    def test_load_checkpoint_reads_only_service_owned_checkpoints(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        outside = self.root / "elsewhere.ckpt"
+        outside.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(outside)})
+        self.assertEqual(caught.exception.status, 400)
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint(
+                {"path": str(self.output / "absent.ckpt")})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(session.loaded, [])
+
+    def test_load_checkpoint_reports_the_restored_iteration(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        checkpoint = self.output / "uploaded-checkpoints" / "a.ckpt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        revision = self.state.session_revision
+
+        response = self.state.load_checkpoint({"path": str(checkpoint)})
+
+        self.assertTrue(response["loaded"])
+        self.assertEqual(response["restored_iteration"], 4200)
+        self.assertEqual(session.loaded, [str(checkpoint)])
+        self.assertEqual(self.state.session_paths.checkpoint, str(checkpoint))
+        self.assertEqual(
+            self.state.session_request["paths"]["checkpoint"], str(checkpoint))
+        self.assertEqual(self.state.session_revision, revision + 1)
+
+    def test_a_refused_checkpoint_is_a_conflict_and_changes_nothing(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.load_refusal = "checkpoint model z-domain [0, 10) is not..."
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        revision = self.state.session_revision
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(checkpoint)})
+
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("z-domain", caught.exception.message)
+        self.assertEqual(self.state.session_revision, revision)
+        self.assertEqual(self.state.session_paths.checkpoint, "")
+
+    def test_load_checkpoint_requires_an_idle_session(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.state = SessionState.Running
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(checkpoint)})
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(session.loaded, [])
 
 
 class UploadTests(unittest.TestCase):

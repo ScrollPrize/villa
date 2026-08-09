@@ -42,7 +42,7 @@ constexpr int kEventPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 19;
+constexpr int kSupportedApiVersion = 20;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -894,6 +894,56 @@ void SpiralServiceManager::saveCheckpoint(const QString& path)
                   {{QStringLiteral("command_id"), commandId()},
                    {QStringLiteral("path"), path}},
                   Timeout::LongCommand, kMutationRetries, {});
+}
+
+void SpiralServiceManager::loadCheckpointIntoSession(const QString& checkpoint)
+{
+    // The resident model stays; only its parameters, optimiser, scheduler and
+    // RNG state are replaced, and only if the service's preflight finds the
+    // checkpoint an exact match for the live model. A client-local file is
+    // uploaded first, exactly as a resume checkpoint is for a session load.
+    auto send = [this](const QString& hostPath) {
+        postWithRetry(QStringLiteral("/session/load-checkpoint"),
+                      {{QStringLiteral("command_id"), commandId()},
+                       {QStringLiteral("path"), hostPath}},
+                      Timeout::Load, kMutationRetries,
+                      [this, hostPath](const QJsonObject& response) {
+                          handleStatus(response);
+                          emit checkpointLoaded(
+                              hostPath,
+                              response.value(QStringLiteral("restored_iteration"))
+                                  .toInteger(-1));
+                      },
+                      [this](const QString& error) {
+                          emit errorOccurred(
+                              tr("Checkpoint load refused: %1").arg(error));
+                      });
+    };
+
+    bool serviceSide = !_serviceOwnsDataset;
+    for (const QJsonValue& value :
+         _advertisedDataset.value(QStringLiteral("detected_checkpoints")).toArray())
+        if (value.toString() == checkpoint) serviceSide = true;
+    const QString outputDir = _advertisedDataset.value(QStringLiteral("resolved")).toObject()
+                                  .value(QStringLiteral("output_directory")).toString();
+    if (!outputDir.isEmpty() && checkpoint.startsWith(outputDir)) serviceSide = true;
+    if (serviceSide || !QFileInfo(checkpoint).isFile()) {
+        send(checkpoint);
+        return;
+    }
+    emit logMessage(tr("Uploading checkpoint %1 to the service…").arg(checkpoint));
+    uploadCheckpointForResume(
+        checkpoint,
+        [this, send](const QString& hostPath, const QString& error, bool reused) {
+            if (hostPath.isEmpty()) {
+                emit errorOccurred(tr("Checkpoint upload failed: %1").arg(error));
+                return;
+            }
+            emit logMessage(reused
+                                ? tr("Reusing checkpoint already on the service at %1").arg(hostPath)
+                                : tr("Checkpoint uploaded to service path %1").arg(hostPath));
+            send(hostPath);
+        });
 }
 
 void SpiralServiceManager::downloadCheckpoint(const QString& localPath)

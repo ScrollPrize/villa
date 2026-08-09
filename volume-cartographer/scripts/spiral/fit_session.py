@@ -31,7 +31,13 @@ from config import Config
 # state: a session that has never run and a session paused after N
 # iterations are the same lifecycle state, distinguished by
 # current_iteration (0 vs > 0). Clients derive the "Ready"/"Paused" label.
-API_VERSION = 19
+# Version 20 adds POST /session/load-checkpoint: a strict, two-phase,
+# all-rank load of a checkpoint into the resident model, valid in Idle. The
+# service refuses (409) any checkpoint that is not an exact match for the
+# live model domain and structure instead of rebuilding the model behind the
+# client's back; a domain change stays the job of a new fit. An accepted load
+# restores the checkpoint's completed_iterations and publishes it.
+API_VERSION = 20
 
 
 class SessionState(str, Enum):

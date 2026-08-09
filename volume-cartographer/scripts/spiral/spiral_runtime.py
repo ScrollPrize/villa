@@ -41,8 +41,12 @@ _LEGAL_SESSION_TRANSITIONS = {
     # transition to itself.
     SessionState.Loading: {SessionState.Loading, SessionState.Idle,
                            SessionState.ExportingPreview},
+    # Idle -> Loading is the in-session checkpoint load: inspecting and
+    # applying a checkpoint takes the session out of Idle for the whole
+    # two-phase operation, so nothing can be admitted against the model while
+    # it is being replaced.
     SessionState.Idle: {SessionState.Idle, SessionState.Running,
-                        SessionState.Saving},
+                        SessionState.Saving, SessionState.Loading},
     SessionState.Running: {SessionState.Running, SessionState.Idle,
                            SessionState.Saving},
     SessionState.Saving: {SessionState.Saving, SessionState.Idle,
@@ -100,6 +104,12 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # Extra slack on top of a caller-supplied operation timeout (checkpoint save,
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
+
+
+# All-rank commands that only a rank with nothing outstanding may enter.
+_QUIESCENT_COMMANDS = frozenset({
+    "run", "preflight_checkpoint", "apply_checkpoint",
+})
 
 
 class CommandBarrierViolation(RuntimeError):
@@ -386,6 +396,43 @@ class SaveCheckpointCommand(SessionCommand):
     path: str = ""
 
 
+@dataclasses.dataclass
+class PreflightCheckpointCommand(SessionCommand):
+    """Phase 1 of an in-session load: inspect a checkpoint on the CPU.
+
+    Reads the file and validates it against this rank's live model; it never
+    mutates resident state, so a refusal (on this or any sibling rank) leaves
+    the session exactly as it was. An accepted preflight retains the loaded
+    CPU payload for the apply command that follows it.
+    """
+
+    kind: ClassVar[str] = "preflight_checkpoint"
+
+    path: str = ""
+
+
+@dataclasses.dataclass
+class ApplyCheckpointCommand(SessionCommand):
+    """Phase 2 of an in-session load: move the preflighted payload in.
+
+    Issued only after every rank accepted the same checkpoint. A failure here
+    is fatal to the session rather than a refusal: the model and optimiser
+    are partially written by then, and a partially loaded optimiser is not a
+    state any rank may keep training from.
+    """
+
+    kind: ClassVar[str] = "apply_checkpoint"
+
+    path: str = ""
+
+
+@dataclasses.dataclass
+class DiscardCheckpointCommand(SessionCommand):
+    """Release a preflighted payload no rank will apply."""
+
+    kind: ClassVar[str] = "discard_checkpoint"
+
+
 class InteractiveFitSession:
     def __init__(self, paths: SpiralInputPaths, run: SpiralRunConfig,
                  preview: SpiralPreviewConfig, scroll: ScrollSpec,
@@ -438,6 +485,10 @@ class InteractiveFitSession:
         # commands that were computed against a session state the fitter no
         # longer has.
         self._commands = []
+        # The CPU-side checkpoint an accepted preflight is holding for the
+        # apply command that follows it, as (path, payload). Only the fitter
+        # thread ever reads or writes it.
+        self._pending_checkpoint = None
         self.session_generation = 0
         self._config_revision = 0
         # The all-rank command epoch this rank has entered. It advances only
@@ -856,6 +907,17 @@ class InteractiveFitSession:
             if isinstance(command, ConfigureCommand):
                 self._run_configuration(command)
                 continue
+            if isinstance(command, PreflightCheckpointCommand):
+                self._run_checkpoint_preflight(command)
+                continue
+            if isinstance(command, ApplyCheckpointCommand):
+                # Not guarded: a failure here is deliberately allowed to
+                # unwind the fitter thread and fail the session.
+                self._run_checkpoint_apply(command)
+                continue
+            if isinstance(command, DiscardCheckpointCommand):
+                self._run_checkpoint_discard(command)
+                continue
             if not isinstance(command, SaveCheckpointCommand):
                 command.fail(f"Unknown session command {command.kind}")
                 continue
@@ -891,6 +953,124 @@ class InteractiveFitSession:
                 command.complete(path=path)
             else:
                 command.fail(error)
+
+    def _release_pending_checkpoint(self):
+        """Drop any retained CPU payload. Fitter thread only."""
+        pending, self._pending_checkpoint = self._pending_checkpoint, None
+        del pending
+
+    def _leave_checkpoint_load(self, phase=None):
+        """Return this rank to Idle after a load ended without applying."""
+        self._progress_reporter().clear()
+        with self._condition:
+            self._transition_locked(
+                SessionState.Idle, phase or idle_phase(self._completed))
+        self._publish_status()
+
+    def _run_checkpoint_preflight(self, command):
+        """Inspect a checkpoint on the CPU without touching resident state.
+
+        The session leaves Idle for the whole two-phase load: an in-flight
+        load must not race a run admitted against the model it is replacing.
+        Nothing here writes model, optimiser, scheduler or RNG state, so any
+        refusal - this rank's or, through the coordinator, a sibling's -
+        leaves the live session exactly as it was.
+        """
+        checkpoint = None
+        try:
+            if self._context is None:
+                raise RuntimeError(
+                    "The resident fitter does not support loading a checkpoint")
+            self._release_pending_checkpoint()
+            with self._condition:
+                self._transition_locked(
+                    SessionState.Loading, "Inspecting checkpoint",
+                    reason=f"checkpoint preflight {command.command_id}")
+            self._publish_status()
+            self._progress_reporter().begin(
+                "loading", "Inspecting checkpoint",
+                detail=Path(command.path).name)
+            from checkpoint_io import load_checkpoint_cpu
+            checkpoint = load_checkpoint_cpu(command.path)
+            verdict = self._context.inspect_checkpoint(
+                checkpoint, source=command.path)
+        except Exception as exc:
+            del checkpoint
+            self._release_pending_checkpoint()
+            self._leave_checkpoint_load()
+            command.fail(f"{type(exc).__name__}: {exc}")
+            return
+        if not verdict.accepted:
+            del checkpoint
+            self._leave_checkpoint_load()
+            command.fail(verdict.message())
+            return
+        # Retained for the apply command: re-reading the file between the two
+        # phases would mean applying bytes no rank inspected.
+        self._pending_checkpoint = (command.path, checkpoint)
+        with self._condition:
+            self._transition_locked(
+                SessionState.Loading, "Checkpoint accepted")
+        self._publish_status()
+        command.complete(**verdict.to_dict())
+
+    def _run_checkpoint_apply(self, command):
+        """Move the preflighted checkpoint into the live fit.
+
+        Reached only once every rank accepted this exact path. From the first
+        ``load_state_dict`` there is no unchanged session left to return to,
+        so a failure is re-raised: it unwinds the fitter thread, fails this
+        session, and (under DDP) the parent watchdog takes the siblings down
+        rather than leaving a rank training from a partially loaded optimiser.
+        """
+        pending = self._pending_checkpoint
+        if pending is None or pending[0] != command.path:
+            self._release_pending_checkpoint()
+            self._leave_checkpoint_load()
+            command.fail(
+                f"No inspected checkpoint is pending for {command.path}")
+            return
+        self._pending_checkpoint = None
+        path, checkpoint = pending
+        try:
+            self._progress_reporter().begin(
+                "loading", "Restoring model and optimizer",
+                detail=Path(path).name)
+            completed = self._context.apply_checkpoint(
+                checkpoint, realign_lr=True)
+        except BaseException as exc:
+            error = (f"Applying checkpoint {path} failed after every rank "
+                     f"accepted it; the resident model and optimiser state "
+                     f"are partial: {type(exc).__name__}: {exc}")
+            command.fail(error)
+            raise RuntimeError(error) from exc
+        finally:
+            del checkpoint, pending
+        self._progress_reporter().clear()
+        with self._condition:
+            # The durable step the checkpoint reached is the session's
+            # iteration now; the LR schedule was realigned to it rather than
+            # reset to zero.
+            self._completed = self._target = completed
+            self._run_start_completed = completed
+            self._latest_metrics = {}
+            self.input_manifest["checkpoint"] = path
+            self._config_revision += 1
+            revision = self._config_revision
+            self._transition_locked(
+                SessionState.Idle, idle_phase(completed))
+        self._publish_status()
+        command.complete(path=path, completed_iterations=completed,
+                         config_revision=revision)
+
+    def _run_checkpoint_discard(self, command):
+        """Release a payload no rank will apply and return to Idle."""
+        self._release_pending_checkpoint()
+        with self._condition:
+            loading = self._state is SessionState.Loading
+        if loading:
+            self._leave_checkpoint_load()
+        command.complete(discarded=True)
 
     def _run_incorporation(self, command):
         """Append newly uploaded ephemeral inputs to the resident fit.
@@ -1174,6 +1354,73 @@ class InteractiveFitSession:
             raise RuntimeError(command.error)
         return command.result["path"]
 
+    def _queue_command(self, command, timeout):
+        with self._condition:
+            self._commands.append(command)
+            self._condition.notify_all()
+        if not command.wait(timeout):
+            raise TimeoutError(f"{command.kind} command timed out")
+        if command.error is not None:
+            raise RuntimeError(command.error)
+        return dict(command.result)
+
+    def preflight_checkpoint(self, path, timeout=600.0, barrier=None):
+        """Phase 1 of an in-session load, on this rank.
+
+        Valid only in Idle: a checkpoint replaces the resident model, so the
+        session must have nothing outstanding against it.
+        """
+        with self._condition:
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Loading a checkpoint is not allowed while session state "
+                    f"is {self._state.name}")
+            epoch = self._enter_epoch_locked("preflight_checkpoint", barrier)
+            command = PreflightCheckpointCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed,
+                expected_config_revision=self._config_revision, path=path)
+        return self._queue_command(command, timeout)
+
+    def apply_checkpoint(self, path, timeout=600.0, barrier=None):
+        """Phase 2 of an in-session load, on this rank."""
+        with self._condition:
+            if self._state is not SessionState.Loading:
+                raise RuntimeError(
+                    f"No checkpoint load is in progress (session state is "
+                    f"{self._state.name})")
+            epoch = self._enter_epoch_locked("apply_checkpoint", barrier)
+            command = ApplyCheckpointCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed, path=path)
+        return self._queue_command(command, timeout)
+
+    def discard_checkpoint(self, timeout=30.0, barrier=None):
+        """Release a preflighted payload after a refusal on any rank."""
+        with self._condition:
+            epoch = self._enter_epoch_locked("discard_checkpoint", barrier)
+            command = DiscardCheckpointCommand(
+                session_generation=self.session_generation, epoch=epoch)
+        return self._queue_command(command, timeout)
+
+    def load_checkpoint(self, path, timeout=600.0):
+        """Load a checkpoint into the live session, strictly and atomically.
+
+        A single-rank session is its own coordinator, so it runs the same two
+        phases the distributed proxy runs across its ranks: inspect first and
+        refuse without touching anything, then apply.
+        """
+        try:
+            verdict = self.preflight_checkpoint(path, timeout)
+        except BaseException:
+            try:
+                self.discard_checkpoint()
+            except BaseException:
+                traceback.print_exc(limit=4)
+            raise
+        result = self.apply_checkpoint(path, timeout)
+        return {**verdict, **result}
+
     def close(self, timeout=15.0, barrier=None):
         with self._condition:
             self._enter_epoch_locked("close", barrier)
@@ -1236,6 +1483,17 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     )
                 elif name == "stop":
                     result = session.stop(barrier=barrier)
+                elif name == "preflight_checkpoint":
+                    result = session.preflight_checkpoint(
+                        arguments["path"], arguments.get("timeout", 600.0),
+                        barrier=barrier)
+                elif name == "apply_checkpoint":
+                    result = session.apply_checkpoint(
+                        arguments["path"], arguments.get("timeout", 600.0),
+                        barrier=barrier)
+                elif name == "discard_checkpoint":
+                    result = session.discard_checkpoint(
+                        arguments.get("timeout", 30.0), barrier=barrier)
                 elif name == "save_checkpoint":
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
@@ -1433,10 +1691,11 @@ class DistributedInteractiveFitSession:
         return CommandBarrier(
             epoch=self._command_epoch, kind=kind,
             config_revision=config_revision,
-            # A run is admitted only by a quiescent rank. stop and close are
-            # asynchronous with respect to the step loop by construction, so
-            # they assert nothing about the pending count.
-            pending=0 if kind == "run" else None)
+            # A run, and either phase of a checkpoint load, is admitted only
+            # by a quiescent rank. stop and close are asynchronous with
+            # respect to the step loop by construction, so they assert
+            # nothing about the pending count.
+            pending=(0 if kind in _QUIESCENT_COMMANDS else None))
 
     # Coordinator: fail-stop.
     def _fail_session(self, cause, *, rank=None, detail=None):
@@ -1677,6 +1936,34 @@ class DistributedInteractiveFitSession:
         if state != SessionState.Running:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
+
+    def load_checkpoint(self, path, timeout=600.0):
+        """Coordinate a strict two-phase checkpoint load across every rank.
+
+        Phase 1 asks every rank to inspect the same file on its CPU. A
+        refusal by any rank fails the whole load with every rank's reasons,
+        and the payloads the accepting ranks retained are discarded, so the
+        live session is untouched. Only when every rank accepted does phase 2
+        apply it everywhere.
+        """
+        state = self.status()["state"]
+        if state != SessionState.Idle:
+            raise RuntimeError(
+                f"Loading a checkpoint is not allowed in {state}")
+        arguments = {"path": path, "timeout": timeout}
+        try:
+            verdict = self._call("preflight_checkpoint", arguments,
+                                 timeout=timeout + COMMAND_ACK_GRACE_S)
+        except BaseException:
+            try:
+                self._call("discard_checkpoint", {},
+                           timeout=COMMAND_ACK_TIMEOUT_S)
+            except BaseException:
+                traceback.print_exc(limit=4)
+            raise
+        result = self._call("apply_checkpoint", arguments,
+                            timeout=timeout + COMMAND_ACK_GRACE_S)
+        return {**(verdict or {}), **(result or {})}
 
     def save_checkpoint(self, path, timeout=120.0):
         state = self.status()["state"]
