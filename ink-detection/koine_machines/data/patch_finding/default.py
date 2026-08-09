@@ -41,6 +41,19 @@ def _nonzero_patch_coverage(image_patch) -> float:
     return float(np.count_nonzero(patch)) / float(patch.size)
 
 
+def _combined_patch_discovery_support(supervision_slice, validation_slice=None):
+    """Find candidate patches from both train and held-out labeled regions."""
+    support = np.asarray(supervision_slice) > 0
+    if validation_slice is not None:
+        validation = np.asarray(validation_slice) > 0
+        if validation.shape != support.shape:
+            raise ValueError(
+                f"validation support {validation.shape} != supervision {support.shape}"
+            )
+        support = support | validation
+    return support
+
+
 def _resolve_scan_scale(segment, volume_auth):
     patch_finding_scale = segment.config.get("patch_finding_scale", None)
     if patch_finding_scale is not None and int(patch_finding_scale) != int(segment.scale):
@@ -81,7 +94,17 @@ def find_segment_patches(segment, patch_cls):
     scan_patch_h = max(1, int(round(patch_size[1] / scale_factor_y)))
     scan_patch_w = max(1, int(round(patch_size[2] / scale_factor_x)))
 
-    surface_slice = np.asarray(supervision_mask[mask_scan_surface])
+    validation_scan_surface = (
+        None if validation_mask is None else int(validation_mask.shape[0] // 2)
+    )
+    surface_slice = _combined_patch_discovery_support(
+        supervision_mask[mask_scan_surface],
+        (
+            None
+            if validation_mask is None
+            else validation_mask[validation_scan_surface]
+        ),
+    )
     ys, xs = np.nonzero(surface_slice)
     if len(ys) == 0:
         raise ValueError(f"{segment.supervision_mask} contains no nonzero voxels at scan scale")
@@ -111,7 +134,7 @@ def find_segment_patches(segment, patch_cls):
         has_training_supervision = bool(supervision_patch.size > 0 and np.any(supervision_patch))
         if validation_mask is not None:
             validation_patch = validation_mask[
-                mask_scan_surface,
+                validation_scan_surface,
                 y0_s:y0_s + scan_patch_h,
                 x0_s:x0_s + scan_patch_w,
             ]
