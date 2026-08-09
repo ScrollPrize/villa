@@ -21,15 +21,41 @@ Resumable: completed (variant, case) pairs in <work>/results.jsonl are
 skipped, so interrupted runs continue and real-fit rows can be reused when
 only the phantom side changes (e.g. adding --phantom-slips).
 
-Result on record (2026-08-08, in-family phantoms, PHerc0172 ds8 slabs
-883/1405/1927): Spearman rho = 0.31 (p = 0.32) -- NO significant rank
-correlation. The phantom caught catastrophic configs (its worst three
-included the two real-scroll disasters) but could not rank the mid-field:
-in-family representability compresses phantom scores into a narrow band
-(0.28..0.47) while real scores spread 0.60..3.32, and the real reference
-itself (classically traced arcs) has a ~0.6-winding noise floor. The
---phantom-slips option (out-of-family slip dislocations) exists to attack
-the first cause; a cleaner real reference is the open second front.
+Results on record (12 reference-fitter variants; real reference = classical
+traces from trace_real_windings.py; Spearman rho of phantom truth-MAE vs real
+held-out-arc MAE):
+
+  in-family, clean labels                              rho=0.31 (p=0.32)
+  + out-of-family slips (--phantom-slips 3)            rho=0.40 (p=0.20)
+  + deformation calibrated to the real fit             rho=0.72 (p=0.008)
+    + contradictory labels (--phantom-index-noise 0.2)
+
+Each critique the PR review raised, when implemented, moved the benchmark
+toward reality. The dominant fix was deformation MAGNITUDE: the phantom's
+warps had been far milder than a real scroll's, so undertrained configs
+passed on phantoms while failing on real data; matching the phantom's
+flow/gap/linear std to the real fitted checkpoint (in winding units) fixed it.
+
+COLD CROSS-SCROLL (calibration measured on PHerc0172, frozen, then tested on
+PHerc0332 slabs 700/1050/1400 -- a scroll the calibration never saw):
+rho=0.80 (p=0.002), i.e. transfer without recalibration. The two real scrolls
+rank the 12 methods at rho=0.95 with each other, so method quality is largely
+scroll-independent -- the precondition that makes the benchmark viable.
+
+Reproduce cross-scroll (frozen calibration): seed a fresh work dir's
+results.jsonl with the PHANTOM rows from the calibration run (so phantoms are
+reused, not recalibrated), then:
+
+  python phantom_real_correlation.py --work <new> \
+      --real-dataset <PHerc0332 ds700> --real-dataset ... \
+      --phantom-slips 3 --phantom-index-noise 0.2 \
+      --phantom-flow-std 0.0137 --phantom-gap-log-std 0.107 \
+      --phantom-linear-std 0.0046
+
+Honest scope: n=12 variants, one fitter FAMILY (this reference fitter, not
+production fit_spiral), two scrolls, a classical-trace real reference with a
+~0.6-winding floor. The benchmark reliably separates good configs from
+catastrophic ones; it does not yet finely rank within the good cluster.
 """
 
 import json
