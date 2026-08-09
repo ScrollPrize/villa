@@ -22,9 +22,10 @@ import traceback
 from typing import Any, ClassVar, Mapping
 import uuid
 
-from fit_session import (ScrollSpec, SessionState, SpiralInputPaths,
-                         SpiralPreviewConfig, SpiralRunConfig,
-                         run_mutable_config)
+from fit_session import (AUTOSAVE_CHECKPOINT_NAME, ScrollSpec, SessionState,
+                         SpiralInputPaths, SpiralPreviewConfig,
+                         SpiralRunConfig, run_mutable_config,
+                         write_autosave_metadata)
 from config import Config, FitConfig, durable_config
 from spiral_progress import NullProgressReporter, ProgressReporter
 
@@ -1268,8 +1269,17 @@ class InteractiveFitSession:
                     "saving_checkpoint", "Autosaving checkpoint",
                     detail="checkpoint_autosave.ckpt")
                 autosave = str(
-                    Path(self._output_path) / "checkpoint_autosave.ckpt")
+                    Path(self._output_path) / AUTOSAVE_CHECKPOINT_NAME)
                 self._context.save_checkpoint(autosave, self._completed)
+                # Name the file beside itself. An always-loaded service picks
+                # its startup autosave from these sidecars alone: the output
+                # root it belongs to, the dataset it was fit against, and how
+                # far it got. Without one the checkpoint is inert.
+                write_autosave_metadata(
+                    autosave,
+                    session_namespace=self.paths.output_directory,
+                    dataset_root=self.paths.dataset_root,
+                    completed_iterations=self._completed)
             self._progress_reporter().clear()
             self._transition(SessionState.Idle, idle_phase(self._completed))
 

@@ -42,7 +42,7 @@ constexpr int kEventPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 21;
+constexpr int kSupportedApiVersion = 22;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -639,11 +639,11 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     return request;
 }
 
-void SpiralServiceManager::loadSession(QJsonObject request)
+void SpiralServiceManager::rebuildSession(QJsonObject request)
 {
     if (!_serviceOwnsDataset) {
         request[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(request);
+        sendRebuildRequest(request);
         return;
     }
     // The service owns its base inputs; a remote load request carries run
@@ -662,7 +662,7 @@ void SpiralServiceManager::loadSession(QJsonObject request)
         if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
         else load[QStringLiteral("paths")] = selectable;
         load[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(load);
+        sendRebuildRequest(load);
     };
 
     if (checkpoint.isEmpty()) {
@@ -699,9 +699,16 @@ void SpiralServiceManager::loadSession(QJsonObject request)
                               });
 }
 
-void SpiralServiceManager::sendLoadRequest(QJsonObject request)
+void SpiralServiceManager::rebuildWithDefaults()
 {
-    postWithRetry(QStringLiteral("/session/load"), request, Timeout::Load, kMutationRetries,
+    if (!isReady()) return;
+    sendRebuildRequest({{QStringLiteral("defaults"), true},
+                        {QStringLiteral("command_id"), commandId()}});
+}
+
+void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
+{
+    postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
                   [this](const QJsonObject& response) {
                       handleStatus(response);
                   });
@@ -838,9 +845,9 @@ void SpiralServiceManager::runIterations(int iterations,
          [this](const QJsonObject& plan) {
              if (plan.value(QStringLiteral("new_fit_required")).toBool()) {
                  QMessageBox::information(
-                     QApplication::activeWindow(), tr("Start New Fit required"),
+                     QApplication::activeWindow(), tr("Rebuild required"),
                      tr("These changes are incompatible with the resident model. "
-                        "Use New Fit to apply them."));
+                        "Use Rebuild Fit to apply them."));
                  emit configurationReviewRequested();
                  return;
              }
@@ -848,7 +855,7 @@ void SpiralServiceManager::runIterations(int iterations,
                  QMessageBox::information(
                      QApplication::activeWindow(), tr("Reload fit inputs required"),
                      tr("These changes require reloading the resident fit inputs. "
-                        "Use New Fit to apply them."));
+                        "Use Rebuild Fit to apply them."));
                  emit configurationReviewRequested();
                  return;
              }
@@ -1012,23 +1019,6 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
         [this, localPath](const QString& error) {
             emit checkpointDownloadFinished(localPath, error);
         });
-}
-
-void SpiralServiceManager::deleteSession()
-{
-    if (!isReady()) return;
-    QNetworkRequest request = makeRequest(QStringLiteral("/session"),
-                                          static_cast<int>(Timeout::Command));
-    const QJsonObject body{{QStringLiteral("command_id"), commandId()}};
-    auto* reply = _network->sendCustomRequest(request, "DELETE",
-                                              QJsonDocument(body).toJson(QJsonDocument::Compact));
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
-        handleReply(reply, generation,
-                    [this](const QJsonObject& response) {
-                        handleStatus(response);
-                    }, {});
-    });
 }
 
 void SpiralServiceManager::commitInputs()
@@ -1385,8 +1375,10 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     if (!applied.isEmpty()) _appliedConfiguration = applied;
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
-    const bool active = !sessionId.isEmpty()
-        && status.value(QStringLiteral("state")).toString() != QStringLiteral("Empty");
+    // The service always holds a session; there is no "no session" state to
+    // check for. A session identity is present from the moment the service
+    // starts building one.
+    const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;
         emit sessionActiveChanged(active);

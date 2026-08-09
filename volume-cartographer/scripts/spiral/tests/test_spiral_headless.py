@@ -11,7 +11,9 @@ import unittest
 import numpy as np
 import torch
 
-from fit_session import (PclInputSpec, PclRole, ScrollSpecError, SessionState,
+from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
+                         AUTOSAVE_METADATA_SCHEMA, PclInputSpec, PclRole,
+                         ScrollSpecError, SessionState, SpiralInputPaths,
                          load_scroll_spec, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 import spiral_runtime
@@ -25,6 +27,15 @@ from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
+
+
+def _zip_checkpoint_bytes(payload=b"payload"):
+    import io
+    import zipfile
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("data.pkl", payload)
+    return buffer.getvalue()
 
 
 def write_scroll_spec(root, **extra):
@@ -934,7 +945,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(command.error)
         self.assertEqual(command.result["config_revision"], 1)
 
-    def _paused_session(self, calls, autosave_on_pause=True):
+    def _paused_session(self, calls, output_path, autosave_on_pause=True):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
         session._state = SessionState.Running
@@ -943,36 +954,62 @@ class ProtocolTests(unittest.TestCase):
         session._target = 10
         session._stop_requested = False
         session._latest_metrics = {}
-        session._output_path = "/tmp"
+        session._output_path = str(output_path)
         session._status_callback = None
         session._autosave_on_pause = autosave_on_pause
+        session.paths = SpiralInputPaths.from_mapping({
+            "dataset_root": "/datasets/scroll1",
+            "output_directory": str(output_path),
+        })
+
+        def save_checkpoint(path, *_):
+            calls.append("save")
+            Path(path).write_bytes(_zip_checkpoint_bytes())
+
         session._context = SimpleNamespace(
             clear_interactive_influence=lambda: calls.append("finish"),
-            save_checkpoint=lambda *_: calls.append("save"))
+            save_checkpoint=save_checkpoint)
         session._publish_preview = lambda: calls.append("preview")
         return session
 
     def test_run_finish_callback_precedes_autosave(self):
         calls = []
-        session = self._paused_session(calls)
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(calls, output)
 
-        session.iteration_completed(
-            completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
 
-        # Pausing writes the autosave and nothing else: a preview is an
-        # explicit request now, not a side effect of stopping.
-        self.assertEqual(calls, ["finish", "save"])
-        self.assertEqual(session._state, SessionState.Idle)
+            # Pausing writes the autosave and nothing else: a preview is an
+            # explicit request now, not a side effect of stopping.
+            self.assertEqual(calls, ["finish", "save"])
+            self.assertEqual(session._state, SessionState.Idle)
+
+            # The autosave names itself, so an always-loaded service can
+            # select it at startup without guessing from filenames.
+            metadata = json.loads(
+                (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
+            self.assertEqual(metadata["schema"], AUTOSAVE_METADATA_SCHEMA)
+            self.assertEqual(metadata["session_namespace"], str(output))
+            self.assertEqual(metadata["dataset_root"], "/datasets/scroll1")
+            self.assertEqual(metadata["completed_iterations"], 10)
+            self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
 
     def test_a_run_can_ask_for_no_autosave_on_pause(self):
         calls = []
-        session = self._paused_session(calls, autosave_on_pause=False)
+        with tempfile.TemporaryDirectory() as output:
+            session = self._paused_session(calls, output,
+                                           autosave_on_pause=False)
 
-        session.iteration_completed(
-            completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
+            session.iteration_completed(
+                completed_iterations=10, total_loss=1.0, losses={},
+                learning_rate=1.e-3)
 
-        self.assertEqual(calls, ["finish"])
-        self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(calls, ["finish"])
+            self.assertEqual(session._state, SessionState.Idle)
+            # No autosave means no metadata claiming one exists.
+            self.assertFalse((Path(output) / AUTOSAVE_METADATA_NAME).exists())
 
     def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
         session = self._idle_session(completed=4)

@@ -554,7 +554,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    _load = new QPushButton(tr("Start Fit"), runContents);
+    // The service holds a session from startup, so this never creates one:
+    // it applies the panel's inputs and configuration by rebuilding.
+    _load = new QPushButton(tr("Rebuild Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
     _run = new QPushButton(tr("Run"), runContents);
@@ -572,7 +574,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _loadCheckpoint->setToolTip(
         tr("Replace the resident model's weights, optimiser and RNG state "
            "from a checkpoint. The service refuses any checkpoint that is not "
-           "an exact match for the live model; use Start Fit to change the "
+           "an exact match for the live model; use Rebuild Fit to change the "
            "model domain or structure."));
     checkpointControls->addWidget(_save);
     checkpointControls->addWidget(_downloadCheckpoint);
@@ -889,12 +891,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 && QMessageBox::question(
                        this, tr("Uncommitted inputs"),
                        tr("The current session has %1 added input(s) that were not committed "
-                          "to the dataset. Reloading discards them. Continue?").arg(_uncommittedCount))
+                          "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
                        != QMessageBox::Yes)
                 return;
             persist();
             emit pythonOutputRequested();
-            _service->loadSession(sessionRequest());
+            _service->rebuildSession(sessionRequest());
         });
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
@@ -1631,8 +1633,11 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
-    _load->setText(status.value(QStringLiteral("session_id")).toString().isEmpty()
-                       ? tr("Start Fit") : tr("New Fit"));
+    // The service is always loaded, so the button is always a rebuild; it
+    // names the recovery case explicitly when the session failed to build.
+    _load->setText(status.value(QStringLiteral("state")).toString()
+                           == QStringLiteral("Error")
+                       ? tr("Rebuild Fit (recover)") : tr("Rebuild Fit"));
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
     const QJsonObject runConfigLimits =
         status.value(QStringLiteral("run_config_limits")).toObject();
@@ -1672,14 +1677,9 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     }
 
     const QString state = status.value("state").toString();
-    if (state == QStringLiteral("Empty")) {
-        _hasSession = false;
-        _loadedSessionRequest = {};
-        _attachedAdvancedConfig = {};
-        _reloadRequired = false;
-        _advancedSessionGeneration = -1;
-        _runConfigKeys.clear();
-    }
+    // There is no state in which the service has no session, so nothing
+    // here has to un-adopt one. A rebuild advances session_generation and
+    // the adopted configuration is re-synchronized from that.
     const QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
     // The service reports one idle lifecycle state; "Ready" (nothing has run

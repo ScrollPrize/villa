@@ -58,7 +58,13 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    void loadSession(QJsonObject request);
+    // Rebuild the always-loaded session: the service holds one from
+    // startup, so this replaces it rather than creating it. It is also the
+    // only verb that may change the model domain or structural config.
+    void rebuildSession(QJsonObject request);
+    // Rebuild from the service's own launch defaults, ignoring any autosave.
+    // This is how a service stuck in Error recovers.
+    void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
                        const QJsonObject& runConfig,
                        const QJsonObject& inputs = {});
@@ -76,7 +82,6 @@ public:
     // are no longer a side effect of pausing or of resuming a checkpoint, so
     // this is what keeps VC3D's "see the fit after it stops" behaviour.
     void requestPreview();
-    void deleteSession();
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
@@ -161,7 +166,7 @@ private:
     QString endpointFingerprint() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
-    void sendLoadRequest(QJsonObject request);
+    void sendRebuildRequest(QJsonObject request);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,

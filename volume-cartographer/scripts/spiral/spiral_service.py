@@ -11,6 +11,14 @@ generated state) are required; ``--cache`` defaults to the documented user
 cache (``$XDG_CACHE_HOME/vc3d/spiral``). Both --output and --cache must
 resolve outside the dataset root — the dataset holds inputs only.
 
+The session is eager and always loaded: once the dataset and its scroll
+specification validate, the service builds its runtime asynchronously and
+reports ``Loading`` (then ``Idle``, or ``Error`` with the cause) without any
+client request. There is no state in which no session exists, and no verb
+that deletes one; ``POST /session/rebuild`` replaces the resident session and
+is the only path that may change the model domain or structural
+configuration.
+
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
@@ -41,10 +49,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
-                         ScrollSpecError, SessionState,
+                         AutosaveError, ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir, fit_input,
                          input_change_impact, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
+                         select_startup_autosave, validate_autosave,
                          validate_session_request)
 from config import Config
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
@@ -113,6 +122,18 @@ def parse_gpu_ids(value):
     if len(set(gpu_ids)) != len(gpu_ids):
         raise argparse.ArgumentTypeError("--gpus cannot contain duplicate devices")
     return gpu_ids
+
+
+def _cause(exc):
+    """One human-readable line for a failure that has no client to raise to."""
+    if isinstance(exc, ApiError):
+        details = "; ".join(
+            f"{detail.get('field')}: {detail.get('message')}"
+            for detail in (exc.details or []))
+        return f"{exc.message}{f' ({details})' if details else ''}"
+    if isinstance(exc, AutosaveError):
+        return f"Startup autosave cannot be loaded: {exc}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def parse_session_name(value):
@@ -476,16 +497,22 @@ class _TeeStream:
 class ServiceState:
     """HTTP-facing state of the service process.
 
-    The session lifecycle state is owned by the runtime session and is only
-    observed here: every decision reads ``session.status()["state"]`` (a
-    ``SessionState``) and the service never keeps or advances a copy of it.
+    The session is eager and always loaded: the service starts building its
+    runtime as soon as it is up, and there is no state in which no session
+    exists. While the runtime is being constructed (or after a construction
+    failure) there is no session *object* to ask, so the service reports the
+    lifecycle state it is driving itself — ``Loading``, or ``Error`` with the
+    cause. Once the object exists the runtime owns the state again: every
+    decision reads ``session.status()["state"]`` and the service never keeps
+    or advances a copy of it.
+
     What the service does own is service-scoped bookkeeping — session and
     command generations, artifacts, uploads, run plans.
     """
 
     def __init__(self, dataset_root=None, dataset_resolution=None,
                  service_name=None, session_name="", logs=None, events=None,
-                 gpu_ids=(0,)):
+                 gpu_ids=(0,), startup_run=None):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -498,8 +525,16 @@ class ServiceState:
         self.commands = OrderedDict()
         self.inflight_commands = set()
         self.command_condition = threading.Condition(self.lock)
-        self.replacing = False
-        self.replacement_old_session_released = False
+        # Lifecycle the service drives while there is no session object to
+        # ask: Loading until the runtime is built, Error (with the cause) if
+        # building it failed. Never Idle/Running — those belong to the
+        # runtime, which is authoritative the moment it exists.
+        self._session_state = SessionState.Loading
+        self._session_phase = "Starting the fit session"
+        self._session_error = None
+        self._autosave_selection = None
+        self._building = False
+        self.startup_run = dict(startup_run or {})
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
@@ -532,7 +567,6 @@ class ServiceState:
         self.config_catalog = Config.catalog()
         self.session_revision = 0
         self.run_plans = {}
-        self.pending_revision_target = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -550,8 +584,6 @@ class ServiceState:
             "session_revision": self.session_revision,
             "command_generation": self.command_generation,
             "generation": self.status_generation,
-            "session_replacement_in_progress": self.replacing,
-            "replacement_old_session_released": self.replacement_old_session_released,
             "gpus": list(self.gpu_ids),
         }
 
@@ -573,13 +605,18 @@ class ServiceState:
         with self.lock:
             response = self._base()
             response.update(self.session.status() if self.session else {
-                # "Empty" is not a SessionState: it reports the absence of a
-                # session, not a state a session can be in.
-                "state": "Empty", "phase": "No session", "current_iteration": 0,
+                # No session object yet (or no longer): the service is
+                # building one, or building it failed. Both are real
+                # lifecycle states, so there is nothing like "Empty" to
+                # report.
+                "state": self._session_state, "phase": self._session_phase,
+                "current_iteration": 0,
                 "target_iteration": 0, "latest_metrics": {}, "warnings": [],
-                "error": None, "preview_manifest_path": None, "preview_generation": 0,
+                "error": self._session_error, "preview_manifest_path": None,
+                "preview_generation": 0,
                 "progress": None,
             })
+            response["autosave_selection"] = self._autosave_selection
             response.setdefault("progress", None)
             # The status snapshot carries raw progress facts only. ETA is a
             # presentation value clients derive from step/total/elapsed.
@@ -634,15 +671,27 @@ class ServiceState:
             response["dataset_owned"] = self.dataset_resolution is not None
             return response
 
+    def session_state(self):
+        """The authoritative lifecycle state, session object or not."""
+        with self.lock:
+            if self.session is None:
+                return self._session_state
+            return self.session.status()["state"]
+
     def health(self):
+        # Answered from service-owned facts only, so it keeps answering while
+        # CUDA and the model are being constructed and after a construction
+        # failure.
+        state = self.session_state()
         response = self._base()
         response.update({
             "ready": True,
             "process_id": os.getpid(),
             "dataset_owned": self.dataset_resolution is not None,
             "dataset_root": self.dataset_root,
-            "cuda_ready": None if not self.session
-            else self.session.status()["state"] != SessionState.Error,
+            "session_state": state,
+            "cuda_ready": None if state == SessionState.Loading
+            else state != SessionState.Error,
         })
         return response
 
@@ -708,14 +757,15 @@ class ServiceState:
 
         return {**request, "paths": paths}
 
-    def load(self, request):
+    def _prepare_session_request(self, request):
+        """Validate one session request into the arguments a build needs."""
         if self.dataset_resolution is not None:
             request = self._dataset_session_request(request)
         paths, run, preview = parse_session_request(request)
         errors = validate_session_request(paths, run)
         # The scroll specification is resolved from the dataset root; it
         # carries the physical scroll facts (including the outward sense,
-        # which is not part of the load request).
+        # which is not part of the session request).
         scroll = None
         try:
             scroll = load_scroll_spec(paths.dataset_root)
@@ -723,63 +773,168 @@ class ServiceState:
             errors.append({"field": "scroll_spec", "message": str(exc)})
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
+        return paths, run, preview, scroll
+
+    def startup_session_request(self, *, resume=True):
+        """The request this service builds its own session from.
+
+        With ``resume``, the durable autosave for this service's output
+        namespace is selected from metadata (see
+        ``fit_session.select_startup_autosave``) and resumed. A selected
+        autosave that fails container or identity validation raises
+        ``AutosaveError``: the service says so rather than silently starting
+        from scratch or from an older state.
+        """
+        request = {"run": dict(self.startup_run)}
+        output_root = self._output_root()
+        if not resume or output_root is None or self.dataset_root is None:
+            with self.lock:
+                self._autosave_selection = None
+            return request
+        selection = select_startup_autosave(
+            output_root, session_namespace=output_root,
+            dataset_root=self.dataset_root)
         with self.lock:
-            if self.replacing:
-                raise ApiError(HTTPStatus.CONFLICT, "A session replacement is already in progress")
-            if (self.session
-                    and self.session.status()["state"] in SESSION_BUSY_STATES):
-                raise ApiError(HTTPStatus.CONFLICT, "The current session is active")
+            self._autosave_selection = selection.manifest()
+        if selection.selected is not None:
+            validate_autosave(selection.selected)
+            request["paths"] = {"checkpoint": selection.selected.checkpoint}
+        return request
+
+    def start_initial_session(self):
+        """Build the startup session asynchronously.
+
+        Returns as soon as the work is handed to a thread: the HTTP surface
+        is already listening, and /health, /dataset, /configuration, /events
+        and status must keep answering while CUDA and the model come up.
+        """
+        def bootstrap():
+            try:
+                request = self.startup_session_request()
+                prepared = self._prepare_session_request(request)
+            except BaseException as exc:
+                self._fail_session(None, _cause(exc))
+                return
+            self._begin_build(*prepared)
+        threading.Thread(target=bootstrap, name="spiral-session-bootstrap",
+                         daemon=True).start()
+
+    def rebuild(self, request):
+        """Tear the resident session down and build a fresh one.
+
+        This is the only verb that may replace the model domain or the
+        structural configuration: teardown is visible as ``Loading`` instead
+        of hidden inside a load. ``{"defaults": true}`` rebuilds from the
+        launch defaults and ignores every autosave, which is how a service
+        stuck in ``Error`` recovers.
+        """
+        request = dict(request or {})
+        request.pop("command_id", None)
+        defaults = request.pop("defaults", False)
+        if not isinstance(defaults, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "defaults must be true or false")
+        if defaults:
+            if set(request):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "A defaults rebuild takes no other request fields")
+            request = self.startup_session_request(resume=False)
+        paths, run, preview, scroll = self._prepare_session_request(request)
+        with self.lock:
+            # Idle|Error -> Loading. A resident session that is mid-operation
+            # has to settle first, and a build already in flight is its own
+            # conflict (there is nothing to tear down twice).
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
+            state = self.session.status()["state"] if self.session else None
+            if state in SESSION_BUSY_STATES:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"A rebuild requires an idle or failed session (state is "
+                    f"{SessionState(state).name})")
+        self._begin_build(paths, run, preview, scroll)
+        return {**self.status(), "accepted": True, "rebuilding": True}
+
+    def _begin_build(self, paths, run, preview, scroll):
+        """Publish ``Loading`` and construct the runtime off the HTTP thread."""
+        with self.lock:
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
             previous = self.session
             previous_ephemeral = self._session_ephemeral_dir()
-            self.replacing = True
-            self.replacement_old_session_released = False
+            self.session = None
+            self._building = True
+            self.session_generation += 1
+            self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
+            self.session_paths = paths
+            self.session_request = {
+                "paths": paths.manifest(),
+                "run": run.manifest(),
+                "preview": preview.manifest(),
+            }
+            self.session_revision += 1
+            self.run_plans.clear()
+            self._reset_session_scope()
+            self._session_state = SessionState.Loading
+            self._session_phase = "Building the fit session"
+            self._session_error = None
+            self.status_generation += 1
+            session_id = self.session_id
+        threading.Thread(
+            target=self._build,
+            args=(session_id, previous, previous_ephemeral, paths, run,
+                  preview, scroll),
+            name="spiral-session-build", daemon=True).start()
+
+    def _build(self, session_id, previous, previous_ephemeral, paths, run,
+               preview, scroll):
+        """Close the old resident session, then construct the new one.
+
+        A rebuild is an all-rank teardown and reconstruction: the previous
+        context is released through the session's own ``close()`` (on its
+        fitter thread) and the replacement is a fresh session object with a
+        fresh fitter thread.
+        """
+        session = None
         try:
-            if previous:
+            if previous is not None:
                 previous.close()
-                with self.lock:
-                    # Validation happened before replacement.  Once teardown has
-                    # succeeded, report honestly that the previous resident CUDA
-                    # session is no longer available even if new loading fails.
-                    if self.session is previous:
-                        self.session = None
-                        self.session_id = None
-                        self.session_paths = None
-                        self.session_request = None
-                    self._reset_session_scope()
-                    self.replacement_old_session_released = True
-                    self.status_generation += 1
-                if previous_ephemeral:
-                    shutil.rmtree(previous_ephemeral, ignore_errors=True)
+            if previous_ephemeral:
+                shutil.rmtree(previous_ephemeral, ignore_errors=True)
             from spiral_runtime import create_session
-            with self.lock:
-                self.session_generation += 1
-                self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
-                self.session_paths = paths
-                self.session_request = {
-                    "paths": paths.manifest(),
-                    "run": run.manifest(),
-                    "preview": preview.manifest(),
-                }
-                self.session_revision += 1
-                self.run_plans.clear()
-                self._reset_session_scope()
-                try:
-                    self.session = create_session(
-                        paths, run, preview, scroll, self._status_changed,
-                        gpu_ids=self.gpu_ids,
-                        event_callback=self._session_event)
-                except BaseException:
-                    self.session_id = None
-                    self.session_paths = None
-                    self.session_request = None
-                    raise
-                self.status_generation += 1
-                response = self.status()
-                response["accepted"] = True
-                return response
-        finally:
-            with self.lock:
-                self.replacing = False
+            session = create_session(
+                paths, run, preview, scroll, self._status_changed,
+                gpu_ids=self.gpu_ids, event_callback=self._session_event)
+        except BaseException as exc:
+            self._fail_session(session_id, _cause(exc))
+            return
+        superseded = None
+        with self.lock:
+            self._building = False
+            if self.session_id == session_id:
+                self.session = session
+            else:
+                superseded = session
+            self.status_generation += 1
+        if superseded is not None:
+            superseded.close()
+
+    def _fail_session(self, session_id, cause):
+        """Report a session that could not be built, and why."""
+        with self.lock:
+            self._building = False
+            if session_id is not None and self.session_id != session_id:
+                return
+            self._session_state = SessionState.Error
+            self._session_phase = "Error"
+            self._session_error = cause
+            self.status_generation += 1
+        print(f"SPIRAL_SESSION_ERROR {cause}", file=sys.stderr, flush=True)
+        self.events.append("error", cause, severity="error", source="service",
+                           operation="building_session")
 
     def _reset_session_scope(self):
         previous_raw = self._previous_raw_preview_manifest
@@ -818,12 +973,6 @@ class ServiceState:
                 if self.session_request is not None:
                     self.session_request["paths"] = \
                         self.session_paths.manifest()
-            if (self.pending_revision_target is not None
-                    and status.get("state") == SessionState.Idle
-                    and int(status.get("current_iteration") or 0)
-                    >= self.pending_revision_target):
-                self.session_revision += 1
-                self.pending_revision_target = None
             self.status_generation += 1
 
     def _session_event(self, rank, status):
@@ -1023,11 +1172,7 @@ class ServiceState:
                         self.ephemeral_records.resolve(records), error=error)
                     self.status_generation += 1
 
-        with self.lock:
-            self.pending_revision_target = (
-                int(status.get("current_iteration") or 0) + plan["iterations"])
-        try:
-            run_arguments = {
+        run_arguments = {
                 "pending_inputs": pending,
                 "mark_incorporated": mark_incorporated,
                 "influence_config": influence_config,
@@ -1036,14 +1181,10 @@ class ServiceState:
                 # belongs to the run request, not to the plan: it changes
                 # nothing about the model, so it needs no planning round.
                 "autosave_on_pause": autosave_on_pause,
-            }
-            if plan["path_changes"]:
-                run_arguments["path_changes"] = plan["path_changes"]
-            target = session.run(plan["iterations"], **run_arguments)
-        except BaseException:
-            with self.lock:
-                self.pending_revision_target = None
-            raise
+        }
+        if plan["path_changes"]:
+            run_arguments["path_changes"] = plan["path_changes"]
+        target = session.run(plan["iterations"], **run_arguments)
         with self.lock:
             self.run_plans.clear()
             self.status_generation += 1
@@ -1297,30 +1438,24 @@ class ServiceState:
         self.artifacts.prune("spiral-checkpoint", session_id, CHECKPOINT_ARTIFACTS_KEPT)
         return {**self.status(), "checkpoint_artifact": ref}
 
-    def delete(self):
-        with self.lock:
-            if not self.session:
-                return {**self.status(), "deleted": False}
-            if self.session.status()["state"] in SESSION_BUSY_STATES:
-                raise ApiError(HTTPStatus.CONFLICT, "Stop and wait for the session to settle before deleting it")
-            session = self.session
-            ephemeral_dir = self._session_ephemeral_dir()
-            self.session = None
-            self.session_id = None
-            self.session_paths = None
-            self.session_request = None
-            self.session_generation += 1
-            self.status_generation += 1
-            self._reset_session_scope()
-        session.close()
-        if ephemeral_dir:
-            shutil.rmtree(ephemeral_dir, ignore_errors=True)
-        return {**self.status(), "deleted": True}
-
     def _require_session(self):
+        """The resident session, or why there is nothing to operate on.
+
+        The service is always trying to hold a session, so the only reasons
+        the object is absent are that it is still being built or that
+        building it failed. Both are reported as the lifecycle state the
+        client is already polling, with the cause when there is one.
+        """
         with self.lock:
             if self.session is None:
-                raise ApiError(HTTPStatus.CONFLICT, "No fit session is loaded")
+                if self._session_state == SessionState.Error:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        f"The fit session failed to build: "
+                        f"{self._session_error}. Rebuild with defaults to "
+                        f"recover.")
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The fit session is still loading")
             return self.session
 
     # ------------------------------------------------------------------
@@ -1818,9 +1953,8 @@ ROUTES = (
     Route("PUT", re.compile(rf"/session/inputs/({_UPLOAD_ID})/files/(.+)"),
           "upload_file", _route_upload_file, Idempotency.CONTENT),
 
-    Route("DELETE", "/session", "session_delete",
-          lambda ctx: ctx.state.delete(), Idempotency.COMMAND_ID,
-          reads_body=True),
+    # There is deliberately no DELETE /session: the service always holds a
+    # session, and replacing one is POST /session/rebuild.
     Route("DELETE", "/session/ephemeral-inputs", "ephemeral_input_remove",
           lambda ctx: ctx.state.remove_input(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
@@ -1838,8 +1972,8 @@ ROUTES = (
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
           reads_body=True),
-    Route("POST", "/session/load", "session_load",
-          lambda ctx: ctx.state.load(ctx.body), Idempotency.COMMAND_ID,
+    Route("POST", "/session/rebuild", "session_rebuild",
+          lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
     Route("POST", "/session/run/plan", "run_plan",
           lambda ctx: ctx.state.plan_run(ctx.body), Idempotency.NONE,
@@ -2142,6 +2276,20 @@ def main(argv=None):
         "--session-name", type=parse_session_name, default=None, metavar="NAME",
         help="Stable output namespace: generated state moves to "
              "<output>/NAME, held under an exclusive lease")
+    # The session is eager, so the z-domain it is built with has to be
+    # expressible at launch. Both are startup defaults only: changing them
+    # afterwards is a rebuild, which is the one verb allowed to replace the
+    # model domain.
+    parser.add_argument("--z-begin", type=int, default=Config().z_begin,
+                        help="First z slice of the startup session "
+                             f"(default: {Config().z_begin})")
+    parser.add_argument("--z-end", type=int, default=Config().z_end,
+                        help="Last z slice (exclusive) of the startup session "
+                             f"(default: {Config().z_end})")
+    parser.add_argument("--config", default=None, metavar="JSON",
+                        help="Advanced configuration overrides for the startup "
+                             "session, as a JSON object. These are the "
+                             "'defaults' a rebuild-with-defaults returns to.")
     parser.add_argument(
         "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
         help="Physical CUDA device indices to use (default: 0; example: 0,1,2,3)")
@@ -2151,6 +2299,21 @@ def main(argv=None):
     # visibility now so even the single-process path consistently uses the
     # operator-selected physical device as its local cuda:0.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in args.gpus)
+
+    if args.z_begin >= args.z_end:
+        parser.error("--z-begin must be less than --z-end")
+    startup_config = {}
+    if args.config:
+        try:
+            startup_config = json.loads(args.config)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--config must be a JSON object: {exc}")
+        if not isinstance(startup_config, dict):
+            parser.error("--config must be a JSON object")
+        try:
+            Config(startup_config)
+        except (ValueError, AttributeError, TypeError) as exc:
+            parser.error(f"--config is not a valid configuration: {exc}")
 
     loopback = _is_loopback(args.bind)
     if not loopback and args.nonce:
@@ -2231,7 +2394,10 @@ def main(argv=None):
                          session_name=args.session_name or "",
                          logs=logs,
                          events=events,
-                         gpu_ids=args.gpus)
+                         gpu_ids=args.gpus,
+                         startup_run={"z_begin": args.z_begin,
+                                      "z_end": args.z_end,
+                                      "config": startup_config})
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.
     SpiralServer.allow_reuse_address = args.port != 0
@@ -2267,7 +2433,13 @@ def main(argv=None):
     print(f"Spiral cache root: {cache_root}", flush=True)
     if args.session_name:
         print(f"Spiral session name: {args.session_name}", flush=True)
+    print(f"Spiral z-range: [{args.z_begin}, {args.z_end})", flush=True)
     print(f"SPIRAL_SERVICE_READY port={server.server_port}", flush=True)
+    # The session is eager: startup dataset and spec validation has passed,
+    # so the runtime is built now, asynchronously, and the service reports
+    # Loading while CUDA and the model come up. No client request creates a
+    # session.
+    state.start_initial_session()
     server.timeout = 0.5
     try:
         while not shutdown.is_set():
