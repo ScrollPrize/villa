@@ -989,6 +989,10 @@ class ServiceState:
 
     def run(self, request):
         token = request.get("plan_token")
+        autosave_on_pause = request.get("autosave_on_pause", True)
+        if not isinstance(autosave_on_pause, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "autosave_on_pause must be true or false")
         with self.lock:
             plan = self.run_plans.pop(token, None)
         if not plan or plan["expires"] < time.monotonic():
@@ -1028,6 +1032,10 @@ class ServiceState:
                 "mark_incorporated": mark_incorporated,
                 "influence_config": influence_config,
                 "run_config": run_config,
+                # Whether this run's pause writes the durable autosave. It
+                # belongs to the run request, not to the plan: it changes
+                # nothing about the model, so it needs no planning round.
+                "autosave_on_pause": autosave_on_pause,
             }
             if plan["path_changes"]:
                 run_arguments["path_changes"] = plan["path_changes"]
@@ -1170,6 +1178,28 @@ class ServiceState:
                                "session output directory")
         saved = session.save_checkpoint(str(resolved))
         return {**self.status(), "checkpoint_path": saved}
+
+    def export_preview(self):
+        """Export and publish one preview generation, on request.
+
+        Previews are not a side effect of pausing or of resuming from a
+        checkpoint any more: they cost minutes, and a client that wants one
+        asks for one. Publication (Lasagna flattening and packaging) still
+        follows the session's preview status, so this returns as soon as the
+        session has exported and published the new generation.
+        """
+        session = self._require_session()
+        state = session.status().get("state")
+        if state != SessionState.Idle:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                f"Exporting a preview requires an idle session (state is "
+                f"{SessionState(state).name})")
+        result = session.export_preview()
+        with self.lock:
+            self.status_generation += 1
+        return {**self.status(), "exported": True,
+                "preview_generation": result.get("preview_generation")}
 
     def _resolve_loadable_checkpoint(self, path):
         """Where an in-session load may read a checkpoint from.
@@ -1822,6 +1852,9 @@ ROUTES = (
           reads_body=True),
     Route("POST", "/session/save-checkpoint", "save_checkpoint",
           lambda ctx: ctx.state.save_checkpoint(ctx.body),
+          Idempotency.COMMAND_ID, reads_body=True),
+    Route("POST", "/session/export-preview", "export_preview",
+          lambda ctx: ctx.state.export_preview(),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/load-checkpoint", "load_checkpoint",
           lambda ctx: ctx.state.load_checkpoint(ctx.body),

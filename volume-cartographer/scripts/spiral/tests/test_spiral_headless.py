@@ -625,9 +625,12 @@ class ProtocolTests(unittest.TestCase):
     def test_illegal_lifecycle_transition_is_a_programming_error(self):
         session = self._idle_session()
         with session._condition:
+            # An idle session may now start an explicit preview export, but a
+            # preview export cannot start a run.
+            session._transition_locked(SessionState.ExportingPreview)
             with self.assertRaisesRegex(RuntimeError,
-                                        "Idle -> ExportingPreview"):
-                session._transition_locked(SessionState.ExportingPreview)
+                                        "ExportingPreview -> Running"):
+                session._transition_locked(SessionState.Running)
             # Every state may still fail or shut down.
             session._transition_locked(SessionState.Error, "Error")
             with self.assertRaisesRegex(RuntimeError, "Error -> Running"):
@@ -931,7 +934,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(command.error)
         self.assertEqual(command.result["config_revision"], 1)
 
-    def test_run_finish_callback_precedes_autosave(self):
+    def _paused_session(self, calls, autosave_on_pause=True):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
         session._state = SessionState.Running
@@ -942,17 +945,47 @@ class ProtocolTests(unittest.TestCase):
         session._latest_metrics = {}
         session._output_path = "/tmp"
         session._status_callback = None
-        calls = []
+        session._autosave_on_pause = autosave_on_pause
         session._context = SimpleNamespace(
             clear_interactive_influence=lambda: calls.append("finish"),
             save_checkpoint=lambda *_: calls.append("save"))
         session._publish_preview = lambda: calls.append("preview")
+        return session
+
+    def test_run_finish_callback_precedes_autosave(self):
+        calls = []
+        session = self._paused_session(calls)
 
         session.iteration_completed(
             completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
 
-        self.assertEqual(calls, ["finish", "save", "preview"])
+        # Pausing writes the autosave and nothing else: a preview is an
+        # explicit request now, not a side effect of stopping.
+        self.assertEqual(calls, ["finish", "save"])
         self.assertEqual(session._state, SessionState.Idle)
+
+    def test_a_run_can_ask_for_no_autosave_on_pause(self):
+        calls = []
+        session = self._paused_session(calls, autosave_on_pause=False)
+
+        session.iteration_completed(
+            completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
+
+        self.assertEqual(calls, ["finish"])
+        self.assertEqual(session._state, SessionState.Idle)
+
+    def test_the_autosave_flag_is_decided_when_a_run_is_admitted(self):
+        session = self._idle_session(completed=4)
+        session.requested_config = {"optimizer_num_training_steps": 30_000}
+        session._progress_reporter = lambda: NullProgressReporter()
+
+        session.run(2, autosave_on_pause=False)
+        self.assertFalse(session._autosave_on_pause)
+        with session._condition:
+            session._state = SessionState.Idle
+            session._pending = 0
+        session.run(2)
+        self.assertTrue(session._autosave_on_pause)
 
     def test_preview_is_announced_before_exporting_state_can_pause(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -982,6 +1015,75 @@ class ProtocolTests(unittest.TestCase):
                 str(Path(temporary) / ".spiral-preview" / "test-session"
                     / "generation-1" / "manifest.json"),
             )])
+
+    def test_a_restored_checkpoint_session_does_not_export_a_preview(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = SessionState.Loading
+        session._phase = "Loading"
+        session._completed = 0
+        session._target = 0
+        session._status_callback = None
+        session._event_callback = None
+        session.publishes_outputs = True
+        session.paths = SimpleNamespace(checkpoint="/ckpt/a.ckpt",
+                                        output_directory="/tmp")
+        calls = []
+        session._publish_preview = lambda: calls.append("preview")
+        session._progress_reporter = lambda: NullProgressReporter()
+
+        session._session_ready(SimpleNamespace(start_iteration=4200,
+                                               out_path="/tmp/out"))
+
+        # Inspecting a checkpoint costs a load, not a preview export.
+        self.assertEqual(calls, [])
+        self.assertEqual(session._state, SessionState.Idle)
+        self.assertEqual(session._phase, "Paused")
+        self.assertEqual(session._completed, 4200)
+
+    def test_export_preview_is_a_requested_coordinator_operation(self):
+        session = self._idle_session(completed=12)
+        session.publishes_outputs = True
+        session._preview_manifest = None
+        session._preview_generation = 0
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        states = []
+
+        def publish_preview():
+            states.append(session._state)
+            session._preview_manifest = "/preview/manifest.json"
+            session._preview_generation = 3
+
+        session._publish_preview = publish_preview
+        results = []
+        requester = threading.Thread(
+            target=lambda: results.append(session.export_preview(timeout=5.0)))
+        requester.start()
+        deadline = time.time() + 5
+        while not session._commands and time.time() < deadline:
+            time.sleep(0.005)
+        command = session._commands.pop(0)
+        self.assertIsInstance(command, spiral_runtime.ExportPreviewCommand)
+        # A coordinator sub-operation: no command epoch of its own.
+        self.assertIsNone(command.epoch)
+        self.assertEqual(command.expected_iteration, 12)
+
+        session._run_export_preview(command)
+        requester.join(5)
+
+        self.assertEqual(states, [SessionState.ExportingPreview])
+        self.assertEqual(session._state, SessionState.Idle)
+        self.assertEqual(results, [{"preview_manifest_path": "/preview/manifest.json",
+                                    "preview_generation": 3}])
+
+    def test_export_preview_is_refused_outside_idle(self):
+        session = self._idle_session()
+        with session._condition:
+            session._state = SessionState.Running
+        with self.assertRaisesRegex(RuntimeError, "not allowed in Running"):
+            session.export_preview(timeout=0.1)
+        self.assertEqual(session._commands, [])
 
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

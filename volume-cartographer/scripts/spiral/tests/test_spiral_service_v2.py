@@ -76,6 +76,8 @@ class FakeSession:
             "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
+        self.autosave_calls = []
+        self.previews = 0
         self.loaded = []
         self.load_refusal = None
         self.closed = False
@@ -96,10 +98,12 @@ class FakeSession:
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None):
+            influence_config=None, run_config=None, path_changes=None,
+            autosave_on_pause=True):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
+        self.autosave_calls.append(autosave_on_pause)
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -115,6 +119,11 @@ class FakeSession:
         self.loaded.append(path)
         return {"completed_iterations": 4200, "config_revision": 1,
                 "path": path}
+
+    def export_preview(self, timeout=600.0):
+        self.previews += 1
+        return {"preview_generation": self.previews,
+                "preview_manifest_path": f"/preview/{self.previews}"}
 
     def close(self):
         self.closed = True
@@ -208,7 +217,7 @@ def _planned_run(state, request):
         "influence": request.pop("influence_config", {}),
         "expected_session_revision": state.session_revision,
     })
-    return state.run({"plan_token": plan["plan_token"]})
+    return state.run({"plan_token": plan["plan_token"], **request})
 
 
 def _digest(data):
@@ -441,14 +450,15 @@ class RouteTableTests(HttpServiceFixture):
                          spiral_service.Idempotency.COMMAND_ID)
         self.assertTrue(route.reads_body)
 
-        # A logical mutation of resident model state: command-ID idempotent,
-        # so a retried load replays instead of loading twice.
-        route, args = spiral_service.resolve_route(
-            "POST", "/session/load-checkpoint")
-        self.assertEqual((route.operation, args), ("load_checkpoint", ()))
-        self.assertEqual(route.idempotency,
-                         spiral_service.Idempotency.COMMAND_ID)
-        self.assertTrue(route.reads_body)
+        # Logical mutations: command-ID idempotent, so a retried load or
+        # preview export replays instead of acting twice.
+        for path, operation in (("/session/load-checkpoint", "load_checkpoint"),
+                                ("/session/export-preview", "export_preview")):
+            route, args = spiral_service.resolve_route("POST", path)
+            self.assertEqual((route.operation, args), (operation, ()))
+            self.assertEqual(route.idempotency,
+                             spiral_service.Idempotency.COMMAND_ID)
+            self.assertTrue(route.reads_body)
 
         upload_id = "a" * 32
         route, args = spiral_service.resolve_route(
@@ -953,6 +963,35 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertIn("z-domain", caught.exception.message)
         self.assertEqual(self.state.session_revision, revision)
         self.assertEqual(self.state.session_paths.checkpoint, "")
+
+    def test_autosave_on_pause_is_a_run_request_flag_defaulting_on(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+
+        _planned_run(self.state, {"iterations": 4})
+        self.assertEqual(session.autosave_calls, [True])
+
+        _planned_run(self.state, {"iterations": 4, "autosave_on_pause": False})
+        self.assertEqual(session.autosave_calls, [True, False])
+
+        with self.assertRaises(ApiError) as caught:
+            _planned_run(self.state,
+                         {"iterations": 4, "autosave_on_pause": "no"})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_export_preview_is_an_explicit_verb_valid_when_idle(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+
+        response = self.state.export_preview()
+
+        self.assertTrue(response["exported"])
+        self.assertEqual(response["preview_generation"], 1)
+        self.assertEqual(session.previews, 1)
+
+        session.state = SessionState.Running
+        with self.assertRaises(ApiError) as caught:
+            self.state.export_preview()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(session.previews, 1)
 
     def test_load_checkpoint_requires_an_idle_session(self):
         session = _attach_fake_session(self.state, self.output, self.root)

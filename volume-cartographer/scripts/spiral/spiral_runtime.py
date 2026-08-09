@@ -46,7 +46,8 @@ _LEGAL_SESSION_TRANSITIONS = {
     # two-phase operation, so nothing can be admitted against the model while
     # it is being replaced.
     SessionState.Idle: {SessionState.Idle, SessionState.Running,
-                        SessionState.Saving, SessionState.Loading},
+                        SessionState.Saving, SessionState.Loading,
+                        SessionState.ExportingPreview},
     SessionState.Running: {SessionState.Running, SessionState.Idle,
                            SessionState.Saving},
     SessionState.Saving: {SessionState.Saving, SessionState.Idle,
@@ -397,6 +398,19 @@ class SaveCheckpointCommand(SessionCommand):
 
 
 @dataclasses.dataclass
+class ExportPreviewCommand(SessionCommand):
+    """Export and publish one preview generation, on request.
+
+    Previews are no longer a side effect of pausing or of resuming from a
+    checkpoint: a client that wants one asks for one. Like a checkpoint save
+    it is a coordinator sub-operation - only the publishing rank exports -
+    so it carries no command epoch.
+    """
+
+    kind: ClassVar[str] = "export_preview"
+
+
+@dataclasses.dataclass
 class PreflightCheckpointCommand(SessionCommand):
     """Phase 1 of an in-session load: inspect a checkpoint on the CPU.
 
@@ -476,6 +490,9 @@ class InteractiveFitSession:
         self._preview_manifest = None
         self._preview_generation = 0
         self._preview_session_id = uuid.uuid4().hex
+        # Set by every run; the default matters only for the interval before
+        # the first one.
+        self._autosave_on_pause = True
         # The FitContext this session owns, set on the fitter thread once the
         # device state is built. It doubles as the capability flag for the
         # fitter operations (save/preview/incorporate/configure).
@@ -831,20 +848,15 @@ class InteractiveFitSession:
         """Adopt the built context and publish Idle.
 
         Runs on the fitter thread once build_device_state() has returned.
-        When the session was constructed from a checkpoint, the restored
-        model's preview is exported and published before the session goes
-        idle, exactly as the legacy on_ready handoff did.
+        Resuming from a checkpoint no longer exports a preview on the way to
+        Idle: a preview is minutes of work a client may not want, and
+        inspecting a checkpoint should not require it. A client that wants to
+        see the restored model asks for one.
         """
         with self._condition:
             self._context = context
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
-        if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
-            self._transition(SessionState.ExportingPreview,
-                             "Exporting restored checkpoint preview")
-            self._progress_reporter().begin(
-                "exporting_preview", "Exporting restored checkpoint preview")
-            self._publish_preview()
         self._progress_reporter().clear()
         self._transition(SessionState.Idle, idle_phase(self._completed))
 
@@ -917,6 +929,9 @@ class InteractiveFitSession:
                 continue
             if isinstance(command, DiscardCheckpointCommand):
                 self._run_checkpoint_discard(command)
+                continue
+            if isinstance(command, ExportPreviewCommand):
+                self._run_export_preview(command)
                 continue
             if not isinstance(command, SaveCheckpointCommand):
                 command.fail(f"Unknown session command {command.kind}")
@@ -1072,6 +1087,34 @@ class InteractiveFitSession:
             self._leave_checkpoint_load()
         command.complete(discarded=True)
 
+    def _run_export_preview(self, command):
+        """Export and publish one preview generation at the pause boundary."""
+        with self._condition:
+            previous_state = self._state
+            previous_phase = self._phase
+            self._transition_locked(
+                SessionState.ExportingPreview, "Exporting preview",
+                reason=f"preview command {command.command_id}")
+        error = None
+        try:
+            self._progress_reporter().begin(
+                "exporting_preview", "Exporting preview")
+            self._publish_preview()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._progress_reporter().clear()
+            with self._condition:
+                self._transition_locked(previous_state, previous_phase)
+                manifest = self._preview_manifest
+                generation = self._preview_generation
+            self._publish_status()
+            if error is None:
+                command.complete(preview_manifest_path=manifest,
+                                 preview_generation=generation)
+            else:
+                command.fail(error)
+
     def _run_incorporation(self, command):
         """Append newly uploaded ephemeral inputs to the resident fit.
 
@@ -1214,20 +1257,19 @@ class InteractiveFitSession:
         if pause:
             if self._context is not None:
                 self._context.clear_interactive_influence()
-            if not getattr(self, "publishes_outputs", True):
-                self._progress_reporter().clear()
-                self._transition(SessionState.Idle, idle_phase(self._completed))
-                return
-            self._transition(SessionState.Saving, "Autosaving checkpoint")
-            self._progress_reporter().begin(
-                "saving_checkpoint", "Autosaving checkpoint",
-                detail="checkpoint_autosave.ckpt")
-            autosave = str(Path(self._output_path) / "checkpoint_autosave.ckpt")
-            self._context.save_checkpoint(autosave, self._completed)
-            self._transition(SessionState.ExportingPreview, "Exporting preview")
-            self._progress_reporter().begin(
-                "exporting_preview", "Exporting preview")
-            self._publish_preview()
+            # Pausing writes the durable autosave when the run asked for it,
+            # and does nothing else. Exporting a preview is a request of its
+            # own: it costs minutes, and a client that wants one after a
+            # pause asks for one.
+            if (getattr(self, "publishes_outputs", True)
+                    and getattr(self, "_autosave_on_pause", True)):
+                self._transition(SessionState.Saving, "Autosaving checkpoint")
+                self._progress_reporter().begin(
+                    "saving_checkpoint", "Autosaving checkpoint",
+                    detail="checkpoint_autosave.ckpt")
+                autosave = str(
+                    Path(self._output_path) / "checkpoint_autosave.ckpt")
+                self._context.save_checkpoint(autosave, self._completed)
             self._progress_reporter().clear()
             self._transition(SessionState.Idle, idle_phase(self._completed))
 
@@ -1250,7 +1292,7 @@ class InteractiveFitSession:
     # Coordinator-thread commands.
     def run(self, count, pending_inputs=None, mark_incorporated=None,
             influence_config=None, run_config=None, path_changes=None,
-            barrier=None):
+            autosave_on_pause=True, barrier=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
@@ -1262,6 +1304,10 @@ class InteractiveFitSession:
             # coordinator's epoch, kind, configuration revision, and pending
             # count before anything is queued for the step loop.
             epoch = self._enter_epoch_locked("run", barrier)
+            # Whether this run's pause writes the durable autosave: a
+            # property of the run that is pausing, decided at admission
+            # rather than read from configuration at the boundary.
+            self._autosave_on_pause = bool(autosave_on_pause)
             run_config = dict(run_config or {})
             path_changes = dict(path_changes or {})
             target = self._completed + count
@@ -1403,6 +1449,23 @@ class InteractiveFitSession:
                 session_generation=self.session_generation, epoch=epoch)
         return self._queue_command(command, timeout)
 
+    def export_preview(self, timeout=600.0):
+        """Export and publish one preview generation, on request.
+
+        A coordinator sub-operation: only the publishing rank exports, so it
+        carries no command epoch, exactly like a checkpoint save.
+        """
+        with self._condition:
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Preview export is not allowed in {self._state.name}")
+            if not getattr(self, "publishes_outputs", True):
+                raise RuntimeError("This rank does not publish outputs")
+            command = ExportPreviewCommand(
+                session_generation=self.session_generation,
+                expected_iteration=self._completed)
+        return self._queue_command(command, timeout)
+
     def load_checkpoint(self, path, timeout=600.0):
         """Load a checkpoint into the live session, strictly and atomically.
 
@@ -1479,10 +1542,17 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         influence_config=arguments.get("influence_config"),
                         run_config=arguments.get("run_config"),
                         path_changes=arguments.get("path_changes"),
+                        autosave_on_pause=arguments.get(
+                            "autosave_on_pause", True),
                         barrier=barrier,
                     )
                 elif name == "stop":
                     result = session.stop(barrier=barrier)
+                elif name == "export_preview":
+                    # Coordinator sub-operation: only the publishing rank is
+                    # asked, and it carries no barrier.
+                    result = session.export_preview(
+                        arguments.get("timeout", 600.0))
                 elif name == "preflight_checkpoint":
                     result = session.preflight_checkpoint(
                         arguments["path"], arguments.get("timeout", 600.0),
@@ -1917,7 +1987,8 @@ class DistributedInteractiveFitSession:
             f"{silent} to {name}"))
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None):
+            influence_config=None, run_config=None, path_changes=None,
+            autosave_on_pause=True):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
@@ -1927,6 +1998,7 @@ class DistributedInteractiveFitSession:
             "influence_config": dict(influence_config or {}),
             "run_config": dict(run_config or {}),
             "path_changes": dict(path_changes or {}),
+            "autosave_on_pause": bool(autosave_on_pause),
         }
         return self._call("run", arguments, timeout=COMMAND_ACK_TIMEOUT_S,
                           incorporation_callback=mark_incorporated)
@@ -1936,6 +2008,16 @@ class DistributedInteractiveFitSession:
         if state != SessionState.Running:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
+
+    def export_preview(self, timeout=600.0):
+        state = self.status()["state"]
+        if state != SessionState.Idle:
+            raise RuntimeError(f"Preview export is not allowed in {state}")
+        # Explicitly a coordinator sub-operation: rank 0 publishes outputs,
+        # so rank 0 alone exports the preview, outside the epoch sequence.
+        return self._call("export_preview", {"timeout": timeout}, ranks=(0,),
+                          timeout=timeout + COMMAND_ACK_GRACE_S,
+                          collective=False)
 
     def load_checkpoint(self, path, timeout=600.0):
         """Coordinate a strict two-phase checkpoint load across every rank.

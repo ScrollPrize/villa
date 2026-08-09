@@ -37,7 +37,14 @@ from config import Config
 # live model domain and structure instead of rebuilding the model behind the
 # client's back; a domain change stays the job of a new fit. An accepted load
 # restores the checkpoint's completed_iterations and publishes it.
-API_VERSION = 20
+# Version 21 makes previews and pause-time saving explicit. POST
+# /session/export-preview exports and publishes one preview generation on
+# request; resuming from a checkpoint and pausing after a run no longer
+# export one by themselves, so inspecting a checkpoint costs a load rather
+# than a load plus a preview. The run request carries autosave_on_pause
+# (default true), which decides whether that run's pause writes the durable
+# autosave.
+API_VERSION = 21
 
 
 class SessionState(str, Enum):

@@ -42,7 +42,7 @@ constexpr int kEventPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 20;
+constexpr int kSupportedApiVersion = 21;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -896,6 +896,23 @@ void SpiralServiceManager::saveCheckpoint(const QString& path)
                   Timeout::LongCommand, kMutationRetries, {});
 }
 
+void SpiralServiceManager::requestPreview()
+{
+    if (!isReady() || _previewRequestInFlight) return;
+    _previewRequestInFlight = true;
+    postWithRetry(QStringLiteral("/session/export-preview"),
+                  {{QStringLiteral("command_id"), commandId()}},
+                  Timeout::LongCommand, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      _previewRequestInFlight = false;
+                      handleStatus(response);
+                  },
+                  [this](const QString& error) {
+                      _previewRequestInFlight = false;
+                      emit logMessage(tr("Preview export failed: %1").arg(error));
+                  });
+}
+
 void SpiralServiceManager::loadCheckpointIntoSession(const QString& checkpoint)
 {
     // The resident model stays; only its parameters, optimiser, scheduler and
@@ -909,6 +926,10 @@ void SpiralServiceManager::loadCheckpointIntoSession(const QString& checkpoint)
                       Timeout::Load, kMutationRetries,
                       [this, hostPath](const QJsonObject& response) {
                           handleStatus(response);
+                          // Preserve the behaviour the automatic
+                          // checkpoint-resume preview used to give: after a
+                          // load, show the restored model.
+                          requestPreview();
                           emit checkpointLoaded(
                               hostPath,
                               response.value(QStringLiteral("restored_iteration"))
@@ -1380,6 +1401,16 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
         }
+    }
+    // Pausing no longer exports a preview by itself. Ask for one exactly
+    // where the automatic pause preview used to appear: the first Idle after
+    // a run.
+    const QString state = status.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("Running")) {
+        _sawRunningSinceIdle = true;
+    } else if (state == QStringLiteral("Idle") && _sawRunningSinceIdle) {
+        _sawRunningSinceIdle = false;
+        requestPreview();
     }
     emit sessionStatusChanged(status);
     syncArtifacts(status);

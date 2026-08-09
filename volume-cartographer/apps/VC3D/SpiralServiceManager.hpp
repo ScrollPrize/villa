@@ -72,6 +72,10 @@ public:
     // service refuses anything that is not an exact match for the live model;
     // a client-local file is uploaded first.
     void loadCheckpointIntoSession(const QString& checkpoint);
+    // Ask the session to export and publish one preview generation. Previews
+    // are no longer a side effect of pausing or of resuming a checkpoint, so
+    // this is what keeps VC3D's "see the fit after it stops" behaviour.
+    void requestPreview();
     void deleteSession();
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
@@ -193,6 +197,10 @@ private:
     qint64 _sessionRevision = 0;
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;
+    // True once a run has been observed; the following Idle is the pause the
+    // panel wants a preview of.
+    bool _sawRunningSinceIdle = false;
+    bool _previewRequestInFlight = false;
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;

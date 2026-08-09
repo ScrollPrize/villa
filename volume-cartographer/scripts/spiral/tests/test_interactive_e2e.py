@@ -3,7 +3,9 @@
 Constructs a real InteractiveFitSession (which builds and drives a real
 FitContext on the fitter thread) against the local Scroll1 dataset over a
 small z-range, waits for Idle, runs two iterations, and checks the pause
-protocol outputs (autosave checkpoint + published preview manifest).
+protocol outputs: the run-request autosave on pause, and a preview
+manifest published by an explicit export request (pausing no longer exports
+one by itself).
 
 Gated behind SPIRAL_INTERACTIVE_E2E=1: it needs a GPU and the local dataset
 and takes minutes, so it must run in its own interpreter, not as part of the
@@ -106,7 +108,17 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 autosaves = glob.glob(
                     f"{out_dir}/*/checkpoint_autosave.ckpt")
                 self.assertEqual(len(autosaves), 1, autosaves)
-                manifest = status["preview_manifest_path"]
+                # Pausing writes the autosave and nothing else; a preview is
+                # exported only when a client asks for one.
+                self.assertIsNone(status["preview_manifest_path"])
+                self.assertEqual(status["preview_generation"], 0)
+
+                exported = session.export_preview(timeout=900.0)
+                status = session.status()
+                self.assertEqual(status["state"], SessionState.Idle,
+                                 status.get("error"))
+                manifest = exported["preview_manifest_path"]
+                self.assertEqual(manifest, status["preview_manifest_path"])
                 self.assertIsNotNone(manifest)
                 self.assertTrue(Path(manifest).is_file(), manifest)
                 self.assertEqual(status["preview_generation"], 1)
