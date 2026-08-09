@@ -24,15 +24,14 @@ from tqdm import tqdm
 
 from ddp_helpers import (
     StepTimer,
+    DistributedContext,
     allreduce_grads_,
     broadcast_model_params,
     configure_torch_threads_from_env,
-    get_rank,
-    get_world_size,
-    is_distributed,
     is_main_process,
     maybe_destroy_distributed,
     maybe_init_distributed,
+    process_context,
 )
 from config import Config, FitConfig, durable_config
 from fit_session import fit_input, input_change_impact
@@ -659,7 +658,7 @@ class FitContext:
                  progress=None, resume_path=None, resume_step=0,
                  out_base_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
-                 render_volume_scale=16):
+                 render_volume_scale=16, dist_context=None):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
@@ -702,6 +701,12 @@ class FitContext:
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_tag = run_tag or None
         self.run_name = run_name
+        # Who this process is in the job, as an explicit value. Callers that
+        # joined a process group pass the context maybe_init_distributed()
+        # returned; the default is the process context installed there (a
+        # single-rank context when nothing joined one). Nothing below reads
+        # RANK/WORLD_SIZE from the environment.
+        self.dist = dist_context or process_context()
 
         # Scroll physical facts.
         self.scroll_name = scroll.name
@@ -1830,7 +1835,7 @@ class FitContext:
             self._realign_lr_schedule(self.start_iteration)
 
         progress.begin('loading', 'Synchronizing model across GPU workers')
-        broadcast_model_params(self.spiral_and_transform)
+        broadcast_model_params(self.spiral_and_transform, self.dist)
 
         if os.environ.get('FIT_SPIRAL_TORCH_PROFILE') == '1':
             self.profiler = torch.profiler.profile(
@@ -1928,7 +1933,7 @@ class FitContext:
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
         def report_first_dt_target_cache(kind, cache):
-            if is_main_process():
+            if self.dist.is_main_process:
                 message = (
                     f'dt-target[{kind}]: {int(cache["valid"].numel())} objects, '
                     f'{cache.get("num_points", 0)} points'
@@ -1941,12 +1946,12 @@ class FitContext:
             self.config['dt_target_update_interval'], report_first_dt_target_cache,
         )
 
-        if is_distributed():
-            np.random.seed(self.config['optimizer_random_seed'] + get_rank())
-            torch.manual_seed(self.config['optimizer_random_seed'] + get_rank())
+        if self.dist.is_distributed:
+            np.random.seed(self.config['optimizer_random_seed'] + self.dist.rank)
+            torch.manual_seed(self.config['optimizer_random_seed'] + self.dist.rank)
         self.dist_grad_params = list(self.spiral_and_transform.parameters())
         self.dist_grad_named = list(self.spiral_and_transform.named_parameters())
-        if is_main_process():
+        if self.dist.is_main_process:
             n_params = sum(p.numel() for p in self.dist_grad_params)
             n_bytes = sum(p.numel() * p.element_size() for p in self.dist_grad_params)
             print(
@@ -1955,7 +1960,7 @@ class FitContext:
             )
         self.step_timer = StepTimer(
             enabled=os.environ.get('FIT_SPIRAL_PROFILE_STEPS') == '1',
-            report=is_main_process(),
+            report=self.dist.is_main_process,
         )
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
@@ -3071,7 +3076,7 @@ class FitContext:
             )
         self.step_timer.stop('bwd')
         self.step_timer.start('comm')
-        allreduce_grads_(self.dist_grad_params)
+        allreduce_grads_(self.dist_grad_params, self.dist.world_size)
         self.step_timer.stop('comm')
 
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
@@ -3145,7 +3150,7 @@ class FitContext:
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
             # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
-            if is_main_process():
+            if self.dist.is_main_process:
                 print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
                 n_sanitised = int(self.nonfinite_grad_steps.item())
                 if n_sanitised > 0:
@@ -3188,7 +3193,7 @@ class FitContext:
             unit='iterations')
         for iteration in tqdm(
                 range(self.start_iteration, self.num_training_steps),
-                disable=not is_main_process() or has_progress):
+                disable=not self.dist.is_main_process or has_progress):
             loss, losses, log_metrics, shell_metrics = self.step(iteration)
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
@@ -3198,7 +3203,7 @@ class FitContext:
         # ==========================================================================
 
         suffix = 'fitted'
-        if is_main_process():
+        if self.dist.is_main_process:
             progress.begin(
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
@@ -3272,7 +3277,7 @@ class FitContext:
 def main(config, *, scroll, paths, progress=None, resume_path=None,
          resume_step=0, out_base_dir=None, run_tag=None, run_name=None,
          cache_dir=None, storage_backend='sparse_cuda',
-         render_volume_scale=16):
+         render_volume_scale=16, dist_context=None):
     """Run one headless fit over a fresh context (library entry point).
 
     config is the resolved FitConfig; scroll/paths are the ScrollSpec and
@@ -3292,6 +3297,7 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         cache_dir=cache_dir,
         storage_backend=storage_backend,
         render_volume_scale=render_volume_scale,
+        dist_context=dist_context,
     ).run()
 
 
@@ -3321,8 +3327,13 @@ if __name__ == '__main__':
     scroll_spec = load_scroll_spec(cli_args.dataset, cli_args.scroll_spec)
     input_paths = conventional_input_paths(cli_args.dataset, scroll_spec)
 
-    cli_progress = ProgressReporter(stream=sys.stderr) if is_main_process() else None
-    maybe_init_distributed()
+    # The CLI is a torchrun rendezvous boundary: this is where RANK /
+    # WORLD_SIZE / LOCAL_RANK are read, once, into an explicit context that is
+    # passed down to everything below.
+    dist_context = DistributedContext.from_env()
+    cli_progress = (ProgressReporter(stream=sys.stderr)
+                    if dist_context.is_main_process else None)
+    maybe_init_distributed(dist_context)
     try:
         config = Config().as_dict()
         config.update(get_env_config_overrides())
@@ -3344,23 +3355,23 @@ if __name__ == '__main__':
         )
         z_range_scale, z_range_num_slices, split_divisor = scale_and_split_counts(
             config, config['z_begin'], config['z_end'],
-            z_range_scaled_count_keys)
-        if is_main_process():
+            z_range_scaled_count_keys, world_size=dist_context.world_size)
+        if dist_context.is_main_process:
             print(
                 f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
                 f'z-range [{config["z_begin"]}, {config["z_end"]}) '
                 f'(reference {REFERENCE_Z_RANGE_NUM_SLICES} slices):\n  '
                 + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
             )
-            if is_distributed():
+            if dist_context.is_distributed:
                 policy = f'split by {split_divisor}' if split_divisor > 1 else 'scale-up (full counts per rank)'
-                print(f'distributed: world_size={get_world_size()}, per-step counts {policy}')
+                print(f'distributed: world_size={dist_context.world_size}, per-step counts {policy}')
 
         # wandb is an optional logging sink only: the run records the config
         # and receives log_step_metrics payloads, but the fit reads its
         # configuration exclusively from the explicit FitConfig below.
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
-        if not is_main_process():
+        if not dist_context.is_main_process:
             wandb_mode = 'disabled'
         wandb.init(project='scrolls', config=config, mode=wandb_mode)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
@@ -3380,8 +3391,9 @@ if __name__ == '__main__':
                        or default_user_cache_dir()),
             render_volume_scale=int(
                 os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '16')),
+            dist_context=dist_context,
         )
     finally:
         if cli_progress is not None:
             cli_progress.close()
-        maybe_destroy_distributed()
+        maybe_destroy_distributed(dist_context)

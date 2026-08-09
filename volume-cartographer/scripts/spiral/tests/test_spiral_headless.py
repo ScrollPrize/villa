@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 import queue
@@ -15,9 +16,12 @@ from fit_session import (PclInputSpec, PclRole, ScrollSpecError, SessionState,
                          resolve_logical_dbm, validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
-from spiral_runtime import (ConfigureCommand, DistributedInteractiveFitSession,
-                            IncorporateCommand, InteractiveFitSession,
-                            SaveCheckpointCommand)
+from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
+                            ConfigureCommand,
+                            DistributedInteractiveFitSession,
+                            FileStoreRendezvous, IncorporateCommand,
+                            InteractiveFitSession, SaveCheckpointCommand,
+                            collective_view)
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
@@ -249,30 +253,76 @@ class PreviewRangeTests(unittest.TestCase):
         self.assertEqual(pcl_extents, [])
 
 
+class _FakeWorker:
+    """A worker process stand-in for the parent watchdog and fail-stop paths."""
+
+    def __init__(self, rank):
+        self.rank = rank
+        self.alive = True
+        self.exitcode = None
+        self.terminated = 0
+        self.killed = 0
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminated += 1
+        self.alive = False
+        if self.exitcode is None:
+            self.exitcode = -15
+
+    def kill(self):
+        self.killed += 1
+        self.alive = False
+        self.exitcode = -9
+
+    def join(self, timeout=None):
+        return None
+
+
+def rank_status(state, epoch=0, config_revision=0, **extra):
+    status = {
+        "state": state, "phase": str(state), "warnings": [], "error": None,
+        "current_iteration": 0, "target_iteration": 0,
+        "command_epoch": epoch, "config_revision": config_revision,
+    }
+    status.update(extra)
+    return status
+
+
 class ProtocolTests(unittest.TestCase):
-    def test_distributed_session_waits_for_every_rank_before_ready(self):
-        session = DistributedInteractiveFitSession.__new__(DistributedInteractiveFitSession)
-        session._gpu_ids = (0, 1)
-        session._condition = threading.Condition()
+    def _proxy(self, world_size=2, published=None):
+        """A coordinator with fake workers and no spawned processes."""
+        session = DistributedInteractiveFitSession.__new__(
+            DistributedInteractiveFitSession)
+        session._init_coordinator_state(
+            tuple(range(world_size)),
+            (published.append if published is not None else None),
+            None)
         session._events = queue.Queue()
-        session._rank_statuses = {}
-        session._acks = {}
-        session._incorporation_callbacks = {}
-        session._failed_error = None
-        session._status = {"state": SessionState.Loading, "warnings": []}
+        session._commands = [queue.Queue() for _ in range(world_size)]
+        session._processes = [_FakeWorker(rank) for rank in range(world_size)]
+        return session
+
+    def _wait_for(self, predicate, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_distributed_session_waits_for_every_rank_before_ready(self):
         published = []
-        session._status_callback = lambda status: published.append(status)
+        session = self._proxy(published=published)
         listener = threading.Thread(target=session._listen)
         listener.start()
-        ready = {
-            "state": SessionState.Idle, "phase": "Ready", "warnings": [],
-            "error": None, "current_iteration": 0, "target_iteration": 0,
-        }
+        ready = rank_status(SessionState.Idle, epoch=3)
+        ready["phase"] = "Ready"
         session._events.put(("status", 0, ready))
-        session._events.put(("status", 1, {
-            **ready,
-            "state": SessionState.Loading,
-            "progress": {
+        session._events.put(("status", 1, rank_status(
+            SessionState.Loading, epoch=3, progress={
                 "operation": "loading",
                 "stage_name": "Loading tracks",
                 "detail": None,
@@ -281,26 +331,270 @@ class ProtocolTests(unittest.TestCase):
                 "unit": "DB keys",
                 "elapsed_seconds": 3.0,
                 "eta_seconds": 12.0,
-            },
-        }))
-        deadline = time.time() + 2
-        while len(published) < 2 and time.time() < deadline:
-            time.sleep(0.01)
+            })))
+        self.assertTrue(self._wait_for(lambda: len(published) >= 2))
+        # Rank 0 being ready is not a collective fact, so the last state every
+        # rank agreed on (Loading) stands and the phase names the laggard.
         self.assertEqual(published[-1]["state"], SessionState.Loading)
         self.assertEqual(published[-1]["phase"], "Loading tracks")
         self.assertIn(
             "GPU worker 2/2", published[-1]["progress"]["detail"])
 
-        session._events.put(("status", 1, ready))
-        deadline = time.time() + 2
-        while (published[-1]["state"] != SessionState.Idle
-               and time.time() < deadline):
-            time.sleep(0.01)
-        self.assertEqual(published[-1]["state"], SessionState.Idle)
+        session._events.put(("status", 1, rank_status(
+            SessionState.Idle, epoch=3)))
+        self.assertTrue(self._wait_for(
+            lambda: published[-1]["state"] == SessionState.Idle))
+        self.assertEqual(session._collective_state, SessionState.Idle)
         session._events.put(None)
         listener.join(2)
 
-    def _idle_session(self, completed=0):
+    def test_collective_state_is_visible_only_when_every_rank_agrees(self):
+        idle = rank_status(SessionState.Idle, epoch=4)
+        running = rank_status(SessionState.Running, epoch=4)
+
+        # One rank has not reported at all.
+        view = collective_view({0: idle}, 2, SessionState.Loading)
+        self.assertFalse(view.visible)
+        self.assertEqual(view.state, SessionState.Loading)
+
+        # Both reported, but they are in different states.
+        view = collective_view({0: idle, 1: running}, 2, SessionState.Loading)
+        self.assertFalse(view.visible)
+        self.assertEqual(view.state, SessionState.Loading)
+        self.assertEqual(view.laggard, 1)
+
+        # Same state, different command epochs: still not a collective fact,
+        # because the ranks are executing different commands.
+        view = collective_view(
+            {0: running, 1: rank_status(SessionState.Running, epoch=5)},
+            2, SessionState.Idle)
+        self.assertFalse(view.visible)
+        self.assertEqual(view.state, SessionState.Idle)
+        self.assertEqual(view.laggard, 1)
+
+        # Same epoch and same state.
+        view = collective_view({0: running, 1: running}, 2, SessionState.Idle)
+        self.assertTrue(view.visible)
+        self.assertEqual(view.state, SessionState.Running)
+
+    def test_rank_zero_publication_is_named_a_coordinator_sub_operation(self):
+        published = []
+        session = self._proxy(published=published)
+        session._collective_state = SessionState.Idle
+        listener = threading.Thread(target=session._listen)
+        listener.start()
+        saving = rank_status(SessionState.Saving, epoch=6)
+        saving["phase"] = "Autosaving checkpoint"
+        saving["progress"] = {"operation": "saving_checkpoint",
+                              "stage_name": "Autosaving checkpoint",
+                              "detail": "checkpoint_autosave.ckpt"}
+        session._events.put(("status", 1, rank_status(
+            SessionState.Idle, epoch=6)))
+        session._events.put(("status", 0, saving))
+        self.assertTrue(self._wait_for(
+            lambda: published and published[-1].get("coordinator_operation")))
+        latest = published[-1]
+        self.assertEqual(latest["state"], SessionState.Saving)
+        self.assertEqual(latest["coordinator_operation"], "saving")
+        self.assertIn("Coordinator saving (rank 0)", latest["phase"])
+        self.assertIn("coordinator rank 1/2", latest["progress"]["detail"])
+        # The agreed collective state is untouched by rank-0-only work.
+        self.assertEqual(session._collective_state, SessionState.Idle)
+        session._events.put(None)
+        listener.join(2)
+
+    def test_all_rank_commands_carry_a_monotonic_epoch(self):
+        session = self._proxy()
+        with session._condition:
+            session._rank_statuses = {
+                0: rank_status(SessionState.Idle, config_revision=7),
+                1: rank_status(SessionState.Idle, config_revision=7),
+            }
+            first = session._issue_barrier("run")
+            second = session._issue_barrier("stop")
+        self.assertEqual((first.epoch, first.kind), (1, "run"))
+        self.assertEqual((second.epoch, second.kind), (2, "stop"))
+        # A run may only be admitted by a quiescent rank; stop is
+        # asynchronous with respect to the step loop.
+        self.assertEqual(first.pending, 0)
+        self.assertIsNone(second.pending)
+        self.assertEqual(first.config_revision, 7)
+
+        # Without unanimous revisions there is nothing to assert.
+        with session._condition:
+            session._rank_statuses[1] = rank_status(
+                SessionState.Idle, config_revision=8)
+            third = session._issue_barrier("run")
+        self.assertIsNone(third.config_revision)
+
+    def test_checkpoint_save_is_a_coordinator_sub_operation_without_a_barrier(self):
+        session = self._proxy()
+        session._collective_state = SessionState.Idle
+        session._status["state"] = SessionState.Idle
+        thread = threading.Thread(
+            target=lambda: session._call(
+                "save_checkpoint", {"path": "/tmp/x.ckpt"}, ranks=(0,),
+                timeout=5.0, collective=False))
+        thread.start()
+        barrier, command_id, name, _ = session._commands[0].get(timeout=5)
+        self.assertIsNone(barrier)
+        self.assertEqual(name, "save_checkpoint")
+        self.assertEqual(session._command_epoch, 0)
+        self.assertTrue(session._commands[1].empty())
+        session._events.put(("ack", command_id, 0, True, "/tmp/x.ckpt"))
+        listener = threading.Thread(target=session._listen)
+        listener.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        session._events.put(None)
+        listener.join(2)
+
+    def test_worker_error_fails_the_session_and_terminates_siblings(self):
+        published = []
+        session = self._proxy(published=published)
+        session._start_coordinator_threads()
+        try:
+            started = time.monotonic()
+            session._events.put((
+                "worker_error", 1, "RuntimeError: boom", "Traceback: boom"))
+            self.assertTrue(self._wait_for(
+                lambda: session.status()["state"] == SessionState.Error))
+            self.assertTrue(self._wait_for(
+                lambda: all(worker.terminated
+                            for worker in session._processes)))
+            elapsed = time.monotonic() - started
+        finally:
+            session._stop_watchdog.set()
+            session._events.put(None)
+        self.assertLess(elapsed, 60.0)
+        self.assertIn("rank 1", session.status()["error"])
+        self.assertIn("boom", session.status()["error"])
+        self.assertTrue(all(worker.terminated
+                            for worker in session._processes))
+        self.assertTrue(published)
+
+    def test_unexpected_worker_exit_fails_the_session_in_bounded_time(self):
+        session = self._proxy()
+        session._start_coordinator_threads()
+        try:
+            started = time.monotonic()
+            session._processes[1].alive = False
+            session._processes[1].exitcode = 7
+            self.assertTrue(self._wait_for(
+                lambda: session.status()["state"] == SessionState.Error))
+            self.assertTrue(self._wait_for(
+                lambda: session._processes[0].terminated == 1))
+            elapsed = time.monotonic() - started
+        finally:
+            session._stop_watchdog.set()
+            session._events.put(None)
+        self.assertLess(elapsed, 60.0)
+        error = session.status()["error"]
+        self.assertIn("rank 1", error)
+        self.assertIn("exit code 7", error)
+        # The surviving sibling is taken down with it.
+        self.assertEqual(session._processes[0].terminated, 1)
+
+    def test_command_timeout_fails_the_session_and_aborts_the_workers(self):
+        session = self._proxy()
+        session._collective_state = SessionState.Idle
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError) as caught:
+            session._call("run", {"count": 1}, timeout=0.05)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 60.0)
+        self.assertIn("Timed out", str(caught.exception))
+        self.assertIn("[0, 1]", str(caught.exception))
+        self.assertEqual(session.status()["state"], SessionState.Error)
+        self.assertTrue(all(worker.terminated
+                            for worker in session._processes))
+        # A failed session refuses further work with the original cause.
+        with self.assertRaisesRegex(RuntimeError, "Timed out"):
+            session._call("stop")
+
+    def test_first_failure_cause_wins_and_workers_are_aborted_once(self):
+        session = self._proxy()
+        session._fail_session("first cause", rank=1)
+        session._fail_session("second cause", rank=0)
+        self.assertIn("first cause", session.status()["error"])
+        self.assertTrue(all(worker.terminated == 1
+                            for worker in session._processes))
+
+    def test_rendezvous_owns_its_endpoint_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as root:
+            rendezvous = FileStoreRendezvous(Path(root) / ".spiral-rendezvous")
+            directory = Path(rendezvous.directory)
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(
+                Path(rendezvous.endpoint.store_path).parent, directory)
+            # Two sessions never share an endpoint.
+            other = FileStoreRendezvous(Path(root) / ".spiral-rendezvous")
+            self.assertNotEqual(other.directory, rendezvous.directory)
+            other.close()
+            # Closing one leaves the other's endpoint owned.
+            self.assertTrue(directory.is_dir())
+
+            session = self._proxy()
+            session._rendezvous = rendezvous
+            session._close_rendezvous()
+            self.assertFalse(directory.exists())
+            self.assertIsNone(session._rendezvous)
+
+    def test_run_barrier_is_validated_against_the_rank_state(self):
+        session = self._idle_session(rank=1, world_size=2)
+        session._config_revision = 4
+        good = CommandBarrier(epoch=1, kind="run", config_revision=4,
+                              pending=0)
+
+        for barrier, expected in [
+            (dataclasses.replace(good, epoch=2), "expected command epoch 1"),
+            (dataclasses.replace(good, kind="stop"),
+             "coordinator issued as stop"),
+            (dataclasses.replace(good, config_revision=9),
+             "configuration revision 4"),
+            (dataclasses.replace(good, pending=3), "requires 3"),
+        ]:
+            with self.assertRaises(CommandBarrierViolation) as caught:
+                session.run(5, barrier=barrier)
+            self.assertIn("rank 1", str(caught.exception))
+            self.assertIn(expected, str(caught.exception))
+            # A refused barrier leaves the rank exactly where it was.
+            self.assertEqual(session._state, SessionState.Idle)
+            self.assertEqual(session._command_epoch, 0)
+
+        session.run(5, barrier=good)
+        self.assertEqual(session._command_epoch, 1)
+        self.assertEqual(session._step_epoch, 1)
+        self.assertEqual(session._state, SessionState.Running)
+
+    def test_command_from_another_epoch_fail_stops_the_rank(self):
+        session = self._idle_session(rank=1, world_size=2)
+        session._commands.append(IncorporateCommand(
+            session_generation=0, epoch=99, records=[]))
+        with self.assertRaisesRegex(CommandBarrierViolation,
+                                    "from epoch 99 while in epoch 0"):
+            session.wait_for_iteration(0)
+
+    def test_step_boundary_refuses_an_epoch_the_run_was_not_admitted_in(self):
+        session = self._idle_session(rank=1, world_size=2)
+        session.run(5, barrier=CommandBarrier(
+            epoch=1, kind="run", config_revision=0, pending=0))
+        # A step under the admitting epoch is allowed...
+        session.wait_for_iteration(0)
+        # ...and one under any other epoch is not.
+        with session._condition:
+            session._command_epoch = 2
+        with self.assertRaisesRegex(CommandBarrierViolation,
+                                    "admitted in epoch 1"):
+            session.wait_for_iteration(0)
+        with session._condition:
+            session._command_epoch = 1
+            session._config_revision = 3
+        with self.assertRaisesRegex(CommandBarrierViolation,
+                                    "against revision 0"):
+            session.wait_for_iteration(0)
+
+    def _idle_session(self, completed=0, rank=0, world_size=1):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
         session._state = SessionState.Idle
@@ -311,6 +605,19 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session._stop_requested = False
+        session._shutdown = False
+        session._run_start_completed = completed
+        session.rank = rank
+        session.world_size = world_size
         session._status_callback = None
         session._event_callback = None
         return session
@@ -395,6 +702,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
 
         target = session.run(250)
 
@@ -414,6 +726,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -441,6 +758,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -463,6 +785,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -486,6 +813,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -513,6 +845,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -541,6 +878,11 @@ class ProtocolTests(unittest.TestCase):
         session._commands = []
         session.session_generation = 0
         session._config_revision = 0
+        session._command_epoch = 0
+        session._step_epoch = 0
+        session._step_config_revision = 0
+        session.rank = 0
+        session.world_size = 1
         session.requested_config = {"loss_weight_patch_radius": 8.0}
         session._run_config = {"loss_weight_patch_radius": 8.0}
 

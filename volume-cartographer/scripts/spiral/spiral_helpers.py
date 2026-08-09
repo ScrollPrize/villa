@@ -62,15 +62,17 @@ SAMPLING_COUNT_FLOORS = {
 REFERENCE_Z_RANGE_NUM_SLICES = 9500
 
 
-def scale_and_split_counts(config, z_begin, z_end, count_keys):
+def scale_and_split_counts(config, z_begin, z_end, count_keys, world_size=None):
     """Scale per-step counts for the z-range, then split them across ranks.
 
     The shared scale-then-split sequence used by both the headless CLI
     (fit_spiral.__main__) and the interactive runtime (spiral_runtime).
     The callers pass their own key sets: the CLI keeps its historical
     tuple while the runtime derives keys from the Config catalog's
-    scale_with_z fields. Returns (scale, num_slices, split_divisor) for
-    caller-side reporting.
+    scale_with_z fields. ``world_size`` is passed explicitly by callers that
+    hold a DistributedContext; None falls back to the installed process
+    context. Returns (scale, num_slices, split_divisor) for caller-side
+    reporting.
     """
     from ddp_helpers import split_counts_across_ranks
 
@@ -79,7 +81,8 @@ def scale_and_split_counts(config, z_begin, z_end, count_keys):
         REFERENCE_Z_RANGE_NUM_SLICES, count_keys,
         floors=SAMPLING_COUNT_FLOORS,
     )
-    split_divisor = split_counts_across_ranks(config, count_keys)
+    split_divisor = split_counts_across_ranks(
+        config, count_keys, world_size=world_size)
     return scale, num_slices, split_divisor
 
 
