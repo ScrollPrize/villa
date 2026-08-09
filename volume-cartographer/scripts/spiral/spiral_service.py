@@ -39,7 +39,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG, ScrollSpecError,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
+                         ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir, fit_input,
                          input_change_impact, load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
@@ -472,6 +473,15 @@ class _TeeStream:
 
 
 class ServiceState:
+    """HTTP-facing state of the service process.
+
+    The session lifecycle state is owned by the runtime session and is only
+    observed here: every decision reads ``session.status()["state"]`` (a
+    ``SessionState``) and the service never keeps or advances a copy of it.
+    What the service does own is service-scoped bookkeeping — session and
+    command generations, artifacts, uploads, run plans.
+    """
+
     def __init__(self, dataset_root=None, dataset_resolution=None,
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,)):
@@ -562,6 +572,8 @@ class ServiceState:
         with self.lock:
             response = self._base()
             response.update(self.session.status() if self.session else {
+                # "Empty" is not a SessionState: it reports the absence of a
+                # session, not a state a session can be in.
                 "state": "Empty", "phase": "No session", "current_iteration": 0,
                 "target_iteration": 0, "latest_metrics": {}, "warnings": [],
                 "error": None, "preview_manifest_path": None, "preview_generation": 0,
@@ -628,7 +640,8 @@ class ServiceState:
             "process_id": os.getpid(),
             "dataset_owned": self.dataset_resolution is not None,
             "dataset_root": self.dataset_root,
-            "cuda_ready": None if not self.session else self.session.status()["state"] != "Error",
+            "cuda_ready": None if not self.session
+            else self.session.status()["state"] != SessionState.Error,
         })
         return response
 
@@ -712,9 +725,8 @@ class ServiceState:
         with self.lock:
             if self.replacing:
                 raise ApiError(HTTPStatus.CONFLICT, "A session replacement is already in progress")
-            if self.session and self.session.status()["state"] in {
-                "Loading", "Running", "Saving", "ExportingPreview"
-            }:
+            if (self.session
+                    and self.session.status()["state"] in SESSION_BUSY_STATES):
                 raise ApiError(HTTPStatus.CONFLICT, "The current session is active")
             previous = self.session
             previous_ephemeral = self._session_ephemeral_dir()
@@ -806,7 +818,7 @@ class ServiceState:
                     self.session_request["paths"] = \
                         self.session_paths.manifest()
             if (self.pending_revision_target is not None
-                    and status.get("state") in {"Ready", "Paused"}
+                    and status.get("state") == SessionState.Idle
                     and int(status.get("current_iteration") or 0)
                     >= self.pending_revision_target):
                 self.session_revision += 1
@@ -863,7 +875,7 @@ class ServiceState:
                     payload={"iteration": iteration, **dict(metrics)},
                     coalesce_key=("metric", rank))
         error = status.get("error")
-        if status.get("state") == "Error" and error:
+        if status.get("state") == SessionState.Error and error:
             with self.lock:
                 emit = self._event_errors.get(rank) != error
                 if emit:
@@ -1030,7 +1042,7 @@ class ServiceState:
 
     def plan_run(self, request):
         session = self._require_session()
-        if session.status().get("state") not in {"Ready", "Paused"}:
+        if session.status().get("state") != SessionState.Idle:
             raise ApiError(HTTPStatus.CONFLICT,
                            "Run planning requires a paused session")
         expected = request.get("expected_session_revision")
@@ -1182,7 +1194,7 @@ class ServiceState:
         with self.lock:
             if not self.session:
                 return {**self.status(), "deleted": False}
-            if self.session.status()["state"] in {"Loading", "Running", "Saving", "ExportingPreview"}:
+            if self.session.status()["state"] in SESSION_BUSY_STATES:
                 raise ApiError(HTTPStatus.CONFLICT, "Stop and wait for the session to settle before deleting it")
             session = self.session
             ephemeral_dir = self._session_ephemeral_dir()

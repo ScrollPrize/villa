@@ -27,7 +27,46 @@ from config import Config
 # Version 18 adds the structured /events stream and stops synthesizing
 # eta_seconds inside the /session/status progress snapshot: clients derive
 # the ETA from the raw step/total/elapsed fields.
-API_VERSION = 18
+# Version 19 replaces the Ready/Paused session states with a single Idle
+# state: a session that has never run and a session paused after N
+# iterations are the same lifecycle state, distinguished by
+# current_iteration (0 vs > 0). Clients derive the "Ready"/"Paused" label.
+API_VERSION = 19
+
+
+class SessionState(str, Enum):
+    """Lifecycle state of one resident fit session.
+
+    The wire form is the member name; the member is a ``str`` so a status
+    snapshot serializes and compares exactly like the string it replaces.
+
+    Ready and Paused are one state: an idle session that has never stepped
+    and an idle session paused after N iterations differ only in
+    ``completed_iterations``. Operation phase and progress are reported
+    separately (``phase``/``progress``) and are not part of this enum.
+
+    ``Empty`` is deliberately absent: it describes a service with no
+    session at all, not a state a session can be in.
+    """
+
+    Loading = "Loading"
+    Idle = "Idle"
+    Running = "Running"
+    Saving = "Saving"
+    ExportingPreview = "ExportingPreview"
+    Error = "Error"
+    Closing = "Closing"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
+
+
+# States in which a session is executing something on the fitter thread and
+# cannot accept a new run, a save, or a replacement.
+SESSION_BUSY_STATES = frozenset({
+    SessionState.Loading, SessionState.Running, SessionState.Saving,
+    SessionState.ExportingPreview,
+})
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:

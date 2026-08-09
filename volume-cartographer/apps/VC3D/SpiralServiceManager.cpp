@@ -42,7 +42,7 @@ constexpr int kEventPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 18;
+constexpr int kSupportedApiVersion = 19;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the

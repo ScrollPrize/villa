@@ -2,7 +2,7 @@
 
 Constructs a real InteractiveFitSession (which builds and drives a real
 FitContext on the fitter thread) against the local Scroll1 dataset over a
-small z-range, waits for Ready, runs two iterations, and checks the pause
+small z-range, waits for Idle, runs two iterations, and checks the pause
 protocol outputs (autosave checkpoint + published preview manifest).
 
 Gated behind SPIRAL_INTERACTIVE_E2E=1: it needs a GPU and the local dataset
@@ -29,8 +29,9 @@ class InteractiveEndToEndTests(unittest.TestCase):
     def test_session_reaches_ready_runs_and_pauses_with_outputs(self):
         import tempfile
 
-        from fit_session import (SpiralInputPaths, SpiralPreviewConfig,
-                                 SpiralRunConfig, load_scroll_spec)
+        from fit_session import (SessionState, SpiralInputPaths,
+                                 SpiralPreviewConfig, SpiralRunConfig,
+                                 load_scroll_spec)
         from spiral_runtime import InteractiveFitSession
 
         with tempfile.TemporaryDirectory(prefix="spiral-e2e-") as work:
@@ -77,20 +78,28 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 status_callback=None)
             try:
                 deadline = time.monotonic() + 900
-                while (session.status()["state"] not in {"Ready", "Error"}
+                while (session.status()["state"] not in {SessionState.Idle,
+                                                         SessionState.Error}
                        and time.monotonic() < deadline):
                     time.sleep(0.5)
                 status = session.status()
-                self.assertEqual(status["state"], "Ready", status.get("error"))
+                self.assertEqual(status["state"], SessionState.Idle,
+                                 status.get("error"))
                 self.assertTrue(status["supports_input_incorporation"])
+                # Idle with no completed iterations is the former "Ready".
                 self.assertEqual(status["current_iteration"], 0)
+                self.assertEqual(status["phase"], "Ready")
 
                 session.run(2)
-                while (session.status()["state"] not in {"Paused", "Error"}
+                while (session.status()["state"] not in {SessionState.Idle,
+                                                         SessionState.Error}
                        and time.monotonic() < deadline):
                     time.sleep(0.5)
                 status = session.status()
-                self.assertEqual(status["state"], "Paused", status.get("error"))
+                # Idle after N completed iterations is the former "Paused".
+                self.assertEqual(status["state"], SessionState.Idle,
+                                 status.get("error"))
+                self.assertEqual(status["phase"], "Paused")
                 self.assertEqual(status["current_iteration"], 2)
                 self.assertIn("total_loss", status["latest_metrics"])
 

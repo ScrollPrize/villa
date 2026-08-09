@@ -1650,10 +1650,18 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     }
     const QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
+    // The service reports one idle lifecycle state; "Ready" (nothing has run
+    // yet) and "Paused" (stopped after N iterations) are a client-side label
+    // derived from the completed iteration count.
+    const bool idle = state == QStringLiteral("Idle");
+    const QString stateLabel = idle
+        ? (status.value("current_iteration").toInteger() > 0
+               ? tr("Paused") : tr("Ready"))
+        : state;
     QString stateText = progress.isEmpty()
         ? tr("Session: %1 — %2")
-              .arg(state, status.value("phase").toString())
-        : tr("Session: %1").arg(state);
+              .arg(stateLabel, status.value("phase").toString())
+        : tr("Session: %1").arg(stateLabel);
     if (state == QStringLiteral("Running"))
         stateText += tr(" — iteration %1/%2")
             .arg(status.value("current_iteration").toInteger())
@@ -1752,7 +1760,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         if (!text.isEmpty()) diagnostics.push_back(text);
     }
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
-    const bool runnable = state == "Ready" || state == "Paused";
+    const bool runnable = idle;
     _sessionRunnable = runnable;
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");

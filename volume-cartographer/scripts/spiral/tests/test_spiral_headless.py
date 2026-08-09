@@ -10,10 +10,14 @@ import unittest
 import numpy as np
 import torch
 
-from fit_session import (PclInputSpec, PclRole, ScrollSpecError,
+from fit_session import (PclInputSpec, PclRole, ScrollSpecError, SessionState,
                          load_scroll_spec, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
-from spiral_runtime import DistributedInteractiveFitSession, InteractiveFitSession
+import spiral_runtime
+from spiral_progress import NullProgressReporter
+from spiral_runtime import (ConfigureCommand, DistributedInteractiveFitSession,
+                            IncorporateCommand, InteractiveFitSession,
+                            SaveCheckpointCommand)
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
@@ -255,19 +259,19 @@ class ProtocolTests(unittest.TestCase):
         session._acks = {}
         session._incorporation_callbacks = {}
         session._failed_error = None
-        session._status = {"state": "Loading", "warnings": []}
+        session._status = {"state": SessionState.Loading, "warnings": []}
         published = []
         session._status_callback = lambda status: published.append(status)
         listener = threading.Thread(target=session._listen)
         listener.start()
         ready = {
-            "state": "Ready", "phase": "Ready", "warnings": [],
+            "state": SessionState.Idle, "phase": "Ready", "warnings": [],
             "error": None, "current_iteration": 0, "target_iteration": 0,
         }
         session._events.put(("status", 0, ready))
         session._events.put(("status", 1, {
             **ready,
-            "state": "Loading",
+            "state": SessionState.Loading,
             "progress": {
                 "operation": "loading",
                 "stage_name": "Loading tracks",
@@ -282,43 +286,134 @@ class ProtocolTests(unittest.TestCase):
         deadline = time.time() + 2
         while len(published) < 2 and time.time() < deadline:
             time.sleep(0.01)
-        self.assertEqual(published[-1]["state"], "Loading")
+        self.assertEqual(published[-1]["state"], SessionState.Loading)
         self.assertEqual(published[-1]["phase"], "Loading tracks")
         self.assertIn(
             "GPU worker 2/2", published[-1]["progress"]["detail"])
 
         session._events.put(("status", 1, ready))
         deadline = time.time() + 2
-        while published[-1]["state"] != "Ready" and time.time() < deadline:
+        while (published[-1]["state"] != SessionState.Idle
+               and time.time() < deadline):
             time.sleep(0.01)
-        self.assertEqual(published[-1]["state"], "Ready")
+        self.assertEqual(published[-1]["state"], SessionState.Idle)
         session._events.put(None)
         listener.join(2)
+
+    def _idle_session(self, completed=0):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = SessionState.Idle
+        session._phase = "Idle"
+        session._completed = completed
+        session._target = completed
+        session._pending = 0
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
+        session._status_callback = None
+        session._event_callback = None
+        return session
+
+    def test_illegal_lifecycle_transition_is_a_programming_error(self):
+        session = self._idle_session()
+        with session._condition:
+            with self.assertRaisesRegex(RuntimeError,
+                                        "Idle -> ExportingPreview"):
+                session._transition_locked(SessionState.ExportingPreview)
+            # Every state may still fail or shut down.
+            session._transition_locked(SessionState.Error, "Error")
+            with self.assertRaisesRegex(RuntimeError, "Error -> Running"):
+                session._transition_locked(SessionState.Running)
+
+    def test_idle_phase_distinguishes_never_run_from_paused(self):
+        never_run = self._idle_session()
+        paused = self._idle_session(completed=42)
+        with never_run._condition:
+            never_run._transition_locked(
+                SessionState.Idle, spiral_runtime.idle_phase(
+                    never_run._completed))
+        with paused._condition:
+            paused._transition_locked(
+                SessionState.Idle, spiral_runtime.idle_phase(
+                    paused._completed))
+        self.assertEqual(never_run._state, SessionState.Idle)
+        self.assertEqual(paused._state, SessionState.Idle)
+        self.assertEqual(never_run.completed_iterations, 0)
+        self.assertEqual(paused.completed_iterations, 42)
+        self.assertEqual(never_run._phase, "Ready")
+        self.assertEqual(paused._phase, "Paused")
+
+    def test_save_command_carries_identity_and_completes_with_a_result(self):
+        session = self._idle_session(completed=7)
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session._context = SimpleNamespace(
+            save_checkpoint=lambda path, iteration: f"{path}#{iteration}")
+        saved = threading.Thread(
+            target=lambda: results.append(
+                session.save_checkpoint("/tmp/c.ckpt", timeout=5.0)))
+        results = []
+        saved.start()
+        deadline = time.time() + 5
+        while not session._commands and time.time() < deadline:
+            time.sleep(0.005)
+        command = session._commands[0]
+        self.assertIsInstance(command, SaveCheckpointCommand)
+        self.assertTrue(command.command_id)
+        self.assertEqual(command.session_generation, 0)
+        self.assertEqual(command.expected_iteration, 7)
+        session._commands.pop(0)
+        session._run_checkpoint_save(command)
+        saved.join(5)
+        self.assertEqual(results, ["/tmp/c.ckpt#7"])
+        self.assertEqual(command.result["path"], "/tmp/c.ckpt#7")
+        self.assertFalse(command.cancelled)
+        self.assertEqual(session._state, SessionState.Idle)
+
+    def test_command_queued_against_a_closed_session_is_cancelled(self):
+        session = self._idle_session(completed=3)
+        command = SaveCheckpointCommand(
+            session_generation=session.session_generation,
+            expected_iteration=3, path="/tmp/c.ckpt")
+        session.session_generation += 1
+        stale = command.stale_reason(
+            session_generation=session.session_generation,
+            iteration=3, config_revision=0)
+        self.assertIsNotNone(stale)
+        command.cancel(stale)
+        self.assertTrue(command.cancelled)
+        self.assertIn("no longer current", command.error)
 
     def test_interactive_run_can_continue_past_checkpoint_training_steps(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 30_000
         session._pending = 0
         session._target = 30_000
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
 
         target = session.run(250)
 
         self.assertEqual(target, 30_250)
         self.assertEqual(session._pending, 250)
         self.assertEqual(session._target, 30_250)
-        self.assertEqual(session._state, "Running")
+        self.assertEqual(session._state, SessionState.Running)
 
     def test_interactive_run_extends_training_horizon_to_target_iteration(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Paused"
+        session._state = SessionState.Idle
         session._completed = 30_000
         session._pending = 0
         session._target = 30_000
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -327,9 +422,9 @@ class ProtocolTests(unittest.TestCase):
         target = session.run(250)
 
         self.assertEqual(target, 30_250)
-        self.assertEqual(session._idle_actions[0][0], "configure")
+        self.assertIsInstance(session._commands[0], ConfigureCommand)
         self.assertEqual(
-            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            session._commands[0].config["optimizer_num_training_steps"],
             30_250,
         )
         self.assertEqual(
@@ -338,12 +433,14 @@ class ProtocolTests(unittest.TestCase):
     def test_interactive_run_preserves_horizon_when_target_is_within_it(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 100
         session._pending = 0
         session._target = 100
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -351,19 +448,21 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(250)
 
-        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(session._commands, [])
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
     def test_interactive_run_preserves_horizon_when_target_equals_it(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 29_750
         session._pending = 0
         session._target = 29_750
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -372,19 +471,21 @@ class ProtocolTests(unittest.TestCase):
         target = session.run(250)
 
         self.assertEqual(target, 30_000)
-        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(session._commands, [])
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_000)
 
     def test_interactive_run_extends_horizon_by_run_count_when_crossed(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 29_751
         session._pending = 0
         session._target = 29_751
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -393,9 +494,9 @@ class ProtocolTests(unittest.TestCase):
         target = session.run(250)
 
         self.assertEqual(target, 30_001)
-        self.assertEqual(session._idle_actions[0][0], "configure")
+        self.assertIsInstance(session._commands[0], ConfigureCommand)
         self.assertEqual(
-            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            session._commands[0].config["optimizer_num_training_steps"],
             30_250,
         )
         self.assertEqual(
@@ -404,12 +505,14 @@ class ProtocolTests(unittest.TestCase):
     def test_run_queues_influence_config_with_only_pending_inputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 10
         session._pending = 0
         session._target = 10
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {
             "optimizer_num_training_steps": 30_000,
         }
@@ -419,20 +522,25 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(20, pending_inputs=pending, influence_config=influence)
 
-        action = session._idle_actions[0]
-        self.assertEqual(action[0], "incorporate")
-        self.assertEqual(action[1], pending)
-        self.assertEqual(action[3], influence)
+        command = session._commands[0]
+        self.assertIsInstance(command, IncorporateCommand)
+        self.assertEqual(command.records, pending)
+        self.assertEqual(command.influence_config, influence)
+        self.assertTrue(command.command_id)
+        self.assertEqual(command.session_generation, 0)
+        self.assertEqual(command.expected_iteration, 10)
 
     def test_run_configuration_is_queued_before_input_incorporation(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Ready"
+        session._state = SessionState.Idle
         session._completed = 10
         session._pending = 0
         session._target = 10
         session._context = object()
-        session._idle_actions = []
+        session._commands = []
+        session.session_generation = 0
+        session._config_revision = 0
         session.requested_config = {"loss_weight_patch_radius": 8.0}
         session._run_config = {"loss_weight_patch_radius": 8.0}
 
@@ -442,7 +550,7 @@ class ProtocolTests(unittest.TestCase):
             run_config={"loss_weight_patch_radius": 4.0},
         )
 
-        self.assertEqual([action[0] for action in session._idle_actions],
+        self.assertEqual([command.kind for command in session._commands],
                          ["configure", "incorporate"])
         self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
 
@@ -459,11 +567,16 @@ class ProtocolTests(unittest.TestCase):
 
         session._context = SimpleNamespace(apply_config=apply_config)
 
-        session._run_configuration({
+        session._state = SessionState.Idle
+        session._commands = []
+        session._config_revision = 0
+        session._applied_config = None
+        command = ConfigureCommand(config={
             "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })
+        session._run_configuration(command)
 
         self.assertEqual(applied["config"], {
             "sample_count_patches_per_step": 101,
@@ -472,11 +585,14 @@ class ProtocolTests(unittest.TestCase):
         })
         self.assertEqual(applied["path_changes"], {})
         self.assertEqual(applied["current_iteration"], 7)
+        self.assertTrue(command.done.is_set())
+        self.assertIsNone(command.error)
+        self.assertEqual(command.result["config_revision"], 1)
 
     def test_run_finish_callback_precedes_autosave(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Running"
+        session._state = SessionState.Running
         session._completed = 9
         session._pending = 1
         session._target = 10
@@ -494,7 +610,7 @@ class ProtocolTests(unittest.TestCase):
             completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
 
         self.assertEqual(calls, ["finish", "save", "preview"])
-        self.assertEqual(session._state, "Paused")
+        self.assertEqual(session._state, SessionState.Idle)
 
     def test_preview_is_announced_before_exporting_state_can_pause(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -505,7 +621,7 @@ class ProtocolTests(unittest.TestCase):
             session.paths = type(
                 "Paths", (), {"output_directory": temporary})()
             states = []
-            session._state = "ExportingPreview"
+            session._state = SessionState.ExportingPreview
             session._context = SimpleNamespace(
                 export_preview=lambda destination, surface_id: {
                     "manifest_path": str(Path(destination) / "manifest.json"),
@@ -519,7 +635,7 @@ class ProtocolTests(unittest.TestCase):
             session._publish_preview()
 
             self.assertEqual(states, [(
-                "ExportingPreview",
+                SessionState.ExportingPreview,
                 1,
                 str(Path(temporary) / ".spiral-preview" / "test-session"
                     / "generation-1" / "manifest.json"),
@@ -528,7 +644,7 @@ class ProtocolTests(unittest.TestCase):
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
-        session._state = "Running"
+        session._state = SessionState.Running
         session._completed = 9
         session._pending = 1
         session._target = 10
@@ -546,7 +662,7 @@ class ProtocolTests(unittest.TestCase):
             completed_iterations=10, total_loss=1.0, losses={}, learning_rate=1.e-3)
 
         self.assertEqual(calls, ["finish"])
-        self.assertEqual(session._state, "Paused")
+        self.assertEqual(session._state, SessionState.Idle)
 
     def test_mutating_command_is_deduplicated(self):
         service = ServiceState()

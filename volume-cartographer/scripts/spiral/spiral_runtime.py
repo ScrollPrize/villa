@@ -18,11 +18,12 @@ import sys
 import threading
 import time
 import traceback
-from typing import Mapping
+from typing import Any, ClassVar, Mapping
 import uuid
 
-from fit_session import (ScrollSpec, SpiralInputPaths, SpiralPreviewConfig,
-                         SpiralRunConfig, run_mutable_config)
+from fit_session import (ScrollSpec, SessionState, SpiralInputPaths,
+                         SpiralPreviewConfig, SpiralRunConfig,
+                         run_mutable_config)
 from config import Config, FitConfig, durable_config
 from spiral_progress import NullProgressReporter, ProgressReporter
 
@@ -30,8 +31,152 @@ from spiral_progress import NullProgressReporter, ProgressReporter
 _NO_PROGRESS = NullProgressReporter()
 
 
+# The transitions the resident session is allowed to make, keyed by the state
+# it is leaving. Error and Closing are reachable from every state and are
+# therefore not repeated here; Closing is terminal. Anything outside this
+# table is a programming error in the runtime, not a runtime condition.
+_LEGAL_SESSION_TRANSITIONS = {
+    # A phase-only update repeats the current state, so every state may
+    # transition to itself.
+    SessionState.Loading: {SessionState.Loading, SessionState.Idle,
+                           SessionState.ExportingPreview},
+    SessionState.Idle: {SessionState.Idle, SessionState.Running,
+                        SessionState.Saving},
+    SessionState.Running: {SessionState.Running, SessionState.Idle,
+                           SessionState.Saving},
+    SessionState.Saving: {SessionState.Saving, SessionState.Idle,
+                          SessionState.ExportingPreview},
+    SessionState.ExportingPreview: {SessionState.ExportingPreview,
+                                    SessionState.Idle},
+    SessionState.Error: {SessionState.Error},
+    SessionState.Closing: {SessionState.Closing},
+}
+
+
+def idle_phase(completed_iterations):
+    """Human-facing phase for an idle session.
+
+    Ready and Paused are the same lifecycle state; only the iteration count
+    tells "has never produced work" from "stopped after N iterations". The
+    label is presentation, so clients derive the same words from
+    ``state == Idle`` plus ``current_iteration``.
+    """
+    return "Paused" if int(completed_iterations or 0) > 0 else "Ready"
+
+
+# Provisional ordering, least-advanced first, for the distributed proxy's
+# "minimum state across ranks" aggregation. This models a collective state as
+# the least-advanced rank, which is only an approximation: it cannot tell "one
+# rank is still loading" from "the ranks disagree about which command they are
+# executing". PR 3 commit 2 replaces it with an explicit command epoch that
+# every rank validates, so collective states become visible only when all
+# ranks report the same epoch. Until then this keeps the existing behaviour,
+# expressed over the enum instead of over ad-hoc string sets.
+_PROVISIONAL_RANK_STATE_ORDER = (
+    SessionState.Loading, SessionState.Saving, SessionState.ExportingPreview,
+    SessionState.Running, SessionState.Idle,
+)
+
+
+def _provisional_aggregate_state(states):
+    ordered = [state for state in states
+               if state in _PROVISIONAL_RANK_STATE_ORDER]
+    if not ordered:
+        return SessionState.Loading
+    return min(ordered, key=_PROVISIONAL_RANK_STATE_ORDER.index)
+
+
 class _SessionShutdown(BaseException):
     pass
+
+
+@dataclasses.dataclass
+class SessionCommand:
+    """One command queued for the fitter thread's pause boundary.
+
+    Commands are created by coordinator threads and executed by the fitter
+    thread while the session is idle between steps. Each one carries the
+    facts needed to decide, at execution time, whether it is still the
+    command the caller asked for: the session generation it was queued
+    against and the iteration/configuration revision it was computed from.
+    A mismatch cancels the command instead of applying stale work.
+    """
+
+    kind: ClassVar[str] = "command"
+
+    command_id: str = dataclasses.field(
+        default_factory=lambda: uuid.uuid4().hex)
+    session_generation: int = 0
+    expected_iteration: int | None = None
+    expected_config_revision: int | None = None
+    result: dict[str, Any] = dataclasses.field(default_factory=dict)
+    error: str | None = None
+    cancelled: bool = False
+    done: threading.Event = dataclasses.field(
+        default_factory=threading.Event, repr=False)
+
+    def stale_reason(self, *, session_generation, iteration, config_revision):
+        if self.session_generation != session_generation:
+            return (f"{self.kind} command {self.command_id} was queued "
+                    f"against session generation {self.session_generation}, "
+                    f"which is no longer current ({session_generation})")
+        if (self.expected_iteration is not None
+                and self.expected_iteration != iteration):
+            return (f"{self.kind} command {self.command_id} expected "
+                    f"iteration {self.expected_iteration}, found {iteration}")
+        if (self.expected_config_revision is not None
+                and self.expected_config_revision != config_revision):
+            return (f"{self.kind} command {self.command_id} expected "
+                    f"configuration revision {self.expected_config_revision}, "
+                    f"found {config_revision}")
+        return None
+
+    def complete(self, **result):
+        self.result.update(result)
+        self.done.set()
+
+    def fail(self, error):
+        self.error = str(error)
+        self.done.set()
+
+    def cancel(self, reason):
+        self.cancelled = True
+        self.error = str(reason)
+        self.done.set()
+
+    def wait(self, timeout):
+        return self.done.wait(timeout)
+
+
+@dataclasses.dataclass
+class ConfigureCommand(SessionCommand):
+    """Apply Run-scoped configuration and input path changes."""
+
+    kind: ClassVar[str] = "configure"
+
+    config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    path_changes: dict[str, Any] = dataclasses.field(default_factory=dict)
+    previous_run_config: dict[str, Any] | None = None
+
+
+@dataclasses.dataclass
+class IncorporateCommand(SessionCommand):
+    """Append newly uploaded ephemeral inputs to the resident fit."""
+
+    kind: ClassVar[str] = "incorporate"
+
+    records: list = dataclasses.field(default_factory=list)
+    mark_incorporated: Any = None
+    influence_config: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class SaveCheckpointCommand(SessionCommand):
+    """Write a checkpoint from the fitter thread."""
+
+    kind: ClassVar[str] = "save"
+
+    path: str = ""
 
 
 class InteractiveFitSession:
@@ -54,7 +199,7 @@ class InteractiveFitSession:
         self._event_callback = event_callback
         self.publishes_outputs = publishes_outputs
         self._condition = threading.Condition()
-        self._state = "Loading"
+        self._state = SessionState.Loading
         self._phase = "Importing fitter"
         self._error = None
         self._warnings = []
@@ -72,7 +217,13 @@ class InteractiveFitSession:
         # device state is built. It doubles as the capability flag for the
         # fitter operations (save/preview/incorporate/configure).
         self._context = None
-        self._idle_actions = []
+        # Commands queued for the fitter thread's pause boundary, oldest
+        # first. Both the generation and the configuration revision fence
+        # commands that were computed against a session state the fitter no
+        # longer has.
+        self._commands = []
+        self.session_generation = 0
+        self._config_revision = 0
         self.progress = ProgressReporter(
             self._progress_changed,
             stream=sys.stdout,
@@ -135,11 +286,31 @@ class InteractiveFitSession:
                 self._phase = str(snapshot.get("stage_name") or self._phase)
         self._publish_status()
 
-    def _set_state(self, state, phase=""):
+    def _transition_locked(self, new_state, phase="", *, reason=None):
+        """Authoritative lifecycle transition; call with the lock held.
+
+        Every state change in the session goes through here. An illegal
+        transition is a programming error in the runtime — the fitter thread
+        is the only writer and the legal set describes the whole loop — so it
+        raises instead of silently correcting itself.
+        """
+        new_state = SessionState(new_state)
+        legal = _LEGAL_SESSION_TRANSITIONS[self._state]
+        if self._state is not SessionState.Closing:
+            legal = legal | {SessionState.Error, SessionState.Closing}
+        if new_state not in legal:
+            raise RuntimeError(
+                f"Illegal session transition {self._state.name} -> "
+                f"{new_state.name}"
+                + (f" ({reason})" if reason else ""))
+        self._state = new_state
+        self._phase = phase or new_state.value
+        self._condition.notify_all()
+
+    def _transition(self, new_state, phase="", *, reason=None):
+        """Transition and publish the resulting status snapshot."""
         with self._condition:
-            self._state = state
-            self._phase = phase or state
-            self._condition.notify_all()
+            self._transition_locked(new_state, phase, reason=reason)
         self._publish_status()
 
     def _fit_main(self):
@@ -147,7 +318,7 @@ class InteractiveFitSession:
         distributed_initialized = False
         try:
             self._progress_reporter().begin("loading", "Importing Torch and fitter")
-            self._set_state("Loading", "Importing Torch and fitter")
+            self._transition(SessionState.Loading, "Importing Torch and fitter")
             import fit_spiral as fitter
             from ddp_helpers import (maybe_destroy_distributed,
                                      maybe_init_distributed)
@@ -265,7 +436,7 @@ class InteractiveFitSession:
             self._publish_status()
 
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
-            self._set_state("Loading", "Loading fit inputs and model")
+            self._transition(SessionState.Loading, "Loading fit inputs and model")
             # The scroll specification supplies the physical facts (including
             # the outward sense, which is not part of the load request). The
             # session request may still override the request-carried scroll
@@ -305,12 +476,11 @@ class InteractiveFitSession:
         except BaseException as exc:
             with self._condition:
                 if self._shutdown and isinstance(exc, _SessionShutdown):
-                    self._state, self._phase = "Empty", "Stopped"
+                    self._transition_locked(SessionState.Closing, "Stopped")
                 else:
-                    self._state, self._phase = "Error", "Error"
                     self._error = f"{type(exc).__name__}: {exc}"
                     self._warnings.append(traceback.format_exc(limit=12))
-                self._condition.notify_all()
+                    self._transition_locked(SessionState.Error, "Error")
             self._publish_status()
         finally:
             if context is not None:
@@ -322,24 +492,25 @@ class InteractiveFitSession:
 
     # Fitter-thread session driver.
     def _session_ready(self, context):
-        """Adopt the built context and publish Ready.
+        """Adopt the built context and publish Idle.
 
         Runs on the fitter thread once build_device_state() has returned.
         When the session was constructed from a checkpoint, the restored
-        model's preview is exported and published before Ready, exactly as
-        the legacy on_ready handoff did.
+        model's preview is exported and published before the session goes
+        idle, exactly as the legacy on_ready handoff did.
         """
         with self._condition:
             self._context = context
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
-            self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
+            self._transition(SessionState.ExportingPreview,
+                             "Exporting restored checkpoint preview")
             self._progress_reporter().begin(
                 "exporting_preview", "Exporting restored checkpoint preview")
             self._publish_preview()
         self._progress_reporter().clear()
-        self._set_state("Ready", "Ready")
+        self._transition(SessionState.Idle, idle_phase(self._completed))
 
     def _optimize(self, context):
         """Drive the resident optimizer loop on the fitter thread.
@@ -369,51 +540,72 @@ class InteractiveFitSession:
             with self._condition:
                 if self._shutdown:
                     raise _SessionShutdown()
-                # Idle actions are drained before the pending check so inputs
+                # Commands are drained before the pending check so inputs
                 # queued by run() are incorporated before the next step begins.
-                action = self._idle_actions.pop(0) if self._idle_actions else None
-                if action is None:
+                command = self._commands.pop(0) if self._commands else None
+                if command is None:
                     if self._pending > 0:
                         return
                     self._condition.wait()
                     continue
-            if action[0] == "incorporate":
-                _, records, mark_incorporated, influence_config = action
-                self._run_incorporation(records, mark_incorporated, influence_config)
+                stale = command.stale_reason(
+                    session_generation=self.session_generation,
+                    iteration=self._completed,
+                    config_revision=self._config_revision)
+            if stale is not None:
+                command.cancel(stale)
                 continue
-            if action[0] == "configure":
-                self._run_configuration(action[1], action[2], action[3])
+            if isinstance(command, IncorporateCommand):
+                self._run_incorporation(command)
                 continue
-            kind, path, done, result = action
-            try:
-                if kind == "save":
-                    with self._condition:
-                        previous_state = self._state
-                        self._state, self._phase = "Saving", "Saving checkpoint"
-                    self._progress_reporter().begin(
-                        "saving_checkpoint", "Saving checkpoint",
-                        detail=Path(path).name)
-                    result["path"] = self._context.save_checkpoint(path, self._completed)
-                    self._progress_reporter().finish()
-                else:
-                    result["error"] = f"Unknown idle action {kind}"
-            except Exception as exc:
-                result["error"] = f"{type(exc).__name__}: {exc}"
-            finally:
-                if kind == "save":
-                    self._progress_reporter().clear()
-                    with self._condition:
-                        self._state = previous_state
-                        self._phase = previous_state
-                    self._publish_status()
-                done.set()
+            if isinstance(command, ConfigureCommand):
+                self._run_configuration(command)
+                continue
+            if not isinstance(command, SaveCheckpointCommand):
+                command.fail(f"Unknown session command {command.kind}")
+                continue
+            self._run_checkpoint_save(command)
 
-    def _run_incorporation(self, records, mark_incorporated, influence_config):
+    def _run_checkpoint_save(self, command):
+        """Write one requested checkpoint at the pause boundary."""
+        with self._condition:
+            previous_state = self._state
+            previous_phase = self._phase
+            self._transition_locked(
+                SessionState.Saving, "Saving checkpoint",
+                reason=f"save command {command.command_id}")
+        path = None
+        error = None
+        try:
+            self._progress_reporter().begin(
+                "saving_checkpoint", "Saving checkpoint",
+                detail=Path(command.path).name)
+            path = self._context.save_checkpoint(
+                command.path, self._completed)
+            self._progress_reporter().finish()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._progress_reporter().clear()
+            with self._condition:
+                self._transition_locked(previous_state, previous_phase)
+            self._publish_status()
+            # The waiter is released only once the session is back in the
+            # state it will be observed in.
+            if error is None:
+                command.complete(path=path)
+            else:
+                command.fail(error)
+
+    def _run_incorporation(self, command):
         """Append newly uploaded ephemeral inputs to the resident fit.
 
         Runs on the fitter thread at the pause boundary. A failure cancels the
         queued run and surfaces a warning instead of tearing down the session.
         """
+        records = command.records
+        mark_incorporated = command.mark_incorporated
+        influence_config = command.influence_config
         try:
             if self._context is None:
                 raise RuntimeError(
@@ -439,26 +631,31 @@ class InteractiveFitSession:
                 self._pending = 0
                 self._target = self._completed
                 self._warnings.append(f"Input incorporation failed: {error}")
-                self._state, self._phase = "Paused", "Paused"
-                self._condition.notify_all()
+                self._transition_locked(
+                    SessionState.Idle, idle_phase(self._completed),
+                    reason="input incorporation failed")
             if mark_incorporated is not None:
                 mark_incorporated(records, error=error)
+            command.fail(error)
             self._publish_status()
         else:
             if mark_incorporated is not None:
                 mark_incorporated(records)
             with self._condition:
-                if self._state == "Running":
+                if self._state is SessionState.Running:
                     self._phase = "Optimizing"
-            if getattr(self, "_state", None) == "Running":
+            command.complete(incorporated=len(records))
+            if getattr(self, "_state", None) is SessionState.Running:
                 self._begin_optimization_progress()
             else:
                 self._progress_reporter().clear()
             self._publish_status()
 
-    def _run_configuration(
-            self, config, path_changes=None, previous_run_config=None):
+    def _run_configuration(self, command):
         """Apply validated Run-scoped settings on the fitter thread."""
+        config = command.config
+        path_changes = command.path_changes
+        previous_run_config = command.previous_run_config
         try:
             if self._context is None:
                 raise RuntimeError(
@@ -480,15 +677,21 @@ class InteractiveFitSession:
                 self._pending = 0
                 self._target = self._completed
                 # Leave newly uploaded inputs pending for a later valid Run.
-                self._idle_actions = [
-                    action for action in self._idle_actions
-                    if action[0] != "incorporate"
-                ]
+                abandoned = [queued for queued in self._commands
+                             if isinstance(queued, IncorporateCommand)]
+                self._commands = [queued for queued in self._commands
+                                  if not isinstance(queued, IncorporateCommand)]
                 self._warnings.append(f"Run configuration failed: {error}")
                 if previous_run_config is not None:
                     self._run_config.update(previous_run_config)
-                self._state, self._phase = "Paused", "Paused"
-                self._condition.notify_all()
+                self._transition_locked(
+                    SessionState.Idle, idle_phase(self._completed),
+                    reason="run configuration failed")
+            for queued in abandoned:
+                queued.cancel(
+                    f"cancelled by failed configure command "
+                    f"{command.command_id}")
+            command.fail(error)
             self._publish_status()
         else:
             if getattr(self, "_applied_config", None) is not None:
@@ -497,7 +700,10 @@ class InteractiveFitSession:
                     self._run_config.update(config)
                     self.requested_config.update(config)
                     self.input_manifest.update(path_changes)
-            if getattr(self, "_state", None) == "Running":
+            with self._condition:
+                self._config_revision += 1
+            command.complete(config_revision=self._config_revision)
+            if getattr(self, "_state", None) is SessionState.Running:
                 self._begin_optimization_progress()
             else:
                 self._progress_reporter().clear()
@@ -533,20 +739,20 @@ class InteractiveFitSession:
                 self._context.clear_interactive_influence()
             if not getattr(self, "publishes_outputs", True):
                 self._progress_reporter().clear()
-                self._set_state("Paused", "Paused")
+                self._transition(SessionState.Idle, idle_phase(self._completed))
                 return
-            self._set_state("Saving", "Autosaving checkpoint")
+            self._transition(SessionState.Saving, "Autosaving checkpoint")
             self._progress_reporter().begin(
                 "saving_checkpoint", "Autosaving checkpoint",
                 detail="checkpoint_autosave.ckpt")
             autosave = str(Path(self._output_path) / "checkpoint_autosave.ckpt")
             self._context.save_checkpoint(autosave, self._completed)
-            self._set_state("ExportingPreview", "Exporting preview")
+            self._transition(SessionState.ExportingPreview, "Exporting preview")
             self._progress_reporter().begin(
                 "exporting_preview", "Exporting preview")
             self._publish_preview()
             self._progress_reporter().clear()
-            self._set_state("Paused", "Paused")
+            self._transition(SessionState.Idle, idle_phase(self._completed))
 
     def _publish_preview(self):
         with self._condition:
@@ -570,8 +776,10 @@ class InteractiveFitSession:
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
-            if self._state not in {"Ready", "Paused"}:
-                raise RuntimeError(f"Run is not allowed while session state is {self._state}")
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Run is not allowed while session state is "
+                    f"{self._state.name}")
             run_config = dict(run_config or {})
             path_changes = dict(path_changes or {})
             target = self._completed + count
@@ -603,49 +811,67 @@ class InteractiveFitSession:
                     key: self._run_config.get(key)
                     for key in run_config
                 }
-                self._idle_actions.append(
-                    ("configure", run_config, path_changes,
-                     previous_run_config))
+                # Configuration is queued ahead of incorporation: new inputs
+                # must be incorporated under the settings this run asked for.
+                self._commands.append(ConfigureCommand(
+                    session_generation=self.session_generation,
+                    expected_iteration=self._completed,
+                    expected_config_revision=self._config_revision,
+                    config=run_config, path_changes=path_changes,
+                    previous_run_config=previous_run_config))
                 self._run_config.update(run_config)
             if pending_inputs:
                 if self._context is None:
                     raise RuntimeError(
                         "The resident fitter does not support adding inputs to a running session")
-                self._idle_actions.append(
-                    ("incorporate", list(pending_inputs), mark_incorporated,
-                     dict(influence_config or {})))
+                self._commands.append(IncorporateCommand(
+                    session_generation=self.session_generation,
+                    expected_iteration=self._completed,
+                    records=list(pending_inputs),
+                    mark_incorporated=mark_incorporated,
+                    influence_config=dict(influence_config or {})))
             self._pending = count
             self._run_start_completed = self._completed
             self._target = target
-            self._state, self._phase = "Running", "Optimizing"
+            self._transition_locked(SessionState.Running, "Optimizing")
             self._begin_optimization_progress()
             self._condition.notify_all()
             return self._target
 
     def stop(self):
         with self._condition:
-            if self._state != "Running":
+            if self._state is not SessionState.Running:
                 raise RuntimeError("Session is not running")
             self._stop_requested = True
 
     def save_checkpoint(self, path, timeout=120.0):
         with self._condition:
-            if self._state not in {"Ready", "Paused"}:
-                raise RuntimeError(f"Checkpoint save is not allowed in {self._state}")
-            done = threading.Event()
-            result = {}
-            self._idle_actions.append(("save", path, done, result))
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Checkpoint save is not allowed in {self._state.name}")
+            command = SaveCheckpointCommand(
+                session_generation=self.session_generation,
+                expected_iteration=self._completed,
+                path=path)
+            self._commands.append(command)
             self._condition.notify_all()
-        if not done.wait(timeout):
+        if not command.wait(timeout):
             raise TimeoutError("Checkpoint save timed out")
-        if "error" in result:
-            raise RuntimeError(result["error"])
-        return result["path"]
+        if command.error is not None:
+            raise RuntimeError(command.error)
+        return command.result["path"]
 
     def close(self, timeout=15.0):
         with self._condition:
             self._shutdown = True
+            # Commands queued against the session being torn down belong to a
+            # generation that no longer exists; release their waiters instead
+            # of letting them time out.
+            self.session_generation += 1
+            abandoned, self._commands = self._commands, []
             self._condition.notify_all()
+        for command in abandoned:
+            command.cancel("The fit session was closed")
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise TimeoutError("Spiral fitter did not stop at a safe boundary")
@@ -739,7 +965,7 @@ class DistributedInteractiveFitSession:
         self._event_callback = event_callback
         self._condition = threading.Condition()
         self._status = {
-            "state": "Loading", "phase": "Starting GPU workers",
+            "state": SessionState.Loading, "phase": "Starting GPU workers",
             "current_iteration": 0, "target_iteration": 0,
             "session_horizon": None, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None,
@@ -822,16 +1048,17 @@ class DistributedInteractiveFitSession:
                 self._publish_rank_event(rank, status)
                 with self._condition:
                     self._rank_statuses[rank] = status
-                    if self._failed_error is not None and status.get("state") != "Error":
+                    if (self._failed_error is not None
+                            and status.get("state") != SessionState.Error):
                         continue
-                    if status.get("state") == "Error":
+                    if status.get("state") == SessionState.Error:
                         if rank == 0:
                             self._status = status
                         else:
                             warnings = list(self._status.get("warnings", []))
                             warnings.extend(status.get("warnings", []))
                             self._status.update({
-                                "state": "Error", "phase": "Error",
+                                "state": SessionState.Error, "phase": "Error",
                                 "error": f"GPU worker rank {rank}: {status.get('error')}",
                                 "warnings": warnings,
                             })
@@ -845,22 +1072,24 @@ class DistributedInteractiveFitSession:
                             continue
 
                         rank_zero = self._rank_statuses.get(0, {})
-                        ready_states = {"Ready", "Paused"}
                         all_ranks_ready = (
                             len(self._rank_statuses) == len(self._gpu_ids)
-                            and all(item.get("state") in ready_states
+                            and all(item.get("state") == SessionState.Idle
                                     for item in self._rank_statuses.values())
                         )
-                        if rank_zero.get("state") in ready_states and not all_ranks_ready:
+                        if (rank_zero.get("state") == SessionState.Idle
+                                and not all_ranks_ready):
                             unfinished = next(
                                 ((worker_rank, item)
                                  for worker_rank, item
                                  in sorted(self._rank_statuses.items())
-                                 if item.get("state") not in ready_states),
+                                 if item.get("state") != SessionState.Idle),
                                 None)
                             self._status = copy.deepcopy(rank_zero)
                             self._status.update({
-                                "state": "Loading",
+                                "state": _provisional_aggregate_state(
+                                    item.get("state")
+                                    for item in self._rank_statuses.values()),
                                 "phase": "Waiting for all GPU workers",
                             })
                             if unfinished is not None:
@@ -901,12 +1130,14 @@ class DistributedInteractiveFitSession:
             elif kind == "worker_error":
                 _, rank, error, trace = event
                 self._publish_rank_event(rank, {
-                    "state": "Error", "error": error, "warnings": [trace]})
+                    "state": SessionState.Error, "error": error,
+                    "warnings": [trace]})
                 with self._condition:
                     warnings = list(self._status.get("warnings", []))
                     warnings.append(f"GPU worker rank {rank} failed:\n{trace}")
                     self._status.update({
-                        "state": "Error", "phase": "Error", "error": error,
+                        "state": SessionState.Error, "phase": "Error",
+                        "error": error,
                         "warnings": warnings,
                     })
                     self._failed_error = error
@@ -953,7 +1184,7 @@ class DistributedInteractiveFitSession:
     def run(self, count, pending_inputs=None, mark_incorporated=None,
             influence_config=None, run_config=None, path_changes=None):
         state = self.status()["state"]
-        if state not in {"Ready", "Paused"}:
+        if state != SessionState.Idle:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
         arguments = {
             "count": count,
@@ -967,13 +1198,13 @@ class DistributedInteractiveFitSession:
 
     def stop(self):
         state = self.status()["state"]
-        if state != "Running":
+        if state != SessionState.Running:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
 
     def save_checkpoint(self, path, timeout=120.0):
         state = self.status()["state"]
-        if state not in {"Ready", "Paused"}:
+        if state != SessionState.Idle:
             raise RuntimeError(f"Checkpoint save is not allowed in {state}")
         return self._call("save_checkpoint", {"path": path, "timeout": timeout},
                           ranks=(0,), timeout=timeout + 5.0)

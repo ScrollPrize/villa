@@ -43,13 +43,14 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
-from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
+from fit_session import (API_VERSION, SessionState, SpiralInputPaths,
+                         resolve_dataset_root)
 from config import Config
 
 
 class FakeSession:
     def __init__(self):
-        self.state = "Paused"
+        self.state = SessionState.Idle
         self.run_calls = []
         self.run_config = {
             "sample_count_patches_per_step": 360,
@@ -81,7 +82,8 @@ class FakeSession:
 
     def status(self):
         return {
-            "state": self.state, "phase": self.state, "current_iteration": 5,
+            "state": self.state, "phase": str(self.state),
+            "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "supports_input_incorporation": True,
