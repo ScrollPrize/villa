@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -180,6 +181,36 @@ std::string deriveRemoteVolumeId(const std::string& url)
     const auto name = deriveRemoteVolumeName(normalized);
     const auto hash = utils::fnv1a(std::string_view(normalized));
 
+    std::ostringstream out;
+    out << name << "-" << std::hex << std::nouppercase << std::setw(16)
+        << std::setfill('0') << hash;
+    return out.str();
+}
+
+std::string normalizeLocalVolumePathForId(const std::filesystem::path& path)
+{
+    return std::filesystem::absolute(path).lexically_normal().string();
+}
+
+std::string deriveLocalVolumeName(const std::filesystem::path& path)
+{
+    const auto filename = path.filename().string();
+    if (!filename.empty() &&
+        std::all_of(filename.begin(), filename.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
+        const auto parentName = path.parent_path().filename().string();
+        if (!parentName.empty())
+            return parentName;
+    }
+    return filename.empty() ? std::string("volume") : filename;
+}
+
+std::string deriveLocalVolumeId(const std::filesystem::path& path)
+{
+    const std::string name = deriveLocalVolumeName(path);
+    const std::string normalized = normalizeLocalVolumePathForId(path);
+    const auto hash = utils::fnv1a(std::string_view(normalized));
     std::ostringstream out;
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)
         << std::setfill('0') << hash;
@@ -1074,9 +1105,8 @@ void Volume::loadMetadata()
         }
         metaPath = altPath;
     } else {
-        const auto baseName = path_.filename().string();
-        metadata_["uuid"] = baseName;
-        metadata_["name"] = baseName;
+        metadata_["uuid"] = deriveLocalVolumeId(path_);
+        metadata_["name"] = deriveLocalVolumeName(path_);
         metadata_["type"] = "vol";
         metadata_["format"] = "zarr";
         metadata_["width"] = 0;

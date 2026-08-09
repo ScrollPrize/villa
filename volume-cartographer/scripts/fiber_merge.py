@@ -69,6 +69,14 @@ REOPTIMIZE_TAG = 'needs_reoptimization'
 # ^ consumed by VC3D's load-time re-optimization prompt; keep the literal
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
 
+TRACE_NEEDS_REVIEW_TAG = 'interp_unreviewed'
+# ^ VC3D's review workflow for prediction-traced geometry; keep the
+#   literal in sync with kTraceNeedsReviewTag in
+#   LineAnnotationFiberSegments.hpp. A traced fiber WITHOUT the tag counts
+#   as reviewed, so a review decision is only valid for the exact geometry
+#   the reviewer saw — merge_fibers re-adds the tag when the merged
+#   geometry differs from every reviewed side.
+
 
 def _cp_position(value):
     return value.get('position') if isinstance(value, dict) else value
@@ -827,6 +835,23 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
     return merged, notes, stats
 
 
+def _has_trace_span(doc):
+    """True when any span's stored geometry was produced by the prediction
+    tracer (v3 interp_mode == 'trace')."""
+    if doc.get('version', 1) != 3:
+        return False
+    control_points = doc.get('control_points') or []
+    for cp in control_points[:-1]:
+        segment = cp.get('segment_to_next') if isinstance(cp, dict) else None
+        if isinstance(segment, dict) and segment.get('interp_mode') == 'trace':
+            return True
+    return False
+
+
+def _geometry_pair(doc):
+    return (doc.get('control_points'), doc.get('line_points'))
+
+
 def merge_tags(base_doc, local_doc, remote_doc):
     base = list(base_doc.get('tags', []) or [])
     local = list(local_doc.get('tags', []) or [])
@@ -1105,6 +1130,30 @@ def merge_fibers(base, local, remote):
     merged['tags'] = merge_tags(base, local, remote)
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
+    # A review decision (absence of TRACE_NEEDS_REVIEW_TAG) covers only the
+    # geometry the reviewer actually saw. If the merged result still
+    # contains prediction-traced spans but its geometry matches no side
+    # that lacks the tag, the review is stale — re-add the tag (fail-safe:
+    # unreviewed wins). Catches verify-vs-retrace races and span-mixing
+    # merges where neither reviewer saw the combined line. Conversely, a
+    # merged line with NO trace spans has left the review workflow: the
+    # tag must go, because VC3D's generic tag controls reject it and its
+    # review actions reject untraced fibers, which would strand the tag
+    # (mirrors applyTraceReviewTags on save).
+    if _has_trace_span(merged):
+        if TRACE_NEEDS_REVIEW_TAG not in merged['tags']:
+            reviewed_geometries = [
+                _geometry_pair(doc) for doc in (local, remote)
+                if TRACE_NEEDS_REVIEW_TAG not in (doc.get('tags') or [])
+            ]
+            if _geometry_pair(merged) not in reviewed_geometries:
+                merged['tags'].append(TRACE_NEEDS_REVIEW_TAG)
+                notes.append('merged geometry differs from every reviewed '
+                             'side; re-added ' + TRACE_NEEDS_REVIEW_TAG)
+    elif TRACE_NEEDS_REVIEW_TAG in merged['tags']:
+        merged['tags'].remove(TRACE_NEEDS_REVIEW_TAG)
+        notes.append('merged geometry contains no trace spans; removed ' +
+                     TRACE_NEEDS_REVIEW_TAG)
     merged['generation'] = max(generation_local, generation_remote) + 1
     manual_tag_conflict = _merge_manual_hv_tag(base, local, remote, merged,
                                                notes)

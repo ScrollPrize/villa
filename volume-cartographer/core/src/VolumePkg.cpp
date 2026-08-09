@@ -111,6 +111,8 @@ bool hasZarrMarkerAtRoot(const fs::path& dir)
 bool isSingleZarrVolumeDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
+    if (fs::exists(dir / ".zarray") || fs::exists(dir / "zarr.json"))
+        return true;
     bool meta = fs::exists(dir / "meta.json")
              || fs::exists(dir / "metadata.json")
              || hasZarrMarkerAtRoot(dir);
@@ -155,15 +157,6 @@ constexpr const char* kDirectRemoteZarrRequired =
     "remote Zarr volume locations must point directly to a .zarr root; "
     "collection listing is not supported";
 
-constexpr std::string_view kLasagnaDerivedPrefix = "vc-lasagna-derived:";
-
-bool hasLasagnaDerivedTag(const std::vector<std::string>& tags)
-{
-    return std::any_of(tags.begin(), tags.end(), [](const auto& tag) {
-        return tag.rfind(kLasagnaDerivedPrefix, 0) == 0;
-    });
-}
-
 std::string validateRemoteVolumeLocation(
     const std::string& location,
     bool requireDirectZarr)
@@ -195,6 +188,11 @@ std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string
     return {};
 }
 
+// Note that this deliberately disagrees with sameAttachmentLocation() for
+// remote locators: two selector-free locators are deduped there when they
+// resolve to the same source URL, and kept distinct here unless the strings
+// match. Pre-existing, and left alone, but it means attach/match and
+// persisted-entry dedupe can reach different answers for the same pair.
 bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
@@ -223,6 +221,20 @@ fs::path absoluteLocalPath(
     return path.lexically_normal();
 }
 
+// Do two already-absolute, lexically normalized paths name the same thing?
+// A lexical comparison cannot see through a symlink, and the two sides do not
+// always arrive in the same spelling: load() keeps path_ verbatim and the open
+// dialog does not resolve links. fs::equivalent needs both paths to exist and
+// reports through the error_code, so the lexical answer stays authoritative for
+// locations that have not been created yet.
+bool samePathOnDisk(const fs::path& a, const fs::path& b)
+{
+    if (a == b)
+        return true;
+    std::error_code ec;
+    return fs::equivalent(a, b, ec);
+}
+
 bool sameAttachmentLocation(
     const std::string& a,
     const std::string& b,
@@ -233,8 +245,9 @@ bool sameAttachmentLocation(
     if (aRemote != bRemote)
         return false;
     if (!aRemote) {
-        return absoluteLocalPath(a, projectDirectory) ==
-               absoluteLocalPath(b, projectDirectory);
+        return samePathOnDisk(
+            absoluteLocalPath(a, projectDirectory),
+            absoluteLocalPath(b, projectDirectory));
     }
     try {
         const auto aSpec = vc::parseRemoteVolumeSpec(a);
@@ -265,7 +278,7 @@ bool entryBacksAttachmentLocation(
     try {
         return fs::is_directory(entryPath) &&
                !isSingleZarrVolumeDir(entryPath) &&
-               attachmentPath.parent_path() == entryPath &&
+               samePathOnDisk(attachmentPath.parent_path(), entryPath) &&
                isSingleZarrVolumeDir(attachmentPath);
     } catch (const fs::filesystem_error&) {
         return false;
@@ -287,43 +300,9 @@ bool loadedVolumeMatchesLocation(
     auto loadedPath = volume->path();
     if (loadedPath.is_relative())
         loadedPath = fs::absolute(loadedPath);
-    return loadedPath.lexically_normal() ==
-           absoluteLocalPath(location, projectDirectory);
-}
-
-std::optional<std::string> incompatibleVolumeMetadata(
-    const Volume& existing,
-    const Volume& prepared)
-{
-    if (existing.shape() != prepared.shape())
-        return "3D shape differs";
-    if (existing.dtype() != prepared.dtype())
-        return "dtype differs";
-    if (existing.fillValue() != prepared.fillValue())
-        return "fill value differs";
-    if (existing.baseScaleLevel() != prepared.baseScaleLevel())
-        return "base scale level differs";
-
-    const double existingSpacing = existing.voxelSize();
-    const double preparedSpacing = prepared.voxelSize();
-    const double spacingScale = std::max(
-        {1.0, std::abs(existingSpacing), std::abs(preparedSpacing)});
-    if (!std::isfinite(existingSpacing) || !std::isfinite(preparedSpacing) ||
-        std::abs(existingSpacing - preparedSpacing) > 1.0e-12 * spacingScale) {
-        return "voxel spacing differs";
-    }
-
-    const auto existingLevels = existing.presentScaleLevels();
-    const auto preparedLevels = prepared.presentScaleLevels();
-    if (existingLevels != preparedLevels)
-        return "present scale levels differ";
-    for (const int level : existingLevels) {
-        if (existing.levelShape(level) != prepared.levelShape(level))
-            return "level shape differs";
-        if (existing.chunkShape(level) != prepared.chunkShape(level))
-            return "level chunk shape differs";
-    }
-    return std::nullopt;
+    return samePathOnDisk(
+        loadedPath.lexically_normal(),
+        absoluteLocalPath(location, projectDirectory));
 }
 
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
@@ -1280,19 +1259,37 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         manifestTags.emplace_back(vc::project::kFiberLasagnaTag);
 
     std::set<std::string> incomingLocations;
-    std::set<std::string> incomingIds;
+    std::vector<std::pair<std::string, std::string>> incomingIdLocations;
     for (const auto& prepared : preparedVolumes) {
-        const std::string provenanceTag =
-            std::string(kLasagnaDerivedPrefix) + manifestLocation;
-        if (prepared.location.empty() || !prepared.volume ||
-            !hasTag(prepared.tags, provenanceTag)) {
-            throw std::invalid_argument("prepared Lasagna volumes require a derived location, volume, and provenance tag");
+        if (prepared.location.empty() || !prepared.volume) {
+            throw std::invalid_argument(
+                "prepared Lasagna volumes require a location and volume");
         }
-        if (!incomingLocations.insert(prepared.location).second || !incomingIds.insert(prepared.volume->id()).second) {
-            throw std::invalid_argument("prepared Lasagna volumes contain duplicate identities");
+        if (!incomingLocations.insert(prepared.location).second) {
+            throw std::invalid_argument(
+                "prepared Lasagna volumes contain duplicate source location: " +
+                prepared.location);
         }
-        if (loadedVolumes_.count(prepared.volume->id()) > 0 &&
-            std::none_of(volumes_.begin(), volumes_.end(), [&](const auto& entry) { return entry.location == prepared.location; })) {
+        const std::string id = prepared.volume->id();
+        auto duplicateId = std::find_if(
+            incomingIdLocations.begin(), incomingIdLocations.end(),
+            [&](const auto& candidate) { return candidate.first == id; });
+        if (duplicateId != incomingIdLocations.end()) {
+            throw std::invalid_argument(
+                "prepared Lasagna volumes contain duplicate volume id '" + id +
+                "' for locations '" + duplicateId->second + "' and '" +
+                prepared.location + "'");
+        }
+        incomingIdLocations.push_back({id, prepared.location});
+        if (!loadedVolumeMatchesLocation(
+                prepared.volume, prepared.location, path_.parent_path())) {
+            throw std::invalid_argument(
+                "prepared Lasagna volume does not match its attachment location");
+        }
+        auto loaded = loadedVolumes_.find(prepared.volume->id());
+        if (loaded != loadedVolumes_.end() &&
+            !loadedVolumeMatchesLocation(
+                loaded->second, prepared.location, path_.parent_path())) {
             return AttachLasagnaResult::VolumeIdConflict;
         }
     }
@@ -1347,99 +1344,42 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
         }
 
-        const std::string provenanceTag =
-            std::string(kLasagnaDerivedPrefix) + manifestLocation;
-        auto eraseProvenance = [&](std::vector<std::string>& tags) {
-            const auto oldSize = tags.size();
-            tags.erase(std::remove(tags.begin(), tags.end(), provenanceTag),
-                       tags.end());
-            return tags.size() != oldSize;
-        };
-        for (auto entry = volumes_.begin(); entry != volumes_.end();) {
-            if (incomingLocations.contains(entry->location) ||
-                !eraseProvenance(entry->tags)) {
-                ++entry;
-                continue;
-            }
-            changed = true;
-            if (hasLasagnaDerivedTag(entry->tags))
-                ++entry;
-            else
-                entry = volumes_.erase(entry);
-        }
-        for (auto tags = volumeTagsByID_.begin();
-             tags != volumeTagsByID_.end();) {
-            if (!eraseProvenance(tags->second)) {
-                ++tags;
-                continue;
-            }
-            if (hasLasagnaDerivedTag(tags->second)) {
-                ++tags;
-            } else {
-                loadedVolumes_.erase(tags->first);
-                tags = volumeTagsByID_.erase(tags);
-            }
-        }
-
         for (const auto& prepared : preparedVolumes) {
-            auto entry =
-                std::find_if(volumes_.begin(), volumes_.end(), [&](const auto& candidate) { return candidate.location == prepared.location; });
+            std::string persistedLocation = prepared.location;
+            if (vc::project::isLocationRemote(prepared.location)) {
+                const auto spec = vc::parseRemoteVolumeSpec(prepared.location);
+                if (spec.hasBaseScaleSelector)
+                    persistedLocation = spec.portableLocator;
+            }
+            auto entry = std::find_if(
+                volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+                    return entryBacksAttachmentLocation(
+                        candidate.location, persistedLocation,
+                        path_.parent_path());
+                });
             if (entry == volumes_.end()) {
-                volumes_.push_back({prepared.location, prepared.tags});
+                volumes_.push_back({persistedLocation, prepared.tags});
+                entry = std::prev(volumes_.end());
                 changed = true;
             } else {
                 const auto oldTags = entry->tags;
-                const bool independentlyOwned = !hasLasagnaDerivedTag(entry->tags);
                 for (const auto& tag : prepared.tags) {
-                    if (!independentlyOwned ||
-                        tag.rfind(kLasagnaDerivedPrefix, 0) != 0) {
-                        addUniqueTags(entry->tags, {tag});
-                    }
+                    addUniqueTags(entry->tags, {tag});
                 }
                 changed = changed || entry->tags != oldTags;
-                if (independentlyOwned) {
-                    std::shared_ptr<Volume> existingVolume;
-                    for (const auto& [id, volume] : loadedVolumes_) {
-                        (void)id;
-                        if (!loadedVolumeMatchesLocation(
-                                volume, prepared.location,
-                                path_.parent_path())) {
-                            continue;
-                        }
-                        if (existingVolume && existingVolume != volume) {
-                            throw std::runtime_error(
-                                "Cannot reuse independently attached Lasagna volume '" +
-                                prepared.location +
-                                "': multiple loaded volumes reference the source");
-                        }
-                        existingVolume = volume;
-                    }
-                    if (!existingVolume) {
-                        throw std::runtime_error(
-                            "Cannot reuse independently attached Lasagna volume '" +
-                            prepared.location +
-                            "': its loaded volume is unavailable for compatibility validation");
-                    }
-                    if (const auto mismatch = incompatibleVolumeMetadata(
-                            *existingVolume, *prepared.volume)) {
-                        throw std::runtime_error(
-                            "Cannot reuse independently attached Lasagna volume '" +
-                            prepared.location + "': " + *mismatch);
-                    }
-                    continue;
-                }
             }
             auto loaded = loadedVolumes_.find(prepared.volume->id());
             if (loaded == loadedVolumes_.end()) {
                 loadedVolumes_.emplace(prepared.volume->id(), prepared.volume);
                 changed = true;
-            } else if (loaded->second != prepared.volume) {
+            } else if (loaded->second != prepared.volume &&
+                       !loadedVolumeMatchesLocation(
+                           loaded->second, persistedLocation,
+                           path_.parent_path())) {
                 loaded->second = prepared.volume;
                 changed = true;
             }
-            volumeTagsByID_[prepared.volume->id()] = std::find_if(volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
-                                                         return candidate.location == prepared.location;
-                                                     })->tags;
+            volumeTagsByID_[prepared.volume->id()] = entry->tags;
         }
         if (remoteCacheRoot_.empty() && !remoteCacheRoot.empty()) {
             remoteCacheRoot_ = remoteCacheRoot;
@@ -1466,11 +1406,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
 
 bool VolumePkg::removeEntry(const std::string& location)
 {
-    const bool removingLasagna = std::any_of(
-        lasagnaDatasets_.begin(), lasagnaDatasets_.end(),
-        [&](const auto& entry) { return entry.location == location; });
-    const std::string removedProvenance =
-        std::string(kLasagnaDerivedPrefix) + location;
     auto eraseFrom = [&](std::vector<vc::project::Entry>& v) {
         auto it = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.location == location; });
         if (it == v.end())
@@ -1487,37 +1422,6 @@ bool VolumePkg::removeEntry(const std::string& location)
         removed = true;
     if (eraseFrom(lasagnaDatasets_))
         removed = true;
-    if (removingLasagna) {
-        auto removeManifestReferences = [&](std::vector<std::string>& tags) {
-            const auto oldSize = tags.size();
-            tags.erase(std::remove(tags.begin(), tags.end(), removedProvenance),
-                       tags.end());
-            return tags.size() != oldSize;
-        };
-        for (auto it = volumes_.begin(); it != volumes_.end();) {
-            if (!removeManifestReferences(it->tags)) {
-                ++it;
-                continue;
-            }
-            removed = true;
-            if (hasLasagnaDerivedTag(it->tags))
-                ++it;
-            else
-                it = volumes_.erase(it);
-        }
-        for (auto tags = volumeTagsByID_.begin(); tags != volumeTagsByID_.end();) {
-            if (!removeManifestReferences(tags->second)) {
-                ++tags;
-                continue;
-            }
-            if (hasLasagnaDerivedTag(tags->second)) {
-                ++tags;
-            } else {
-                loadedVolumes_.erase(tags->first);
-                tags = volumeTagsByID_.erase(tags);
-            }
-        }
-    }
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location)
             outputSegments_.reset();
@@ -1968,20 +1872,6 @@ void VolumePkg::persistProjectState()
 
 void VolumePkg::resolveAll()
 {
-    struct PreparedLasagnaRuntimeVolume {
-        std::string id;
-        std::shared_ptr<Volume> volume;
-        std::vector<std::string> tags;
-    };
-    std::vector<PreparedLasagnaRuntimeVolume> preparedLasagnaVolumes;
-    for (const auto& [id, volume] : loadedVolumes_) {
-        const auto tags = volumeTagsByID_.find(id);
-        if (tags == volumeTagsByID_.end() ||
-            !hasLasagnaDerivedTag(tags->second)) {
-            continue;
-        }
-        preparedLasagnaVolumes.push_back({id, volume, tags->second});
-    }
     loadedVolumes_.clear();
     volumeTagsByID_.clear();
     {
@@ -2000,8 +1890,7 @@ void VolumePkg::resolveAll()
     std::vector<std::size_t> remoteIndices;
     remoteIndices.reserve(volumes_.size());
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
-        if (vc::project::isLocationRemote(volumes_[i].location) &&
-            !hasLasagnaDerivedTag(volumes_[i].tags)) {
+        if (vc::project::isLocationRemote(volumes_[i].location)) {
             remoteIndices.push_back(i);
         }
     }
@@ -2061,8 +1950,6 @@ void VolumePkg::resolveAll()
 
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
         const auto& entry = volumes_[i];
-        if (hasLasagnaDerivedTag(entry.tags))
-            continue;
         if (!vc::project::isLocationRemote(entry.location)) {
             resolveVolumeEntry(entry);
             continue;
@@ -2086,17 +1973,6 @@ void VolumePkg::resolveAll()
         }
         loadedVolumes_.emplace(id, std::move(resolved.volume));
         if (!entry.tags.empty()) volumeTagsByID_[id] = entry.tags;
-    }
-
-    for (auto& prepared : preparedLasagnaVolumes) {
-        if (loadedVolumes_.count(prepared.id) > 0) {
-            Logger()->warn(
-                "Prepared Lasagna volume id '{}' conflicts during project resolution; skipping",
-                prepared.id);
-            continue;
-        }
-        loadedVolumes_.emplace(prepared.id, std::move(prepared.volume));
-        volumeTagsByID_[prepared.id] = std::move(prepared.tags);
     }
 
     const vc::project::Entry* selectedSegments = nullptr;
@@ -2132,10 +2008,6 @@ void VolumePkg::resolveDeferredEntries()
 
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
-    if (hasLasagnaDerivedTag(e.tags)) {
-        // Reconstructed by the Lasagna attachment resolver.
-        return;
-    }
     if (vc::project::isLocationRemote(e.location)) {
         try {
             if (!isDirectRemoteZarrLocation(e.location)) {

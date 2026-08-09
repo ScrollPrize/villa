@@ -275,3 +275,24 @@ TEST_CASE("centers interpolate between control points")
     CHECK(mid[0] == doctest::Approx(5.0f).epsilon(1e-3));
     CHECK(mid[1] == doctest::Approx(5.0f).epsilon(1e-3));
 }
+
+TEST_CASE("control_points json format loads via the shared loader")
+{
+    const auto path = tmpFile("control_points", ".json");
+    writeFile(path,
+              R"({"control_points": [)"
+              R"({"x": 10, "y": 20, "z": 5, "score": 100},)"
+              R"({"x": 12, "y": 22, "z": 15, "score": 100}],)"
+              R"("metadata": {"total_points": 2}})");
+
+    const auto points = Umbilicus::LoadControlPoints(path);
+    REQUIRE(points.size() == 2);
+    CHECK(points[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
+    CHECK(points[1] == cv::Vec3f(12.0f, 22.0f, 15.0f));
+
+    // FromFile shares the same parser, so the format works there too.
+    const auto umbilicus = Umbilicus::FromFile(path, cv::Vec3i(20, 40, 40));
+    CHECK(umbilicus.centers().size() == 20);
+
+    fs::remove(path);
+}

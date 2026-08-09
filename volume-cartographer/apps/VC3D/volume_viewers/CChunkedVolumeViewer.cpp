@@ -116,10 +116,12 @@ struct IntersectionStyle {
     QRgb color = 0;
     int z = kIntersectionZ;
     int widthQ = 0;
+    bool dashed = false;
 
     bool operator==(const IntersectionStyle& other) const
     {
-        return color == other.color && z == other.z && widthQ == other.widthQ;
+        return color == other.color && z == other.z && widthQ == other.widthQ &&
+               dashed == other.dashed;
     }
 };
 
@@ -129,6 +131,7 @@ struct IntersectionStyleHash {
         size_t h = std::hash<QRgb>{}(style.color);
         h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(style.dashed) + 0x9e3779b9u + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -674,6 +677,16 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
     connect(_view, &CVolumeViewerView::sendMouseLeftView, this, [this]() {
         clearLineAnnotationPlacementMarker();
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+        _lastCursorVolumePos.reset();
+        updateStatusLabel();
+        // Clear mirrored crosshairs in the other viewers too (nullopt
+        // broadcasts are never gated), so they don't freeze at the last point.
+        if (_viewerManager) {
+            _viewerManager->broadcastLinkedCursor(this, std::nullopt);
+        }
     });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
@@ -708,6 +721,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     _statsBar = new ViewerStatsBar(this);
     _statsBar->move(10, 5);
+    _statsBarRight = new ViewerStatsBar(this);
+    _statsBarRight->setMinimumWidth(0);
+    _statsBarRight->hide();
 }
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
@@ -732,6 +748,20 @@ void CChunkedVolumeViewer::showEvent(QShowEvent* event)
         _renderStaleWhileHidden = false;
         submitRender("shown after hidden");
     }
+}
+
+void CChunkedVolumeViewer::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    repositionStatsBarRight();
+}
+
+void CChunkedVolumeViewer::repositionStatsBarRight()
+{
+    if (!_statsBarRight) {
+        return;
+    }
+    _statsBarRight->move(std::max(0, width() - _statsBarRight->width() - 10), 5);
 }
 
 bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
@@ -849,7 +879,7 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
-    _zOff = state.zOffset;
+    setZOffset(state.zOffset);
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
     _genCacheDirty = true;
@@ -870,6 +900,8 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
+    // Raw assignment, not setZOffset(): offscreen replay must not schedule
+    // intersection renders in the other viewers.
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
@@ -1421,7 +1453,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (_resetViewOnSurfaceChange) {
             (void)setSegmentationPointerFromFocus();
         }
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         if (_resetViewOnSurfaceChange) {
@@ -1431,7 +1463,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
@@ -1455,6 +1487,52 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
             }
         }
     }
+
+    // Safety net: whatever branch ran above, the (possibly preserved) pan can
+    // land entirely off the new segment's extent — e.g. the user had zoomed
+    // deep into a large segment and switched to a small one, leaving the
+    // viewport in a region the new quad doesn't cover (all black). If the
+    // viewport no longer intersects the segment's UV bounds, pan the view
+    // center to the nearest point of those bounds. Zoom and the focus POI are
+    // deliberately left untouched.
+    if (!isEditUpdate && isSegmentationQuadSurface && _view) {
+        auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+        try {
+            quad->ensureLoaded();
+            if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
+                points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
+                const cv::Vec3f center = quad->center();
+                const cv::Vec2f gridScale = quad->scale();
+                const float minU = -center[0];
+                const float minV = -center[1];
+                const float maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                const float maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
+                if (maxU > minU && maxV > minV) {
+                    if (!std::isfinite(_surfacePtrX) || !std::isfinite(_surfacePtrY)) {
+                        _surfacePtrX = (minU + maxU) * 0.5f;
+                        _surfacePtrY = (minV + maxV) * 0.5f;
+                    } else {
+                        const QSize viewportSize = _view->viewport()->size();
+                        const float scale = std::max(_scale, kMinScale);
+                        const float halfW = 0.5f * static_cast<float>(viewportSize.width()) / scale;
+                        const float halfH = 0.5f * static_cast<float>(viewportSize.height()) / scale;
+                        const bool viewportTouchesSegment =
+                            _surfacePtrX + halfW > minU && _surfacePtrX - halfW < maxU &&
+                            _surfacePtrY + halfH > minV && _surfacePtrY - halfH < maxV;
+                        if (!viewportTouchesSegment) {
+                            _surfacePtrX = std::clamp(_surfacePtrX, minU, maxU);
+                            _surfacePtrY = std::clamp(_surfacePtrY, minV, maxV);
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not keep segment visible after surface change:" << e.what();
+        }
+    }
+
     updateFocusMarker();
     // A new preview generation installs a new surface pointer, which retires
     // the tiles built for the previous one.
@@ -3120,7 +3198,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
         const auto [w, h, d] = _volume->shapeXyz();
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
-    _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
+    setZOffset(std::clamp(_zOff + delta, -maxZ, maxZ));
     _genCacheDirty = true;
     submitRender("surface offset changed");
     updateStatusLabel();
@@ -3130,10 +3208,34 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
 {
     _surfacePtrX = 0.0f;
     _surfacePtrY = 0.0f;
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     submitRender("surface offsets reset");
+}
+
+// Sets the normal offset, refreshing dependent overlays when it changes. Use
+// this instead of assigning _zOff directly unless the notification must be
+// suppressed (e.g. offscreen replay repaints).
+void CChunkedVolumeViewer::setZOffset(float value)
+{
+    if (_zOff == value) {
+        return;
+    }
+    _zOff = value;
+    notifyNormalOffsetChanged();
+}
+
+// Plane viewers draw a dashed copy of the segmentation intersection displaced
+// by the flattened viewer's normal offset; refresh them when that offset moves.
+void CChunkedVolumeViewer::notifyNormalOffsetChanged()
+{
+    if (!_viewerManager || _viewerManager->segmentationViewer() != this)
+        return;
+    _viewerManager->forEachBaseViewer([this](VolumeViewerBase* v) {
+        if (v && v != this)
+            v->scheduleIntersectionRender("segmentation normal offset changed");
+    });
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -3179,12 +3281,14 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
             quad->ensureLoaded();
             if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
                 points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
                 const cv::Vec3f center = quad->center();
                 const cv::Vec2f gridScale = quad->scale();
-                minU = -center[0] * gridScale[0];
-                minV = -center[1] * gridScale[1];
-                maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
-                maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                minU = -center[0];
+                minV = -center[1];
+                maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
                 haveBounds = maxU > minU && maxV > minV;
             }
         } catch (const std::exception& e) {
@@ -3202,7 +3306,7 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                maxV - minV,
                                viewportSize.width(),
                                viewportSize.height());
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
     recalcPyramidLevel();
     _genCacheDirty = true;
@@ -3285,7 +3389,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 const float delta = static_cast<float>(steps) * _zScrollSensitivity;
                 auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
                 shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
-                _zOff = 0.0f;
+                setZOffset(0.0f);
                 _zOffWorldDir = {0, 0, 0};
                 if (_state) {
                     _state->setSurface(_surfName, shiftedPlane, false, true);
@@ -3298,7 +3402,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 }
             }
         } else {
-            _zOff += static_cast<float>(steps) * _zScrollSensitivity;
+            setZOffset(_zOff + static_cast<float>(steps) * _zScrollSensitivity);
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
         }
@@ -3837,10 +3941,17 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     return {};
 }
 
-void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
+void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos, bool projected)
 {
     if (!_scene || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y()))
         return;
+
+    const auto crosshairPen = [](bool greyedOut) {
+        QPen pen(greyedOut ? QColor(160, 160, 160, 190) : QColor(50, 255, 215),
+                 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(true);
+        return pen;
+    };
 
     if (!_cursorCrosshair || !_cursorCrosshair->scene()) {
         QPainterPath path;
@@ -3858,14 +3969,16 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
         path.lineTo(0.0, arm);
 
         auto* marker = new QGraphicsPathItem(path);
-        QPen pen(QColor(50, 255, 215), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        pen.setCosmetic(true);
-        marker->setPen(pen);
+        marker->setPen(crosshairPen(projected));
         marker->setBrush(Qt::NoBrush);
         marker->setZValue(120.0);
         marker->setAcceptedMouseButtons(Qt::NoButton);
         _scene->addItem(marker);
         _cursorCrosshair = marker;
+        _cursorCrosshairProjected = projected;
+    } else if (projected != _cursorCrosshairProjected) {
+        static_cast<QGraphicsPathItem*>(_cursorCrosshair)->setPen(crosshairPen(projected));
+        _cursorCrosshairProjected = projected;
     }
 
     _cursorCrosshair->setPos(scenePos);
@@ -4196,21 +4309,49 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         }
     };
 
-    if (!_segmentationCursorMirroring || !point) {
+    const bool accepted =
+        (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
+    // Track the point for the status-bar position readout even when it doesn't
+    // project onto this viewer's surface and the crosshair stays hidden. Only
+    // refresh the (monolithic) status bar when the value changed and this
+    // viewer actually displays the position — this runs per mouse move on
+    // every mirrored viewer.
+    const std::optional<cv::Vec3f> linkedPoint = accepted ? point : std::nullopt;
+    if (linkedPoint != _linkedCursorVolumePos) {
+        _linkedCursorVolumePos = linkedPoint;
+        if (!property("vc_hide_status_position").toBool()) {
+            updateStatusLabel();
+        }
+    }
+
+    if (!accepted) {
         hideCrosshair();
         return;
     }
 
     QPointF scenePos;
+    bool offPlane = false;
     if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
+        // The flattened viewer's cursor point includes its normal offset, which
+        // pushes it off-plane by up to that amount; widen the depth band so the
+        // crosshair still lands on the dashed offset intersection line.
+        float tolerance = _linkedCursorViewTolerance;
+        if (auto* segViewer =
+                _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+            segViewer && segViewer != this) {
+            tolerance += std::abs(segViewer->normalOffset());
+        }
         const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
         if (!std::isfinite(projected[0]) ||
             !std::isfinite(projected[1]) ||
-            !std::isfinite(projected[2]) ||
-            std::abs(projected[2] - _zOff) > _linkedCursorViewTolerance) {
+            !std::isfinite(projected[2])) {
             hideCrosshair();
             return;
         }
+        // Beyond the depth band the point is not on this plane (typically after
+        // a normal-offset scroll); show its in-plane projection greyed out
+        // instead of hiding — the projection is already computed.
+        offPlane = std::abs(projected[2] - _zOff) > tolerance;
         scenePos = surfaceToScene(projected[0], projected[1]);
     } else {
         scenePos = volumeToScene(*point);
@@ -4221,7 +4362,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         return;
     }
 
-    updateCursorCrosshair(scenePos);
+    updateCursorCrosshair(scenePos, offPlane);
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)
@@ -5188,6 +5329,15 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
 
+    // Normal offset of the flattened segmentation viewer: plane viewers draw a
+    // dashed copy of the active segment's intersection displaced by this amount
+    // so the mirrored crosshair (which maps through the offset) stays on a line.
+    float segNormalOffset = 0.0f;
+    if (auto* segViewer = _viewerManager->segmentationViewer();
+        segViewer && segViewer != this) {
+        segNormalOffset = segViewer->normalOffset();
+    }
+
     const std::uint64_t surfacesVersion = _state->surfacesVersion();
     if (!_resolvedIntersectTargets.valid ||
         _resolvedIntersectTargets.activeSeg != activeSeg.get() ||
@@ -5310,6 +5460,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     for (const auto& id : _highlightedSurfaceIds)
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
+    fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
     fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
                     (std::hash<int>{}(_framebuffer.height()) << 1);
     fp.valid = true;
@@ -5358,6 +5509,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.targetGenerationHash == b.targetGenerationHash &&
                a.activeSegHash == b.activeSegHash &&
                a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
+               a.segNormalOffsetQ == b.segNormalOffsetQ &&
                a.cameraHash == b.cameraHash;
     };
     if (geometryCacheValid && !_intersectionItems.empty() &&
@@ -5598,6 +5750,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
         };
         groupedColors[style] = baseColor;
+        // Dotted copy of the active segment's line, displaced along the surface
+        // normal by the flattened viewer's offset: it marks where that viewer's
+        // mirrored crosshair lands, so cross-referencing works off-surface too.
+        const bool drawOffsetCopy =
+            target == activeSeg && std::abs(segNormalOffset) > 1e-3f;
+        IntersectionStyle offsetStyle;
+        if (drawOffsetCopy) {
+            offsetStyle = IntersectionStyle{style.color, style.z, style.widthQ, true};
+            groupedColors[offsetStyle] = baseColor;
+        }
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
@@ -5607,6 +5769,19 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             groupedPaths[style].lineTo(b);
             if (target == activeSeg) {
                 addApprovalMaskIntersection(seg, opacity, penWidth);
+            }
+            if (drawOffsetCopy) {
+                const cv::Vec3f n0 = target->normal(seg.surfaceParams[0]);
+                const cv::Vec3f n1 = target->normal(seg.surfaceParams[1]);
+                if (!std::isfinite(n0[0]) || !std::isfinite(n0[1]) || !std::isfinite(n0[2]) ||
+                    !std::isfinite(n1[0]) || !std::isfinite(n1[1]) || !std::isfinite(n1[2]))
+                    continue;
+                const QPointF oa = planeToScene(seg.world[0] + n0 * segNormalOffset);
+                const QPointF ob = planeToScene(seg.world[1] + n1 * segNormalOffset);
+                if (!isFinitePoint(oa) || !isFinitePoint(ob))
+                    continue;
+                groupedPaths[offsetStyle].moveTo(oa);
+                groupedPaths[offsetStyle].lineTo(ob);
             }
         }
     }
@@ -5640,6 +5815,10 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
+        if (style.dashed) {
+            pen.setStyle(Qt::DotLine);
+            pen.setCapStyle(Qt::FlatCap);
+        }
         item->setTransform(QTransform());
         item->setPath(path);
         item->setPen(pen);
@@ -5745,16 +5924,24 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     QStringList items;
     QStringList sharedCacheItems;
-    items << QString("L%1").arg(_dsScaleIdx);
+    // The stats group (mip level, label, scale, framebuffer, composite) can be
+    // routed to the right-anchored bar or dropped per viewer.
+    QStringList statsItems;
+    statsItems << QString("L%1").arg(_dsScaleIdx);
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
-        items << viewerLabel;
-    items << QString("scale %1").arg(_scale, 0, 'f', 2);
-    items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
+        statsItems << viewerLabel;
+    statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);
 
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        items << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+    }
+
+    const bool showStats = !property("vc_hide_status_stats").toBool();
+    const bool statsTopRight = property("vc_status_stats_top_right").toBool();
+    if (showStats && !statsTopRight) {
+        items << statsItems;
     }
 
     if (_chunkArray) {
@@ -5813,19 +6000,31 @@ void CChunkedVolumeViewer::updateStatusLabel()
         sharedCacheItems << QStringLiteral("surface: out of band");
 
     auto surf = _surfWeak.lock();
-    if (_lastCursorVolumePos)
-        items << formatWholeVolumePosition(*_lastCursorVolumePos);
+    const auto& cursorPos =
+        _lastCursorVolumePos ? _lastCursorVolumePos : _linkedCursorVolumePos;
+    if (cursorPos && !property("vc_hide_status_position").toBool())
+        items << formatWholeVolumePosition(*cursorPos);
     if (dynamic_cast<QuadSurface*>(surf.get())) {
-        items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
-        if (_state) {
+        if (_zOff != 0.0f)
+            items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
+        if (_state && !property("vc_hide_status_poi").toBool()) {
             if (auto* poi = _state->poi("focus"))
                 items << QString("POI %1").arg(formatVec3(poi->p));
         }
     } else if (property("vc_show_custom_normal_offset").toBool()) {
-        items << QString("normal offset %1")
-                     .arg(property("vc_custom_normal_offset_vx").toDouble(), 0, 'f', 1);
+        const double offsetVx = property("vc_custom_normal_offset_vx").toDouble();
+        if (offsetVx != 0.0)
+            items << QString("normal offset %1").arg(offsetVx, 0, 'f', 1);
     }
 
     _statsBar->setItems(items);
+    _statsBar->setVisible(!items.isEmpty());
+    if (_statsBarRight) {
+        const QStringList rightItems =
+            (showStats && statsTopRight) ? statsItems : QStringList{};
+        _statsBarRight->setItems(rightItems);
+        _statsBarRight->setVisible(!rightItems.isEmpty());
+        repositionStatsBarRight();
+    }
     emit sharedCacheStatsChanged(sharedCacheItems);
 }

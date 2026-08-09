@@ -916,20 +916,24 @@ if(VC_TESTING)
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-core-offline
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$" -LE "^network$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-specialized
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-specialized$"
         DEPENDS vc_test_specialized
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         DEPENDS ${_vc_test_targets}
+        VERBATIM
         USES_TERMINAL)
 
     if(VC_ENABLE_COVERAGE)

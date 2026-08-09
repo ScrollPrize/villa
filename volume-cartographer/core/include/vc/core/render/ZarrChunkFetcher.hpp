@@ -11,7 +11,10 @@
 #include <string>
 #include <vector>
 
-namespace utils { class ZarrArray; }
+namespace utils {
+class Store;
+class ZarrArray;
+}
 
 namespace vc::render {
 
@@ -44,6 +47,15 @@ OpenedChunkedZarr openHttpZarrPyramid(
 OpenedChunkedZarr validateAndRebaseVcPyramid(
     OpenedChunkedZarr opened,
     int baseScaleLevel);
+
+// Map multiscales[0].datasets of the store's .zattrs to (physicalLevel, key)
+// pairs. All-numeric dataset paths bind by their value — exporters may publish
+// only levels >= some scaledown, and positional binding would register the
+// coarse array as full resolution. Exposed for deterministic synthetic tests;
+// the remote open uses the same implementation.
+std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
+    const std::shared_ptr<utils::Store>& store,
+    int firstLevel);
 
 std::unique_ptr<ChunkCache> createChunkCache(
     OpenedChunkedZarr opened,

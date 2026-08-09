@@ -62,7 +62,7 @@ void createCzyx(const fs::path& path)
 
 }  // namespace
 
-TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
+TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
 {
     const auto dir = temporaryDirectory();
     createZyx(dir / "pred.zarr", 100);
@@ -71,11 +71,9 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
         std::ofstream manifest(manifestPath);
         manifest << R"({
           "version":2,
-          "source_to_base":2.0,
           "groups":{
             "pred":{
               "zarr":"pred.zarr",
-              "scaledown":1,
               "channels":["presence"]
             }
           }
@@ -85,21 +83,16 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
     REQUIRE(prepared.size() == 1);
-    CHECK(prepared[0].volume->shape() == std::array<int, 3>{4, 4, 4});
-    CHECK_FALSE(prepared[0].volume->hasScaleLevel(0));
-    CHECK(prepared[0].volume->hasScaleLevel(1));
-    CHECK(prepared[0].volume->levelShape(1) == std::array<int, 3>{2, 2, 2});
-    CHECK(prepared[0].volume->voxelSize() == doctest::Approx(4.0));
+    CHECK(prepared[0].volume->shape() == std::array<int, 3>{2, 2, 2});
+    CHECK(prepared[0].volume->hasScaleLevel(0));
+    CHECK(prepared[0].volume->levelShape(0) == std::array<int, 3>{2, 2, 2});
     CHECK(prepared[0].location ==
           fs::absolute(dir / "pred.zarr").lexically_normal().string());
-    CHECK(std::find(
-              prepared[0].tags.begin(), prepared[0].tags.end(),
-              "vc-lasagna-derived:" + manifestPath.string()) !=
-          prepared[0].tags.end());
     CHECK(prepared[0].tags == std::vector<std::string>{
-          "vc-lasagna-derived:" + manifestPath.string()});
+          "vc-lasagna-manifest:" + manifestPath.string(),
+          "vc-lasagna-group:pred"});
 
-    const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(1, 0, 0, 0);
+    const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(0, 0, 0, 0);
     REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
     REQUIRE(chunk.bytes);
     REQUIRE(chunk.bytes->size() == 8);
@@ -108,10 +101,160 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
     fs::remove_all(dir);
 }
 
-TEST_CASE("Lasagna project preparation preserves manifest base shape for scaled groups")
+TEST_CASE("Lasagna project preparation deduplicates shared source zarrs")
 {
     const auto dir = temporaryDirectory();
-    createZyx(dir / "pred.zarr", {2, 3, 3}, 50);
+    createZyx(dir / "pred.zarr", 10);
+    const auto manifestPath = dir / "fiber.lasagna.json";
+    {
+        std::ofstream manifest(manifestPath);
+        manifest << R"({
+          "version":2,
+          "groups":{
+            "presence":{
+              "zarr":"pred.zarr",
+              "channels":["presence"]
+            },
+            "nx":{
+              "zarr":"pred.zarr",
+              "channels":["nx"]
+            },
+            "ny":{
+              "zarr":"pred.zarr",
+              "channels":["ny"]
+            }
+          }
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
+    REQUIRE(prepared.size() == 1);
+    CHECK(prepared[0].location ==
+          fs::absolute(dir / "pred.zarr").lexically_normal().string());
+    CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(),
+                    "vc-lasagna-manifest:" + manifestPath.string()) !=
+          prepared[0].tags.end());
+    CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(),
+                    "vc-lasagna-group:presence") != prepared[0].tags.end());
+    CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(),
+                    "vc-lasagna-group:nx") != prepared[0].tags.end());
+    CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(),
+                    "vc-lasagna-group:ny") != prepared[0].tags.end());
+
+    std::vector<VolumePkg::PreparedVolumeAttachment> attachments;
+    for (auto& item : vc::lasagna::prepareLasagnaProjectVolumes(dataset)) {
+        attachments.push_back({
+            std::move(item.location),
+            std::move(item.tags),
+            std::move(item.volume)});
+    }
+    auto package = VolumePkg::newDetached();
+    const auto result = package->attachPreparedLasagnaDataset(
+        manifestPath.string(), {}, true, attachments);
+    REQUIRE(result == VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(package->numberOfVolumes() == 1);
+    CHECK(package->volumeEntries().size() == 1);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna project preparation keeps numeric scale group ids unique")
+{
+    const auto dir = temporaryDirectory();
+    createZyx(dir / "fiber_sd1_exp002_crop_presence.ome.zarr" / "3", 1);
+    createZyx(dir / "fiber_sd1_exp002_crop_nx.ome.zarr" / "3", 10);
+    createZyx(dir / "fiber_sd1_exp002_crop_ny.ome.zarr" / "3", 20);
+    const auto manifestPath = dir / "fiber.lasagna.json";
+    {
+        std::ofstream manifest(manifestPath);
+        manifest << R"({
+          "version":2,
+          "source_to_base":1.0,
+          "groups":{
+            "presence":{
+              "zarr":"fiber_sd1_exp002_crop_presence.ome.zarr/3",
+              "scaledown":3,
+              "channels":["presence"]
+            },
+            "nx":{
+              "zarr":"fiber_sd1_exp002_crop_nx.ome.zarr/3",
+              "scaledown":3,
+              "channels":["nx"]
+            },
+            "ny":{
+              "zarr":"fiber_sd1_exp002_crop_ny.ome.zarr/3",
+              "scaledown":3,
+              "channels":["ny"]
+            }
+          }
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
+    REQUIRE(prepared.size() == 3);
+    auto requirePreparedGroup = [&](const std::string& group,
+                                    const fs::path& expectedRoot) {
+        auto it = std::find_if(
+            prepared.begin(), prepared.end(), [&](const auto& item) {
+                return std::find(item.tags.begin(), item.tags.end(),
+                                 "vc-lasagna-group:" + group) !=
+                       item.tags.end();
+        });
+        REQUIRE(it != prepared.end());
+        CHECK(it->location == fs::absolute(expectedRoot).lexically_normal().string());
+        CHECK(fs::path(it->location).filename() != "3");
+    };
+    requirePreparedGroup("presence",
+                         dir / "fiber_sd1_exp002_crop_presence.ome.zarr");
+    requirePreparedGroup("nx",
+                         dir / "fiber_sd1_exp002_crop_nx.ome.zarr");
+    requirePreparedGroup("ny",
+                         dir / "fiber_sd1_exp002_crop_ny.ome.zarr");
+
+    std::vector<VolumePkg::PreparedVolumeAttachment> attachments;
+    for (auto& item : prepared) {
+        attachments.push_back({
+            std::move(item.location),
+            std::move(item.tags),
+            std::move(item.volume)});
+    }
+    REQUIRE(attachments.size() == 3);
+    auto requireGroup = [&](const std::string& group,
+                            const std::string& expectedName) {
+        auto it = std::find_if(
+            attachments.begin(), attachments.end(), [&](const auto& item) {
+                return std::find(item.tags.begin(), item.tags.end(),
+                                 "vc-lasagna-group:" + group) !=
+                       item.tags.end();
+            });
+        REQUIRE(it != attachments.end());
+        CHECK(it->volume->name() == expectedName);
+        CHECK(it->volume->id().rfind(expectedName + "-", 0) == 0);
+        CHECK(it->volume->id().find("/3") == std::string::npos);
+    };
+    requireGroup("presence", "fiber_sd1_exp002_crop_presence.ome.zarr");
+    requireGroup("nx", "fiber_sd1_exp002_crop_nx.ome.zarr");
+    requireGroup("ny", "fiber_sd1_exp002_crop_ny.ome.zarr");
+    CHECK(attachments[0].volume->id() != attachments[1].volume->id());
+    CHECK(attachments[0].volume->id() != attachments[2].volume->id());
+    CHECK(attachments[1].volume->id() != attachments[2].volume->id());
+
+    auto package = VolumePkg::newDetached();
+    REQUIRE(package->attachPreparedLasagnaDataset(
+                manifestPath.string(), {}, true, attachments) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(package->numberOfVolumes() == 3);
+    CHECK(package->volumeEntries().size() == 3);
+    for (const auto& entry : package->volumeEntries())
+        CHECK(fs::path(entry.location).filename() != "3");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna project preparation leaves scale handling to native volume loading")
+{
+    const auto dir = temporaryDirectory();
+    createZyx(dir / "pred.zarr" / "2", {2, 3, 3}, 50);
     const auto manifestPath = dir / "data.lasagna.json";
     {
         std::ofstream manifest(manifestPath);
@@ -132,9 +275,12 @@ TEST_CASE("Lasagna project preparation preserves manifest base shape for scaled 
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
     REQUIRE(prepared.size() == 1);
+    CHECK(prepared[0].location ==
+          fs::absolute(dir / "pred.zarr").lexically_normal().string());
+    CHECK(fs::path(prepared[0].location).filename() != "2");
     const auto& volume = prepared[0].volume;
-    CHECK(volume->shape() == std::array<int, 3>{8, 10, 12});
-    CHECK(volume->shapeXyz() == std::array<int, 3>{12, 10, 8});
+    CHECK(volume->shape() == std::array<int, 3>{8, 12, 12});
+    CHECK(volume->shapeXyz() == std::array<int, 3>{12, 12, 8});
     CHECK_FALSE(volume->hasScaleLevel(0));
     CHECK_FALSE(volume->hasScaleLevel(1));
     CHECK(volume->hasScaleLevel(2));
@@ -148,7 +294,7 @@ TEST_CASE("Lasagna project preparation preserves manifest base shape for scaled 
     fs::remove_all(dir);
 }
 
-TEST_CASE("Lasagna project preparation rejects CZYX arrays")
+TEST_CASE("Lasagna project preparation uses native volume validation")
 {
     const auto dir = temporaryDirectory();
     createCzyx(dir / "pred.zarr");
@@ -156,28 +302,12 @@ TEST_CASE("Lasagna project preparation rejects CZYX arrays")
         parseText(R"({"version":2,"groups":{"pred":{"zarr":"pred.zarr","channels":["presence"]}}})", dir / "data.lasagna.json");
     CHECK_THROWS_WITH_AS(
         vc::lasagna::prepareLasagnaProjectVolumes(vc::lasagna::LasagnaDataset(manifest)),
-        doctest::Contains("must reference a 3D (Z,Y,X) array"),
+        doctest::Contains("must be 3D"),
         std::runtime_error);
     fs::remove_all(dir);
 }
 
-TEST_CASE("Lasagna project preparation rejects ambiguous 3D multi-channel groups")
-{
-    const auto dir = temporaryDirectory();
-    utils::ZarrMetadata metadata;
-    metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {2, 2, 2};
-    metadata.chunks = {2, 2, 2};
-    metadata.dtype = utils::ZarrDtype::uint8;
-    metadata.compressor_id.clear();
-    (void)utils::ZarrArray::create(dir / "pred.zarr", metadata);
-    const auto manifest = vc::lasagna::LasagnaDatasetManifest::
-        parseText(R"({"version":2,"groups":{"pred":{"zarr":"pred.zarr","channels":["a","b"]}}})", dir / "data.lasagna.json");
-    CHECK_THROWS_AS(vc::lasagna::prepareLasagnaProjectVolumes(vc::lasagna::LasagnaDataset(manifest)), std::runtime_error);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("Lasagna project reconciliation restores prepared volumes after reload")
+TEST_CASE("Lasagna project volumes reload without Lasagna-specific reconciliation")
 {
     const auto dir = temporaryDirectory();
     createZyx(dir / "presence.zarr", 1);
@@ -200,13 +330,13 @@ TEST_CASE("Lasagna project reconciliation restores prepared volumes after reload
     options.deferResolution = true;
     auto package = VolumePkg::newDetached(options);
     REQUIRE(package->attachPreparedLasagnaDataset(manifestPath.string(), {}, false, attachments) == VolumePkg::AttachLasagnaResult::Attached);
+    REQUIRE(package->volumeEntries().size() == 2);
     const auto projectPath = dir / "project.volpkg.json";
     package->save(projectPath);
 
     auto reloaded = VolumePkg::load(projectPath, options);
     CHECK(reloaded->numberOfVolumes() == 0);
-    const auto diagnostics = vc::lasagna::reconcileLasagnaProjectVolumes(*reloaded);
-    CHECK_MESSAGE(diagnostics.empty(), (diagnostics.empty() ? std::string{} : diagnostics.front()));
+    reloaded->resolveDeferredEntries();
     CHECK(reloaded->numberOfVolumes() == 2);
     CHECK(reloaded->volumeEntries().size() == 2);
     fs::remove_all(dir);

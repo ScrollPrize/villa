@@ -99,8 +99,14 @@ loading.
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--inference-scaledown-power`, `--crop`,
-  `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
+  `--device`, `--devices`, `--download-workers`, `--no-download`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
+- Use all visible GPUs with `--devices all`, or select a subset such as
+  `--devices cuda:0,cuda:2`. `--device` retains the single-device/CPU path and
+  cannot be combined with `--devices`.
+- `--download-workers` controls parallel automatic S3 chunk transfers and
+  defaults to 64. It is separate from CPU tile `--prefetch-workers`, GPU
+  `--slots-per-gpu`, and output `--pyramid-workers`.
 - Fiber defaults to `--inference-scaledown-power 2`: filtered factor-4 output,
   or 0.25x per axis relative to the selected input. Power 0 keeps full input
   resolution. This is independent of the tracer/model config's `scaledown`.
@@ -133,8 +139,54 @@ scale relative to the selected input array for runner geometry only; it is not
 serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
-Each distinct inference scale has separate raw-product float32 mmap rings and
-one shared geometric weight ring. Fiber and Lasagna use the same repeated
+For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
+lattice and never creates its Cartesian job list. By default one shared
+TensorStore Zarr driver asynchronously reads bounding boxes into an independent
+bounded prefetch window. A ready tile is copied into reusable shared memory only
+when an input slot, result slot, and GPU queue are available. One persistent
+spawned process per GPU performs normalization, model inference, weighting, and
+filtered scaledown. Weighted results use separate fixed shared-memory slots;
+process queues carry descriptors only. Results may complete out of order, but the
+coordinator commits them in canonical order and flushes a Z row only after all
+of that row's inference and skip events commit. Consequently the coordinator
+remains the sole owner of the circular rings, resume checks, progress, and Zarr
+write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
+`--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
+TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
+fallback uses `--prefetch-workers`. Single-device inference submits the same
+bounded canonical TensorStore future window before synchronous model forwards.
+
+The shared multi-device runner's opt-in `--profile-pipeline` diagnostics use
+streaming aggregates and callbacks bounded by that prefetch window. They report
+read service/active span/throughput/effective outstanding-request concurrency,
+completion and ready delays,
+shared-memory copy, worker CPU conversion, H2D, mixed adapter preprocessing,
+model inference, output/D2H, result receipt, and commit. CUDA events are
+recorded on the inference stream and read after the existing terminal sync.
+With profiling disabled, no callbacks or CUDA events are created and workers
+retain the legacy result message.
+
+CUDA workers copy the source uint8/uint16 tile before expanding it. UInt16 uses
+the historical floor division by 257, then normalization is performed in CUDA
+FP32 before adapter preprocessing. Fiber model autocast remains scoped inside
+`FiberTrace3DPredictAdapter.run_tile_inference`; its output is restored to FP32
+before shared product transformation, weighting, scaledown, and D2H.
+
+Fiber CLI `--inference-precision auto` reads the checkpoint's saved
+`config.training.mixed_precision` policy. Literal `bf16`/`fp16` policies are
+validated on every selected device; missing/off metadata uses FP32, while
+invalid, unsupported, or historically ambiguous saved `auto` policy warns and
+falls back to FP32. Explicit `fp32`, `bf16`, or `fp16` overrides take priority
+and unsupported explicit modes fail. This metadata records training policy,
+not the dtype of checkpoint parameter tensors.
+
+Each distinct inference scale has separate raw-product float32 mmap rings by
+default and one shared float32 geometric weight ring. Experimental
+`--product-accumulator-dtype float16` halves product backing but measured much
+slower with NumPy CPU accumulation on the target machine. Flush
+workers widen each bounded chunk before normalization; FP16 reduces ring
+backing/mmap traffic, not float32 chunk-temporary RAM. Unbounded custom products
+should use float32. Fiber and Lasagna use the same repeated
 separable `[1,4,6,4,1]/16` blur plus 2x decimation for both weighted
 predictions and weights. Predictions are weighted before filtering and then
 normalized by the filtered denominator, so power 2 is not stride-4 sampling.
@@ -145,15 +197,39 @@ border predictions never contribute.
 A logical Z plane maps to
 `physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
 plane from being overwritten. Ring depth is planned from actual canonical tile
-positions and chunk-aligned flush frontiers, so backing size is
+positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
+each Z row writes before its post-row flush. One runner-wide flush batch handled
+by persistent spawn-process workers may retain the preceding finalized
+interval while the next row accumulates.
+The planner simulates that exact write, join/release, submit, next-write order,
+so the enlarged ring has disjoint physical slots without copying live overlap
+or finalized bands. At the following advancing frontier the coordinator waits
+if necessary, then clears/releases the completed interval before submitting
+another; storage slowdown creates bounded backpressure rather than additional
+queued bands. Workers receive only mmap-path/chunk descriptors, reopen mappings
+read-only, and allocate one chunk of temporary arrays each. The CLI default is
+the available CPU count capped at 64 workers; zero is the synchronous
+immediate-release baseline. Backing size is
 `(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
 not depend on full volume depth. Candidate output chunks are lazily checked
-against their direct local Zarr-v2 input footprint. Unsupported chunks stay
-absent in output and scratch. Flushes visit only contribution-dirty chunks,
+against their direct local Zarr-v2 input footprint. Their global output bounds
+are clipped against the full output volume before conversion to selected-input
+coordinates; crop-local ring dimensions are not source-support bounds.
+Unsupported chunks stay absent in output and scratch. Flushes visit only
+contribution-dirty chunks,
 normalize with chunk-sized denominator scratch, atomically write coherent
 channel bundles, clear only dirty regions, and only then release their logical
 Z generations. Progress reports dirty/written/unsupported/resumed chunks and
-actual scratch bytes touched and cleared.
+actual scratch bytes touched and cleared. `flush stats work=... wait=...`
+separates total background work from coordinator backpressure. Submitted work
+does not advance `final_z`; completion does. Jobs contain immutable chunk
+descriptors rather than decoded arrays, and shutdown waits for an active mmap
+reader before closing scratch files.
+
+While a flush runs, output completeness checks can inspect future disjoint
+chunks and model inference can overlap product finalization. The shipped
+adapters keep these operations stateless or filesystem-disjoint; custom shared
+runner adapters must provide the same concurrency safety.
 
 Fiber and Lasagna OME-Zarr outputs default to 64x64x64 chunks;
 `--ome-chunk` remains an override.
@@ -507,7 +583,8 @@ Ownership changed as follows:
   ```
 
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
-  `--resume`, and `--trace2cp-vis`.
+  `--resume`, `--trace2cp-vis`, and the normal-training-only
+  `--test-hang-diagnostics` flag.
 - Multi-GPU training uses the standard `torchrun` launch environment and does
   not require config changes:
 
@@ -520,11 +597,33 @@ Ownership changed as follows:
   disjoint deterministic training-stream slice, and `training.loader_workers`
   is also per rank. CUDA DDP converts
   `BatchNorm3d` modules to `SyncBatchNorm` automatically; single-process
-  training keeps regular `BatchNorm3d`. TensorBoard, stdout progress,
-  checkpoints, dense tests, Trace2CP metrics, and sample sheets are written
-  only by rank 0, and snapshots are saved without DDP `module.` key prefixes.
+  training keeps regular `BatchNorm3d`. Dense test batches are partitioned
+  deterministically across every rank by global batch ID. TensorBoard, stdout
+  progress, checkpoints, Trace2CP metrics, and sample sheets remain rank-0-only,
+  and snapshots are saved without DDP `module.` key prefixes.
+  Each rank retains a second process-worker DataLoader for tests with the same
+  worker/prefetch settings as training. Gathered per-batch metric rows are
+  sorted back into global order on rank 0 before applying the historical
+  unweighted batch mean. Rank 0 reuses evaluated global batch zero for the test
+  sample sheet. Test completion prints `test_timing ... total_seconds=...` and
+  logs `timing/test_total_seconds` to TensorBoard.
+  Hang diagnostics are disabled by default. Enable them explicitly with the
+  JSON boolean `training.test_hang_diagnostics_enabled: true` or the normal
+  training flag `--test-hang-diagnostics`. When enabled, every rank writes an
+  append-only `<run_dir>/hang_diagnostics_rank_<rank>.log`; rank 0 guards the
+  complete configured-test routine with an automatic traceback dump after
+  eight minutes (`training.test_watchdog_seconds`, default `480`, required to
+  be below the 600-second process-group timeout). Dense-test batch loading,
+  target creation, forward/CUDA synchronization, CPU loss conversion, test
+  visualization, Trace2CP, and TensorBoard flush have flushed phase markers
+  with process and CUDA-memory counters. Disabled mode creates no log, handler,
+  timer, resource polling, or diagnostic CUDA synchronization.
+  On platforms with `SIGUSR2`, `kill -USR2 <pid>` appends an immediate
+  all-thread Python traceback to that rank's file; find rank 0 with
+  `ps -eo pid,cmd | grep 'fiber_trace_3d.train'`.
   `--prefetch`, `--benchmark`, and `--trace2cp-vis` remain single-process
-  modes and reject `WORLD_SIZE > 1`.
+  modes and reject `WORLD_SIZE > 1`; they also reject
+  `--test-hang-diagnostics` because it is a normal-training option.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
@@ -620,11 +719,13 @@ Ownership changed as follows:
   debugging.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
-- Normal training and `--benchmark --load-only` use
+- Normal training, distributed dense tests, and `--benchmark --load-only` use
   `torch.utils.data.DataLoader` process workers when
   `training.loader_workers > 0`. Each worker lazily constructs its own
   `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
   a complete `FiberTrace3DBatch` keyed by deterministic batch index.
+  Training and test DataLoaders retain separate persistent worker pools on each
+  rank so test prefetch is reusable across step 0 and every test interval.
 - Public 3D loader calls may still accept `sample_index` for compatibility, but
   its semantics are `stream_index`. `sample_index_limit` derives bounded
   `data_index` CP/data selection from that stream index; augmentation seeding
@@ -2368,6 +2469,30 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/te
 ```
 
 The tests are expected to use fake/local data and not require network access.
+
+## Shared 3D accumulator pipeline
+
+`lasagna/tiled_predict3d.py` owns accumulation for both Lasagna and Fiber 3D
+inference. Multi-device runs send chunk-bounded descriptors to persistent
+spawned processes; result tensors stay in the existing shared-memory slots and
+accumulators stay in the rolling mmap. No tile-sized arrays are serialized
+through multiprocessing queues.
+
+`--accumulator-workers` controls process count (default `min(CPU count, 32)`;
+zero selects the synchronous diagnostic baseline). Each spatial output chunk
+has a deterministic worker owner and FIFO ordering. Startup and completion
+logs report backend, task rate, summed work, queue wait, and wall time.
+
+Product accumulators default to float16 and weights remain float32. The
+`accumulator_add` extension uses runtime AVX-512F+F16C dispatch on matching x86
+hosts and otherwise uses a portable scalar path; installation builds both this
+extension and `monotone_norm`. Use `--product-accumulator-dtype float32` for the
+higher-memory float32 result.
+
+The native kernel requires contiguous X rows but supports arbitrary Y/Z
+strides, unaligned rows, ring-wrap pieces, and scalar tails. It releases the
+GIL, although production parallelism comes from processes rather than Python
+threads.
 
 ## Local Caveats
 

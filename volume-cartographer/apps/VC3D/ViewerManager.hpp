@@ -291,6 +291,9 @@ signals:
     // Emitted whenever the user explicitly places the focus (Ctrl+click,
     // focus-on-cursor key, point activation, ...).
     void focusCenteredByUser(const cv::Vec3f& position);
+    // Emitted on Ctrl+Shift+click in a slice view when a patch lies under the
+    // clicked point; the owner should make that patch the active segment.
+    void surfaceActivationRequested(const std::string& surfaceId);
     // Aggregated per-viewer cache statistics (RAM / disk / network).
     void sharedCacheStatsChanged(const QStringList& items);
     void overlayWindowChanged(float low, float high);
