@@ -33,15 +33,20 @@ STOCHASTIC_PREFIXES = (
     '["satisfied"',
 )
 
-# Per-entry satisfaction values are additionally quantized in coarse cells
-# (a single borderline cell shifts satisfied_area by hundreds), so their
-# bands get a much wider relative + absolute margin. The tight regression
-# signal lives in the satisfied_aggregates sums instead.
+# Per-entry satisfaction values are not asserted at all. They are quantized
+# in coarse cells, so one borderline cell moves satisfied_area by hundreds,
+# and there are ~1600 of them: banding each one still leaves a high chance
+# that some run trips a single band, which makes the gate flaky without
+# making it more sensitive. The regression signal for satisfaction lives in
+# the satisfied_aggregates sums (whose spread is an order of magnitude
+# tighter because the per-entry noise averages out) and in the exact entry
+# identities and counts, both of which are still asserted.
 PER_ENTRY_SATISFIED_RE = re.compile(
     r'^\["satisfied", "(patches|pcls|unverified_patches)", "\d+", '
     r'"(fraction|satisfied_area|satisfied_points)"')
-PER_ENTRY_REL_MARGIN = 0.5
-PER_ENTRY_ABS_MARGIN = 25.0
+PER_ENTRY_SATISFIED_REASON = (
+    'per-entry satisfaction value: quantized and individually noisy; '
+    'covered by satisfied_aggregates')
 
 # Margin beyond the observed spread: bands are centre +/- (SPREAD_MARGIN *
 # half-spread + REL_MARGIN * |centre| + ABS_MARGIN). Calibrated from a small
@@ -91,6 +96,9 @@ def calibrate(results, spec):
         if is_volatile(path):
             ignored.append({'path': path, 'reason': 'volatile'})
             continue
+        if PER_ENTRY_SATISFIED_RE.match(path):
+            ignored.append({'path': path, 'reason': PER_ENTRY_SATISFIED_REASON})
+            continue
         values = [f[path] for f in flattened]
         numeric = all(_is_number(value) and math.isfinite(value) for value in values)
         stochastic = numeric and path.startswith(STOCHASTIC_PREFIXES)
@@ -99,11 +107,7 @@ def calibrate(results, spec):
         elif stochastic:
             low, high = min(values), max(values)
             centre = (low + high) / 2
-            if PER_ENTRY_SATISFIED_RE.match(path):
-                margin = (SPREAD_MARGIN * (high - low) / 2
-                          + PER_ENTRY_REL_MARGIN * abs(centre)
-                          + PER_ENTRY_ABS_MARGIN)
-            elif low == high:
+            if low == high:
                 margin = (ZERO_SPREAD_REL_MARGIN * abs(centre)
                           + ZERO_SPREAD_ABS_MARGIN)
             else:
