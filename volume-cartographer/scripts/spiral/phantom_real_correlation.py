@@ -143,7 +143,16 @@ def heldout_mae(ckpt_path, npz_path):
                    'synth_phantom --num-slips).')
 @click.option('--phantom-coverage', default=0.45, type=float)
 @click.option('--phantom-noise', default=1.0, type=float)
-def main(work, real_datasets, phantom_slips, phantom_coverage, phantom_noise):
+@click.option('--phantom-index-noise', default=0., type=float,
+              help='Per-patch +-1 winding mis-index rate (self-INconsistent '
+                   'constraints; PHerc0172 classical traces measured ~0.24).')
+@click.option('--phantom-flow-std', default=None, type=float,
+              help='Override synth_phantom --flow-std (deformation calibration).')
+@click.option('--phantom-gap-log-std', default=None, type=float)
+@click.option('--phantom-linear-std', default=None, type=float)
+def main(work, real_datasets, phantom_slips, phantom_coverage, phantom_noise,
+         phantom_index_noise, phantom_flow_std, phantom_gap_log_std,
+         phantom_linear_std):
     os.makedirs(work, exist_ok=True)
     results_path = os.path.join(work, 'results.jsonl')
 
@@ -154,14 +163,22 @@ def main(work, real_datasets, phantom_slips, phantom_coverage, phantom_noise):
         train = os.path.join(work, f'phtrain_{seed}')
         npz = os.path.join(work, f'phheld_{seed}.npz')
         if not os.path.exists(os.path.join(ph, 'phantom_checkpoint.pt')):
+            extra = []
+            for flag, value in (('--flow-std', phantom_flow_std),
+                                ('--gap-log-std', phantom_gap_log_std),
+                                ('--linear-std', phantom_linear_std)):
+                if value is not None:
+                    extra += [flag, str(value)]
             run(['synth_phantom.py', '--out', ph, '--seed', str(seed),
                  '--z-size', '32', '--yx-size', '640', '--dr-per-winding', '12',
-                 '--num-tears', '0', '--num-slips', str(phantom_slips)])
+                 '--num-tears', '0', '--num-slips', str(phantom_slips), *extra])
             click.echo(f'phantom {seed} generated (slips={phantom_slips})')
         if not os.path.exists(npz):
             run(['export_phantom_dataset.py', '--phantom', ph, '--out', ds,
                  '--step', '2', '--coverage', str(phantom_coverage),
-                 '--position-noise', str(phantom_noise), '--seed', str(seed)])
+                 '--position-noise', str(phantom_noise),
+                 '--index-noise-rate', str(phantom_index_noise),
+                 '--seed', str(seed)])
             mask_sectors(ds, train, npz)
             click.echo(f'phantom {seed} dataset + sector holdout built')
         cases.append(('phantom', f'ph{seed}', train, npz, ph))

@@ -100,6 +100,11 @@ def winding_surface_grid(model, winding, theta0, theta1, z0, z1, step, device):
               help='Patch grid spacing in voxels (both axes).')
 @click.option('--position-noise', default=0., type=float,
               help='Gaussian vertex position noise std, voxels (label imprecision).')
+@click.option('--index-noise-rate', default=0., type=float,
+              help='Probability that a patch gets a whole +-1 WINDING-INDEX '
+                   'error -- constraints that contradict each other, the way '
+                   'real mis-indexed traced fragments do (real classical '
+                   'traces measured ~0.24 on PHerc0172).')
 @click.option('--winding-annotations/--no-winding-annotations', default=True,
               help='Write per-vertex absolute winding annotations (winding.tif).')
 @click.option('--z-margin', default=2., type=float,
@@ -107,7 +112,8 @@ def winding_surface_grid(model, winding, theta0, theta1, z0, z1, step, device):
 @click.option('--seed', default=0, type=int)
 @click.option('--device', default='cpu')
 def main(phantom, out, coverage, patch_arc_deg, winding_stride, step,
-         position_noise, winding_annotations, z_margin, seed, device):
+         position_noise, index_noise_rate, winding_annotations, z_margin,
+         seed, device):
     rng = np.random.default_rng(seed)
     device = torch.device(device)
     checkpoint = load_checkpoint_cpu(os.path.join(phantom, 'phantom_checkpoint.pt'))
@@ -136,6 +142,11 @@ def main(phantom, out, coverage, patch_arc_deg, winding_stride, step,
                 model, winding, theta0, theta0 + arc, z0, z1, step, device)
             if position_noise > 0:
                 zyxs = zyxs + rng.standard_normal(zyxs.shape).astype(np.float32) * position_noise
+            if index_noise_rate > 0 and rng.random() < index_noise_rate:
+                # Whole-patch winding mis-index: the annotation says winding
+                # k+-1 while the geometry sits on winding k -- self-
+                # INconsistent constraints, as real mis-indexed fragments are.
+                annotation = annotation + rng.choice([-1., 1.]).astype(np.float32)
             uuid = f'phantom_w{winding:03d}_t{int(np.rad2deg(theta0)):03d}'
             save_tifxyz(zyxs, patches_dir, uuid, step_size=int(round(step)),
                         voxel_size_um=1.0, source='synth_phantom')
@@ -151,6 +162,7 @@ def main(phantom, out, coverage, patch_arc_deg, winding_stride, step,
             'coverage': coverage, 'patch_arc_deg': patch_arc_deg,
             'winding_stride': winding_stride, 'step': step,
             'position_noise': position_noise,
+            'index_noise_rate': index_noise_rate,
             'winding_annotations': winding_annotations,
             'seed': seed, 'num_patches': num_patches,
         }, f, indent=2)
