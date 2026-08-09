@@ -16,8 +16,8 @@ class VOIMetric(BaseMetric):
 
     Returns:
         voi_total: voi_split + voi_merge (lower is better)
-        voi_split: H(GT | PR) - over-segmentation term
-        voi_merge: H(PR | GT) - under-segmentation term
+        voi_split: H(PR | GT) - over-segmentation term
+        voi_merge: H(GT | PR) - under-segmentation term
         voi_score: normalized to [0,1] (higher is better)
     """
 
