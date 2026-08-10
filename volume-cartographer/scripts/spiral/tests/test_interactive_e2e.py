@@ -89,9 +89,8 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 self.assertEqual(status["state"], SessionState.Idle,
                                  status.get("error"))
                 self.assertTrue(status["supports_input_incorporation"])
-                # Idle with no completed iterations is the former "Ready".
                 self.assertEqual(status["current_iteration"], 0)
-                self.assertEqual(status["phase"], "Ready")
+                self.assertEqual(status["phase"], "Idle")
 
                 session.run(2)
                 while (session.status()["state"] not in {SessionState.Idle,
@@ -99,10 +98,11 @@ class InteractiveEndToEndTests(unittest.TestCase):
                        and time.monotonic() < deadline):
                     time.sleep(0.5)
                 status = session.status()
-                # Idle after N completed iterations is the former "Paused".
+                # An idle session that has run reports the same phase; only
+                # current_iteration says work happened.
                 self.assertEqual(status["state"], SessionState.Idle,
                                  status.get("error"))
-                self.assertEqual(status["phase"], "Paused")
+                self.assertEqual(status["phase"], "Idle")
                 self.assertEqual(status["current_iteration"], 2)
                 self.assertIn("total_loss", status["latest_metrics"])
 

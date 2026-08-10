@@ -1682,18 +1682,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     // the adopted configuration is re-synchronized from that.
     const QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
-    // The service reports one idle lifecycle state; "Ready" (nothing has run
-    // yet) and "Paused" (stopped after N iterations) are a client-side label
-    // derived from the completed iteration count.
     const bool idle = state == QStringLiteral("Idle");
-    const QString stateLabel = idle
-        ? (status.value("current_iteration").toInteger() > 0
-               ? tr("Paused") : tr("Ready"))
-        : state;
-    QString stateText = progress.isEmpty()
-        ? tr("Session: %1 — %2")
-              .arg(stateLabel, status.value("phase").toString())
-        : tr("Session: %1").arg(stateLabel);
+    const QString phase = status.value(QStringLiteral("phase")).toString();
+    // An idle session reports "Idle" as both its state and its phase, so the
+    // phase is only worth appending when it says something the state does not.
+    QString stateText = (progress.isEmpty() && !phase.isEmpty() && phase != state)
+        ? tr("Session: %1 — %2").arg(state, phase)
+        : tr("Session: %1").arg(state);
     if (state == QStringLiteral("Running"))
         stateText += tr(" — iteration %1/%2")
             .arg(status.value("current_iteration").toInteger())

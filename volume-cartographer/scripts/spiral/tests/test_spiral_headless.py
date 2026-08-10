@@ -330,7 +330,7 @@ class ProtocolTests(unittest.TestCase):
         listener = threading.Thread(target=session._listen)
         listener.start()
         ready = rank_status(SessionState.Idle, epoch=3)
-        ready["phase"] = "Ready"
+        ready["phase"] = "Idle"
         session._events.put(("status", 0, ready))
         session._events.put(("status", 1, rank_status(
             SessionState.Loading, epoch=3, progress={
@@ -647,23 +647,21 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Error -> Running"):
                 session._transition_locked(SessionState.Running)
 
-    def test_idle_phase_distinguishes_never_run_from_paused(self):
+    def test_idle_reports_one_phase_and_the_iteration_count(self):
         never_run = self._idle_session()
         paused = self._idle_session(completed=42)
-        with never_run._condition:
-            never_run._transition_locked(
-                SessionState.Idle, spiral_runtime.idle_phase(
-                    never_run._completed))
-        with paused._condition:
-            paused._transition_locked(
-                SessionState.Idle, spiral_runtime.idle_phase(
-                    paused._completed))
+        for session in (never_run, paused):
+            with session._condition:
+                session._transition_locked(
+                    SessionState.Idle, spiral_runtime.IDLE_PHASE)
         self.assertEqual(never_run._state, SessionState.Idle)
         self.assertEqual(paused._state, SessionState.Idle)
+        # Both idle sessions look the same to a client except for the work
+        # they have done; the phase does not editorialise about it.
+        self.assertEqual(never_run._phase, "Idle")
+        self.assertEqual(paused._phase, "Idle")
         self.assertEqual(never_run.completed_iterations, 0)
         self.assertEqual(paused.completed_iterations, 42)
-        self.assertEqual(never_run._phase, "Ready")
-        self.assertEqual(paused._phase, "Paused")
 
     def test_save_command_carries_identity_and_completes_with_a_result(self):
         session = self._idle_session(completed=7)
@@ -1075,7 +1073,7 @@ class ProtocolTests(unittest.TestCase):
         # Inspecting a checkpoint costs a load, not a preview export.
         self.assertEqual(calls, [])
         self.assertEqual(session._state, SessionState.Idle)
-        self.assertEqual(session._phase, "Paused")
+        self.assertEqual(session._phase, "Idle")
         self.assertEqual(session._completed, 4200)
 
     def test_export_preview_is_a_requested_coordinator_operation(self):

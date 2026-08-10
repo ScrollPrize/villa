@@ -60,15 +60,12 @@ _LEGAL_SESSION_TRANSITIONS = {
 }
 
 
-def idle_phase(completed_iterations):
-    """Human-facing phase for an idle session.
-
-    Ready and Paused are the same lifecycle state; only the iteration count
-    tells "has never produced work" from "stopped after N iterations". The
-    label is presentation, so clients derive the same words from
-    ``state == Idle`` plus ``current_iteration``.
-    """
-    return "Paused" if int(completed_iterations or 0) > 0 else "Ready"
+# An idle session reports one phase. "Ready" and "Paused" used to be
+# separate lifecycle states, and briefly survived as labels derived from the
+# completed iteration count, but the distinction is not one a user acts on:
+# both mean the session is loaded, doing nothing, and ready to run. Clients
+# that want to say how much work has happened read current_iteration.
+IDLE_PHASE = "Idle"
 
 
 # Bounded fail-stop budget for the distributed proxy.
@@ -859,7 +856,7 @@ class InteractiveFitSession:
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
         self._progress_reporter().clear()
-        self._transition(SessionState.Idle, idle_phase(self._completed))
+        self._transition(SessionState.Idle, IDLE_PHASE)
 
     def _optimize(self, context):
         """Drive the resident optimizer loop on the fitter thread.
@@ -980,7 +977,7 @@ class InteractiveFitSession:
         self._progress_reporter().clear()
         with self._condition:
             self._transition_locked(
-                SessionState.Idle, phase or idle_phase(self._completed))
+                SessionState.Idle, phase or IDLE_PHASE)
         self._publish_status()
 
     def _run_checkpoint_preflight(self, command):
@@ -1074,7 +1071,7 @@ class InteractiveFitSession:
             self._config_revision += 1
             revision = self._config_revision
             self._transition_locked(
-                SessionState.Idle, idle_phase(completed))
+                SessionState.Idle, IDLE_PHASE)
         self._publish_status()
         command.complete(path=path, completed_iterations=completed,
                          config_revision=revision)
@@ -1151,7 +1148,7 @@ class InteractiveFitSession:
                 self._target = self._completed
                 self._warnings.append(f"Input incorporation failed: {error}")
                 self._transition_locked(
-                    SessionState.Idle, idle_phase(self._completed),
+                    SessionState.Idle, IDLE_PHASE,
                     reason="input incorporation failed")
             if mark_incorporated is not None:
                 mark_incorporated(records, error=error)
@@ -1204,7 +1201,7 @@ class InteractiveFitSession:
                 if previous_run_config is not None:
                     self._run_config.update(previous_run_config)
                 self._transition_locked(
-                    SessionState.Idle, idle_phase(self._completed),
+                    SessionState.Idle, IDLE_PHASE,
                     reason="run configuration failed")
             for queued in abandoned:
                 queued.cancel(
@@ -1281,7 +1278,7 @@ class InteractiveFitSession:
                     dataset_root=self.paths.dataset_root,
                     completed_iterations=self._completed)
             self._progress_reporter().clear()
-            self._transition(SessionState.Idle, idle_phase(self._completed))
+            self._transition(SessionState.Idle, IDLE_PHASE)
 
     def _publish_preview(self):
         with self._condition:

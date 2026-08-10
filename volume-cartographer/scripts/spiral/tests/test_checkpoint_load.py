@@ -313,7 +313,7 @@ def _idle_session(completed=5):
     session = InteractiveFitSession.__new__(InteractiveFitSession)
     session._condition = threading.Condition()
     session._state = SessionState.Idle
-    session._phase = "Paused"
+    session._phase = "Idle"
     session._completed = completed
     session._target = completed
     session._pending = 0
@@ -376,7 +376,7 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
 
         self.assertIsNone(apply_command.error)
         self.assertEqual(session._state, SessionState.Idle)
-        self.assertEqual(session._phase, "Paused")
+        self.assertEqual(session._phase, "Idle")
         self.assertEqual(session._completed, 99)
         self.assertEqual(session._target, 99)
         self.assertEqual(session._config_revision, 1)
@@ -393,7 +393,7 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
 
         self.assertIn("z-domain differs", command.error)
         self.assertEqual(session._state, SessionState.Idle)
-        self.assertEqual(session._phase, "Paused")
+        self.assertEqual(session._phase, "Idle")
         self.assertEqual(session._completed, 5)
         self.assertEqual(session._config_revision, 0)
         self.assertEqual(session._context.applied, [])

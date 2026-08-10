@@ -30,9 +30,10 @@ from config import Config
 # eta_seconds inside the /session/status progress snapshot: clients derive
 # the ETA from the raw step/total/elapsed fields.
 # Version 19 replaces the Ready/Paused session states with a single Idle
-# state: a session that has never run and a session paused after N
-# iterations are the same lifecycle state, distinguished by
-# current_iteration (0 vs > 0). Clients derive the "Ready"/"Paused" label.
+# state, reported as both the state and the phase: a session that has never
+# run and a session paused after N iterations are the same lifecycle state,
+# and the difference is not one a user acts on. Clients that want to report
+# how much work has happened read current_iteration.
 # Version 20 adds POST /session/load-checkpoint: a strict, two-phase,
 # all-rank load of a checkpoint into the resident model, valid in Idle. The
 # service refuses (409) any checkpoint that is not an exact match for the
