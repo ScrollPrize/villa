@@ -60,6 +60,15 @@ def test_outputs_exist_and_consistent(phantom_dir):
     w_valid = winding[mask > 0]
     assert w_valid.min() >= meta['first_winding']
     assert w_valid.max() <= meta['last_winding']
+    # Sheets must hold signal on the DEFAULT render path (not just the preset).
+    # A zero-thickness / zero-contrast render passes every check above while
+    # being useless -- the villa #191 failure, invisible until someone looked
+    # at the voxels. Intensity spread across the annulus must far exceed the
+    # additive-noise floor (default noise_std 0.03 -> ~8/255; pure-noise p95-p5
+    # is ~26; real sheet-vs-gap contrast is ~150).
+    intensity = volume[mask > 0]
+    spread = int(np.percentile(intensity, 95)) - int(np.percentile(intensity, 5))
+    assert spread > 60, f'sheets carry no signal (annulus p95-p5={spread})'
 
 
 def test_tears_land_on_papyrus(phantom_dir):
