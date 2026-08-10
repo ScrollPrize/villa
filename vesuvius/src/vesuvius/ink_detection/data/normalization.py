@@ -69,11 +69,9 @@ def normalize_image(
 def exclude_validation_voxels(
     supervision: np.ndarray,
     validation: np.ndarray | None,
-    *,
-    is_validation_patch: bool = False,
 ) -> np.ndarray:
     """Remove held-out voxels from training supervision without mutating input."""
-    if is_validation_patch or validation is None:
+    if validation is None:
         return supervision
     supervision = np.asarray(supervision)
     validation = np.asarray(validation)

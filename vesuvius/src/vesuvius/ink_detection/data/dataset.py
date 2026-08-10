@@ -55,7 +55,6 @@ def flat_z_window_bbox(
     config: InkDataConfig,
     do_augmentations: bool,
     is_validation: bool,
-    rng=random,
 ) -> tuple[tuple[int, int, int, int, int, int], int]:
     """Select the canonical or randomly shifted real-layer flat Z window."""
     z0, y0, x0, z1, y1, x1 = bbox_zyx
@@ -79,10 +78,10 @@ def flat_z_window_bbox(
         or jitter.max_offset == 0
         or not do_augmentations
         or is_validation
-        or rng.random() >= jitter.probability
+        or random.random() >= jitter.probability
     ):
         return canonical, 0
-    offset = rng.randint(-jitter.max_offset, jitter.max_offset)
+    offset = random.randint(-jitter.max_offset, jitter.max_offset)
     z0, y0, x0, z1, y1, x1 = canonical
     return (z0 + offset, y0, x0, z1 + offset, y1, x1), offset
 
@@ -116,13 +115,10 @@ class InkDataset(Dataset):
         patches: list[Patch] | None = None,
         segments: list[Segment] | None = None,
     ) -> None:
-        if not isinstance(config, InkDataConfig):
-            raise TypeError("InkDataset requires a resolved InkDataConfig")
         self.config = config
         self.patch_size = config.patch_size
         self.mode = config.mode
         self.do_augmentations = bool(do_augmentations)
-        self.input_channels = 2 if self.mode == "full_3d_single_wrap" else 1
         self._zarr_cache: dict[tuple, object] = {}
         self._tifxyz_cache: dict[str, object] = {}
         self._stored_resolution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -153,7 +149,6 @@ class InkDataset(Dataset):
             patch for patch in self.patches if not patch.is_validation
         ]
         self.validation_patches = [patch for patch in self.patches if patch.is_validation]
-        self.unlabeled_patches = [patch for patch in self.patches if patch.is_unlabeled]
         self._segments_by_volume: dict[tuple[int, str, int], list[Segment]] = {}
         for segment in self.segments:
             key = segment.dataset_idx, str(segment.image_volume), segment.scale
@@ -288,7 +283,7 @@ class InkDataset(Dataset):
                     validation_volume, bbox, fill_value=0
                 )
                 supervision = exclude_validation_voxels(
-                    supervision, validation, is_validation_patch=False
+                    supervision, validation
                 )
             labels, _ = read_bbox_with_padding(labels_volume, bbox, fill_value=0)
         return self._tensor_sample(
@@ -338,22 +333,16 @@ class InkDataset(Dataset):
             crop_bbox = maybe_translate_crop_bbox(
                 crop_bbox, patch_positions, patch_valid, patch_supervision
             )
-        (
-            support_bbox,
-            support_positions,
-            support_valid,
-            _,
-            _,
-            _,
-        ) = select_flat_pixels_via_stored_resolution(
-            patch_tifxyz,
-            crop_bbox,
-            coarse_native_pad=coarse_pad,
-            coarse_positions_zyx=coarse_positions,
-            coarse_valid=coarse_valid,
-            native_coordinate_scale=coordinate_scale,
-            flat_grid_stride=stride,
-            return_halo=True,
+        support_bbox, support_positions, support_valid = (
+            select_flat_pixels_via_stored_resolution(
+                patch_tifxyz,
+                crop_bbox,
+                coarse_native_pad=coarse_pad,
+                coarse_positions_zyx=coarse_positions,
+                coarse_valid=coarse_valid,
+                native_coordinate_scale=coordinate_scale,
+                flat_grid_stride=stride,
+            )
         )
         support_y0, support_y1, support_x0, support_x1 = support_bbox
         support_supervision = _read_flat_surface(
@@ -569,7 +558,7 @@ class InkDataset(Dataset):
             data["surface_mask"] = torch.from_numpy(surface_mask).float().unsqueeze(0)
         if self.augmentations is not None:
             augmentation_data = data
-            if self.mode == "full_3d_single_wrap" and "surface_mask" in data:
+            if self.mode == "full_3d_single_wrap":
                 augmentation_data = dict(data)
                 augmentation_data["regression_keys"] = ["surface_mask"]
             data = self.augmentations(**augmentation_data)
@@ -578,11 +567,11 @@ class InkDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         requested_index = int(index)
+        if self.mode == "flat":
+            return self._flat_sample(self.patches[requested_index])
         current_index = requested_index
         while True:
             patch = self.patches[current_index]
-            if self.mode == "flat":
-                return self._flat_sample(patch)
             try:
                 return self._native_sample(patch)
             except ValueError as exc:

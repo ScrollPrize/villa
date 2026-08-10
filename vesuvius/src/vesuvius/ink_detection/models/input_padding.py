@@ -5,14 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from vesuvius.ink_detection.config import InkConfig
-
-
-def configured_input_pad_depth(config: InkConfig) -> int | None:
-    """Return the validated target depth selected by the model configuration."""
-
-    return config.model.input_pad_depth_to
-
 
 def center_pad_input_depth(
     image_BCZYX: torch.Tensor,

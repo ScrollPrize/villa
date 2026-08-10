@@ -288,34 +288,12 @@ def test_confusion_and_balanced_accuracy_match_binary_counts():
     targets = torch.tensor([[[[1.0, 1.0], [0.0, 0.0]]]])
     valid = torch.tensor([[[[True, True], [True, False]]]])
     batch = MetricBatch(logits=logits, targets=targets, valid_mask=valid)
-    counts = Confusion().compute(batch)
+    counts = Confusion().compute_batch(batch)
     count_values = tuple(
         value.item() for value in (counts.tp, counts.fp, counts.fn, counts.tn)
     )
     assert count_values == (1, 1, 1, 0)
-    assert BalancedAccuracy().compute(batch) == pytest.approx(0.25)
-    assert (
-        BalancedAccuracy(threshold=128 / 255).metric_name()
-        == "BalancedAccuracy_thr_128_255"
-    )
-
-
-def test_metric_api_distinguishes_batch_and_per_sample_reduction():
-    logits = torch.full((2, 1, 1, 10), -10.0)
-    targets = torch.ones_like(logits)
-    valid = torch.ones_like(logits, dtype=torch.bool)
-    valid[0, ..., 1:] = False
-    logits[0, ..., 0] = 10.0
-    targets[1, ..., -1] = 0.0
-    logits[1, ..., -1] = -10.0
-    batch = MetricBatch(logits=logits, targets=targets, valid_mask=valid)
-    assert BalancedAccuracy().compute(batch) == pytest.approx(0.55)
-    assert BalancedAccuracy(per_sample=True).compute(batch) == pytest.approx(0.75)
-    per_sample_counts = Confusion(per_sample=True).compute(batch)
-    assert [
-        tuple(value.item() for value in (count.tp, count.fp, count.fn, count.tn))
-        for count in per_sample_counts
-    ] == [(1, 0, 0, 0), (0, 0, 9, 1)]
+    assert BalancedAccuracy._from_counts(counts).item() == pytest.approx(0.25)
 
 
 def _sampling_config(tmp_path: Path, strategy: str) -> InkDataConfig:
@@ -374,7 +352,7 @@ def test_all_three_sampling_policies(tmp_path):
     uniform_config = _sampling_config(tmp_path, "uniform")
     patches = _sampling_patches(uniform_config, tmp_path)
     uniform = build_sampling_policy(patches, uniform_config, batch_size=4)
-    assert uniform.strategy == "uniform"
+    assert uniform.audit["strategy"] == uniform_config.sampling.strategy
     assert uniform.generator.initial_seed() == 42
 
     balanced_config = _sampling_config(tmp_path, "scroll_segment_balanced")

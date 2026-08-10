@@ -197,6 +197,18 @@ def test_unknown_target_settings_fail_factually(key, value, message):
         InkConfig.from_mapping(authored)
 
 
+@pytest.mark.parametrize("location", ["nested_target", "model_config"])
+def test_projection_modes_are_validated_without_storing_a_second_view(location):
+    authored = _config_mapping()
+    if location == "nested_target":
+        authored["targets"]["ink"]["z_projection"] = {"mode": "mystery"}
+    else:
+        authored["model_config"]["z_projection_mode"] = "mystery"
+
+    with pytest.raises(ValueError, match="z_projection"):
+        InkConfig.from_mapping(authored)
+
+
 @pytest.mark.parametrize("name", ["BettiMatchingLoss", "NearbyDiceLoss"])
 def test_unsupported_loss_names_fail_factually(name):
     authored = _config_mapping()

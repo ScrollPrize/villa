@@ -199,17 +199,19 @@ def test_runtime_gpu_and_amp_boundaries():
     assert checkpoint_amp_dtype({"config": {"mixed_precision": "no"}}) is None
 
 
-def test_compile_status_is_false_when_compiler_is_unavailable(monkeypatch):
+def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monkeypatch):
     monkeypatch.setattr(torch, "compile", None)
 
-    _, _, compiled = prepare_model_for_inference(
-        nn.Linear(1, 1),
+    source = nn.Linear(1, 1)
+    prepared, device = prepare_model_for_inference(
+        source,
         gpu_ids=(),
         compile_model=True,
         compile_mode="default",
     )
 
-    assert compiled is False
+    assert prepared is source
+    assert device.type in {"cpu", "cuda"}
 
 
 def test_root_volume_view_and_level_selection_share_one_open(tmp_path):

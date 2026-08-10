@@ -44,19 +44,6 @@ def load_checkpoint(
         return torch.load(str(resolved), map_location="cpu")
 
 
-def load_checkpoint_from_config(
-    config: InkConfig,
-    config_path: str | Path,
-) -> tuple[Path | None, Any | None, bool]:
-    """Resolve and optionally load the checkpoint selected by an InkConfig."""
-
-    checkpoint_path = resolve_checkpoint_path(config.checkpoint.path, config_path)
-    payload = None
-    if checkpoint_path is not None:
-        payload = load_checkpoint(checkpoint_path)
-    return checkpoint_path, payload, config.checkpoint.weights_only
-
-
 def load_model_state(
     model: nn.Module,
     model_state: Mapping[str, Any],

@@ -27,10 +27,11 @@ def patch_finding_cache_token(config: InkDataConfig) -> str:
         )
     scan_scale = "" if finding.scan_scale is None else finding.scan_scale
     if config.discovery_mode == "unlabeled":
+        # The reference spelled its unused option default here; keep token compatibility.
         return (
             f"unlabeled-default-{_CACHE_VERSION}"
             f"-po-{finding.overlap}"
-            f"-mdc-{finding.unlabeled_min_data_coverage}"
+            "-mdc-0.15"
             f"-pfs-{scan_scale}"
         )
     return (

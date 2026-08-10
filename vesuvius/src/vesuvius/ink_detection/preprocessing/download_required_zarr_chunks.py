@@ -23,10 +23,6 @@ from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
-def open_zarr(path: str | Path, resolution: int, auth=None):
-    return open_volume(path, resolution, auth_json_path=auth)
-
-
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
 DEFAULT_OVERLAP_FRACTION = 0.25
 DEFAULT_STORED_GRID_PAD = 40
@@ -65,10 +61,6 @@ class DatasetChunkPlan:
     chunk_ids_by_scale: dict[int, tuple[tuple[int, int, int], ...]]
 
     @property
-    def chunk_bytes(self) -> int:
-        return int(np.prod(self.chunk_shapes_by_scale[self.volume_scale], dtype=np.int64))
-
-    @property
     def total_bytes(self) -> int:
         total = 0
         for scale, chunk_ids in self.chunk_ids_by_scale.items():
@@ -78,10 +70,6 @@ class DatasetChunkPlan:
     @property
     def requested_scale_chunk_count(self) -> int:
         return int(len(self.chunk_ids_by_scale[self.volume_scale]))
-
-
-def open_zarr_group(path, auth=None):
-    return open_volume_root(str(path), auth_json_path=auth)
 
 
 def compressor_from_recompress_preset(preset: str):
@@ -498,7 +486,9 @@ def _missing_chunk_ids_for_scale(
 
 def _init_chunk_copy_worker(volume_path: str, volume_scale: int, volume_auth_json: str | None, output_path: str):
     global _WORKER_SOURCE, _WORKER_DEST, _WORKER_CHUNK_SHAPE, _WORKER_ARRAY_SHAPE
-    _WORKER_SOURCE = open_zarr(volume_path, volume_scale, auth=volume_auth_json)
+    _WORKER_SOURCE = open_volume(
+        volume_path, volume_scale, auth_json_path=volume_auth_json
+    )
     _WORKER_DEST = zarr.open_group(str(output_path), mode="r+")[str(int(volume_scale))]
     _WORKER_CHUNK_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.chunks)
     _WORKER_ARRAY_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.shape)
@@ -541,7 +531,9 @@ def copy_chunks_to_output(
     overwrite: bool,
     recompress: str,
 ) -> dict[str, dict[int, int]]:
-    source_group = open_zarr_group(volume_path, auth=volume_auth_json)
+    source_group = open_volume_root(
+        volume_path, auth_json_path=volume_auth_json
+    )
     plan = _build_download_plan(
         source_group,
         volume_path=volume_path,
@@ -670,8 +662,16 @@ def _segment_patch_candidates(
         raise ValueError(f"Unsupported patch filter: {patch_filter!r}")
 
     volume_auth = segment.data_config.volume_auth_json
-    supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
-    inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
+    supervision_mask = open_volume(
+        segment.supervision_mask,
+        resolution=segment.scale,
+        auth_json_path=volume_auth,
+    )
+    inklabels = open_volume(
+        segment.inklabels,
+        resolution=segment.scale,
+        auth_json_path=volume_auth,
+    )
 
     surface = int(supervision_mask.shape[0] // 2)
     patch_size = tuple(int(v) for v in segment.patch_size)
@@ -721,11 +721,23 @@ def _build_segment_download_patches(
     candidates, candidate_count = _segment_patch_candidates(segment, patch_filter=patch_filter)
 
     volume_auth = segment.data_config.volume_auth_json
-    supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
-    inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
+    supervision_mask = open_volume(
+        segment.supervision_mask,
+        resolution=segment.scale,
+        auth_json_path=volume_auth,
+    )
+    inklabels = open_volume(
+        segment.inklabels,
+        resolution=segment.scale,
+        auth_json_path=volume_auth,
+    )
     validation_mask = None
     if segment.validation_mask is not None:
-        validation_mask = open_zarr(segment.validation_mask, resolution=segment.scale, auth=volume_auth)
+        validation_mask = open_volume(
+            segment.validation_mask,
+            resolution=segment.scale,
+            auth_json_path=volume_auth,
+        )
 
     surface = int(supervision_mask.shape[0] // 2)
     patch_size = tuple(int(v) for v in segment.patch_size)
@@ -909,8 +921,6 @@ def build_dataset_chunk_plan(
     source_spec: DatasetSourceSpec,
     patch_size_zyx: tuple[int, int, int],
     overlap_fraction: float,
-    stored_grid_pad: int,
-    patch_finding_workers: int,
     patch_filter: str,
     patch_finding_type: str,
     patch_min_labeled_coverage: float,
@@ -924,7 +934,10 @@ def build_dataset_chunk_plan(
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
 
-    source_group = open_zarr_group(source_spec.volume_path, auth=source_spec.volume_auth_json)
+    source_group = open_volume_root(
+        source_spec.volume_path,
+        auth_json_path=source_spec.volume_auth_json,
+    )
     scale_keys = sorted(
         int(key) for key in source_group.array_keys() if str(key).isdigit()
     )
@@ -932,8 +945,6 @@ def build_dataset_chunk_plan(
         raise KeyError(
             f"Requested scale {source_spec.volume_scale} is missing from source group {source_spec.volume_path!r}."
         )
-
-    del stored_grid_pad, patch_finding_workers
 
     patches, candidate_bbox_count = _build_dataset_download_patches(
         dataset_dir=dataset_dir,
@@ -1055,13 +1066,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stored-grid-pad",
         type=int,
         default=DEFAULT_STORED_GRID_PAD,
-        help="Accepted compatibility no-op; retained for frozen reference invocations.",
+        help="Accepted but does not affect patch discovery or the chunk plan.",
     )
     parser.add_argument(
         "--patch-finding-workers",
         type=int,
         default=4,
-        help="Compatibility no-op kept for existing invocations.",
+        help="Accepted but does not affect patch discovery or the chunk plan.",
     )
     parser.add_argument(
         "--patch-finding-type",
@@ -1168,8 +1179,6 @@ def main(argv: list[str] | None = None) -> int:
             source_spec=source_spec,
             patch_size_zyx=patch_size_zyx,
             overlap_fraction=float(args.overlap_fraction),
-            stored_grid_pad=int(args.stored_grid_pad),
-            patch_finding_workers=int(args.patch_finding_workers),
             patch_filter=str(args.patch_filter),
             patch_finding_type=str(args.patch_finding_type),
             patch_min_labeled_coverage=float(args.patch_min_labeled_coverage),

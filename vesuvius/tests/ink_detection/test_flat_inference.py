@@ -310,6 +310,10 @@ def test_cli_aliases_folder_shorthand_and_segment_resolution(tmp_path):
     assert shorthand.checkpoint == Path("weights.pth")
     with pytest.raises(SystemExit):
         parse_args(["--overlap", "1"])
+    with pytest.raises(SystemExit):
+        parse_args(["--model-type", "auto"])
+    with pytest.raises(SystemExit):
+        parse_args(["--metadata-json", "metadata.json"])
 
     segment = tmp_path / "segment"
     segment.mkdir()

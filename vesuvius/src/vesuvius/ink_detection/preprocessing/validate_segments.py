@@ -202,10 +202,6 @@ def read_tiff_metadata(path: Path) -> TiffMetadata:
     )
 
 
-def read_tiff_shape(path: Path) -> tuple[int, int]:
-    return read_tiff_metadata(path).spatial_shape
-
-
 def _label_channel_axis(shape: Sequence[int]) -> int | None:
     dims = tuple(int(dimension) for dimension in shape)
     if len(dims) != 3:
@@ -271,11 +267,11 @@ def _iter_label_tiles(path: Path, *, workers: int) -> Iterator[np.ndarray]:
             yield tile
 
 
-def validate_label_tiff(path: Path, *, workers: int, raw_shape: Sequence[int] | None = None) -> tuple[str, ...]:
+def validate_label_tiff(
+    path: Path, *, workers: int, raw_shape: Sequence[int]
+) -> tuple[str, ...]:
     issues: list[str] = []
 
-    if raw_shape is None:
-        raw_shape = _read_tiff_series_shape(path)
     if _label_has_alpha_channel(raw_shape):
         issues.append("label image has an alpha channel")
 

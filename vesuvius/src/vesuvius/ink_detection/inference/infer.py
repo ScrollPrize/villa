@@ -46,7 +46,6 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
 DEFAULT_OVERLAP = 0.25
-DEFAULT_PREFETCH_FACTOR = 2
 
 
 @dataclass(frozen=True)
@@ -77,7 +76,6 @@ class ConfiguredModel:
     preprocessing: str
     amp_dtype: torch.dtype | None
     config: InkConfig
-    selected_state: str
 
 
 class FlatTargetModel(nn.Module):
@@ -875,7 +873,6 @@ def iter_probability_tiles(
                 weight_sum_store[y0:y1, x0:x1], dtype=np.float32
             )
             np.divide(probability, weight, out=probability, where=weight > 1e-6)
-            probability[weight <= 1e-6] = 0
             np.clip(probability, 0, 1, out=probability)
             probability *= 255
             yield probability.astype(np.uint8, copy=False)
@@ -956,8 +953,6 @@ def load_flat_inference_state(
 def configure_model(args: Any) -> ConfiguredModel:
     """Rebuild one strict flat model and preprocessing contract from checkpoint."""
 
-    if args.model_type == "resnet3d":
-        raise ValueError("Unsupported model_type 'resnet3d' for ink inference")
     payload = load_checkpoint(args.checkpoint)
     if not isinstance(payload, Mapping) or not isinstance(
         payload.get("config"), Mapping
@@ -985,11 +980,6 @@ def configure_model(args: Any) -> ConfiguredModel:
         len(incompatibility.missing_keys),
         len(incompatibility.unexpected_keys),
     )
-    if args.metadata_json is not None:
-        LOGGER.info(
-            "Ignoring --metadata-json for config-backed checkpoint %s",
-            args.checkpoint,
-        )
     base_model.eval()
     crop_z, crop_y, crop_x = config.model.crop_size
     if crop_y != crop_x:
@@ -1007,7 +997,6 @@ def configure_model(args: Any) -> ConfiguredModel:
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
         config=config,
-        selected_state=selected_state,
     )
 
 
@@ -1338,15 +1327,9 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("input_zarr", nargs="?")
     parser.add_argument("checkpoint", nargs="?", type=Path)
     parser.add_argument("output_tiff", nargs="?", type=Path)
-    parser.add_argument(
-        "--model-type",
-        choices=("auto", "resnet3d", "residual_unet", "tifxyz_unet"),
-        default="auto",
-    )
     parser.add_argument("--folder", type=Path)
     parser.add_argument("--checkpoint-path", type=Path)
     parser.add_argument("--output-prefix", default="")
-    parser.add_argument("--metadata-json", type=Path)
     parser.add_argument("--mask-path", type=Path)
     parser.add_argument("--resolution", default="0")
     parser.add_argument(
@@ -1408,7 +1391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     configured = configure_model(args)
-    prepared_model, device, _ = prepare_model_for_inference(
+    prepared_model, device = prepare_model_for_inference(
         configured.model,
         gpu_ids=args.gpu_ids,
         compile_model=args.compile_model,
@@ -1421,7 +1404,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         preprocessing=configured.preprocessing,
         amp_dtype=configured.amp_dtype,
         config=configured.config,
-        selected_state=configured.selected_state,
     )
     if args.folder is not None:
         infer_folder(args, configured, device=device)

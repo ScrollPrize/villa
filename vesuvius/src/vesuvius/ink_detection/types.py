@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,21 +50,6 @@ class Segment:
             "" if self.validation_mask is None else str(self.validation_mask),
         )
 
-    def with_labels(
-        self,
-        *,
-        inklabels: Path | None,
-        supervision_mask: Path | None,
-        validation_mask: Path | None,
-    ) -> "Segment":
-        return replace(
-            self,
-            inklabels=inklabels,
-            supervision_mask=supervision_mask,
-            validation_mask=validation_mask,
-        )
-
-
 @dataclass(frozen=True)
 class Patch:
     """One fixed ZYX crop and its training/validation role."""
@@ -81,7 +66,11 @@ class Patch:
 
     @property
     def supervision_mask(self) -> Path | str | None:
-        return self.supervision_mask_override or self.segment.supervision_mask
+        return (
+            self.segment.supervision_mask
+            if self.supervision_mask_override is None
+            else self.supervision_mask_override
+        )
 
     @property
     def inklabels(self) -> Path | None:
@@ -118,7 +107,6 @@ class ConfusionCounts:
 class SamplingPolicy:
     """The DataLoader arguments selected by one sampling strategy."""
 
-    strategy: str
     shuffle: bool = False
     generator: torch.Generator | None = None
     sampler: Any = None

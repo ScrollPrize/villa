@@ -47,7 +47,6 @@ class DirectionResult:
     direction: str
     matched_files: int
     output_path: str | None
-    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,8 +197,6 @@ def choose_output_suffix(paths: Sequence[Path]) -> str:
 
 
 def build_terms_slug(normalized_terms: Sequence[str]) -> str:
-    if not normalized_terms:
-        return "all"
     return "_".join(normalized_terms)
 
 
@@ -493,7 +490,6 @@ def process_preds_folder(
                     direction=direction,
                     matched_files=0,
                     output_path=None,
-                    skipped_reason="no_matches",
                 )
             )
             continue

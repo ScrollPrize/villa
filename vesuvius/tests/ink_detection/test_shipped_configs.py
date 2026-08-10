@@ -6,7 +6,7 @@ from collections import Counter
 import json
 from pathlib import Path
 
-from vesuvius.ink_detection.config import TrainingConfig
+from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
 
 
 _CONFIGS = (
@@ -25,7 +25,7 @@ def _load_config(name: str) -> dict:
 def test_aligned21_hybrid_recipe_parses_with_frozen_values_and_layout():
     authored = _load_config("aligned21_hybrid_3d2d.json")
 
-    training = TrainingConfig.from_authored_mapping(authored)
+    training = TrainingConfig.from_mapping(resolve_training_mapping(authored))
     source = authored["datasets"][0]
 
     assert training.ink.model.model_type == "vesuvius_unet_3d_stem_2d"

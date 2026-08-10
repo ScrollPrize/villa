@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import pickle
 import random
@@ -30,7 +31,6 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 )
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import (
-    build_matching_label_asset_path,
     discover_segment_labels,
     gather_segments,
     parse_label_asset_path,
@@ -177,9 +177,6 @@ def test_segment_asset_parsing_and_independent_auto_versions(tmp_path):
     parsed = parse_label_asset_path(paths[1])
     assert parsed["label_kind"] == "inklabels"
     assert parsed["version_num"] == 3
-    assert build_matching_label_asset_path(
-        paths[1], label_kind="supervision_mask"
-    ).name == "segment-a_supervision_mask_v3.zarr"
 
     discovered = discover_segment_labels(_segment(_config(tmp_path), tmp_path))
     assert discovered.inklabels == paths[1]
@@ -296,7 +293,8 @@ def test_patch_discovery_math_and_filter_empty_tile_subtiling():
 
 def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
     labeled_config = _config(tmp_path, patch_size=[3, 2, 2], patch_overlap=1.0)
-    labeled_segment = _segment(labeled_config, tmp_path, image_volume="image").with_labels(
+    labeled_segment = replace(
+        _segment(labeled_config, tmp_path, image_volume="image"),
         inklabels=Path("labels"),
         supervision_mask=Path("supervision"),
         validation_mask=Path("validation"),
@@ -357,7 +355,8 @@ def test_default_labeled_and_unlabeled_patch_origins(tmp_path):
 
 def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     config = _config(tmp_path)
-    segment = _segment(config, tmp_path).with_labels(
+    segment = replace(
+        _segment(config, tmp_path),
         inklabels=tmp_path / "ink.zarr",
         supervision_mask=tmp_path / "supervision.zarr",
         validation_mask=tmp_path / "validation.zarr",
@@ -376,10 +375,30 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     assert loaded[0].bbox == patch.bbox
     assert loaded[0].is_validation
     assert loaded[0].supervision_mask == str(segment.validation_mask)
+    assert replace(patch, supervision_mask_override="").supervision_mask == ""
     assert "v6" in patch_finding_cache_token(config)
 
     changed = _config(tmp_path, patch_overlap=0.25)
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
+
+
+def test_unlabeled_coverage_key_is_rejected_and_cache_token_stays_compatible(tmp_path):
+    unlabeled = _config(
+        tmp_path,
+        patch_discovery_mode="unlabeled",
+        unlabeled_datasets=[
+            {"segments_path": str(tmp_path), "volume_scale": 0}
+        ],
+    )
+    assert patch_finding_cache_token(unlabeled) == (
+        "unlabeled-default-v6-po-0.5-mdc-0.15-pfs-"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="threshold is fixed at 0.25.*not honored",
+    ):
+        _config(tmp_path, unlabeled_patch_min_data_coverage=0.9)
 
 
 def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
@@ -448,7 +467,8 @@ def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch
         (validation_path, validation),
     ):
         _write_pyramid(path, value)
-    segment = _segment(config, tmp_path, image_volume=image_path).with_labels(
+    segment = replace(
+        _segment(config, tmp_path, image_volume=image_path),
         inklabels=labels_path,
         supervision_mask=supervision_path,
         validation_mask=validation_path,

@@ -114,7 +114,7 @@ def prepare_model_for_inference(
     gpu_ids: Sequence[int],
     compile_model: bool,
     compile_mode: str,
-) -> tuple[nn.Module, torch.device, bool]:
+) -> tuple[nn.Module, torch.device]:
     """Move, optionally wrap, and optionally compile an inference model."""
 
     requested = tuple(int(device_id) for device_id in gpu_ids)
@@ -146,4 +146,4 @@ def prepare_model_for_inference(
         enabled=compile_enabled,
         mode=compile_mode,
     )
-    return model, device, compile_enabled
+    return model, device

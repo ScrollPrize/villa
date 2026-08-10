@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Iterable
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Segment
@@ -48,46 +48,6 @@ def parse_label_asset_path(path: str | Path) -> dict[str, object] | None:
     return None
 
 
-def build_matching_label_asset_path(
-    path: str | Path, *, label_kind: str
-) -> Path:
-    parsed = parse_label_asset_path(path)
-    if parsed is None:
-        raise ValueError(f"Label path has unexpected format: {path}")
-    version_num = int(parsed["version_num"])
-    version_suffix = "" if version_num <= 1 else f"_v{version_num}"
-    return Path(parsed["dir_prefix"]) / (
-        f"{parsed['prefix']}_{label_kind}{version_suffix}{parsed['extension']}"
-    )
-
-
-def resolve_versioned_label_path(
-    paths: Iterable[str | Path],
-    *,
-    label_kind: str,
-    label_version: str | None = None,
-    context: str = "labels",
-) -> Path:
-    """Select one label kind with traversal-order overwrite semantics."""
-    requested = None if label_version in (None, "") else str(label_version).strip()
-    candidates: dict[int, Path] = {}
-    for path in paths:
-        parsed = parse_label_asset_path(path)
-        if parsed is None or parsed["label_kind"] != label_kind:
-            continue
-        candidates[int(parsed["version_num"])] = Path(path)
-    if not candidates:
-        raise ValueError(f"{context} must contain at least one {label_kind} path")
-    if requested:
-        for version_num, candidate in candidates.items():
-            if f"v{version_num}" == requested:
-                return candidate
-        raise ValueError(
-            f"{context} does not contain {label_kind} version {requested}"
-        )
-    return candidates[max(candidates)]
-
-
 def discover_segment_labels(
     segment: Segment, *, extension: str = ".zarr", required: bool = True
 ) -> Segment:
@@ -129,10 +89,12 @@ def discover_segment_labels(
                     f"{segment.segment_dir} does not contain matching "
                     f"{normalized_extension} labels for version {requested}"
                 )
-            return segment.with_labels(
+            return replace(
+                segment,
                 inklabels=None, supervision_mask=None, validation_mask=None
             )
-        return segment.with_labels(
+        return replace(
+            segment,
             inklabels=selected["inklabels"],
             supervision_mask=selected["supervision_mask"],
             validation_mask=selected.get("validation_mask"),
@@ -152,7 +114,8 @@ def discover_segment_labels(
     selected_paths: dict[str, Path | None] = {}
     for kind, candidates in candidates_by_kind.items():
         selected_paths[kind] = candidates[max(candidates)] if candidates else None
-    return segment.with_labels(
+    return replace(
+        segment,
         inklabels=selected_paths["inklabels"],
         supervision_mask=selected_paths["supervision_mask"],
         validation_mask=selected_paths["validation_mask"],

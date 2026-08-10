@@ -153,6 +153,8 @@ def test_cli_uses_hyphen_underscore_parser_and_explicit_workers_alias(tmp_path):
     assert legacy.num_workers == 7
     with pytest.raises(SystemExit):
         native.parse_args([*common, "--overlap", "1"])
+    with pytest.raises(SystemExit):
+        native.parse_args([*common, "--foreground-channel", "0"])
 
 
 def test_volume_source_is_anchored_to_tifxyz_directory(tmp_path, monkeypatch):
@@ -241,22 +243,9 @@ def test_probability_rules_resize_and_exact_eight_way_tta():
     one = native.logits_to_probabilities(
         torch.zeros((1, 1, 1, 2, 2)),
         patch_size_zyx=shape,
-        foreground_channel=0,
     )
     assert one.shape == (1, 1, *shape)
     assert torch.equal(one, torch.full_like(one, 0.5))
-
-    two_logits = torch.tensor([0.0, np.log(3.0)]).reshape(1, 2, 1, 1, 1)
-    two = native.logits_to_probabilities(
-        two_logits, patch_size_zyx=(1, 1, 1), foreground_channel=0
-    )
-    assert two.item() == pytest.approx(0.75)
-
-    many_logits = torch.tensor([0.0, 1.0, 2.0]).reshape(1, 3, 1, 1, 1)
-    many = native.logits_to_probabilities(
-        many_logits, patch_size_zyx=(1, 1, 1), foreground_channel=2
-    )
-    assert many.item() == pytest.approx(torch.softmax(many_logits, dim=1)[0, 2].item())
 
     variants = native.tta_variants(True)
     assert variants == [
@@ -278,7 +267,6 @@ def test_probability_rules_resize_and_exact_eight_way_tta():
             variants=variants,
             tta_batch_size=batch_size,
             patch_size_zyx=(2, 3, 4),
-            foreground_channel=0,
         )
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-7)
 
@@ -559,8 +547,6 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         model=ZeroModel(),
         device=torch.device("cpu"),
         amp_dtype=None,
-        selected_state="injected",
-        compile_enabled=False,
     )
 
     output = tmp_path / "command.zarr"
@@ -574,7 +560,6 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         blend_mode="constant",
         tta=False,
         tta_batch_size=None,
-        foreground_channel=1,
         batch_size=1,
         gpu_ids=[],
         num_workers=0,

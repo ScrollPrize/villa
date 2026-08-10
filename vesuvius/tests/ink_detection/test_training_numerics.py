@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vesuvius.ink_detection.config import TrainingConfig
+from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
 from vesuvius.ink_detection.training.deep_supervision import (
     DeepSupervisionWrapper,
     build_deep_supervision_targets,
@@ -48,6 +48,10 @@ def _training_mapping() -> dict:
     return authored
 
 
+def _training_config(authored: dict) -> TrainingConfig:
+    return TrainingConfig.from_mapping(resolve_training_mapping(authored))
+
+
 class _EncoderDecoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -60,7 +64,7 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
     authored["model_config"]["pretrained_backbone"] = "/weights.pth"
     authored["encoder_lr_mult"] = 0.25
     authored["learning_rate"] = 0.01
-    config = TrainingConfig.from_authored_mapping(authored)
+    config = _training_config(authored)
     model = _EncoderDecoder()
 
     target = plan_optimizer_target(model, config)
@@ -80,7 +84,7 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
     frozen_mapping["freeze_encoder"] = True
     frozen_model = _EncoderDecoder()
     frozen = plan_optimizer_target(
-        frozen_model, TrainingConfig.from_authored_mapping(frozen_mapping)
+        frozen_model, _training_config(frozen_mapping)
     )
     assert [id(value) for value in frozen.parameters()[0]["params"]] == [
         id(frozen_model.decoder.weight)
@@ -89,7 +93,7 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
 
 
 def test_default_sgd_one_step_matches_hand_calculated_nesterov_update():
-    config = TrainingConfig.from_authored_mapping(_training_mapping())
+    config = _training_config(_training_mapping())
     model = _EncoderDecoder()
     with torch.no_grad():
         model.shared_encoder.weight.fill_(1.0)
@@ -117,7 +121,7 @@ def test_cosine_and_one_cycle_use_configured_constructor_values():
         "eta_min": 0.001,
     }
     cosine = create_training_scheduler(
-        optimizer, TrainingConfig.from_authored_mapping(cosine_mapping)
+        optimizer, _training_config(cosine_mapping)
     )
     assert cosine.T_max == 4
     assert cosine.eta_min == 0.001
@@ -133,7 +137,7 @@ def test_cosine_and_one_cycle_use_configured_constructor_values():
     one_cycle_optimizer = torch.optim.SGD([nn.Parameter(torch.tensor(1.0))], lr=0.01)
     one_cycle = create_training_scheduler(
         one_cycle_optimizer,
-        TrainingConfig.from_authored_mapping(one_cycle_mapping),
+        _training_config(one_cycle_mapping),
     )
     assert one_cycle.total_steps == 6
     assert one_cycle._schedule_phases[0]["end_step"] == pytest.approx(0.8)
@@ -166,7 +170,7 @@ def test_accelerate_prepares_exactly_four_objects_and_never_scheduler():
 
 
 def test_fresh_initialization_overwrites_zero_attention_and_pretrained_skips():
-    fresh_config = TrainingConfig.from_authored_mapping(_training_mapping())
+    fresh_config = _training_config(_training_mapping())
     fresh = nn.Conv3d(1, 1, kernel_size=1)
     nn.init.zeros_(fresh.weight)
 
@@ -178,7 +182,7 @@ def test_fresh_initialization_overwrites_zero_attention_and_pretrained_skips():
     pretrained = nn.Conv3d(1, 1, kernel_size=1)
     nn.init.zeros_(pretrained.weight)
     assert initialize_training_model(
-        pretrained, TrainingConfig.from_authored_mapping(pretrained_mapping)
+        pretrained, _training_config(pretrained_mapping)
     ) is False
     assert torch.count_nonzero(pretrained.weight).item() == 0
 
@@ -304,7 +308,7 @@ def test_dilation_level_scaling_and_mixed_positive_levels():
         "supervision_dilation_distance": 4,
     }
     authored["datasets"][0]["volume_scale"] = 2
-    config = TrainingConfig.from_authored_mapping(authored)
+    config = _training_config(authored)
     assert resolve_dilation_distances(config) == (2.0, 1.0)
 
     authored["datasets"].append(
@@ -312,7 +316,7 @@ def test_dilation_level_scaling_and_mixed_positive_levels():
     )
     with pytest.raises(ValueError, match="single volume_scale"):
         resolve_dilation_distances(
-            TrainingConfig.from_authored_mapping(authored)
+            _training_config(authored)
         )
 
 
@@ -324,7 +328,7 @@ def test_flat_mode_never_enters_positive_full_3d_dilation_configuration():
     }
 
     assert resolve_dilation_distances(
-        TrainingConfig.from_authored_mapping(authored)
+        _training_config(authored)
     ) == (0.0, 0.0)
 
 
@@ -343,7 +347,7 @@ def test_ema_lerps_floats_and_copies_integer_buffers_on_exact_cadence():
         "start_step": 2,
         "update_every_steps": 2,
     }
-    config = TrainingConfig.from_authored_mapping(authored)
+    config = _training_config(authored)
     ema = _EmaModel(2.0, 1)
     source = _EmaModel(4.0, 7)
 
@@ -366,7 +370,7 @@ class _StepCounter:
 
 
 def test_sync_boundary_advances_scheduler_even_without_a_skip_gate():
-    config = TrainingConfig.from_authored_mapping(_training_mapping())
+    config = _training_config(_training_mapping())
     scheduler = _StepCounter()
     source = _EmaModel(4.0, 7)
 

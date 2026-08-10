@@ -212,7 +212,7 @@ reference spelling. The commands have these persistent-state guarantees:
   completed chunk ids. Resume requires all of those plus the actual output
   schema to agree; use `--overwrite` to replace an incompatible store.
 
-The downloader accepts two inert reference-compatibility flags:
+The downloader accepts two inert planning flags:
 `--stored-grid-pad` and `--patch-finding-workers`. They do not change patch
 discovery or the exported chunk plan. Active planning controls are
 `--patch-size`, `--overlap-fraction`, `--patch-finding-type`, the subtiling
@@ -288,7 +288,7 @@ Data, patch, and augmentation controls:
 | `patch_discovery_mode` | `labeled` (default) or `unlabeled`; the latter reads `unlabeled_datasets`. |
 | `patch_finding_type` | `default` or `subtiling`. Subtiling requires `patch_finding_filter_empty_tile: true`. |
 | `patch_finding_scale`, `patch_finding_tile_size`, `patch_finding_stride` | Optional subtiling/scan controls. |
-| `unlabeled_patch_min_data_coverage` | Minimum nonempty coverage for unlabeled discovery, default `0.15`. |
+| `unlabeled_patch_min_data_coverage` | Rejected: unlabeled discovery uses a fixed `0.25` nonempty-coverage threshold. |
 | `label_version` | Optional explicit `v<N>` label version. |
 | `patch_cache_filename` | Optional patch-index JSON path; otherwise the cache is under `out_dir`. |
 | `volume_auth_json` | Optional HTTPS Basic-Auth JSON with `username` and `password`. Public Vesuvius S3 is opened anonymously. |
@@ -412,8 +412,6 @@ the second output.
 | `--folder` | One segment directory or a parent of segment directories. |
 | `--checkpoint-path` | Explicit checkpoint, useful in folder mode; overrides the positional checkpoint. |
 | `--output-prefix` | Folder-mode filename prefix, default empty. |
-| `--model-type` | `auto`, `resnet3d`, `residual_unet`, or `tifxyz_unet`; default `auto`. The checkpoint config remains authoritative, and `resnet3d` is unsupported. |
-| `--metadata-json` | Accepted compatibility argument; ignored for config-backed checkpoints. |
 | `--mask-path` | Optional 2D TIFF; nonzero pixels limit scheduled output. |
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
@@ -489,7 +487,6 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 | `--gpus` | Unique comma-separated CUDA IDs; omit for automatic CUDA/CPU selection. |
-| `--foreground-channel` | Softmax foreground channel for multi-channel logits, default `1`; one-channel ink logits use sigmoid. |
 | `--plan-only` | Print volume/chunk/patch counts without building or running the model or creating output. The checkpoint is still deserialized for its config. |
 | `--max-target-chunks` | Refuse plans larger than this positive count. |
 | `--cache-dir`, `--cache-max-gb` | Optional Zarr-3 compressed-volume cache root and per-volume decimal-GB budget. |

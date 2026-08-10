@@ -22,7 +22,7 @@ from vesuvius.ink_detection.training.train import (
     validation_due,
 )
 
-from vesuvius.ink_detection.config import TrainingConfig
+from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
 
 from .test_model_foundation import _config_mapping
 from vesuvius.ink_detection.training.visualization import (
@@ -190,7 +190,7 @@ def test_checkpoint_payload_uses_canonical_mapping_and_optional_ema_state():
             "scheduler": {"name": "cosine_annealing"},
         }
     )
-    config = TrainingConfig.from_authored_mapping(authored)
+    config = TrainingConfig.from_mapping(resolve_training_mapping(authored))
     model = torch.nn.Linear(1, 1)
     ema_model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)

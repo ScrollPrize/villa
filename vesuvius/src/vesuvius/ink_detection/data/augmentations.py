@@ -46,6 +46,14 @@ from vesuvius.models.augmentation.transforms.utils.oneoftransform import OneOfTr
 from vesuvius.models.augmentation.transforms.utils.random import RandomTransform
 
 
+NATIVE_CROP_TRANSLATION_PROBABILITY = 0.30
+NATIVE_CROP_TRANSLATION_MIN_VOXELS = 10
+NATIVE_CROP_TRANSLATION_MAX_VOXELS = 40
+NATIVE_CROP_TRANSLATION_KEEP_FRACTION = 1.0 / 3.0
+NATIVE_CROP_TRANSLATION_MAX_AXES = 2
+NATIVE_CROP_TRANSLATION_MAX_ATTEMPTS = 24
+
+
 def _mirror_axes(dimension: int) -> tuple[int, ...]:
     if dimension == 2:
         return 0, 1
@@ -133,14 +141,8 @@ def create_spatial_intensity_no_clip_transforms(
 
 def create_default_training_transforms(
     patch_size: tuple[int, ...],
-    *,
-    no_spatial: bool = False,
-    no_scaling: bool = False,
-    only_spatial_and_intensity: bool = False,
-    rotation_axes: tuple[int, ...] | None = None,
 ) -> ComposeTransforms:
     """Compose the default ink training transform graph."""
-    del no_scaling
     dimension = len(patch_size)
     if dimension not in (2, 3):
         raise ValueError(f"Invalid patch size dimension: {dimension}. Expected 2 or 3")
@@ -150,84 +152,75 @@ def create_default_training_transforms(
         for axis_a, axis_b in ((0, 1), (0, 2), (1, 2)):
             if patch_size[axis_a] == patch_size[axis_b]:
                 transpose_axes.update((axis_a, axis_b))
-    if not no_spatial:
-        if dimension == 2:
-            transforms.append(MirrorTransform(allowed_axes=(0, 1)))
-        else:
-            allowed = set()
-            if patch_size[1] == patch_size[2]:
-                allowed.update((1, 2))
-            if patch_size[0] == patch_size[2]:
-                allowed.update((0, 2))
-            if patch_size[0] == patch_size[1]:
-                allowed.update((0, 1))
-            if rotation_axes is not None:
-                allowed &= set(rotation_axes)
-            if allowed:
-                transforms.append(
-                    RandomTransform(
-                        Rot90Transform(
-                            num_axis_combinations=1,
-                            num_rot_per_combination=(1, 2, 3),
-                            allowed_axes=allowed,
-                        ),
-                        apply_probability=0.5,
-                    )
-                )
-
-    blank_rectangle = None
-    if not only_spatial_and_intensity:
-        blank_rectangle = RandomTransform(
-            BlankRectangleTransform(
-                rectangle_size=tuple(
-                    (max(1, size // 6), size // 3) for size in patch_size
-                ),
-                rectangle_value=np.mean,
-                num_rectangles=(1, 5),
-                force_square=False,
-                p_per_sample=0.4,
-                p_per_channel=0.5,
-            ),
-            apply_probability=0.1,
-        )
-
-    common = []
-    if not only_spatial_and_intensity:
-        common.extend(
-            [
-                OneOfTransform(
-                    [
-                        RandomTransform(
-                            GaussianBlurTransform(
-                                blur_sigma=(0.3, 1.5),
-                                synchronize_channels=False,
-                                synchronize_axes=False,
-                                p_per_channel=0.5,
-                                benchmark=False,
-                            ),
-                            apply_probability=0.3,
-                        )
-                    ]
-                ),
+    if dimension == 2:
+        transforms.append(MirrorTransform(allowed_axes=(0, 1)))
+    else:
+        allowed = set()
+        if patch_size[1] == patch_size[2]:
+            allowed.update((1, 2))
+        if patch_size[0] == patch_size[2]:
+            allowed.update((0, 2))
+        if patch_size[0] == patch_size[1]:
+            allowed.update((0, 1))
+        if allowed:
+            transforms.append(
                 RandomTransform(
-                    GaussianNoiseTransform(
-                        noise_variance=(0, 0.2),
+                    Rot90Transform(
+                        num_axis_combinations=1,
+                        num_rot_per_combination=(1, 2, 3),
+                        allowed_axes=allowed,
+                    ),
+                    apply_probability=0.5,
+                )
+            )
+
+    blank_rectangle = RandomTransform(
+        BlankRectangleTransform(
+            rectangle_size=tuple(
+                (max(1, size // 6), size // 3) for size in patch_size
+            ),
+            rectangle_value=np.mean,
+            num_rectangles=(1, 5),
+            force_square=False,
+            p_per_sample=0.4,
+            p_per_channel=0.5,
+        ),
+        apply_probability=0.1,
+    )
+
+    common = [
+        OneOfTransform(
+            [
+                RandomTransform(
+                    GaussianBlurTransform(
+                        blur_sigma=(0.3, 1.5),
+                        synchronize_channels=False,
+                        synchronize_axes=False,
                         p_per_channel=0.5,
-                        synchronize_channels=True,
+                        benchmark=False,
                     ),
                     apply_probability=0.3,
-                ),
-                RandomTransform(
-                    SharpeningTransform(
-                        strength=(0.1, 1.5),
-                        p_same_for_each_channel=0.5,
-                        p_per_channel=0.5,
-                        p_clamp_intensities=0.5,
-                    ),
-                    apply_probability=0.2,
-                ),
+                )
             ]
-        )
+        ),
+        RandomTransform(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.2),
+                p_per_channel=0.5,
+                synchronize_channels=True,
+            ),
+            apply_probability=0.3,
+        ),
+        RandomTransform(
+            SharpeningTransform(
+                strength=(0.1, 1.5),
+                p_same_for_each_channel=0.5,
+                p_per_channel=0.5,
+                p_clamp_intensities=0.5,
+            ),
+            apply_probability=0.2,
+        ),
+    ]
     common.extend(
         [
             OneOfTransform(
@@ -262,20 +255,19 @@ def create_default_training_transforms(
             ),
         ]
     )
-    if not only_spatial_and_intensity:
-        common.append(
-            RandomTransform(
-                SimulateLowResolutionTransform(
-                    scale=(0.25, 1),
-                    synchronize_channels=False,
-                    synchronize_axes=True,
-                    ignore_axes=None,
-                    allowed_channels=None,
-                    p_per_channel=0.5,
-                ),
-                apply_probability=0.4,
-            )
+    common.append(
+        RandomTransform(
+            SimulateLowResolutionTransform(
+                scale=(0.25, 1),
+                synchronize_channels=False,
+                synchronize_axes=True,
+                ignore_axes=None,
+                allowed_channels=None,
+                p_per_channel=0.5,
+            ),
+            apply_probability=0.4,
         )
+    )
     common.extend(
         [
             RandomTransform(
@@ -309,26 +301,23 @@ def create_default_training_transforms(
         ]
     )
     if dimension == 2:
-        if blank_rectangle is not None:
-            transforms.append(blank_rectangle)
+        transforms.append(blank_rectangle)
         transforms.extend(common)
         return ComposeTransforms(transforms)
-    if not no_spatial and len(transpose_axes) >= 2:
+    if len(transpose_axes) >= 2:
         transforms.append(
             RandomTransform(
                 TransposeAxesTransform(allowed_axes=transpose_axes),
                 apply_probability=0.2,
             )
         )
-    if blank_rectangle is not None:
-        transforms.append(blank_rectangle)
-    if not only_spatial_and_intensity:
-        transforms.append(
-            RandomTransform(
-                SmearTransform(shift=(5, 0), alpha=0.2, num_prev_slices=3, smear_axis=3),
-                apply_probability=0.3,
-            )
+    transforms.append(blank_rectangle)
+    transforms.append(
+        RandomTransform(
+            SmearTransform(shift=(5, 0), alpha=0.2, num_prev_slices=3, smear_axis=3),
+            apply_probability=0.3,
         )
+    )
     transforms.extend(
         [
             RandomTransform(
@@ -368,6 +357,8 @@ def build_augmentations(
     *,
     rotation_axes: tuple[int, ...] | None,
 ) -> ComposeTransforms | None:
+    """Build one configured preset, returning no transform for `none`."""
+
     if preset == "none":
         return None
     if preset == "spatial_only":
@@ -375,7 +366,6 @@ def build_augmentations(
     if preset == "spatial_intensity_no_clip":
         return create_spatial_intensity_no_clip_transforms(patch_size, rotation_axes)
     if preset == "default":
-        # rotation_axes applies only to the two restricted presets.
         return create_default_training_transforms(patch_size)
     raise ValueError(f"unknown augmentation preset {preset!r}")
 
@@ -386,17 +376,11 @@ def maybe_translate_crop_bbox(
     valid_mask,
     supervision_flat,
     *,
-    probability: float = 0.30,
-    min_translation: int = 10,
-    max_translation: int = 40,
-    min_keep_fraction: float = 1.0 / 3.0,
-    max_axes: int = 2,
-    max_attempts: int = 24,
     rng=None,
 ):
     """Translate a native crop while retaining the required supervised points."""
     rng = np.random if rng is None else rng
-    if probability <= 0 or rng.random() >= probability:
+    if rng.random() >= NATIVE_CROP_TRANSLATION_PROBABILITY:
         return crop_bbox_zyx
     constrained = np.zeros(np.asarray(valid_mask).shape, dtype=bool)
     supervision_flat = np.asarray(supervision_flat)
@@ -409,16 +393,27 @@ def maybe_translate_crop_bbox(
     points = np.asarray(positions_zyx)[constrained].astype(np.int64, copy=False)
     if points.shape[0] == 0:
         return crop_bbox_zyx
-    required = max(1, int(np.ceil(points.shape[0] * min_keep_fraction)))
+    required = max(
+        1,
+        int(np.ceil(points.shape[0] * NATIVE_CROP_TRANSLATION_KEEP_FRACTION)),
+    )
     axes = np.array([1, 2], dtype=np.int64)
-    max_axes = max(1, min(int(max_axes), axes.size))
-    for _ in range(max(1, int(max_attempts))):
+    for _ in range(NATIVE_CROP_TRANSLATION_MAX_ATTEMPTS):
         selected = axes.copy()
         rng.shuffle(selected)
-        count = 2 if max_axes >= 2 and rng.random() < 0.5 else 1
+        count = (
+            2
+            if NATIVE_CROP_TRANSLATION_MAX_AXES >= 2 and rng.random() < 0.5
+            else 1
+        )
         translation = np.zeros(3, dtype=np.int64)
         for axis in selected[:count]:
-            magnitude = int(rng.randint(min_translation, max_translation + 1))
+            magnitude = int(
+                rng.randint(
+                    NATIVE_CROP_TRANSLATION_MIN_VOXELS,
+                    NATIVE_CROP_TRANSLATION_MAX_VOXELS + 1,
+                )
+            )
             translation[int(axis)] = -magnitude if rng.random() < 0.5 else magnitude
         starts = np.asarray(crop_bbox_zyx[:3]) + translation
         stops = np.asarray(crop_bbox_zyx[3:]) + translation

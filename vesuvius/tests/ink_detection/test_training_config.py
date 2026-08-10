@@ -28,6 +28,10 @@ def _training_mapping(*, mode: str = "flat") -> dict:
     return authored
 
 
+def _parse_training(authored: dict) -> TrainingConfig:
+    return TrainingConfig.from_mapping(resolve_training_mapping(authored))
+
+
 def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(tmp_path):
     authored = _training_mapping(mode="full_3d")
     authored.pop("in_channels")
@@ -117,17 +121,16 @@ def test_dinov2_nested_values_win_during_training_resolution():
 def test_stitching_scales_only_loader_yx_and_native_forces_factor_one():
     flat = _training_mapping()
     flat["stitch_factor"] = 2
-    flat_training = TrainingConfig.from_authored_mapping(flat)
+    flat_training = _parse_training(flat)
     native = _training_mapping(mode="full_3d_single_wrap")
     native.pop("in_channels")
     native["stitch_factor"] = 2
-    native_training = TrainingConfig.from_authored_mapping(native)
+    native_training = _parse_training(native)
 
     assert flat_training.model_crop_size == (3, 8, 8)
     assert flat_training.loader_patch_size == (3, 16, 16)
     assert flat_training.use_stitched_forward is True
     assert native_training.loader_patch_size == (3, 8, 8)
-    assert native_training.stitch_factor == 1
     assert native_training.use_stitched_forward is False
     assert native_training.ink.model.in_channels == 2
 
@@ -137,7 +140,7 @@ def test_training_seed_remains_required_instead_of_using_data_default():
     authored.pop("seed")
 
     with pytest.raises(KeyError, match="seed"):
-        TrainingConfig.from_authored_mapping(authored)
+        _parse_training(authored)
 
 
 def test_diffusers_warmup_is_top_level_not_nested_scheduler_value():
@@ -148,7 +151,7 @@ def test_diffusers_warmup_is_top_level_not_nested_scheduler_value():
         "warmup_steps": 999,
     }
 
-    training = TrainingConfig.from_authored_mapping(authored)
+    training = _parse_training(authored)
 
     assert training.scheduler.warmup_steps == 23
     assert training.to_mapping()["scheduler"]["warmup_steps"] == 999
@@ -169,7 +172,7 @@ def test_inactive_optimizer_and_scheduler_values_are_not_interpreted():
         },
     )
 
-    training = TrainingConfig.from_authored_mapping(authored)
+    training = _parse_training(authored)
 
     assert training.optimizer.betas == "unused-by-sgd"
     assert training.optimizer.encoder_lr_mult is None
@@ -177,9 +180,9 @@ def test_inactive_optimizer_and_scheduler_values_are_not_interpreted():
 
 
 def test_pin_memory_distinguishes_absence_from_explicit_null():
-    absent = TrainingConfig.from_authored_mapping(_training_mapping())
+    absent = _parse_training(_training_mapping())
     explicit = _training_mapping()
     explicit["pin_memory"] = None
 
     assert absent.pin_memory is None
-    assert TrainingConfig.from_authored_mapping(explicit).pin_memory is False
+    assert _parse_training(explicit).pin_memory is False

@@ -1,12 +1,10 @@
-"""Ink segmentation objectives, weighting, and stitched clDice math."""
+"""Ink segmentation objectives and scalar weighting."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vesuvius.ink_detection.config import InkConfig
@@ -144,9 +142,6 @@ class CompositeLoss(nn.Module):
         return total
 
 
-ProjectedSegmentationLoss = CompositeLoss
-
-
 def create_loss(config: InkConfig) -> CompositeLoss:
     """Build the ordered segmentation objective selected by InkConfig."""
 
@@ -171,162 +166,3 @@ def create_loss(config: InkConfig) -> CompositeLoss:
             )
         )
     return CompositeLoss(terms)
-
-
-def _soft_erode_2d(image_BCHW: torch.Tensor) -> torch.Tensor:
-    if image_BCHW.ndim != 4:
-        raise ValueError(
-            f"_soft_erode_2d expects shape (N, C, H, W), got {tuple(image_BCHW.shape)}"
-        )
-    pooled_h = -F.max_pool2d(
-        -image_BCHW,
-        kernel_size=(3, 1),
-        stride=(1, 1),
-        padding=(1, 0),
-    )
-    pooled_w = -F.max_pool2d(
-        -image_BCHW,
-        kernel_size=(1, 3),
-        stride=(1, 1),
-        padding=(0, 1),
-    )
-    return torch.min(pooled_h, pooled_w)
-
-
-def _soft_dilate_2d(image_BCHW: torch.Tensor) -> torch.Tensor:
-    if image_BCHW.ndim != 4:
-        raise ValueError(
-            f"_soft_dilate_2d expects shape (N, C, H, W), got {tuple(image_BCHW.shape)}"
-        )
-    return F.max_pool2d(
-        image_BCHW,
-        kernel_size=(3, 3),
-        stride=(1, 1),
-        padding=(1, 1),
-    )
-
-
-def _soft_open_2d(image_BCHW: torch.Tensor) -> torch.Tensor:
-    return _soft_dilate_2d(_soft_erode_2d(image_BCHW))
-
-
-def _soft_skeletonize_2d(
-    image_BCHW: torch.Tensor,
-    *,
-    num_iter: int,
-) -> torch.Tensor:
-    if int(num_iter) < 0:
-        raise ValueError(f"num_iter must be >= 0, got {num_iter}")
-    opened_BCHW = _soft_open_2d(image_BCHW)
-    skeleton_BCHW = F.relu(image_BCHW - opened_BCHW)
-    for _ in range(int(num_iter)):
-        image_BCHW = _soft_erode_2d(image_BCHW)
-        opened_BCHW = _soft_open_2d(image_BCHW)
-        delta_BCHW = F.relu(image_BCHW - opened_BCHW)
-        skeleton_BCHW = skeleton_BCHW + F.relu(
-            delta_BCHW - skeleton_BCHW * delta_BCHW
-        )
-    return skeleton_BCHW
-
-
-def compute_binary_soft_cldice_loss(
-    logits_BCHW: torch.Tensor,
-    targets_BCHW: torch.Tensor,
-    *,
-    valid_mask: torch.Tensor | None = None,
-    mask_mode: str = "pre_skeleton",
-    reduction_dims: tuple[int, ...] = (1, 2, 3),
-    num_iter: int = 10,
-    smooth: float = 1.0,
-) -> torch.Tensor:
-    """Compute per-batch clDice from BCHW logits and binary targets."""
-
-    if tuple(logits_BCHW.shape) != tuple(targets_BCHW.shape):
-        raise ValueError(
-            "logits/targets shape mismatch: "
-            f"{tuple(logits_BCHW.shape)} vs {tuple(targets_BCHW.shape)}"
-        )
-    if logits_BCHW.ndim != 4:
-        raise ValueError(
-            "binary topology helpers expect shape (N, C, H, W), "
-            f"got {tuple(logits_BCHW.shape)}"
-        )
-
-    probabilities_BCHW = torch.sigmoid(logits_BCHW)
-    targets_BCHW = targets_BCHW.to(
-        device=probabilities_BCHW.device,
-        dtype=probabilities_BCHW.dtype,
-    )
-    topology_mask_BCHW = None
-    if valid_mask is not None:
-        topology_mask_BCHW = valid_mask.to(
-            device=probabilities_BCHW.device,
-            dtype=probabilities_BCHW.dtype,
-        )
-        if tuple(topology_mask_BCHW.shape) != tuple(probabilities_BCHW.shape):
-            raise ValueError(
-                "valid_mask shape must match logits shape, got "
-                f"{tuple(topology_mask_BCHW.shape)} vs "
-                f"{tuple(probabilities_BCHW.shape)}"
-            )
-
-    mask_mode = str(mask_mode).strip().lower()
-    if mask_mode not in {"pre_skeleton", "post_skeleton"}:
-        raise ValueError(
-            "mask_mode must be 'pre_skeleton' or 'post_skeleton', "
-            f"got {mask_mode!r}"
-        )
-    if topology_mask_BCHW is not None and mask_mode == "pre_skeleton":
-        probabilities_BCHW = probabilities_BCHW * topology_mask_BCHW
-        targets_BCHW = targets_BCHW * topology_mask_BCHW
-        topology_mask_BCHW = None
-
-    skeleton_pred_BCHW = _soft_skeletonize_2d(
-        probabilities_BCHW,
-        num_iter=int(num_iter),
-    )
-    skeleton_true_BCHW = _soft_skeletonize_2d(
-        targets_BCHW,
-        num_iter=int(num_iter),
-    )
-    probabilities_eval_BCHW = probabilities_BCHW
-    targets_eval_BCHW = targets_BCHW
-    if topology_mask_BCHW is not None:
-        probabilities_eval_BCHW = probabilities_eval_BCHW * topology_mask_BCHW
-        targets_eval_BCHW = targets_eval_BCHW * topology_mask_BCHW
-        skeleton_pred_BCHW = skeleton_pred_BCHW * topology_mask_BCHW
-        skeleton_true_BCHW = skeleton_true_BCHW * topology_mask_BCHW
-
-    reduce_dims = tuple(int(dimension) for dimension in reduction_dims)
-    smooth = float(smooth)
-    topology_precision = (
-        (skeleton_pred_BCHW * targets_eval_BCHW).sum(dim=reduce_dims) + smooth
-    ) / (skeleton_pred_BCHW.sum(dim=reduce_dims) + smooth)
-    topology_sensitivity = (
-        (skeleton_true_BCHW * probabilities_eval_BCHW).sum(dim=reduce_dims)
-        + smooth
-    ) / (skeleton_true_BCHW.sum(dim=reduce_dims) + smooth)
-    return 1.0 - 2.0 * (topology_precision * topology_sensitivity) / (
-        topology_precision + topology_sensitivity
-    )
-
-
-@dataclass(frozen=True)
-class StitchCLDiceLoss:
-    """Compute a weighted clDice term for one stitched YX batch view."""
-
-    weight: float = 1.0
-    mask_mode: str = "pre_skeleton"
-
-    def compute(self, batch: Any) -> dict[str, torch.Tensor]:
-        cldice_loss = compute_binary_soft_cldice_loss(
-            batch.logits[None, None],
-            batch.targets[None, None],
-            valid_mask=batch.valid_mask[None, None],
-            mask_mode=self.mask_mode,
-            reduction_dims=(1, 2, 3),
-        )[0]
-        return {
-            "loss": float(self.weight) * cldice_loss,
-            "cldice_loss": cldice_loss,
-        }

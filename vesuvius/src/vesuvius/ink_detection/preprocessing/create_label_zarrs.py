@@ -45,14 +45,17 @@ def parse_target_image(path: Path) -> dict[str, object] | None:
     parsed = parse_label_asset_path(normalized)
     if parsed is None:
         return None
-    version_num = int(parsed["version_num"])
-    final_stem_part = path.stem.rsplit("_", 1)[-1].lower()
-    explicit_version = final_stem_part.startswith("v") and final_stem_part[1:].isdigit()
+    unversioned_stem = f"{parsed['prefix']}_{parsed['label_kind']}"
+    version_num = (
+        None
+        if normalized.stem == unversioned_stem
+        else int(parsed["version_num"])
+    )
     prefix_length = len(str(parsed["prefix"]))
     return {
         "prefix": path.stem[:prefix_length],
         "label_kind": parsed["label_kind"],
-        "version_num": version_num if explicit_version else None,
+        "version_num": version_num,
         "extension": path.suffix,
     }
 
@@ -191,13 +194,6 @@ def build_pyramid_with_mode(
     return pyramid
 
 
-def build_pyramid(
-    image_2d: np.ndarray, levels: int = DEFAULT_LEVELS
-) -> list[np.ndarray]:
-    """Build the nearest-neighbor label pyramid used for label assets."""
-    return build_pyramid_with_mode(image_2d, levels=levels)
-
-
 def _iter_block_slices(
     height: int, width: int, *, block_size: int = STREAM_BLOCK_SIZE
 ) -> Iterable[tuple[int, int, int, int]]:
@@ -287,9 +283,7 @@ def _create_ome_zarr_datasets(
     image_shape: tuple[int, int],
     dtype: np.dtype,
     levels: int,
-    chunk_shape: Sequence[int] = DEFAULT_CHUNKS,
     overwrite: bool = False,
-    use_compression: bool = True,
 ) -> list[zarr.Array]:
     if output_path.exists():
         if not overwrite:
@@ -304,17 +298,15 @@ def _create_ome_zarr_datasets(
     group = zarr.open_group(str(output_path), **group_kwargs)
     shapes = _pyramid_shapes(image_shape, levels)
     group.attrs.update(_multiscales_metadata(output_path.stem, len(shapes)))
-    compressor = LABEL_COMPRESSOR if use_compression else None
-    chunks = tuple(int(value) for value in chunk_shape)
     datasets = []
     for level, shape in enumerate(shapes):
         dataset = _create_dataset(
             group,
             str(level),
             shape=shape,
-            chunks=chunks,
+            chunks=DEFAULT_CHUNKS,
             dtype=np.dtype(dtype),
-            compressor=compressor,
+            compressor=LABEL_COMPRESSOR,
         )
         dataset.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
         datasets.append(dataset)
@@ -325,9 +317,7 @@ def write_ome_zarr(
     pyramid: Sequence[np.ndarray],
     output_path: Path,
     *,
-    chunk_shape: Sequence[int] = DEFAULT_CHUNKS,
     overwrite: bool = False,
-    use_compression: bool = True,
 ) -> None:
     """Write an in-memory ZYX pyramid as an explicit Zarr-v2 OME group."""
     if not pyramid:
@@ -337,9 +327,7 @@ def write_ome_zarr(
         image_shape=tuple(int(value) for value in pyramid[0].shape[1:]),
         dtype=pyramid[0].dtype,
         levels=len(pyramid),
-        chunk_shape=chunk_shape,
         overwrite=overwrite,
-        use_compression=use_compression,
     )
     for dataset, array_ZYX in zip(datasets, pyramid):
         dataset[:] = array_ZYX
@@ -490,7 +478,6 @@ def convert_image(
             "status": "skipped",
             "input": str(input_path),
             "output": str(output_path),
-            "additional_outputs": "",
         }
     downsample_mode: Literal["nearest", "mean"] = (
         "mean" if is_composite_image(input_path) else "nearest"
@@ -521,7 +508,6 @@ def convert_image(
         "status": "written",
         "input": str(input_path),
         "output": str(output_path),
-        "additional_outputs": "",
         "downsample_mode": downsample_mode,
         "streamed_tiled_tiff": str(tiled_metadata is not None).lower(),
     }

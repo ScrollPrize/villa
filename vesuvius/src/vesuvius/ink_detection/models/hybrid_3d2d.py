@@ -27,10 +27,6 @@ class LocalDepthFusionStem(nn.Module):
         nn.init.zeros_(self.attention_logits.weight)
         nn.init.zeros_(self.attention_logits.bias)
 
-    @property
-    def output_channels(self) -> int:
-        return 2 * self.channels
-
     def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
         features_BCZYX = self.features(image_BCZYX)
         weights_B1ZYX = torch.softmax(

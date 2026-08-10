@@ -94,10 +94,6 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
         for sample_idx, patch in enumerate(patches):
             source = config.datasets[patch.segment.dataset_idx]
             relpath = patch.segment.segment_relpath
-            if not source.sampling_scroll:
-                raise ValueError(
-                    f"datasets[{patch.segment.dataset_idx}] must define non-empty sampling_scroll"
-                )
             try:
                 physical = source.sampling_physical_segment_keys[relpath]
                 representation = source.sampling_representation_keys[relpath]
@@ -246,13 +242,14 @@ def hierarchical_scroll_segment_weights(
     """Equalize scroll mass, then representation-segment mass within each scroll."""
     if not patches:
         raise ValueError("hierarchical sampling requires at least one patch")
+    for dataset_idx, source in enumerate(config.datasets):
+        if not source.sampling_scroll:
+            raise ValueError(
+                f"datasets[{dataset_idx}] must define non-empty sampling_scroll"
+            )
     keys: list[tuple[str, str]] = []
     for patch in patches:
         source = config.datasets[patch.segment.dataset_idx]
-        if not source.sampling_scroll:
-            raise ValueError(
-                f"datasets[{patch.segment.dataset_idx}] must define non-empty sampling_scroll"
-            )
         keys.append((source.sampling_scroll, patch.segment.segment_relpath))
     patch_counts = Counter(keys)
     segments_by_scroll: dict[str, set[str]] = defaultdict(set)
@@ -300,7 +297,6 @@ def build_sampling_policy(
         generator = torch.Generator()
         generator.manual_seed(config.sampling.seed)
         return SamplingPolicy(
-            strategy=strategy,
             shuffle=True,
             generator=generator,
             audit={"strategy": strategy, "patches": len(patches)},
@@ -316,7 +312,6 @@ def build_sampling_policy(
             generator=generator,
         )
         return SamplingPolicy(
-            strategy=strategy,
             generator=generator,
             sampler=sampler,
             audit=audit,
@@ -325,7 +320,6 @@ def build_sampling_policy(
         patches, config, batch_size=batch_size
     )
     return SamplingPolicy(
-        strategy=strategy,
         batch_sampler=batch_sampler,
         audit=batch_sampler.definition_audit(),
     )

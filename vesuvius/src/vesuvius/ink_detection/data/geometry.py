@@ -178,7 +178,6 @@ def select_flat_pixels_via_stored_resolution(
     coarse_valid: np.ndarray,
     native_coordinate_scale: float = 1.0,
     flat_grid_stride: int = 1,
-    return_halo: bool = False,
     required: bool = True,
 ):
     """Refine a coarse tifxyz intersection to an exact full-grid support window."""
@@ -212,21 +211,7 @@ def select_flat_pixels_via_stored_resolution(
         base_x0 + local_x0,
         base_x0 + local_x1,
     )
-    if not return_halo:
-        return support_bbox, support, support_valid
-    halo_y0, halo_y1 = max(0, local_y0 - 1), min(positions_zyx.shape[0], local_y1 + 1)
-    halo_x0, halo_x1 = max(0, local_x0 - 1), min(positions_zyx.shape[1], local_x1 + 1)
-    return (
-        support_bbox,
-        support,
-        support_valid,
-        positions_zyx[halo_y0:halo_y1, halo_x0:halo_x1],
-        valid[halo_y0:halo_y1, halo_x0:halo_x1],
-        (
-            slice(local_y0 - halo_y0, local_y1 - halo_y0),
-            slice(local_x0 - halo_x0, local_x1 - halo_x0),
-        ),
-    )
+    return support_bbox, support, support_valid
 
 
 def project_flat_patch(
@@ -277,50 +262,6 @@ def project_surface_distance(
     return np.clip(1.0 - distance / max_distance_voxels, 0.0, 1.0).astype(
         np.float32, copy=False
     )
-
-
-def compute_normals_from_position_halo(
-    positions_zyx_halo: np.ndarray,
-    valid_halo: np.ndarray,
-    trim_slices: tuple[slice, slice],
-) -> np.ndarray:
-    """Compute centered-difference local normals in ZYX order."""
-    positions = np.asarray(positions_zyx_halo, dtype=np.float32)
-    valid = np.asarray(valid_halo, dtype=bool)
-    z, y, x = positions[..., 0], positions[..., 1], positions[..., 2]
-    nx = np.full(z.shape, np.nan, dtype=np.float32)
-    ny = np.full(z.shape, np.nan, dtype=np.float32)
-    nz = np.full(z.shape, np.nan, dtype=np.float32)
-    if z.shape[0] >= 3 and z.shape[1] >= 3:
-        interior = (
-            valid[1:-1, 1:-1]
-            & valid[1:-1, :-2]
-            & valid[1:-1, 2:]
-            & valid[:-2, 1:-1]
-            & valid[2:, 1:-1]
-        )
-        tx_x, tx_y, tx_z = (
-            x[1:-1, 2:] - x[1:-1, :-2],
-            y[1:-1, 2:] - y[1:-1, :-2],
-            z[1:-1, 2:] - z[1:-1, :-2],
-        )
-        ty_x, ty_y, ty_z = (
-            x[2:, 1:-1] - x[:-2, 1:-1],
-            y[2:, 1:-1] - y[:-2, 1:-1],
-            z[2:, 1:-1] - z[:-2, 1:-1],
-        )
-        n_x = ty_y * tx_z - ty_z * tx_y
-        n_y = ty_z * tx_x - ty_x * tx_z
-        n_z = ty_x * tx_y - ty_y * tx_x
-        magnitude = np.sqrt(n_x**2 + n_y**2 + n_z**2)
-        magnitude = np.where(magnitude > 1e-10, magnitude, np.nan)
-        nx[1:-1, 1:-1] = np.where(interior, n_x / magnitude, np.nan)
-        ny[1:-1, 1:-1] = np.where(interior, n_y / magnitude, np.nan)
-        nz[1:-1, 1:-1] = np.where(interior, n_z / magnitude, np.nan)
-    rows, columns = trim_slices
-    return np.stack(
-        [nz[rows, columns], ny[rows, columns], nx[rows, columns]], axis=-1
-    ).astype(np.float32, copy=False)
 
 
 @njit(cache=True)

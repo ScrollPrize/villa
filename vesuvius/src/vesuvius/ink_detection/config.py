@@ -212,13 +212,13 @@ class FlatZWindowJitterConfig:
     window_depth: int | None = None
     max_offset: int = 0
     probability: float = 1.0
-    padding: str = "forbidden"
 
     @classmethod
     def from_mapping(cls, value: Any) -> "FlatZWindowJitterConfig":
         authored = {} if value is None else value
         if not isinstance(authored, Mapping):
             raise TypeError("flat_z_window_jitter must be an object or null")
+        padding = str(authored.get("padding", "forbidden")).strip().lower()
         result = cls(
             enabled=bool(authored.get("enabled", False)),
             window_depth=(
@@ -228,13 +228,12 @@ class FlatZWindowJitterConfig:
             ),
             max_offset=int(authored.get("max_offset", 0)),
             probability=float(authored.get("probability", 1.0)),
-            padding=str(authored.get("padding", "forbidden")).strip().lower(),
         )
         if result.max_offset < 0:
             raise ValueError("flat_z_window_jitter.max_offset must be >= 0")
         if not 0.0 <= result.probability <= 1.0:
             raise ValueError("flat_z_window_jitter.probability must be in [0, 1]")
-        if result.padding != "forbidden":
+        if padding != "forbidden":
             raise ValueError("flat_z_window_jitter.padding must be 'forbidden'")
         return result
 
@@ -244,7 +243,6 @@ class PatchFindingConfig:
     overlap: float
     min_labeled_coverage: float
     kind: PatchFindingType = "default"
-    unlabeled_min_data_coverage: float = 0.15
     scan_scale: int | None = None
     tile_size: int | None = None
     stride: int | None = None
@@ -252,6 +250,11 @@ class PatchFindingConfig:
 
     @classmethod
     def from_mapping(cls, authored: Mapping[str, Any]) -> "PatchFindingConfig":
+        if "unlabeled_patch_min_data_coverage" in authored:
+            raise ValueError(
+                "unlabeled discovery threshold is fixed at 0.25; "
+                "unlabeled_patch_min_data_coverage is not honored"
+            )
         kind = str(authored.get("patch_finding_type", "default")).strip().lower()
         if kind not in {"default", "subtiling"}:
             raise ValueError(
@@ -261,9 +264,6 @@ class PatchFindingConfig:
             kind=kind,
             overlap=float(authored["patch_overlap"]),
             min_labeled_coverage=float(authored["patch_min_labeled_coverage"]),
-            unlabeled_min_data_coverage=float(
-                authored.get("unlabeled_patch_min_data_coverage", 0.15)
-            ),
             scan_scale=(
                 None
                 if authored.get("patch_finding_scale") is None
@@ -327,7 +327,6 @@ class AugmentationConfig:
 
 @dataclass(frozen=True)
 class Full3DConfig:
-    projection_half_thickness: float = 1.0
     label_projection_half_thickness: float | None = None
     background_projection_half_thickness: float | None = None
     support_grid_max_distance: float | None = 64.0
@@ -352,7 +351,6 @@ class Full3DConfig:
             raise ValueError("full_3d projection half-thickness values must be >= 0")
         max_distance = pooling.get("support_grid_max_distance", 64.0)
         return cls(
-            projection_half_thickness=default,
             label_projection_half_thickness=label,
             background_projection_half_thickness=background,
             support_grid_max_distance=(
@@ -598,24 +596,17 @@ class InkDataConfig:
 
 @dataclass(frozen=True)
 class TargetConfig:
-    """One output head and its checkpointed activation/projection contract."""
+    """One validated output head's frozen authored builder mapping."""
 
-    name: Literal["ink"]
-    out_channels: int
-    activation: Literal["none"]
-    z_projection_mode: str
     _settings: Mapping[str, Any] = field(repr=False)
 
     @classmethod
     def from_mapping(
         cls,
-        name: str,
         authored: Any,
         *,
         model_config: Mapping[str, Any],
     ) -> "TargetConfig":
-        if name != "ink":
-            raise ValueError(f"Unsupported target {name!r}; expected 'ink'")
         if not isinstance(authored, Mapping):
             raise TypeError("targets.ink must be an object")
         out_channels = int(authored["out_channels"])
@@ -633,27 +624,37 @@ class TargetConfig:
         projection = authored.get("z_projection")
         if projection is not None and not isinstance(projection, Mapping):
             raise TypeError("targets.ink.z_projection must be an object")
+        authored_modes = []
         if isinstance(projection, Mapping) and "mode" in projection:
-            projection_mode = str(projection["mode"]).strip().lower()
-        elif "z_projection_mode" in authored:
-            projection_mode = str(authored["z_projection_mode"]).strip().lower()
-        else:
-            projection_mode = str(
-                model_config.get("z_projection_mode", "none")
-            ).strip().lower()
-        if projection_mode in {"", "off", "false", "0"}:
-            projection_mode = "none"
-        allowed = {"none", "max", "mean", "logsumexp", "learned_mlp"}
-        if projection_mode not in allowed:
+            authored_modes.append(str(projection["mode"]).strip().lower())
+        if "z_projection_mode" in authored:
+            authored_modes.append(
+                str(authored["z_projection_mode"]).strip().lower()
+            )
+        if "z_projection_mode" in model_config:
+            authored_modes.append(
+                str(model_config["z_projection_mode"]).strip().lower()
+            )
+        allowed = {
+            "",
+            "0",
+            "false",
+            "learned_mlp",
+            "logsumexp",
+            "max",
+            "mean",
+            "none",
+            "off",
+        }
+        invalid_mode = next(
+            (mode for mode in authored_modes if mode not in allowed), None
+        )
+        if invalid_mode is not None:
             raise ValueError(
                 "Unsupported targets.ink z_projection mode "
-                f"{projection_mode!r}; allowed: {', '.join(sorted(allowed))}"
+                f"{invalid_mode!r}; allowed: {', '.join(sorted(allowed))}"
             )
         return cls(
-            name="ink",
-            out_channels=out_channels,
-            activation="none",
-            z_projection_mode=projection_mode,
             _settings=_FrozenMapping(
                 {
                     str(key): _freeze_json(value)
@@ -968,12 +969,9 @@ class InkConfig:
             raise ValueError(
                 f"Unsupported target {unknown_targets[0]!r}; expected 'ink'"
             )
-        if "ink" not in raw_targets:
-            raise ValueError("targets must contain 'ink'")
         targets = _FrozenMapping(
             {
                 "ink": TargetConfig.from_mapping(
-                    "ink",
                     raw_targets["ink"],
                     model_config=canonical.get("model_config") or {},
                 )
@@ -1234,7 +1232,6 @@ class TrainingConfig:
     batch_size: int
     model_crop_size: tuple[int, int, int]
     loader_patch_size: tuple[int, int, int]
-    stitch_factor: int
     use_stitched_forward: bool
     stitched_gradient_checkpointing: bool
     ema: EmaConfig
@@ -1313,7 +1310,6 @@ class TrainingConfig:
             batch_size=batch_size,
             model_crop_size=model_crop_size,
             loader_patch_size=loader_patch_size,
-            stitch_factor=stitch_factor,
             use_stitched_forward=bool(canonical["use_stitched_forward"]),
             stitched_gradient_checkpointing=bool(
                 canonical["stitched_gradient_checkpointing"]
@@ -1351,12 +1347,6 @@ class TrainingConfig:
             verify_finite_gradients_steps=verify_finite,
             max_amp_overflow_events=max_overflows,
         )
-
-    @classmethod
-    def from_authored_mapping(
-        cls, authored: Mapping[str, Any]
-    ) -> "TrainingConfig":
-        return cls.from_mapping(resolve_training_mapping(authored))
 
     @property
     def surface_mask_channel(self) -> bool:

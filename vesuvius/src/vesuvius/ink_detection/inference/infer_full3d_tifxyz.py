@@ -69,8 +69,6 @@ class NativeModelBundle:
     model: Any
     device: Any
     amp_dtype: Any
-    selected_state: str
-    compile_enabled: bool
 
 
 def build_parser():
@@ -112,7 +110,6 @@ def build_parser():
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
     parser.add_argument("--gpus", default=None)
-    parser.add_argument("--foreground-channel", type=int, default=1)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--max-target-chunks", type=int, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
@@ -515,9 +512,8 @@ def logits_to_probabilities(
     logits,
     *,
     patch_size_zyx: tuple[int, int, int],
-    foreground_channel: int,
 ):
-    """Resize BCZYX logits and return one foreground-probability channel."""
+    """Resize one-channel BCZYX logits and return sigmoid probabilities."""
 
     import torch.nn.functional as F
 
@@ -527,16 +523,7 @@ def logits_to_probabilities(
         logits = F.interpolate(
             logits.float(), size=patch_size_zyx, mode="trilinear", align_corners=False
         )
-    channels = int(logits.shape[1])
-    if channels == 1:
-        return logits.float().sigmoid()
-    if channels == 2:
-        return logits.float().softmax(dim=1)[:, 1:2]
-    if not 0 <= int(foreground_channel) < channels:
-        raise ValueError(
-            f"foreground_channel={foreground_channel} is invalid for {channels} channels"
-        )
-    return logits.float().softmax(dim=1)[:, foreground_channel : foreground_channel + 1]
+    return logits.float().sigmoid()
 
 
 def predict_batch(
@@ -546,7 +533,6 @@ def predict_batch(
     variants: Sequence[tuple[int, ...]],
     tta_batch_size: int | None,
     patch_size_zyx: tuple[int, int, int],
-    foreground_channel: int,
 ):
     """Average restored mirror predictions for one BCZYX image batch."""
 
@@ -555,7 +541,6 @@ def predict_batch(
         return logits_to_probabilities(
             model(images),
             patch_size_zyx=patch_size_zyx,
-            foreground_channel=foreground_channel,
         )
     import torch
 
@@ -568,7 +553,6 @@ def predict_batch(
         probabilities = logits_to_probabilities(
             model(augmented),
             patch_size_zyx=patch_size_zyx,
-            foreground_channel=foreground_channel,
         ).reshape(len(group), batch_size, -1, *patch_size_zyx)
         for index, axes in enumerate(group):
             restored = flip_spatial(probabilities[index], axes)
@@ -1045,7 +1029,7 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     )
     from vesuvius.ink_detection.models.model import make_model
 
-    selected_state, state = select_native_inference_weights(
+    _, state = select_native_inference_weights(
         payload, source=args.checkpoint
     )
     base_model = make_model(config)
@@ -1082,7 +1066,7 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
             return logits
 
     model = NativeTargetModel(base_model.eval()).eval()
-    model, device, compile_enabled = prepare_model_for_inference(
+    model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
         compile_model=bool(args.compile_model),
@@ -1092,8 +1076,6 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
         model=model,
         device=device,
         amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
-        selected_state=selected_state,
-        compile_enabled=compile_enabled,
     )
 
 
@@ -1150,7 +1132,6 @@ def run_native_inference(
                 variants=variants,
                 tta_batch_size=args.tta_batch_size,
                 patch_size_zyx=plan.patch_size_zyx,
-                foreground_channel=int(args.foreground_channel),
             )
             probability_values = probabilities[:, 0].cpu().numpy()
             metadata_values = metadata.cpu().numpy()

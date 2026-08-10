@@ -13,7 +13,6 @@ from vesuvius.ink_detection.training.losses import (
     CompositeLoss,
     LabelSmoothedDCAndBCELoss,
     WeightedLossTerm,
-    compute_binary_soft_cldice_loss,
     create_loss,
 )
 
@@ -186,83 +185,3 @@ def test_configured_composite_retains_term_weights_and_smoothing():
     assert loss.terms[0].metric_name == "ink base"
     assert loss.terms[0].module.weight_ce == 0.5
     assert loss.terms[0].module.bce_label_smoothing == 0.5
-
-
-@pytest.mark.parametrize("mask_mode", ["pre_skeleton", "post_skeleton"])
-def test_cldice_all_invalid_mask_has_zero_value_and_gradient(mask_mode):
-    logits_BCHW = torch.randn((1, 1, 5, 5), requires_grad=True)
-    targets_BCHW = torch.ones_like(logits_BCHW)
-    valid_BCHW = torch.zeros_like(logits_BCHW)
-
-    loss = compute_binary_soft_cldice_loss(
-        logits_BCHW,
-        targets_BCHW,
-        valid_mask=valid_BCHW,
-        mask_mode=mask_mode,
-    ).sum()
-    loss.backward()
-
-    torch.testing.assert_close(loss, torch.tensor(0.0), rtol=0.0, atol=0.0)
-    torch.testing.assert_close(
-        logits_BCHW.grad,
-        torch.zeros_like(logits_BCHW),
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
-def test_cldice_center_pixel_has_nonzero_one_fifteenth_loss():
-    probabilities_BCHW = torch.full((1, 1, 3, 3), 0.25)
-    probabilities_BCHW[0, 0, 1, 1] = 0.75
-    targets_BCHW = torch.zeros_like(probabilities_BCHW)
-    targets_BCHW[0, 0, 1, 1] = 1.0
-
-    actual = compute_binary_soft_cldice_loss(
-        torch.logit(probabilities_BCHW),
-        targets_BCHW,
-        num_iter=0,
-    )
-
-    torch.testing.assert_close(
-        actual,
-        torch.tensor([1.0 / 15.0]),
-        rtol=1e-6,
-        atol=1e-7,
-    )
-
-
-def test_cldice_pre_and_post_skeleton_masks_are_numerically_distinct():
-    probabilities_BCHW = torch.full((1, 1, 3, 3), 0.25)
-    probabilities_BCHW[0, 0, 1, 1] = 0.75
-    targets_BCHW = torch.zeros_like(probabilities_BCHW)
-    valid_BCHW = torch.zeros_like(probabilities_BCHW)
-    valid_BCHW[0, 0, 1, 1] = 1.0
-    logits_BCHW = torch.logit(probabilities_BCHW)
-
-    pre = compute_binary_soft_cldice_loss(
-        logits_BCHW,
-        targets_BCHW,
-        valid_mask=valid_BCHW,
-        mask_mode="pre_skeleton",
-        num_iter=0,
-    )
-    post = compute_binary_soft_cldice_loss(
-        logits_BCHW,
-        targets_BCHW,
-        valid_mask=valid_BCHW,
-        mask_mode="post_skeleton",
-        num_iter=0,
-    )
-
-    torch.testing.assert_close(
-        pre,
-        torch.tensor([3.0 / 11.0]),
-        rtol=1e-6,
-        atol=1e-7,
-    )
-    torch.testing.assert_close(
-        post,
-        torch.tensor([1.0 / 5.0]),
-        rtol=1e-6,
-        atol=1e-7,
-    )

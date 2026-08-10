@@ -64,13 +64,13 @@ def to_uint8_probability(probability_HW) -> np.ndarray:
 def _pad_bottom_right(
     image_HW: np.ndarray,
     *,
-    target_height: int | None = None,
-    target_width: int | None = None,
+    target_height: int,
+    target_width: int,
 ) -> np.ndarray:
     image_HW = np.asarray(image_HW, dtype=np.uint8)
     height, width = image_HW.shape
-    target_height = height if target_height is None else int(target_height)
-    target_width = width if target_width is None else int(target_width)
+    target_height = int(target_height)
+    target_width = int(target_width)
     padding = (
         (0, max(0, target_height - height)),
         (0, max(0, target_width - width)),
@@ -93,29 +93,36 @@ def stack_preview_tiles(
     for index, tile in enumerate(tiles):
         if index:
             pieces.append(gap)
-        pieces.append(_pad_bottom_right(tile, target_width=maximum_width))
+        pieces.append(
+            _pad_bottom_right(
+                tile,
+                target_height=int(tile.shape[0]),
+                target_width=maximum_width,
+            )
+        )
     return np.concatenate(pieces, axis=0)
 
 
 def build_panel_grid(
-    rows: list[list[np.ndarray]], gap_size: int = 4
+    tiles: list[np.ndarray], gap_size: int = 4
 ) -> np.ndarray | None:
-    """Join panels horizontally and rows vertically with fixed zero gaps."""
+    """Join one row of preview panels with fixed zero gaps."""
 
-    row_tiles = []
-    for row in rows:
-        if not row:
-            continue
-        row_height = max(int(tile.shape[0]) for tile in row)
-        pieces = []
-        for index, tile in enumerate(row):
-            pieces.append(_pad_bottom_right(tile, target_height=row_height))
-            if index + 1 < len(row):
-                pieces.append(
-                    np.zeros((row_height, gap_size), dtype=np.uint8)
-                )
-        row_tiles.append(np.concatenate(pieces, axis=1))
-    return stack_preview_tiles(row_tiles, gap_size=gap_size)
+    if not tiles:
+        return None
+    row_height = max(int(tile.shape[0]) for tile in tiles)
+    pieces = []
+    for index, tile in enumerate(tiles):
+        pieces.append(
+            _pad_bottom_right(
+                tile,
+                target_height=row_height,
+                target_width=int(tile.shape[1]),
+            )
+        )
+        if index + 1 < len(tiles):
+            pieces.append(np.zeros((row_height, gap_size), dtype=np.uint8))
+    return np.concatenate(pieces, axis=1)
 
 
 @dataclass
@@ -159,11 +166,11 @@ class PreviewAccumulator:
             strict=True,
         ):
             tile = build_panel_grid(
-                [[
+                [
                     to_uint8_image(input_HW),
                     to_uint8_label(label_HW, ignore_HW),
                     to_uint8_probability(probability_HW),
-                ]],
+                ],
                 gap_size=self.gap_size,
             )
             if tile is not None:
