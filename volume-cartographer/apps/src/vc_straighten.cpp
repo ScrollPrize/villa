@@ -23,6 +23,7 @@
 // bilinear resampling, matching the Python reference.
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "utils/Json.hpp"
 
@@ -93,6 +94,23 @@ static Grid loadGrid(const fs::path& dir)
     return g;
 }
 
+// Serialize a bbox the way QuadSurface::save() writes its own: [[lo],[hi]].
+static Json bboxToJson(const Rect3D& bb)
+{
+    auto lo = Json::array();
+    lo.push_back(bb.low[0]);
+    lo.push_back(bb.low[1]);
+    lo.push_back(bb.low[2]);
+    auto hi = Json::array();
+    hi.push_back(bb.high[0]);
+    hi.push_back(bb.high[1]);
+    hi.push_back(bb.high[2]);
+    auto bbox = Json::array();
+    bbox.push_back(std::move(lo));
+    bbox.push_back(std::move(hi));
+    return bbox;
+}
+
 static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcdir)
 {
     if (fs::exists(outdir))
@@ -127,7 +145,17 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
         Json b; b = (double)g.scale[1]; arr.push_back(b);
         meta["scale"] = arr;
     }
-    meta.erase("bbox");
+    // Recompute rather than erase: straightening moves every point, so the
+    // input's bbox is stale, but dropping the key entirely makes the output
+    // invisible to any tool gating on meta.contains("bbox") — e.g. three
+    // checks in vc_grow_seg_from_seed.cpp, and vc_seg_add_overlap.cpp's own
+    // directory discovery (is_tifxyz_dir requires it). See villa#1321.
+    Rect3D bb;
+    if (bbox_of_valid_points(P, bb)) {
+        meta["bbox"] = bboxToJson(bb);
+    } else {
+        meta.erase("bbox");  // genuinely no valid points left; nothing to report
+    }
     std::ofstream out(outdir / "meta.json");
     out << meta.dump();
 }

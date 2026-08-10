@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
 
 #include "utils/Json.hpp"
@@ -170,7 +171,28 @@ int main(int argc, char* argv[])
     }
 
     Json meta = Json::parse_file(src / "meta.json");
-    if (meta.contains("bbox")) meta.erase("bbox");
+    // Recompute rather than erase. Trimming drops rows/columns, so the input's
+    // bbox is stale — but dropping the key outright makes the segment invisible
+    // to everything gating on its presence: is_tifxyz_dir() in
+    // vc_seg_add_overlap.cpp (directory discovery) and three checks in
+    // vc_grow_seg_from_seed.cpp all skip such a segment silently.
+    Rect3D bb;
+    if (bbox_of_valid_points(trimmed, bb)) {
+        auto lo = Json::array();
+        lo.push_back(bb.low[0]);
+        lo.push_back(bb.low[1]);
+        lo.push_back(bb.low[2]);
+        auto hi = Json::array();
+        hi.push_back(bb.high[0]);
+        hi.push_back(bb.high[1]);
+        hi.push_back(bb.high[2]);
+        auto bbox = Json::array();
+        bbox.push_back(std::move(lo));
+        bbox.push_back(std::move(hi));
+        meta["bbox"] = std::move(bbox);
+    } else if (meta.contains("bbox")) {
+        meta.erase("bbox");  // no valid points left; stale is worse than absent
+    }
     {
         std::ofstream out(stage / "meta.json");
         out << meta.dump(4) << std::endl;

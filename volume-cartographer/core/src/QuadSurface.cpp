@@ -2585,6 +2585,27 @@ Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)
     return res;
 }
 
+bool bbox_of_valid_points(const cv::Mat_<cv::Vec3f>& points, Rect3D& out)
+{
+    bool any = false;
+    Rect3D res;
+    for (int j = 0; j < points.rows; j++)
+        for (int i = 0; i < points.cols; i++) {
+            const cv::Vec3f& p = points(j, i);
+            if (p[0] == -1)
+                continue;
+            if (!any) {
+                res = {p, p};
+                any = true;
+            } else
+                res = expand_rect(res, p);
+        }
+
+    if (any)
+        out = res;
+
+    return any;
+}
 
 bool intersect(const Rect3D &a, const Rect3D &b)
 {
