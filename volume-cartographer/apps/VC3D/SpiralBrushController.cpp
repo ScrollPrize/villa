@@ -4,6 +4,9 @@
 #include "VCSettings.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
+// cv::boundingRect moved from imgproc into the geometry module in OpenCV 5;
+// OpenCvCompat pulls that header in on 5 and is a no-op on 4.
+#include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QDateTime>

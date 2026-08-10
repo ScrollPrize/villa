@@ -288,7 +288,7 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     'the composite must receive protected values only through explicit inputs',
   );
   assert.doesNotMatch(rehearsal, /google-github-actions\/auth/);
-  assert.equal([...action.matchAll(/google-github-actions\/auth@/g)].length, 2);
+  assert.equal([...action.matchAll(/google-github-actions\/auth@/g)].length, 4);
   assert.match(action, /create_credentials_file: false/);
   assert.match(action, /export_environment_variables: false/);
   assert.match(action, /printf '::add-mask::%s\\n' "\$value"/);
@@ -313,15 +313,23 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     action,
     /test "\$PROGRESS_PRIZE_FOLDER_ID" = "\$PROGRESS_PRIZE_STAGING_FOLDER_ID"/,
   );
-  assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 2);
+  assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 4);
   assert.doesNotMatch(action, /access_token_scopes: >-/);
   assert.match(
     action,
-    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\.readonly/,
+    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly/,
   );
   assert.match(
     action,
-    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n/,
+    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\n/,
+  );
+  assert.match(
+    action,
+    /Authenticate append-only response sync without a credential file[\s\S]*access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\n/,
+  );
+  assert.match(
+    action,
+    /Authenticate marker-only reconciliation without a credential file[\s\S]*access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly\n/,
   );
   assert.doesNotMatch(action, /drive\.file/);
   assert.match(action, /automation-cli\.mjs/);

@@ -1108,7 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
     _save_noremote(local_root, st.snapshot_noremote())
 
     # Store S3 source URI in local .zattrs so predict3d can re-download
-    _store_download_meta(local_root, remote_root, anon, args.region)
+    initialize_download_source(local_root, remote_root, anon, args.region)
 
     snap = st.snapshot()
     sys.stderr.write("\n")
@@ -1124,9 +1124,10 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if snap["failed"] else 0
 
 
-def _store_download_meta(local_root: str, source_uri: str, anon: bool,
-                         region: str | None = None) -> None:
+def initialize_download_source(local_root: str, source_uri: str, anon: bool,
+                               region: str | None = None) -> None:
     """Write _download metadata into local .zattrs for later re-download."""
+    os.makedirs(local_root, exist_ok=True)
     zattrs_path = os.path.join(local_root, ".zattrs")
     if os.path.isfile(zattrs_path):
         with open(zattrs_path) as f:

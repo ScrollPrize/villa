@@ -1,84 +1,152 @@
-# Plan: parallel native accumulation
+# Plan: minimize manager staging and Atlas inference ingestion
 
-## Mechanical refactor
+## Scope and invariants
 
-1. Separate current `_accumulate_group` into coordinator-side chunk planning
-   and an execution primitive. Preserve exact clipping, resume masks, shared
-   weight semantics, product selection, activity accounting, and canonical
-   ordering. Validate this synchronous refactor before enabling processes.
-2. Describe an accumulation task entirely with bounded descriptors: tile/result
-   slot, scale, global chunk origin, logical ring destination slices, result
-   source slices, product names, weight/product mmap descriptors, and task IDs.
+1. Preserve the existing Atlas copy-first `lasagna` flow. The internal Atlas
+   entry stores a private S3 origin; data-sync resolves it, copies to the
+   canonical public Lasagna path, adds the public origin, and public metadata
+   export retains only `public-read` origins.
+2. Preserve the existing origin representation. `DataOrigin.path` is relative
+   to its `AccessRoot.url`; Atlas joins them as
+   `access_root.url.rstrip('/') + '/' + origin.path.lstrip('/')`. For the
+   current run this resolves
+   `s3://philodemos` plus
+   `hendrik/lasagna/inference/<run_uuid>/` to the complete private S3 URI.
+3. Keep the approved UUID staging layout, `_INCOMPLETE`, portable
+   `inference.json`, automatic model registration, `fiber3d/unet` model
+   architecture, snapshot path/SHA-256, numeric model references, and the
+   Lasagna 3--4 product validation requiring `nx` and `ny`.
+4. Remove only two unneeded extensions:
+   - remote `upload-manifest.json` and its manager bookkeeping;
+   - duplicated portable provenance in Atlas `DataEntry.creation_info`.
 
-## Native kernel
+## Marker-only rclone staging
 
-3. Add a pybind11 `accumulator_add` extension and package it with Lasagna. It
-   accepts strided 3D float16/float32 destination views and float32 source
-   views, releases the GIL, and performs in-place add with the same per-add
-   rounding implied by destination dtype.
-4. On GCC/Clang x86, compile an isolated target-attributed AVX-512F+F16C row
-   kernel that converts half to float32, adds float32, and rounds-to-nearest-even
-   back to half; F16C is not treated as half arithmetic. Runtime-dispatch only
-   when matching CPU support is present. Keep the module
-   baseline free of global `-mavx512*` flags. Provide portable IEEE-half scalar
-   conversion/add and float32 scalar/vector-friendly fallback for macOS,
-   arm64, older x86, unsupported compilers, and missing extension. Report the
-   selected backend once; never fail inference merely because SIMD is absent.
+5. Keep the fixed local bundle inventory used for `rclone --files-from-raw`,
+   but reduce it to the information needed to name files. Do not recursively
+   hash every Zarr chunk for upload transaction metadata.
+6. Simplify manager staging to:
+   - put `<prefix>/_INCOMPLETE` before starting transfer;
+   - invoke the configured `rclone copy` over the fixed inventory;
+   - retain `_INCOMPLETE` on every failure or interruption;
+   - delete `_INCOMPLETE` only after rclone exits successfully.
+   `_INCOMPLETE` is a manager-side transaction/commit guard. Atlas data-sync
+   does not inspect it, so failed staging must never call the Atlas ingester.
+7. Let rclone provide retry/resume/idempotent transfer behavior. A repeated
+   manager upload runs rclone again; already transferred files are skipped by
+   the configured comparison flags. Do not add a second remote completion
+   record.
+8. Remove `UPLOAD_MANIFEST`, manifest put/get/verification, bundle-digest
+   calculation, per-file upload SHA-256, same-UUID manifest collision checks,
+   and manifest-specific reserved-name handling. Keep `_INCOMPLETE` reserved in
+   local bundles so artifact content cannot collide with the manager marker.
+   Retain checkpoint SHA-256 and
+   portable inference validation because those identify the model and bundle,
+   not the upload transaction.
+9. Remove `bundle_digest`, `manifest`, and the ambiguous `uploaded` boolean from
+   newly persisted manager upload metadata and from human/JSON validation
+   output. Keep staging URL and upload lifecycle; every upload command invokes
+   a resumable rclone transfer attempt.
+10. Document the deliberate marker-only limitation: `rclone copy --size-only`
+    neither detects changed same-size objects nor deletes stale destination
+    objects. This is safe only under the existing immutable run UUID/bundle
+    contract. Validate that completed bundle identity/content is immutable and
+    never reuse a run UUID for changed artifacts.
 
-## Process pipeline
+## Lean Atlas ingestion
 
-5. Add persistent spawn-context accumulator workers after GPU workers and
-   before TensorStore context creation. Workers attach existing result shared
-   slots, lazily reopen accumulator mmaps, set native libraries to one thread,
-   and invoke the native primitive. Queues carry descriptors only.
-6. Deterministically map `(scale, chunk_z, chunk_y, chunk_x)` to one worker with
-   a stable integer formula (never Python hash) and one bounded FIFO per worker.
-   The coordinator dispatches tiles canonically, calls ring `ensure` before
-   dispatch, and only that owner updates a chunk, preserving per-chunk order
-   without locks or races. Weight and all missing products for one chunk form
-   one task.
-7. Split dispatch from canonical completion. Reference-count every GPU result
-   slot by its accumulation tasks; release it only after all acknowledgements.
-   Consume completed events canonically before progress/row flush. Do not allow
-   dispatch to reserve more rolling Z generations than the existing active-row
-   plus frozen-flush capacity. Flush waits only for tasks that precede its
-   frontier by construction.
-   Queue submission is nonblocking and pumps acknowledgements under backpressure.
-   Activity becomes committed only after successful acknowledgements; failures
-   invalidate the event and cannot expose provisional data to flush.
-8. Add `--accumulator-workers` to both frontends and shared API: default
-   `min(cpu_count, 32)`, zero restores synchronous accumulation. Keep queues and
-   outstanding tasks bounded by result slots and a small per-worker window.
-   Add startup, throughput, queue-wait, work-sum, and backend diagnostics.
-9. On errors/interrupts, stop GPU assignment, drain/cancel no new work,
-   terminate accumulator workers if necessary, then stop flush workers and
-   clean queues/shared memory/mmaps without semaphore leaks or hangs.
-   Worker mmap/shared-memory caches close on every exit; normal sentinels,
-   timeout escalation, termination, and queue feeder joins are explicit.
+11. Parse and validate `inference.json` as before, but do not construct or pass
+    Atlas `creation_info` from schema version, run UUID, timestamps, catalog
+    hash, code commit, inference settings, or artifact inventory.
+12. Ingest exactly the existing `lasagna` data-entry shape:
 
-## Testing and measurement
+    ```json
+    {
+      "type": "lasagna",
+      "origins": [{
+        "path": "hendrik/lasagna/inference/<run_uuid>/",
+        "access_roots": [{
+          "type": "s3",
+          "url": "s3://philodemos",
+          "usage": "private-s3"
+        }]
+      }],
+      "parameters": {
+        "model_id": "<numeric-model-id>",
+        "level": "<input-OME-group>"
+      }
+    }
+    ```
 
-10. Native tests: exhaustive/representative half boundaries, subnormals,
-    signed cancellation, overflow/NaN/Inf behavior, arbitrary row strides,
-    float32 exactness, backend reporting, portable fallback, and native-vs-
-    NumPy per-add results. Require contiguous X rows for SIMD, support unaligned
-    rows/YZ strides/wrap pieces/tails, validate writable/nonoverlapping buffers,
-    and expose forceable scalar/SIMD selection. Compile without global ISA flags.
-11. Pipeline tests: synchronous mechanical equivalence, deterministic chunk
-    ownership/order, multi-process speed/concurrency, result-slot lifetime,
-    rolling wrap, sparse/resume, multi-product shared weight, async flush
-    overlap, worker exception/hard-exit/interrupt cleanup, and serial plus
-    multi-device Fiber/Lasagna output comparisons for FP16 and FP32.
-12. Benchmark native-kernel throughput separately from process-pipeline
-    throughput using identical fixtures for NumPy FP16/FP32, native scalar/SIMD, and
-    1/8/32 accumulation workers. Report command, CPU, backing, iterations,
-    mean/median/min/max, effective task concurrency, and end-to-end controlled
-    crop if the environment permits. Do not claim speedup without results.
+13. Keep detailed provenance solely in staged `inference.json`. Keep the
+    separate approved minimal Atlas model record unchanged.
+14. Preserve strict idempotency for Atlas entries: an existing entry with the
+    same type and parameters must match the lean origin entry; conflicting
+    origins remain an error. Do not silently preserve obsolete
+    `creation_info` during re-ingestion.
 
-## Specs/docs/changelog/workflow
+## Existing-state cleanup
 
-13. Update specs for deterministic process-owned chunks, native runtime
-    dispatch/portable fallback, slot/frontier lifecycle, boundedness, numerical
-    behavior, and CLI defaults. Document architecture, tuning, installation,
-    diagnostics, limitations, and benchmarking. Update status, task log, and
-    changelog, explicitly recording any deferred test or platform limitation.
+15. Discover every manager run whose local record references
+    `upload-manifest.json` and every configured staging prefix that contains
+    that sidecar. Report the exact set before mutation.
+16. Also inspect/report whether a transaction manifest was already copied to a
+    canonical or public destination. Do not mutate published data as part of
+    this cleanup without separate user direction.
+17. For private staged bundles that are otherwise complete, delete only the remote
+    `upload-manifest.json`; do not touch `inference.json`, Lasagna manifests,
+    OME-Zarr objects, or public destinations. `_INCOMPLETE` must remain absent
+    for completed uploads.
+18. Remove obsolete local `upload.manifest`, `upload.bundle_digest`, and
+    `upload.uploaded` fields
+    from affected run metadata atomically, preserving lifecycle and staging
+    URL.
+19. Remove only the newly copied `creation_info` from already ingested Fiber
+    Lasagna entries. Preserve type, origins, parameters, all legacy Lasagna
+    entries, models, and copy/publication information. Perform this as a
+    reported one-off cleanup rather than shipping a permanent migration CLI.
+
+## Tests and validation
+
+20. Manager unit tests must cover successful marker creation/removal, marker
+    retention on rclone failure, safe rerun through rclone, absence of manifest
+    reads/writes and digest fields, exact fixed file-list transfer, reserved
+    local `_INCOMPLETE`, failed staging never invoking Atlas ingestion, the
+    immutable run UUID/bundle invariant, and both Fiber and direct Lasagna
+    bundles.
+21. Atlas tests must assert that parsed portable provenance still validates,
+    model registration remains unchanged, and the ingested data entry has no
+    `creation_info`. Test full S3 source reconstruction from access root plus
+    relative origin and verify public export excludes the private origin.
+22. Validate cleanup on copies first. Then run focused Villa manager tests,
+    Atlas inference-bundle/model/config/export tests, `git diff --check`, and
+    compile/import smoke tests. No real inference or public data-sync is
+    required.
+23. Keep commits reviewable: one Villa commit for manager protocol changes and
+    one Atlas commit for lean ingestion/tests. Report remote and local one-off
+    cleanup separately from source commits.
+
+## Spec update
+
+Replace the Atlas staging specification that currently defines immutable
+identity as run UUID plus a complete path/size/SHA-256 upload manifest. Specify
+marker-only rclone staging: `_INCOMPLETE` guards transfer, rclone owns resume,
+and successful marker removal commits the staging prefix. State explicitly
+that `inference.json` remains portable provenance and is not copied into Atlas
+`creation_info`. Specify the lean existing Lasagna data entry and relative
+origin/access-root resolution.
+
+## Docs updates
+
+Update `lasagna/docs/manager.md` and the Lasagna README where applicable:
+remove upload-manifest, digest, collision, and per-file hashing claims; document
+marker-only rclone retry behavior; explain relative Atlas origin paths; and
+state that detailed provenance remains in `inference.json`, not Atlas data
+entries.
+
+## Changelog
+
+Add one concise changelog entry recording the removal of the manager upload
+manifest and the restoration of lean existing-schema Atlas Lasagna entries.
+Record exact cleanup commands/results in `task_log.md`, not in the durable
+specification.

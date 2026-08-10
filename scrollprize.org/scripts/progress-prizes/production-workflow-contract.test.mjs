@@ -9,6 +9,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../.
 const googleJobs = [
   'validate',
   'dry-run',
+  'sync-responses',
   'reconcile-active',
   'prepare-google',
   'activate-production',
@@ -214,6 +215,22 @@ test('production dry-run immediately exercises a read-only public proposal', asy
   );
 });
 
+test('response sync is append-only, reviewer-free, and isolated from GitHub writes', async () => {
+  const production = await productionWorkflow();
+  const sync = jobBlock(production, 'sync-responses');
+
+  assert.match(sync, /^    if: inputs\.operation == 'sync-responses'$/m);
+  assert.match(sync, /^    needs: preflight$/m);
+  assert.match(sync, /^    environment: progress-prizes-production$/m);
+  assert.match(sync, /permissions:\n      contents: read\n      id-token: write/);
+  assert.match(sync, /^          operation: sync-responses$/m);
+  assert.match(sync, /^          source-cycle: \$\{\{ inputs\['source-cycle'\] \}\}$/m);
+  assert.match(sync, /^          branch: main$/m);
+  assert.match(sync, /^          target-branch: main$/m);
+  assert.doesNotMatch(sync, /activation-approval|pull-requests: write|contents: write/);
+  assert.doesNotMatch(sync, /simulated-now:|fault:|dry-run:|head-sha:|base-sha:/);
+});
+
 test('normal preparation no-ops safely outside the seven-day window', async () => {
   const production = await productionWorkflow();
   const google = jobBlock(production, 'prepare-google');
@@ -277,8 +294,9 @@ test('reconcile-active requires secret-free approval and permits only marker met
   assert.match(action, /test -z "\$BASE_SHA"/);
   assert.match(
     action,
-    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\['dry-run'\] != 'true'/,
+    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\.operation != 'sync-responses' && inputs\.operation != 'reconcile-active' && inputs\['dry-run'\] != 'true'/,
   );
+  assert.match(action, /Authenticate marker-only reconciliation without a credential file/);
 });
 
 test('every privileged checkout executes the immutable trigger code', async () => {

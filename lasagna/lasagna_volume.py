@@ -60,6 +60,8 @@ class LasagnaVolume:
 	umbilicus_json: str = ""
 	init_shell_dir: str = ""
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
+	provenance_json: str = ""
+	extra_fields: dict = field(default_factory=dict)
 
 	# --- queries ---
 
@@ -121,6 +123,9 @@ class LasagnaVolume:
 			"grad_mag_factor": self.grad_mag_factor,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
+		d.update(self.extra_fields)
+		if self.provenance_json:
+			d["provenance"] = self.provenance_json
 		if self.umbilicus_json:
 			d["umbilicus_json"] = self.umbilicus_json
 		if self.init_shell_dir:
@@ -173,6 +178,11 @@ class LasagnaVolume:
 				"Lasagna volumes must be described by a .lasagna.json manifest."
 			)
 		d = json.loads(p.read_text(encoding="utf-8"))
+		known_fields = {
+			"version", "source_to_base", "grad_mag_encode_scale", "grad_mag_factor",
+			"groups", "umbilicus_json", "init_shell_dir", "crops", "base_shape_zyx",
+			"crop_xyzwhd", "provenance",
+		}
 		version = int(d.get("version", 1))
 		umbilicus_raw = d.get("umbilicus_json", "")
 		umbilicus_json = "" if umbilicus_raw is None else str(umbilicus_raw).strip()
@@ -214,6 +224,8 @@ class LasagnaVolume:
 			umbilicus_json=umbilicus_json,
 			init_shell_dir=init_shell_dir,
 			groups=groups,
+			provenance_json=str(d.get("provenance", "")).strip(),
+			extra_fields={key: value for key, value in d.items() if key not in known_fields},
 		)
 
 	def add_crop(self, crop: tuple[int, int, int, int, int, int]) -> None:

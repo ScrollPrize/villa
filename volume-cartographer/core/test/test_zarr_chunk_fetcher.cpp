@@ -8,9 +8,15 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
+#include <utils/zarr.hpp>
+
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -97,6 +103,56 @@ TEST_CASE("createChunkCache wraps openLocalZarrPyramid result")
         /*decodedByteCapacity=*/1ULL << 20);
     REQUIRE(cache);
     CHECK(cache->numLevels() >= 1);
+    fs::remove_all(d);
+}
+
+TEST_CASE("remoteLevelKeysFromZattrs binds numeric dataset paths by value")
+{
+    // A scaledown export (lasagna/tiled_predict3d.py with first_level=2)
+    // advertises only its coarse datasets; positional binding would register
+    // the level-2 array as full resolution.
+    auto d = tmpDir("zattrs_numeric");
+    {
+        std::ofstream f(d / ".zattrs");
+        f << R"({"multiscales":[{"datasets":[{"path":"2"},{"path":"3"}]}]})";
+    }
+    auto store = std::make_shared<utils::FileSystemStore>(d);
+    const auto keys = vc::render::remoteLevelKeysFromZattrs(store, 0);
+    REQUIRE(keys.size() == 2);
+    CHECK(keys[0] == std::pair<int, std::string>{2, "2"});
+    CHECK(keys[1] == std::pair<int, std::string>{3, "3"});
+    fs::remove_all(d);
+}
+
+TEST_CASE("remoteLevelKeysFromZattrs keeps positional binding for named datasets")
+{
+    auto d = tmpDir("zattrs_named");
+    {
+        std::ofstream f(d / ".zattrs");
+        f << R"({"multiscales":[{"datasets":[{"path":"s0"},{"path":"s1"}]}]})";
+    }
+    auto store = std::make_shared<utils::FileSystemStore>(d);
+    const auto keys = vc::render::remoteLevelKeysFromZattrs(store, 0);
+    REQUIRE(keys.size() == 2);
+    CHECK(keys[0] == std::pair<int, std::string>{0, "s0"});
+    CHECK(keys[1] == std::pair<int, std::string>{1, "s1"});
+    fs::remove_all(d);
+}
+
+TEST_CASE("remoteLevelKeysFromZattrs is unchanged for standard zero-based pyramids")
+{
+    auto d = tmpDir("zattrs_standard");
+    {
+        std::ofstream f(d / ".zattrs");
+        f << R"({"multiscales":[{"datasets":[{"path":"0"},{"path":"1"},{"path":"2"}]}]})";
+    }
+    auto store = std::make_shared<utils::FileSystemStore>(d);
+    const auto keys = vc::render::remoteLevelKeysFromZattrs(store, 0);
+    REQUIRE(keys.size() == 3);
+    for (int level = 0; level < 3; ++level) {
+        CHECK(keys[static_cast<std::size_t>(level)] ==
+              std::pair<int, std::string>{level, std::to_string(level)});
+    }
     fs::remove_all(d);
 }
 
