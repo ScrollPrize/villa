@@ -94,23 +94,6 @@ static Grid loadGrid(const fs::path& dir)
     return g;
 }
 
-// Serialize a bbox the way QuadSurface::save() writes its own: [[lo],[hi]].
-static Json bboxToJson(const Rect3D& bb)
-{
-    auto lo = Json::array();
-    lo.push_back(bb.low[0]);
-    lo.push_back(bb.low[1]);
-    lo.push_back(bb.low[2]);
-    auto hi = Json::array();
-    hi.push_back(bb.high[0]);
-    hi.push_back(bb.high[1]);
-    hi.push_back(bb.high[2]);
-    auto bbox = Json::array();
-    bbox.push_back(std::move(lo));
-    bbox.push_back(std::move(hi));
-    return bbox;
-}
-
 static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcdir)
 {
     if (fs::exists(outdir))
@@ -152,7 +135,7 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     // directory discovery (is_tifxyz_dir requires it). See villa#1321.
     Rect3D bb;
     if (bbox_of_valid_points(P, bb)) {
-        meta["bbox"] = bboxToJson(bb);
+        meta["bbox"] = bbox_to_json(bb);
     } else {
         meta.erase("bbox");  // genuinely no valid points left; nothing to report
     }

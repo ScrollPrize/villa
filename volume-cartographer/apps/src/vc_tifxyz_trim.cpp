@@ -178,18 +178,7 @@ int main(int argc, char* argv[])
     // vc_grow_seg_from_seed.cpp all skip such a segment silently.
     Rect3D bb;
     if (bbox_of_valid_points(trimmed, bb)) {
-        auto lo = Json::array();
-        lo.push_back(bb.low[0]);
-        lo.push_back(bb.low[1]);
-        lo.push_back(bb.low[2]);
-        auto hi = Json::array();
-        hi.push_back(bb.high[0]);
-        hi.push_back(bb.high[1]);
-        hi.push_back(bb.high[2]);
-        auto bbox = Json::array();
-        bbox.push_back(std::move(lo));
-        bbox.push_back(std::move(hi));
-        meta["bbox"] = std::move(bbox);
+        meta["bbox"] = bbox_to_json(bb);
     } else if (meta.contains("bbox")) {
         meta.erase("bbox");  // no valid points left; stale is worse than absent
     }

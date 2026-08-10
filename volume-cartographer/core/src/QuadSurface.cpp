@@ -2585,6 +2585,23 @@ Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)
     return res;
 }
 
+utils::Json bbox_to_json(const Rect3D& bbox)
+{
+    auto lo = utils::Json::array();
+    lo.push_back(bbox.low[0]);
+    lo.push_back(bbox.low[1]);
+    lo.push_back(bbox.low[2]);
+    auto hi = utils::Json::array();
+    hi.push_back(bbox.high[0]);
+    hi.push_back(bbox.high[1]);
+    hi.push_back(bbox.high[2]);
+    auto arr = utils::Json::array();
+    arr.push_back(std::move(lo));
+    arr.push_back(std::move(hi));
+
+    return arr;
+}
+
 bool bbox_of_valid_points(const cv::Mat_<cv::Vec3f>& points, Rect3D& out)
 {
     bool any = false;
