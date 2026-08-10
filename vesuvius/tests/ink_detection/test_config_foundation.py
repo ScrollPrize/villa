@@ -103,7 +103,7 @@ def test_dinov2_requires_a_pretrained_backbone():
         ),
     ],
 )
-def test_main_only_model_construction_paths_fail_at_config_boundary(
+def test_unsupported_model_construction_paths_fail_at_config_boundary(
     key,
     value,
     message,
@@ -119,7 +119,7 @@ def test_main_only_model_construction_paths_fail_at_config_boundary(
         InkConfig.from_mapping(authored)
 
 
-def test_reference_era_and_unknown_model_settings_remain_preserved():
+def test_accepted_unknown_model_settings_remain_preserved():
     authored = _config_mapping()
     authored["model_config"]["architecture_type"] = "primus_s"
     authored["model_config"]["freeze_encoder"] = True
