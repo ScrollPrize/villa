@@ -71,7 +71,9 @@ from config import Config
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
-from service_uploads import (EphemeralLedger, PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_KEPT,
+from service_uploads import (EphemeralLedger, PCL_ROLE_FILES,
+                             UPLOADED_CHECKPOINTS_DIRNAME,
+                             UPLOADED_CHECKPOINTS_KEPT,
                              UPLOAD_GC_SECONDS, UploadEnvironment,
                              UploadManager, _copy_publish,
                              _merge_pcl_documents, _utc_stamp)
@@ -86,11 +88,14 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
                              _validate_tifxyz_output_step)
 
 
-SERVICE_VERSION = "7.0.0"
+SERVICE_VERSION = "8.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
+# Upper bound on the checkpoint listing /dataset advertises. A client offers
+# this as a choice, so it is a menu, not an inventory.
+SESSION_CHECKPOINTS_LISTED = 200
 EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
                                            4 * 1024 * 1024 * 1024))
 MAX_LOG_ENTRY_CHARS = 8192
@@ -682,10 +687,36 @@ class ServiceState:
         return {**self._base(), **self.config_catalog}
 
     def dataset(self):
-        if self.dataset_resolution is None:
-            raise ApiError(HTTPStatus.NOT_FOUND,
-                           "This service was not launched with --dataset")
-        return {**self._base(), **self.dataset_resolution.to_dict()}
+        return {**self._base(), **self.dataset_resolution.to_dict(),
+                "session_checkpoints": self.session_checkpoints()}
+
+    def session_checkpoints(self):
+        """Checkpoints under the session output directory, newest first.
+
+        Between this and ``detected_checkpoints`` a client has the whole set
+        of checkpoints it may name: the dataset root holds the ones that came
+        with the dataset, and the output directory holds everything this
+        service wrote or received (saves, autosaves, uploads). Advertising
+        both is what lets a client offer a choice instead of asking the user
+        to type a path on a host it may never have seen.
+        """
+        root = self._output_root()
+        if root is None or not root.is_dir():
+            return []
+        found = []
+        for path in root.glob("**/*.ckpt"):
+            relative = path.relative_to(root)
+            # Artifact staging is transfer plumbing, and the upload store
+            # holds digest-named copies a client already has a handle on
+            # (``uploaded_checkpoint``). Neither is something a user picks
+            # from, which also keeps the two load sources disjoint.
+            if any(part.startswith(".") for part in relative.parts) \
+                    or relative.parts[0] == UPLOADED_CHECKPOINTS_DIRNAME:
+                continue
+            if path.is_file():
+                found.append((path.stat().st_mtime, str(path)))
+        found.sort(key=lambda entry: (-entry[0], entry[1]))
+        return [path for _, path in found[:SESSION_CHECKPOINTS_LISTED]]
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -1354,33 +1385,48 @@ class ServiceState:
                 self._preview_export_active = False
                 self.status_generation += 1
 
-    def _resolve_loadable_checkpoint(self, path):
-        """Where an in-session load may read a checkpoint from.
+    def _resolve_load_source(self, request):
+        """The single checkpoint a load request names, resolved by its host.
 
-        The same rule the session-load request uses: a checkpoint this
-        service advertises, or one under the session output directory (which
-        is where uploaded checkpoints and autosaves land).
+        A load names exactly one of two things, and both are strings this
+        service handed out: ``host_checkpoint`` is one of the checkpoints
+        ``/dataset`` advertises, and ``uploaded_checkpoint`` is the path a
+        checkpoint upload returned. Neither asks the client to reason about a
+        filesystem it may never have seen — that is why they are separate
+        fields rather than one free path: they are checked against different
+        sets, and the client knows which it has without inspecting the string.
         """
-        if not path:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Checkpoint path is required")
-        resolved = Path(path).expanduser().resolve(strict=False)
-        if not resolved.is_file():
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Checkpoint does not exist on the service host",
-                           [{"field": "path", "message": "No such file"}])
-        advertised = set() if self.dataset_resolution is None else set(
-            self.dataset_resolution.to_dict().get("detected_checkpoints", []))
-        output_root = Path(
-            self.session_paths.output_directory).resolve(strict=False)
-        if (str(resolved) not in advertised
-                and not resolved.is_relative_to(output_root)):
+        host = str(request.get("host_checkpoint") or "").strip()
+        uploaded = str(request.get("uploaded_checkpoint") or "").strip()
+        if bool(host) == bool(uploaded):
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
-                "Checkpoint must be one the service advertises or one "
-                "under the session output directory",
-                [{"field": "path",
-                  "message": "Not a service-advertised checkpoint"}])
+                "A load names exactly one of host_checkpoint or "
+                "uploaded_checkpoint")
+        if host:
+            advertised = set(
+                self.dataset_resolution.to_dict()["detected_checkpoints"])
+            advertised.update(self.session_checkpoints())
+            if host not in advertised:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "host_checkpoint must be one of the checkpoints /dataset "
+                    "advertises",
+                    [{"field": "host_checkpoint",
+                      "message": "Not a service-advertised checkpoint"}])
+            return host
+        root = self._output_root()
+        store = None if root is None \
+            else (root / UPLOADED_CHECKPOINTS_DIRNAME).resolve(strict=False)
+        resolved = Path(uploaded).expanduser().resolve(strict=False)
+        if store is None or not resolved.is_relative_to(store) \
+                or not resolved.is_file():
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "uploaded_checkpoint must be a path a checkpoint upload "
+                "returned",
+                [{"field": "uploaded_checkpoint",
+                  "message": "Not an uploaded checkpoint"}])
         return str(resolved)
 
     def load_checkpoint(self, request):
@@ -1393,7 +1439,7 @@ class ServiceState:
         rebuilt behind the client's back; that is what a new fit is for.
         """
         session = self._require_session()
-        path = self._resolve_loadable_checkpoint(request.get("path"))
+        path = self._resolve_load_source(request)
         state = session.status().get("state")
         if state != SessionState.Idle:
             raise ApiError(
@@ -1715,9 +1761,7 @@ class ServiceState:
         finally:
             commit_lock.release()
 
-    def remove_input(self, request):
-        kind = str(request.get("kind") or "").strip()
-        input_id = str(request.get("id") or "").strip()
+    def remove_input(self, kind, input_id):
         with self.lock:
             self._require_session()
             record = self.ephemeral_records.find(kind, input_id)
@@ -1922,9 +1966,15 @@ ROUTES = (
 
     # There is deliberately no DELETE /session: the service always holds a
     # session, and replacing one is POST /session/rebuild.
-    Route("DELETE", "/session/ephemeral-inputs", "ephemeral_input_remove",
-          lambda ctx: ctx.state.remove_input(ctx.body), Idempotency.COMMAND_ID,
-          reads_body=True),
+    #
+    # A removal names its target in the path, so it needs no body: the
+    # operation is already idempotent (a second DELETE finds nothing to
+    # remove), and clients do not retry it.
+    Route("DELETE",
+          re.compile(r"/session/ephemeral-inputs/([a-z]+)/([A-Za-z0-9._-]+)"),
+          "ephemeral_input_remove",
+          lambda ctx: ctx.state.remove_input(ctx.args[0], ctx.args[1]),
+          Idempotency.NONE),
 
     Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
           "upload_finalize",

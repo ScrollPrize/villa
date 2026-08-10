@@ -40,7 +40,7 @@ constexpr int kPollReconnectMs = 5000;
 // short poll interval keeps the panel live without flooding it.
 constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 23;
+constexpr int kSupportedApiVersion = 24;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -814,7 +814,13 @@ void SpiralServiceManager::saveCheckpoint(const QString& name)
     postWithRetry(QStringLiteral("/session/save-checkpoint"),
                   {{QStringLiteral("command_id"), commandId()},
                    {QStringLiteral("name"), name}},
-                  Timeout::LongCommand, kMutationRetries, {});
+                  Timeout::LongCommand, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      handleStatus(response);
+                      // The saved file joins the checkpoints the service
+                      // advertises, which is what a load offers to choose from.
+                      fetchAdvertisedDataset();
+                  });
 }
 
 void SpiralServiceManager::requestPreview()
@@ -838,49 +844,27 @@ void SpiralServiceManager::requestPreview()
                   });
 }
 
-void SpiralServiceManager::loadCheckpointIntoSession(const QString& checkpoint)
+QStringList SpiralServiceManager::serviceCheckpoints() const
 {
-    // The resident model stays; only its parameters, optimiser, scheduler and
-    // RNG state are replaced, and only if the service's preflight finds the
-    // checkpoint an exact match for the live model. A client-local file is
-    // uploaded first, exactly as a resume checkpoint is for a session load.
-    auto send = [this](const QString& hostPath) {
-        postWithRetry(QStringLiteral("/session/load-checkpoint"),
-                      {{QStringLiteral("command_id"), commandId()},
-                       {QStringLiteral("path"), hostPath}},
-                      Timeout::Load, kMutationRetries,
-                      [this, hostPath](const QJsonObject& response) {
-                          handleStatus(response);
-                          // Preserve the behaviour the automatic
-                          // checkpoint-resume preview used to give: after a
-                          // load, show the restored model.
-                          requestPreview();
-                          emit checkpointLoaded(
-                              hostPath,
-                              response.value(QStringLiteral("restored_iteration"))
-                                  .toInteger(-1));
-                      },
-                      [this](const QString& error) {
-                          emit errorOccurred(
-                              tr("Checkpoint load refused: %1").arg(error));
-                      });
-    };
+    QStringList paths;
+    for (const QString& key : {QStringLiteral("session_checkpoints"),
+                               QStringLiteral("detected_checkpoints")})
+        for (const QJsonValue& value : _advertisedDataset.value(key).toArray())
+            if (!value.toString().isEmpty()) paths.push_back(value.toString());
+    return paths;
+}
 
-    bool serviceSide = false;
-    for (const QJsonValue& value :
-         _advertisedDataset.value(QStringLiteral("detected_checkpoints")).toArray())
-        if (value.toString() == checkpoint) serviceSide = true;
-    const QString outputDir = _advertisedDataset.value(QStringLiteral("resolved")).toObject()
-                                  .value(QStringLiteral("output_directory")).toString();
-    if (!outputDir.isEmpty() && checkpoint.startsWith(outputDir)) serviceSide = true;
-    if (serviceSide || !QFileInfo(checkpoint).isFile()) {
-        send(checkpoint);
-        return;
-    }
-    emit logMessage(tr("Uploading checkpoint %1 to the service…").arg(checkpoint));
+void SpiralServiceManager::loadServiceCheckpoint(const QString& hostPath)
+{
+    sendLoadCheckpoint({{QStringLiteral("host_checkpoint"), hostPath}});
+}
+
+void SpiralServiceManager::loadLocalCheckpointFile(const QString& localPath)
+{
+    emit logMessage(tr("Uploading checkpoint %1 to the service…").arg(localPath));
     uploadCheckpointForResume(
-        checkpoint,
-        [this, send](const QString& hostPath, const QString& error, bool reused) {
+        localPath,
+        [this](const QString& hostPath, const QString& error, bool reused) {
             if (hostPath.isEmpty()) {
                 emit errorOccurred(tr("Checkpoint upload failed: %1").arg(error));
                 return;
@@ -888,8 +872,35 @@ void SpiralServiceManager::loadCheckpointIntoSession(const QString& checkpoint)
             emit logMessage(reused
                                 ? tr("Reusing checkpoint already on the service at %1").arg(hostPath)
                                 : tr("Checkpoint uploaded to service path %1").arg(hostPath));
-            send(hostPath);
+            sendLoadCheckpoint({{QStringLiteral("uploaded_checkpoint"), hostPath}});
         });
+}
+
+void SpiralServiceManager::sendLoadCheckpoint(QJsonObject body)
+{
+    // The resident model stays; only its parameters, optimiser, scheduler and
+    // RNG state are replaced, and only if the service's preflight finds the
+    // checkpoint an exact match for the live model. Which checkpoint that is
+    // the service resolves: this only says whether the name came from its own
+    // advertisement or from an upload.
+    body[QStringLiteral("command_id")] = commandId();
+    postWithRetry(QStringLiteral("/session/load-checkpoint"), body,
+                  Timeout::Load, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      handleStatus(response);
+                      // Preserve the behaviour the automatic
+                      // checkpoint-resume preview used to give: after a load,
+                      // show the restored model.
+                      requestPreview();
+                      emit checkpointLoaded(
+                          response.value(QStringLiteral("checkpoint_path")).toString(),
+                          response.value(QStringLiteral("restored_iteration"))
+                              .toInteger(-1));
+                  },
+                  [this](const QString& error) {
+                      emit errorOccurred(
+                          tr("Checkpoint load refused: %1").arg(error));
+                  });
 }
 
 void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
@@ -961,17 +972,10 @@ void SpiralServiceManager::commitInputs()
 void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QString& inputId)
 {
     if (!isReady()) return;
-    QNetworkRequest request = makeRequest(QStringLiteral("/session/ephemeral-inputs"),
-                                          static_cast<int>(Timeout::Command));
-    const QJsonObject body{{QStringLiteral("command_id"), commandId()},
-                           {QStringLiteral("kind"), kind},
-                           {QStringLiteral("id"), inputId}};
-    auto* reply = _network->sendCustomRequest(request, "DELETE",
-                                              QJsonDocument(body).toJson(QJsonDocument::Compact));
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
-        handleReply(reply, generation, {}, {});
-    });
+    // The target is named in the path, so this is a bodyless DELETE and goes
+    // through the same helpers as every other verb.
+    del(QStringLiteral("/session/ephemeral-inputs/%1/%2").arg(kind, inputId),
+        Timeout::Command);
 }
 
 void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
@@ -1153,6 +1157,18 @@ void SpiralServiceManager::get(const QString& path, Timeout timeout,
 {
     QNetworkRequest request = makeRequest(path, static_cast<int>(timeout));
     auto* reply = _network->get(request);
+    const quint64 generation = _connectionGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation, success, failure]() {
+        handleReply(reply, generation, success, failure);
+    });
+}
+
+void SpiralServiceManager::del(const QString& path, Timeout timeout,
+                               std::function<void(const QJsonObject&)> success,
+                               std::function<void(const QString&)> failure)
+{
+    QNetworkRequest request = makeRequest(path, static_cast<int>(timeout));
+    auto* reply = _network->sendCustomRequest(request, "DELETE");
     const quint64 generation = _connectionGeneration;
     connect(reply, &QNetworkReply::finished, this, [this, reply, generation, success, failure]() {
         handleReply(reply, generation, success, failure);

@@ -885,9 +885,31 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                           "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
                        != QMessageBox::Yes)
                 return;
+            // A session that failed to build may have failed because of what
+            // it was pointed at — a poisoned autosave, or an input the panel
+            // still names. The recovery case therefore also offers the
+            // service's own launch defaults, which ignore every autosave.
+            bool useDefaults = false;
+            if (_sessionState == QStringLiteral("Error")) {
+                QMessageBox box(QMessageBox::Question, tr("Rebuild Fit (recover)"),
+                                tr("The resident session failed to build. Rebuild it from "
+                                   "the panel's inputs, or from the service's launch "
+                                   "defaults, ignoring every autosave?"),
+                                QMessageBox::Cancel, this);
+                auto* panelInputs = box.addButton(tr("Use Panel Inputs"),
+                                                 QMessageBox::AcceptRole);
+                auto* launchDefaults = box.addButton(tr("Use Launch Defaults"),
+                                                     QMessageBox::DestructiveRole);
+                box.exec();
+                if (box.clickedButton() == launchDefaults) useDefaults = true;
+                else if (box.clickedButton() != panelInputs) return;
+            }
             persist();
             emit pythonOutputRequested();
-            _service->rebuildSession(sessionRequest());
+            if (useDefaults)
+                _service->rebuildWithDefaults();
+            else
+                _service->rebuildSession(sessionRequest());
         });
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
@@ -939,19 +961,32 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _service->downloadCheckpoint(path);
     });
     connect(_loadCheckpoint, &QPushButton::clicked, this, [this]() {
-        const QString initial = _paths[QStringLiteral("checkpoint")]->text().isEmpty()
-            ? _paths[QStringLiteral("output_directory")]->text()
-            : _paths[QStringLiteral("checkpoint")]->text();
-        const QString path = _remoteMode
-            ? QInputDialog::getText(
-                  this, tr("Load Spiral checkpoint into the resident fit"),
-                  tr("Service-host checkpoint path:"), QLineEdit::Normal, initial)
-            : QFileDialog::getOpenFileName(this, tr("Load Spiral checkpoint into the fit"),
-                                           initial, tr("Checkpoint (*.ckpt)"));
-        if (path.isEmpty()) return;
+        // The service lists the checkpoints it can load, so the user picks
+        // one instead of typing a path on a host that may not be this one.
+        // The remaining case is a checkpoint that only exists here, which is
+        // uploaded first; that is the same question in either mode.
+        const QString browse = tr("Choose a local file…");
+        QStringList choices = _service->serviceCheckpoints();
+        choices.push_back(browse);
+        bool accepted = false;
+        const QString choice = QInputDialog::getItem(
+            this, tr("Load Spiral checkpoint into the fit"),
+            tr("Checkpoint to load into the resident model:"), choices, 0,
+            false, &accepted);
+        if (!accepted || choice.isEmpty()) return;
+        QString localFile;
+        if (choice == browse) {
+            localFile = QFileDialog::getOpenFileName(
+                this, tr("Load Spiral checkpoint into the fit"),
+                QDir::homePath(), tr("Checkpoint (*.ckpt)"));
+            if (localFile.isEmpty()) return;
+        }
         _loadCheckpoint->setEnabled(false);
         _warnings->setText(tr("Loading checkpoint into the resident fit…"));
-        _service->loadCheckpointIntoSession(path);
+        if (localFile.isEmpty())
+            _service->loadServiceCheckpoint(choice);
+        else
+            _service->loadLocalCheckpointFile(localFile);
     });
     connect(_service, &SpiralServiceManager::checkpointLoaded, this,
             [this](const QString& hostPath, qint64 iteration) {
@@ -1613,8 +1648,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         status.value(QStringLiteral("session_generation")).toInteger(-1);
     // The service is always loaded, so the button is always a rebuild; it
     // names the recovery case explicitly when the session failed to build.
-    _load->setText(status.value(QStringLiteral("state")).toString()
-                           == QStringLiteral("Error")
+    _sessionState = status.value(QStringLiteral("state")).toString();
+    _load->setText(_sessionState == QStringLiteral("Error")
                        ? tr("Rebuild Fit (recover)") : tr("Rebuild Fit"));
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
     const QJsonObject runConfigLimits =

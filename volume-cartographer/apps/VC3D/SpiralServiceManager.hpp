@@ -72,10 +72,15 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
+    // Every checkpoint the service says it can load: GET /dataset's
+    // session_checkpoints (newest first) followed by detected_checkpoints.
+    QStringList serviceCheckpoints() const;
     // Load a checkpoint into the resident session without replacing it. The
-    // service refuses anything that is not an exact match for the live model;
-    // a client-local file is uploaded first.
-    void loadCheckpointIntoSession(const QString& checkpoint);
+    // service refuses anything that is not an exact match for the live model.
+    // The two verbs differ only in where the checkpoint comes from, and the
+    // service — which owns the filesystem — resolves it either way.
+    void loadServiceCheckpoint(const QString& hostPath);
+    void loadLocalCheckpointFile(const QString& localPath);
     // Ask the session to export and publish one preview generation. Previews
     // are no longer a side effect of pausing or of resuming a checkpoint, so
     // this is what keeps VC3D's "see the fit after it stops" behaviour.
@@ -148,6 +153,9 @@ private:
     void get(const QString& path, Timeout timeout,
              std::function<void(const QJsonObject&)> success,
              std::function<void(const QString&)> failure = {});
+    void del(const QString& path, Timeout timeout,
+             std::function<void(const QJsonObject&)> success = {},
+             std::function<void(const QString&)> failure = {});
     void handleReply(QNetworkReply* reply, quint64 generation,
                      std::function<void(const QJsonObject&)> success,
                      std::function<void(const QString&)> failure);
@@ -164,6 +172,7 @@ private:
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
     void sendRebuildRequest(QJsonObject request);
+    void sendLoadCheckpoint(QJsonObject body);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,

@@ -1030,14 +1030,40 @@ class DatasetOwnershipTests(unittest.TestCase):
         session = _attach_fake_session(self.state, self.output, self.root)
         outside = self.root / "elsewhere.ckpt"
         outside.write_bytes(b"PK\x03\x04checkpoint")
-        with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(outside)})
-        self.assertEqual(caught.exception.status, 400)
-        with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint(
-                {"path": str(self.output / "absent.ckpt")})
-        self.assertEqual(caught.exception.status, 400)
+        uploaded = self.output / "uploaded-checkpoints" / "a.ckpt"
+        uploaded.parent.mkdir(parents=True, exist_ok=True)
+        uploaded.write_bytes(b"PK\x03\x04checkpoint")
+        # A host checkpoint must be one this service advertises, and an
+        # uploaded one must live in the upload store; neither field takes an
+        # arbitrary path, and a load names exactly one of them.
+        for request in ({"host_checkpoint": str(outside)},
+                        {"host_checkpoint": str(self.output / "absent.ckpt")},
+                        # The upload store is not advertised, so the two
+                        # sources name disjoint sets.
+                        {"host_checkpoint": str(uploaded)},
+                        {"uploaded_checkpoint": str(outside)},
+                        {"uploaded_checkpoint": str(self.output / "a.ckpt")},
+                        {"host_checkpoint": str(uploaded),
+                         "uploaded_checkpoint": str(uploaded)},
+                        {}):
+            with self.subTest(request=request):
+                with self.assertRaises(ApiError) as caught:
+                    self.state.load_checkpoint(request)
+                self.assertEqual(caught.exception.status, 400)
         self.assertEqual(session.loaded, [])
+
+    def test_dataset_advertises_the_checkpoints_a_load_may_name(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        saved = self.state.save_checkpoint({"name": "manual"})["checkpoint_path"]
+        staging = self.output / ".spiral-artifacts" / "checkpoint-abc"
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "checkpoint.ckpt").write_bytes(b"PK\x03\x04checkpoint")
+
+        listed = self.state.dataset()["session_checkpoints"]
+
+        self.assertIn(saved, listed)
+        # Artifact staging is transfer plumbing, not a user choice.
+        self.assertNotIn(str(staging / "checkpoint.ckpt"), listed)
 
     def test_load_checkpoint_reports_the_restored_iteration(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -1046,7 +1072,8 @@ class DatasetOwnershipTests(unittest.TestCase):
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
         revision = self.state.session_revision
 
-        response = self.state.load_checkpoint({"path": str(checkpoint)})
+        response = self.state.load_checkpoint(
+            {"uploaded_checkpoint": str(checkpoint)})
 
         self.assertTrue(response["loaded"])
         self.assertEqual(response["restored_iteration"], 4200)
@@ -1064,7 +1091,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         revision = self.state.session_revision
 
         with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(checkpoint)})
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
 
         self.assertEqual(caught.exception.status, 409)
         self.assertIn("z-domain", caught.exception.message)
@@ -1139,7 +1166,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         checkpoint = self.output / "a.ckpt"
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
         with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(checkpoint)})
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.loaded, [])
 
@@ -2317,7 +2344,7 @@ class CommitTests(unittest.TestCase):
     def test_remove_pending_input_deletes_the_staged_copy(self):
         record = self._finalize("fiber", "fiber-9", FIBER_FILES)
         staged = Path(record["path"])
-        response = self.state.remove_input({"kind": "fiber", "id": "fiber-9"})
+        response = self.state.remove_input("fiber", "fiber-9")
         self.assertEqual(response["removed"], "fiber-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertFalse(staged.exists())
@@ -2330,13 +2357,13 @@ class CommitTests(unittest.TestCase):
         _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
-            self.state.remove_input({"kind": "patch", "id": "patch-9"})
+            self.state.remove_input("patch", "patch-9")
         self.assertEqual(caught.exception.status, 409)
 
     def test_remove_committed_pending_input_keeps_the_dataset_copy(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self.state.commit_inputs()
-        self.state.remove_input({"kind": "patch", "id": "patch-9"})
+        self.state.remove_input("patch", "patch-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertTrue((self.dataset / "verified_patches" / "patch-9" / "meta.json").is_file())
 

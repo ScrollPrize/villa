@@ -76,7 +76,7 @@ from config import Config
 # the whole export; status carries preview_exporting while it runs.
 # dataset_owned is gone from /health and /session/status: --dataset is
 # required, so it was always true.
-API_VERSION = 23
+API_VERSION = 24
 
 
 class SessionState(str, Enum):
