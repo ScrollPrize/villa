@@ -294,6 +294,10 @@ def test_pid_store_with_read_only_reconstructs_durable_state():
     async def scenario():
         value = await writable.get("value", default_buffer_prototype())
         assert value.to_bytes() == b"value"
+        with pytest.raises(NotImplementedError, match="do not support writes"):
+            await writable.set("value", value)
+        with pytest.raises(NotImplementedError, match="do not support deletes"):
+            await writable.delete("value")
 
     asyncio.run(scenario())
     assert factory_calls == [

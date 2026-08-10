@@ -236,10 +236,10 @@ if hasattr(zarr.storage, "WrapperStore"):
             return await self._current_store().exists(key)
 
         async def set(self, key, value) -> None:
-            self._check_writable()
+            raise NotImplementedError("PID-aware volume stores do not support writes")
 
         async def delete(self, key: str) -> None:
-            self._check_writable()
+            raise NotImplementedError("PID-aware volume stores do not support deletes")
 
         async def list(self):
             async for key in self._current_store().list():
