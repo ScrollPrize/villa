@@ -358,3 +358,23 @@ plus a relative origin path and joins them for data-sync; public metadata export
 keeps only the subsequently added `public-read` origin. Publication remains an explicit
 `vesuvius-atlas data-sync` operation; the manager never writes the public
 bucket and leaves `atlas_publication = not_started`.
+
+### Refinement direction: reuse generic Atlas ingestion
+
+Atlas already provides the `lasagna` data type, its canonical destination and
+validation rules, copy-first `data-sync` publication, model ingestion, and the
+generic `ingest data` path. The current Atlas-side `inference_bundle.py`
+adapter adds convenience around the manager's portable `inference.json`: it
+validates the bundle, derives the sample/volume/model/level identity, verifies
+the licence and snapshot identity, creates a missing model, and registers the
+existing `lasagna` data entry.
+
+This adapter is not fundamentally required for publication. A preferred future
+refinement is to keep interpretation of manager-specific `inference.json` in
+`las_manager`, generate the minimal model and data-registration inputs there,
+and invoke shared generic Atlas registration APIs. Once that path preserves the
+same validation and collision guarantees, remove the dedicated Atlas
+`inference_bundle.py` adapter and its tests. Atlas should retain only generally
+useful Lasagna support, including Fiber's three-or-four-product bundle
+validation, required `nx`/`ny` products, recursive architecture paths such as
+`fiber3d/unet`, and any approved snapshot identity fields.
