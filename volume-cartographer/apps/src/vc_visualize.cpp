@@ -37,8 +37,9 @@ class SegmentRenderer {
 
     std::map<std::string, int> segment_color_map_;
 
-    // Surfaces that were requested but could not be loaded. They are skipped so
-    // the rest still renders, but main() needs to know they went missing.
+    // Surfaces requested by the current render() that could not be loaded. They
+    // are skipped so the rest still renders, but main() needs to know they went
+    // missing. Reset at the start of each render(), alongside the colour map.
     int failed_surface_loads_ = 0;
 
     cv::Vec3b getColormapColor(int index, int total_count) {
@@ -116,7 +117,7 @@ class SegmentRenderer {
     }
 
 public:
-    // Number of requested surfaces that failed to load during the last render.
+    // Number of requested surfaces that failed to load in the most recent render().
     int failedSurfaceLoads() const { return failed_surface_loads_; }
 
     SegmentRenderer(const fs::path& volpkg_path, const std::string& volume_id) {
@@ -158,6 +159,7 @@ private:
         std::cout << "Rendering " << source << " for segment: " << target_segment_id << std::endl;
 
         segment_color_map_.clear();
+        failed_surface_loads_ = 0;
 
         // Load target segment
         auto target_surf = vpkg_->loadSurface(target_segment_id);
@@ -381,7 +383,12 @@ private:
 
         for (const auto& seq_id : original_sequence) {
             auto surf = vpkg_->loadSurface(seq_id);
-            if (surf && segment_color_map_.find(seq_id) != segment_color_map_.end()) {
+            // Only a failed load counts: an id absent from the colour map was
+            // deliberately left out of the sorted sequence, which is not an error.
+            if (!surf) {
+                std::cerr << "Failed to load surface: " << seq_id << std::endl;
+                failed_surface_loads_++;
+            } else if (segment_color_map_.find(seq_id) != segment_color_map_.end()) {
                 surfaces.push_back({seq_id, surf, segment_color_map_[seq_id]});
             }
 
