@@ -35,7 +35,7 @@ from ddp_helpers import (
     process_context,
 )
 from config import Config, FitConfig, durable_config
-from fit_session import fit_input, input_change_impact
+from fit_session import fit_input
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
@@ -828,7 +828,7 @@ class FitContext:
 
     def shell_losses_enabled(self):
         # The outer-shell enabling predicate is fit-input catalog data,
-        # shared with request validation and run planning.
+        # shared with request validation and run admission.
         return fit_input('outer_shell').required(self.config)
 
     def _load_patches_from_dir(self, path, label='patches'):
@@ -2783,78 +2783,15 @@ class FitContext:
         old_values = {key: self.config[key] for key in config}
         self.config.update(config)
         try:
-            # The fit-input catalog names which path changes rebuild device
-            # shell state (today: exactly the outer-shell input).
-            shell_path_key = next(
-                (key for key in path_changes
-                 if input_change_impact(key)[0] == 'shell_reload'), None)
-            shell_changed = (
-                bool(changed & {
-                    key for key in self.config.keys()
-                    if str(key).startswith('shell_')
-                })
-                or shell_path_key is not None
-            )
+            # Static path changes are rejected by the service. Shell atlas
+            # construction settings are classified as prepared-input changes
+            # and likewise never reach this live boundary; ordinary shell
+            # parameters are just run configuration.
             rebuilt_tracks = None
             replace_prepared_tracks = False
-            rebuilt_track_rows = self.tracks
-            rebuilt_families = self.track_families
-            rebuilt_source_ids = self.track_source_ids
-            rebuilt_shell_patch = self.shell_patch
             rebuilt_shell_map = self.shell_map
-            rebuilt_shell_envelope = self.shell_envelope
             rebuilt_shell_outer = self.shell_outer_winding_idx
             rebuilt_shell_valid = self.shell_valid_zyxs_gpu
-            requested_shell_path = str(
-                path_changes.get(shell_path_key, self.shell_path) or '')
-
-            if shell_changed:
-                if not requested_shell_path:
-                    raise ValueError(
-                        'shell configuration requires an outer shell path')
-                rebuilt_shell_patch = load_tifxyz(requested_shell_path)
-                rebuilt_shell_envelope = (
-                    ShellPolarMap(
-                        rebuilt_shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device='cpu', config=self.config)
-                    if self.filter_tracks_by_shell else None
-                )
-                if self.filter_tracks_by_shell and self.track_reload_source is not None:
-                    (rebuilt_track_rows, rebuilt_families,
-                     kept_track_indices) = filter_tracks_to_outer_shell(
-                        self.track_reload_source, rebuilt_shell_envelope,
-                        self.track_reload_families, return_indices=True)
-                    rebuilt_source_ids = (
-                        self.track_reload_source_ids[kept_track_indices]
-                        if self.track_reload_source_ids is not None else None)
-                    rebuilt_tracks = prepare_main_phase_tracks(
-                        rebuilt_track_rows, None,
-                        float(self.config['track_exclusion_radius']), self.device,
-                        anchor_tree=self.trusted_geometry_tree,
-                        sampling_config=validate_track_sampling_config(self.config),
-                        track_families=rebuilt_families,
-                        track_source_ids=rebuilt_source_ids,
-                        crossing_cache=self.track_crossing_cache,
-                        track_graph=self.track_graph)
-                    replace_prepared_tracks = True
-
-                rebuilt_shell_map = (
-                    ShellPolarMap(
-                        rebuilt_shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device=self.device, config=self.config)
-                    if self.config['loss_weight_shell_outer'] > 0 else None
-                )
-                rebuilt_shell_valid = (
-                    self._subsample_shell_radius_pool(rebuilt_shell_patch)
-                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
-                )
-                rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
 
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
@@ -2904,6 +2841,28 @@ class FitContext:
                     self.unverified_patch_sampling_probabilities
                 rebuilt_unverified_atlas = self.unverified_patch_atlas
 
+            # Loss weights are live settings. If a shell loss is enabled for
+            # the first time, construct only the resident structure that loss
+            # needs; disabling it releases that structure. Atlas-shaping
+            # settings themselves require a full prepared-input rebuild.
+            if 'loss_weight_shell_outer' in changed:
+                rebuilt_shell_map = (
+                    ShellPolarMap(
+                        self.shell_patch, self.umbilicus,
+                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
+                        num_theta_bins=self.config['shell_num_theta_bins'],
+                        device=self.device, config=self.config)
+                    if self.config['loss_weight_shell_outer'] > 0 else None
+                )
+            if 'loss_weight_shell_patch_radius' in changed:
+                rebuilt_shell_valid = (
+                    self._subsample_shell_radius_pool(self.shell_patch)
+                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
+                )
+            if 'shell_outer_winding_idx' in changed:
+                rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
+
             dt_preparation_changed = bool(changed & {
                 'dt_target_mode', 'dt_target_max_stride',
                 'sample_count_patch_dt_target_points',
@@ -2937,16 +2896,9 @@ class FitContext:
             self.config.update(old_values)
             raise
 
-        if shell_changed:
-            self.shell_path = requested_shell_path
-            self.shell_patch = rebuilt_shell_patch
-            self.shell_map = rebuilt_shell_map
-            self.shell_envelope = rebuilt_shell_envelope
-            self.shell_outer_winding_idx = rebuilt_shell_outer
-            self.shell_valid_zyxs_gpu = rebuilt_shell_valid
-            self.tracks = rebuilt_track_rows
-            self.track_families = rebuilt_families
-            self.track_source_ids = rebuilt_source_ids
+        self.shell_map = rebuilt_shell_map
+        self.shell_outer_winding_idx = rebuilt_shell_outer
+        self.shell_valid_zyxs_gpu = rebuilt_shell_valid
         if replace_prepared_tracks:
             self.prepared_main_tracks = rebuilt_tracks
             self.preview_extent_tracks = (

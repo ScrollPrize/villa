@@ -245,13 +245,13 @@ class ProgressStatusTests(unittest.TestCase):
 def _planned_run(state, request):
     request = dict(request)
     configuration = Config(request.pop("run_config", {})).as_dict()
-    plan = state.plan_run({
+    return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
         "influence": request.pop("influence_config", {}),
         "expected_session_revision": state.session_revision,
+        **request,
     })
-    return state.run({"plan_token": plan["plan_token"], **request})
 
 
 def _digest(data):
@@ -1421,18 +1421,16 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
             self.state.start_initial_session()
             _await_build(self.state)
 
-            # A run plan that changes a new-fit configuration key reports it
-            # and the run is refused: the resident model keeps its domain.
+            # A run that changes a new-fit configuration key is refused: the
+            # resident model keeps its domain.
             configuration = Config({**_NO_DENSE_LOSSES,
                                     "model_num_flow_stages": 3}).as_dict()
-            plan = self.state.plan_run({
-                "configuration": configuration,
-                "iterations": 3,
-                "expected_session_revision": self.state.session_revision,
-            })
-            self.assertTrue(plan["new_fit_required"])
-            with self.assertRaisesRegex(ApiError, "Start New Fit"):
-                self.state.run({"plan_token": plan["plan_token"]})
+            with self.assertRaisesRegex(ApiError, "requires rebuilding"):
+                self.state.run({
+                    "configuration": configuration,
+                    "iterations": 3,
+                    "expected_session_revision": self.state.session_revision,
+                })
 
             # The same change through a rebuild is accepted; it is the one
             # path that tears the model down and builds a new domain.
@@ -1718,7 +1716,7 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(session.run_calls[-1][4], config)
         self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
-        with self.assertRaisesRegex(ApiError, "Start New Fit"):
+        with self.assertRaisesRegex(ApiError, "requires rebuilding"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "model_num_flow_stages": 2,
             }})
@@ -1750,33 +1748,27 @@ class UploadTests(unittest.TestCase):
         shell.mkdir()
         inputs = self.state.session_paths.manifest()
         inputs["outer_shell"] = str(shell)
-        with self.assertRaisesRegex(ApiError, "restart.*service") as caught:
-            self.state.plan_run({
+        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+            self.state.run({
                 "configuration": Config().as_dict(),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
             })
-        self.assertEqual(caught.exception.status, 400)
-        self.assertEqual(caught.exception.details, [{
-            "field": "inputs.outer_shell",
-            "message": "Static input changes require a service restart",
-        }])
+        self.assertEqual(caught.exception.status, 409)
 
     def test_any_other_static_path_change_is_also_rejected(self):
         self._session()
         inputs = self.state.session_paths.manifest()
         inputs["verified_patches"] = str(self.dataset / "other-patches")
-        with self.assertRaisesRegex(ApiError, "restart.*service") as caught:
-            self.state.plan_run({
+        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+            self.state.run({
                 "configuration": Config().as_dict(),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
             })
-        self.assertEqual(caught.exception.status, 400)
-        self.assertEqual(caught.exception.details[0]["field"],
-                         "inputs.verified_patches")
+        self.assertEqual(caught.exception.status, 409)
 
     def test_a_rebuilt_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()

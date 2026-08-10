@@ -88,7 +88,7 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
                              _validate_tifxyz_output_step)
 
 
-SERVICE_VERSION = "8.0.0"
+SERVICE_VERSION = "9.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
@@ -500,7 +500,7 @@ class ServiceState:
     or advances a copy of it.
 
     What the service does own is service-scoped bookkeeping — session and
-    command generations, artifacts, uploads, run plans.
+    command generations, artifacts, and uploads.
     """
 
     def __init__(self, dataset_root=None, dataset_resolution=None,
@@ -555,7 +555,6 @@ class ServiceState:
         self._preview_export_active = False
         self.config_catalog = Config.catalog()
         self.session_revision = 0
-        self.run_plans = {}
 
     # ------------------------------------------------------------------
     # Status and health
@@ -571,8 +570,8 @@ class ServiceState:
             stamps log and fitter event records, and is what a client uses
             to notice that the session it adopted has been replaced.
         ``session_revision``
-            Which configuration/input revision the session is at. Run plans
-            are computed against it and refused when it moves.
+            Which configuration/input revision the session is at. Mutations
+            carrying an older revision are refused.
         ``generation`` (the status revision)
             Ordering for status snapshots, so a client can drop a reply that
             overtook a newer one.
@@ -890,7 +889,6 @@ class ServiceState:
                 "preview": preview.manifest(),
             }
             self.session_revision += 1
-            self.run_plans.clear()
             self._reset_session_scope()
             self._session_state = SessionState.Loading
             self._session_phase = "Building the fit session"
@@ -1125,27 +1123,58 @@ class ServiceState:
             payload=snapshot, coalesce_key=("preview-publish",))
 
     def run(self, request):
-        token = request.get("plan_token")
         autosave_on_pause = request.get("autosave_on_pause", True)
         if not isinstance(autosave_on_pause, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "autosave_on_pause must be true or false")
-        with self.lock:
-            plan = self.run_plans.pop(token, None)
-        if not plan or plan["expires"] < time.monotonic():
-            raise ApiError(HTTPStatus.CONFLICT, "Run plan is missing or expired")
-        if plan["revision"] != self.session_revision:
-            raise ApiError(HTTPStatus.CONFLICT, "Run plan is stale")
-        if plan["new_fit_required"]:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "This plan requires Start New Fit")
-        if plan["session_reload_required"]:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "This plan requires reloading fit inputs")
         session = self._require_session()
+        if session.status().get("state") != SessionState.Idle:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "Running requires an idle session")
+        expected = request.get("expected_session_revision")
+        if expected != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
+        configuration = request.get("configuration")
+        if not isinstance(configuration, dict) or \
+                set(configuration) != set(self.config_catalog["defaults"]):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Running requires a complete configuration")
+        try:
+            configuration = Config(configuration).as_dict()
+            iterations = int(request.get("iterations", 0))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if iterations < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "iterations must be at least 1")
+        current = session.status().get("applied_config")
+        if current is None:
+            current = Config(
+                (self.session_request.get("run") or {}).get("config") or {}
+            ).as_dict()
+        changes = {key: value for key, value in configuration.items()
+                   if current.get(key) != value}
+        fields = self.config_catalog["schema"]["fields"]
+        forbidden = {
+            key: fields[key]["runtime_impact"] for key in changes
+            if fields[key]["runtime_impact"] != "run_boundary"
+        }
+        if forbidden:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "The requested configuration requires rebuilding the fit",
+                [{"field": f"configuration.{key}",
+                  "message": f"Runtime impact is {impact}"}
+                 for key, impact in sorted(forbidden.items())])
+        current_manifest = self.session_paths.manifest()
+        input_manifest = request.get("inputs")
+        if input_manifest is not None and input_manifest != current_manifest:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Static dataset inputs cannot be changed by a run")
         influence_config = _validate_run_influence_config(
-            plan["influence"])
-        run_config = plan["configuration_changes"]
+            request.get("influence") or {})
+        run_config = changes
         with self.lock:
             # The fitter (and, under DDP, its child ranks) receives plain
             # records; the ledger maps them back to its own entries when the
@@ -1169,108 +1198,10 @@ class ServiceState:
                 # nothing about the model, so it needs no planning round.
                 "autosave_on_pause": autosave_on_pause,
         }
-        if plan["path_changes"]:
-            run_arguments["path_changes"] = plan["path_changes"]
-        target = session.run(plan["iterations"], **run_arguments)
+        target = session.run(iterations, **run_arguments)
         with self.lock:
-            self.run_plans.clear()
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
-
-    def plan_run(self, request):
-        session = self._require_session()
-        if session.status().get("state") != SessionState.Idle:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "Run planning requires a paused session")
-        expected = request.get("expected_session_revision")
-        if expected != self.session_revision:
-            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
-        configuration = request.get("configuration")
-        if not isinstance(configuration, dict) or \
-                set(configuration) != set(self.config_catalog["defaults"]):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Run planning requires a complete configuration")
-        try:
-            configuration = Config(configuration).as_dict()
-        except ValueError as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-        iterations = int(request.get("iterations", 0))
-        if iterations < 1:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "iterations must be at least 1")
-        current = session.status().get("applied_config")
-        if current is None:
-            current = Config(
-                (self.session_request.get("run") or {}).get("config") or {}
-            ).as_dict()
-        changes = {
-            key: value for key, value in configuration.items()
-            if current.get(key) != value
-        }
-        fields = self.config_catalog["schema"]["fields"]
-        impacts = {fields[key]["runtime_impact"] for key in changes}
-        dependencies = sorted({
-            dependency for key in changes
-            for dependency in fields[key]["dependencies"]
-        })
-        current_manifest = self.session_paths.manifest()
-        input_manifest = request.get("inputs")
-        if input_manifest is None:
-            input_manifest = current_manifest
-        if not isinstance(input_manifest, dict):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "inputs must be a path manifest object")
-        path_changes = {
-            key: input_manifest.get(key)
-            for key in set(current_manifest) | set(input_manifest)
-            if input_manifest.get(key) != current_manifest.get(key)
-        }
-        if path_changes:
-            raise ApiError(
-                HTTPStatus.BAD_REQUEST,
-                "Static dataset inputs cannot be changed by a run; restart "
-                "the dataset-bound Spiral service to resolve new inputs",
-                [
-                    {
-                        "field": f"inputs.{key}",
-                        "message": "Static input changes require a service restart",
-                    }
-                    for key in sorted(path_changes)
-                ])
-        input_changes = []
-        dependencies = sorted(set(dependencies))
-        token = secrets.token_urlsafe(24)
-        new_fit = "new_fit" in impacts
-        session_reload_required = "prepared_input_rebuild" in impacts
-        plan = {
-            "revision": self.session_revision,
-            "expires": time.monotonic() + 60.0,
-            "iterations": iterations,
-            "influence": request.get("influence") or {},
-            "configuration_changes": changes,
-            "path_changes": {},
-            "changes": [
-                {"key": key, "before": current.get(key), "after": value,
-                 "runtime_impact": fields[key]["runtime_impact"]}
-                for key, value in changes.items()
-            ],
-            "affected_prepared_inputs": dependencies,
-            "model_state_preserved": not new_fit,
-            "optimizer_state_preserved": not new_fit,
-            "new_fit_required": new_fit,
-            "session_reload_required": session_reload_required,
-            "input_changed": False,
-            "input_changes": input_changes,
-        }
-        with self.lock:
-            self.run_plans[token] = plan
-        return {
-            **self._base(), "plan_token": token,
-            "expires_in_seconds": 60,
-            **{key: value for key, value in plan.items()
-               if key not in {"expires", "configuration_changes", "path_changes",
-                              "iterations", "influence", "revision"}},
-        }
 
     def stop(self):
         self._require_session().stop()
@@ -1453,8 +1384,7 @@ class ServiceState:
                 paths = dict(self.session_request.get("paths") or {})
                 paths["checkpoint"] = path
                 self.session_request = {**self.session_request, "paths": paths}
-            # Plans computed against the replaced model are stale.
-            self.run_plans.clear()
+            # Loading replaces the model state represented by this revision.
             self.session_revision += 1
             self.status_generation += 1
         return {**self.status(), "loaded": True, "checkpoint_path": path,
@@ -1971,9 +1901,6 @@ ROUTES = (
           reads_body=True),
     Route("POST", "/session/rebuild", "session_rebuild",
           lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
-          reads_body=True),
-    Route("POST", "/session/run/plan", "run_plan",
-          lambda ctx: ctx.state.plan_run(ctx.body), Idempotency.NONE,
           reads_body=True),
     Route("POST", "/session/run", "session_run",
           lambda ctx: ctx.state.run(ctx.body), Idempotency.COMMAND_ID,

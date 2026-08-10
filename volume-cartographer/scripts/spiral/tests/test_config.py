@@ -49,20 +49,27 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     for key, field in fields.items():
         if key.startswith("patch_"):
             expected = (
-                "prepared_input_rebuild"
+                "new_fit"
                 if key == "patch_erode_patches" else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):
             expected = (
-                "prepared_input_rebuild"
+                "new_fit"
                 if key == "dense_spacing_mode" else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dt_"):
             assert field["runtime_impact"] == "run_boundary"
         if key.startswith("shell_"):
-            assert field["runtime_impact"] == "shell_reload"
-    # Input identities are fixed for a resident session. Run-mutable shell
-    # settings still rebuild shell-derived state from the same outer shell.
+            expected = (
+                "new_fit"
+                if key in {"shell_num_theta_bins",
+                           "shell_table_smooth_sigma_z",
+                           "shell_table_smooth_sigma_theta",
+                           "shell_min_confidence"}
+                else "run_boundary")
+            assert field["runtime_impact"] == expected
+    # Input identities and shell-atlas construction are fixed for a resident
+    # session; ordinary shell loss settings remain run-mutable.
     assert schema["paths"] == {}
 
     mutable_tracks = {
@@ -78,7 +85,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     }
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in mutable_tracks)
-    assert all(fields[key]["runtime_impact"] == "prepared_input_rebuild"
+    assert all(fields[key]["runtime_impact"] == "new_fit"
                for key in {
                    "track_crossing_precompute_max", "track_crossing_mode",
                    "track_exclusion_radius",

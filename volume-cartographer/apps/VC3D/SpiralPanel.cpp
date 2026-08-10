@@ -765,8 +765,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     const QString impact =
                         it.value().toObject()
                             .value(QStringLiteral("runtime_impact")).toString();
-                    if (impact == QStringLiteral("run_boundary")
-                        || impact == QStringLiteral("shell_reload"))
+                    if (impact == QStringLiteral("run_boundary"))
                         _runMutablePaths.insert(it.key());
                 }
                 refreshReloadRequired();

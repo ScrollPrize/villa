@@ -37,6 +37,13 @@ _PREPARED_INPUT_FIELDS = {
     "output_winding_margin",
     "output_step_size",
     "output_num_slices_for_visualization",
+    # These values define the discretised outer-shell lookup/atlas. Unlike
+    # ordinary shell loss parameters they cannot be changed on an existing
+    # prepared shell.
+    "shell_num_theta_bins",
+    "shell_table_smooth_sigma_z",
+    "shell_table_smooth_sigma_theta",
+    "shell_min_confidence",
 }
 
 _DENSE_LOSS_ONLY_FIELDS = {
@@ -96,12 +103,10 @@ def _runtime_impact(key):
         # Changing the z-range invalidates host inputs, dense stores, and the
         # model's flow-field domain: a new fit, never a run-boundary tweak.
         return "new_fit"
-    if key.startswith("shell_"):
-        return "shell_reload"
     if key.startswith("model_") or key == "optimizer_random_seed":
         return "new_fit"
     if key.startswith(("input_", "pcl_")) or key in _PREPARED_INPUT_FIELDS:
-        return "prepared_input_rebuild"
+        return "new_fit"
     return "run_boundary"
 
 
@@ -432,7 +437,7 @@ class Config:
         # The advertised path entries derive from the declarative fit-input
         # catalog (imported lazily: fit_session imports Config). Only inputs
         # a resident session can take live appear; every other path change
-        # implies the prepared-input-rebuild default.
+        # implies the new-fit default.
         from fit_session import input_path_schema
 
         return {

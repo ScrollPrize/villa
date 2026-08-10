@@ -746,57 +746,15 @@ void SpiralServiceManager::runIterations(int iterations,
         configuration[it.key()] = it.value();
     for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
         configuration[it.key()] = it.value();
-    post(QStringLiteral("/session/run/plan"),
-         {{QStringLiteral("configuration"), configuration},
-          {QStringLiteral("iterations"), iterations},
-          {QStringLiteral("influence"), influenceConfig},
-          {QStringLiteral("inputs"), inputs},
-          {QStringLiteral("expected_session_revision"), _sessionRevision}},
-         Timeout::Command,
-         [this](const QJsonObject& plan) {
-             if (plan.value(QStringLiteral("new_fit_required")).toBool()) {
-                 QMessageBox::information(
-                     QApplication::activeWindow(), tr("Rebuild required"),
-                     tr("These changes are incompatible with the resident model. "
-                        "Use Rebuild Fit to apply them."));
-                 emit configurationReviewRequested();
-                 return;
-             }
-             if (plan.value(QStringLiteral("session_reload_required")).toBool()) {
-                 QMessageBox::information(
-                     QApplication::activeWindow(), tr("Reload fit inputs required"),
-                     tr("These changes require reloading the resident fit inputs. "
-                        "Use Rebuild Fit to apply them."));
-                 emit configurationReviewRequested();
-                 return;
-             }
-             const bool changed =
-                 !plan.value(QStringLiteral("changes")).toArray().isEmpty()
-                 || plan.value(QStringLiteral("input_changed")).toBool();
-             if (changed) {
-                 QMessageBox box(QMessageBox::Question,
-                                 tr("Spiral configuration changed"),
-                                 tr("Configuration changed since last run: continue?"),
-                                 QMessageBox::Cancel,
-                                 QApplication::activeWindow());
-                 auto* proceed = box.addButton(tr("Continue Run"),
-                                               QMessageBox::AcceptRole);
-                 auto* review = box.addButton(tr("Review"),
-                                              QMessageBox::ActionRole);
-                 box.exec();
-                 if (box.clickedButton() == review) {
-                     emit configurationReviewRequested();
-                     return;
-                 }
-                 if (box.clickedButton() != proceed) return;
-             }
-             postWithRetry(
-                 QStringLiteral("/session/run"),
-                 {{QStringLiteral("command_id"), commandId()},
-                  {QStringLiteral("plan_token"),
-                   plan.value(QStringLiteral("plan_token"))}},
-                 Timeout::Command, kMutationRetries, {});
-         });
+    postWithRetry(
+        QStringLiteral("/session/run"),
+        {{QStringLiteral("command_id"), commandId()},
+         {QStringLiteral("configuration"), configuration},
+         {QStringLiteral("iterations"), iterations},
+         {QStringLiteral("influence"), influenceConfig},
+         {QStringLiteral("inputs"), inputs},
+         {QStringLiteral("expected_session_revision"), _sessionRevision}},
+        Timeout::Command, kMutationRetries, {});
 }
 
 void SpiralServiceManager::stopAfterIteration()

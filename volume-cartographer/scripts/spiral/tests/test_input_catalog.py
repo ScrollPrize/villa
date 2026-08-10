@@ -21,7 +21,7 @@ def test_catalog_covers_every_fit_input_path_field():
 def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
-    assert spec.runtime_impact == "prepared_input_rebuild"
+    assert spec.runtime_impact == "new_fit"
     assert spec.dependencies == FULL_REBUILD_DEPENDENCIES
     # Enabled by either shell loss weight; the outer weight defaults on.
     assert spec.required({}) is True
@@ -33,11 +33,11 @@ def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
 
 def test_every_input_path_change_requires_a_full_host_rebuild():
     assert input_change_impact("outer_shell") == (
-        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
+        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
     assert input_change_impact("verified_patches") == (
-        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
+        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
     assert input_change_impact("checkpoint") == (
-        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
+        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
 
 
 def test_config_catalog_paths_derive_from_the_input_catalog():
@@ -45,11 +45,10 @@ def test_config_catalog_paths_derive_from_the_input_catalog():
     assert Config.catalog()["schema"]["paths"] == input_path_schema()
 
 
-def test_no_input_is_checkpoint_domain_but_new_fit_config_keys_are():
+def test_input_paths_and_model_configuration_are_new_fit_changes():
     assert not any(spec.checkpoint_domain for spec in FIT_INPUT_CATALOG)
-    assert all(input_change_impact(spec.key)[0] != "new_fit"
+    assert all(input_change_impact(spec.key)[0] == "new_fit"
                for spec in FIT_INPUT_CATALOG)
-    # The checkpoint domain is set by new_fit configuration keys instead.
     fields = Config.catalog()["schema"]["fields"]
     assert fields["z_begin"]["runtime_impact"] == "new_fit"
     assert fields["model_num_flow_stages"]["runtime_impact"] == "new_fit"

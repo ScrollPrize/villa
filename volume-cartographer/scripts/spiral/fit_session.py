@@ -77,11 +77,10 @@ from config import Config
 # dataset_owned is gone from /health and /session/status: --dataset is
 # required, so it was always true.
 # Version 25 makes the startup-resolved input manifest strictly read-only.
-# POST /session/run/plan may echo the manifest advertised by status, but any
-# changed, added, or removed path is rejected immediately: replacing static
-# dataset inputs requires restarting the dataset-bound service, not planning a
-# run or rebuilding its resident session.
-API_VERSION = 25
+# Version 26 removes the stateful run-plan handshake. POST /session/run carries
+# the complete request and rejects configuration that requires a rebuild;
+# run-boundary configuration is applied directly.
+API_VERSION = 26
 
 
 class SessionState(str, Enum):
@@ -122,7 +121,7 @@ SESSION_BUSY_STATES = frozenset({
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
     fields = Config.catalog()["schema"]["fields"]
     return {key: value for key, value in config.items()
-            if fields[key]["runtime_impact"] in {"run_boundary", "shell_reload"}}
+            if fields[key]["runtime_impact"] == "run_boundary"}
 
 
 class PclRole(str, Enum):
@@ -139,7 +138,7 @@ class PclRole(str, Enum):
 #
 # One description of every fit input, consumed by request validation
 # (validate_session_request), dataset resolution (resolve_dataset_root /
-# conventional_input_paths), run planning (spiral_service.plan_run), and the
+# conventional_input_paths), run admission (spiral_service.ServiceState.run), and the
 # resident fitter's impact analysis (FitContext.apply_config). Each entry
 # records the input's path kind, its enabling/required predicates over the
 # run configuration, what must be rebuilt when the path changes, and whether
@@ -219,7 +218,7 @@ class FitInputSpec:
     # are static for the lifetime of a resident session, so the default is a
     # host-input/session rebuild. More granular impacts remain representable
     # for a future input type whose identity is explicitly session-mutable.
-    runtime_impact: str = "prepared_input_rebuild"
+    runtime_impact: str = "new_fit"
     dependencies: tuple[str, ...] = FULL_REBUILD_DEPENDENCIES
     # Whether changing the input breaks checkpoint compatibility. No fit
     # input does today: the checkpoint domain is set by "new_fit" config
@@ -273,7 +272,7 @@ def input_change_impact(key: str) -> tuple[str, list[str]]:
     """
     spec = _FIT_INPUTS_BY_KEY.get(key)
     if spec is None:
-        return "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES)
+        return "new_fit", list(FULL_REBUILD_DEPENDENCIES)
     return spec.runtime_impact, list(spec.dependencies)
 
 
@@ -282,13 +281,13 @@ def input_path_schema() -> dict[str, dict[str, Any]]:
 
     Only inputs a resident session can take live (without a session reload)
     are advertised; everything else uses the implicit
-    prepared-input-rebuild default.
+    new-fit default.
     """
     return {
         spec.key: {"runtime_impact": spec.runtime_impact,
                    "dependencies": list(spec.dependencies)}
         for spec in FIT_INPUT_CATALOG
-        if spec.runtime_impact != "prepared_input_rebuild"
+        if spec.runtime_impact != "new_fit"
     }
 
 
