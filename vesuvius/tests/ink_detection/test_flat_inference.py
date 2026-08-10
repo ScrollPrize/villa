@@ -17,6 +17,7 @@ from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
     FlatPatchReader,
+    choose_pyramid_array,
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
     compute_importance_map_2d,
@@ -25,12 +26,14 @@ from vesuvius.ink_detection.inference.infer import (
     infer_folder,
     iter_blocks,
     iter_probability_tiles,
+    load_grayscale_mask,
     main,
     normalize_flat_patch,
     normalize_inference_paths,
     open_temp_zarr_array,
     parse_args,
     predict_with_mirror_tta,
+    resolve_patch_stride,
     resolve_segment_zarr_path,
     select_layer_indices,
     write_output_tiff,
@@ -50,6 +53,30 @@ def test_temp_accumulation_array_is_explicit_v2(tmp_path):
     assert tuple(array.shape) == (3, 5)
     assert tuple(array.chunks) == (2, 3)
     assert np.dtype(array.dtype) == np.dtype(np.float32)
+
+
+def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog):
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        group = zarr.open_group(
+            tmp_path / "pyramid.zarr", mode="w", zarr_format=2
+        )
+        group.create_array("1", shape=(2, 2), dtype="u1")
+    else:
+        group = zarr.open_group(tmp_path / "pyramid.zarr", mode="w")
+        group.create_dataset("1", shape=(2, 2), dtype="u1")
+    mask_path = tmp_path / "mask.tif"
+    tifffile.imwrite(mask_path, np.ones((2, 3), dtype=np.uint8))
+
+    with caplog.at_level("WARNING"):
+        selected, _ = choose_pyramid_array(
+            group, preferred_key="0", purpose="input"
+        )
+        mask = load_grayscale_mask(mask_path, (3, 2))
+
+    assert selected == "1"
+    assert mask.shape == (3, 2)
+    assert "Requested input level 0 was not found; using level 1" in caplog.text
+    assert "Mask shape (2, 3) did not match Zarr shape (3, 2)" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -308,8 +335,13 @@ def test_cli_aliases_folder_shorthand_and_segment_resolution(tmp_path):
     )
     assert shorthand.input_zarr is None
     assert shorthand.checkpoint == Path("weights.pth")
-    with pytest.raises(SystemExit):
-        parse_args(["--overlap", "1"])
+    overlap = parse_args(["--overlap", "1"])
+    with pytest.raises(ValueError, match="--overlap"):
+        resolve_patch_stride(
+            patch_size=32,
+            overlap=overlap.overlap,
+            explicit_stride=overlap.stride,
+        )
     with pytest.raises(SystemExit):
         parse_args(["--model-type", "auto"])
     with pytest.raises(SystemExit):
@@ -351,7 +383,7 @@ def test_folder_mode_logs_existing_prediction_and_summary(
     assert "segments_ran=0 segments_skipped=1" in caplog.text
 
 
-def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path):
+def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
     config_mapping = _config_mapping(
         "vesuvius_unet_2p5d", depth=3, side=16
     )
@@ -389,6 +421,30 @@ def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path):
         ]
     ) == 0
     assert np.all(tifffile.imread(output) == 127)
+
+    mask_path = tmp_path / "empty-mask.tif"
+    tifffile.imwrite(mask_path, np.zeros((16, 16), dtype=np.uint8))
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        assert main(
+            [
+                str(input_path),
+                str(checkpoint),
+                str(output),
+                "--workers",
+                "0",
+                "--no-compile",
+                "--blend-mode",
+                "constant",
+                "--mask-path",
+                str(mask_path),
+            ]
+        ) == 0
+    assert not tifffile.imread(output).any()
+    assert "Selected source layer indices=" in caplog.text
+    assert "foreground coverage 0.000%" in caplog.text
+    assert "Selected 0 patches for inference" in caplog.text
+    assert "all-zero output" in caplog.text
 
     array[:] = 2
     assert main(

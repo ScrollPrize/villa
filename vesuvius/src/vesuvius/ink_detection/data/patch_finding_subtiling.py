@@ -29,7 +29,7 @@ def build_patch_index(
     stride: int,
     filter_empty_tile: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build the exact working full-grid index; unfiltered mode is undefined."""
+    """Build the full-grid index after filtering empty label tiles."""
     size, tile_size, stride = int(size), int(tile_size), int(stride)
     if size <= 0 or tile_size <= 0 or stride <= 0:
         raise ValueError("size, tile_size, and stride must be positive")

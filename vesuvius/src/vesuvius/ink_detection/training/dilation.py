@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Any
+from collections.abc import Mapping
 
 import torch
 
@@ -40,11 +39,9 @@ def dilate_label_batch_with_cucim(
     labels_BCZYX: torch.Tensor,
     valid_B1ZYX: torch.Tensor,
     distance: float | None,
-    ignore_label: Any = None,
 ) -> torch.Tensor:
     """Dilate CUDA binary labels within a validity mask via cuCIM EDT."""
 
-    del ignore_label
     if distance in (None, 0):
         return labels_BCZYX
     if labels_BCZYX.device.type != "cuda":
@@ -97,15 +94,11 @@ def apply_label_dilation(
     batch: Mapping[str, torch.Tensor],
     label_distance: float,
     supervision_distance: float,
-    *,
-    dilator: Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]
-    | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return a batch with ink/background dilation-union semantics."""
 
     if label_distance <= 0.0 and supervision_distance <= 0.0:
         return batch if isinstance(batch, dict) else dict(batch)
-    dilation = dilate_label_batch_with_cucim if dilator is None else dilator
     output = dict(batch)
     inklabels_BCZYX = output["inklabels"]
     supervision_BCZYX = output["supervision_mask"]
@@ -117,14 +110,14 @@ def apply_label_dilation(
         dtype=inklabels_BCZYX.dtype,
     )
     if label_distance > 0.0:
-        inklabels_BCZYX = dilation(
+        inklabels_BCZYX = dilate_label_batch_with_cucim(
             inklabels_BCZYX, valid_B1ZYX, label_distance
         )
     if supervision_distance > 0.0:
         background_BCZYX = (
             (supervision_BCZYX > 0) & (inklabels_BCZYX <= 0)
         ).to(dtype=inklabels_BCZYX.dtype)
-        background_BCZYX = dilation(
+        background_BCZYX = dilate_label_batch_with_cucim(
             background_BCZYX, valid_B1ZYX, supervision_distance
         )
         background_BCZYX = background_BCZYX * (

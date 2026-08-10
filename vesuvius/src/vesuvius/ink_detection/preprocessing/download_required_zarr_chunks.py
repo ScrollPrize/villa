@@ -19,7 +19,7 @@ from vesuvius.ink_detection.data.geometry import compute_native_crop_bbox
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
-from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
+from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume, open_volume_root
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -384,8 +384,7 @@ def _write_progress(
 
 def _create_output_arrays(source_group, output_path: Path, recompress: str):
     group_kwargs: dict[str, object] = {"mode": "w"}
-    zarr_v3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-    if zarr_v3:
+    if ZARR_V3:
         group_kwargs["zarr_format"] = 2
     root = zarr.open_group(str(output_path), **group_kwargs)
     compressor = compressor_from_recompress_preset(recompress)
@@ -405,7 +404,7 @@ def _create_output_arrays(source_group, output_path: Path, recompress: str):
             "filters": source_array.filters,
             "order": getattr(source_array, "order", "C"),
         }
-        if zarr_v3:
+        if ZARR_V3:
             output_array = root.create_array(key, **create_kwargs)
         else:
             output_array = root.create_dataset(key, **create_kwargs)
@@ -1078,7 +1077,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--patch-finding-type",
         choices=("default", "subtiling"),
         default="default",
-        help="Current shared patch-finding implementation to mirror.",
+        help="Patch-finding implementation used to select source chunks.",
     )
     parser.add_argument(
         "--patch-min-labeled-coverage",
@@ -1101,7 +1100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--patch-finding-filter-empty-tile",
         action="store_true",
-        help="Mirror the subtiling empty-tile pruning used by training.",
+        help="Enable subtiling empty-tile pruning.",
     )
     parser.add_argument(
         "--label-version",

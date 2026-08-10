@@ -29,6 +29,8 @@ class LocalDepthFusionStem(nn.Module):
 
     def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
         features_BCZYX = self.features(image_BCZYX)
+        # Keep the depth softmax stable under autocast. It begins as a depth
+        # mean while the parallel max branch preserves strong local features.
         weights_B1ZYX = torch.softmax(
             self.attention_logits(features_BCZYX).float(), dim=2
         )

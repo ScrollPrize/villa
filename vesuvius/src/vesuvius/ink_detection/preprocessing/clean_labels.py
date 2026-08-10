@@ -9,15 +9,20 @@ import os
 from pathlib import Path
 import re
 import shutil
-import tempfile
 from typing import Dict, List, Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
 from scipy import ndimage
 import tifffile
 from tqdm.auto import tqdm
 
+from vesuvius.ink_detection.preprocessing.staged_write import (
+    create_staged_output,
+    discard_staged_output,
+    publish_staged_output,
+)
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -214,8 +219,6 @@ def remove_small_components(mask_u8: np.ndarray, min_component_size: int) -> np.
     if min_component_size <= 1:
         return np.ascontiguousarray(mask_u8)
 
-    import cv2
-
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     keep = np.zeros(num_labels, dtype=bool)
     keep[0] = False
@@ -232,8 +235,6 @@ def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
 def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
     if max_hole_area <= 0:
         return np.ascontiguousarray(mask_u8)
-
-    import cv2
 
     background = (mask_u8 == 0).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=8)
@@ -348,27 +349,16 @@ def process_one(
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=output_path.parent,
-        prefix=f".{output_path.stem}.",
-        suffix=output_path.suffix,
-        delete=False,
-    ) as stream:
-        staged_output = Path(stream.name)
+    staged_output = create_staged_output(output_path)
     try:
         write_tiff(staged_output, cleaned)
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         if overwrite and backup_path.exists():
             backup_path.unlink()
         shutil.move(str(input_path), str(backup_path))
-        try:
-            staged_output.replace(output_path)
-        except Exception:
-            if not input_path.exists() and backup_path.exists():
-                shutil.move(str(backup_path), str(input_path))
-            raise
+        publish_staged_output(staged_output, output_path)
     finally:
-        staged_output.unlink(missing_ok=True)
+        discard_staged_output(staged_output)
     return {
         "status": "written",
         "input": str(input_path),
@@ -454,7 +444,6 @@ def run_processing(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _configure_image_policy()
     args = parse_args(argv)
     root = args.root.expanduser().resolve()
     if not root.exists():

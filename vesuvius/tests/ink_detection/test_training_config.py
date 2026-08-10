@@ -7,6 +7,7 @@ import json
 import pytest
 
 import vesuvius.ink_detection.config as config_module
+import vesuvius.ink_detection.training.train as train_module
 from vesuvius.ink_detection.config import (
     InkDataConfig,
     TrainingConfig,
@@ -38,7 +39,9 @@ def _parse_training(authored: dict) -> TrainingConfig:
     return TrainingConfig.from_mapping(resolve_training_mapping(authored))
 
 
-def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(tmp_path):
+def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(
+    tmp_path, monkeypatch
+):
     authored = _training_mapping(mode="full_3d")
     authored.pop("in_channels")
     authored["targets"]["ink"].pop("out_channels")
@@ -55,7 +58,8 @@ def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(tmp_path)
         assert "crop_size" not in still_raw
         return {"model": {}}
 
-    request = stage_training_request(config_path, checkpoint_loader=loader)
+    monkeypatch.setattr(train_module, "load_checkpoint", loader)
+    request = stage_training_request(config_path)
     canonical = request.config.to_mapping()
 
     assert selected == [tmp_path / "weights/start.pth"]
@@ -300,6 +304,14 @@ def test_data_and_training_defaults_remain_deliberately_forked():
         missing.pop(required)
         with pytest.raises(KeyError, match=required):
             _parse_training(missing)
+
+
+def test_staged_training_rejects_a_non_object_at_the_config_boundary(tmp_path):
+    config_path = tmp_path / "training.json"
+    config_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(TypeError, match="ink training config must be an object"):
+        stage_training_request(config_path)
 
 
 def test_training_config_constructs_a_synthetic_dataset(tmp_path):

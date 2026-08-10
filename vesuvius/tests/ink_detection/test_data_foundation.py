@@ -645,15 +645,8 @@ def test_native_dataset_modes_use_shared_geometry(
         assert sample["surface_mask"].max() == 1.0
 
 
-@pytest.mark.parametrize(
-    "retry_message",
-    [
-        "No valid tifxyz points found for patch",
-        "Oversized native support grid (9, 9) exceeded side limits (4, 4)",
-    ],
-)
 def test_native_sample_retry_follows_replacement_chain(
-    tmp_path, monkeypatch, retry_message
+    tmp_path, monkeypatch
 ):
     config = InkDataConfig.from_mapping(
         {
@@ -691,7 +684,7 @@ def test_native_sample_retry_follows_replacement_chain(
         patch_index = patch.bbox[2]
         attempts.append(patch_index)
         if patch_index < 2:
-            raise ValueError(retry_message)
+            return None
         return {"patch_index": torch.tensor(patch_index)}
 
     class ScriptedRandom:

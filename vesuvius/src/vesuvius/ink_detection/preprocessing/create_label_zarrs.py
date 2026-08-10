@@ -11,28 +11,24 @@ from typing import Iterable, Literal, Sequence
 
 import cv2
 import numpy as np
-from numcodecs import Blosc
 import tifffile
 from tqdm.auto import tqdm
 import zarr
 
 from vesuvius.ink_detection.data.segment import parse_label_asset_path
+from vesuvius.label_zarr import (
+    DEFAULT_LEVELS,
+    LABEL_SLICE as DEFAULT_LABEL_SLICE,
+    VOLUME_DEPTH as DEFAULT_DEPTH,
+    create_label_array,
+    create_label_group,
+    pyramid_shapes,
+)
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
-AXES = [
-    {"name": "z", "type": "space"},
-    {"name": "y", "type": "space"},
-    {"name": "x", "type": "space"},
-]
-ARRAY_DIMENSIONS = ["z", "y", "x"]
-DEFAULT_LEVELS = 6
-DEFAULT_DEPTH = 65
-DEFAULT_LABEL_SLICE = 32
-DEFAULT_CHUNKS = (65, 128, 128)
 STREAM_BLOCK_SIZE = 1024
 SKIP_DIR_NAMES = {".git", "__pycache__"}
-LABEL_COMPRESSOR = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
 
 def parse_target_image(path: Path) -> dict[str, object] | None:
@@ -204,79 +200,6 @@ def _iter_block_slices(
             yield y_start, x_start, block_height, block_width
 
 
-def _pyramid_shapes(
-    image_shape: tuple[int, int], levels: int
-) -> list[tuple[int, int, int]]:
-    if levels < 1:
-        raise ValueError("levels must be at least 1")
-    height, width = image_shape
-    shapes = []
-    for _ in range(levels):
-        shapes.append((DEFAULT_DEPTH, height, width))
-        height = (height + 1) // 2
-        width = (width + 1) // 2
-    return shapes
-
-
-def _multiscales_metadata(name: str, levels: int) -> dict[str, object]:
-    datasets = []
-    for level in range(levels):
-        scale_factor = 2**level
-        datasets.append(
-            {
-                "path": str(level),
-                "coordinateTransformations": [
-                    {
-                        "type": "scale",
-                        "scale": [1.0, float(scale_factor), float(scale_factor)],
-                    }
-                ],
-            }
-        )
-    return {
-        "multiscales": [
-            {
-                "name": name,
-                "version": "0.4",
-                "axes": AXES,
-                "datasets": datasets,
-            }
-        ]
-    }
-
-
-def _create_dataset(
-    group: zarr.Group,
-    name: str,
-    *,
-    shape: tuple[int, int, int],
-    chunks: tuple[int, int, int],
-    dtype: np.dtype,
-    compressor: Blosc | None,
-) -> zarr.Array:
-    kwargs = {
-        "shape": shape,
-        "chunks": chunks,
-        "dtype": dtype,
-        "compressor": compressor,
-        "fill_value": 0,
-        "overwrite": True,
-    }
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        return group.create_array(
-            name,
-            **kwargs,
-            chunk_key_encoding={"name": "v2", "separator": "/"},
-            config={"write_empty_chunks": False},
-        )
-    return group.create_dataset(
-        name,
-        **kwargs,
-        dimension_separator="/",
-        write_empty_chunks=False,
-    )
-
-
 def _create_ome_zarr_datasets(
     output_path: Path,
     *,
@@ -292,23 +215,16 @@ def _create_ome_zarr_datasets(
             shutil.rmtree(output_path)
         else:
             output_path.unlink()
-    group_kwargs: dict[str, object] = {"mode": "w"}
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
-        group_kwargs["zarr_format"] = 2
-    group = zarr.open_group(str(output_path), **group_kwargs)
-    shapes = _pyramid_shapes(image_shape, levels)
-    group.attrs.update(_multiscales_metadata(output_path.stem, len(shapes)))
+    shapes = pyramid_shapes(image_shape, levels)
+    group = create_label_group(output_path, levels=len(shapes))
     datasets = []
     for level, shape in enumerate(shapes):
-        dataset = _create_dataset(
+        dataset = create_label_array(
             group,
             str(level),
             shape=shape,
-            chunks=DEFAULT_CHUNKS,
             dtype=np.dtype(dtype),
-            compressor=LABEL_COMPRESSOR,
         )
-        dataset.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
         datasets.append(dataset)
     return datasets
 

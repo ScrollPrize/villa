@@ -9,8 +9,51 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import nn
 
+from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+
 
 LOGGER = logging.getLogger(__name__)
+
+
+class TargetModel(nn.Module):
+    """Project the configured ink target to one logits tensor."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        input_pad_depth_to: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.input_pad_depth_to = input_pad_depth_to
+
+    def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
+        image_BCZYX = center_pad_input_depth(
+            image_BCZYX, self.input_pad_depth_to
+        )
+        outputs = self.model(image_BCZYX)
+        if not isinstance(outputs, Mapping):
+            raise TypeError(
+                "Ink model must return a target mapping, got "
+                f"{type(outputs).__name__}"
+            )
+        if "ink" not in outputs:
+            raise KeyError(
+                f"Ink model output is missing 'ink'; available: {sorted(outputs)}"
+            )
+        logits = outputs["ink"]
+        if isinstance(logits, (list, tuple)):
+            if not logits:
+                raise ValueError(
+                    "Ink model returned an empty deep-supervision output"
+                )
+            logits = logits[0]
+        if not isinstance(logits, torch.Tensor):
+            raise TypeError(
+                f"Ink logits must be a tensor, got {type(logits).__name__}"
+            )
+        return logits
 
 
 def parse_gpu_ids(value: str | None) -> tuple[int, ...]:

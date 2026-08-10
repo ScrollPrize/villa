@@ -290,7 +290,7 @@ class InkDataset(Dataset):
             patch, image, valid_slices, labels, supervision, surface_mask=None
         )
 
-    def _native_sample(self, patch: Patch) -> dict[str, torch.Tensor]:
+    def _native_sample(self, patch: Patch) -> dict[str, torch.Tensor] | None:
         z0, y0, x0, z1, y1, x1 = patch.bbox
         image_volume = self._open(patch.image_volume, patch.segment.scale)
         supervision_volume = self._open(patch.supervision_mask, patch.segment.scale)
@@ -316,9 +316,12 @@ class InkDataset(Dataset):
             flat_grid_stride=stride,
             native_coordinate_scale=coordinate_scale,
         )
-        crop_bbox = compute_native_crop_bbox(
-            patch_positions, patch_valid, self.patch_size
-        )
+        try:
+            crop_bbox = compute_native_crop_bbox(
+                patch_positions, patch_valid, self.patch_size
+            )
+        except ValueError:
+            return None
         patch_supervision = _read_flat_surface(
             supervision_volume, y0=y0, y1=y1, x0=x0, x1=x1
         )
@@ -389,10 +392,7 @@ class InkDataset(Dataset):
         support_shape = tuple(int(value) for value in support_valid.shape)
         support_limits = self.patch_size[1] * 4, self.patch_size[2] * 4
         if support_shape[0] > support_limits[0] or support_shape[1] > support_limits[1]:
-            raise ValueError(
-                f"Oversized native support grid {support_shape!r} exceeded "
-                f"side limits {support_limits!r}"
-            )
+            return None
         support_y0, support_y1, support_x0, support_x1 = support_bbox
         nx, ny, nz = patch_tifxyz.get_normals(
             support_y0 * stride,
@@ -445,6 +445,9 @@ class InkDataset(Dataset):
         supervision: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         key = patch.segment.dataset_idx, str(patch.image_volume), patch.segment.scale
+        label_thickness, background_thickness = self._normal_thicknesses(
+            patch.segment.scale
+        )
         for segment in self._segments_by_volume.get(key, ()):
             if segment.segment_relpath == patch.segment.segment_relpath:
                 continue
@@ -507,9 +510,8 @@ class InkDataset(Dataset):
             nx, ny, nz = patch_tifxyz.get_normals(
                 y0 * stride, y1 * stride, x0 * stride, x1 * stride
             )
-            normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride]
-            label_thickness, background_thickness = self._normal_thicknesses(
-                segment.scale
+            normals = np.stack([nz, ny, nx], axis=-1)[::stride, ::stride].astype(
+                np.float32, copy=False
             )
             other_labels, other_supervision = project_labels_and_supervision(
                 positions_zyx=positions,
@@ -572,23 +574,23 @@ class InkDataset(Dataset):
         current_index = requested_index
         while True:
             patch = self.patches[current_index]
-            try:
-                return self._native_sample(patch)
-            except ValueError as exc:
-                resample_error = str(exc) == "No valid tifxyz points found for patch" or str(
-                    exc
-                ).startswith("Oversized native support grid")
-                if not resample_error or len(self.patches) <= 1:
-                    raise
-                rng = random.Random(self.config.seed + current_index * 7919)
-                replacement = current_index
-                while replacement == current_index:
-                    replacement = rng.randrange(len(self.patches))
-                warnings.warn(
-                    "Native patch could not produce an admissible crop for "
-                    f"requested idx {requested_index}, patch idx {current_index}: "
-                    f"{exc}; resampling idx {replacement}",
-                    RuntimeWarning,
-                    stacklevel=2,
+            sample = self._native_sample(patch)
+            if sample is not None:
+                return sample
+            if len(self.patches) <= 1:
+                raise RuntimeError(
+                    "Cannot resample an inadmissible native patch from a dataset "
+                    "with one patch"
                 )
-                current_index = replacement
+            rng = random.Random(self.config.seed + current_index * 7919)
+            replacement = current_index
+            while replacement == current_index:
+                replacement = rng.randrange(len(self.patches))
+            warnings.warn(
+                "Native patch could not produce an admissible crop for "
+                f"requested idx {requested_index}, patch idx {current_index}; "
+                f"resampling idx {replacement}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            current_index = replacement

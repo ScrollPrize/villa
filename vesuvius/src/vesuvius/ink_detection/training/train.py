@@ -21,7 +21,6 @@ from vesuvius.ink_detection.models.checkpoint import (
     restore_training_state,
 )
 from vesuvius.ink_detection.config import (
-    BenchmarkConfig,
     InkDataConfig,
     TrainingConfig,
     resolve_training_mapping,
@@ -59,30 +58,22 @@ class TrainingRequest:
 
 def stage_training_request(
     config_path: str | Path,
-    *,
-    checkpoint_loader=load_checkpoint,
 ) -> TrainingRequest:
-    """Load the raw checkpoint before applying ordered training mutations."""
+    """Resolve config and load any raw checkpoint before creating frozen views."""
 
     config_path = Path(config_path)
     with config_path.open("r", encoding="utf-8") as stream:
         authored = json.load(stream)
-    if not isinstance(authored, Mapping):
-        raise TypeError("ink training config must contain a JSON object")
-
-    BenchmarkConfig.from_mapping(
-        authored, num_iterations=int(authored["num_iterations"])
-    )
+    canonical = resolve_training_mapping(authored)
     raw_checkpoint = authored.get("checkpoint")
     checkpoint_path = resolve_checkpoint_path(raw_checkpoint, config_path)
     checkpoint = (
         None
         if checkpoint_path is None
-        else checkpoint_loader(checkpoint_path)
+        else load_checkpoint(checkpoint_path)
     )
     weights_only = bool(authored.get("weights_only", False))
 
-    canonical = resolve_training_mapping(authored)
     return TrainingRequest(
         config=TrainingConfig.from_mapping(canonical),
         checkpoint_path=checkpoint_path,
@@ -182,49 +173,6 @@ def masked_unsmoothed_bce_with_logits(
     return (elements * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
 
 
-def update_ema_model(
-    ema_model,
-    source_model,
-    *,
-    optimizer_step: int,
-    config: TrainingConfig,
-) -> bool:
-    """Apply the exact floating lerp and integer-copy EMA state transition."""
-
-    ema = config.ema
-    if optimizer_step < ema.start_step:
-        return False
-    if (optimizer_step - ema.start_step) % ema.update_every_steps:
-        return False
-    ema_state = ema_model.state_dict()
-    for name, model_value in source_model.state_dict().items():
-        ema_value = ema_state[name]
-        model_value = model_value.detach()
-        if torch.is_floating_point(ema_value):
-            ema_value.lerp_(
-                model_value.to(dtype=ema_value.dtype), 1.0 - ema.decay
-            )
-        else:
-            ema_value.copy_(model_value)
-    return True
-
-
-def checkpoint_due(step: int, save_every: int) -> bool:
-    """Return the periodic-save cadence for a zero-based step."""
-
-    return (step + 1) % save_every == 0
-
-
-def validation_due(step: int, val_every: int) -> bool:
-    """Return the validation cadence for a zero-based step."""
-
-    return step > 0 and step % val_every == 0
-
-
-def periodic_checkpoint_name(step: int) -> str:
-    return f"ckpt_{step + 1:06}.pth"
-
-
 def append_validation_metrics(path: str | Path, record: Mapping) -> None:
     """Append one sorted JSON object without truncation or deduplication."""
 
@@ -293,53 +241,14 @@ def create_training_scheduler(optimizer, config: TrainingConfig):
     )
 
 
-def initialize_training_model(model, config: TrainingConfig) -> bool:
+def initialize_training_model(model, config: TrainingConfig) -> None:
     """Apply He initialization only when no pretrained backbone is configured."""
 
     if config.ink.model.pretrained_backbone is not None:
-        return False
+        return
     from vesuvius.models.utils import InitWeights_He
 
     model.apply(InitWeights_He(neg_slope=0.2))
-    return True
-
-
-def prepare_training_components(
-    accelerator,
-    *,
-    model,
-    optimizer,
-    train_loader,
-    val_loader,
-):
-    """Prepare exactly model, optimizer, and loaders; keep scheduler raw."""
-
-    return accelerator.prepare(model, optimizer, train_loader, val_loader)
-
-
-def advance_synchronized_optimizer_step(
-    *,
-    sync_gradients: bool,
-    scheduler,
-    optimizer_step: int,
-    ema_model,
-    source_model,
-    config: TrainingConfig,
-) -> int:
-    """Advance the raw scheduler/counter/EMA only at accumulation boundaries."""
-
-    if not sync_gradients:
-        return optimizer_step
-    scheduler.step()
-    optimizer_step += 1
-    if ema_model is not None:
-        update_ema_model(
-            ema_model,
-            source_model,
-            optimizer_step=optimizer_step,
-            config=config,
-        )
-    return optimizer_step
 
 
 def _distributed_mean_scalar(accelerator, value) -> torch.Tensor:
@@ -440,6 +349,8 @@ def _run_training(request: TrainingRequest) -> int:
     accumulation = GradientAccumulationPlugin(
         num_steps=config.grad_acc_steps, sync_with_dataloader=False
     )
+    # The training loop reuses the dataloader indefinitely, so accumulation
+    # boundaries must stay independent of dataloader exhaustion.
     accelerator = accelerate.Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_plugin=accumulation,
@@ -535,6 +446,8 @@ def _run_training(request: TrainingRequest) -> int:
             num_workers=config.dataloader_workers,
             **dataloader_kwargs,
         )
+    # Validation consumes only val_steps batches, so shuffle to sample a
+    # different deterministic subset on each pass.
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
@@ -568,13 +481,15 @@ def _run_training(request: TrainingRequest) -> int:
             )
         loss = DeepSupervisionWrapper(loss, weights)
 
-    model, optimizer, train_loader, val_loader = prepare_training_components(
-        accelerator,
-        model=model,
-        optimizer=optimizer,
-        train_loader=train_loader,
-        val_loader=val_loader,
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
     )
+    # NOTE: we intentionally do NOT prepare lr_scheduler with Accelerate.
+    # AcceleratedScheduler calls scheduler.step() num_processes times per
+    # optimizer step (when split_batches=False), which makes the LR schedule
+    # run num_processes-x faster than intended. Instead we step the raw
+    # scheduler ourselves exactly once per optimizer step inside the
+    # sync_gradients guard.
     unwrapped_model = accelerator.unwrap_model(model)
     freeze_encoder = config.ink.model.freeze_encoder
     frozen_encoder = unwrapped_model.shared_encoder if freeze_encoder else None
@@ -643,7 +558,7 @@ def _run_training(request: TrainingRequest) -> int:
         validation_metrics: Mapping | None = None,
     ) -> None:
         if not accelerator.is_main_process or (
-            not force and not checkpoint_due(step, config.save_every)
+            not force and (step + 1) % config.save_every != 0
         ):
             return
         payload = build_training_checkpoint_payload(
@@ -660,7 +575,7 @@ def _run_training(request: TrainingRequest) -> int:
         )
         torch.save(
             payload,
-            config.out_dir / (filename or periodic_checkpoint_name(step)),
+            config.out_dir / (filename or f"ckpt_{step + 1:06}.pth"),
         )
 
     write_gradient_health()
@@ -793,14 +708,29 @@ def _run_training(request: TrainingRequest) -> int:
             ):
                 write_gradient_health()
             optimizer.zero_grad(set_to_none=True)
-            optimizer_step = advance_synchronized_optimizer_step(
-                sync_gradients=accelerator.sync_gradients,
-                scheduler=scheduler,
-                optimizer_step=optimizer_step,
-                ema_model=ema_model,
-                source_model=unwrapped_model,
-                config=config,
-            )
+            if accelerator.sync_gradients:
+                scheduler.step()
+                optimizer_step += 1
+                ema = config.ema
+                if (
+                    ema_model is not None
+                    and optimizer_step >= ema.start_step
+                    and not (
+                        (optimizer_step - ema.start_step)
+                        % ema.update_every_steps
+                    )
+                ):
+                    ema_state = ema_model.state_dict()
+                    for name, model_value in unwrapped_model.state_dict().items():
+                        ema_value = ema_state[name]
+                        model_value = model_value.detach()
+                        if torch.is_floating_point(ema_value):
+                            ema_value.lerp_(
+                                model_value.to(dtype=ema_value.dtype),
+                                1.0 - ema.decay,
+                            )
+                        else:
+                            ema_value.copy_(model_value)
 
         if config.benchmark.enabled:
             if step >= config.benchmark.warmup_steps:
@@ -844,7 +774,7 @@ def _run_training(request: TrainingRequest) -> int:
             if wandb_module is not None and wandb_module.run is not None:
                 wandb_module.log(log_values, step=step)
 
-        if validation_due(step, config.val_every):
+        if step > 0 and step % config.val_every == 0:
             train_preview = PreviewAccumulator(
                 accelerator=accelerator, get_model_input=get_model_input
             )
@@ -1149,7 +1079,7 @@ def _run_training(request: TrainingRequest) -> int:
 
         save_checkpoint(step)
         if fixed_batch_sampler is not None and (
-            checkpoint_due(step, config.sampling_audit_every)
+            (step + 1) % config.sampling_audit_every == 0
             or step + 1 == config.num_iterations
         ):
             write_sampling_audit(step + 1)

@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
-import tempfile
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -26,6 +24,11 @@ import tifffile
 import zarr
 from tqdm import tqdm
 
+from vesuvius.ink_detection.preprocessing.staged_write import (
+    create_staged_output,
+    discard_staged_output,
+    publish_staged_output,
+)
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 _THREAD_LOCAL = threading.local()
@@ -53,6 +56,11 @@ class DatasetJob:
     start_z: int
     end_z: int
     tile_shape: tuple[int, int]
+    method: str
+    parallelism: str
+    workers: int
+    no_progress: bool
+    compression: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +253,10 @@ def _build_jobs(
     method: str,
     resolution: str,
     overwrite: bool,
+    parallelism: str,
+    workers: int,
+    no_progress: bool,
+    compression: str | None,
 ) -> list[DatasetJob]:
     zarr_dirs = _discover_zarr_dirs(input_root)
     if not zarr_dirs:
@@ -280,6 +292,11 @@ def _build_jobs(
                 start_z=z_start,
                 end_z=z_end,
                 tile_shape=_validate_tile_shape(spec.chunks),
+                method=method,
+                parallelism=parallelism,
+                workers=workers,
+                no_progress=no_progress,
+                compression=compression,
             )
         )
 
@@ -359,7 +376,8 @@ def _to_uint8(data: np.ndarray) -> np.ndarray:
 def _project_chunk(task: ChunkTask) -> np.ndarray:
     array = _get_worker_array()
     config = _WORKER_CONFIG
-    assert config is not None
+    if config is None:
+        raise RuntimeError("Worker configuration has not been initialized.")
 
     if config.leading_axis_index is None:
         block = np.asarray(
@@ -385,37 +403,31 @@ def _project_chunk(task: ChunkTask) -> np.ndarray:
     return tile
 
 
-def _write_projection(job: DatasetJob, args: argparse.Namespace) -> None:
+def _write_projection(job: DatasetJob) -> None:
     worker_config = WorkerConfig(
         zarr_path=str(job.zarr_path),
         array_key=job.array_key,
         leading_axis_index=job.leading_axis_index,
         start_z=job.start_z,
         end_z=job.end_z,
-        method=args.method,
+        method=job.method,
         tile_shape=job.tile_shape,
     )
     tasks = _iter_chunk_tasks(job.shape, job.chunks)
 
-    if args.parallelism == "threads":
+    if job.parallelism == "threads":
         _set_worker_config(worker_config)
         executor_cls = ThreadPoolExecutor
-        executor_kwargs = {"max_workers": args.workers}
+        executor_kwargs = {"max_workers": job.workers}
     else:
         executor_cls = ProcessPoolExecutor
         executor_kwargs = {
-            "max_workers": args.workers,
+            "max_workers": job.workers,
             "initializer": _set_worker_config,
             "initargs": (worker_config,),
         }
 
-    with tempfile.NamedTemporaryFile(
-        dir=job.output_path.parent,
-        prefix=f".{job.output_path.stem}.",
-        suffix=job.output_path.suffix,
-        delete=False,
-    ) as stream:
-        staged_output = Path(stream.name)
+    staged_output = create_staged_output(job.output_path)
     try:
         with executor_cls(**executor_kwargs) as executor:
             tile_iter = executor.map(_project_chunk, tasks, chunksize=1)
@@ -423,7 +435,7 @@ def _write_projection(job: DatasetJob, args: argparse.Namespace) -> None:
             progress = tqdm(
                 total=len(tasks),
                 desc=job.folder.name,
-                disable=args.no_progress,
+                disable=job.no_progress,
                 leave=False,
             )
 
@@ -442,33 +454,32 @@ def _write_projection(job: DatasetJob, args: argparse.Namespace) -> None:
                     dtype=np.uint8,
                     tile=job.tile_shape,
                     photometric="minisblack",
-                    compression=args.compression,
+                    compression=job.compression,
                     maxworkers=1,
                 )
-        staged_output.replace(job.output_path)
+        publish_staged_output(staged_output, job.output_path)
     finally:
-        staged_output.unlink(missing_ok=True)
+        discard_staged_output(staged_output)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     input_root = Path(args.input_root)
     if not input_root.is_dir():
-        print(f"Input root is not a directory: {input_root}", file=sys.stderr)
-        return 1
+        raise NotADirectoryError(f"Input root is not a directory: {input_root}")
 
-    try:
-        jobs = _build_jobs(
-            input_root=input_root,
-            start_z=args.start_z,
-            end_z=args.end_z,
-            method=args.method,
-            resolution=args.resolution,
-            overwrite=args.overwrite,
-        )
-    except (FileNotFoundError, FileExistsError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
+    jobs = _build_jobs(
+        input_root=input_root,
+        start_z=args.start_z,
+        end_z=args.end_z,
+        method=args.method,
+        resolution=args.resolution,
+        overwrite=args.overwrite,
+        parallelism=args.parallelism,
+        workers=args.workers,
+        no_progress=args.no_progress,
+        compression=args.compression,
+    )
 
     job_iter: Sequence[DatasetJob] | tqdm[DatasetJob]
     job_iter = jobs
@@ -477,7 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     wrote = 0
     for job in job_iter:
-        _write_projection(job, args)
+        _write_projection(job)
         wrote += 1
 
     print(f"Wrote {wrote} TIFF projection(s).")

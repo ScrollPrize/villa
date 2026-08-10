@@ -38,10 +38,7 @@ def load_checkpoint(
     resolved = resolve_checkpoint_path(checkpoint_path)
     if resolved is None or not resolved.exists():
         raise FileNotFoundError(f"Checkpoint not found: {resolved}")
-    try:
-        return torch.load(str(resolved), map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(str(resolved), map_location="cpu")
+    return torch.load(str(resolved), map_location="cpu", weights_only=False)
 
 
 def load_model_state(
@@ -63,13 +60,11 @@ def load_model_state(
             for key, value in model_state.items()
         }
         if any(str(key).startswith("module.") for key in model_state):
-            stripped_error = None
             try:
                 model.load_state_dict(stripped_state)
-            except RuntimeError as error:
-                stripped_error = error
-            if stripped_error is None:
                 return
+            except RuntimeError:
+                pass
 
         prefixed_state = {
             (
@@ -125,21 +120,24 @@ def restore_training_state(
 def select_inference_weights(
     checkpoint: Mapping[str, Any],
     *,
-    prefer_ema: bool = True,
     source: str | Path = "<memory>",
 ) -> tuple[str, Mapping[str, Any]]:
     """Select one supported inference state container by compatibility priority."""
 
     if not isinstance(checkpoint, Mapping):
         raise ValueError(f"Checkpoint {str(source)!r} must contain a mapping")
-    candidates = (
-        ("ema_model", "state_dict", "model_state_dict", "model")
-        if prefer_ema
-        else ("state_dict", "model_state_dict", "model")
-    )
+    # Unlike the reference's fail-soft root selection, an empty checkpoint must
+    # not let inference continue with randomly initialized model weights.
+    if not checkpoint:
+        raise ValueError(f"Checkpoint {str(source)!r} is empty")
+    candidates = ("ema_model", "state_dict", "model_state_dict", "model")
     for name in candidates:
         model_state = checkpoint.get(name)
         if isinstance(model_state, Mapping):
+            if not model_state:
+                raise ValueError(
+                    f"Checkpoint {str(source)!r} model state {name!r} is empty"
+                )
             return name, model_state
     if all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
         return "<root>", checkpoint

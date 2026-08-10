@@ -17,9 +17,6 @@ from vesuvius.ink_detection.training.train import (
     append_validation_metrics,
     benchmark_summary,
     build_training_checkpoint_payload,
-    checkpoint_due,
-    periodic_checkpoint_name,
-    validation_due,
 )
 
 from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
@@ -144,13 +141,6 @@ def test_validation_jsonl_has_exact_schema_sorted_bytes_and_appends(tmp_path):
         "learning_rate",
     }
     assert "ema" not in lines[0]
-
-
-def test_periodic_save_and_validation_offsets_remain_different():
-    assert [step for step in range(6) if checkpoint_due(step, 3)] == [2, 5]
-    assert [step for step in range(6) if validation_due(step, 3)] == [3]
-    assert periodic_checkpoint_name(2) == "ckpt_000003.pth"
-    assert checkpoint_due(4, 3) is False
 
 
 def test_benchmark_summary_uses_global_examples_and_cpu_zero_peaks():

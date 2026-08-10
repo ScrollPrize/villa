@@ -341,19 +341,9 @@ def test_inference_ema_preference_and_fallback_are_explicit():
     ema_state = {"weight": torch.tensor([2.0])}
     payload = {"model": model_state, "ema_model": ema_state}
 
-    selected_name, selected_state = select_inference_weights(
-        payload,
-        prefer_ema=True,
-    )
+    selected_name, selected_state = select_inference_weights(payload)
     assert selected_name == "ema_model"
     assert selected_state is ema_state
-
-    selected_name, selected_state = select_inference_weights(
-        payload,
-        prefer_ema=False,
-    )
-    assert selected_name == "model"
-    assert selected_state is model_state
 
     selected_name, selected_state = select_inference_weights(
         {"model": model_state}

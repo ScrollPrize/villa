@@ -113,6 +113,33 @@ def test_clean_labels_exports_backup_is_rerunnable_and_preserves_source_on_failu
     np.testing.assert_array_equal(tifffile.imread(source), original * 255)
 
 
+def test_clean_labels_publish_failure_keeps_original_in_backup(tmp_path: Path) -> None:
+    root = tmp_path / "labels"
+    root.mkdir()
+    source = root / "segment_inklabels.tif"
+    original = np.arange(32 * 32, dtype=np.uint16).reshape(32, 32)
+    tifffile.imwrite(source, original)
+    backup = clean_labels.backup_path_for_input(root, source)
+
+    with patch.object(
+        clean_labels,
+        "publish_staged_output",
+        side_effect=OSError("injected publish failure"),
+    ):
+        with pytest.raises(OSError, match="injected publish failure"):
+            clean_labels.process_one(
+                root,
+                source,
+                min_component_size=1,
+                do_fill_holes=False,
+                max_hole_area=0,
+                overwrite=False,
+            )
+
+    assert not source.exists()
+    np.testing.assert_array_equal(tifffile.imread(backup), original)
+
+
 def test_spawned_clean_worker_applies_the_same_pillow_policy(tmp_path: Path) -> None:
     root = tmp_path / "labels"
     root.mkdir()
@@ -196,7 +223,7 @@ def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_in
         unmatched / "model_ckpt_1_forward_prediction.tif",
         np.zeros((2, 2), dtype=np.uint8),
     )
-    with pytest.raises(ValueError, match="none match the frozen selection terms"):
+    with pytest.raises(ValueError, match="none match the selection terms"):
         merge_predictions.main([str(unmatched), "--workers", "1", "--direction", "forward"])
     with pytest.raises(ValueError, match="non-finite"):
         merge_predictions.normalize_prediction_array(
@@ -238,11 +265,13 @@ def test_composite_cli_exports_reference_values_and_has_safe_error_paths(
     assert composite_from_zarr.main(args) == 0
     output = folder / f"{folder.name}_{method}_0_2.tif"
     np.testing.assert_array_equal(tifffile.imread(output)[:2, :2], expected)
-    assert composite_from_zarr.main(args) == 1
+    with pytest.raises(FileExistsError):
+        composite_from_zarr.main(args)
     assert composite_from_zarr.main([*args, "--overwrite"]) == 0
-    assert composite_from_zarr.main(
-        ["--input-root", str(tmp_path / "missing"), "--method", "max", "--no-progress"]
-    ) == 1
+    with pytest.raises(NotADirectoryError):
+        composite_from_zarr.main(
+            ["--input-root", str(tmp_path / "missing"), "--method", "max", "--no-progress"]
+        )
 
 
 def test_composite_failure_leaves_no_published_or_partial_tiff(tmp_path: Path) -> None:
@@ -263,10 +292,14 @@ def test_composite_failure_leaves_no_published_or_partial_tiff(tmp_path: Path) -
         method=args.method,
         resolution=args.resolution,
         overwrite=args.overwrite,
+        parallelism=args.parallelism,
+        workers=args.workers,
+        no_progress=args.no_progress,
+        compression=args.compression,
     )[0]
     with patch.object(composite_from_zarr, "_project_chunk", side_effect=OSError("injected")):
         with pytest.raises(OSError, match="injected"):
-            composite_from_zarr._write_projection(job, args)
+            composite_from_zarr._write_projection(job)
     assert list(folder.glob("*.tif")) == []
 
 

@@ -8,7 +8,7 @@ import math
 import shutil
 import tempfile
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
@@ -29,13 +29,14 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.inference_runtime import (
+    TargetModel,
     parse_gpu_ids,
     prepare_model_for_inference,
     resolve_amp_dtype,
 )
-from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
+    ZARR_V3,
     open_volume,
     open_volume_root,
     select_volume_level,
@@ -76,40 +77,6 @@ class ConfiguredModel:
     preprocessing: str
     amp_dtype: torch.dtype | None
     config: InkConfig
-
-
-class FlatTargetModel(nn.Module):
-    """Project the configured ink target to one BCYX logits tensor."""
-
-    def __init__(self, model: nn.Module, *, input_pad_depth_to: int | None) -> None:
-        super().__init__()
-        self.model = model
-        self.input_pad_depth_to = input_pad_depth_to
-
-    def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
-        image_BCZYX = center_pad_input_depth(
-            image_BCZYX, self.input_pad_depth_to
-        )
-        outputs = self.model(image_BCZYX)
-        if not isinstance(outputs, Mapping):
-            raise TypeError(
-                "Ink model must return a target mapping, got "
-                f"{type(outputs).__name__}"
-            )
-        if "ink" not in outputs:
-            raise KeyError(
-                f"Ink model output is missing 'ink'; available: {sorted(outputs)}"
-            )
-        logits = outputs["ink"]
-        if isinstance(logits, (list, tuple)):
-            if not logits:
-                raise ValueError("Ink model returned an empty deep-supervision output")
-            logits = logits[0]
-        if not isinstance(logits, torch.Tensor):
-            raise TypeError(
-                f"Ink logits must be a tensor, got {type(logits).__name__}"
-            )
-        return logits
 
 
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
@@ -214,6 +181,8 @@ def compute_importance_map_2d(
             torch.hann_window(patch_w, periodic=False, dtype=torch.float32),
         )
         weight /= torch.clamp(weight.max(), min=torch.finfo(weight.dtype).eps)
+        # An exact Hann window is zero at its outermost pixels; flooring keeps a
+        # boundary covered by only one patch normalizable.
         return torch.clamp(weight, min=0.001)
     if mode != "gaussian":
         raise ValueError(f"Unsupported flat blend mode {mode!r}")
@@ -365,6 +334,8 @@ def choose_pyramid_array(
         return "0", root
     available = [str(key) for key in root.array_keys()]
     if preferred_key not in available:
+        # HTTP-backed stores may allow direct key access without directory
+        # listing, so probe the requested level before treating the group empty.
         try:
             requested = root[preferred_key]
         except (KeyError, FileNotFoundError):
@@ -384,6 +355,12 @@ def choose_pyramid_array(
         )
     else:
         selected = sorted(available)[0]
+    LOGGER.warning(
+        "Requested %s level %s was not found; using level %s instead",
+        purpose,
+        preferred_key,
+        selected,
+    )
     return selected, root[selected]
 
 
@@ -575,10 +552,12 @@ class FlatBlockDataset(Dataset):
             self.patch_size,
             self.patch_size,
         )
+        # Measure occupancy before normalization because robust normalization
+        # maps an all-zero patch to nonzero values.
         nonempty = int(patch_HWZ.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
         patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
-        image_CZYX = torch.from_numpy(np.ascontiguousarray(patch_ZYX)).unsqueeze(0)
+        image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
         metadata = torch.tensor(
             [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
             dtype=torch.int64,
@@ -820,6 +799,8 @@ def run_block_inference(
     )
     with torch.inference_mode(), autocast:
         for images_BCZYX, metadata in loader:
+            # The dataset records occupancy on raw patches; normalized all-zero
+            # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
             if not bool(keep.any()):
                 continue
@@ -910,7 +891,7 @@ def open_temp_zarr_array(
 
     format_keyword = (
         {"zarr_format": 2}
-        if int(zarr.__version__.split(".", 1)[0]) >= 3
+        if ZARR_V3
         else {"zarr_version": 2}
     )
     return zarr.open(
@@ -935,6 +916,13 @@ def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray
     height = min(target_shape[0], image.shape[0])
     width = min(target_shape[1], image.shape[1])
     output[:height, :width] = image[:height, :width] != 0
+    if tuple(int(value) for value in image.shape[:2]) != tuple(target_shape):
+        LOGGER.warning(
+            "Mask shape %s did not match Zarr shape %s; applied top-left "
+            "crop/pad alignment",
+            tuple(int(value) for value in image.shape[:2]),
+            tuple(int(value) for value in target_shape),
+        )
     return output
 
 
@@ -969,7 +957,7 @@ def configure_model(args: Any) -> ConfiguredModel:
             f"Flat inference requires checkpoint mode='flat', got {config.data.mode!r}"
         )
     selected_state, state = select_inference_weights(
-        payload, prefer_ema=True, source=args.checkpoint
+        payload, source=args.checkpoint
     )
     base_model = make_model(config)
     incompatibility = load_flat_inference_state(base_model, state)
@@ -986,7 +974,7 @@ def configure_model(args: Any) -> ConfiguredModel:
         raise ValueError(
             f"Flat inference requires square Y/X patches, got {config.model.crop_size!r}"
         )
-    model = FlatTargetModel(
+    model = TargetModel(
         base_model,
         input_pad_depth_to=config.model.input_pad_depth_to,
     ).eval()
@@ -1055,6 +1043,23 @@ def infer_single_zarr(
         output_depth=configured_model.input_depth,
         direction=layer_direction,
     )
+    LOGGER.info("Selected source layer indices=%s", layer_indices.tolist())
+    LOGGER.info(
+        "Input level=%s shape=(depth=%d, height=%d, width=%d) "
+        "chunks=(%d, %d) patch=%d stride=%d requested_overlap=%.3f "
+        "blend_mode=%s tta_mirror=%s",
+        resolution,
+        depth,
+        height,
+        width,
+        chunk_h,
+        chunk_w,
+        patch_size,
+        stride,
+        float(args.overlap),
+        blend_mode,
+        bool(args.tta_mirror),
+    )
     reader = FlatPatchReader(
         input_path=input_zarr,
         resolution=resolution,
@@ -1073,12 +1078,36 @@ def infer_single_zarr(
         if args.mask_path is None
         else load_grayscale_mask(args.mask_path, (height, width))
     )
-    occupancy, occupancy_scale, _ = build_lowres_block_mask(
+    if mask is None:
+        LOGGER.info("No mask supplied; using the entire Zarr")
+    else:
+        LOGGER.info(
+            "Loaded mask %s with foreground coverage %.3f%%",
+            args.mask_path,
+            100.0 * float(mask.mean()),
+        )
+    occupancy, occupancy_scale, occupancy_level = build_lowres_block_mask(
         root,
         height=height,
         width=width,
         user_mask=mask,
     )
+    if occupancy is None:
+        LOGGER.warning(
+            "No low-resolution occupancy scan is available for %s; all tiles "
+            "will be scheduled",
+            input_zarr,
+        )
+    else:
+        LOGGER.info(
+            "Using occupancy scan level=%s shape=%s scale=(%d, %d) "
+            "nonempty_coverage=%.3f%%",
+            occupancy_level,
+            tuple(int(value) for value in occupancy.shape),
+            int(occupancy_scale[0]),
+            int(occupancy_scale[1]),
+            100.0 * float(occupancy.mean()),
+        )
     blocks = iter_blocks(
         (height, width),
         patch_size,
@@ -1086,6 +1115,7 @@ def infer_single_zarr(
         occupancy,
         occupancy_scale,
     )
+    LOGGER.info("Selected %d patches for inference", len(blocks))
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1157,6 +1187,10 @@ def infer_single_zarr(
                 tta_batch_size=args.tta_batch_size,
             )
             accumulator.flush_remaining()
+        else:
+            LOGGER.warning(
+                "No occupied blocks were found; writing an all-zero output"
+            )
         write_output_tiff(
             probability_sum,
             weight_sum,
@@ -1369,10 +1403,6 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
-    if not 0 <= args.overlap < 1:
-        parser.error("--overlap must be in [0, 1)")
-    if args.stride is not None and args.stride <= 0:
-        parser.error("--stride must be positive")
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -1397,14 +1427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
     )
-    configured = ConfiguredModel(
-        model=prepared_model,
-        patch_size=configured.patch_size,
-        input_depth=configured.input_depth,
-        preprocessing=configured.preprocessing,
-        amp_dtype=configured.amp_dtype,
-        config=configured.config,
-    )
+    configured = replace(configured, model=prepared_model)
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:

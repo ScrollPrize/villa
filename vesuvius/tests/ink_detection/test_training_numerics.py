@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,6 +17,8 @@ from vesuvius.ink_detection.training.deep_supervision import (
     build_deep_supervision_targets,
     deep_supervision_weights,
 )
+import vesuvius.ink_detection.training.dilation as dilation_module
+import vesuvius.ink_detection.training.train as train_module
 from vesuvius.ink_detection.training.dilation import (
     apply_label_dilation,
     dilate_label_batch_with_cucim,
@@ -24,12 +30,10 @@ from vesuvius.ink_detection.training.optimizers import (
     plan_optimizer_target,
 )
 from vesuvius.ink_detection.training.stitching import run_model_forward
-from vesuvius.ink_detection.training.train import update_ema_model
 from vesuvius.ink_detection.training.train import (
-    advance_synchronized_optimizer_step,
     create_training_scheduler,
     initialize_training_model,
-    prepare_training_components,
+    stage_training_request,
 )
 
 from .test_model_foundation import _config_mapping
@@ -143,47 +147,19 @@ def test_cosine_and_one_cycle_use_configured_constructor_values():
     assert one_cycle._schedule_phases[0]["end_step"] == pytest.approx(0.8)
 
 
-class _RecordingAccelerator:
-    def __init__(self) -> None:
-        self.prepared = None
-
-    def prepare(self, *objects):
-        self.prepared = objects
-        return objects
-
-
-def test_accelerate_prepares_exactly_four_objects_and_never_scheduler():
-    accelerator = _RecordingAccelerator()
-    values = tuple(object() for _ in range(5))
-
-    observed = prepare_training_components(
-        accelerator,
-        model=values[0],
-        optimizer=values[1],
-        train_loader=values[2],
-        val_loader=values[3],
-    )
-
-    assert observed == values[:4]
-    assert accelerator.prepared == values[:4]
-    assert values[4] not in accelerator.prepared
-
-
 def test_fresh_initialization_overwrites_zero_attention_and_pretrained_skips():
     fresh_config = _training_config(_training_mapping())
     fresh = nn.Conv3d(1, 1, kernel_size=1)
     nn.init.zeros_(fresh.weight)
 
-    assert initialize_training_model(fresh, fresh_config) is True
+    initialize_training_model(fresh, fresh_config)
     assert torch.count_nonzero(fresh.weight).item() == 1
 
     pretrained_mapping = _training_mapping()
     pretrained_mapping["model_config"]["pretrained_backbone"] = "/weights.pth"
     pretrained = nn.Conv3d(1, 1, kernel_size=1)
     nn.init.zeros_(pretrained.weight)
-    assert initialize_training_model(
-        pretrained, _training_config(pretrained_mapping)
-    ) is False
+    initialize_training_model(pretrained, _training_config(pretrained_mapping))
     assert torch.count_nonzero(pretrained.weight).item() == 0
 
 
@@ -268,17 +244,19 @@ def _fake_dilator(labels, valid, distance):
     return F.max_pool3d(labels, kernel_size=3, stride=1, padding=1)
 
 
-def test_dilation_union_excludes_new_ink_from_background():
+def test_dilation_union_excludes_new_ink_from_background(monkeypatch):
     labels = torch.zeros(1, 1, 1, 1, 5)
     labels[..., 2] = 1
     supervision = torch.zeros_like(labels)
     supervision[..., 0] = 1
 
+    monkeypatch.setattr(
+        dilation_module, "dilate_label_batch_with_cucim", _fake_dilator
+    )
     output = apply_label_dilation(
         {"inklabels": labels, "supervision_mask": supervision},
         1.0,
         1.0,
-        dilator=_fake_dilator,
     )
 
     torch.testing.assert_close(
@@ -332,64 +310,139 @@ def test_flat_mode_never_enters_positive_full_3d_dilation_configuration():
     ) == (0.0, 0.0)
 
 
-class _EmaModel(nn.Module):
-    def __init__(self, value: float, counter: int) -> None:
+class _SyntheticTrainingDataset(torch.utils.data.Dataset):
+    def __init__(self, config, *, do_augmentations, patches=None, segments=None):
+        del config, do_augmentations
+        self.training_patches = [0, 1]
+        self.validation_patches = []
+        self.segments = []
+        self._patches = self.training_patches if patches is None else list(patches)
+        if segments is not None:
+            self.segments = list(segments)
+
+    def __len__(self) -> int:
+        return len(self._patches)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        del index
+        return {
+            "image": torch.ones(1, 1, 4, 4),
+            "inklabels": torch.zeros(1, 1, 4, 4),
+            "supervision_mask": torch.ones(1, 1, 4, 4),
+        }
+
+
+class _SyntheticTrainingModel(nn.Module):
+    def __init__(self) -> None:
         super().__init__()
-        self.value = nn.Parameter(torch.tensor(value))
-        self.register_buffer("counter", torch.tensor(counter))
+        self.value = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("counter", torch.tensor(0, dtype=torch.int64))
+
+    def forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
+        self.counter.add_(1)
+        return {"ink": image[:, :1, 0] * self.value}
 
 
-def test_ema_lerps_floats_and_copies_integer_buffers_on_exact_cadence():
-    authored = _training_mapping()
-    authored["ema"] = {
-        "enabled": True,
-        "decay": 0.5,
-        "start_step": 2,
-        "update_every_steps": 2,
-    }
-    config = _training_config(authored)
-    ema = _EmaModel(2.0, 1)
-    source = _EmaModel(4.0, 7)
-
-    assert update_ema_model(
-        ema, source, optimizer_step=3, config=config
-    ) is False
-    assert update_ema_model(
-        ema, source, optimizer_step=4, config=config
-    ) is True
-    assert ema.value.item() == 3.0
-    assert ema.counter.item() == 7
+class _SyntheticTrainingLoss(nn.Module):
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.mean((prediction - target[:, :1]) ** 2)
 
 
-class _StepCounter:
+class _RecordingScheduler:
     def __init__(self) -> None:
         self.steps = 0
 
     def step(self) -> None:
         self.steps += 1
 
+    def state_dict(self) -> dict[str, int]:
+        return {"steps": self.steps}
 
-def test_sync_boundary_advances_scheduler_even_without_a_skip_gate():
-    config = _training_config(_training_mapping())
-    scheduler = _StepCounter()
-    source = _EmaModel(4.0, 7)
 
-    counter = advance_synchronized_optimizer_step(
-        sync_gradients=False,
-        scheduler=scheduler,
-        optimizer_step=0,
-        ema_model=None,
-        source_model=source,
-        config=config,
+def test_real_training_entry_preserves_prepare_sync_and_ema_numerics(
+    tmp_path: Path, monkeypatch
+):
+    import accelerate
+    import vesuvius.ink_detection.data.dataset as dataset_module
+    import vesuvius.ink_detection.models.model as model_module
+    import vesuvius.ink_detection.training.losses as losses_module
+    import vesuvius.ink_detection.training.optimizers as optimizers_module
+    import vesuvius.ink_detection.training.samplers as samplers_module
+
+    authored = _training_mapping()
+    authored.update(
+        {
+            "num_iterations": 2,
+            "out_dir": str(tmp_path / "output"),
+            "grad_acc_steps": 2,
+            "mixed_precision": "no",
+            "dataloader_workers": 0,
+            "pin_memory": False,
+            "val_every": 99,
+            "save_every": 2,
+            "log_every": 99,
+            "ema": {
+                "enabled": True,
+                "decay": 0.5,
+                "start_step": 1,
+                "update_every_steps": 1,
+                "validate": False,
+                "save_in_checkpoint": True,
+            },
+        }
     )
-    counter = advance_synchronized_optimizer_step(
-        sync_gradients=True,
-        scheduler=scheduler,
-        optimizer_step=counter,
-        ema_model=None,
-        source_model=source,
-        config=config,
+    authored["model_config"]["pretrained_backbone"] = "synthetic"
+    config_path = tmp_path / "training.json"
+    config_path.write_text(json.dumps(authored), encoding="utf-8")
+
+    model = _SyntheticTrainingModel()
+    scheduler = _RecordingScheduler()
+    prepared_objects: list[tuple[object, ...]] = []
+    original_prepare = accelerate.Accelerator.prepare
+
+    def recording_prepare(accelerator, *objects):
+        prepared_objects.append(objects)
+        return original_prepare(accelerator, *objects)
+
+    monkeypatch.setattr(accelerate.Accelerator, "prepare", recording_prepare)
+    monkeypatch.setattr(dataset_module, "InkDataset", _SyntheticTrainingDataset)
+    monkeypatch.setattr(model_module, "make_model", lambda config: model)
+    monkeypatch.setattr(
+        losses_module, "create_loss", lambda config: _SyntheticTrainingLoss()
+    )
+    monkeypatch.setattr(
+        optimizers_module,
+        "create_training_optimizer",
+        lambda model, config: torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    monkeypatch.setattr(
+        samplers_module,
+        "build_sampling_policy",
+        lambda patches, config, batch_size: SimpleNamespace(
+            batch_sampler=None,
+            shuffle=False,
+            sampler=None,
+            generator=None,
+            audit={},
+        ),
+    )
+    monkeypatch.setattr(
+        train_module, "create_training_scheduler", lambda optimizer, config: scheduler
     )
 
-    assert counter == 1
+    assert train_module._run_training(stage_training_request(config_path)) == 0
+
+    assert len(prepared_objects) == 1
+    assert len(prepared_objects[0]) == 4
+    assert scheduler not in prepared_objects[0]
     assert scheduler.steps == 1
+    checkpoint = torch.load(
+        tmp_path / "output" / "ckpt_000002.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["ema_optimizer_step"] == 1
+    torch.testing.assert_close(checkpoint["model"]["value"], torch.tensor(0.8))
+    torch.testing.assert_close(checkpoint["ema_model"]["value"], torch.tensor(0.9))
+    assert checkpoint["model"]["counter"].item() == 2
+    assert checkpoint["ema_model"]["counter"].item() == 2

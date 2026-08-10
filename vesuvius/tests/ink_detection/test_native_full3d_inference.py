@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
-import os
 from pathlib import Path
 import pickle
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -67,59 +65,35 @@ def test_negative_resolution_fails_before_native_volume_open(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="must be >= 0"):
-        native._plan_from_args(
-            SimpleNamespace(checkpoint=Path("unused"), resolution="-1"),
-            volume_opener=lambda *args, **kwargs: pytest.fail(
+        monkeypatch.setattr(
+            native,
+            "_open_shared_volume",
+            lambda *args, **kwargs: pytest.fail(
                 "negative resolution opened the volume"
             ),
         )
+        native._plan_from_args(
+            SimpleNamespace(checkpoint=Path("unused"), resolution="-1")
+        )
 
 
-def test_import_is_pure_and_keeps_heavy_dependencies_lazy():
-    code = """
-import json, multiprocessing, os, sys
-import vesuvius.ink_detection
-before = multiprocessing.get_start_method(allow_none=True)
-baseline = {
-    "opencv": os.environ.get("OPENCV_IO_MAX_IMAGE_PIXELS"),
-    "tifxyz": "vesuvius.tifxyz" in sys.modules,
-    "torch": "torch" in sys.modules,
-    "zarr": "zarr" in sys.modules,
-}
-import vesuvius.ink_detection.inference.infer_full3d_tifxyz
-print(json.dumps({
-    "before": before,
-    "after": multiprocessing.get_start_method(allow_none=True),
-    "baseline": baseline,
-    "current": {
-        "opencv": os.environ.get("OPENCV_IO_MAX_IMAGE_PIXELS"),
-        "tifxyz": "vesuvius.tifxyz" in sys.modules,
-        "torch": "torch" in sys.modules,
-        "zarr": "zarr" in sys.modules,
-    },
-}))
-"""
-    environment = os.environ.copy()
-    environment.pop("OPENCV_IO_MAX_IMAGE_PIXELS", None)
-    source_root = str(Path(__file__).parents[2] / "src")
-    environment["PYTHONPATH"] = source_root
-    completed = subprocess.run(
-        [sys.executable, "-B", "-c", code],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=environment,
+def test_native_module_has_no_function_local_imports():
+    tree = ast.parse(Path(native.__file__).read_text(encoding="utf-8"))
+    functions = (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
-    result = json.loads(completed.stdout)
-    assert result["before"] is result["after"] is None
-    assert result["current"] == result["baseline"]
+    assert not [
+        child
+        for function in functions
+        for child in ast.walk(function)
+        if isinstance(child, (ast.Import, ast.ImportFrom))
+    ]
 
 
 def test_cli_uses_hyphen_underscore_parser_and_explicit_workers_alias(tmp_path):
-    from vesuvius.utils.cli import HyphenUnderscoreParser
-
-    parser = native.build_parser()
-    assert isinstance(parser, HyphenUnderscoreParser)
+    assert "HyphenUnderscoreParser" in native.parse_args.__code__.co_names
     common = [str(tmp_path), str(tmp_path / "model.ckpt"), str(tmp_path / "out")]
     hyphen = native.parse_args(
         [
@@ -151,8 +125,7 @@ def test_cli_uses_hyphen_underscore_parser_and_explicit_workers_alias(tmp_path):
     assert hyphen.max_target_chunks == underscore.max_target_chunks == 2
     assert hyphen.compile_model is underscore.compile_model is False
     assert legacy.num_workers == 7
-    with pytest.raises(SystemExit):
-        native.parse_args([*common, "--overlap", "1"])
+    assert native.parse_args([*common, "--overlap", "1"]).overlap == 1.0
     with pytest.raises(SystemExit):
         native.parse_args([*common, "--foreground-channel", "0"])
 
@@ -308,7 +281,9 @@ def test_importance_maps_and_sparse_accumulator_round_half_to_even():
     assert not output[:, :, 2:].any()
 
 
-def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel():
+def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
+    monkeypatch,
+):
     from vesuvius.ink_detection.config import NormalizationConfig
 
     config = SimpleNamespace(
@@ -319,6 +294,21 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
             ),
         )
     )
+    current_volume = {"value": np.full((2, 2, 2), 10, dtype=np.uint8)}
+    monkeypatch.setattr(
+        native,
+        "_open_shared_volume",
+        lambda *args, **kwargs: current_volume["value"],
+    )
+    original_params = native.native_tifxyz_pyramid_params
+    params_calls = []
+    monkeypatch.setattr(
+        native,
+        "native_tifxyz_pyramid_params",
+        lambda resolution: (
+            params_calls.append(resolution) or original_params(resolution)
+        ),
+    )
     dataset = native.NativePatchDataset(
         tifxyz_dir=Path("unused"),
         volume_path="memory://native",
@@ -326,7 +316,6 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
         patches=(native.PatchSpec(-1, -1, -1),),
         patch_size_zyx=(3, 3, 3),
         config=config,
-        volume=np.full((2, 2, 2), 10, dtype=np.uint8),
     )
     image, metadata = dataset[0]
     assert metadata.tolist() == [-1, -1, -1]
@@ -362,6 +351,7 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
             normalization=NormalizationConfig.from_value("none"),
         )
     )
+    current_volume["value"] = np.zeros((2, 2, 2), dtype=np.uint8)
     wrapped = native.NativePatchDataset(
         tifxyz_dir=Path("unused"),
         volume_path="memory://native",
@@ -369,13 +359,13 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
         patches=(native.PatchSpec(0, 0, 0),),
         patch_size_zyx=(2, 2, 2),
         config=wrap_config,
-        volume=np.zeros((2, 2, 2), dtype=np.uint8),
     )
     wrapped._tifxyz = FakeTifxyz()
     wrapped_image, _ = wrapped[0]
     assert wrapped_image.shape == (2, 2, 2, 2)
     assert torch.all(wrapped_image[1, 0] == 1)
     assert torch.allclose(wrapped_image[1, 1], torch.full((2, 2), 0.9))
+    assert params_calls == [0, 0]
 
     restored = pickle.loads(pickle.dumps(wrapped))
     assert restored._volume is None
@@ -486,22 +476,23 @@ def test_plan_only_does_not_load_runtime_or_touch_existing_output(tmp_path, monk
     sentinel.write_bytes(b"immutable")
     calls = []
 
-    def fake_plan(args, *, volume_opener):
-        calls.append((args.checkpoint, volume_opener))
-        return plan, object(), object(), object()
+    def fake_plan(args):
+        calls.append(args.checkpoint)
+        return plan, object(), object()
 
     monkeypatch.setattr(native, "_plan_from_args", fake_plan)
+    monkeypatch.setattr(
+        native,
+        "_load_native_model",
+        lambda *args: pytest.fail("model must remain lazy"),
+    )
     args = SimpleNamespace(
         plan_only=True,
         checkpoint=tmp_path / "model.ckpt",
         output_zarr=sentinel,
     )
-    assert native.run_command(
-        args,
-        volume_opener=lambda *a, **k: None,
-        model_loader=lambda *a, **k: pytest.fail("model must remain lazy"),
-    ) == 0
-    assert calls and calls[0][0] == args.checkpoint
+    assert native.run_command(args) == 0
+    assert calls == [args.checkpoint]
     assert sentinel.read_bytes() == b"immutable"
 
 
@@ -532,7 +523,7 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
     monkeypatch.setattr(
         native,
         "_plan_from_args",
-        lambda args, volume_opener: (plan, object(), config, volume),
+        lambda args: (plan, object(), config),
     )
 
     class ZeroModel(torch.nn.Module):
@@ -548,6 +539,8 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         device=torch.device("cpu"),
         amp_dtype=None,
     )
+    monkeypatch.setattr(native, "_load_native_model", lambda *args: bundle)
+    monkeypatch.setattr(native, "_open_shared_volume", lambda *args, **kwargs: volume)
 
     output = tmp_path / "command.zarr"
     args = SimpleNamespace(
@@ -568,27 +561,24 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         cache_max_gb=None,
         downsample_workers=1,
     )
-    assert native.run_command(args, model_loader=lambda *a: bundle) == 0
+    assert native.run_command(args) == 0
     group = zarr.open_group(output, mode="r")
     assert sorted(group.array_keys()) == [str(level) for level in range(6)]
     assert all(np.all(np.asarray(group[str(level)]) == 128) for level in range(6))
     with pytest.raises(FileExistsError):
-        native.run_command(args, model_loader=lambda *a: bundle)
+        native.run_command(args)
     assert np.all(np.asarray(zarr.open_group(output, mode="r")["0"]) == 128)
     args.overwrite = True
-    assert native.run_command(args, model_loader=lambda *a: bundle) == 0
+    assert native.run_command(args) == 0
     assert all(
         np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
         for level in range(6)
     )
 
 
-def test_native_module_contains_no_layout_vocabulary_or_eager_tifxyz_import():
+def test_native_module_contains_no_layout_vocabulary():
     source = Path(native.__file__).read_text(encoding="utf-8")
     lowered = source.lower()
     assert "scroll_id" not in lowered
     assert "scroll-name" not in lowered
     assert "s3://" not in lowered
-    prefix = source.split("def read_tifxyz_points", 1)[0]
-    assert "import vesuvius.tifxyz" not in prefix
-    assert "from vesuvius import tifxyz" not in prefix

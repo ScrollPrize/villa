@@ -14,6 +14,8 @@ SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS = 10.0
 
 
 def native_volume_downsample_factor(resolution: int) -> int:
+    """Return the native-coordinate factor for an OME-Zarr pyramid level."""
+
     try:
         level = int(resolution)
     except (TypeError, ValueError) as exc:
@@ -26,6 +28,8 @@ def native_volume_downsample_factor(resolution: int) -> int:
 
 
 def native_tifxyz_pyramid_params(resolution: int) -> tuple[int, float, int]:
+    """Return `(flat-grid stride, native-coordinate scale, coarse pad)`."""
+
     factor = native_volume_downsample_factor(resolution)
     pad = max(1, int(np.ceil(NATIVE_COARSE_PAD_LEVEL0_VOXELS / float(factor))))
     return factor, 1.0 / float(factor), pad
@@ -145,8 +149,15 @@ def _stored_resolution_window(
     if selection is None:
         return None
     (coarse_y0, coarse_y1, coarse_x0, coarse_x1), _, _ = selection
-    stored_h, stored_w = coarse_positions_zyx.shape[:2]
+    stored_h, stored_w = (int(value) for value in coarse_positions_zyx.shape[:2])
     full_h, full_w = (int(value) for value in patch_tifxyz.full_resolution_shape)
+    if stored_h <= 0 or stored_w <= 0:
+        raise ValueError(
+            "stored-resolution tifxyz grid must have positive shape, "
+            f"got {(stored_h, stored_w)!r}"
+        )
+    # Expand by one stored cell before mapping to full resolution so exact
+    # full-resolution refinement cannot miss an intersection at a coarse edge.
     coarse_y0, coarse_y1 = max(0, coarse_y0 - 1), min(stored_h, coarse_y1 + 1)
     coarse_x0, coarse_x1 = max(0, coarse_x0 - 1), min(stored_w, coarse_x1 + 1)
     full_y0 = max(0, int(np.floor(coarse_y0 * full_h / float(stored_h))))

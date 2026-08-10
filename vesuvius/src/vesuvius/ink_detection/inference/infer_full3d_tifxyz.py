@@ -7,13 +7,48 @@ import logging
 import math
 import shutil
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
+from numcodecs import Blosc
+import tifffile
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import vesuvius.tifxyz as tifxyz
+import zarr
+
+from vesuvius.ink_detection.data.geometry import (
+    SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
+    native_tifxyz_pyramid_params,
+    native_volume_downsample_factor,
+    project_surface_distance,
+    select_flat_pixels_via_stored_resolution,
+)
+from vesuvius.ink_detection.data.normalization import normalize_image
+from vesuvius.ink_detection.inference.inference_runtime import (
+    TargetModel,
+    parse_gpu_ids,
+    prepare_model_for_inference,
+    resolve_amp_dtype,
+)
+from vesuvius.ink_detection.models.checkpoint import (
+    config_from_checkpoint,
+    load_checkpoint,
+    load_model_state,
+)
+from vesuvius.ink_detection.models.model import make_model
+from vesuvius.ink_detection.volume_io import (
+    ZARR_V3,
+    open_volume,
+    read_bbox_with_padding,
+)
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 LOGGER = logging.getLogger("vesuvius.ink_detection.inference.infer_full3d_tifxyz")
@@ -71,10 +106,8 @@ class NativeModelBundle:
     amp_dtype: Any
 
 
-def build_parser():
-    """Build the user-facing parser without importing model or tifxyz code."""
-
-    from vesuvius.utils.cli import HyphenUnderscoreParser
+def parse_args(argv: Sequence[str] | None = None):
+    """Parse the native inference command line."""
 
     parser = HyphenUnderscoreParser(
         description=(
@@ -115,36 +148,21 @@ def build_parser():
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--cache-max-gb", type=float, default=None)
     parser.add_argument("--log-level", default="INFO")
-    return parser
-
-
-def parse_args(argv: Sequence[str] | None = None):
-    """Parse and validate the native inference command line."""
-
-    parser = build_parser()
     args = parser.parse_args(argv)
     checks = (
         (args.batch_size > 0, "--batch-size must be positive"),
         (args.num_workers >= 0, "--num-workers must be >= 0"),
         (args.prefetch_factor > 0, "--prefetch-factor must be positive"),
         (args.downsample_workers > 0, "--downsample-workers must be positive"),
-        (0.0 <= args.overlap < 1.0, "--overlap must be in [0, 1)"),
-        (args.chunk_halo >= 0, "--chunk-halo must be >= 0"),
         (
             args.tta_batch_size is None or args.tta_batch_size > 0,
             "--tta-batch-size must be positive",
-        ),
-        (
-            args.max_target_chunks is None or args.max_target_chunks > 0,
-            "--max-target-chunks must be positive",
         ),
     )
     for valid, message in checks:
         if not valid:
             parser.error(message)
     try:
-        from vesuvius.ink_detection.inference.inference_runtime import parse_gpu_ids
-
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
         parser.error(str(exc))
@@ -177,8 +195,6 @@ def read_tifxyz_points(
     tifxyz_dir: Path, *, native_coordinate_scale: float = 1.0
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Read level-0 XYZ TIFF coordinates and return scaled arrays plus validity."""
-
-    import tifffile
 
     arrays = []
     for name in ("x.tif", "y.tif", "z.tif"):
@@ -503,8 +519,6 @@ def flip_spatial(tensor, axes: Sequence[int]):
 
     if not axes:
         return tensor
-    import torch
-
     return torch.flip(tensor, dims=[int(axis) + 2 for axis in axes])
 
 
@@ -514,8 +528,6 @@ def logits_to_probabilities(
     patch_size_zyx: tuple[int, int, int],
 ):
     """Resize one-channel BCZYX logits and return sigmoid probabilities."""
-
-    import torch.nn.functional as F
 
     if logits.ndim != 5:
         raise ValueError(f"Expected logits [B,C,Z,Y,X], got {tuple(logits.shape)}")
@@ -537,13 +549,13 @@ def predict_batch(
     """Average restored mirror predictions for one BCZYX image batch."""
 
     variants = list(variants)
+    if not variants:
+        raise RuntimeError("Mirror TTA produced no variants")
     if len(variants) == 1:
         return logits_to_probabilities(
             model(images),
             patch_size_zyx=patch_size_zyx,
         )
-    import torch
-
     maximum = len(variants) if tta_batch_size is None else min(tta_batch_size, len(variants))
     probability_sum = None
     batch_size = int(images.shape[0])
@@ -710,9 +722,6 @@ def create_output_zarr(
 ):
     """Create a six-level local Zarr-v2 OME prediction pyramid."""
 
-    import zarr
-    from numcodecs import Blosc
-
     output_path = Path(output_path)
     if output_path.exists():
         if not overwrite:
@@ -722,7 +731,7 @@ def create_output_zarr(
         else:
             output_path.unlink()
     kwargs = {"mode": "w"}
-    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+    if ZARR_V3:
         kwargs["zarr_format"] = 2
     group = zarr.open_group(str(output_path), **kwargs)
     group.attrs.update(multiscales_metadata(output_path.stem, levels))
@@ -730,7 +739,7 @@ def create_output_zarr(
     arrays = []
     for level, shape in enumerate(pyramid_shapes(shape_zyx, levels)):
         chunks = tuple(min(chunks_zyx[axis], shape[axis]) for axis in range(3))
-        if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        if ZARR_V3:
             array = group.create_array(
                 str(level),
                 shape=shape,
@@ -846,8 +855,6 @@ def build_downsample_levels(
             for chunk in target_chunks:
                 downsample_level_chunk(source, target, chunk)
         else:
-            from concurrent.futures import ThreadPoolExecutor
-
             with ThreadPoolExecutor(max_workers=min(workers, len(target_chunks))) as executor:
                 list(
                     executor.map(
@@ -858,7 +865,7 @@ def build_downsample_levels(
         current_chunks = set(target_chunks)
 
 
-class NativePatchDataset:
+class NativePatchDataset(Dataset):
     """Lazy, spawn-safe reader for planned native ZYX patches."""
 
     def __init__(
@@ -873,8 +880,6 @@ class NativePatchDataset:
         auth_json_path=None,
         cache_dir=None,
         cache_max_gb=None,
-        volume=None,
-        volume_opener: Callable | None = None,
     ) -> None:
         self.tifxyz_dir = Path(tifxyz_dir)
         self.volume_path = str(volume_path)
@@ -886,8 +891,12 @@ class NativePatchDataset:
         self.auth_json_path = auth_json_path
         self.cache_dir = cache_dir
         self.cache_max_gb = cache_max_gb
-        self.volume_opener = volume_opener
-        self._volume = volume
+        (
+            self.flat_grid_stride,
+            self.native_coordinate_scale,
+            self.coarse_native_pad,
+        ) = native_tifxyz_pyramid_params(int(self.resolution))
+        self._volume = None
         self._tifxyz = None
         self._coarse_positions = None
         self._coarse_valid = None
@@ -905,8 +914,7 @@ class NativePatchDataset:
 
     def _ensure_volume(self):
         if self._volume is None:
-            opener = self.volume_opener or _open_shared_volume
-            self._volume = opener(
+            self._volume = _open_shared_volume(
                 self.volume_path,
                 self.resolution,
                 self.auth_json_path,
@@ -917,8 +925,6 @@ class NativePatchDataset:
 
     def _ensure_tifxyz(self):
         if self._tifxyz is None:
-            import vesuvius.tifxyz as tifxyz
-
             self._tifxyz = tifxyz.read_tifxyz(
                 self.tifxyz_dir,
                 load_mask=False,
@@ -940,25 +946,15 @@ class NativePatchDataset:
         return self._coarse_positions, self._coarse_valid
 
     def _surface_mask(self, bbox_zyx) -> np.ndarray:
-        from vesuvius.ink_detection.data.geometry import (
-            SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
-            native_tifxyz_pyramid_params,
-            project_surface_distance,
-            select_flat_pixels_via_stored_resolution,
-        )
-
-        stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(
-            int(self.resolution)
-        )
         coarse_positions, coarse_valid = self._ensure_coarse_positions()
         selection = select_flat_pixels_via_stored_resolution(
             self._ensure_tifxyz(),
             bbox_zyx,
-            coarse_native_pad=coarse_pad,
+            coarse_native_pad=self.coarse_native_pad,
             coarse_positions_zyx=coarse_positions,
             coarse_valid=coarse_valid,
-            native_coordinate_scale=coordinate_scale,
-            flat_grid_stride=stride,
+            native_coordinate_scale=self.native_coordinate_scale,
+            flat_grid_stride=self.flat_grid_stride,
             required=False,
         )
         if selection is None:
@@ -969,16 +965,12 @@ class NativePatchDataset:
             valid,
             bbox_zyx,
             max_distance_voxels=(
-                SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS / float(stride)
+                SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS
+                / float(self.flat_grid_stride)
             ),
         )
 
     def __getitem__(self, index: int):
-        import torch
-
-        from vesuvius.ink_detection.data.normalization import normalize_image
-        from vesuvius.ink_detection.volume_io import read_bbox_with_padding
-
         patch = self.patches[int(index)]
         starts = (int(patch.z0), int(patch.y0), int(patch.x0))
         stops = tuple(
@@ -1017,55 +1009,12 @@ def select_native_inference_weights(
 def _load_native_model(payload, config, args) -> NativeModelBundle:
     """Build a native target model from checkpoint configuration and weights."""
 
-    import torch
-    from torch import nn
-
-    from vesuvius.ink_detection.models.checkpoint import (
-        load_model_state,
-    )
-    from vesuvius.ink_detection.inference.inference_runtime import (
-        prepare_model_for_inference,
-        resolve_amp_dtype,
-    )
-    from vesuvius.ink_detection.models.model import make_model
-
     _, state = select_native_inference_weights(
         payload, source=args.checkpoint
     )
     base_model = make_model(config)
     load_model_state(base_model, state)
-
-    class NativeTargetModel(nn.Module):
-        def __init__(self, model) -> None:
-            super().__init__()
-            self.model = model
-
-        def forward(self, image):
-            outputs = self.model(image)
-            if not isinstance(outputs, Mapping):
-                raise TypeError(
-                    "Ink model must return a target mapping, got "
-                    f"{type(outputs).__name__}"
-                )
-            if "ink" not in outputs:
-                raise KeyError(
-                    "Ink model output is missing 'ink'; available: "
-                    f"{sorted(outputs)}"
-                )
-            logits = outputs["ink"]
-            if isinstance(logits, (list, tuple)):
-                if not logits:
-                    raise ValueError(
-                        "Ink model returned an empty deep-supervision output"
-                    )
-                logits = logits[0]
-            if not isinstance(logits, torch.Tensor):
-                raise TypeError(
-                    f"Ink logits must be a tensor, got {type(logits).__name__}"
-                )
-            return logits
-
-    model = NativeTargetModel(base_model.eval()).eval()
+    model = TargetModel(base_model.eval()).eval()
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
@@ -1089,9 +1038,6 @@ def run_native_inference(
     importance_map: np.ndarray,
 ) -> None:
     """Execute native patch loading, prediction, and chunk accumulation."""
-
-    import torch
-    from torch.utils.data import DataLoader
 
     effective_batch_size = int(args.batch_size) * max(1, len(args.gpu_ids))
     loader_kwargs = {
@@ -1154,8 +1100,6 @@ def _open_shared_volume(
     cache_dir,
     cache_max_gb,
 ):
-    from vesuvius.ink_detection.volume_io import open_volume
-
     return open_volume(
         path,
         int(resolution),
@@ -1167,15 +1111,11 @@ def _open_shared_volume(
 
 
 def _load_checkpoint_config(checkpoint_path: Path):
-    from vesuvius.ink_detection.models.checkpoint import config_from_checkpoint, load_checkpoint
-
     payload = load_checkpoint(checkpoint_path)
     return payload, config_from_checkpoint(payload, source=checkpoint_path)
 
 
-def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
-    from vesuvius.ink_detection.data.geometry import native_volume_downsample_factor
-
+def _plan_from_args(args):
     payload, config = _load_checkpoint_config(args.checkpoint)
     if config.data.mode not in {"full_3d", "full_3d_single_wrap"}:
         raise ValueError(
@@ -1184,7 +1124,7 @@ def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
         )
     downsample_factor = native_volume_downsample_factor(int(args.resolution))
     volume_path = read_volume_source(args.tifxyz_dir)
-    volume = volume_opener(
+    volume = _open_shared_volume(
         volume_path,
         args.resolution,
         config.data.volume_auth_json,
@@ -1213,7 +1153,7 @@ def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
         write_region=args.write_region,
         max_target_chunks=args.max_target_chunks,
     )
-    return plan, payload, config, volume
+    return plan, payload, config
 
 
 def summarize_plan(plan: NativePlan) -> None:
@@ -1233,29 +1173,21 @@ def summarize_plan(plan: NativePlan) -> None:
     )
 
 
-def run_command(
-    args,
-    *,
-    volume_opener: Callable = _open_shared_volume,
-    model_loader: Callable = _load_native_model,
-    dataset_factory: Callable = NativePatchDataset,
-) -> int:
+def run_command(args) -> int:
     """Plan occupied work, then execute model and output lifecycles."""
 
-    plan, payload, config, volume = _plan_from_args(
-        args, volume_opener=volume_opener
-    )
+    plan, payload, config = _plan_from_args(args)
     summarize_plan(plan)
     if args.plan_only:
         return 0
-    bundle = model_loader(payload, config, args)
+    bundle = _load_native_model(payload, config, args)
     arrays = create_output_zarr(
         args.output_zarr,
         shape_zyx=plan.array_shape_zyx,
         chunks_zyx=plan.chunk_shape_zyx,
         overwrite=args.overwrite,
     )
-    dataset = dataset_factory(
+    dataset = NativePatchDataset(
         tifxyz_dir=args.tifxyz_dir,
         volume_path=plan.volume_path,
         resolution=args.resolution,
@@ -1265,8 +1197,6 @@ def run_command(
         auth_json_path=config.data.volume_auth_json,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
-        volume=volume,
-        volume_opener=volume_opener,
     )
     run_native_inference(
         args=args,
@@ -1294,8 +1224,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper()),
         format="[%(asctime)s] %(levelname)s %(message)s",
     )
-    import torch
-
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     return run_command(args)

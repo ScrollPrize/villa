@@ -49,7 +49,19 @@ class _RecyclingQueue:
 
 
 class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
-    """Draw exact scroll quotas, then balance physical/representation/patch queues."""
+    """Draw exact scroll quotas and balance physical segments hierarchically.
+
+    Each scroll owns a shuffled physical-segment queue. Each physical segment
+    owns a shuffled representation queue, and each representation owns a
+    shuffled patch-index queue. Every queue is consumed without replacement
+    until exhausted and is reshuffled only when it recycles. This gives every
+    physical segment equal long-run mass within its scroll and divides segment
+    mass among duplicate representations instead of double-counting them.
+
+    Every dataset maps each representation ``segment_relpath`` to explicit
+    physical-segment and representation keys. No naming or shared-volume
+    heuristic is applied at runtime.
+    """
 
     def __init__(
         self,
@@ -239,7 +251,12 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
 def hierarchical_scroll_segment_weights(
     patches: Sequence[Patch], config: InkDataConfig
 ) -> tuple[torch.Tensor, dict]:
-    """Equalize scroll mass, then representation-segment mass within each scroll."""
+    """Equalize scroll mass, then physical-segment mass within each scroll.
+
+    Multiple representations of the same physical segment intentionally share
+    one segment budget. Their patch windows divide that budget instead of
+    counting as independent segments.
+    """
     if not patches:
         raise ValueError("hierarchical sampling requires at least one patch")
     for dataset_idx, source in enumerate(config.datasets):

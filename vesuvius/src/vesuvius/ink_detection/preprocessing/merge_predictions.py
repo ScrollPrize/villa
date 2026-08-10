@@ -17,6 +17,11 @@ from PIL import Image
 import tifffile
 from tqdm.auto import tqdm
 
+from vesuvius.ink_detection.preprocessing.staged_write import (
+    create_staged_output,
+    discard_staged_output,
+    publish_staged_output,
+)
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -60,7 +65,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description=(
             "Recursively find preds folders, merge matching prediction files with a "
             "selected aggregation method, and write merged outputs back into each preds folder. "
-            "The frozen selection keeps the greatest checkpoint for each of betti, ema, and 640; "
+            "Selection keeps the greatest checkpoint for each of betti, ema, and 640; "
             "the command fails when no requested output is produced."
         )
     )
@@ -427,15 +432,9 @@ def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_me
             output_array[row_start:row_end, :] = merge_chunk(chunks, merge_method=merge_method)
 
         output_array.flush()
-        with tempfile.NamedTemporaryFile(
-            dir=output_path.parent,
-            prefix=f".{output_path.stem}.",
-            suffix=output_path.suffix,
-            delete=False,
-        ) as stream:
-            staged_output_path = Path(stream.name)
+        staged_output_path = create_staged_output(output_path)
         write_prediction_image(staged_output_path, output_array)
-        staged_output_path.replace(output_path)
+        publish_staged_output(staged_output_path, output_path)
         staged_output_path = None
     finally:
         if output_array is not None:
@@ -450,7 +449,7 @@ def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_me
             except Exception:
                 pass
         if staged_output_path is not None:
-            staged_output_path.unlink(missing_ok=True)
+            discard_staged_output(staged_output_path)
 
 
 def directions_to_process(direction: str) -> tuple[str, ...]:
@@ -482,7 +481,7 @@ def process_preds_folder(
             if directional_inputs:
                 raise ValueError(
                     f"{preds_dir} contains {len(directional_inputs)} valid {direction} "
-                    "prediction file(s), but none match the frozen selection terms: "
+                    "prediction file(s), but none match the selection terms: "
                     + ", ".join(normalized_terms)
                 )
             direction_results.append(

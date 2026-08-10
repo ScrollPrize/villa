@@ -16,6 +16,7 @@ from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
 
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
+ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
 
 
 def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
@@ -105,7 +106,7 @@ def open_volume_root(
     is_remote = path_text.startswith(("s3://", "http://", "https://"))
 
     if cache_dir is not None:
-        if int(zarr.__version__.split(".", 1)[0]) < 3:
+        if not ZARR_V3:
             raise NotImplementedError(
                 "volume disk cache requires zarr 3; "
                 f"installed zarr is {zarr.__version__}"
@@ -141,7 +142,7 @@ def open_volume_root(
         )
         return zarr.open(store=store, mode="r")
 
-    if is_remote and int(zarr.__version__.split(".", 1)[0]) >= 3:
+    if is_remote and ZARR_V3:
         storage_options["skip_instance_cache"] = True
         store = zarr.storage.FsspecStore.from_url(
             path_text,

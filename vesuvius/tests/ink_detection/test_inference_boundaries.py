@@ -74,12 +74,9 @@ def test_state_alias_precedence_and_root_tensor_acceptance():
             ("ema_model", "state_dict", "model_state_dict", "model"), start=1
         )
     }
-    selected, state = select_inference_weights(states, prefer_ema=True)
+    selected, state = select_inference_weights(states)
     assert selected == "ema_model"
     assert state is states["ema_model"]
-    selected, state = select_inference_weights(states, prefer_ema=False)
-    assert selected == "state_dict"
-    assert state is states["state_dict"]
 
     for expected in ("state_dict", "model_state_dict", "model"):
         payload = {
@@ -89,13 +86,16 @@ def test_state_alias_precedence_and_root_tensor_acceptance():
             and tuple(("state_dict", "model_state_dict", "model")).index(key)
             >= tuple(("state_dict", "model_state_dict", "model")).index(expected)
         }
-        assert select_inference_weights(payload, prefer_ema=False)[0] == expected
+        assert select_inference_weights(payload)[0] == expected
 
     root = {"weight": torch.tensor([17.0]), "bias": torch.tensor([-3.0])}
     assert select_inference_weights(root) == ("<root>", root)
     with pytest.raises(KeyError, match="config"):
         config_from_checkpoint(root)
-    assert select_inference_weights({}) == ("<root>", {})
+    with pytest.raises(ValueError, match="empty"):
+        select_inference_weights({})
+    with pytest.raises(ValueError, match="model state 'state_dict' is empty"):
+        select_inference_weights({"state_dict": {}})
     with pytest.raises(ValueError, match="supported model state"):
         select_inference_weights({"step": 7})
 

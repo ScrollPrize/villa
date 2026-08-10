@@ -11,6 +11,8 @@ import numpy as np
 from numcodecs import Blosc
 import zarr
 
+from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
+from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume_root
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -32,8 +34,8 @@ def centered_slice(length: int, requested: int) -> tuple[int, int]:
 
 def open_source_array(path: str, level: str) -> zarr.Array:
     """Open a bare ZYX array or one named level from a local or remote group."""
-    node = zarr.open(path, mode="r")
-    if isinstance(node, zarr.Array):
+    node = open_volume_root(path)
+    if hasattr(node, "shape"):
         return node
     if level not in node:
         available = sorted(node.array_keys())
@@ -49,8 +51,7 @@ def _create_target_array(
     shape_zyx: tuple[int, int, int],
 ) -> tuple[zarr.Group, zarr.Array]:
     group_kwargs: dict[str, object] = {"mode": "w"}
-    zarr_v3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-    if zarr_v3:
+    if ZARR_V3:
         group_kwargs["zarr_format"] = 2
     group = zarr.open_group(str(partial_path), **group_kwargs)
     chunks = (
@@ -66,7 +67,7 @@ def _create_target_array(
         "compressor": compressor,
         "fill_value": 0,
     }
-    if zarr_v3:
+    if ZARR_V3:
         target = group.create_array("0", **create_kwargs)
     else:
         target = group.create_dataset("0", **create_kwargs)
@@ -112,7 +113,7 @@ def prepare_isotropic_input(
         for x0 in range(0, shape[2], TILE)
     ]
 
-    def process(tile: tuple[int, int, int, int]) -> int:
+    def process(tile: tuple[int, int, int, int]) -> None:
         y0, y1, x0, x1 = tile
         block_ZYX = np.asarray(
             source[z0:z1, y0:y1, x0:x1], dtype=np.float32
@@ -123,15 +124,12 @@ def prepare_isotropic_input(
             ).mean(axis=1)
         ).astype(np.uint8)
         target[:, y0:y1, x0:x1] = pooled_ZYX
-        return 1
 
-    completed = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for count in pool.map(process, tiles):
-            completed += count
+        for completed, _ in enumerate(pool.map(process, tiles), start=1):
             if completed % 50 == 0 or completed == len(tiles):
                 print(f"tiles={completed}/{len(tiles)}", flush=True)
-    partial.replace(output_zarr)
+    publish_staged_output(partial, output_zarr)
     print(f"wrote {output_zarr} shape={tuple(target.shape)}")
     return output_zarr
 
