@@ -67,3 +67,32 @@ def test_cli_entrypoints_show_help(module: str) -> None:
     assert (  # noqa: PT017
         result.returncode == 0
     ), f"{module} -h failed: {result.stderr}\n{result.stdout}"
+
+
+def test_console_scripts_resolve_to_real_modules() -> None:
+    """Every console_script target must exist on disk.
+
+    Entry points are resolved only when the command is invoked, so a path left
+    stale by a file move survives the build, the install and the test suite --
+    the command simply fails with ModuleNotFoundError for whoever runs it.
+    This check needs no imports, so it also covers entrypoints whose optional
+    dependencies are absent in CI.
+    """
+
+    import tomllib
+
+    root = Path(__file__).resolve().parents[1]
+    with (root / "pyproject.toml").open("rb") as handle:
+        scripts = tomllib.load(handle)["project"]["scripts"]
+
+    src = root / "src"
+    missing = []
+    for name, target in sorted(scripts.items()):
+        module = target.split(":", 1)[0]
+        relative = Path(*module.split("."))
+        if not (src / relative.with_suffix(".py")).is_file() and not (
+            src / relative / "__init__.py"
+        ).is_file():
+            missing.append(f"{name} -> {module}")
+
+    assert not missing, "console_scripts pointing at missing modules: " + ", ".join(missing)
