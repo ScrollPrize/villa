@@ -144,6 +144,26 @@ are reported and make the command exit nonzero.
 | `--levels` | Number of OME-Zarr levels, default `6`. |
 | `--overwrite` | Replace existing same-stem `.zarr` outputs. |
 
+## Curation operations
+
+The remaining label and prediction maintenance commands keep the reference
+arguments but run below `vesuvius.ink_detection.preprocessing`:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.validate_segments ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.clean_labels ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.merge_predictions ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_from_zarr --input-root ROOT --method max
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_required_zarr_chunks --datasets-root DATASETS --volumes-json VOLUMES.json --output-root OUTPUT
+```
+
+`validate_segments` checks label binary encodings and TIFF/Zarr spatial shape;
+`clean_labels` rewrites matching label images as `{0,255}` TIFFs after optional
+component and hole cleanup; `merge_predictions` aggregates matching directional
+prediction files; and `composite_from_zarr` writes max or mean TIFF projections.
+The downloader uses tifxyz patch geometry to copy only source chunks required
+by selected label patches. Use `--dry-run` to inspect its plan before writing.
+
 ## Train
 
 Copy the shipped hybrid recipe, replace `out_dir` and `datasets`, then run:

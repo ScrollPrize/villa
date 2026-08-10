@@ -69,6 +69,16 @@ uv run --extra models python -m \
   /data/ink_9um/labels/0139/public_2p4_level2_zmean4
 ```
 
+Curation commands use the same preprocessing module namespace:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.validate_segments ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.clean_labels ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.merge_predictions ROOT
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_from_zarr --input-root ROOT --method max
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_required_zarr_chunks --datasets-root DATASETS --volumes-json VOLUMES.json --output-root OUTPUT --dry-run
+```
+
 Train:
 
 ```bash
