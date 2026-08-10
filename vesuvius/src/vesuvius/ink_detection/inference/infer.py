@@ -911,23 +911,19 @@ def open_temp_zarr_array(
 ):
     """Create one explicit-v2 float32 accumulation array."""
 
-    try:
-        return zarr.open(
-            str(path),
-            mode="w",
-            shape=shape,
-            chunks=chunks,
-            dtype=np.float32,
-            zarr_version=2,
-        )
-    except TypeError:
-        return zarr.open(
-            str(path),
-            mode="w",
-            shape=shape,
-            chunks=chunks,
-            dtype=np.float32,
-        )
+    format_keyword = (
+        {"zarr_format": 2}
+        if int(zarr.__version__.split(".", 1)[0]) >= 3
+        else {"zarr_version": 2}
+    )
+    return zarr.open(
+        str(path),
+        mode="w",
+        shape=shape,
+        chunks=chunks,
+        dtype=np.float32,
+        **format_keyword,
+    )
 
 
 def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:

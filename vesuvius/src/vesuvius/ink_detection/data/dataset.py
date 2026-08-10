@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import random
 import warnings
@@ -160,6 +161,7 @@ class InkDataset(Dataset):
 
     def _open(self, path: str | Path, resolution: int):
         key = (
+            os.getpid(),
             str(path),
             int(resolution),
             None if self.config.volume_auth_json is None else str(self.config.volume_auth_json),

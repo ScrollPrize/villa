@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ from vesuvius.ink_detection.inference.infer import (
     main,
     normalize_flat_patch,
     normalize_inference_paths,
+    open_temp_zarr_array,
     parse_args,
     predict_with_mirror_tta,
     resolve_segment_zarr_path,
@@ -36,6 +38,18 @@ from vesuvius.ink_detection.inference.infer import (
 from vesuvius.ink_detection.models.model import make_model
 
 from .test_model_foundation import _config_mapping
+
+
+def test_temp_accumulation_array_is_explicit_v2(tmp_path):
+    path = tmp_path / "accumulation.zarr"
+    array = open_temp_zarr_array(path, shape=(3, 5), chunks=(2, 3))
+    array[:] = np.arange(15, dtype=np.float32).reshape(3, 5)
+
+    metadata = json.loads((path / ".zarray").read_text(encoding="utf-8"))
+    assert metadata["zarr_format"] == 2
+    assert tuple(array.shape) == (3, 5)
+    assert tuple(array.chunks) == (2, 3)
+    assert np.dtype(array.dtype) == np.dtype(np.float32)
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from pathlib import Path
 import pickle
 import random
@@ -11,7 +10,6 @@ import pytest
 import torch
 import zarr
 
-from vesuvius.ink_detection import volume_io
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
@@ -39,7 +37,6 @@ from vesuvius.ink_detection.data.segment import (
 )
 from vesuvius.ink_detection.types import Patch, Segment
 from vesuvius.ink_detection.volume_io import (
-    DiskCachedMapping,
     open_volume,
     read_bbox_with_padding,
 )
@@ -385,7 +382,7 @@ def test_v6_patch_cache_round_trip_and_stale_rejection(tmp_path):
     assert load_patch_cache(path, config=changed, segments=[segment]) is None
 
 
-def test_volume_resolution_padding_and_zarr3_disk_cache(tmp_path):
+def test_volume_resolution_padding_and_disk_cache_boundary(tmp_path):
     volume_path = tmp_path / "volume.zarr"
     array = np.arange(3 * 4 * 5, dtype=np.uint16).reshape(3, 4, 5)
     _write_pyramid(volume_path, array)
@@ -398,6 +395,13 @@ def test_volume_resolution_padding_and_zarr3_disk_cache(tmp_path):
     assert valid == (slice(1, 3), slice(0, 3), slice(0, 2))
     np.testing.assert_array_equal(crop[1:3, :3, :2], array[:2, 1:4, 3:5])
 
+    if int(zarr.__version__.split(".", 1)[0]) < 3:
+        with pytest.raises(
+            NotImplementedError, match="volume disk cache requires zarr 3"
+        ):
+            open_volume(volume_path, 0, cache_dir=tmp_path / "cache")
+        return
+
     cached = open_volume(
         volume_path,
         0,
@@ -405,44 +409,7 @@ def test_volume_resolution_padding_and_zarr3_disk_cache(tmp_path):
         cache_max_gb=0.001,
     )
     np.testing.assert_array_equal(cached[:], array)
-    assert any((tmp_path / "cache").rglob("*__*"))
-
-
-def test_disk_cache_is_read_through_atomic_and_lru_bounded(tmp_path, monkeypatch):
-    class CountingSource(dict):
-        def __init__(self):
-            super().__init__({"a/chunk": b"a" * 8, "b/chunk": b"b" * 8})
-            self.reads = Counter()
-
-        def __getitem__(self, key):
-            self.reads[key] += 1
-            return super().__getitem__(key)
-
-    source = CountingSource()
-    cache = DiskCachedMapping(source, tmp_path / "bounded-cache", max_bytes=10)
-    snapshot_calls = 0
-    original_snapshot = volume_io._cache_snapshot
-
-    def counted_snapshot(cache_dir):
-        nonlocal snapshot_calls
-        snapshot_calls += 1
-        return original_snapshot(cache_dir)
-
-    monkeypatch.setattr(volume_io, "_cache_snapshot", counted_snapshot)
-    assert cache["a/chunk"] == b"a" * 8
-    assert snapshot_calls == 0
-    assert cache["b/chunk"] == b"b" * 8
-    assert snapshot_calls == 1
-    assert cache["b/chunk"] == b"b" * 8
-    assert source.reads == {"a/chunk": 1, "b/chunk": 1}
-    cached_files = [
-        path
-        for path in (tmp_path / "bounded-cache").iterdir()
-        if not path.name.endswith(".tmp")
-    ]
-    assert [path.name for path in cached_files] == ["b__chunk"]
-    assert not any(path.name.endswith(".tmp") for path in cached_files)
-    assert not ((tmp_path / "bounded-cache") / ".cache.lock").exists()
+    assert any(path.is_file() for path in (tmp_path / "cache").rglob("*"))
 
 
 def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch):

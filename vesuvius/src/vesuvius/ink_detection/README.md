@@ -37,6 +37,14 @@ Runtime code is layout-agnostic: JSON supplies the segment and volume paths,
 and label assets are discovered beside each segment. Sampling identifiers are
 free strings and do not encode paths.
 
+Paste volume paths in their correct local, `s3://`, or `https://` form; the
+package does not rewrite URLs. The optional compressed-chunk disk cache requires
+Zarr 3; uncached reads support Zarr 2.18.7 and Zarr 3. Its budget is per volume:
+an over-budget volume subdirectory is swept oldest-first to 90% when opened,
+then Zarr CacheStore applies a process-local LRU. Concurrent workers use atomic
+LocalStore installs, but their independent accounting can cause a brief shared
+cache-directory overshoot.
+
 ## Shipped configs
 
 ```text

@@ -62,6 +62,32 @@ assets use `_v<N>` before the extension. Without `label_version`, each label
 kind independently selects its greatest numeric version. With an explicit
 `label_version`, ink and supervision assets must both exist at that version.
 
+## Volume paths and disk cache
+
+Supply each volume path exactly as it should be opened: a local path, `s3://`
+URL, or `https://` URL. Ink detection does not rewrite endpoint spellings.
+S3 paths containing `vesuvius-challenge-open-data` use anonymous access;
+HTTPS volumes may use the username/password JSON selected by
+`volume_auth_json`.
+
+The optional on-disk compressed-chunk cache requires Zarr 3. Set
+`volume_cache_dir` for training or flat inference, or `--cache-dir` for native
+inference. Uncached volume reads remain supported with Zarr 2.18.7 and Zarr 3;
+the package dependency range remains `zarr>=2.18.7,<4`. Each authored volume
+path receives its own hashed subdirectory, so
+`volume_cache_max_gb` and `--cache-max-gb` are decimal-GB budgets per volume,
+not totals across the cache root.
+
+When a volume opens with a budget, the code scans that volume's cache
+subdirectory once. An over-budget directory is pruned oldest-mtime-first to at
+most 90% of the budget; an at- or under-budget directory is left alone. Zarr's
+CacheStore then applies a process-local steady-state LRU. Multiple workers may
+share the directory safely because LocalStore installs complete values
+atomically, but independent process accounting means the directory can briefly
+overshoot its budget before a later open-time sweep. Every process constructs
+its own source store after it starts; a remote fsspec store is never inherited
+as the active transport across a fork.
+
 ## Shipped aligned-corpus configs
 
 Two JSON files ship with the package:
@@ -266,7 +292,7 @@ Data, patch, and augmentation controls:
 | `label_version` | Optional explicit `v<N>` label version. |
 | `patch_cache_filename` | Optional patch-index JSON path; otherwise the cache is under `out_dir`. |
 | `volume_auth_json` | Optional HTTPS Basic-Auth JSON with `username` and `password`. Public Vesuvius S3 is opened anonymously. |
-| `volume_cache_dir`, `volume_cache_max_gb` | Optional compressed-chunk read-through cache and decimal-GB budget. |
+| `volume_cache_dir`, `volume_cache_max_gb` | Optional Zarr-3 compressed-chunk cache root and per-volume decimal-GB budget. |
 | `augmentation_preset` | `default`, `spatial_only`, `spatial_intensity_no_clip`, or `none`. |
 | `augmentation_rotation_axes` | Optional rotation-axis list. |
 | `disable_augmentations` | Disable augmentation independently of the preset. |
@@ -466,7 +492,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--foreground-channel` | Softmax foreground channel for multi-channel logits, default `1`; one-channel ink logits use sigmoid. |
 | `--plan-only` | Print volume/chunk/patch counts without building or running the model or creating output. The checkpoint is still deserialized for its config. |
 | `--max-target-chunks` | Refuse plans larger than this positive count. |
-| `--cache-dir`, `--cache-max-gb` | Optional compressed-volume cache and decimal-GB budget. |
+| `--cache-dir`, `--cache-max-gb` | Optional Zarr-3 compressed-volume cache root and per-volume decimal-GB budget. |
 | `--log-level` | Python logging level, default `INFO`. |
 
 Native inference requires a checkpoint whose mode is `full_3d` or
