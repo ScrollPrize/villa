@@ -342,16 +342,20 @@ def train(config_path):
             config=config,
         )
 
-    train_dataset = WindingModelDataset(config)
-    if "val_datasets" in config:
-        val_config = dict(config)
-        val_config["datasets"] = config["val_datasets"]
-        val_dataset = WindingModelDataset(val_config)
-    else:
-        # Sampling is procedural, so a second instance over the same segments
-        # would only duplicate raycaster construction; validation batches are
-        # simply fresh draws.
-        val_dataset = train_dataset
+    # Dataset construction may create the shared mmapped patch pack. Let rank 0
+    # finish that one-time write before the other ranks construct their datasets
+    # and open the completed pack read-only.
+    with accelerator.main_process_first():
+        train_dataset = WindingModelDataset(config)
+        if "val_datasets" in config:
+            val_config = dict(config)
+            val_config["datasets"] = config["val_datasets"]
+            val_dataset = WindingModelDataset(val_config)
+        else:
+            # Sampling is procedural, so a second instance over the same segments
+            # would only duplicate raycaster construction; validation batches are
+            # simply fresh draws.
+            val_dataset = train_dataset
 
     def make_generator(offset):
         generator = torch.Generator()
