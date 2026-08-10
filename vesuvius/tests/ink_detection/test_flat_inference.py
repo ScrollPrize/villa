@@ -13,7 +13,7 @@ from torch import nn
 import zarr
 
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
-from vesuvius.ink_detection.infer import (
+from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
     FlatPatchReader,
     compute_chunk_contribution_counts,
@@ -33,7 +33,7 @@ from vesuvius.ink_detection.infer import (
     select_layer_indices,
     write_output_tiff,
 )
-from vesuvius.ink_detection.model import make_model
+from vesuvius.ink_detection.models.model import make_model
 
 from .test_model_foundation import _config_mapping
 
@@ -316,7 +316,7 @@ def test_folder_mode_logs_existing_prediction_and_summary(
     existing = prediction_dir / "segment_model_forward_010101.tif"
     existing.touch()
     monkeypatch.setattr(
-        "vesuvius.ink_detection.infer.infer_single_zarr",
+        "vesuvius.ink_detection.inference.infer.infer_single_zarr",
         lambda **kwargs: pytest.fail("existing prediction was rerun"),
     )
     args = SimpleNamespace(

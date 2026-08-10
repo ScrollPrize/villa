@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from vesuvius.ink_detection.checkpoint import (
+from vesuvius.ink_detection.models.checkpoint import (
     config_from_checkpoint,
     load_checkpoint,
     load_model_state,

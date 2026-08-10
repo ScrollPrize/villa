@@ -16,7 +16,7 @@ import tifffile
 from tqdm.auto import tqdm
 import zarr
 
-from vesuvius.ink_detection.segment import parse_label_asset_path
+from vesuvius.ink_detection.data.segment import parse_label_asset_path
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 

@@ -72,7 +72,7 @@ uv run --extra models python -m \
 Train:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.train \
+uv run --extra models python -m vesuvius.ink_detection.training.train \
   /path/to/aligned21_hybrid_3d2d.json
 ```
 
@@ -80,13 +80,13 @@ Train with two Accelerate workers:
 
 ```bash
 uv run --extra models accelerate launch --num_processes 2 --module \
-  vesuvius.ink_detection.train /path/to/aligned21_hybrid_3d2d.json
+  vesuvius.ink_detection.training.train /path/to/aligned21_hybrid_3d2d.json
 ```
 
 Run flat inference:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
   /data/ink_9um/checkpoints/hybrid-best.pth \
   /data/predictions/pherc0139-w016.tif
@@ -95,7 +95,7 @@ uv run --extra models python -m vesuvius.ink_detection.infer \
 Run native inference:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer_full3d_tifxyz \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
   /data/ink_9um/labels/0139/native_9p362_level0/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr

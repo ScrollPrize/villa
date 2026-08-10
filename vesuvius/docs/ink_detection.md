@@ -16,7 +16,7 @@ uv sync --extra models --extra tests
 Commands below use the managed environment:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.train -h
+uv run --extra models python -m vesuvius.ink_detection.training.train -h
 ```
 
 The `models` extra includes PyTorch, Accelerate, the model-building stack,
@@ -149,7 +149,7 @@ are reported and make the command exit nonzero.
 Copy the shipped hybrid recipe, replace `out_dir` and `datasets`, then run:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.train \
+uv run --extra models python -m vesuvius.ink_detection.training.train \
   /path/to/aligned21_hybrid_3d2d.json
 ```
 
@@ -157,7 +157,7 @@ For two Accelerate workers:
 
 ```bash
 uv run --extra models accelerate launch --num_processes 2 --module \
-  vesuvius.ink_detection.train /path/to/aligned21_hybrid_3d2d.json
+  vesuvius.ink_detection.training.train /path/to/aligned21_hybrid_3d2d.json
 ```
 
 The training CLI has one positional argument, `config_path`. Device placement,
@@ -307,7 +307,7 @@ override a checkpoint.
 Run one surface volume:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
   /data/ink_9um/checkpoints/hybrid-best.pth \
   /data/predictions/pherc0139-w016.tif \
@@ -318,7 +318,7 @@ uv run --extra models python -m vesuvius.ink_detection.infer \
 Run every resolvable segment below a folder:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   --folder /data/ink_9um/labels/0139/public_2p4_level2_zmean4 \
   --checkpoint-path /data/ink_9um/checkpoints/hybrid-best.pth \
   --output-prefix aligned21 \
@@ -374,7 +374,7 @@ relative to the tifxyz directory.
 Inspect the occupied-chunk plan without creating output:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer_full3d_tifxyz \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
   /data/ink_9um/labels/0139/native_9p362_level0/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr \
@@ -384,7 +384,7 @@ uv run --extra models python -m vesuvius.ink_detection.infer_full3d_tifxyz \
 Run inference with eight mirror variants and a bounded volume cache:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.infer_full3d_tifxyz \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
   /data/ink_9um/labels/0139/native_9p362_level0/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr \

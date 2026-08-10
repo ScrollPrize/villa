@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 import torch
 
-from vesuvius.ink_detection.augmentations import (
+from vesuvius.ink_detection.data.augmentations import (
     build_augmentations,
     maybe_translate_crop_bbox,
 )
 from vesuvius.ink_detection.config import InkDataConfig, NormalizationConfig
-from vesuvius.ink_detection.geometry import (
+from vesuvius.ink_detection.data.geometry import (
     _draw_line,
     compute_native_crop_bbox,
     project_binary_mask_along_normals,
@@ -22,9 +22,9 @@ from vesuvius.ink_detection.geometry import (
     project_labels_and_supervision,
     project_surface_distance,
 )
-from vesuvius.ink_detection.metrics import BalancedAccuracy, Confusion
-from vesuvius.ink_detection.normalization import normalize_image
-from vesuvius.ink_detection.samplers import (
+from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
+from vesuvius.ink_detection.data.normalization import normalize_image
+from vesuvius.ink_detection.training.samplers import (
     FixedScrollPriorStratifiedBatchSampler,
     build_sampling_policy,
     hierarchical_scroll_segment_weights,

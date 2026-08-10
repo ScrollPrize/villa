@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import numpy as np
 
 
-LOGGER = logging.getLogger("vesuvius.ink_detection.infer_full3d_tifxyz")
+LOGGER = logging.getLogger("vesuvius.ink_detection.inference.infer_full3d_tifxyz")
 DEFAULT_LEVELS = 6
 DEFAULT_OVERLAP = 0.5
 DEFAULT_PREFETCH_FACTOR = 2
@@ -146,7 +146,7 @@ def parse_args(argv: Sequence[str] | None = None):
         if not valid:
             parser.error(message)
     try:
-        from vesuvius.ink_detection.inference_runtime import parse_gpu_ids
+        from vesuvius.ink_detection.inference.inference_runtime import parse_gpu_ids
 
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -956,7 +956,7 @@ class NativePatchDataset:
         return self._coarse_positions, self._coarse_valid
 
     def _surface_mask(self, bbox_zyx) -> np.ndarray:
-        from vesuvius.ink_detection.geometry import (
+        from vesuvius.ink_detection.data.geometry import (
             SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
             native_tifxyz_pyramid_params,
             project_surface_distance,
@@ -992,7 +992,7 @@ class NativePatchDataset:
     def __getitem__(self, index: int):
         import torch
 
-        from vesuvius.ink_detection.normalization import normalize_image
+        from vesuvius.ink_detection.data.normalization import normalize_image
         from vesuvius.ink_detection.volume_io import read_bbox_with_padding
 
         patch = self.patches[int(index)]
@@ -1036,14 +1036,14 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     import torch
     from torch import nn
 
-    from vesuvius.ink_detection.checkpoint import (
+    from vesuvius.ink_detection.models.checkpoint import (
         load_model_state,
     )
-    from vesuvius.ink_detection.inference_runtime import (
+    from vesuvius.ink_detection.inference.inference_runtime import (
         prepare_model_for_inference,
         resolve_amp_dtype,
     )
-    from vesuvius.ink_detection.model import make_model
+    from vesuvius.ink_detection.models.model import make_model
 
     selected_state, state = select_native_inference_weights(
         payload, source=args.checkpoint
@@ -1186,14 +1186,14 @@ def _open_shared_volume(
 
 
 def _load_checkpoint_config(checkpoint_path: Path):
-    from vesuvius.ink_detection.checkpoint import config_from_checkpoint, load_checkpoint
+    from vesuvius.ink_detection.models.checkpoint import config_from_checkpoint, load_checkpoint
 
     payload = load_checkpoint(checkpoint_path)
     return payload, config_from_checkpoint(payload, source=checkpoint_path)
 
 
 def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
-    from vesuvius.ink_detection.geometry import native_volume_downsample_factor
+    from vesuvius.ink_detection.data.geometry import native_volume_downsample_factor
 
     payload, config = _load_checkpoint_config(args.checkpoint)
     if config.data.mode not in {"full_3d", "full_3d_single_wrap"}:

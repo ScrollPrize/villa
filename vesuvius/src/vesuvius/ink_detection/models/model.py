@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from vesuvius.ink_detection.config import InkConfig
-from vesuvius.ink_detection.hybrid_3d2d import Local3DStem2DUNet
+from vesuvius.ink_detection.models.hybrid_3d2d import Local3DStem2DUNet
 
 
 def _build_network(config_dict: dict, *, op_dims: int) -> nn.Module:

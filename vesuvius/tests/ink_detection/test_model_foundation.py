@@ -11,12 +11,12 @@ import torch
 from torch import nn
 
 from vesuvius.ink_detection.config import InkConfig
-from vesuvius.ink_detection.hybrid_3d2d import (
+from vesuvius.ink_detection.models.hybrid_3d2d import (
     Local3DStem2DUNet,
     LocalDepthFusionStem,
 )
-from vesuvius.ink_detection.input_padding import center_pad_input_depth
-from vesuvius.ink_detection.model import SliceChannel2DModel, make_model
+from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.ink_detection.models.model import SliceChannel2DModel, make_model
 
 
 def _config_mapping(

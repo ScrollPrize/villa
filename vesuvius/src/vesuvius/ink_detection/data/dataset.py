@@ -11,12 +11,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from vesuvius.ink_detection.augmentations import (
+from vesuvius.ink_detection.data.augmentations import (
     build_augmentations,
     maybe_translate_crop_bbox,
 )
 from vesuvius.ink_detection.config import InkDataConfig
-from vesuvius.ink_detection.geometry import (
+from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
     compute_native_crop_bbox,
     filter_support_components,
@@ -27,23 +27,23 @@ from vesuvius.ink_detection.geometry import (
     read_tifxyz_on_flat_grid,
     select_flat_pixels_via_stored_resolution,
 )
-from vesuvius.ink_detection.normalization import (
+from vesuvius.ink_detection.data.normalization import (
     exclude_validation_voxels,
     normalize_image,
 )
-from vesuvius.ink_detection.patch_cache import (
+from vesuvius.ink_detection.data.patch_cache import (
     load_patch_cache,
     patch_cache_path,
     save_patch_cache,
 )
-from vesuvius.ink_detection.patch_finding_default import (
+from vesuvius.ink_detection.data.patch_finding_default import (
     find_segment_patches as find_default_patches,
     find_segment_unlabeled_patches,
 )
-from vesuvius.ink_detection.patch_finding_subtiling import (
+from vesuvius.ink_detection.data.patch_finding_subtiling import (
     find_segment_patches as find_subtiling_patches,
 )
-from vesuvius.ink_detection.segment import gather_segments
+from vesuvius.ink_detection.data.segment import gather_segments
 from vesuvius.ink_detection.types import Patch, Segment
 from vesuvius.ink_detection.volume_io import open_volume, read_bbox_with_padding
 

@@ -13,7 +13,7 @@ import pytest
 import tifffile
 import torch
 
-from vesuvius.ink_detection.train import (
+from vesuvius.ink_detection.training.train import (
     append_validation_metrics,
     benchmark_summary,
     build_training_checkpoint_payload,
@@ -25,7 +25,7 @@ from vesuvius.ink_detection.train import (
 from vesuvius.ink_detection.config import TrainingConfig
 
 from .test_model_foundation import _config_mapping
-from vesuvius.ink_detection.visualization import (
+from vesuvius.ink_detection.training.visualization import (
     PreviewAccumulator,
     central_full_3d_preview,
     to_uint8_image,
@@ -233,7 +233,7 @@ def test_train_help_is_import_pure_without_accelerate_or_wandb():
     environment["PYTHONPATH"] = str(source_root)
     script = (
         "import sys; import vesuvius; baseline = set(sys.modules); "
-        "import vesuvius.ink_detection.train as train; "
+        "import vesuvius.ink_detection.training.train as train; "
         "added = set(sys.modules) - baseline; "
         "assert 'accelerate' not in sys.modules; "
         "assert 'wandb' not in sys.modules; "
@@ -256,7 +256,7 @@ def test_train_help_is_import_pure_without_accelerate_or_wandb():
 
 def test_module_cli_help_exits_zero():
     with pytest.raises(SystemExit) as help_exit:
-        from vesuvius.ink_detection.train import main
+        from vesuvius.ink_detection.training.train import main
 
         main(["-h"])
     assert help_exit.value.code == 0

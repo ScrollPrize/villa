@@ -8,24 +8,24 @@ import torch.nn.functional as F
 from torch import nn
 
 from vesuvius.ink_detection.config import TrainingConfig
-from vesuvius.ink_detection.deep_supervision import (
+from vesuvius.ink_detection.training.deep_supervision import (
     DeepSupervisionWrapper,
     build_deep_supervision_targets,
     deep_supervision_weights,
 )
-from vesuvius.ink_detection.dilation import (
+from vesuvius.ink_detection.training.dilation import (
     apply_label_dilation,
     dilate_label_batch_with_cucim,
     resolve_dilation_distances,
 )
-from vesuvius.ink_detection.optimizers import (
+from vesuvius.ink_detection.training.optimizers import (
     OptimizerParamGroupTarget,
     create_training_optimizer,
     plan_optimizer_target,
 )
-from vesuvius.ink_detection.stitching import run_model_forward
-from vesuvius.ink_detection.train import update_ema_model
-from vesuvius.ink_detection.train import (
+from vesuvius.ink_detection.training.stitching import run_model_forward
+from vesuvius.ink_detection.training.train import update_ema_model
+from vesuvius.ink_detection.training.train import (
     advance_synchronized_optimizer_step,
     create_training_scheduler,
     initialize_training_model,

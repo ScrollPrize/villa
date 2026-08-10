@@ -10,7 +10,7 @@ from vesuvius.ink_detection.config import (
     TrainingConfig,
     resolve_training_mapping,
 )
-from vesuvius.ink_detection.train import stage_training_request
+from vesuvius.ink_detection.training.train import stage_training_request
 
 from .test_model_foundation import _config_mapping
 

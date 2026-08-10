@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from vesuvius.ink_detection.checkpoint import (
+from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
     resolve_checkpoint_path,
     restore_training_state,
@@ -26,20 +26,20 @@ from vesuvius.ink_detection.config import (
     TrainingConfig,
     resolve_training_mapping,
 )
-from vesuvius.ink_detection.deep_supervision import (
+from vesuvius.ink_detection.training.deep_supervision import (
     DeepSupervisionWrapper,
     concatenate_deep_supervision_ignore,
     deep_supervision_weights,
 )
-from vesuvius.ink_detection.dilation import (
+from vesuvius.ink_detection.training.dilation import (
     apply_label_dilation,
     resolve_dilation_distances,
 )
-from vesuvius.ink_detection.input_padding import center_pad_input_depth
-from vesuvius.ink_detection.metrics import BalancedAccuracy, Confusion
-from vesuvius.ink_detection.stitching import run_model_forward
+from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
+from vesuvius.ink_detection.training.stitching import run_model_forward
 from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch
-from vesuvius.ink_detection.visualization import (
+from vesuvius.ink_detection.training.visualization import (
     PreviewAccumulator,
     build_validation_preview_log,
     central_full_3d_preview,
@@ -421,11 +421,11 @@ def _run_training(request: TrainingRequest) -> int:
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from vesuvius.ink_detection.dataset import InkDataset
-    from vesuvius.ink_detection.losses import create_loss
-    from vesuvius.ink_detection.model import make_model
-    from vesuvius.ink_detection.optimizers import create_training_optimizer
-    from vesuvius.ink_detection.samplers import build_sampling_policy
+    from vesuvius.ink_detection.data.dataset import InkDataset
+    from vesuvius.ink_detection.training.losses import create_loss
+    from vesuvius.ink_detection.models.model import make_model
+    from vesuvius.ink_detection.training.optimizers import create_training_optimizer
+    from vesuvius.ink_detection.training.samplers import build_sampling_policy
 
     config = request.config
     canonical = config.to_mapping()

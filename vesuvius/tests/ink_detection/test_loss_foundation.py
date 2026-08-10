@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from vesuvius.ink_detection.config import InkConfig
-from vesuvius.ink_detection.losses import (
+from vesuvius.ink_detection.training.losses import (
     CompositeLoss,
     LabelSmoothedDCAndBCELoss,
     WeightedLossTerm,

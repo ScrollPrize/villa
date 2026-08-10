@@ -22,19 +22,19 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 import zarr
 
-from vesuvius.ink_detection.checkpoint import (
+from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
     resolve_pretrained_backbone_config,
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
-from vesuvius.ink_detection.inference_runtime import (
+from vesuvius.ink_detection.inference.inference_runtime import (
     parse_gpu_ids,
     prepare_model_for_inference,
     resolve_amp_dtype,
 )
-from vesuvius.ink_detection.input_padding import center_pad_input_depth
-from vesuvius.ink_detection.model import make_model
+from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
+from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     open_volume_root,
@@ -899,7 +899,7 @@ def write_output_tiff(
         tile=tuple(int(value) for value in tile_shape),
         bigtiff=True,
         metadata=None,
-        software="vesuvius.ink_detection.infer",
+        software="vesuvius.ink_detection.inference.infer",
     )
 
 

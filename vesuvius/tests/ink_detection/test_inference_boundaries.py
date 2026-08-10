@@ -13,17 +13,17 @@ import torch
 from torch import nn
 import zarr
 
-from vesuvius.ink_detection.checkpoint import (
+from vesuvius.ink_detection.models.checkpoint import (
     config_from_checkpoint,
     resolve_pretrained_backbone_config,
     select_inference_weights,
 )
-from vesuvius.ink_detection.inference_runtime import (
+from vesuvius.ink_detection.inference.inference_runtime import (
     checkpoint_amp_dtype,
     parse_gpu_ids,
     prepare_model_for_inference,
 )
-from vesuvius.ink_detection.infer import load_flat_inference_state
+from vesuvius.ink_detection.inference.infer import load_flat_inference_state
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     open_volume_root,
@@ -42,7 +42,7 @@ for name in tuple(sys.modules):
     if name == 'vesuvius.tifxyz' or name.startswith('vesuvius.tifxyz.'):
         sys.modules.pop(name)
 before = mp.get_start_method(allow_none=True)
-import vesuvius.ink_detection.infer
+import vesuvius.ink_detection.inference.infer
 assert os.environ.get('OPENCV_IO_MAX_IMAGE_PIXELS') is None
 assert mp.get_start_method(allow_none=True) == before
 assert 'vesuvius.tifxyz.reader' not in sys.modules

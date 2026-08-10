@@ -15,7 +15,7 @@ import pytest
 import torch
 import zarr
 
-from vesuvius.ink_detection import infer_full3d_tifxyz as native
+from vesuvius.ink_detection.inference import infer_full3d_tifxyz as native
 
 
 def _plan(**overrides) -> native.NativePlan:
@@ -86,7 +86,7 @@ baseline = {
     "torch": "torch" in sys.modules,
     "zarr": "zarr" in sys.modules,
 }
-import vesuvius.ink_detection.infer_full3d_tifxyz
+import vesuvius.ink_detection.inference.infer_full3d_tifxyz
 print(json.dumps({
     "before": before,
     "after": multiprocessing.get_start_method(allow_none=True),

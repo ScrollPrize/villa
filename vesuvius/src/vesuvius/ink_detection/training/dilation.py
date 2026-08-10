@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from vesuvius.ink_detection.config import TrainingConfig
-from vesuvius.ink_detection.geometry import native_volume_downsample_factor
+from vesuvius.ink_detection.data.geometry import native_volume_downsample_factor
 
 
 def resolve_dilation_distances(

@@ -13,25 +13,25 @@ import zarr
 
 from vesuvius.ink_detection import volume_io
 from vesuvius.ink_detection.config import InkDataConfig
-from vesuvius.ink_detection.dataset import InkDataset, flat_z_window_bbox
-from vesuvius.ink_detection.geometry import (
+from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
+from vesuvius.ink_detection.data.geometry import (
     filter_support_components,
     read_tifxyz_on_flat_grid,
     select_flat_pixels_via_stored_resolution,
 )
-from vesuvius.ink_detection.patch_cache import (
+from vesuvius.ink_detection.data.patch_cache import (
     load_patch_cache,
     patch_finding_cache_token,
     save_patch_cache,
 )
-from vesuvius.ink_detection.patch_finding_default import (
+from vesuvius.ink_detection.data.patch_finding_default import (
     combined_patch_discovery_support,
     find_segment_patches,
     find_segment_unlabeled_patches,
     labeled_patch_coverage,
 )
-from vesuvius.ink_detection.patch_finding_subtiling import build_patch_index
-from vesuvius.ink_detection.segment import (
+from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
+from vesuvius.ink_detection.data.segment import (
     build_matching_label_asset_path,
     discover_segment_labels,
     gather_segments,
@@ -716,7 +716,7 @@ def test_native_sample_retry_follows_replacement_chain(
             return self.replacement
 
     monkeypatch.setattr(dataset, "_native_sample", scripted_sample)
-    monkeypatch.setattr("vesuvius.ink_detection.dataset.random.Random", ScriptedRandom)
+    monkeypatch.setattr("vesuvius.ink_detection.data.dataset.random.Random", ScriptedRandom)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         sample = dataset[0]
