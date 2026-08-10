@@ -49,10 +49,10 @@ private:
 
     cv::Vec2f uv_min, uv_max;
     cv::Vec2i grid_size;
-    cv::Vec2f scale;
+    cv::Vec2f scale{0.f, 0.f};  // meta.json scale: grid cells per volume voxel (density)
     // UV handling
-    bool uv_is_metric = true;   // if true, scale comes from UV spacing
-    float uv_to_obj   = 1.0f;   // OBJ units per 1 UV unit (used when uv_is_metric)
+    bool uv_is_metric = true;   // if true, the grid is sized from UV spacing (see determineGridDimensions)
+    float uv_to_obj   = 1.0f;   // OBJ units per UV unit (grid sizing only; scale is measured from 3D, not UV)
     // UV decimation / capping
     float uv_downsample = 1.0f;            // user-specified uniform decimation
     uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
@@ -234,20 +234,14 @@ public:
                       << "  scale: " << scale[0] << ", " << scale[1]
                       << "  (matched to input tifxyz)" << std::endl;
         } else if (uv_is_metric) {
-            // --- Preserve physical pixel size (scale) from the RAW grid ---
-            // du_raw/dv_raw are UV units per pixel *before* decimation.
-            const float du_raw = (gw_raw > 1) ? uv_range[0] / float(gw_raw - 1) : 0.f;
-            const float dv_raw = (gh_raw > 1) ? uv_range[1] / float(gh_raw - 1) : 0.f;
-            scale[0] = du_raw * uv_to_obj; // OBJ units per pixel (unchanged by decimation)
-            scale[1] = dv_raw * uv_to_obj;
-
-            std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1]
-                      << "  scale(OBJ units): " << scale[0] << ", " << scale[1] << std::endl;
+            std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1] << std::endl;
             if (decim > 1.0) {
                 std::cout << "  (applied UV decimation ~" << decim << "x per axis; "
-                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "]; "
-                          << "preserved per-pixel physical scale)\n";
+                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "])\n";
             }
+            // `scale` is computed in createQuadSurface() from the emitted
+            // grid's actual 3D spacing, not from UV (an arbitrary/normalized
+            // parametrization with no reliable voxel-space density).
         } else {
             // --- Legacy non-metric: measure from 3D on decimated grid, then compensate ---
             std::cout << "Creating preliminary grid " << grid_size[0] << " x " << grid_size[1]
@@ -257,10 +251,12 @@ public:
             for (const auto& face : faces) {
                 rasterizeTriangle(preliminary_points, face);
             }
-            // This fills 'scale' with the distance between adjacent samples on the DECIMATED grid
+            // This fills 'scale' with the distance between adjacent samples on the DECIMATED
+            // grid. Used only to size the final grid below; the actual metadata `scale` is
+            // computed later in createQuadSurface() from the grid actually emitted.
             calculateScaleFromGrid(preliminary_points);
 
-            // Compensate by the effective decimation so that scale matches the raw-grid pixel size
+            // Compensate by the effective decimation so the measurement matches the raw-grid pixel size
             if (scale[0] > 0) scale[0] = static_cast<float>(scale[0] / eff_decim_x);
             if (scale[1] > 0) scale[1] = static_cast<float>(scale[1] / eff_decim_y);
 
@@ -270,7 +266,7 @@ public:
             grid_size[1] = std::max(2, static_cast<int>(std::round(measured[1] * stretch_factor)) + 1);
 
             std::cout << "Final grid: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-            std::cout << "Scale(OBJ units; compensated to raw-pixel spacing): "
+            std::cout << "Grid step (OBJ units; compensated to raw-pixel spacing, used only for sizing): "
                       << measured[0] << ", " << measured[1] << std::endl;
         }
 
@@ -313,7 +309,6 @@ public:
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
         
-        // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
             std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
         }
@@ -321,31 +316,41 @@ public:
         if (src_scale_mode) {
             // Scale was adopted verbatim from the source tifxyz; do not rescale.
             std::cout << "Scale (from source tifxyz): " << scale[0] << ", " << scale[1] << std::endl;
-        } else if (uv_is_metric) {
-            scale[0] *= mesh_units;
-            scale[1] *= mesh_units;
-            std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
         } else {
-            // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
-            calculateScaleFromGrid(*points, mesh_units);
+            // meta.json `scale` is grid cells per volume voxel, not a length:
+            // measure the emitted grid's actual 3D spacing (after any
+            // decimation/grid-cap already baked into grid_size) and invert,
+            // preserving per-axis anisotropy. mesh_units is a display-only
+            // value and does not apply here.
+            if (!calculateDensityScaleFromGrid(*points)) {
+                std::cerr << "Error: could not measure grid spacing from the emitted points; "
+                             "refusing to write an invalid scale." << std::endl;
+                delete points;
+                return nullptr;
+            }
+            std::cout << "Scale (grid cells per volume voxel, measured from emitted grid): "
+                      << scale[0] << ", " << scale[1] << std::endl;
         }
-        
+
         return new QuadSurface(points, scale);
     }
     
-    void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
-        // Based on vc_segmentation_scales from Slicing.cpp
+    // Average 3D distance between adjacent grid points (in mesh/OBJ units).
+    // Based on vc_segmentation_scales from Slicing.cpp. Skips a 10% border
+    // and invalid points; for small grids (<20 in either dimension) uses
+    // every point. Returns (0,0) if no valid neighbor pairs were found.
+    cv::Vec2f measureGridSpacing(const cv::Mat_<cv::Vec3f>& points) const {
         double sum_x = 0;
         double sum_y = 0;
         int count = 0;
-        
+
         // Skip borders (10% on each side) to avoid artifacts
         int jmin = static_cast<int>(points.rows * 0.1) + 1;
         int jmax = static_cast<int>(points.rows * 0.9);
         int imin = static_cast<int>(points.cols * 0.1) + 1;
         int imax = static_cast<int>(points.cols * 0.9);
         int step = 4;
-        
+
         // For small grids, use all points
         if (points.rows < 20 || points.cols < 20) {
             jmin = 1;
@@ -354,21 +359,21 @@ public:
             imax = points.cols;
             step = 1;
         }
-        
+
         // Calculate average distance between adjacent points
         for (int j = jmin; j < jmax; j += step) {
             for (int i = imin; i < imax; i += step) {
                 // Skip invalid points
                 if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
                     continue;
-                
+
                 // Distance to neighbor in X direction
                 cv::Vec3f v = points(j, i) - points(j, i-1);
                 const double dist_x_sq = v.dot(v);
                 if (dist_x_sq > 0) {
                     sum_x += std::sqrt(dist_x_sq);
                 }
-                
+
                 // Distance to neighbor in Y direction
                 v = points(j, i) - points(j-1, i);
                 const double dist_y_sq = v.dot(v);
@@ -378,18 +383,40 @@ public:
                 count++;
             }
         }
-        
+
         if (count > 0 && sum_x > 0 && sum_y > 0) {
-            // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = static_cast<float>((sum_x / count) * mesh_units);
-            scale[1] = static_cast<float>((sum_y / count) * mesh_units);
-        } else {
-            // Fallback to UV-based scale if we couldn't calculate from grid
-            std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
-            // scale already set in determineGridDimensions
+            return cv::Vec2f(static_cast<float>(sum_x / count), static_cast<float>(sum_y / count));
         }
-        
-        std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
+        return cv::Vec2f(0.f, 0.f);
+    }
+
+    // Legacy grid-sizing helper: writes a length (not a density) into
+    // `scale`, used only by the non-metric branch of determineGridDimensions()
+    // to size the final grid; always overwritten by calculateDensityScaleFromGrid().
+    void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
+        const cv::Vec2f spacing = measureGridSpacing(points);
+        if (spacing[0] > 0.f && spacing[1] > 0.f) {
+            scale[0] = spacing[0] * mesh_units;
+            scale[1] = spacing[1] * mesh_units;
+        } else {
+            // No valid neighbor pairs found on the preliminary grid; `scale`
+            // is left unset here (default 0,0), which clamps the final grid
+            // size to its 2x2 minimum below.
+            std::cerr << "Warning: Could not calculate scale from grid" << std::endl;
+        }
+    }
+
+    // meta.json `scale` (scroll-prize/villa#1319): grid cells per volume
+    // voxel, i.e. the reciprocal of the FINAL emitted grid's measured 3D
+    // spacing. Returns false if no valid neighbor pairs were found.
+    bool calculateDensityScaleFromGrid(const cv::Mat_<cv::Vec3f>& points) {
+        const cv::Vec2f spacing = measureGridSpacing(points);
+        if (!(spacing[0] > 0.f) || !(spacing[1] > 0.f)) {
+            return false;
+        }
+        scale[0] = static_cast<float>(1.0 / static_cast<double>(spacing[0]));
+        scale[1] = static_cast<float>(1.0 / static_cast<double>(spacing[1]));
+        return true;
     }
     
 private:
