@@ -17,55 +17,88 @@ def _as_numpy(value: torch.Tensor) -> np.ndarray:
     return value.detach().cpu().numpy()
 
 
-def _plane_affine_zyx(sample: dict[str, torch.Tensor], plane_idx: int) -> np.ndarray:
-    """Map a [1, H, W] plane image's local ZYX indices into volume ZYX."""
-    origin = _as_numpy(sample["plane_origins_zyx"])[plane_idx]
-    x_step = _as_numpy(sample["plane_x_steps_zyx"])[plane_idx]
-    y_step = _as_numpy(sample["plane_y_steps_zyx"])[plane_idx]
-    normal = np.cross(y_step, x_step)
-    normal *= np.sqrt(np.linalg.norm(x_step) * np.linalg.norm(y_step)) / np.linalg.norm(
-        normal
-    )
-
+def _slab_affine_zyx(sample: dict[str, torch.Tensor]) -> np.ndarray:
+    """Map the [H, W, L] slab's local (i, j, k) indices into volume ZYX."""
+    spacing = float(sample["spacing"])
     affine = np.eye(4, dtype=np.float32)
-    affine[:3, 0] = normal
-    affine[:3, 1] = y_step
-    affine[:3, 2] = x_step
-    affine[:3, 3] = origin
+    affine[:3, 0] = spacing * _as_numpy(sample["slab_axis_a_zyx"])
+    affine[:3, 1] = spacing * _as_numpy(sample["slab_axis_b_zyx"])
+    affine[:3, 2] = spacing * _as_numpy(sample["ray_direction_zyx"])
+    affine[:3, 3] = _as_numpy(sample["slab_origin_zyx"])
     return affine
+
+
+def _column_crossing_points(
+    sample: dict[str, torch.Tensor],
+) -> tuple[np.ndarray, np.ndarray]:
+    """World-ZYX crossing points of every supervised column, with indices."""
+    counts = _as_numpy(sample["num_crossings"])
+    crossing_t = _as_numpy(sample["crossing_t"])
+    crossing_indices = _as_numpy(sample["crossing_indices"])
+    stride = int(sample["column_stride"])
+    spacing = float(sample["spacing"])
+    origin = _as_numpy(sample["slab_origin_zyx"]).astype(np.float64)
+    axis_a = _as_numpy(sample["slab_axis_a_zyx"]).astype(np.float64)
+    axis_b = _as_numpy(sample["slab_axis_b_zyx"]).astype(np.float64)
+    direction = _as_numpy(sample["ray_direction_zyx"]).astype(np.float64)
+
+    points, indices = [], []
+    for row, col in np.argwhere(counts > 0):
+        ts = crossing_t[row, col, : counts[row, col], None].astype(np.float64)
+        base = origin + spacing * stride * (row * axis_a + col * axis_b)
+        points.append(base[None] + ts * direction[None])
+        indices.append(crossing_indices[row, col, : counts[row, col]])
+    if not points:
+        return np.zeros((0, 3)), np.zeros(0, dtype=np.int64)
+    return np.concatenate(points), np.concatenate(indices)
 
 
 def display_napari_sample(viewer, sample: dict[str, torch.Tensor]) -> None:
     """Replace the viewer layers with one dataset sample in volume ZYX space."""
     viewer.layers.clear()
-    plane_images = _as_numpy(sample["plane_images"])
-    winding_indices = _as_numpy(sample["winding_indices"])
-    for plane_idx in range(len(plane_images)):
-        viewer.add_image(
-            plane_images[plane_idx][None],
-            name=f"ray_plane_{plane_idx}",
-            affine=_plane_affine_zyx(sample, plane_idx),
-            colormap="gray",
-            blending="translucent",
-            rendering="translucent",
-            contrast_limits=(0, 255),
-        )
-
-    crossings = _as_numpy(sample["crossing_zyx"])
-    viewer.add_points(
-        crossings,
-        name="crossings",
-        size=5,
-        face_color="magenta",
-        blending="translucent_no_depth",
-        features={"winding": winding_indices},
-        text={
-            "string": "{winding}",
-            "color": "yellow",
-            "size": 18,
-            "blending": "translucent_no_depth",
-        },
+    slab_image = _as_numpy(sample["slab_image"])
+    affine = _slab_affine_zyx(sample)
+    viewer.add_image(
+        slab_image,
+        name="slab",
+        affine=affine,
+        colormap="gray",
+        blending="translucent",
+        rendering="attenuated_mip",
+        contrast_limits=(0, 255),
     )
+    # The transverse slice containing the central ray, for a plane view
+    # matching the training visualization.
+    viewer.add_image(
+        slab_image[slab_image.shape[0] // 2][None],
+        name="center_slice",
+        affine=affine
+        @ np.array(
+            [
+                [1, 0, 0, slab_image.shape[0] // 2],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=np.float32,
+        ),
+        colormap="gray",
+        blending="translucent",
+        rendering="translucent",
+        contrast_limits=(0, 255),
+    )
+
+    crossings, winding = _column_crossing_points(sample)
+    if len(crossings):
+        viewer.add_points(
+            crossings,
+            name="column_crossings",
+            size=2,
+            features={"winding": winding.astype(np.float32)},
+            face_color="winding",
+            face_colormap="turbo",
+            blending="translucent_no_depth",
+        )
 
     origin = _as_numpy(sample["ray_origin_zyx"])
     direction = _as_numpy(sample["ray_direction_zyx"])
@@ -78,30 +111,6 @@ def display_napari_sample(viewer, sample: dict[str, torch.Tensor]) -> None:
         edge_width=2,
         face_color="transparent",
     )
-
-    invalid = ~_as_numpy(sample["winding_valid"]).astype(bool)
-    if invalid.any():
-        spacing = float(sample["ray_extent"]) / (int(sample["ray_length"]) - 1)
-        edges = np.diff(invalid.astype(np.int8), prepend=0, append=0)
-        spans = [
-            np.stack(
-                (
-                    origin + start * spacing * direction,
-                    origin + end * spacing * direction,
-                )
-            )
-            for start, end in zip(
-                np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0] - 1
-            )
-        ]
-        viewer.add_shapes(
-            spans,
-            shape_type="path",
-            name="unlabeled",
-            edge_color="red",
-            edge_width=3,
-            face_color="transparent",
-        )
     viewer.reset_view()
 
 
@@ -128,16 +137,16 @@ def run_napari_inspector(config_path: Path) -> None:
     ray_length_spin = QSpinBox()
     ray_length_spin.setRange(2, 1_000_000)
     ray_length_spin.setSingleStep(128)
-    plane_height_label = QLabel("Plane height (samples)")
-    plane_height_spin = QSpinBox()
-    plane_height_spin.setRange(2, 65_536)
-    plane_height_spin.setSingleStep(32)
+    transverse_label = QLabel("Transverse size (samples)")
+    transverse_spin = QSpinBox()
+    transverse_spin.setRange(8, 65_536)
+    transverse_spin.setSingleStep(8)
     next_button = QPushButton("Next")
     status = QLabel("Loading dataset…")
     layout.addWidget(ray_length_label)
     layout.addWidget(ray_length_spin)
-    layout.addWidget(plane_height_label)
-    layout.addWidget(plane_height_spin)
+    layout.addWidget(transverse_label)
+    layout.addWidget(transverse_spin)
     layout.addWidget(next_button)
     layout.addWidget(status)
     viewer.window.add_dock_widget(controls, area="right", name="Dataset")
@@ -145,7 +154,7 @@ def run_napari_inspector(config_path: Path) -> None:
     with config_path.open() as config_file:
         dataset = WindingModelDataset(json.load(config_file))
     ray_length_spin.setValue(dataset.ray_length)
-    plane_height_spin.setValue(dataset.plane_height)
+    transverse_spin.setValue(dataset.transverse_size)
     status.setText("Loading first sample…")
 
     sample_iterator = iter(dataset)
@@ -165,10 +174,11 @@ def run_napari_inspector(config_path: Path) -> None:
         sample_number += 1
         display_napari_sample(viewer, sample)
         volume_idx = int(sample["volume_idx"])
-        crossing_count = len(sample["crossing_t"])
+        supervised = int((_as_numpy(sample["num_crossings"]) > 0).sum())
+        total = sample["num_crossings"].numel()
         status.setText(
-            f"Sample {sample_number} · volume {volume_idx} · {crossing_count} "
-            f"crossings · {int(sample['plane_height'])}×{int(sample['ray_length'])}"
+            f"Sample {sample_number} · volume {volume_idx} · {supervised}/{total} "
+            f"columns · {int(sample['transverse_size'])}²×{int(sample['ray_length'])}"
         )
 
     def show_error(error: BaseException) -> None:
@@ -178,20 +188,20 @@ def run_napari_inspector(config_path: Path) -> None:
         nonlocal active_worker
         next_button.setEnabled(True)
         ray_length_spin.setEnabled(True)
-        plane_height_spin.setEnabled(True)
+        transverse_spin.setEnabled(True)
         active_worker = None
 
     def request_next_sample(_checked: bool = False) -> None:
         nonlocal active_worker
         if active_worker is not None:
             return
-        dataset.set_plane_dimensions(
+        dataset.set_slab_dimensions(
             ray_length=ray_length_spin.value(),
-            plane_height=plane_height_spin.value(),
+            transverse_size=transverse_spin.value(),
         )
         next_button.setEnabled(False)
         ray_length_spin.setEnabled(False)
-        plane_height_spin.setEnabled(False)
+        transverse_spin.setEnabled(False)
         status.setText("Sampling…")
         active_worker = thread_worker(take_next_sample)()
         active_worker.returned.connect(show_sample)

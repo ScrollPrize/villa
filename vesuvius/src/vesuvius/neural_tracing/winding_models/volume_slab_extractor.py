@@ -3,45 +3,75 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import vc
 
-PlaneGeometry = tuple[np.ndarray, np.ndarray, np.ndarray]
+
+@dataclass(frozen=True)
+class SlabFrame:
+    """Right-handed ray-aligned frame for a sampled slab.
+
+    Slab voxel (i, j, k) sits at ``origin + spacing * (i * axis_a + j *
+    axis_b + k * direction)`` in segment/display space; the ray runs along
+    the k axis through the transverse center, so k equals the ray's t in
+    sample units.
+    """
+
+    origin: np.ndarray
+    axis_a: np.ndarray
+    axis_b: np.ndarray
+    direction: np.ndarray
+    spacing: float
+
+    def to_slab(self, points_xyz: np.ndarray) -> np.ndarray:
+        """Map segment-space XYZ points to fractional (i, j, k) slab indices."""
+        offsets = np.asarray(points_xyz, dtype=np.float64) - self.origin
+        axes = np.stack([self.axis_a, self.axis_b, self.direction], axis=-1)
+        return offsets @ axes / self.spacing
+
+    def to_world(self, points_ijk: np.ndarray) -> np.ndarray:
+        """Map fractional (i, j, k) slab indices to segment-space XYZ."""
+        axes = np.stack([self.axis_a, self.axis_b, self.direction])
+        return self.origin + self.spacing * np.asarray(points_ijk, np.float64) @ axes
 
 
-class VolumePlaneExtractor:
-    """Fast, fused extraction of intersecting ray-aligned planes."""
+class VolumeSlabExtractor:
+    """Fused extraction of a ray-aligned 3-D slab.
+
+    The slab is transverse_size x transverse_size across the ray and
+    ray_length along it, sampled at ``spacing`` voxel steps on every axis
+    so the ray axis stays at full volume resolution.
+    """
 
     def __init__(
         self,
         volume_paths: list[Path],
         *,
-        shape: tuple[int, int] = (256, 256),
+        transverse_size: int = 96,
+        ray_length: int = 384,
         spacing: float = 1.0,
-        num_planes: int = 2,
         sampling: str = "trilinear",
         tile_size: int = 32,
         cache_bytes: int = 0,
         io_threads: int = 0,
         segment_to_volume_xyz: list[np.ndarray] | None = None,
     ) -> None:
-        if len(shape) != 2 or any(int(size) <= 0 for size in shape):
-            raise ValueError("shape must contain positive [height, width]")
+        if transverse_size < 2 or ray_length < 2:
+            raise ValueError("transverse_size and ray_length must be at least 2")
         if not math.isfinite(spacing) or spacing <= 0:
             raise ValueError("spacing must be finite and positive")
-        if num_planes not in {2, 4}:
-            raise ValueError("num_planes must be 2 or 4")
         if sampling not in {"nearest", "trilinear"}:
             raise ValueError("sampling must be 'nearest' or 'trilinear'")
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
 
         self.volume_paths = [Path(path) for path in volume_paths]
-        self.shape = tuple(int(size) for size in shape)
+        self.transverse_size = int(transverse_size)
+        self.ray_length = int(ray_length)
         self.spacing = float(spacing)
-        self.num_planes = int(num_planes)
         self.sampling = sampling
         self.tile_size = int(tile_size)
         self.cache_bytes = int(cache_bytes)
@@ -118,64 +148,63 @@ class VolumePlaneExtractor:
             self._volume_handles[key] = volume
         return volume
 
-    def intersecting_geometry(
-        self,
-        direction: np.ndarray,
-        ray_origin: np.ndarray,
-    ) -> PlaneGeometry:
-        """Construct configured transverse planes intersecting along the ray."""
+    def slab_frame(
+        self, direction: np.ndarray, ray_origin: np.ndarray
+    ) -> SlabFrame:
+        """Deterministic right-handed slab frame around the ray."""
         direction = np.asarray(direction, dtype=np.float64)
         norm = np.linalg.norm(direction)
         if not math.isfinite(norm) or norm <= 0:
             raise ValueError("direction must be finite and nonzero")
-        direction /= norm
+        direction = direction / norm
 
         reference = np.zeros(3, dtype=np.float64)
         reference[int(np.argmin(np.abs(direction)))] = 1.0
-        transverse_a = np.cross(reference, direction)
-        transverse_a /= np.linalg.norm(transverse_a)
-        transverse_b = np.cross(direction, transverse_a)
+        axis_a = np.cross(reference, direction)
+        axis_a /= np.linalg.norm(axis_a)
+        axis_b = np.cross(direction, axis_a)
 
-        transverse_axes = [transverse_a, transverse_b]
-        if self.num_planes == 4:
-            inverse_sqrt_two = 1.0 / math.sqrt(2.0)
-            transverse_axes.extend(
-                (
-                    (transverse_a + transverse_b) * inverse_sqrt_two,
-                    (transverse_a - transverse_b) * inverse_sqrt_two,
-                )
-            )
-
-        # Both image axes retain the same physical voxel spacing. Increasing
-        # ray length therefore increases image width rather than resampling.
-        x_steps = self.spacing * np.broadcast_to(
-            direction, (self.num_planes, direction.size)
+        origin = (
+            np.asarray(ray_origin, dtype=np.float64)
+            - 0.5 * (self.transverse_size - 1) * self.spacing * (axis_a + axis_b)
         )
-        y_steps = self.spacing * np.stack(transverse_axes)
-        height, _ = self.shape
-        ray_origin = np.asarray(ray_origin, dtype=np.float64)
-        origins = np.broadcast_to(ray_origin, (self.num_planes, 3)).copy()
-        origins -= 0.5 * (height - 1) * y_steps
-        return tuple(
-            np.ascontiguousarray(values, dtype=np.float32)
-            for values in (origins, x_steps, y_steps)
-        )
+        return SlabFrame(origin, axis_a, axis_b, direction, self.spacing)
 
     def extract(
         self,
         volume_idx: int,
         direction: np.ndarray,
         ray_origin: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, PlaneGeometry]:
-        geometry = self.intersecting_geometry(direction, ray_origin)
-        sampling_geometry = self.sampling_geometry(volume_idx, geometry)
+    ) -> tuple[np.ndarray, np.ndarray, SlabFrame]:
+        """Sample the slab image and validity, both [H, W, L], plus the frame.
+
+        The slab is realized as H parallel planes of shape [W, L] offset
+        along axis_a, so one fused sample_planes call owns all I/O.
+        """
+        frame = self.slab_frame(direction, ray_origin)
+        size = self.transverse_size
+        origins = frame.origin[None] + (
+            self.spacing * np.arange(size, dtype=np.float64)[:, None]
+            * frame.axis_a[None]
+        )
+        x_steps = np.broadcast_to(self.spacing * frame.direction, (size, 3))
+        y_steps = np.broadcast_to(self.spacing * frame.axis_b, (size, 3))
+
+        transform = self.segment_to_volume_xyz[volume_idx]
+        linear = transform[:3, :3]
         images, valid, _ = self._volume(volume_idx).sample_planes(
-            *sampling_geometry,
-            self.shape,
+            np.ascontiguousarray(
+                origins @ linear.T + transform[:3, 3], dtype=np.float32
+            ),
+            np.ascontiguousarray(x_steps @ linear.T, dtype=np.float32),
+            np.ascontiguousarray(y_steps @ linear.T, dtype=np.float32),
+            (size, self.ray_length),
             sampling=self.sampling,
             tile_size=self.tile_size,
         )
-        return images, valid, geometry
+        # Boolean validity: downstream boolean masking must never degrade
+        # into integer fancy indexing.
+        return np.asarray(images), np.asarray(valid, dtype=bool), frame
 
     def sample_points(self, volume_idx: int, points_xyz: np.ndarray) -> np.ndarray:
         """Sample volume intensities at display/segment-space XYZ points."""
@@ -190,18 +219,3 @@ class VolumePlaneExtractor:
             tile_size=self.tile_size,
         )
         return np.asarray(values).reshape(-1)
-
-    def sampling_geometry(
-        self, volume_idx: int, geometry: PlaneGeometry
-    ) -> PlaneGeometry:
-        """Map display/segment plane geometry into volume-array XYZ."""
-        transform = self.segment_to_volume_xyz[volume_idx]
-        linear = transform[:3, :3]
-        origins, x_steps, y_steps = geometry
-        return (
-            np.ascontiguousarray(
-                origins @ linear.T + transform[:3, 3], dtype=np.float32
-            ),
-            np.ascontiguousarray(x_steps @ linear.T, dtype=np.float32),
-            np.ascontiguousarray(y_steps @ linear.T, dtype=np.float32),
-        )
