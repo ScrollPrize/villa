@@ -40,7 +40,7 @@ constexpr int kPollReconnectMs = 5000;
 // short poll interval keeps the panel live without flooding it.
 constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 24;
+constexpr int kSupportedApiVersion = 26;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
