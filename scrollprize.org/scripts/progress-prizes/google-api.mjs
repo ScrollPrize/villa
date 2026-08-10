@@ -1,5 +1,6 @@
 const DRIVE_API_BASE = "https://www.googleapis.com/drive/v3";
 const FORMS_API_BASE = "https://forms.googleapis.com/v1";
+const SHEETS_API_BASE = "https://sheets.googleapis.com/v4";
 
 const DEFAULT_RETRY = Object.freeze({
   maxAttempts: 5,
@@ -151,6 +152,7 @@ function createTransport({
   retry,
   driveApiBase,
   formsApiBase,
+  sheetsApiBase,
 }) {
   if (accessToken !== undefined && getAccessToken !== undefined) {
     throw new TypeError("Provide either accessToken or getAccessToken, not both");
@@ -265,6 +267,14 @@ function createTransport({
       return requestJson({
         operation: options.operation ?? "forms.request",
         baseUrl: formsApiBase,
+        path,
+        ...options,
+      });
+    },
+    sheets(path, options = {}) {
+      return requestJson({
+        operation: options.operation ?? "sheets.request",
+        baseUrl: sheetsApiBase,
         path,
         ...options,
       });
@@ -448,6 +458,7 @@ export function createGoogleApiClient({
   retry,
   driveApiBase = DRIVE_API_BASE,
   formsApiBase = FORMS_API_BASE,
+  sheetsApiBase = SHEETS_API_BASE,
 } = {}) {
   const transport = createTransport({
     accessToken,
@@ -459,6 +470,7 @@ export function createGoogleApiClient({
     retry,
     driveApiBase,
     formsApiBase,
+    sheetsApiBase,
   });
 
   const files = Object.freeze({
@@ -496,6 +508,39 @@ export function createGoogleApiClient({
         body,
         // A lost response to files.copy is ambiguous: retrying here can create a
         // second form. The orchestrator resumes by searching appProperties instead.
+        retry: { ...operationRetry, maxAttempts: 1 },
+      });
+    },
+
+    async create({
+      name,
+      mimeType,
+      parentId,
+      appProperties,
+      fields = DEFAULT_FILE_FIELDS,
+      retry: operationRetry,
+    }) {
+      assertNonEmptyString(name, "name");
+      assertNonEmptyString(mimeType, "mimeType");
+      assertNonEmptyString(parentId, "parentId");
+      if (appProperties !== undefined) assertPlainObject(appProperties, "appProperties");
+
+      return transport.drive("/files", {
+        operation: "drive.files.create",
+        method: "POST",
+        query: {
+          supportsAllDrives: true,
+          ignoreDefaultVisibility: true,
+          fields,
+        },
+        body: {
+          name,
+          mimeType,
+          parents: [parentId],
+          ...(appProperties === undefined ? {} : { appProperties }),
+        },
+        // A lost response is ambiguous. The orchestrator resumes by searching
+        // the unique managed appProperties before attempting another create.
         retry: { ...operationRetry, maxAttempts: 1 },
       });
     },
@@ -720,6 +765,72 @@ export function createGoogleApiClient({
         retry: operationRetry,
       });
     },
+
+    async listResponses({ formId, pageSize = 1_000 }) {
+      if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 5_000) {
+        throw new TypeError("pageSize must be an integer from 1 through 5000");
+      }
+      return collectPages(
+        (pageToken) => transport.forms(`/forms/${encodePath(formId, "formId")}/responses`, {
+          operation: "forms.responses.list",
+          query: { pageSize, pageToken },
+        }),
+        "responses",
+      );
+    },
+  });
+
+  const values = Object.freeze({
+    async get({ spreadsheetId, range }) {
+      assertNonEmptyString(range, "range");
+      return transport.sheets(
+        `/spreadsheets/${encodePath(spreadsheetId, "spreadsheetId")}/values/${encodePath(range, "range")}`,
+        {
+          operation: "sheets.spreadsheets.values.get",
+          query: {
+            majorDimension: "ROWS",
+            valueRenderOption: "UNFORMATTED_VALUE",
+            dateTimeRenderOption: "FORMATTED_STRING",
+          },
+        },
+      );
+    },
+
+    async append({ spreadsheetId, range, rows, retry: operationRetry }) {
+      assertNonEmptyString(range, "range");
+      if (!Array.isArray(rows) || rows.length === 0 || rows.some((row) => !Array.isArray(row))) {
+        throw new TypeError("rows must be a non-empty array of arrays");
+      }
+      return transport.sheets(
+        `/spreadsheets/${encodePath(spreadsheetId, "spreadsheetId")}/values/${encodePath(range, "range")}:append`,
+        {
+          operation: "sheets.spreadsheets.values.append",
+          method: "POST",
+          query: {
+            valueInputOption: "RAW",
+            insertDataOption: "INSERT_ROWS",
+            includeValuesInResponse: false,
+          },
+          body: { majorDimension: "ROWS", values: rows },
+          // A lost append response is ambiguous. The orchestrator always reads
+          // stable response IDs again before retrying, preventing duplicate rows.
+          retry: { ...operationRetry, maxAttempts: 1 },
+        },
+      );
+    },
+  });
+
+  const spreadsheets = Object.freeze({
+    async get({ spreadsheetId }) {
+      return transport.sheets(`/spreadsheets/${encodePath(spreadsheetId, "spreadsheetId")}`, {
+        operation: "sheets.spreadsheets.get",
+        query: {
+          includeGridData: false,
+          fields: "spreadsheetId,sheets.properties(sheetId,title,index,sheetType,hidden)",
+        },
+      });
+    },
+    values,
   });
 
   return Object.freeze({
@@ -727,6 +838,7 @@ export function createGoogleApiClient({
     forms,
     getForm: (options) => forms.get(options),
     getFile: (options) => files.get(options),
+    createFile: (options) => files.create(options),
     listFilesByAppProperties: (options) => files.listByAppProperties(options),
     copyFile: (options) => files.copy(options),
     updateFile: (options) => files.update(options),
@@ -752,11 +864,16 @@ export function createGoogleApiClient({
       });
     },
     setPublishState: (options) => forms.setPublishSettings(options),
+    listFormResponses: (options) => forms.listResponses(options),
+    getSpreadsheet: (options) => spreadsheets.get(options),
+    getSheetValues: (options) => values.get(options),
+    appendSheetValues: (options) => values.append(options),
+    sheets: spreadsheets,
   });
 }
 
 function isSensitiveKey(key) {
-  return /(?:authorization|access[_-]?token|refresh[_-]?token|credential|private[_-]?key|service[_-]?account|form[_-]?id|file[_-]?id|folder[_-]?id|permission[_-]?id|email(?:address)?|editor(?:uri|url)?|domain)/i.test(
+  return /(?:authorization|access[_-]?token|refresh[_-]?token|credential|private[_-]?key|service[_-]?account|form[_-]?id|file[_-]?id|folder[_-]?id|permission[_-]?id|(?:spread)?sheet[_-]?id|linked[_-]?sheet|email(?:address)?|editor(?:uri|url)?|domain)/i.test(
     key,
   );
 }
@@ -765,6 +882,10 @@ function redactString(value, secrets) {
   let redacted = value.replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, `Bearer ${REDACTED}`);
   redacted = redacted.replace(
     /https:\/\/docs\.google\.com\/forms\/d\/(?!e\/)[^/\s]+\/(?:edit|preview|viewform)(?:[^\s]*)?/gi,
+    REDACTED,
+  );
+  redacted = redacted.replace(
+    /https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/\s]+\/(?:edit|preview)(?:[^\s]*)?/gi,
     REDACTED,
   );
   redacted = redacted.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, REDACTED);
@@ -802,9 +923,13 @@ export function redactForLog(value, { secrets = [] } = {}) {
 export const GOOGLE_API_READ_SCOPES = Object.freeze([
   "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/forms.body.readonly",
+  "https://www.googleapis.com/auth/forms.responses.readonly",
+  "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]);
 
 export const GOOGLE_API_SCOPES = Object.freeze([
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/forms.body",
+  "https://www.googleapis.com/auth/forms.responses.readonly",
+  "https://www.googleapis.com/auth/spreadsheets",
 ]);

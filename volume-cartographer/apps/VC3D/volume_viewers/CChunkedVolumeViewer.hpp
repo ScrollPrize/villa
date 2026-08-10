@@ -238,6 +238,10 @@ public:
         return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;
     }
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
+    // Accept linked-cursor points regardless of the global "Sync cursor across
+    // views" toggle (used by the line annotation window's pane group, whose
+    // mirroring is dialog-local).
+    void setLinkedCursorAlwaysEnabled(bool enabled) { _linkedCursorAlwaysEnabled = enabled; }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -253,6 +257,7 @@ public:
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
     void showEvent(QShowEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
@@ -318,6 +323,7 @@ private:
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
+    void repositionStatsBarRight();
     void notifyNormalOffsetChanged();
     void setZOffset(float value);
     void rebuildChunkArray();
@@ -421,7 +427,9 @@ private:
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
-    void updateCursorCrosshair(const QPointF& scenePos);
+    // projected=true draws the greyed-out variant used when a linked cursor
+    // point lies off this pane's plane (e.g. after a normal-offset scroll).
+    void updateCursorCrosshair(const QPointF& scenePos, bool projected = false);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -442,6 +450,7 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
+    ViewerStatsBar* _statsBarRight = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.
     bool _closing = false;
@@ -667,15 +676,20 @@ private:
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
     std::optional<cv::Vec3f> _lastCursorVolumePos;
+    // Cursor point mirrored in from another viewer; display-only fallback for
+    // the status-bar position readout (never used for click/hit-test paths).
+    std::optional<cv::Vec3f> _linkedCursorVolumePos;
     ShiftScrollOverride _shiftScrollOverride;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
+    bool _cursorCrosshairProjected = false;
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
+    bool _linkedCursorAlwaysEnabled = false;
 
     struct MeasurementPoint {
         cv::Vec2f surface{0.0f, 0.0f};
