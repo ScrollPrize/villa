@@ -43,7 +43,6 @@ public:
     void connectToService(const SpiralServiceProfile& profile);
     void disconnectFromService();
     void reconnect();
-    void restartRemoteService();
 
     // Convenience for the built-in local profile (compatibility with callers
     // that only ever used the auto-launched loopback service).
@@ -53,7 +52,6 @@ public:
     ConnectionState connectionState() const { return _connectionState; }
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
-    bool serviceOwnsDataset() const { return _serviceOwnsDataset; }
     QJsonObject advertisedDataset() const { return _advertisedDataset; }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
@@ -70,7 +68,7 @@ public:
                        const QJsonObject& inputs = {});
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
-    void saveCheckpoint(const QString& path);
+    void saveCheckpoint(const QString& name);
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
@@ -138,7 +136,6 @@ private:
     void startLocalProcess();
     void startTunnel();
     void beginHandshake();
-    void probeRestartedService();
     void handleHealth(const QJsonObject& health);
     QNetworkRequest makeRequest(const QString& path, int timeoutMs) const;
     void post(const QString& path, QJsonObject body, Timeout timeout,
@@ -190,10 +187,7 @@ private:
     bool _statusInFlight = false;
     int _statusFailures = 0;
     bool _hasActiveSession = false;
-    bool _serviceOwnsDataset = false;
     bool _eventsInFlight = false;
-    bool _restartInProgress = false;
-    QElapsedTimer _restartElapsed;
     int _eventFailures = 0;
     qint64 _lastEventCursor = 0;
     QJsonObject _advertisedDataset;

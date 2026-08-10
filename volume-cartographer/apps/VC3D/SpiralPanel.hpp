@@ -162,7 +162,6 @@ private:
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;
     QPushButton* _disconnectButton = nullptr;
-    QToolButton* _restartServiceButton = nullptr;
     QWidget* _endpointRow = nullptr;
     QWidget* _sshRow = nullptr;
     QWidget* _apiKeyRow = nullptr;

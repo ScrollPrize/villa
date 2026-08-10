@@ -763,17 +763,6 @@ class UploadManager:
     # Removal
     # ------------------------------------------------------------------
 
-    def delete(self, upload_id):
-        with self._lock:
-            upload = self.uploads.get(upload_id)
-            if upload is None:
-                raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
-            if upload.record is not None:
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "The upload is finalized; it is now a session input")
-            del self.uploads[upload_id]
-        shutil.rmtree(upload.staging_dir, ignore_errors=True)
-
     def collect_garbage(self):
         expired = []
         now = time.time()

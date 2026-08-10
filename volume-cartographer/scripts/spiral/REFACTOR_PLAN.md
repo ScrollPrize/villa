@@ -172,6 +172,8 @@ actual removal (explicit preview verbs) happens in PR 3.
 This phase makes the context explicit to configure and reduces service coupling.
 Client-visible slices carry an `API_VERSION` bump and matching VC3D changes in
 the same commit/PR; `/logs` remains exactly compatible until that bump.
+(Superseded: the compatibility window closed at API version 23, which removed
+`/logs` entirely. Console lines reach clients as log-kind `/events` records.)
 
 **Commit 1: one explicit fit configuration.**
 Introduce `FitConfig` (wrapping the existing `Config` catalog) and pass it to
@@ -259,7 +261,8 @@ event stream is bounded history, not a replacement for reconnect state.
 Avoid duplicates: a structured progress/metric event must not also re-enter as
 a tee-captured log record. Keep `/logs` as the old-schema compatibility endpoint
 for the advertised compatibility window, rather than returning event-shaped
-records under the old name.
+records under the old name. (That window closed at API version 23: `/logs` is
+gone, and the tee publishes straight into the event ring.)
 
 **Commit 6: quiet access logging and update VC3D.**
 Override `SpiralHandler.log_request` to suppress successful polling requests at

@@ -1146,8 +1146,12 @@ class ProtocolTests(unittest.TestCase):
     def test_mutating_command_is_deduplicated(self):
         service = ServiceState()
         calls = []
-        first = service.deduplicated("same-command", lambda: calls.append(1) or {"accepted": True})
-        second = service.deduplicated("same-command", lambda: calls.append(2) or {"accepted": True})
+        first = service.replay_command(
+            "session_run", "same-command",
+            lambda: calls.append(1) or {"accepted": True})
+        second = service.replay_command(
+            "session_run", "same-command",
+            lambda: calls.append(2) or {"accepted": True})
         self.assertEqual(calls, [1])
         self.assertEqual(first, second)
 
@@ -1165,9 +1169,11 @@ class ProtocolTests(unittest.TestCase):
             return {"accepted": True}
 
         first = threading.Thread(target=lambda: results.append(
-            service.deduplicated("concurrent-command", operation)))
+            service.replay_command("session_run", "concurrent-command",
+                                   operation)))
         second = threading.Thread(target=lambda: results.append(
-            service.deduplicated("concurrent-command", operation)))
+            service.replay_command("session_run", "concurrent-command",
+                                   operation)))
         first.start()
         self.assertTrue(entered.wait(1))
         second.start()

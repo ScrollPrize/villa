@@ -24,6 +24,18 @@ checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
 (patches, fibers, PCL documents) can be uploaded into a session-scoped
 ephemeral folder and later committed into the dataset.
+
+Host filesystem paths are the service's business. A client never invents
+one: a saved checkpoint is a name the service places under the session
+output directory, uploads land in service-chosen staging, and everything
+read back is an artifact ID. The one path a client does send — the
+checkpoint to load into the resident fit — has to be one this service
+advertised or wrote itself.
+
+Long operations accept and return. A preview export costs minutes, so
+``POST /session/export-preview`` starts one and answers immediately; the
+client follows it through ``/session/status``, which it already polls. The
+only verbs that hold a request open are the ones that are genuinely quick.
 """
 
 from __future__ import annotations
@@ -74,21 +86,17 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
                              _validate_tifxyz_output_step)
 
 
-SERVICE_VERSION = "6.1.0"
+SERVICE_VERSION = "7.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
 EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
                                            4 * 1024 * 1024 * 1024))
-# This buffer is also the reconnect/late-attach history for a remote VC3D
-# client.  tqdm produces one entry for each carriage-return redraw, so leave
-# enough room for the loading bars and a substantial portion of a long fit.
-MAX_LOG_ENTRIES = 20000
-MAX_LOG_READ_ENTRIES = 1000
 MAX_LOG_ENTRY_CHARS = 8192
-# Structured event ring served through /events. Sized like the log relay so
-# a reconnecting client can recover a comparable window of history.
+# Structured event ring served through /events. This is the whole of what a
+# reconnecting client can recover, so it is sized to hold the loading bars
+# plus a substantial portion of a long fit.
 MAX_EVENT_ENTRIES = 20000
 MAX_EVENT_READ_ENTRIES = 1000
 # High-frequency event kinds (per-iteration metrics, progress redraws)
@@ -254,7 +262,7 @@ def _validate_run_influence_config(value):
         enabled = value["influence_enabled"]
         if not isinstance(enabled, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "interactive_influence_enabled must be boolean")
+                           "influence_enabled must be boolean")
         result["influence_enabled"] = enabled
     ranges = {
         "influence_z": (1.0, 1_000_000.0),
@@ -295,9 +303,9 @@ def _validate_run_influence_config(value):
 
 # Console lines whose information is already published as structured
 # /events records: ProgressReporter console snapshots and the fitter's
-# periodic step-metric prints. They stay on the terminal and in the /logs
-# compatibility relay, but the event stream must not double-report them as
-# log records next to the structured progress/metric records.
+# periodic step-metric prints. They stay on the terminal, but the event
+# stream must not double-report them as log records next to the structured
+# progress/metric records.
 _STRUCTURED_CONSOLE_LINE = re.compile(r"^(?:PROGRESS |step \d+: loss = )")
 
 
@@ -416,63 +424,42 @@ class ServiceEventBuffer:
 
 
 class ServiceLogBuffer:
-    """Bounded, incremental copy of the service's stdout and stderr lines.
+    """Splits the service's stdout and stderr into whole console lines.
 
-    When an event buffer is attached, every complete non-structured console
-    line is also published as a ``log``-kind event record; lines already
-    covered by structured progress/metric events are kept out of the event
-    stream so the same information is never double-reported.
+    Every complete non-structured line is published to the event buffer as a
+    ``log``-kind record; lines already covered by structured
+    progress/metric events are kept out of the event stream so the same
+    information is never double-reported.
+
+    This used to also retain its own ring for a ``GET /logs`` relay. Nothing
+    read it: ``/events`` carries these same lines, with a cursor, a
+    session generation and an overrun signal that the log cursor never had,
+    and retaining every line twice was the single largest thing this process
+    held for the benefit of no client.
     """
 
-    def __init__(self, max_entries=MAX_LOG_ENTRIES, events=None):
+    def __init__(self, events=None):
         self._lock = threading.Lock()
-        self._entries = deque(maxlen=max_entries)
         self._pending = {"stdout": "", "stderr": ""}
-        self._next_sequence = 1
         self._events = events
 
     def write(self, stream, text):
-        if not text:
+        if not text or self._events is None:
             return
         # Carriage-return progress displays should still give remote clients
         # useful snapshots even though they overwrite one terminal line.
         text = str(text).replace("\r", "\n")
+        # Splitting and publishing stay under one lock so concurrently
+        # written streams cannot interleave their lines in the event ring.
         with self._lock:
             parts = (self._pending.get(stream, "") + text).split("\n")
             self._pending[stream] = parts.pop()
             for line in parts:
-                if not line:
+                if not line or _STRUCTURED_CONSOLE_LINE.match(line):
                     continue
                 if len(line) > MAX_LOG_ENTRY_CHARS:
                     line = line[:MAX_LOG_ENTRY_CHARS] + " … [truncated]"
-                self._entries.append({
-                    "sequence": self._next_sequence,
-                    "stream": stream,
-                    "text": line,
-                })
-                self._next_sequence += 1
-                if self._events is not None \
-                        and not _STRUCTURED_CONSOLE_LINE.match(line):
-                    self._events.append("log", line, source=stream)
-
-    def read_after(self, after):
-        with self._lock:
-            latest = self._next_sequence - 1
-            cursor_reset = after > latest
-            if cursor_reset:
-                after = 0
-            oldest = self._entries[0]["sequence"] if self._entries else self._next_sequence
-            dropped = max(0, oldest - max(0, after + 1))
-            entries = [dict(entry) for entry in self._entries
-                       if entry["sequence"] > after][:MAX_LOG_READ_ENTRIES]
-            next_sequence = entries[-1]["sequence"] if entries else min(after, latest)
-        return {
-            "entries": entries,
-            "next_sequence": next_sequence,
-            "latest_sequence": latest,
-            "dropped": dropped,
-            "cursor_reset": cursor_reset,
-        }
+                self._events.append("log", line, source=stream)
 
 
 class _TeeStream:
@@ -538,8 +525,8 @@ class ServiceState:
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
-        self.logs = logs if logs is not None else ServiceLogBuffer()
         self.events = events if events is not None else ServiceEventBuffer()
+        self.logs = logs if logs is not None else ServiceLogBuffer(self.events)
         # Log-kind records produced by the console tee carry the current
         # session generation. Reading the attribute is lock-free by design;
         # the provider runs under the event buffer's own lock.
@@ -557,6 +544,10 @@ class ServiceState:
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
+        # A preview export runs off the HTTP thread (it costs minutes); this
+        # is what makes the verb single-flight and what /session/status
+        # reports so a client reconnecting mid-export can see one is running.
+        self._preview_export_active = False
         self.config_catalog = Config.catalog()
         self.session_revision = 0
         self.run_plans = {}
@@ -661,7 +652,7 @@ class ServiceState:
             available, reason = self._commit_availability()
             response["commit_available"] = available
             response["commit_unavailable_reason"] = reason
-            response["dataset_owned"] = self.dataset_resolution is not None
+            response["preview_exporting"] = self._preview_export_active
             return response
 
     def session_state(self):
@@ -680,7 +671,6 @@ class ServiceState:
         response.update({
             "ready": True,
             "process_id": os.getpid(),
-            "dataset_owned": self.dataset_resolution is not None,
             "dataset_root": self.dataset_root,
             "session_state": state,
             "cuda_ready": None if state == SessionState.Loading
@@ -930,6 +920,7 @@ class ServiceState:
                            operation="building_session")
 
     def _reset_session_scope(self):
+        self._preview_export_active = False
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
@@ -1121,7 +1112,6 @@ class ServiceState:
             raise ApiError(HTTPStatus.CONFLICT,
                            "This plan requires reloading fit inputs")
         session = self._require_session()
-        status = session.status()
         influence_config = _validate_run_influence_config(
             plan["influence"])
         run_config = plan["configuration_changes"]
@@ -1272,41 +1262,97 @@ class ServiceState:
         return {**self.status(), "accepted": True}
 
     def save_checkpoint(self, request):
+        """Write a named checkpoint into this session's checkpoint folder.
+
+        The client names the file; the service decides where it lives. A
+        checkpoint has only ever been allowed under the session output
+        directory, so asking the client for an absolute path on a host it may
+        never have seen only ever meant "type the prefix I am about to check
+        for". A name says the same thing without the path policing, and it is
+        the same name ``/session/status`` reports back as
+        ``checkpoint_path``.
+        """
         session = self._require_session()
-        path = request.get("path")
-        if not path:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Checkpoint path is required")
-        resolved = Path(path).expanduser().resolve(strict=False)
-        if self.dataset_resolution is not None:
-            output_root = Path(self.session_paths.output_directory).resolve(strict=False)
-            if not resolved.is_relative_to(output_root):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "This service only saves checkpoints under the "
-                               "session output directory")
-        saved = session.save_checkpoint(str(resolved))
+        name = self._checkpoint_file_name(request.get("name"))
+        with self.lock:
+            root = Path(self.session_paths.output_directory) / "checkpoints"
+        root.mkdir(parents=True, exist_ok=True)
+        saved = session.save_checkpoint(str(root / name))
         return {**self.status(), "checkpoint_path": saved}
 
+    @staticmethod
+    def _checkpoint_file_name(value):
+        """One safe file name for a client-named checkpoint."""
+        name = str(value or "").strip()
+        if not name:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Checkpoint name is required")
+        if "/" in name or not is_safe_relative_name(name):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Checkpoint name must be a single file name",
+                [{"field": "name",
+                  "message": "Not a valid checkpoint file name"}])
+        return name if name.endswith(".ckpt") else f"{name}.ckpt"
+
     def export_preview(self):
-        """Export and publish one preview generation, on request.
+        """Start one preview generation; do not wait for it.
 
         Previews are not a side effect of pausing or of resuming from a
         checkpoint any more: they cost minutes, and a client that wants one
-        asks for one. Publication (Lasagna flattening and packaging) still
-        follows the session's preview status, so this returns as soon as the
-        session has exported and published the new generation.
+        asks for one. Because they cost minutes, this verb accepts the work
+        and returns. Holding the request open for the whole export and its
+        Lasagna publication meant every real preview outlived the client's
+        transfer timeout, and each retry then queued behind the original on
+        the command-replay condition and timed out in turn — so a preview
+        that in fact succeeded was reported as a failure.
+
+        What the client watches instead is the status it already polls:
+        ``preview_exporting`` while this is running, ``preview_publish`` for
+        publication progress, then ``preview_artifact`` for the result or
+        ``preview_publish_error`` for the cause.
         """
         session = self._require_session()
-        state = session.status().get("state")
-        if state != SessionState.Idle:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"Exporting a preview requires an idle session (state is "
-                f"{SessionState(state).name})")
-        result = session.export_preview()
         with self.lock:
+            if self._preview_export_active:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A preview export is already in progress")
+            state = session.status().get("state")
+            if state != SessionState.Idle:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"Exporting a preview requires an idle session (state is "
+                    f"{SessionState(state).name})")
+            self._preview_export_active = True
             self.status_generation += 1
-        return {**self.status(), "exported": True,
-                "preview_generation": result.get("preview_generation")}
+            session_id = self.session_id
+        threading.Thread(
+            target=self._export_preview, args=(session, session_id),
+            name="spiral-preview-export", daemon=True).start()
+        return {**self.status(), "accepted": True}
+
+    def _export_preview(self, session, session_id):
+        """Run one export off the HTTP thread and report it through status.
+
+        Publication follows the session's preview status on the fitter
+        thread, so this returns only once the whole generation is published;
+        nothing but this thread is waiting on it.
+        """
+        try:
+            session.export_preview()
+        except BaseException as exc:
+            error = _cause(exc)
+            print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
+            self.events.append(
+                "error", f"Preview export failed: {error}", severity="error",
+                source="service", operation="exporting_preview")
+            with self.lock:
+                if self.session_id == session_id:
+                    self._preview.error = error
+        finally:
+            with self.lock:
+                self._preview_export_active = False
+                self.status_generation += 1
 
     def _resolve_loadable_checkpoint(self, path):
         """Where an in-session load may read a checkpoint from.
@@ -1323,19 +1369,18 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Checkpoint does not exist on the service host",
                            [{"field": "path", "message": "No such file"}])
-        if self.dataset_resolution is not None:
-            advertised = set(
-                self.dataset_resolution.to_dict().get("detected_checkpoints", []))
-            output_root = Path(
-                self.session_paths.output_directory).resolve(strict=False)
-            if (str(resolved) not in advertised
-                    and not resolved.is_relative_to(output_root)):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    "Checkpoint must be one the service advertises or one "
-                    "under the session output directory",
-                    [{"field": "path",
-                      "message": "Not a service-advertised checkpoint"}])
+        advertised = set() if self.dataset_resolution is None else set(
+            self.dataset_resolution.to_dict().get("detected_checkpoints", []))
+        output_root = Path(
+            self.session_paths.output_directory).resolve(strict=False)
+        if (str(resolved) not in advertised
+                and not resolved.is_relative_to(output_root)):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Checkpoint must be one the service advertises or one "
+                "under the session output directory",
+                [{"field": "path",
+                  "message": "Not a service-advertised checkpoint"}])
         return str(resolved)
 
     def load_checkpoint(self, request):
@@ -1562,10 +1607,6 @@ class ServiceState:
         return {**self.status(), "input": dict(finalized.record),
                 "accepted": True}
 
-    def delete_upload(self, upload_id):
-        self.uploads_manager.delete(upload_id)
-        return {**self._base(), "deleted": True}
-
     def gc_uploads(self):
         self.uploads_manager.collect_garbage()
 
@@ -1599,7 +1640,6 @@ class ServiceState:
                         HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
                 records = self.ephemeral_records.uncommitted()
                 paths = self.session_paths
-            dataset_root = Path(paths.dataset_root)
             patches_dir = Path(paths.verified_patches) if paths.verified_patches \
                 else dataset_root / "verified_patches"
             fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
@@ -1735,10 +1775,6 @@ class ServiceState:
                 self.inflight_commands.discard(key)
                 self.command_condition.notify_all()
 
-    def deduplicated(self, command_id, operation):
-        """Replay an unnamed command; kept for callers outside the routes."""
-        return self.replay_command("command", command_id, operation)
-
     def close(self):
         with self.lock:
             session = self.session
@@ -1759,19 +1795,6 @@ class SpiralServer(ThreadingHTTPServer):
         super().__init__(address, SpiralHandler)
         self.credentials = list(credentials)
         self.state = state
-        self.restart_requested = threading.Event()
-        self._restart_lock = threading.Lock()
-        self._restart_scheduled = False
-
-    def request_restart(self):
-        """Acknowledge first, then ask main() to close and re-exec the service."""
-        with self._restart_lock:
-            if not self._restart_scheduled:
-                self._restart_scheduled = True
-                timer = threading.Timer(0.1, self.restart_requested.set)
-                timer.daemon = True
-                timer.start()
-        return {**self.state._base(), "restarting": True}
 
 
 class Idempotency:
@@ -1838,19 +1861,6 @@ class Route:
         self.reads_body = reads_body
 
 
-def _route_logs(ctx):
-    values = ctx.query.get("after", ["0"])
-    try:
-        after = int(values[-1])
-    except (TypeError, ValueError):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The log cursor must be an integer")
-    if after < 0:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The log cursor must not be negative")
-    return ctx.state.logs.read_after(after)
-
-
 def _route_events(ctx):
     try:
         cursor = int(ctx.query.get("cursor", ["0"])[-1])
@@ -1885,12 +1895,6 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length)
 
 
-def _route_export_full(_ctx):
-    raise ApiError(HTTPStatus.NOT_IMPLEMENTED,
-                   "Full diagnostic export is not implemented by the "
-                   "interactive service")
-
-
 _UPLOAD_ID = r"[0-9a-f]{32}"
 
 # The whole HTTP surface, declared once. Dispatch walks this table; there is
@@ -1903,7 +1907,6 @@ ROUTES = (
           lambda ctx: ctx.state.configuration_catalog(), Idempotency.NONE),
     Route("GET", "/session/status", "session_status",
           lambda ctx: ctx.state.status(), Idempotency.NONE),
-    Route("GET", "/logs", "logs", _route_logs, Idempotency.NONE),
     Route("GET", "/events", "events", _route_events, Idempotency.NONE),
     Route("GET", "/dataset", "dataset",
           lambda ctx: ctx.state.dataset(), Idempotency.NONE),
@@ -1922,17 +1925,11 @@ ROUTES = (
     Route("DELETE", "/session/ephemeral-inputs", "ephemeral_input_remove",
           lambda ctx: ctx.state.remove_input(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
-    Route("DELETE", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
-          "upload_delete", lambda ctx: ctx.state.delete_upload(ctx.args[0]),
-          Idempotency.NONE),
 
     Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
           "upload_finalize",
           lambda ctx: ctx.state.finalize_upload(ctx.args[0]),
           Idempotency.UPLOAD_ID, reads_body=True),
-    Route("POST", "/service/restart", "service_restart",
-          lambda ctx: ctx.handler.server.request_restart(),
-          Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
           reads_body=True),
@@ -1963,8 +1960,6 @@ ROUTES = (
     Route("POST", "/session/commit-inputs", "commit_inputs",
           lambda ctx: ctx.state.commit_inputs(), Idempotency.COMMAND_ID,
           reads_body=True),
-    Route("POST", "/session/export-full", "export_full", _route_export_full,
-          Idempotency.NONE, reads_body=True),
 )
 
 # Methods whose body is read before the route is resolved, so a malformed or
@@ -2002,9 +1997,9 @@ class SpiralHandler(BaseHTTPRequestHandler):
     def log_request(self, code="-", size="-"):
         """Suppress successful polling requests at the source.
 
-        Status, log, and event reads arrive several times a second from
-        every connected client; logging them would drown the terminal and
-        the relay buffers in access lines. Failed polls still log.
+        Status and event reads arrive several times a second from every
+        connected client; logging them would drown the terminal and the
+        event ring in access lines. Failed polls still log.
         """
         try:
             status = int(code)
@@ -2012,7 +2007,7 @@ class SpiralHandler(BaseHTTPRequestHandler):
             status = 0
         if self.command == "GET" and 200 <= status < 400:
             path = urlparse(self.path).path.rstrip("/")
-            if path in ("/session/status", "/logs", "/events"):
+            if path in ("/session/status", "/events"):
                 return
         super().log_request(code, size)
 
@@ -2407,8 +2402,6 @@ def main(argv=None):
     server.timeout = 0.5
     try:
         while not shutdown.is_set():
-            if server.restart_requested.is_set():
-                break
             server.handle_request()
     finally:
         server.server_close()
@@ -2418,10 +2411,6 @@ def main(argv=None):
             if session_lease is not None:
                 session_lease.release()
             sys.stdout, sys.stderr = original_stdout, original_stderr
-    if server.restart_requested.is_set():
-        restart_args = list(sys.argv[1:] if argv is None else argv)
-        os.execv(sys.executable,
-                 [sys.executable, str(Path(__file__).resolve()), *restart_args])
     return 0
 
 

@@ -64,7 +64,19 @@ from config import Config
 # The counters that remain are session_generation (session identity),
 # session_revision (configuration/input revision) and generation (status
 # ordering).
-API_VERSION = 22
+# Version 23 removes the verbs no client called — GET /logs (every line it
+# carried is already a log-kind /events record), POST /session/export-full (a
+# 501 stub) and DELETE /session/inputs/<id> (abandoned uploads expire on
+# their own) — and POST /service/restart, whose only remaining job was
+# recovering a wedged process that an operator restarts directly.
+# POST /session/save-checkpoint now takes {"name"} instead of {"path"}: a
+# checkpoint was only ever allowed under the session output directory, so
+# the service resolves it and the client stops guessing host paths.
+# POST /session/export-preview accepts and returns instead of blocking for
+# the whole export; status carries preview_exporting while it runs.
+# dataset_owned is gone from /health and /session/status: --dataset is
+# required, so it was always true.
+API_VERSION = 23
 
 
 class SessionState(str, Enum):

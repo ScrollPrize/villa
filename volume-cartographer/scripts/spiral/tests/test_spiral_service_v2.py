@@ -82,6 +82,8 @@ class FakeSession:
         self.saved = []
         self.autosave_calls = []
         self.previews = 0
+        self.preview_gate = None
+        self.preview_failure = None
         self.loaded = []
         self.load_refusal = None
         self.closed = False
@@ -125,6 +127,12 @@ class FakeSession:
                 "path": path}
 
     def export_preview(self, timeout=600.0):
+        # The real export blocks its caller for minutes; these let a test
+        # hold it open, or fail it, the way a real one can.
+        if self.preview_gate is not None:
+            self.preview_gate.wait(5)
+        if self.preview_failure is not None:
+            raise RuntimeError(self.preview_failure)
         self.previews += 1
         return {"preview_generation": self.previews,
                 "preview_manifest_path": f"/preview/{self.previews}"}
@@ -441,33 +449,6 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertNotIn("command_generation", health)
 
 
-class RestartTests(HttpServiceFixture):
-    def test_restart_requires_authentication_and_command_id(self):
-        status, _, _ = self.request(
-            "POST", "/service/restart", token=None,
-            body={"command_id": "restart-1"})
-        self.assertEqual(status, 401)
-        self.assertFalse(self.server.restart_requested.is_set())
-
-        status, payload, _ = self.request("POST", "/service/restart", body={})
-        self.assertEqual(status, 400)
-        self.assertIn("command_id", json.loads(payload)["error"])
-        self.assertFalse(self.server.restart_requested.is_set())
-
-    def test_restart_is_acknowledged_and_duplicate_requests_are_idempotent(self):
-        body = {"command_id": "restart-1"}
-        status, payload, _ = self.request("POST", "/service/restart", body=body)
-        self.assertEqual(status, 200)
-        self.assertTrue(json.loads(payload)["restarting"])
-
-        status, duplicate, _ = self.request("POST", "/service/restart", body=body)
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(duplicate), json.loads(payload))
-
-        self.assertTrue(self.server._restart_scheduled)
-        self.assertTrue(self.server.restart_requested.wait(2))
-
-
 class RouteTableTests(HttpServiceFixture):
     def test_routes_resolve_from_the_declarative_table(self):
         route, args = spiral_service.resolve_route("GET", "/session/status")
@@ -656,55 +637,33 @@ class CommandReplayTests(unittest.TestCase):
                                      lambda: {"accepted": True})
 
 
-class LogStreamingTests(HttpServiceFixture):
-    def test_authenticated_log_reads_are_incremental(self):
+class ConsoleRelayTests(HttpServiceFixture):
+    """The tee's whole client surface is the log-kind records in /events.
+
+    There is no /logs relay any more: it retained every console line a
+    second time for a client that never read it.
+    """
+
+    def relayed(self, buffer=None):
+        events = (buffer or self.state.events).read_after(0)["events"]
+        return [(record["source"], record["text"]) for record in events
+                if record["kind"] == "log"]
+
+    def test_console_lines_are_relayed_as_events_and_logs_is_gone(self):
         self.state.logs.write("stdout", "loading inputs\n")
         self.state.logs.write("stderr", "iteration 1\niteration 2\n")
 
-        status, payload, _ = self.request("GET", "/logs?after=0")
-        self.assertEqual(status, 200)
-        first = json.loads(payload)
-        self.assertEqual(
-            [(entry["stream"], entry["text"]) for entry in first["entries"]],
-            [("stdout", "loading inputs"),
-             ("stderr", "iteration 1"),
-             ("stderr", "iteration 2")])
-        self.assertEqual(first["next_sequence"], 3)
-
-        self.state.logs.write("stdout", "iteration 3\n")
-        status, payload, _ = self.request(
-            "GET", f"/logs?after={first['next_sequence']}")
-        self.assertEqual(status, 200)
-        second = json.loads(payload)
-        self.assertEqual([entry["text"] for entry in second["entries"]],
-                         ["iteration 3"])
-        self.assertEqual(second["next_sequence"], 4)
-
-    def test_log_cursor_validation_and_authentication(self):
-        status, _, _ = self.request("GET", "/logs?after=not-a-number")
-        self.assertEqual(status, 400)
-        status, _, _ = self.request("GET", "/logs?after=-1")
-        self.assertEqual(status, 400)
-        status, _, _ = self.request("GET", "/logs?after=0", token=None)
-        self.assertEqual(status, 401)
-
-    def test_bounded_log_buffer_reports_dropped_entries_and_cursor_reset(self):
-        logs = ServiceLogBuffer(max_entries=2)
-        logs.write("stdout", "one\ntwo\nthree\n")
-        result = logs.read_after(0)
-        self.assertEqual([entry["text"] for entry in result["entries"]],
-                         ["two", "three"])
-        self.assertEqual(result["dropped"], 1)
-
-        restarted_client = logs.read_after(100)
-        self.assertTrue(restarted_client["cursor_reset"])
-        self.assertEqual([entry["text"] for entry in restarted_client["entries"]],
-                         ["two", "three"])
+        self.assertEqual(self.relayed(),
+                         [("stdout", "loading inputs"),
+                          ("stderr", "iteration 1"),
+                          ("stderr", "iteration 2")])
+        status, _, _ = self.request("GET", "/logs?after=0")
+        self.assertEqual(status, 404)
 
     def test_successful_polling_requests_are_suppressed_at_the_source(self):
-        # The handler's log_request override keeps successful status, log,
-        # and event polls out of the terminal (and therefore out of every
-        # relay); failed polls and other requests still log.
+        # The handler's log_request override keeps successful status and
+        # event polls out of the terminal (and therefore out of the relay);
+        # failed polls and other requests still log.
         handler = spiral_service.SpiralHandler.__new__(
             spiral_service.SpiralHandler)
         logged = []
@@ -717,7 +676,6 @@ class LogStreamingTests(HttpServiceFixture):
             handler.log_request(code)
 
         probe("GET", "/session/status", 200)
-        probe("GET", "/logs?after=4", 200)
         probe("GET", "/events?cursor=9", 200)
         self.assertEqual(logged, [])
         probe("GET", "/session/status", 401)
@@ -725,29 +683,41 @@ class LogStreamingTests(HttpServiceFixture):
         probe("POST", "/session/run", 200)
         self.assertEqual(len(logged), 3)
 
-    def test_log_buffer_no_longer_string_filters_access_lines(self):
-        logs = ServiceLogBuffer()
+    def test_relay_no_longer_string_filters_access_lines(self):
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
         logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -\n')
         logs.write("stderr", "useful fitter warning\n")
-        self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
-                         ['SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -',
-                          "useful fitter warning"])
+        self.assertEqual(
+            self.relayed(events),
+            [("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -'),
+             ("stderr", "useful fitter warning")])
 
     def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
-        logs = ServiceLogBuffer()
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
         logs.write("stderr", "\rloading patches:  25%|██▌       | 1/4")
         logs.write("stderr", "\rloading patches: 100%|██████████| 4/4\n")
         logs.write("stderr", "\r 40%|████      | 400/1000")
         logs.write("stderr", "\r100%|██████████| 1000/1000\n")
 
         self.assertEqual(
-            [entry["text"] for entry in logs.read_after(0)["entries"]],
+            [text for _, text in self.relayed(events)],
             [
                 "loading patches:  25%|██▌       | 1/4",
                 "loading patches: 100%|██████████| 4/4",
                 " 40%|████      | 400/1000",
                 "100%|██████████| 1000/1000",
             ])
+
+    def test_oversized_lines_are_truncated_before_the_ring(self):
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
+        logs.write("stdout", "x" * (spiral_service.MAX_LOG_ENTRY_CHARS + 50)
+                   + "\n")
+        text = self.relayed(events)[0][1]
+        self.assertTrue(text.endswith(" … [truncated]"))
+        self.assertEqual(text.count("x"), spiral_service.MAX_LOG_ENTRY_CHARS)
 
 
 class ArtifactHttpTests(HttpServiceFixture):
@@ -1037,14 +1007,24 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(status["state"], SessionState.Idle)
         self.assertIsNone(status["error"])
 
-    def test_save_checkpoint_is_constrained_to_output_directory(self):
+    def test_save_checkpoint_names_a_file_the_service_places(self):
+        """The client names the checkpoint; the service owns the location."""
         _attach_fake_session(self.state, self.output, self.root)
-        with self.assertRaises(ApiError) as caught:
-            self.state.save_checkpoint({"path": str(self.root / "elsewhere.ckpt")})
-        self.assertEqual(caught.exception.status, 400)
-        response = self.state.save_checkpoint(
-            {"path": str(self.output / "manual.ckpt")})
-        self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
+        for name in ("", "   ", "../escape.ckpt", "sub/dir.ckpt", "..",
+                     "/absolute.ckpt"):
+            with self.assertRaises(ApiError) as caught:
+                self.state.save_checkpoint({"name": name})
+            self.assertEqual(caught.exception.status, 400, name)
+
+        response = self.state.save_checkpoint({"name": "manual.ckpt"})
+        expected = self.output / "checkpoints" / "manual.ckpt"
+        self.assertEqual(response["checkpoint_path"], str(expected))
+        self.assertTrue(expected.parent.is_dir())
+
+        # A bare name gains the conventional suffix.
+        response = self.state.save_checkpoint({"name": "second"})
+        self.assertEqual(response["checkpoint_path"],
+                         str(self.output / "checkpoints" / "second.ckpt"))
 
     def test_load_checkpoint_reads_only_service_owned_checkpoints(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -1105,13 +1085,33 @@ class DatasetOwnershipTests(unittest.TestCase):
                          {"iterations": 4, "autosave_on_pause": "no"})
         self.assertEqual(caught.exception.status, 400)
 
-    def test_export_preview_is_an_explicit_verb_valid_when_idle(self):
+    def test_export_preview_accepts_and_runs_off_the_request_thread(self):
+        """A preview costs minutes; the verb accepts it and returns.
+
+        Holding the request open outlived every client transfer timeout, so
+        a preview that succeeded was reported as a failure. The client
+        follows preview_exporting in the status it already polls.
+        """
         session = _attach_fake_session(self.state, self.output, self.root)
+        release = threading.Event()
+        session.preview_gate = release
 
         response = self.state.export_preview()
+        self.assertTrue(response["accepted"])
+        self.assertNotIn("exported", response)
+        self.assertTrue(response["preview_exporting"])
 
-        self.assertTrue(response["exported"])
-        self.assertEqual(response["preview_generation"], 1)
+        # Single-flight while the export is still running.
+        with self.assertRaises(ApiError) as caught:
+            self.state.export_preview()
+        self.assertEqual(caught.exception.status, 409)
+
+        release.set()
+        deadline = time.monotonic() + 5.0
+        while self.state.status()["preview_exporting"] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.state.status()["preview_exporting"])
         self.assertEqual(session.previews, 1)
 
         session.state = SessionState.Running
@@ -1119,6 +1119,19 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.export_preview()
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.previews, 1)
+
+    def test_a_failed_preview_export_is_reported_through_status(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.preview_failure = "OSError: no space left on device"
+
+        self.state.export_preview()
+        deadline = time.monotonic() + 5.0
+        while self.state.status()["preview_exporting"] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = self.state.status()
+        self.assertFalse(status["preview_exporting"])
+        self.assertIn("no space left", status["preview_publish_error"])
 
     def test_load_checkpoint_requires_an_idle_session(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -1509,8 +1522,6 @@ class UploadTests(unittest.TestCase):
                 upload_id, "fiber.json",
                 io.BytesIO(FIBER_FILES["fiber.json"]),
                 len(FIBER_FILES["fiber.json"]))
-        with self.assertRaisesRegex(ApiError, "finalized"):
-            self.state.delete_upload(upload_id)
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -1594,13 +1605,21 @@ class UploadTests(unittest.TestCase):
         finally:
             spiral_service.EPHEMERAL_QUOTA_BYTES = original
 
-    def test_deleted_and_aborted_uploads_leave_no_partial_data(self):
+    def test_abandoned_uploads_leave_no_partial_data(self):
+        """An abandoned transfer expires; there is no cancel verb.
+
+        DELETE /session/inputs/<id> existed for a client that never called
+        it, so garbage collection is the whole story.
+        """
         self._session()
         upload_id = _upload_input(self.state, "patch", "aborted", PATCH_FILES)
         staging = self.output / ".spiral-upload-staging" / upload_id
         self.assertTrue(staging.exists())
-        self.state.delete_upload(upload_id)
+        self.state.uploads[upload_id].created -= \
+            spiral_service.UPLOAD_GC_SECONDS + 1
+        self.state.gc_uploads()
         self.assertFalse(staging.exists())
+        self.assertNotIn(upload_id, self.state.uploads)
 
     def test_expired_uploads_are_garbage_collected(self):
         self._session()
@@ -2661,50 +2680,13 @@ class ServiceProcessTests(unittest.TestCase):
                     health = json.loads(response.read())
                 self.assertEqual(health["api_version"], API_VERSION)
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/logs?after=0",
+                    f"http://127.0.0.1:{port}/events?cursor=0",
                     headers={"Authorization": f"Bearer {key}"})
                 with urllib.request.urlopen(request, timeout=10) as response:
-                    logs = json.loads(response.read())
-                self.assertIn(
-                    ready, [entry["text"] for entry in logs["entries"]])
-            finally:
-                process.terminate()
-                process.wait(10)
-                process.stdout.close()
-
-    def test_restart_reexecs_in_place_and_reuses_the_fixed_port(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "key"
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                port = reservation.getsockname()[1]
-            process = self._launch(
-                ["--port", str(port), "--api-key-file", str(key_file)]
-                + self._dataset_arguments(temporary),
-                temporary)
-            try:
-                self._read_until_ready(process)
-                original_pid = process.pid
-                key = key_file.read_text().strip()
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/service/restart",
-                    method="POST",
-                    data=json.dumps({"command_id": "restart-integration"}).encode(),
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json",
-                    })
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    acknowledgement = json.loads(response.read())
-                self.assertTrue(acknowledgement["restarting"])
-
-                self._read_until_ready(process)
-                self.assertEqual(process.pid, original_pid)
-                health_request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/health",
-                    headers={"Authorization": f"Bearer {key}"})
-                with urllib.request.urlopen(health_request, timeout=10) as response:
-                    self.assertTrue(json.loads(response.read())["ready"])
+                    events = json.loads(response.read())
+                self.assertIn(ready, [record["text"]
+                                      for record in events["events"]
+                                      if record["kind"] == "log"])
             finally:
                 process.terminate()
                 process.wait(10)
