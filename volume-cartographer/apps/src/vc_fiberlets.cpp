@@ -43,6 +43,7 @@ struct CliOptions {
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool sigmaExplicit = false;
     bool printStats = false;
+    bool writePresenceSlices = true;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -67,6 +68,9 @@ void usage(const char* executable)
               << "  --gaussian-sigma N            Gaussian sigma [cell-size/2]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
+              << "  --merge-angle-deg N           maximum duplicate-axis angle [10]\n"
+              << "  --merge-abs-loss N            maximum normalized merge loss [0.01]\n"
+              << "  --merge-rel-loss N            maximum relative merge loss [0.05]\n"
               << "  --maximum-seeds N             deterministic PCA seed count [8]\n"
               << "  --maximum-iterations N        assignment/PCA iteration limit [64]\n"
               << "  --crop X,Y,Z,W,H,D            base-volume box; selects intersected cells\n"
@@ -84,7 +88,8 @@ void usage(const char* executable)
               << "  --smoothness-normal-weight N  normal-tilt weight [0.1]\n"
               << "  --smoothness-tangent-weight N tangent-plane turn weight [10]\n"
               << "  --smoothness-free-angle N     lattice free angle in degrees [45]\n"
-              << "  --stats                       print path-count and score statistics\n";
+              << "  --stats                       print path-count and score statistics\n"
+              << "  --no-slices                   skip central presence-slice outputs\n";
 }
 
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
@@ -196,6 +201,14 @@ CliOptions parseArgs(int argc, char** argv)
             options.anchors.observationPresenceFloor = parseDouble(valueAfter(index, argc, argv, "presence-floor"), "presence-floor");
         } else if (argument == "--minimum-support" && options.command == Command::Anchors) {
             options.anchors.minimumAlignedSupport = parseDouble(valueAfter(index, argc, argv, "minimum-support"), "minimum-support");
+        } else if (argument == "--merge-angle-deg" && options.command == Command::Anchors) {
+            options.anchors.mergeMaximumAngleDegrees = parseDouble(valueAfter(index, argc, argv, "merge-angle-deg"), "merge-angle-deg");
+        } else if (argument == "--merge-abs-loss" && options.command == Command::Anchors) {
+            options.anchors.mergeMaximumAbsoluteObjectiveLoss =
+                parseDouble(valueAfter(index, argc, argv, "merge-abs-loss"), "merge-abs-loss");
+        } else if (argument == "--merge-rel-loss" && options.command == Command::Anchors) {
+            options.anchors.mergeMaximumRelativeObjectiveLoss =
+                parseDouble(valueAfter(index, argc, argv, "merge-rel-loss"), "merge-rel-loss");
         } else if (argument == "--maximum-seeds" && options.command == Command::Anchors) {
             const int value = parseInt(valueAfter(index, argc, argv, "maximum-seeds"), "maximum-seeds");
             if (value <= 0)
@@ -223,6 +236,8 @@ CliOptions parseArgs(int argc, char** argv)
                 fail("--corridor-radius must be positive");
         } else if (argument == "--stats" && options.command == Command::Paths) {
             options.printStats = true;
+        } else if (argument == "--no-slices" && options.command == Command::Paths) {
+            options.writePresenceSlices = false;
         } else if (argument == "--presence-weight" && options.command == Command::Paths) {
             options.paths.presenceWeight = parseDouble(valueAfter(index, argc, argv, "presence-weight"), "presence-weight");
         } else if (argument == "--direction-weight" && options.command == Command::Paths) {
@@ -343,7 +358,8 @@ int main(int argc, char** argv)
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells
                       << " zero=" << report.diagnostics.zeroAnchorCells << " one=" << report.diagnostics.oneAnchorCells
-                      << " two=" << report.diagnostics.twoAnchorCells << " elapsed_seconds=" << report.elapsedSeconds << '\n';
+                      << " two=" << report.diagnostics.twoAnchorCells << " merged=" << report.diagnostics.mergedComponentPairs
+                      << " elapsed_seconds=" << report.elapsedSeconds << '\n';
             if (options.baseVoxelSizeUm.has_value()) {
                 std::cout << "cell_side_um=" << cellSideBase * *options.baseVoxelSizeUm
                           << " cell_diagonal_um=" << cellSideBase * std::sqrt(3.0) * *options.baseVoxelSizeUm << '\n';
@@ -369,12 +385,38 @@ int main(int argc, char** argv)
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
         const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+        const auto printProgress = [](const vc::fiber_tracer::FiberletPathProgress& progress) {
+            const double percent =
+                progress.total == 0 ? 100.0 : 100.0 * static_cast<double>(progress.completed) / static_cast<double>(progress.total);
+            const double rate = progress.elapsedSeconds > 0.0 ? static_cast<double>(progress.completed) / progress.elapsedSeconds : 0.0;
+            const double eta = progress.completed >= progress.total ? 0.0
+                               : rate > 0.0                         ? static_cast<double>(progress.total - progress.completed) / rate
+                                                                    : std::numeric_limits<double>::infinity();
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(1) << "fiberlet_progress completed=" << progress.completed << " total=" << progress.total
+                 << " percent=" << percent << " elapsed_seconds=" << progress.elapsedSeconds << " candidates_per_second=" << rate << " eta_seconds=";
+            if (std::isfinite(eta))
+                line << eta;
+            else
+                line << "n/a";
+            std::cerr << line.str() << '\n';
+        };
         const auto report = vc::fiber_tracer::traceFiberletPaths(
             anchors,
             grid,
             options.paths,
             [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
-            normalSampler);
+            normalSampler,
+            printProgress);
+        std::optional<vc::fiber_tracer::FiberPresenceSliceReport> presenceSlices;
+        if (options.writePresenceSlices) {
+            const auto sliceCrop = vc::fiber_tracer::fiberAnchorCellCoverageCrop(anchors);
+            presenceSlices = vc::fiber_tracer::sampleFiberPresenceSlices(
+                sliceCrop,
+                grid,
+                [&](const auto& indices, int threads, auto& samples) { field.sampleStoredPresenceBatch(indices, threads, samples); },
+                options.paths.parallelThreads);
+        }
         vc::fiber_tracer::FiberletArtifactInfo artifact;
         artifact.fiberManifestLocator = datasetLocator(dataset);
         artifact.fiberManifestContentHash = manifestHash;
@@ -384,16 +426,28 @@ int main(int argc, char** argv)
         artifact.anchorArtifactContentHash = fileHash(options.anchorArtifact);
         artifact.baseVoxelSizeUm = options.baseVoxelSizeUm.has_value() ? options.baseVoxelSizeUm : anchors.artifact.baseVoxelSizeUm;
         vc::fiber_tracer::writeFiberletPathArtifacts(options.outputDirectory, report, artifact);
+        if (presenceSlices.has_value()) {
+            vc::fiber_tracer::writeFiberPresenceSliceArtifacts(options.outputDirectory, *presenceSlices, grid);
+        } else {
+            vc::fiber_tracer::removeFiberPresenceSliceArtifacts(options.outputDirectory);
+        }
         std::cout << "anchors=" << report.diagnostics.occupiedAnchors << " shell_offsets=" << report.diagnostics.shellOffsets
                   << " generated_pairs=" << report.diagnostics.generatedPairs << " axis_rejected=" << report.diagnostics.axisRejectedPairs
                   << " searched=" << report.diagnostics.searchedPairs << " successful=" << report.diagnostics.successfulPaths
-                  << " no_path=" << report.diagnostics.noPathPairs << " elapsed_seconds=" << report.elapsedSeconds << '\n';
+                  << " no_path=" << report.diagnostics.noPathPairs << " preloaded_voxels=" << report.preloadedVoxels
+                  << " estimated_preload_bytes=" << report.estimatedPreloadBytes << " candidate_workers=" << report.candidateWorkers
+                  << " candidate_seconds=" << report.candidateGenerationSeconds << " preload_seconds=" << report.preloadSeconds
+                  << " search_seconds=" << report.searchSeconds << " elapsed_seconds=" << report.elapsedSeconds << '\n';
         if (options.printStats) {
             const auto statistics = vc::fiber_tracer::fiberletPathStatistics(report);
             std::cout << "fiberlet_stats anchors=" << statistics.anchors << " total_candidate_pairs=" << statistics.candidates
                       << " pre_dp_rejections=" << statistics.preDpRejected << " dp_searches=" << statistics.dpSearched
                       << " searched_unscored=" << statistics.searchedUnscored << " scored_fiberlets=" << statistics.scored
-                      << " accepted_fiberlets=" << statistics.accepted << " unscored_candidates=" << statistics.unscored << '\n';
+                      << " accepted_fiberlets=" << statistics.accepted << " unscored_candidates=" << statistics.unscored;
+            if (presenceSlices.has_value())
+                std::cout << " slices=enabled slice_pixels=" << presenceSlices->pixelCount() << '\n';
+            else
+                std::cout << " slices=disabled\n";
             const auto printScores = [](const char* name, const vc::fiber_tracer::FiberletScoreStatistics& scores) {
                 std::cout << name << " count=" << scores.count;
                 if (scores.count == 0) {

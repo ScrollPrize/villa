@@ -13,7 +13,8 @@
 #include <opencv2/core/types.hpp>
 #include <nlohmann/json.hpp>
 
-namespace vc::fiber_tracer {
+namespace vc::fiber_tracer
+{
 
 struct FiberAnchorObservation {
     cv::Vec3d positionPredictionXYZ{0.0, 0.0, 0.0};
@@ -27,6 +28,9 @@ struct FiberAnchorConfig {
     double gaussianSigmaPredictionVoxels = 2.0;
     double observationPresenceFloor = 0.05;
     double minimumAlignedSupport = 0.05;
+    double mergeMaximumAngleDegrees = 10.0;
+    double mergeMaximumAbsoluteObjectiveLoss = 0.01;
+    double mergeMaximumRelativeObjectiveLoss = 0.05;
     size_t maximumSeedCount = 8;
     int maximumIterations = 64;
     double convergenceTolerance = 1.0e-12;
@@ -53,9 +57,19 @@ struct FiberAnchorComponent {
     size_t assignedObservationCount = 0;
 };
 
+struct FiberAnchorMergeEvaluation {
+    double angleDegrees = 0.0;
+    double jointObjective = 0.0;
+    double splitObjective = 0.0;
+    double objectiveLoss = 0.0;
+    double allowedObjectiveLoss = 0.0;
+    bool merged = false;
+};
+
 struct FiberCellAnchorResult {
     std::array<size_t, 3> cellZYX{0, 0, 0};
     std::array<FiberAnchorComponent, 2> components;
+    std::optional<FiberAnchorMergeEvaluation> mergeEvaluation;
     double objective = 0.0;
     size_t retainedAnchorCount = 0;
 };
@@ -68,6 +82,7 @@ struct FiberAnchorExtractionDiagnostics {
     size_t emptyComponents = 0;
     size_t degenerateComponents = 0;
     size_t belowSupportComponents = 0;
+    size_t mergedComponentPairs = 0;
 };
 
 struct FiberAnchorExtractionReport {
@@ -88,16 +103,12 @@ struct FiberAnchorArtifactInfo {
     std::optional<double> baseVoxelSizeUm;
 };
 
-using FiberStoredPredictionBatchSampler = std::function<void(
-    const std::vector<std::array<size_t, 3>>& indicesZYX,
-    int parallelThreads,
-    std::vector<FiberStoredPredictionSample>& samples)>;
+using FiberStoredPredictionBatchSampler =
+    std::function<void(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPredictionSample>& samples)>;
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config);
 
-[[nodiscard]] FiberAnchorCrop fiberAnchorCropFromBaseVoxels(
-    const FiberAnchorCrop& baseCrop,
-    double predictionToBaseScale);
+[[nodiscard]] FiberAnchorCrop fiberAnchorCropFromBaseVoxels(const FiberAnchorCrop& baseCrop, double predictionToBaseScale);
 
 [[nodiscard]] FiberCellAnchorResult fitFiberCellAnchors(
     const std::array<size_t, 3>& cellZYX,
@@ -112,17 +123,10 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const FiberStoredPredictionBatchSampler& sampler,
     std::optional<FiberAnchorCrop> crop = std::nullopt);
 
-[[nodiscard]] nlohmann::json fiberAnchorReportJson(
-    const FiberAnchorExtractionReport& report,
-    const FiberAnchorArtifactInfo& artifact);
+[[nodiscard]] nlohmann::json fiberAnchorReportJson(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 
-[[nodiscard]] std::string fiberAnchorReportObj(
-    const FiberAnchorExtractionReport& report,
-    const FiberAnchorArtifactInfo& artifact);
+[[nodiscard]] std::string fiberAnchorReportObj(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 
-void writeFiberAnchorArtifacts(
-    const std::filesystem::path& outputDirectory,
-    const FiberAnchorExtractionReport& report,
-    const FiberAnchorArtifactInfo& artifact);
+void writeFiberAnchorArtifacts(const std::filesystem::path& outputDirectory, const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 
-} // namespace vc::fiber_tracer
+}  // namespace vc::fiber_tracer

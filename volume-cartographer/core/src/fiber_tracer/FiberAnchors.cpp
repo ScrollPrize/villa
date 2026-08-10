@@ -307,6 +307,19 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !std::isfinite(config.minimumAlignedSupport)) {
         throw std::invalid_argument("fiber anchor minimum aligned support must be in [0, 1]");
     }
+    if (!(config.mergeMaximumAngleDegrees >= 0.0) ||
+        !(config.mergeMaximumAngleDegrees <= 90.0) ||
+        !std::isfinite(config.mergeMaximumAngleDegrees)) {
+        throw std::invalid_argument("fiber anchor merge maximum angle must be in [0, 90]");
+    }
+    if (!(config.mergeMaximumAbsoluteObjectiveLoss >= 0.0) ||
+        !(config.mergeMaximumAbsoluteObjectiveLoss <= 1.0) ||
+        !std::isfinite(config.mergeMaximumAbsoluteObjectiveLoss) ||
+        !(config.mergeMaximumRelativeObjectiveLoss >= 0.0) ||
+        !(config.mergeMaximumRelativeObjectiveLoss <= 1.0) ||
+        !std::isfinite(config.mergeMaximumRelativeObjectiveLoss)) {
+        throw std::invalid_argument("fiber anchor merge objective losses must be in [0, 1]");
+    }
     if (config.maximumSeedCount < 1 || config.maximumSeedCount > 64)
         throw std::invalid_argument("fiber anchor maximum seed count must be in [1, 64]");
     if (config.maximumIterations < 1)
@@ -472,24 +485,51 @@ FiberCellAnchorResult fitFiberCellAnchors(
         ? bestFit.objectiveNumerator / denominator.sum
         : 0.0;
 
-    for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
+    const std::array<PrincipalAxis, 2> fittedComponents{
+        principalAxis(weightedTensor(observations, &bestFit.assignments, 0)),
+        principalAxis(weightedTensor(observations, &bestFit.assignments, 1)),
+    };
+    bool mergeComponents = false;
+    if (denominator.sum > 0.0 && global.unique &&
+        fittedComponents[0].unique && fittedComponents[1].unique) {
+        const double splitObjective =
+            (fittedComponents[0].largestEigenvalue +
+             fittedComponents[1].largestEigenvalue) / denominator.sum;
+        const double jointObjective = global.largestEigenvalue / denominator.sum;
+        const double objectiveLoss = std::max(0.0, splitObjective - jointObjective);
+        const double allowedObjectiveLoss = std::max(
+            config.mergeMaximumAbsoluteObjectiveLoss,
+            config.mergeMaximumRelativeObjectiveLoss * jointObjective);
+        const double axialDot = std::clamp(
+            std::abs(fittedComponents[0].axis.dot(fittedComponents[1].axis)),
+            0.0,
+            1.0);
+        const double angleDegrees =
+            std::acos(axialDot) * 180.0 / std::acos(-1.0);
+        mergeComponents =
+            angleDegrees <= config.mergeMaximumAngleDegrees &&
+            objectiveLoss <= allowedObjectiveLoss;
+        result.mergeEvaluation = FiberAnchorMergeEvaluation{
+            angleDegrees,
+            jointObjective,
+            splitObjective,
+            objectiveLoss,
+            allowedObjectiveLoss,
+            mergeComponents,
+        };
+    }
+
+    const auto populateComponent = [&result, &observations, &config, &denominator](
+                                       uint8_t componentIndex,
+                                       const cv::Vec3d& axis,
+                                       const std::vector<uint8_t>* assignments) {
         auto& component = result.components[componentIndex];
-        const PrincipalAxis fitted = principalAxis(
-            weightedTensor(observations, &bestFit.assignments, componentIndex));
-        if (!fitted.unique) {
-            component.rejectionReason = std::any_of(
-                bestFit.assignments.begin(), bestFit.assignments.end(),
-                [componentIndex](uint8_t assigned) {
-                    return assigned == componentIndex;
-                }) ? "degenerate" : "empty";
-            continue;
-        }
-        component.anchor.axisXYZ = canonicalAxis(fitted.axis);
+        component.anchor.axisXYZ = canonicalAxis(axis);
         CompensatedSum aligned;
         CompensatedSum presenceMass;
         std::array<CompensatedSum, 3> position;
         for (size_t index = 0; index < observations.size(); ++index) {
-            if (bestFit.assignments[index] != componentIndex)
+            if (assignments != nullptr && (*assignments)[index] != componentIndex)
                 continue;
             ++component.assignedObservationCount;
             const auto& observation = observations[index];
@@ -502,7 +542,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
         }
         if (component.assignedObservationCount == 0 || !(aligned.sum > 0.0)) {
             component.rejectionReason = "empty";
-            continue;
+            return;
         }
         component.anchor.alignedSupport = aligned.sum / denominator.sum;
         component.anchor.directionalCoherence = aligned.sum / presenceMass.sum;
@@ -513,10 +553,30 @@ FiberCellAnchorResult fitFiberCellAnchors(
         };
         if (component.anchor.alignedSupport < config.minimumAlignedSupport) {
             component.rejectionReason = "below_support";
-            continue;
+            return;
         }
         component.retained = true;
         ++result.retainedAnchorCount;
+    };
+
+    if (mergeComponents) {
+        result.objective = result.mergeEvaluation->jointObjective;
+        populateComponent(0, global.axis, nullptr);
+        result.components[1].rejectionReason = "merged_same_direction";
+    } else {
+        for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
+            const auto& fitted = fittedComponents[componentIndex];
+            if (!fitted.unique) {
+                result.components[componentIndex].rejectionReason = std::any_of(
+                    bestFit.assignments.begin(), bestFit.assignments.end(),
+                    [componentIndex](uint8_t assigned) {
+                        return assigned == componentIndex;
+                    }) ? "degenerate" : "empty";
+                continue;
+            }
+            populateComponent(
+                componentIndex, fitted.axis, &bestFit.assignments);
+        }
     }
     if (componentLess(result.components[1], result.components[0]))
         std::swap(result.components[0], result.components[1]);
@@ -636,6 +696,8 @@ FiberAnchorExtractionReport extractFiberAnchors(
                         ++report.diagnostics.degenerateComponents;
                     else if (component.rejectionReason == "below_support")
                         ++report.diagnostics.belowSupportComponents;
+                    else if (component.rejectionReason == "merged_same_direction")
+                        ++report.diagnostics.mergedComponentPairs;
                 }
                 if (cell.retainedAnchorCount > 0)
                     report.nonEmptyCells.push_back(std::move(cell));
@@ -686,6 +748,9 @@ nlohmann::json fiberAnchorReportJson(
             {"gaussian_sigma_prediction_voxels", report.config.gaussianSigmaPredictionVoxels},
             {"observation_presence_floor", report.config.observationPresenceFloor},
             {"minimum_aligned_support", report.config.minimumAlignedSupport},
+            {"merge_maximum_angle_degrees", report.config.mergeMaximumAngleDegrees},
+            {"merge_maximum_absolute_objective_loss", report.config.mergeMaximumAbsoluteObjectiveLoss},
+            {"merge_maximum_relative_objective_loss", report.config.mergeMaximumRelativeObjectiveLoss},
             {"maximum_seed_count", report.config.maximumSeedCount},
             {"maximum_iterations", report.config.maximumIterations},
             {"convergence_tolerance", report.config.convergenceTolerance},
@@ -698,6 +763,7 @@ nlohmann::json fiberAnchorReportJson(
             {"empty_components", report.diagnostics.emptyComponents},
             {"degenerate_components", report.diagnostics.degenerateComponents},
             {"below_support_components", report.diagnostics.belowSupportComponents},
+            {"merged_component_pairs", report.diagnostics.mergedComponentPairs},
         }},
         {"cells", nlohmann::json::array()},
     };
@@ -710,6 +776,17 @@ nlohmann::json fiberAnchorReportJson(
             {"objective", cell.objective},
             {"components", nlohmann::json::array()},
         };
+        if (cell.mergeEvaluation.has_value()) {
+            const auto& merge = *cell.mergeEvaluation;
+            cellJson["merge_evaluation"] = {
+                {"angle_degrees", merge.angleDegrees},
+                {"joint_objective", merge.jointObjective},
+                {"split_objective", merge.splitObjective},
+                {"objective_loss", merge.objectiveLoss},
+                {"allowed_objective_loss", merge.allowedObjectiveLoss},
+                {"merged", merge.merged},
+            };
+        }
         for (const auto& component : cell.components) {
             nlohmann::json componentJson = {
                 {"retained", component.retained},
@@ -736,9 +813,13 @@ nlohmann::json fiberAnchorReportJson(
     return root;
 }
 
-std::string fiberAnchorReportObj(
+namespace
+{
+
+std::string fiberAnchorReportObjForComponent(
     const FiberAnchorExtractionReport& report,
-    const FiberAnchorArtifactInfo& artifact)
+    const FiberAnchorArtifactInfo& artifact,
+    std::optional<size_t> selectedComponent)
 {
     if (!(artifact.glyphLengthBaseVoxels > 0.0) ||
         !std::isfinite(artifact.glyphLengthBaseVoxels)) {
@@ -749,8 +830,13 @@ std::string fiberAnchorReportObj(
     output << "# vc_fiberlet_anchors version 1\n";
     size_t vertex = 1;
     for (const auto& cell : report.nonEmptyCells) {
-        size_t anchorIndex = 0;
-        for (const auto& component : cell.components) {
+        for (size_t componentIndex = 0;
+             componentIndex < cell.components.size(); ++componentIndex) {
+            if (selectedComponent.has_value() &&
+                *selectedComponent != componentIndex) {
+                continue;
+            }
+            const auto& component = cell.components[componentIndex];
             if (!component.retained)
                 continue;
             const auto& anchor = component.anchor;
@@ -761,7 +847,7 @@ std::string fiberAnchorReportObj(
             const cv::Vec3d first = center - half;
             const cv::Vec3d second = center + half;
             output << "g cell_" << cell.cellZYX[0] << '_' << cell.cellZYX[1]
-                   << '_' << cell.cellZYX[2] << "_anchor_" << anchorIndex++ << '\n';
+                   << '_' << cell.cellZYX[2] << "_anchor_" << componentIndex << '\n';
             output << "v " << first[0] << ' ' << first[1] << ' ' << first[2] << '\n';
             output << "v " << second[0] << ' ' << second[1] << ' ' << second[2] << '\n';
             output << "l " << vertex << ' ' << vertex + 1 << '\n';
@@ -769,6 +855,15 @@ std::string fiberAnchorReportObj(
         }
     }
     return output.str();
+}
+
+}  // namespace
+
+std::string fiberAnchorReportObj(
+    const FiberAnchorExtractionReport& report,
+    const FiberAnchorArtifactInfo& artifact)
+{
+    return fiberAnchorReportObjForComponent(report, artifact, std::nullopt);
 }
 
 void writeFiberAnchorArtifacts(
@@ -785,6 +880,12 @@ void writeFiberAnchorArtifacts(
     vc::core::util::atomicWriteString(
         outputDirectory / "anchors.obj",
         fiberAnchorReportObj(report, artifact));
+    vc::core::util::atomicWriteString(
+        outputDirectory / "anchors_0.obj",
+        fiberAnchorReportObjForComponent(report, artifact, 0));
+    vc::core::util::atomicWriteString(
+        outputDirectory / "anchors_1.obj",
+        fiberAnchorReportObjForComponent(report, artifact, 1));
 }
 
 } // namespace vc::fiber_tracer

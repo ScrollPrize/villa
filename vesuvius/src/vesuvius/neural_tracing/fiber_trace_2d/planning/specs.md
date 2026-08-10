@@ -2522,6 +2522,16 @@
   centroid. Empty, degenerate, and below-threshold components are discarded
   independently without reassigning or refitting a survivor. A cell emits
   zero, one, or two anchors.
+- When both fitted components and their joint PCA are unique, near-duplicate
+  components are evaluated before support rejection. Let `O2` be the sum of
+  the two fixed-assignment principal eigenvalues divided by `sum_cell g_i` and
+  `O1` the joint principal eigenvalue over the same denominator. The components
+  merge when `acos(abs(u0 dot u1)) <= 10 degrees` and
+  `max(0, O2-O1) <= max(0.01, 0.05 O1)` by default. All comparisons are
+  inclusive and all three limits are configurable. A merge rebuilds axis,
+  position, support, coherence, and assigned count from every usable
+  observation, then applies the ordinary minimum-support test. Exact collapse
+  that already leaves the second component empty is not a merge.
 - Reductions, seeds, assignment ties, convergence, component ordering, and
   serialization sign are deterministic. Parallel work cannot change a
   within-cell reduction. Machine output and OBJ store spatial positions only in
@@ -2530,7 +2540,12 @@
   timing and worker count are not scientific output, so
   artifacts remain byte-identical across worker counts.
 - The anchor command itself does not connect anchors. Its strict version-1
-  JSON is the authoritative input to the separate integer-DP path stage.
+  JSON is the authoritative input to the separate integer-DP path stage. It
+  requires the merge parameters, aggregate merge count, and auditable per-cell
+  merge evaluations where applicable; older experimental artifacts must be
+  regenerated. `anchors.obj` contains all retained anchors, while
+  `anchors_0.obj` and `anchors_1.obj` contain deterministic post-sort
+  per-cell component slots. These slots are not global H/V classes.
 
 # Integer-DP fiberlet paths
 
@@ -2548,6 +2563,27 @@
   order. Both unoriented endpoint axes must align to the chord within the
   configured bound, initially 45 degrees. This stage does not impose degree,
   mutual-best, overlap, or global graph constraints.
+- Candidate generation completes before scoring. The inclusive prediction-grid
+  bounds of every searchable Hermite corridor and every eligible virtual
+  endpoint attachment are clipped to the grid and unioned. The current
+  small-crop implementation samples the complete rectangular enclosing ZYX box
+  exactly once into an immutable dense volume of unmodified
+  `FiberStoredPredictionSample` values and `cv::Vec3d` Lasagna normal
+  vector/validity. Candidate DP performs only checked dense lookups; it cannot
+  trigger prediction decoding, normal interpolation, or nested sample workers.
+- Searchable candidate indices are assigned to a fixed pool of at most the
+  configured thread count. Each task writes only its preallocated canonical
+  result slot. Workers continue after independent exceptions and the
+  lowest-candidate-index exception is rethrown after joining. A deterministic
+  serial pass derives aggregate success/failure diagnostics. Worker count and
+  phase timings are operational output and remain absent from artifacts.
+- An optional core progress callback observes attempted search completions under
+  a serialization mutex, suppresses stale concurrent counts, and is rate-limited
+  to approximately one update per second. Search elapsed time begins after
+  preload. The coordinator emits the sole terminal update after all workers
+  join and before deterministic error propagation. `vc_fiberlets` writes
+  completed/total, percentage, elapsed time, rate, and ETA to stderr; zero
+  searches are `0/0`, 100 percent, zero rate, and zero ETA.
 - Searchable states are integer voxels of the stored prediction grid. Exact
   fitted anchors remain virtual endpoints and connect to every in-bounds
   integer voxel within `sqrt(3)` prediction voxels whose nonzero edge advances
@@ -2597,6 +2633,20 @@
   accepted and the two ranges match.
 - OBJ output uses one group per accepted fiberlet and one explicit two-index
   line element per adjacent path edge for compatibility with MeshLab importers.
+- By default, `paths` writes separate `fiber_presence_{xy,xz,yz}` OBJ/MTL/PNG
+  bundles. Each OBJ is one base-coordinate textured quad on the lower central
+  prediction voxel of the whole-cell-expanded selected region and can be loaded
+  independently. Quad bounds extend half a stored prediction voxel beyond the
+  first and last sample centers on each varying axis. Four UVs map the
+  minimum/minimum corner to `(0,1)`, maximum/minimum to `(1,1)`,
+  maximum/maximum to `(1,0)`, and minimum/maximum to `(0,0)`.
+- Each grayscale PNG samples the canonical stored presence channel directly,
+  one pixel per prediction voxel, with `round(255*clamp(p,0,1))`; missing
+  presence is black and direction validity is irrelevant. Total texture pixels
+  are overflow-checked and capped at one million. Per-file replacement is
+  atomic and each OBJ is published after its PNG and MTL, but the nine-file
+  collection is not transactionally atomic. `--no-slices` skips sampling and
+  removes all bundles without changing path or JSON results.
 - Continuous/sub-voxel search, learned path-quality rejection, overlap
   deduplication, extension, global graph construction, H/V and winding labels,
   CUDA batching, and production radius selection remain out of scope.

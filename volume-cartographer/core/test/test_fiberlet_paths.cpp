@@ -4,10 +4,15 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <random>
 #include <set>
 #include <string>
@@ -29,6 +34,32 @@ public:
 private:
     cv::Vec3d normal_;
     bool valid_;
+};
+
+class CountingNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0.0, 0.0, 1.0}, true, {}}; }
+
+    vc::lasagna::NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& points, bool withDerivative, int parallelThreads, std::vector<vc::lasagna::NormalSampleWithDerivative>& samples) const override
+    {
+        ++batchCalls;
+        requestedThreads = parallelThreads;
+        sampledPoints = points;
+        samples.assign(
+            points.size(),
+            {
+                {{0.0, 0.0, 1.0}, true, {}},
+                cv::Matx33d::zeros(),
+                withDerivative,
+            });
+        return {};
+    }
+
+    mutable std::atomic<size_t> batchCalls{0};
+    mutable int requestedThreads = 0;
+    mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
 vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
@@ -70,6 +101,22 @@ vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
     return artifact;
 }
 
+vc::fiber_tracer::LoadedFiberAnchorArtifact twoPathArtifact()
+{
+    auto artifact = twoAnchorArtifact();
+    const size_t originalCount = artifact.report.nonEmptyCells.size();
+    for (size_t index = 0; index < originalCount; ++index) {
+        auto cell = artifact.report.nonEmptyCells[index];
+        cell.cellZYX[1] += 4;
+        cell.components[0].anchor.cellZYX = cell.cellZYX;
+        cell.components[0].anchor.positionPredictionXYZ[1] += 8.0;
+        artifact.report.nonEmptyCells.push_back(std::move(cell));
+    }
+    artifact.report.diagnostics.totalCells = 4;
+    artifact.report.diagnostics.oneAnchorCells = 4;
+    return artifact;
+}
+
 vc::fiber_tracer::FiberletPathConfig pathConfig()
 {
     vc::fiber_tracer::FiberletPathConfig config;
@@ -86,6 +133,20 @@ std::filesystem::path temporaryPath(const std::string& tag)
 {
     std::mt19937_64 generator(std::random_device{}());
     return std::filesystem::temp_directory_path() / ("vc_fiberlet_paths_" + tag + "_" + std::to_string(generator()) + ".json");
+}
+
+std::filesystem::path temporaryDirectory(const std::string& tag)
+{
+    auto path = temporaryPath(tag);
+    path.replace_extension();
+    std::filesystem::create_directories(path);
+    return path;
+}
+
+std::string readText(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 size_t occurrenceCount(const std::string& text, const std::string& needle)
@@ -148,7 +209,11 @@ TEST_CASE("fiberlet DP emits exact endpoints and integer monotone interior")
 {
     const auto anchors = twoAnchorArtifact();
     const ConstantNormalSampler normals;
-    const auto report = vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, pathConfig(), constantPredictions(), normals);
+    std::vector<vc::fiber_tracer::FiberletPathProgress> progress;
+    const auto report =
+        vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, pathConfig(), constantPredictions(), normals, [&](const auto& update) {
+            progress.push_back(update);
+        });
     REQUIRE(report.diagnostics.generatedPairs == 1);
     REQUIRE_MESSAGE(report.diagnostics.successfulPaths == 1, report.candidates[0].reason);
     const auto& path = report.candidates[0];
@@ -163,19 +228,118 @@ TEST_CASE("fiberlet DP emits exact endpoints and integer monotone interior")
         CHECK(point[0] > path.pointsPredictionXYZ[index - 1][0]);
     }
     CHECK(path.cost.direction == doctest::Approx(0.0).epsilon(1.0e-10));
+    REQUIRE(progress.size() == 1);
+    CHECK(progress.back().completed == 1);
+    CHECK(progress.back().total == 1);
+    CHECK(progress.back().elapsedSeconds >= 0.0);
+}
+
+TEST_CASE("fiberlet DP preloads each scoring voxel once")
+{
+    const auto anchors = twoAnchorArtifact();
+    auto options = pathConfig();
+    options.parallelThreads = 4;
+    size_t predictionCalls = 0;
+    int predictionThreads = 0;
+    std::vector<std::array<size_t, 3>> sampledIndices;
+    const auto predictions = [&](const auto& indices, int threads, auto& samples) {
+        ++predictionCalls;
+        predictionThreads = threads;
+        sampledIndices = indices;
+        samples.assign(indices.size(), {{1.0, 0.0, 0.0}, 1.0, true});
+    };
+    const CountingNormalSampler normals;
+    const auto report = vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, options, predictions, normals);
+    REQUIRE(report.diagnostics.successfulPaths == 1);
+    CHECK(predictionCalls == 1);
+    CHECK(predictionThreads == 4);
+    CHECK(normals.batchCalls.load() == 1);
+    CHECK(normals.requestedThreads == 4);
+    REQUIRE(sampledIndices.size() == report.preloadedVoxels);
+    REQUIRE(normals.sampledPoints.size() == sampledIndices.size());
+    const std::set<std::array<size_t, 3>> unique(sampledIndices.begin(), sampledIndices.end());
+    CHECK(unique.size() == sampledIndices.size());
+    for (size_t index = 0; index < sampledIndices.size(); ++index) {
+        const auto& zyx = sampledIndices[index];
+        CHECK(zyx[0] < anchors.report.grid.shapeZYX[0]);
+        CHECK(zyx[1] < anchors.report.grid.shapeZYX[1]);
+        CHECK(zyx[2] < anchors.report.grid.shapeZYX[2]);
+        CHECK(normals.sampledPoints[index] == cv::Vec3d{static_cast<double>(zyx[2]), static_cast<double>(zyx[1]), static_cast<double>(zyx[0])});
+    }
+}
+
+TEST_CASE("fiberlet candidate workers preserve deterministic results")
+{
+    const auto anchors = twoPathArtifact();
+    const ConstantNormalSampler normals;
+    auto serialConfig = pathConfig();
+    serialConfig.parallelThreads = 1;
+    auto parallelConfig = serialConfig;
+    parallelConfig.parallelThreads = 8;
+    std::vector<vc::fiber_tracer::FiberletPathProgress> progress;
+    const auto serial = vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, serialConfig, constantPredictions(), normals);
+    const auto parallel =
+        vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, parallelConfig, constantPredictions(), normals, [&](const auto& update) {
+            progress.push_back(update);
+        });
+    REQUIRE(serial.diagnostics.searchedPairs == 2);
+    REQUIRE(parallel.diagnostics.searchedPairs == 2);
+    CHECK(serial.candidateWorkers == 1);
+    CHECK(parallel.candidateWorkers == 2);
+    REQUIRE_FALSE(progress.empty());
+    for (size_t index = 1; index < progress.size(); ++index)
+        CHECK(progress[index - 1].completed < progress[index].completed);
+    CHECK(progress.back().completed == 2);
+    CHECK(progress.back().total == 2);
+    vc::fiber_tracer::FiberletArtifactInfo artifact;
+    artifact.fiberManifestLocator = "/tmp/fiber.lasagna.json";
+    artifact.fiberManifestContentHash = "fnv1a64:1111111111111111";
+    artifact.normalManifestLocator = "/tmp/normal.lasagna.json";
+    artifact.normalManifestContentHash = "fnv1a64:2222222222222222";
+    artifact.anchorArtifactLocator = "/tmp/anchors.json";
+    artifact.anchorArtifactContentHash = "fnv1a64:3333333333333333";
+    CHECK(vc::fiber_tracer::fiberletPathReportJson(serial, artifact).dump() == vc::fiber_tracer::fiberletPathReportJson(parallel, artifact).dump());
 }
 
 TEST_CASE("fiberlet pairing rejects an incompatible unoriented endpoint axis")
 {
     const auto anchors = twoAnchorArtifact({1.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
-    const ConstantNormalSampler normals;
+    const CountingNormalSampler normals;
     bool sampled = false;
-    const auto report =
-        vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, pathConfig(), [&](const auto&, int, auto&) { sampled = true; }, normals);
+    std::vector<vc::fiber_tracer::FiberletPathProgress> progress;
+    const auto report = vc::fiber_tracer::traceFiberletPaths(
+        anchors,
+        anchors.report.grid,
+        pathConfig(),
+        [&](const auto&, int, auto&) { sampled = true; },
+        normals,
+        [&](const auto& update) { progress.push_back(update); });
     CHECK(report.diagnostics.axisRejectedPairs == 1);
     CHECK(report.diagnostics.searchedPairs == 0);
     CHECK_FALSE(sampled);
+    CHECK(normals.batchCalls.load() == 0);
+    CHECK(report.preloadedVoxels == 0);
+    CHECK(report.candidateWorkers == 0);
     CHECK(report.candidates[0].reason == "axis_mismatch");
+    REQUIRE(progress.size() == 1);
+    CHECK(progress.back().completed == 0);
+    CHECK(progress.back().total == 0);
+}
+
+TEST_CASE("fiberlet progress callback failures are rethrown after search")
+{
+    const auto anchors = twoAnchorArtifact();
+    const ConstantNormalSampler normals;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::traceFiberletPaths(
+            anchors,
+            anchors.report.grid,
+            pathConfig(),
+            constantPredictions(),
+            normals,
+            [](const auto&) { throw std::runtime_error("progress failed"); }),
+        doctest::Contains("progress failed"),
+        std::runtime_error);
 }
 
 TEST_CASE("fiberlet invalid prediction slabs remain finite bridge costs")
@@ -276,6 +440,128 @@ TEST_CASE("fiberlet statistics separate unscored scored and accepted candidates"
     CHECK_FALSE(empty.allScores.maximum.has_value());
 }
 
+TEST_CASE("fiber presence slices sample deterministic central planes in base coordinates")
+{
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{6, 5, 4}, 2.0};
+    const vc::fiber_tracer::FiberAnchorCrop crop{{1, 1, 1}, {3, 4, 5}};
+    const auto report = vc::fiber_tracer::sampleFiberPresenceSlices(
+        crop,
+        grid,
+        [](const auto& indices, int, auto& samples) {
+            samples.clear();
+            for (const auto& index : indices) {
+                if (index == std::array<size_t, 3>{3, 2, 2}) {
+                    samples.push_back({std::numeric_limits<double>::quiet_NaN(), false});
+                } else {
+                    const size_t encoded = index[0] * 25 + index[1] * 5 + index[2];
+                    samples.push_back({static_cast<double>(encoded) / 255.0, true});
+                }
+            }
+        },
+        3);
+    REQUIRE(report.planes.size() == 3);
+    CHECK(report.planes[0].name == "xy");
+    CHECK(report.planes[1].name == "xz");
+    CHECK(report.planes[2].name == "yz");
+    CHECK(report.planes[0].varyingAxesXYZ == std::array<size_t, 2>{0, 1});
+    CHECK(report.planes[1].varyingAxesXYZ == std::array<size_t, 2>{0, 2});
+    CHECK(report.planes[2].varyingAxesXYZ == std::array<size_t, 2>{1, 2});
+    CHECK(report.planes[0].width == 3);
+    CHECK(report.planes[0].height == 4);
+    CHECK(report.planes[1].width == 3);
+    CHECK(report.planes[1].height == 5);
+    CHECK(report.planes[2].width == 4);
+    CHECK(report.planes[2].height == 5);
+    CHECK(report.pixelCount() == 47);
+    CHECK(report.planes[0].pixels.front().indexZYX == std::array<size_t, 3>{3, 1, 1});
+    CHECK(report.planes[0].pixels[4].presence == 0.0);
+
+    const auto directory = temporaryDirectory("presence_slices");
+    {
+        std::ofstream stale(directory / "fiber_presence_slices.obj");
+        stale << "obsolete point cloud\n";
+    }
+    vc::fiber_tracer::writeFiberPresenceSliceArtifacts(directory, report, grid);
+    CHECK_FALSE(std::filesystem::exists(directory / "fiber_presence_slices.obj"));
+    for (const std::string plane : {"xy", "xz", "yz"}) {
+        const std::string stem = "fiber_presence_" + plane;
+        CHECK(std::filesystem::exists(directory / (stem + ".obj")));
+        CHECK(std::filesystem::exists(directory / (stem + ".mtl")));
+        CHECK(std::filesystem::exists(directory / (stem + ".png")));
+        const std::string obj = readText(directory / (stem + ".obj"));
+        CHECK(obj.find("mtllib " + stem + ".mtl") != std::string::npos);
+        CHECK(obj.find("o " + stem) != std::string::npos);
+        CHECK(occurrenceCount(obj, "\nv ") == 4);
+        CHECK(occurrenceCount(obj, "\nvt ") == 4);
+        CHECK(obj.find("f 1/1 2/2 3/3 4/4") != std::string::npos);
+        const std::string mtl = readText(directory / (stem + ".mtl"));
+        CHECK(mtl.find("map_Kd " + stem + ".png") != std::string::npos);
+    }
+    const std::string xyObj = readText(directory / "fiber_presence_xy.obj");
+    CHECK(xyObj.find("v 1 1 6") != std::string::npos);
+    CHECK(xyObj.find("v 7 1 6") != std::string::npos);
+    CHECK(xyObj.find("v 7 9 6") != std::string::npos);
+    CHECK(xyObj.find("v 1 9 6") != std::string::npos);
+    CHECK(xyObj.find("vt 0 1\nvt 1 1\nvt 1 0\nvt 0 0") != std::string::npos);
+
+    const cv::Mat xy = cv::imread((directory / "fiber_presence_xy.png").string(), cv::IMREAD_GRAYSCALE);
+    const cv::Mat xz = cv::imread((directory / "fiber_presence_xz.png").string(), cv::IMREAD_GRAYSCALE);
+    const cv::Mat yz = cv::imread((directory / "fiber_presence_yz.png").string(), cv::IMREAD_GRAYSCALE);
+    REQUIRE(xy.rows == 4);
+    REQUIRE(xy.cols == 3);
+    CHECK(xy.at<uint8_t>(0, 0) == 81);
+    CHECK(xy.at<uint8_t>(0, 2) == 83);
+    CHECK(xy.at<uint8_t>(3, 0) == 96);
+    CHECK(xy.at<uint8_t>(3, 2) == 98);
+    REQUIRE(xz.rows == 5);
+    REQUIRE(xz.cols == 3);
+    CHECK(xz.at<uint8_t>(0, 0) == 36);
+    CHECK(xz.at<uint8_t>(0, 2) == 38);
+    CHECK(xz.at<uint8_t>(4, 0) == 136);
+    CHECK(xz.at<uint8_t>(4, 2) == 138);
+    REQUIRE(yz.rows == 5);
+    REQUIRE(yz.cols == 4);
+    CHECK(yz.at<uint8_t>(0, 0) == 32);
+    CHECK(yz.at<uint8_t>(0, 3) == 47);
+    CHECK(yz.at<uint8_t>(4, 0) == 132);
+    CHECK(yz.at<uint8_t>(4, 3) == 147);
+
+    {
+        std::ofstream stale(directory / "fiber_presence_slices.obj");
+        stale << "obsolete point cloud\n";
+    }
+    vc::fiber_tracer::removeFiberPresenceSliceArtifacts(directory);
+    CHECK_FALSE(std::filesystem::exists(directory / "fiber_presence_slices.obj"));
+    for (const std::string plane : {"xy", "xz", "yz"}) {
+        const std::string stem = "fiber_presence_" + plane;
+        CHECK_FALSE(std::filesystem::exists(directory / (stem + ".obj")));
+        CHECK_FALSE(std::filesystem::exists(directory / (stem + ".mtl")));
+        CHECK_FALSE(std::filesystem::exists(directory / (stem + ".png")));
+    }
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("fiber presence slices reject unsafe output size before sampling")
+{
+    bool sampled = false;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::sampleFiberPresenceSlices(
+            {{0, 0, 0}, {1000, 1000, 1}}, {{1, 1000, 1000}, 1.0}, [&](const auto&, int, auto&) { sampled = true; }, 1),
+        doctest::Contains("--no-slices"),
+        std::invalid_argument);
+    CHECK_FALSE(sampled);
+}
+
+TEST_CASE("fiber presence slice crop covers complete selected anchor cells")
+{
+    auto anchors = twoAnchorArtifact();
+    anchors.report.selectedCellBeginZYX = {1, 2, 3};
+    anchors.report.selectedCellEndZYX = {4, 6, 7};
+    const auto crop = vc::fiber_tracer::fiberAnchorCellCoverageCrop(anchors);
+    CHECK(crop.originXYZ == std::array<size_t, 3>{6, 4, 2});
+    CHECK(crop.sizeXYZ == std::array<size_t, 3>{8, 8, 6});
+}
+
 TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
 {
     const auto anchors = twoAnchorArtifact();
@@ -297,6 +583,22 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
         output << oldCoordinates.dump(2);
     }
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("coordinate contract is unsupported"), std::runtime_error);
+
+    auto missingMergeParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingMergeParameter["parameters"].erase("merge_maximum_angle_degrees");
+    {
+        std::ofstream output(path);
+        output << missingMergeParameter.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto missingMergeDiagnostic = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingMergeDiagnostic["diagnostics"].erase("merged_component_pairs");
+    {
+        std::ofstream output(path);
+        output << missingMergeDiagnostic.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
     auto json = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     json["version"] = 2;

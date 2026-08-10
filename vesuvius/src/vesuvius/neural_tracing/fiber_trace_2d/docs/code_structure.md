@@ -2513,6 +2513,21 @@ enumerates fixed-radius cell-shell pairs, and solves integer prediction-voxel
 paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
 smoothness equations shared by the native greedy tracer and fiberlet DP.
 
+`FiberPaths.cpp` first generates all candidates in canonical order. It unions
+their clipped Hermite-corridor and virtual-attachment bounds into one enclosing
+ZYX box, then batch-loads an immutable dense scoring volume containing exact
+fiber predictions and Lasagna normal vector/validity. A fixed worker pool solves
+candidate indices concurrently and writes results only to the corresponding
+preallocated slots. Sampling completes before workers start, so DP has no
+nested decoder or normal-sampler parallelism; a final serial pass derives
+diagnostics and preserves deterministic artifact order.
+
+Completed tasks update an atomic counter. A separately locked, rate-limited
+progress callback suppresses stale concurrent observations; the coordinator
+emits the terminal update after joining workers and before rethrowing a task or
+callback exception. `vc_fiberlets` formats this callback on stderr with rate
+and ETA, while the core remains independent of console output.
+
 `volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors` and `paths`.
 The latter requires the matching fiber manifest plus a separate regular
 Lasagna normal manifest and writes machine-readable `fiberlets.json` together

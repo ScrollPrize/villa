@@ -4475,6 +4475,73 @@ public:
         return canonicalGridInfo_;
     }
 
+    [[nodiscard]] static cv::Vec3d storedGridPoint(
+        const Option& option,
+        const std::array<size_t, 3>& zyx)
+    {
+        if (zyx[0] >= option.presence.shapeZYX[0] ||
+            zyx[1] >= option.presence.shapeZYX[1] ||
+            zyx[2] >= option.presence.shapeZYX[2]) {
+            throw std::out_of_range("fiber stored-grid sample index is outside the prediction volume");
+        }
+        return {
+            static_cast<double>(zyx[2]) * option.presence.spacing,
+            static_cast<double>(zyx[1]) * option.presence.spacing,
+            static_cast<double>(zyx[0]) * option.presence.spacing,
+        };
+    }
+
+    template <typename ResolverFactory, typename SampleOne>
+    static void sampleStoredIndices(
+        size_t count,
+        int parallelThreads,
+        ResolverFactory&& resolverFactory,
+        SampleOne&& sampleOne)
+    {
+        const int workers = std::clamp(
+            parallelThreads > 0 ? parallelThreads : 1,
+            1,
+            static_cast<int>(std::min<size_t>(
+                std::max<size_t>(1, count),
+                static_cast<size_t>(std::numeric_limits<int>::max()))));
+        if (count > static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max()))
+            throw std::length_error("fiber stored-grid sample batch is too large");
+#ifdef _OPENMP
+        if (workers > 1) {
+            std::exception_ptr firstError;
+            std::atomic<bool> failed{false};
+            const auto signedCount = static_cast<std::ptrdiff_t>(count);
+#pragma omp parallel num_threads(workers)
+            {
+                auto resolvers = resolverFactory();
+#pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < signedCount; ++rawIndex) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        sampleOne(static_cast<size_t>(rawIndex), resolvers);
+                    } catch (...) {
+                        bool expected = false;
+                        if (failed.compare_exchange_strong(expected, true)) {
+#pragma omp critical(fiber_stored_grid_error)
+                            {
+                                if (!firstError)
+                                    firstError = std::current_exception();
+                            }
+                        }
+                    }
+                }
+            }
+            if (firstError)
+                std::rethrow_exception(firstError);
+            return;
+        }
+#endif
+        auto resolvers = resolverFactory();
+        for (size_t index = 0; index < count; ++index)
+            sampleOne(index, resolvers);
+    }
+
     void sampleStoredGridBatch(
         const std::vector<std::array<size_t, 3>>& indicesZYX,
         int parallelThreads,
@@ -4483,37 +4550,17 @@ public:
         (void)storedGridInfo();
         const auto& option = options_[*canonicalOptionIndex_];
         samples.assign(indicesZYX.size(), {});
-        const int workers = std::clamp(
-            parallelThreads > 0 ? parallelThreads : 1,
-            1,
-            static_cast<int>(std::max<size_t>(1, indicesZYX.size())));
-        const auto sampleOne = [&](
-            size_t index,
-            vc::lasagna::LasagnaLocalChunkResolver& presenceResolver,
-            vc::lasagna::LasagnaLocalChunkResolver& nxResolver,
-            vc::lasagna::LasagnaLocalChunkResolver& nyResolver) {
+        const auto sampleOne = [&](size_t index, auto& resolvers) {
             const auto& zyx = indicesZYX[index];
-            if (zyx[0] >= option.presence.shapeZYX[0] ||
-                zyx[1] >= option.presence.shapeZYX[1] ||
-                zyx[2] >= option.presence.shapeZYX[2]) {
-                throw std::out_of_range("fiber stored-grid sample index is outside the prediction volume");
-            }
-            const cv::Vec3d point{
-                static_cast<double>(zyx[2]) * option.presence.spacing,
-                static_cast<double>(zyx[1]) * option.presence.spacing,
-                static_cast<double>(zyx[0]) * option.presence.spacing,
-            };
-            auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(
-                option.presence, point);
+            const cv::Vec3d point = storedGridPoint(option, zyx);
+            auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(option.presence, point);
             auto nxRequest = vc::lasagna::prepareLasagnaCubeRequest(option.nx, point);
             auto nyRequest = vc::lasagna::prepareLasagnaCubeRequest(option.ny, point);
-            presenceResolver.resolve(presenceRequest);
-            nxResolver.resolve(nxRequest);
-            nyResolver.resolve(nyRequest);
-            const auto rawPresence =
-                vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
-            const auto direction = vc::lasagna::sampleLasagnaCompactAxisTensor(
-                option.nx, option.ny, nxRequest, nyRequest);
+            resolvers[0].resolve(presenceRequest);
+            resolvers[1].resolve(nxRequest);
+            resolvers[2].resolve(nyRequest);
+            const auto rawPresence = vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
+            const auto direction = vc::lasagna::sampleLasagnaCompactAxisTensor(option.nx, option.ny, nxRequest, nyRequest);
             if (!rawPresence.has_value() || !direction.has_value())
                 return;
             const double norm2 = direction->dot(*direction);
@@ -4532,42 +4579,29 @@ public:
                 vc::lasagna::LasagnaLocalChunkResolver(option.ny, *cache_),
             };
         };
-#ifdef _OPENMP
-        if (workers > 1) {
-            std::exception_ptr firstError;
-            std::atomic<bool> failed{false};
-            const auto count = static_cast<std::ptrdiff_t>(indicesZYX.size());
-            #pragma omp parallel num_threads(workers)
-            {
-                auto resolvers = makeResolvers();
-                #pragma omp for schedule(static)
-                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
-                    if (failed.load(std::memory_order_relaxed))
-                        continue;
-                    try {
-                        sampleOne(
-                            static_cast<size_t>(rawIndex),
-                            resolvers[0], resolvers[1], resolvers[2]);
-                    } catch (...) {
-                        bool expected = false;
-                        if (failed.compare_exchange_strong(expected, true)) {
-                            #pragma omp critical(fiber_stored_grid_error)
-                            {
-                                if (!firstError)
-                                    firstError = std::current_exception();
-                            }
-                        }
-                    }
-                }
-            }
-            if (firstError)
-                std::rethrow_exception(firstError);
-            return;
-        }
-#endif
-        auto resolvers = makeResolvers();
-        for (size_t index = 0; index < indicesZYX.size(); ++index)
-            sampleOne(index, resolvers[0], resolvers[1], resolvers[2]);
+        sampleStoredIndices(indicesZYX.size(), parallelThreads, makeResolvers, sampleOne);
+    }
+
+    void sampleStoredPresenceBatch(
+        const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads,
+        std::vector<FiberStoredPresenceSample>& samples) const
+    {
+        (void)storedGridInfo();
+        const auto& option = options_[*canonicalOptionIndex_];
+        samples.assign(indicesZYX.size(), {});
+        const auto sampleOne = [&](size_t index, auto& presenceResolver) {
+            const cv::Vec3d point = storedGridPoint(option, indicesZYX[index]);
+            auto request = vc::lasagna::prepareLasagnaCubeRequest(option.presence, point);
+            presenceResolver.resolve(request);
+            const auto rawPresence = vc::lasagna::sampleLasagnaChannel(option.presence, request);
+            if (rawPresence.has_value())
+                samples[index] = {clamp01(*rawPresence / 255.0), true};
+        };
+        const auto makeResolver = [&]() {
+            return vc::lasagna::LasagnaLocalChunkResolver(option.presence, *cache_);
+        };
+        sampleStoredIndices(indicesZYX.size(), parallelThreads, makeResolver, sampleOne);
     }
 
 private:
@@ -4693,6 +4727,14 @@ void FiberPredictionField::sampleStoredGridBatch(
     std::vector<FiberStoredPredictionSample>& samples) const
 {
     impl_->sampleStoredGridBatch(indicesZYX, parallelThreads, samples);
+}
+
+void FiberPredictionField::sampleStoredPresenceBatch(
+    const std::vector<std::array<size_t, 3>>& indicesZYX,
+    int parallelThreads,
+    std::vector<FiberStoredPresenceSample>& samples) const
+{
+    impl_->sampleStoredPresenceBatch(indicesZYX, parallelThreads, samples);
 }
 
 size_t FiberPredictionField::optionCount() const noexcept

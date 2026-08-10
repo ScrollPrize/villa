@@ -230,6 +230,11 @@ struct FiberStoredPredictionSample {
     bool valid = false;
 };
 
+struct FiberStoredPresenceSample {
+    double presence = 0.0;
+    bool valid = false;
+};
+
 enum class FiberPredictionFieldBindingMode {
     TraceOptions,
     CanonicalStoredGrid,
@@ -347,6 +352,10 @@ public:
         const std::vector<std::array<size_t, 3>>& indicesZYX,
         int parallelThreads,
         std::vector<FiberStoredPredictionSample>& samples) const;
+    void sampleStoredPresenceBatch(
+        const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads,
+        std::vector<FiberStoredPresenceSample>& samples) const;
     [[nodiscard]] size_t optionCount() const noexcept;
 
 private:

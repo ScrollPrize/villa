@@ -9,7 +9,8 @@
 #include <string>
 #include <vector>
 
-namespace vc::lasagna {
+namespace vc::lasagna
+{
 
 struct NormalSample {
     cv::Vec3d normal{0.0, 0.0, 0.0};
@@ -47,29 +48,22 @@ struct NormalBatchReport {
     double materializeMs = 0.0;
 };
 
-class NormalSampler {
+class NormalSampler
+{
 public:
     virtual ~NormalSampler() = default;
-    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
-    {
-        return false;
-    }
+    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept { return false; }
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
-    [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
-        const cv::Vec3d& volumePoint) const
+    [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
     {
         return {sampleNormal(volumePoint), cv::Matx33d::zeros(), false};
     }
-    [[nodiscard]] virtual NormalPrefetchReport prefetchNormalSamples(
-        const std::vector<cv::Vec3d>& /*volumePoints*/,
-        bool /*withDerivative*/) const
+    [[nodiscard]] virtual NormalPrefetchReport prefetchNormalSamples(const std::vector<cv::Vec3d>& /*volumePoints*/, bool /*withDerivative*/) const
     {
         return {};
     }
     [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
-        const std::vector<cv::Vec3d>& volumePoints,
-        bool withDerivative,
-        std::vector<NormalSampleWithDerivative>& samples) const
+        const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, std::vector<NormalSampleWithDerivative>& samples) const
     {
         using Clock = std::chrono::steady_clock;
         const auto prefetchStart = Clock::now();
@@ -79,19 +73,19 @@ public:
         samples.clear();
         samples.resize(volumePoints.size());
         for (size_t index = 0; index < volumePoints.size(); ++index) {
-            samples[index] = withDerivative
-                ? sampleNormalWithDerivative(volumePoints[index])
-                : NormalSampleWithDerivative{
-                      sampleNormal(volumePoints[index]),
-                      cv::Matx33d::zeros(),
-                      false};
+            samples[index] = withDerivative ? sampleNormalWithDerivative(volumePoints[index])
+                                            : NormalSampleWithDerivative{sampleNormal(volumePoints[index]), cv::Matx33d::zeros(), false};
         }
         const auto materializeEnd = Clock::now();
-        report.prefetchMs = std::chrono::duration<double, std::milli>(
-            prefetchEnd - prefetchStart).count();
-        report.materializeMs = std::chrono::duration<double, std::milli>(
-            materializeEnd - prefetchEnd).count();
+        report.prefetchMs = std::chrono::duration<double, std::milli>(prefetchEnd - prefetchStart).count();
+        report.materializeMs = std::chrono::duration<double, std::milli>(materializeEnd - prefetchEnd).count();
         return report;
+    }
+    [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, int parallelThreads, std::vector<NormalSampleWithDerivative>& samples) const
+    {
+        (void)parallelThreads;
+        return sampleNormalBatch(volumePoints, withDerivative, samples);
     }
 };
 
@@ -163,4 +157,4 @@ struct LineOptimizationConfig {
     std::vector<cv::Vec3d> initialLinePoints;
 };
 
-} // namespace vc::lasagna
+}  // namespace vc::lasagna

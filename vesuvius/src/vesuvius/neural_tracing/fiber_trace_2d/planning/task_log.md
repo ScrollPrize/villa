@@ -1,145 +1,109 @@
-# Task log: integer-DP fiberlet paths
+# Task log: preload and parallelize fiberlet DP
 
-## Planning
+## Findings and baseline
 
-- The existing Python Trace2CP DP is structurally relevant because it advances
-  monotonically while retaining two lateral coordinates and the previous move,
-  but it operates in a prepared strip. The new C++ solve operates directly on
-  integer voxels of the stored 3D prediction grid.
-- General A* was not selected for the initial implementation. The local
-  objective has no useful positive lower bound for an informative admissible
-  heuristic, while a strict positive chord-projection constraint makes the
-  integer corridor graph acyclic and directly solvable by deterministic DP.
-- Fitted sub-voxel anchors remain authoritative virtual endpoints. Only the
-  searchable dense-volume states are integer voxels.
-- Fiber direction channels and regular Lasagna normals are separate inputs.
-  The path stage must never interpret fiber `nx/ny` as surface normals.
-- Cumulative tangent-history smoothness is deliberately omitted because its
-  continuous running heading would add another quantized state dimension.
-  Direct one-step curvature uses the shared native equations.
-
-## Review
-
-- Independent review identified underspecified virtual endpoint attachment,
-  invalid-prediction costs, mixed-edge curvature scaling, Hermite rasterization,
-  normal/isotropic breakdown, locator matching, and scorer regression coverage.
-- The plan now connects exact anchors to every eligible nearby integer voxel and
-  scores/constrains the actual virtual edges; defines invalid prediction cost as
-  `4 * edge_length`; defines a dense sampled-Hermite polyline corridor and
-  radius; normalizes turn cost by effective adjacent edge length; makes
-  normal-aware and isotropic fallback components mutually exclusive; permits
-  content-identical manifest relocation; and adds direct smoothness golden
-  tests.
-- Initial testing found that a floor/ceil cube can contain no attachment within
-  45 degrees of a valid endpoint axis when all endpoint coordinates are
-  fractional. Attachments were broadened to the isotropic integer neighborhood
-  within `sqrt(3)` prediction voxels. This still bounds attachment length to one
-  26-neighbour step while providing the stencil's intended angular coverage.
+- Candidate DP is currently serial; `--threads` only reaches per-candidate
+  fiber sampling.
+- Per-candidate normal sampling calls the automatic-thread overload, so even
+  `--threads 1` repeatedly starts hardware-sized normal sampling work.
+- Every overlapping candidate reconstructs and resamples its corridor despite
+  the decoded chunk cache. The cache avoids raw chunk I/O but not voxel decode,
+  normal interpolation, temporary allocation, or worker-team overhead.
+- Release reference crop:
+  `--crop 13600,20256,18144,192,192,192`, 200 anchors, 4,813 generated pairs,
+  676 searched/accepted paths, score min/mean/max
+  3.18031/11.0126/20.8916.
+- Default-thread trace time was 11.6515 s. `--threads 1 --no-slices` trace time
+  was 9.37721 s; process wall/user/system was 9.44/146.49/0.48 s with 73,848
+  KiB peak RSS, confirming hidden normal-sampler parallelism.
+- `perf` is unavailable in this checkout, so source inspection plus controlled
+  wall/CPU measurements are the current profiler substitute.
+- Independent review required endpoint attachment voxels in preload bounds,
+  exact double-valued sample storage, an explicit rectangular-box contract,
+  byte-level checked allocation, continuing workers for deterministic exception
+  selection, expanded concurrency/indexing tests, repeated benchmarks, and
+  structural docs. The plan incorporates these items.
+- For the explicitly small-crop phase, the preload will use the existing generic
+  `NormalSampleWithDerivative` batch as a temporary result and immediately
+  compact it to normal vector/validity. Its derivative matrices and diagnostic
+  strings increase peak preload memory; a new compact Lasagna batch API is
+  intentionally deferred because it is not needed for current crop sizes and
+  would broaden this optimization task.
 
 ## Implementation
 
-- Added `FiberLocalScoring` as a shared implementation of the native tracer's
-  local normal/tangent smoothness equations. The native tracer now delegates to
-  it, and the fiberlet DP uses the same equations without the native cumulative
-  heading term.
-- Added strict anchor-artifact loading and verification of the fiber manifest
-  content hash and prediction grid before path search.
-- Added deterministic radius-four cell-shell pairing, 45-degree endpoint-axis
-  gating, a sampled-Hermite corridor, positive-chord 26-neighbour moves, and a
-  directed integer-voxel DP whose state includes the incoming move.
-- Added exact virtual endpoint edges, batched fiber-prediction and Lasagna-normal
-  sampling, decomposed cost accounting, and JSON plus base-coordinate OBJ
-  serialization.
-- Added `vc_fiberlets paths`; it accepts local or remote fiber and normal
-  manifests through the existing cache layer and requires a separate regular
-  Lasagna manifest for surface normals.
-- Added focused scorer, shell, path, failure, strict-loader, scale, and
-  deterministic-output tests.
+- Added a thread-count-aware virtual normal batch overload; generic samplers
+  retain existing behavior, while `LasagnaNormalSampler` uses its existing
+  explicit-thread implementation.
+- Split path processing into deterministic candidate generation, a single
+  dense preload, concurrent candidate solving, and serial diagnostics.
+- The preload is the rectangular enclosing ZYX box of all clipped candidate
+  Hermite corridor bounds plus endpoint attachment neighborhoods. It enumerates
+  unique voxels in ZYX order and samples fiber predictions and Lasagna normals
+  once each.
+- Dense storage retains exact `FiberStoredPredictionSample` values and
+  `cv::Vec3d` normal vector/validity. Candidate workers perform checked immutable
+  lookups with no nested sampling.
+- A fixed worker pool writes only existing canonical candidate slots. All tasks
+  continue after exceptions; the lowest search-index error is rethrown after
+  joining. Aggregate diagnostics are derived serially.
+- Added runtime reporting for preload voxels, estimated preload working bytes,
+  candidate workers, and generation/preload/search phase times. These remain
+  absent from artifacts.
+- Added a serialized optional core progress callback and CLI stderr reporting
+  for completion, percentage, elapsed time, rate, and ETA. Updates are monotonic
+  and rate-limited; the coordinator guarantees terminal completion reporting,
+  including the zero-search case, before deterministic error propagation.
+- Added one-shot/unique preload, requested-thread propagation, zero-search,
+  narrow-corridor attachment, generic normal sampler, and one-vs-multi-worker
+  deterministic-output coverage.
+
+## Deviations and limitations
+
+- No production-only hook was added to force multiple candidate exceptions or
+  block workers, so deterministic lowest-exception and active-overlap behavior
+  are established by implementation structure rather than synthetic tests.
+  Tests do verify the requested worker bound and exact multi-worker output.
+- The existing generic `NormalSampleWithDerivative` array is retained as a
+  temporary preload result before compacting to vector/validity. This inflates
+  peak memory but is accepted for the explicitly small current test crops.
+- Dense preload samples the full enclosing box, including gaps between
+  corridors. Tiling/masking and a compact Lasagna normal batch are deferred.
+- System `perf` is not installed. Hotspot evidence is source-level plus phase,
+  wall, CPU, and RSS measurements rather than sampled call stacks.
+- The progress-plan review required stale concurrent update suppression,
+  search-only timing, explicit zero/failure terminal behavior, and captured
+  callback exceptions; these are included. A fake clock and production worker
+  blocking hooks are not added solely to test intermediate rate limiting.
 
 ## Validation
 
-- Configured the existing `volume-cartographer/build` tree and built with
-  `cmake --build build --parallel 32 --target vc_cli_all test_fiberlet_paths
-  test_fiber_trace3d test_fiber_anchors test_lasagna_manifest
-  test_lasagna_normal_sampler`.
-- Passed `test_fiberlet_paths` (8), `test_fiber_trace3d` (46),
-  `test_fiber_anchors` (13), `test_lasagna_manifest` (14), and
-  `test_lasagna_normal_sampler` (11).
-- Ran the path command twice on the S1 scale-four anchor crop using
-  `fiber_s1_002.lasagna.json` and the separate `las_tmp.lasagna.json` normal
-  manifest. Each run considered 23,493 pairs, searched 3,087 after axis
-  rejection, and found 3,087 paths. Runtime was 51.94 s and 51.63 s with 32
-  threads and a 0.5 GiB cache.
-- The two 24 MiB JSON reports and 1.6 MiB/53,543-line OBJ files were
-  byte-identical. Successful path costs ranged from 1.99265 to 24.5183 with a
-  mean of 9.93674.
-- The output artifact is available at
-  `/tmp/vc_fiberlet_paths_s4_run1/fiberlets.obj`; interactive visual inspection
-  in a viewer was not performed in this pass.
-
-## Base-coordinate CLI adaptation
-
-- The initial implementation exposed a prediction-coordinate crop flag and
-  prediction-coordinate JSON positions. The user clarified that spatial
-  coordinates in CLI interfaces must always use base-volume coordinates.
-- Cell indices and counts, prediction-grid shape/scale metadata, cell size,
-  Gaussian sigma, and per-prediction-voxel objective parameters remain lattice
-  quantities. They are not point or extent coordinates.
-- No compatibility aliases or old artifact fields will be retained. The short
-  CLI flags are `--crop` and `--corridor-radius`, with base voxels as their only
-  coordinate convention.
-- Independent review rejected the initial floor/ceil mapping because stored
-  prediction indices are point centres, not owned spatial bins. The implemented
-  half-open mapping uses ceil on both base boundaries, with scale-aware snapping
-  at exact lattice boundaries. It rejects overflow, empty mapped intervals, and
-  out-of-volume selections.
-- Anchor JSON now declares `base_volume`, stores fitted
-  `position_base_xyz`, and records the effective prediction interval using
-  base-coordinate boundaries plus exact discrete cell bounds. The strict loader
-  divides fitted positions without snapping, then applies its existing cell
-  ownership tolerance. Fiberlet JSON stores base-coordinate endpoints and
-  polylines, and stores corridor radius in base voxels.
-- The artifact and CLI contain no compatibility reader, alias, or duplicate old
-  coordinate field. Prediction shape/scale and explicit lattice parameters
-  remain available for interpreting cell IDs and objective values.
-- Added aligned, non-aligned, and decimal-scale crop conversion tests; updated
-  serialization tests to reject the former coordinate contract. Passed 14
-  anchor tests, 8 fiberlet-path tests, and the existing native tracer, manifest,
-  and normal-sampler suites after building `vc_cli_all` with 32 jobs.
-- Re-ran the 192-base-voxel S1 crop with
-  `--crop 13600,20256,18144,192,192,192`: 216 anchors, 5,710 candidate pairs,
-  792 searched/successful paths, and 13.35 s. Its OBJ is byte-identical to the
-  earlier prediction-coordinate invocation. An explicit
-  `--corridor-radius 32` run took 13.57 s and produced byte-identical JSON/OBJ
-  to the one-cell-width default.
-- Made the demonstrated values actual CLI defaults: four prediction voxels per
-  anchor cell, radius four, one-cell-width corridor, hardware worker count, and
-  a 0.5 GiB decoded cache. Examples now specify only the base crop and required
-  normal manifest.
-
-## Path statistics
-
-- The current output has no score threshold: every DP path that reaches a sink
-  is accepted and written to OBJ. Axis-mismatch and no-path candidates have no
-  comparable final DP score and must be counted as unscored rather than treated
-  as zero-cost paths.
-- Added independent `score_valid` and acceptance state. JSON omits the cost for
-  every unscored feasibility failure instead of serializing a misleading zero;
-  non-finite final scores fail loudly.
-- Independent review required explicit score presence separate from search and
-  acceptance, a searched-but-unscored count, finite-score enforcement, and
-  `n/a` rather than numeric sentinels for empty score populations.
-- The real-crop OBJ contains 792 groups and 12,046 vertices, but only 792
-  multi-index `l` records with 11--24 indices each. Although valid OBJ, that
-  encoding is not rendered reliably by MeshLab. The output will instead contain
-  one explicit two-index line record per adjacent path edge.
-- Added `paths --stats` and reusable summary coverage, including distinct
-  scored/accepted populations and empty ranges. The real crop reports 216
-  anchors, 5,710 total pairs, 4,918 pre-DP rejections, 792 searches, zero
-  searched-but-unscored failures, and 792 accepted fiberlets. Both current
-  score populations have min 3.18031, mean 10.737, and max 20.8916 because no
-  quality threshold exists yet.
-- Regenerated the OBJ with 792 groups, 12,046 vertices, and 11,254 explicit
-  two-index line segments; every line record has exactly two indices. Built
-  `vc_cli_all` with 32 jobs and passed all five focused suites, including nine
-  fiberlet-path cases.
+- Release build: GCC, `CMAKE_BUILD_TYPE=Release`, `-O3 -DNDEBUG`.
+- Build command:
+  `cmake --build build --parallel 32 --target vc_fiberlets test_fiber_anchors test_fiberlet_paths test_fiber_trace3d`.
+- `ctest --test-dir build --output-on-failure -R
+  'test_(fiber_anchors|fiberlet_paths|fiber_trace3d|lasagna_normal_sampler)$'`
+  passed all four binaries: 19 anchor, 14 path, 46 tracer, and the Lasagna
+  normal-sampler suite.
+- Benchmark command used `vc_fiberlets paths` with the S1 Fiber manifest,
+  regenerated 192-base-voxel crop anchors, `las_tmp.lasagna.json`, defaults,
+  `--no-slices --stats`, and `/usr/bin/time`; three separate processes per
+  implementation were measured after warming the OS file cache.
+- Reference trace counts stayed at 4,813 candidates and 676/676 successful
+  searches; score min/mean/max stayed 3.18031/11.0126/20.8916.
+- Baseline wall min/median/max: 11.80/12.06/12.09 s. Optimized:
+  0.43/0.43/0.44 s, a 28.0x median wall speedup. Internal trace median changed
+  from 11.9944 s to 0.3661 s (32.8x).
+- Baseline user CPU min/median/max: 219.52/227.78/229.04 s. Optimized:
+  10.88/10.89/11.04 s. Peak RSS median increased from 74,756 KiB to 157,192
+  KiB due to dense/temporary preload storage.
+- All six before/after `fiberlets.json` files were byte-identical with SHA-256
+  `a790790b28b482586ae16d2efad8643736649236ea7f1cb45e90e5ca1ae450ff`.
+- A 512-base-voxel S1 crop produced 4,072 anchors, 291,616 candidates, and
+  42,952/42,952 successful searches. It preloaded 416,176 voxels, reported
+  126,517,504 estimated preload working bytes, traced in 23.0707 s, completed
+  in 25.98 s wall, and peaked at 1,516,228 KiB RSS.
+- The same 512 crop with progress emitted monotonic roughly one-second updates
+  from 4.7 percent/20.3 s ETA through 96.7 percent/0.8 s ETA, then exactly
+  `42952/42952`, 100 percent, and zero ETA. Trace/wall time remained
+  23.0073/25.94 s.

@@ -12,6 +12,12 @@
   legacy coordinate fields are retained.
 - Added `paths --stats`, explicit score-presence semantics, and
   MeshLab-compatible two-index OBJ path edges.
+- Added independently loadable central XY/XZ/YZ fiber-presence textured-quad
+  OBJ/MTL/PNG context, with direct presence sampling and `--no-slices` opt-out.
+- Materialized each small crop's fiber/normal scoring volume once and moved
+  exact independent DP searches to a deterministic fixed worker pool, removing
+  repeated sampling and nested thread teams.
+- Added monotonic rate-limited path progress with throughput and ETA on stderr.
 
 # 2026-08-10: C++ fiberlet cell anchors
 
@@ -20,6 +26,10 @@
   `presence/nx/ny`, plus the cache-aware `vc_fiberlets anchors` command and
   sparse JSON/base-coordinate OBJ artifacts. Connection and path stages remain
   deferred.
+- Merged near-duplicate fitted directions using an angle-plus-objective test
+  and a joint PCA refit, with strict diagnostics and configurable thresholds.
+- Kept the complete anchor OBJ and added separate deterministic component-zero
+  and component-one OBJ layers for inspection.
 
 # 2026-08-03
 

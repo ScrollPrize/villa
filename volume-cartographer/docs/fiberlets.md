@@ -48,6 +48,16 @@ samples. Empty, degenerate, and below-threshold components are discarded
 independently; the remaining component is not refitted after rejection. The
 output is therefore zero, one, or two anchors.
 
+After fitting, two valid components are merged when their unoriented angle is
+at most `--merge-angle-deg` (10 degrees by default) and replacing them with a
+joint PCA loses at most
+`max(--merge-abs-loss, --merge-rel-loss * joint_objective)`. The defaults are
+0.01 absolute and 0.05 relative normalized objective loss. The comparison is
+inclusive. A merge refits support and position from all usable observations;
+the joint anchor can still fail the normal minimum-support check. Exact
+single-direction cells, where the second fit is empty, are not counted as
+merges.
+
 ## Command
 
 ```bash
@@ -73,13 +83,21 @@ voxels, counts, and elapsed time. It writes:
 - `anchors.json`: versioned machine input for later fiberlet stages. It stores
   a credential-free manifest locator and content hash, coordinate contract,
   parameters, aggregate rejection counts, and only non-empty cells.
-- `anchors.obj`: diagnostic base-coordinate line glyphs. It is not an input to
-  later stages.
+- `anchors.obj`: all diagnostic base-coordinate line glyphs.
+- `anchors_0.obj`: only component slot zero from every non-empty cell.
+- `anchors_1.obj`: only component slot one from two-anchor cells.
 
-Both files use same-directory temporary files followed by atomic replacement.
+The component slots are deterministic within each cell after support-based
+sorting. They are visualization layers, not global H/V or winding classes, and
+none of the OBJ files is an input to later stages.
+
+All artifacts use same-directory temporary files followed by atomic replacement.
 Timing and worker count are not stored because they are operational values;
 identical inputs and numerical parameters produce byte-identical artifacts
 across worker counts.
+
+Anchor artifacts are experimental and parsed strictly. Regenerate an older
+`anchors.json` that lacks the current merge parameters and diagnostics.
 
 ## Calibration
 
@@ -117,6 +135,30 @@ Endpoint axes must agree with their chord within 45 degrees. Every surviving
 pair is solved independently, so an anchor can currently participate in many
 paths.
 
+Candidate generation finishes before any path search. The path stage computes
+the rectangular enclosing ZYX box of every searchable Hermite corridor and its
+virtual endpoint attachment voxels, clips that box to the prediction grid, and
+materializes every stored prediction and Lasagna normal in the box exactly
+once. Candidate workers then read this immutable dense scoring volume; they do
+not decode chunks, interpolate normals, or launch nested sampling workers.
+Corridors may leave the selected anchor-cell box, so the preload box can extend
+beyond the original crop. This intentionally favors speed for the current
+small test crops and can consume substantial memory on large stored-prediction
+regions.
+
+`--threads` controls both the one-time preload batch and the subsequent fixed
+candidate worker pool. Candidate results are written into their original
+deterministic slots, and timing/worker values are not serialized. Runtime output
+reports the dense voxel count, estimated peak preload working bytes, worker
+count, and candidate-generation/preload/search times.
+
+During candidate solving, `vc_fiberlets` writes a monotonic progress line to
+stderr about once per second. It reports completed/total searches, percentage,
+search-only elapsed seconds, candidates per second, and ETA seconds. A final
+100-percent line with zero ETA is always emitted; a run with no searchable
+candidates reports `0/0`, 100 percent, and zero ETA. Progress is operational
+output and does not affect stdout or artifacts.
+
 `--corridor-radius` is measured in base voxels. If omitted, it defaults to one
 anchor-cell width. Cell radius and shell width remain dimensionless cell-lattice
 parameters.
@@ -140,6 +182,24 @@ The command writes:
 - `fiberlets.json`: every shell pair, rejection/failure reason, objective
   breakdown, and successful base-coordinate polyline.
 - `fiberlets.obj`: one named successful polyline per group in base coordinates.
+- `fiber_presence_xy.{obj,mtl,png}`, `fiber_presence_xz.{obj,mtl,png}`, and
+  `fiber_presence_yz.{obj,mtl,png}`: three independently loadable textured
+  quads through the center of the complete selected anchor-cell region. Each
+  grayscale PNG contains one pixel per stored prediction voxel; black is zero
+  presence and white is one.
+
+Load `fiberlets.obj` and any of the three slice OBJ files as separate MeshLab
+layers to view or hide each prediction plane independently. Each OBJ references
+only its matching MTL and PNG by basename. For an even crop extent, the lower
+of the two central prediction voxels is selected deterministically. The quad
+lies on that voxel center and extends half a prediction voxel beyond the first
+and last texture samples along both varying axes. Slices use presence directly
+and remain defined where a decoded fiber direction is invalid.
+
+Slice output is enabled by default for crop inspection. Use `--no-slices` for
+large or production path runs; this removes all three OBJ/MTL/PNG bundles from
+the output directory. The default export rejects more than one million total
+texture pixels instead of producing unexpectedly large files.
 
 `--stats` prints retained anchors, candidate pairs, pre-DP rejections,
 searched-but-unscored failures, scored paths, accepted fiberlets, and
@@ -147,7 +207,8 @@ min/mean/max total objective scores for all scored and accepted paths. Rejected
 endpoint pairs and failed searches have no path score and are counted as
 unscored, never as zero. Empty score ranges print `n/a`. There is currently no
 quality cutoff, so every scored path is accepted and the two score ranges are
-expected to match.
+expected to match. It also reports whether slice output is enabled and the
+number of emitted slice pixels.
 
 For MeshLab compatibility, each fiberlet OBJ group writes every adjacent path
 edge as an explicit two-vertex `l a b` element. It does not rely on support for

@@ -8,6 +8,7 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/TexturedMesh.hpp"
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -1012,19 +1013,11 @@ void writeTexturedPlaneSliceObj(const cv::Mat_<cv::Vec3f>& coords,
         throw std::runtime_error("cannot write empty control plane slice OBJ");
     }
 
-    std::ofstream output(objPath);
-    if (!output.good()) {
-        throw std::runtime_error("could not open OBJ output: " + objPath.string());
-    }
-    output.imbue(std::locale::classic());
-    output << "# Textured reinit control-point fitted plane slice\n"
-           << "mtllib " << mtlName << '\n'
-           << "usemtl " << materialName << '\n';
-
+    vc::core::util::TexturedMesh mesh;
     for (int row = 0; row < coords.rows; ++row) {
         for (int col = 0; col < coords.cols; ++col) {
             const cv::Vec3f& point = coords(row, col);
-            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+            mesh.vertices.push_back({point[0], point[1], point[2]});
         }
     }
 
@@ -1032,28 +1025,33 @@ void writeTexturedPlaneSliceObj(const cv::Mat_<cv::Vec3f>& coords,
     const double rowDenom = std::max(1, coords.rows - 1);
     for (int row = 0; row < coords.rows; ++row) {
         for (int col = 0; col < coords.cols; ++col) {
-            output << "vt "
-                   << (static_cast<double>(col) / colDenom) << ' '
-                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
+            mesh.textureCoordinates.push_back({
+                static_cast<double>(col) / colDenom,
+                1.0 - static_cast<double>(row) / rowDenom,
+            });
         }
     }
 
     const auto index = [&](int row, int col) {
-        return row * coords.cols + col + 1;
+        return static_cast<size_t>(row * coords.cols + col);
     };
     for (int row = 0; row + 1 < coords.rows; ++row) {
         for (int col = 0; col + 1 < coords.cols; ++col) {
-            const int v00 = index(row, col);
-            const int v01 = index(row, col + 1);
-            const int v10 = index(row + 1, col);
-            const int v11 = index(row + 1, col + 1);
-            output << "f "
-                   << v00 << '/' << v00 << ' '
-                   << v01 << '/' << v01 << ' '
-                   << v11 << '/' << v11 << ' '
-                   << v10 << '/' << v10 << '\n';
+            const size_t v00 = index(row, col);
+            const size_t v01 = index(row, col + 1);
+            const size_t v10 = index(row + 1, col);
+            const size_t v11 = index(row + 1, col + 1);
+            mesh.quads.push_back({{v00, v01, v11, v10}, {v00, v01, v11, v10}});
         }
     }
+    std::ofstream output(objPath);
+    if (!output.good())
+        throw std::runtime_error("could not open OBJ output: " + objPath.string());
+    output << vc::core::util::texturedMeshObj(
+        mesh,
+        "Textured reinit control-point fitted plane slice",
+        mtlName,
+        materialName);
 }
 
 void writeControlPointsObj(const std::vector<cv::Vec3d>& points,
@@ -1121,13 +1119,7 @@ void writeSurfaceMtl(const std::filesystem::path& path,
     if (!output.good()) {
         throw std::runtime_error("could not open MTL output: " + path.string());
     }
-    output << "newmtl " << materialName << '\n'
-           << "Ka 1 1 1\n"
-           << "Kd 1 1 1\n"
-           << "Ks 0 0 0\n"
-           << "d 1\n"
-           << "illum 1\n"
-           << "map_Kd " << textureName << '\n';
+    output << vc::core::util::textureMaterialMtl(materialName, textureName);
 }
 
 void writeSurfaceObj(const QuadSurface& surface,
@@ -1140,42 +1132,34 @@ void writeSurfaceObj(const QuadSurface& surface,
         throw std::runtime_error("surface has no points for OBJ export");
     }
 
-    std::ofstream output(objPath);
-    if (!output.good()) {
-        throw std::runtime_error("could not open OBJ output: " + objPath.string());
-    }
-    output.imbue(std::locale::classic());
-    output << "# VC3D line-view strip\n"
-           << "mtllib " << mtlName << '\n'
-           << "usemtl " << materialName << '\n';
-
-    std::vector<int> vertexIndex(static_cast<size_t>(points->rows * points->cols), 0);
-    int nextVertex = 1;
+    vc::core::util::TexturedMesh mesh;
+    constexpr size_t invalidIndex = std::numeric_limits<size_t>::max();
+    std::vector<size_t> vertexIndex(
+        static_cast<size_t>(points->rows * points->cols), invalidIndex);
     for (int row = 0; row < points->rows; ++row) {
         for (int col = 0; col < points->cols; ++col) {
             const cv::Vec3f& point = (*points)(row, col);
-            if (!validSurfacePoint(point)) {
+            if (!validSurfacePoint(point))
                 continue;
-            }
-            vertexIndex[static_cast<size_t>(row * points->cols + col)] = nextVertex++;
-            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+            vertexIndex[static_cast<size_t>(row * points->cols + col)] = mesh.vertices.size();
+            mesh.vertices.push_back({point[0], point[1], point[2]});
         }
     }
 
-    std::vector<int> uvIndex(static_cast<size_t>(points->rows * points->cols), 0);
-    int nextUv = 1;
+    std::vector<size_t> uvIndex(
+        static_cast<size_t>(points->rows * points->cols), invalidIndex);
     const double colDenom = std::max(1, points->cols - 1);
     const double rowDenom = std::max(1, points->rows - 1);
     for (int row = 0; row < points->rows; ++row) {
         for (int col = 0; col < points->cols; ++col) {
             const cv::Vec3f& point = (*points)(row, col);
-            if (!validSurfacePoint(point)) {
+            if (!validSurfacePoint(point))
                 continue;
-            }
-            uvIndex[static_cast<size_t>(row * points->cols + col)] = nextUv++;
-            output << "vt "
-                   << (static_cast<double>(col) / colDenom) << ' '
-                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
+            uvIndex[static_cast<size_t>(row * points->cols + col)] = mesh.textureCoordinates.size();
+            mesh.textureCoordinates.push_back({
+                static_cast<double>(col) / colDenom,
+                1.0 - static_cast<double>(row) / rowDenom,
+            });
         }
     }
 
@@ -1184,24 +1168,26 @@ void writeSurfaceObj(const QuadSurface& surface,
             const auto idx = [&](int r, int c) {
                 return static_cast<size_t>(r * points->cols + c);
             };
-            const int v00 = vertexIndex[idx(row, col)];
-            const int v01 = vertexIndex[idx(row, col + 1)];
-            const int v10 = vertexIndex[idx(row + 1, col)];
-            const int v11 = vertexIndex[idx(row + 1, col + 1)];
-            if (v00 == 0 || v01 == 0 || v10 == 0 || v11 == 0) {
+            const size_t v00 = vertexIndex[idx(row, col)];
+            const size_t v01 = vertexIndex[idx(row, col + 1)];
+            const size_t v10 = vertexIndex[idx(row + 1, col)];
+            const size_t v11 = vertexIndex[idx(row + 1, col + 1)];
+            if (v00 == invalidIndex || v01 == invalidIndex ||
+                v10 == invalidIndex || v11 == invalidIndex) {
                 continue;
             }
-            const int t00 = uvIndex[idx(row, col)];
-            const int t01 = uvIndex[idx(row, col + 1)];
-            const int t10 = uvIndex[idx(row + 1, col)];
-            const int t11 = uvIndex[idx(row + 1, col + 1)];
-            output << "f "
-                   << v00 << '/' << t00 << ' '
-                   << v01 << '/' << t01 << ' '
-                   << v11 << '/' << t11 << ' '
-                   << v10 << '/' << t10 << '\n';
+            mesh.quads.push_back({
+                {v00, v01, v11, v10},
+                {uvIndex[idx(row, col)], uvIndex[idx(row, col + 1)],
+                 uvIndex[idx(row + 1, col + 1)], uvIndex[idx(row + 1, col)]},
+            });
         }
     }
+    std::ofstream output(objPath);
+    if (!output.good())
+        throw std::runtime_error("could not open OBJ output: " + objPath.string());
+    output << vc::core::util::texturedMeshObj(
+        mesh, "VC3D line-view strip", mtlName, materialName);
 }
 
 cv::Mat renderCoordsTexture(const cv::Mat_<cv::Vec3f>& baseCoords,

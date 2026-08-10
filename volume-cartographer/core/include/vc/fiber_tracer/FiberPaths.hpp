@@ -7,6 +7,7 @@
 #include <compare>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -91,6 +92,31 @@ struct FiberletPathStatistics {
     FiberletScoreStatistics acceptedScores;
 };
 
+struct FiberPresenceSlicePixel {
+    std::array<size_t, 3> indexZYX{0, 0, 0};
+    double presence = 0.0;
+};
+
+struct FiberPresenceSlice {
+    std::string name;
+    std::array<size_t, 2> varyingAxesXYZ{0, 1};
+    size_t fixedAxisXYZ = 2;
+    size_t fixedIndex = 0;
+    size_t width = 0;
+    size_t height = 0;
+    std::vector<FiberPresenceSlicePixel> pixels;
+};
+
+struct FiberPresenceSliceReport {
+    FiberAnchorCrop cropPredictionXYZ;
+    std::vector<FiberPresenceSlice> planes;
+
+    [[nodiscard]] size_t pixelCount() const noexcept;
+};
+
+using FiberStoredPresenceBatchSampler =
+    std::function<void(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPresenceSample>& samples)>;
+
 struct FiberletPathDiagnostics {
     size_t occupiedAnchors = 0;
     size_t shellOffsets = 0;
@@ -109,6 +135,12 @@ struct FiberletPathReport {
     FiberletPathConfig config;
     FiberletPathDiagnostics diagnostics;
     std::vector<FiberletCandidateResult> candidates;
+    size_t preloadedVoxels = 0;
+    size_t estimatedPreloadBytes = 0;
+    size_t candidateWorkers = 0;
+    double candidateGenerationSeconds = 0.0;
+    double preloadSeconds = 0.0;
+    double searchSeconds = 0.0;
     double elapsedSeconds = 0.0;
 };
 
@@ -122,6 +154,14 @@ struct FiberletArtifactInfo {
     std::optional<double> baseVoxelSizeUm;
 };
 
+struct FiberletPathProgress {
+    size_t completed = 0;
+    size_t total = 0;
+    double elapsedSeconds = 0.0;
+};
+
+using FiberletPathProgressCallback = std::function<void(const FiberletPathProgress& progress)>;
+
 void validateFiberletPathConfig(const FiberletPathConfig& config);
 
 [[nodiscard]] LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path);
@@ -133,14 +173,24 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
     const FiberPredictionGridInfo& grid,
     const FiberletPathConfig& config,
     const FiberStoredPredictionBatchSampler& predictionSampler,
-    const vc::lasagna::NormalSampler& normalSampler);
+    const vc::lasagna::NormalSampler& normalSampler,
+    const FiberletPathProgressCallback& progressCallback = {});
 
 [[nodiscard]] FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report);
+
+[[nodiscard]] FiberAnchorCrop fiberAnchorCellCoverageCrop(const LoadedFiberAnchorArtifact& anchors);
+
+[[nodiscard]] FiberPresenceSliceReport sampleFiberPresenceSlices(
+    const FiberAnchorCrop& cropPredictionXYZ, const FiberPredictionGridInfo& grid, const FiberStoredPresenceBatchSampler& presenceSampler, int parallelThreads);
 
 [[nodiscard]] nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const FiberletArtifactInfo& artifact);
 
 [[nodiscard]] std::string fiberletPathReportObj(const FiberletPathReport& report);
 
 void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, const FiberletPathReport& report, const FiberletArtifactInfo& artifact);
+
+void writeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirectory, const FiberPresenceSliceReport& report, const FiberPredictionGridInfo& grid);
+
+void removeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirectory);
 
 }  // namespace vc::fiber_tracer
