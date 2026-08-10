@@ -66,29 +66,29 @@
   "tile_size": 16,
   "datasets": [
     {
-      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+      "volume_path": "/ephemeral/sean/winding_train_data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
       "volume_id": "20260102150214",
       "volume_scale": 2,
       "segment_volume_id": "20260102150214",
       "segment_downscale": 4,
-      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc0139/segments"
+      "segments_path": "/ephemeral/sean/winding_train_data/PHerc0139/segments"
     },
     {
-      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
+      "volume_path": "/ephemeral/sean/winding_train_data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr",
       "volume_id": "20251217075048",
       "volume_scale": 2,
       "segment_volume_id": "20251217075048",
       "segment_downscale": 4,
-      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHerc1667/segments"
+      "segments_path": "/ephemeral/sean/winding_train_data/PHerc1667/segments"
     },
     {
-      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
+      "volume_path": "/ephemeral/sean/winding_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
       "volume_scale": 0,
       "segment_downscale": 1,
-      "segments_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHercParis4/segments"
+      "segments_path": "/ephemeral/sean/winding_train_data/PHercParis4/segments"
     },
     {
-      "volume_path": "/mnt/raid_nvme/intersection_addtl_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
+      "volume_path": "/ephemeral/sean/winding_train_data/PHercParis4/volumes/s1_2um_ds2.zarr",
       "volume_scale": 0,
       "segment_downscale": 1,
       "segments_path": "/mnt/raid_nvme/graph_patches",
