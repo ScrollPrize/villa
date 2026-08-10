@@ -45,8 +45,7 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             parse_session_name)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
-                         AutosaveError, FULL_REBUILD_DEPENDENCIES,
-                         SessionState, SpiralInputPaths,
+                         AutosaveError, SessionState, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
@@ -1751,40 +1750,33 @@ class UploadTests(unittest.TestCase):
         shell.mkdir()
         inputs = self.state.session_paths.manifest()
         inputs["outer_shell"] = str(shell)
-        plan = self.state.plan_run({
-            "configuration": Config().as_dict(),
-            "iterations": 3,
-            "inputs": inputs,
-            "expected_session_revision": self.state.session_revision,
-        })
+        with self.assertRaisesRegex(ApiError, "restart.*service") as caught:
+            self.state.plan_run({
+                "configuration": Config().as_dict(),
+                "iterations": 3,
+                "inputs": inputs,
+                "expected_session_revision": self.state.session_revision,
+            })
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.details, [{
+            "field": "inputs.outer_shell",
+            "message": "Static input changes require a service restart",
+        }])
 
-        self.assertTrue(plan["session_reload_required"])
-        self.assertEqual(
-            plan["affected_prepared_inputs"],
-            sorted(FULL_REBUILD_DEPENDENCIES))
-        self.assertEqual(plan["input_changes"][0]["runtime_impact"],
-                         "prepared_input_rebuild")
-        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
-            self.state.run({"plan_token": plan["plan_token"]})
-
-    def test_non_shell_path_and_patch_erosion_still_require_reload(self):
+    def test_any_other_static_path_change_is_also_rejected(self):
         self._session()
         inputs = self.state.session_paths.manifest()
         inputs["verified_patches"] = str(self.dataset / "other-patches")
-        configuration = Config({
-            "patch_erode_patches": (
-                Config().patch_erode_patches + 1),
-        }).as_dict()
-        plan = self.state.plan_run({
-            "configuration": configuration,
-            "iterations": 3,
-            "inputs": inputs,
-            "expected_session_revision": self.state.session_revision,
-        })
-
-        self.assertTrue(plan["session_reload_required"])
-        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
-            self.state.run({"plan_token": plan["plan_token"]})
+        with self.assertRaisesRegex(ApiError, "restart.*service") as caught:
+            self.state.plan_run({
+                "configuration": Config().as_dict(),
+                "iterations": 3,
+                "inputs": inputs,
+                "expected_session_revision": self.state.session_revision,
+            })
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.details[0]["field"],
+                         "inputs.verified_patches")
 
     def test_a_rebuilt_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()

@@ -76,7 +76,12 @@ from config import Config
 # the whole export; status carries preview_exporting while it runs.
 # dataset_owned is gone from /health and /session/status: --dataset is
 # required, so it was always true.
-API_VERSION = 24
+# Version 25 makes the startup-resolved input manifest strictly read-only.
+# POST /session/run/plan may echo the manifest advertised by status, but any
+# changed, added, or removed path is rejected immediately: replacing static
+# dataset inputs requires restarting the dataset-bound service, not planning a
+# run or rebuilding its resident session.
+API_VERSION = 25
 
 
 class SessionState(str, Enum):

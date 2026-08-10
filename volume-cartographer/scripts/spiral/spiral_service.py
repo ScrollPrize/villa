@@ -62,8 +62,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          AutosaveError, ScrollSpecError, SessionState,
-                         SpiralInputPaths, default_user_cache_dir, fit_input,
-                         input_change_impact, load_scroll_spec,
+                         SpiralInputPaths, default_user_cache_dir,
+                         load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          select_startup_autosave, validate_autosave,
                          validate_session_request)
@@ -1225,33 +1225,19 @@ class ServiceState:
             for key in set(current_manifest) | set(input_manifest)
             if input_manifest.get(key) != current_manifest.get(key)
         }
+        if path_changes:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Static dataset inputs cannot be changed by a run; restart "
+                "the dataset-bound Spiral service to resolve new inputs",
+                [
+                    {
+                        "field": f"inputs.{key}",
+                        "message": "Static input changes require a service restart",
+                    }
+                    for key in sorted(path_changes)
+                ])
         input_changes = []
-        for key, value in sorted(path_changes.items()):
-            impact, path_dependencies = input_change_impact(key)
-            impacts.add(impact)
-            dependencies.extend(path_dependencies)
-            input_changes.append({
-                "key": key,
-                "before": current_manifest.get(key),
-                "after": value,
-                "runtime_impact": impact,
-            })
-        # Path changes a resident session takes live (without a session
-        # reload) are validated eagerly against their catalog kind; changes
-        # that force a reload are validated when the session reloads.
-        for key in sorted(path_changes):
-            spec = fit_input(key)
-            if spec is None or spec.runtime_impact == "prepared_input_rebuild":
-                continue
-            value = str(path_changes[key] or "").strip()
-            if spec.kind in ("directory", "zarr-group") and (
-                    not value or not Path(value).is_dir()):
-                label = spec.key.replace("_", " ").capitalize()
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{label} path is not a readable directory",
-                    [{"field": spec.key,
-                      "message": "Path is not a directory"}])
         dependencies = sorted(set(dependencies))
         token = secrets.token_urlsafe(24)
         new_fit = "new_fit" in impacts
@@ -1262,7 +1248,7 @@ class ServiceState:
             "iterations": iterations,
             "influence": request.get("influence") or {},
             "configuration_changes": changes,
-            "path_changes": path_changes,
+            "path_changes": {},
             "changes": [
                 {"key": key, "before": current.get(key), "after": value,
                  "runtime_impact": fields[key]["runtime_impact"]}
@@ -1273,7 +1259,7 @@ class ServiceState:
             "optimizer_state_preserved": not new_fit,
             "new_fit_required": new_fit,
             "session_reload_required": session_reload_required,
-            "input_changed": bool(path_changes),
+            "input_changed": False,
             "input_changes": input_changes,
         }
         with self.lock:
