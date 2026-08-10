@@ -481,11 +481,17 @@ def open_volume_root(
     return root
 
 
-def select_volume_level(root: Any, resolution: int | str, *, source: str) -> Any:
+def select_volume_level(
+    root: Any,
+    resolution: int | str,
+    *,
+    source: str,
+    root_array_is_requested_level: bool = False,
+) -> Any:
     """Select one resolution from an already opened array or group root."""
 
     if hasattr(root, "shape"):
-        if str(resolution) not in {"0", ""}:
+        if not root_array_is_requested_level and str(resolution) not in {"0", ""}:
             raise _missing_node_error(
                 f"{source.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
                 f"in zarr array {source!r})"
@@ -514,6 +520,7 @@ def open_volume(
     *,
     cache_dir: str | Path | None = None,
     cache_max_gb: float | None = None,
+    root_array_is_requested_level: bool = False,
 ):
     """Open one Zarr pyramid level through the shared root boundary."""
 
@@ -523,7 +530,12 @@ def open_volume(
         cache_dir=cache_dir,
         cache_max_gb=cache_max_gb,
     )
-    return select_volume_level(root, resolution, source=str(path))
+    return select_volume_level(
+        root,
+        resolution,
+        source=str(path),
+        root_array_is_requested_level=root_array_is_requested_level,
+    )
 
 
 def read_bbox_with_padding(

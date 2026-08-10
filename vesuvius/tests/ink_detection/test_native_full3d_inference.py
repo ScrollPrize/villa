@@ -55,6 +55,26 @@ def test_native_weight_selection_uses_only_ema_then_model():
     assert state is model
 
 
+def test_negative_resolution_fails_before_native_volume_open(monkeypatch):
+    config = SimpleNamespace(
+        data=SimpleNamespace(mode="full_3d"),
+        model=SimpleNamespace(crop_size=(3, 3, 3)),
+    )
+    monkeypatch.setattr(
+        native,
+        "_load_checkpoint_config",
+        lambda checkpoint: ({}, config),
+    )
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        native._plan_from_args(
+            SimpleNamespace(checkpoint=Path("unused"), resolution="-1"),
+            volume_opener=lambda *args, **kwargs: pytest.fail(
+                "negative resolution opened the volume"
+            ),
+        )
+
+
 def test_import_is_pure_and_keeps_heavy_dependencies_lazy():
     code = """
 import json, multiprocessing, os, sys

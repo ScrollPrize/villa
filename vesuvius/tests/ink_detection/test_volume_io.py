@@ -473,6 +473,9 @@ def test_missing_resolution_uses_node_error_when_listing_fails(monkeypatch):
     monkeypatch.setattr(volume_io, "open_vesuvius_zarr", lambda *args, **kwargs: ArrayRoot())
     with pytest.raises(zarr.errors.NodeNotFoundError, match="zarr array"):
         open_volume("array.zarr", 2)
+    assert open_volume(
+        "array.zarr", 2, root_array_is_requested_level=True
+    ).shape == (2, 2, 2)
 
 
 def test_missing_node_error_has_zarr2_fallback(monkeypatch):

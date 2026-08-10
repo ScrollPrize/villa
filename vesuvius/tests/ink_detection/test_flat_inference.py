@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from vesuvius.ink_detection.infer import (
     compute_importance_map_2d,
     convert_volume_dtype,
     flat_preprocessing_from_config,
+    infer_folder,
     iter_blocks,
     iter_probability_tiles,
     main,
@@ -300,6 +302,35 @@ def test_cli_aliases_folder_shorthand_and_segment_resolution(tmp_path):
     direct = segment / "segment.ome.zarr"
     direct.mkdir()
     assert resolve_segment_zarr_path(segment) == direct
+
+
+def test_folder_mode_logs_existing_prediction_and_summary(
+    tmp_path, monkeypatch, caplog
+):
+    segment = tmp_path / "segment"
+    input_zarr = segment / "surface.zarr"
+    input_zarr.mkdir(parents=True)
+    (input_zarr / ".zarray").touch()
+    prediction_dir = segment / "preds"
+    prediction_dir.mkdir()
+    existing = prediction_dir / "segment_model_forward_010101.tif"
+    existing.touch()
+    monkeypatch.setattr(
+        "vesuvius.ink_detection.infer.infer_single_zarr",
+        lambda **kwargs: pytest.fail("existing prediction was rerun"),
+    )
+    args = SimpleNamespace(
+        folder=tmp_path,
+        checkpoint=Path("model.pth"),
+        output_prefix="",
+        direction="forward",
+    )
+
+    with caplog.at_level("INFO"):
+        infer_folder(args, None, device=torch.device("cpu"))
+
+    assert "already have segment_model_forward_010101.tif" in caplog.text
+    assert "segments_ran=0 segments_skipped=1" in caplog.text
 
 
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path):

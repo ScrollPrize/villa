@@ -1252,20 +1252,33 @@ def infer_folder(
     checkpoint_stem = Path(args.checkpoint).stem
     date = datetime.now().strftime("%d%m%y")
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
+    ran_count = 0
+    skipped_count = 0
     for segment_dir in segment_dirs:
         try:
             input_zarr = resolve_segment_zarr_path(segment_dir)
         except FileNotFoundError as exc:
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+            skipped_count += 1
             continue
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
                 f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
             )
             prediction_dir = segment_dir / "preds"
-            if prediction_dir.exists() and next(
-                prediction_dir.glob(f"{name_prefix}*.tif"), None
-            ) is not None:
+            existing = (
+                next(prediction_dir.glob(f"{name_prefix}*.tif"), None)
+                if prediction_dir.exists()
+                else None
+            )
+            if existing is not None:
+                LOGGER.info(
+                    "Skipping segment=%s direction=%s — already have %s",
+                    segment_dir.name,
+                    direction,
+                    existing.name,
+                )
+                skipped_count += 1
                 continue
             infer_single_zarr(
                 args=args,
@@ -1275,6 +1288,12 @@ def infer_folder(
                 output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
                 layer_direction=direction,
             )
+            ran_count += 1
+    LOGGER.info(
+        "Folder run complete. segments_ran=%d segments_skipped=%d",
+        ran_count,
+        skipped_count,
+    )
 
 
 def _is_url(path: str | Path) -> bool:

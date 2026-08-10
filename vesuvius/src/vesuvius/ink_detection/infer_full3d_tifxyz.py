@@ -1181,6 +1181,7 @@ def _open_shared_volume(
         auth_json_path,
         cache_dir=cache_dir,
         cache_max_gb=cache_max_gb,
+        root_array_is_requested_level=True,
     )
 
 
@@ -1192,12 +1193,15 @@ def _load_checkpoint_config(checkpoint_path: Path):
 
 
 def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
+    from vesuvius.ink_detection.geometry import native_volume_downsample_factor
+
     payload, config = _load_checkpoint_config(args.checkpoint)
     if config.data.mode not in {"full_3d", "full_3d_single_wrap"}:
         raise ValueError(
             "infer_full3d_tifxyz requires mode 'full_3d' or "
             f"'full_3d_single_wrap', got {config.data.mode!r}"
         )
+    downsample_factor = native_volume_downsample_factor(int(args.resolution))
     volume_path = read_volume_source(args.tifxyz_dir)
     volume = volume_opener(
         volume_path,
@@ -1210,7 +1214,7 @@ def _plan_from_args(args, *, volume_opener: Callable = _open_shared_volume):
     chunks = tuple(int(value) for value in (volume.chunks or volume.shape))
     if len(shape) != 3 or len(chunks) != 3:
         raise ValueError(f"Expected a 3D ZYX input array, got shape={shape}, chunks={chunks}")
-    scale = 1.0 / float(2 ** int(args.resolution))
+    scale = 1.0 / float(downsample_factor)
     x, y, z, valid = read_tifxyz_points(
         args.tifxyz_dir, native_coordinate_scale=scale
     )
