@@ -414,15 +414,14 @@ def _missing_node_error(message: str) -> Exception:
     return error_type(message)
 
 
-def open_volume(
+def open_volume_root(
     path: str | Path,
-    resolution: int,
     auth_json_path: str | Path | None = None,
     *,
     cache_dir: str | Path | None = None,
     cache_max_gb: float | None = None,
 ):
-    """Open one Zarr pyramid level, preserving public-S3 and Basic-Auth rules."""
+    """Open a Zarr root while preserving public-S3 and Basic-Auth rules."""
     path_text, is_public_s3 = normalize_volume_url(path)
     storage_options: dict[str, Any] = {}
     if is_public_s3:
@@ -479,19 +478,25 @@ def open_volume(
         root = open_vesuvius_zarr(
             path_text, mode="r", storage_options=storage_options
         )
+    return root
+
+
+def select_volume_level(root: Any, resolution: int | str, *, source: str) -> Any:
+    """Select one resolution from an already opened array or group root."""
+
     if hasattr(root, "shape"):
         if str(resolution) not in {"0", ""}:
             raise _missing_node_error(
-                f"{path_text.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
-                f"in zarr array {path_text!r})"
+                f"{source.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
+                f"in zarr array {source!r})"
             )
         return root
     try:
         return root[str(resolution)]
     except KeyError as exc:
         message = (
-            f"{path_text.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
-            f"in zarr store {path_text!r})"
+            f"{source.rstrip('/')}/{resolution} (resolution {str(resolution)!r} "
+            f"in zarr store {source!r})"
         )
         try:
             available = _available_top_level_keys(root)
@@ -500,6 +505,25 @@ def open_volume(
         if available:
             message += "; available top-level keys: " + ", ".join(available[:20])
         raise _missing_node_error(message) from exc
+
+
+def open_volume(
+    path: str | Path,
+    resolution: int | str,
+    auth_json_path: str | Path | None = None,
+    *,
+    cache_dir: str | Path | None = None,
+    cache_max_gb: float | None = None,
+):
+    """Open one Zarr pyramid level through the shared root boundary."""
+
+    root = open_volume_root(
+        path,
+        auth_json_path,
+        cache_dir=cache_dir,
+        cache_max_gb=cache_max_gb,
+    )
+    return select_volume_level(root, resolution, source=str(path))
 
 
 def read_bbox_with_padding(
