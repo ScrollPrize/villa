@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import tempfile
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ import numpy as np
 import tifffile
 import zarr
 from tqdm import tqdm
+
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 _THREAD_LOCAL = threading.local()
 _WORKER_CONFIG: "WorkerConfig | None" = None
@@ -71,7 +75,7 @@ class ChunkTask:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description="Create chunked uint8 TIFF projections from Zarr volumes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -405,34 +409,45 @@ def _write_projection(job: DatasetJob, args: argparse.Namespace) -> None:
             "initargs": (worker_config,),
         }
 
-    with executor_cls(**executor_kwargs) as executor:
-        tile_iter = executor.map(_project_chunk, tasks, chunksize=1)
+    with tempfile.NamedTemporaryFile(
+        dir=job.output_path.parent,
+        prefix=f".{job.output_path.stem}.",
+        suffix=job.output_path.suffix,
+        delete=False,
+    ) as stream:
+        staged_output = Path(stream.name)
+    try:
+        with executor_cls(**executor_kwargs) as executor:
+            tile_iter = executor.map(_project_chunk, tasks, chunksize=1)
 
-        progress = tqdm(
-            total=len(tasks),
-            desc=job.folder.name,
-            disable=args.no_progress,
-            leave=False,
-        )
-
-        def _yield_tiles() -> Iterator[np.ndarray]:
-            try:
-                for tile in tile_iter:
-                    progress.update(1)
-                    yield tile
-            finally:
-                progress.close()
-
-        with tifffile.TiffWriter(str(job.output_path), bigtiff=True) as writer:
-            writer.write(
-                data=_yield_tiles(),
-                shape=(job.shape[1], job.shape[2]),
-                dtype=np.uint8,
-                tile=job.tile_shape,
-                photometric="minisblack",
-                compression=args.compression,
-                maxworkers=1,
+            progress = tqdm(
+                total=len(tasks),
+                desc=job.folder.name,
+                disable=args.no_progress,
+                leave=False,
             )
+
+            def _yield_tiles() -> Iterator[np.ndarray]:
+                try:
+                    for tile in tile_iter:
+                        progress.update(1)
+                        yield tile
+                finally:
+                    progress.close()
+
+            with tifffile.TiffWriter(str(staged_output), bigtiff=True) as writer:
+                writer.write(
+                    data=_yield_tiles(),
+                    shape=(job.shape[1], job.shape[2]),
+                    dtype=np.uint8,
+                    tile=job.tile_shape,
+                    photometric="minisblack",
+                    compression=args.compression,
+                    maxworkers=1,
+                )
+        staged_output.replace(job.output_path)
+    finally:
+        staged_output.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

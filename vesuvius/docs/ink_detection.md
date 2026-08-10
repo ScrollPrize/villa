@@ -164,6 +164,36 @@ prediction files; and `composite_from_zarr` writes max or mean TIFF projections.
 The downloader uses tifxyz patch geometry to copy only source chunks required
 by selected label patches. Use `--dry-run` to inspect its plan before writing.
 
+All long options accept hyphens and underscores interchangeably; help shows the
+reference spelling. The commands have these persistent-state guarantees:
+
+- `validate_segments` reports every readable label-content problem even when
+  another segment has missing or corrupt metadata. Pass the family directory
+  whose immediate children are segment directories as `ROOT`.
+- `clean_labels` stages and validates the replacement before moving the source
+  into the sibling `label_backup` tree. A failed write leaves the active input
+  in place, and a completed rerun is reported as skipped unless `--overwrite`
+  is supplied.
+- `merge_predictions` retains the reference selection policy: eligible stems
+  contain `betti`, `ema`, or `640`, and the greatest parsed checkpoint is used
+  for each term and direction. An invocation that writes no merged output fails
+  instead of reporting success; decoded floating predictions must be finite.
+- `composite_from_zarr` publishes each TIFF only after all projected tiles are
+  written. Existing outputs fail unless `--overwrite` is supplied.
+- `download_required_zarr_chunks` writes an explicit Zarr-v2 sparse output
+  readable by Zarr 2 and 3. Its root attributes record the normalized source,
+  every array schema, exact per-scale chunk plan, recompression preset, and
+  completed chunk ids. Resume requires all of those plus the actual output
+  schema to agree; use `--overwrite` to replace an incompatible store.
+
+The downloader accepts two inert reference-compatibility flags:
+`--stored-grid-pad` and `--patch-finding-workers`. They do not change patch
+discovery or the exported chunk plan. Active planning controls are
+`--patch-size`, `--overlap-fraction`, `--patch-finding-type`, the subtiling
+tile/stride/filter options, `--patch-min-labeled-coverage`, `--patch-filter`,
+and `--label-version`. Output controls are `--download-workers`,
+`--recompress`, `--dry-run`, and `--overwrite`.
+
 ## Train
 
 Copy the shipped hybrid recipe, replace `out_dir` and `datasets`, then run:

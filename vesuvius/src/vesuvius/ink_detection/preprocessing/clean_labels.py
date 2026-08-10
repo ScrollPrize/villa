@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Normalize label rasters and publish cleaned TIFFs with recoverable backups."""
+
 from __future__ import annotations
 
 import argparse
@@ -7,14 +9,16 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Dict, List, Sequence
 
-import cv2
 import numpy as np
 from PIL import Image
 from scipy import ndimage
 import tifffile
 from tqdm.auto import tqdm
+
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 TARGET_IMAGE_RE = re.compile(
@@ -45,7 +49,7 @@ def parse_version_id(value: str) -> int:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description=(
             "Normalize label and supervision-mask images, remove small connected "
             "components, optionally fill holes, and write tiled LZW-compressed TIFFs."
@@ -210,6 +214,8 @@ def remove_small_components(mask_u8: np.ndarray, min_component_size: int) -> np.
     if min_component_size <= 1:
         return np.ascontiguousarray(mask_u8)
 
+    import cv2
+
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     keep = np.zeros(num_labels, dtype=bool)
     keep[0] = False
@@ -226,6 +232,8 @@ def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
 def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
     if max_hole_area <= 0:
         return np.ascontiguousarray(mask_u8)
+
+    import cv2
 
     background = (mask_u8 == 0).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=8)
@@ -297,6 +305,11 @@ def write_tiff(output_path: Path, image: np.ndarray) -> None:
     )
 
 
+def _configure_image_policy() -> None:
+    os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
+    Image.MAX_IMAGE_PIXELS = None
+
+
 def process_one(
     root: Path,
     input_path: Path,
@@ -306,6 +319,7 @@ def process_one(
     max_hole_area: int,
     overwrite: bool,
 ) -> Dict[str, str]:
+    _configure_image_policy()
     output_path = output_path_for_input(input_path)
     backup_path = backup_path_for_input(root, input_path)
     output_conflict = output_path != input_path and output_path.exists()
@@ -333,14 +347,28 @@ def process_one(
         max_hole_area=max_hole_area,
     )
 
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    if overwrite and backup_path.exists():
-        backup_path.unlink()
-    shutil.move(str(input_path), str(backup_path))
-
-    if overwrite and output_path != input_path and output_path.exists():
-        output_path.unlink()
-    write_tiff(output_path, cleaned)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent,
+        prefix=f".{output_path.stem}.",
+        suffix=output_path.suffix,
+        delete=False,
+    ) as stream:
+        staged_output = Path(stream.name)
+    try:
+        write_tiff(staged_output, cleaned)
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite and backup_path.exists():
+            backup_path.unlink()
+        shutil.move(str(input_path), str(backup_path))
+        try:
+            staged_output.replace(output_path)
+        except Exception:
+            if not input_path.exists() and backup_path.exists():
+                shutil.move(str(backup_path), str(input_path))
+            raise
+    finally:
+        staged_output.unlink(missing_ok=True)
     return {
         "status": "written",
         "input": str(input_path),
@@ -426,8 +454,7 @@ def run_processing(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
-    Image.MAX_IMAGE_PIXELS = None
+    _configure_image_policy()
     args = parse_args(argv)
     root = args.root.expanduser().resolve()
     if not root.exists():

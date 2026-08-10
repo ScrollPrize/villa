@@ -1,3 +1,5 @@
+"""Copy the source Zarr chunks selected by tifxyz label-patch geometry."""
+
 import argparse
 import json
 import multiprocessing as mp
@@ -10,77 +12,19 @@ import numpy as np
 import zarr
 from numcodecs import Blosc
 from tqdm.auto import tqdm
-
-import aiohttp
-import fsspec
 import vesuvius.tifxyz as tifxyz
 
+from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import compute_native_crop_bbox
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
-from vesuvius.ink_detection.data.segment import parse_label_asset_path
-from vesuvius.ink_detection.volume_io import load_volume_auth as _load_volume_auth
+from vesuvius.ink_detection.data.segment import discover_segment_labels
+from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
-
-
-@dataclass
-class Segment:
-    """The download operation's reference-compatible segment input view."""
-
-    config: dict
-    image_volume: Path
-    scale: int
-    dataset_idx: int
-    segment_relpath: str
-    segment_dir: Path
-    segment_name: str
-    inklabels: Path | None = None
-    supervision_mask: Path | None = None
-    validation_mask: Path | None = None
-
-    @property
-    def patch_size(self) -> tuple[int, int, int]:
-        return tuple(int(value) for value in self.config["patch_size"])
-
-    def discover_labels(self, *, label_version: str | None, extension: str) -> None:
-        candidates: dict[str, dict[int, Path]] = {
-            "inklabels": {}, "supervision_mask": {}, "validation_mask": {}
-        }
-        for path in self.segment_dir.iterdir():
-            parsed = parse_label_asset_path(path)
-            if parsed is None or parsed["prefix"] != self.segment_name:
-                continue
-            if parsed["extension"] != extension:
-                continue
-            candidates[str(parsed["label_kind"])][int(parsed["version_num"])] = path
-        requested = None if label_version in (None, "") else str(label_version)
-        if requested is not None:
-            version = int(requested.removeprefix("v"))
-            self.inklabels = candidates["inklabels"].get(version)
-            self.supervision_mask = candidates["supervision_mask"].get(version)
-            self.validation_mask = candidates["validation_mask"].get(version)
-        else:
-            self.inklabels = candidates["inklabels"].get(max(candidates["inklabels"], default=-1))
-            self.supervision_mask = candidates["supervision_mask"].get(max(candidates["supervision_mask"], default=-1))
-            self.validation_mask = candidates["validation_mask"].get(max(candidates["validation_mask"], default=-1))
-        if self.inklabels is None or self.supervision_mask is None:
-            raise ValueError(f"{self.segment_dir} must contain matching {extension} inklabels and supervision_mask")
-
-
-def load_volume_auth(auth_json_path: str | Path | None) -> tuple[str | None, str | None]:
-    auth = _load_volume_auth(auth_json_path)
-    return (None, None) if auth is None else auth
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def open_zarr(path: str | Path, resolution: int, auth=None):
     return open_volume(path, resolution, auth_json_path=auth)
-
-
-def resolve_patch_finding_type(config: dict) -> str:
-    return str(config.get("patch_finding_type", "default")).strip().lower() or "default"
-
-
-def compute_native_crop_bbox_from_patch_points(points, valid, patch_size):
-    return compute_native_crop_bbox(points, valid, tuple(int(value) for value in patch_size))
 
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
@@ -88,6 +32,9 @@ DEFAULT_OVERLAP_FRACTION = 0.25
 DEFAULT_STORED_GRID_PAD = 40
 DEFAULT_RECOMPRESS_PRESET = "balanced"
 DEFAULT_PATCH_FILTER = "supervision"
+DOWNLOAD_PLAN_ATTR = "vesuvius_ink_download_plan"
+DOWNLOAD_PROGRESS_ATTR = "vesuvius_ink_download_progress"
+DOWNLOAD_PLAN_FORMAT = "vesuvius-ink-sparse-download-v1"
 
 _WORKER_SOURCE = None
 _WORKER_DEST = None
@@ -134,24 +81,7 @@ class DatasetChunkPlan:
 
 
 def open_zarr_group(path, auth=None):
-    path_str = str(path)
-    user, password = load_volume_auth(auth)
-    use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
-    if use_https_auth:
-        fs = fsspec.filesystem(
-            "https",
-            client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
-        )
-        store = zarr.storage.FSStore(
-            path_str.rstrip("/"),
-            fs=fs,
-            mode="r",
-            check=False,
-            create=False,
-            exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
-        )
-        return zarr.open(store, mode="r")
-    return open_volume_root(path_str, auth_json_path=auth)
+    return open_volume_root(str(path), auth_json_path=auth)
 
 
 def compressor_from_recompress_preset(preset: str):
@@ -374,72 +304,189 @@ def scale_chunk_ids_across_multiscale(
     return scaled_chunk_ids
 
 
-def _build_output_arrays(source_group, output_path: Path, overwrite: bool, recompress: str):
-    if output_path.exists():
-        if overwrite:
-            shutil.rmtree(output_path)
+def _array_schema(array) -> dict[str, object]:
+    fill_value = array.fill_value
+    if isinstance(fill_value, np.generic):
+        fill_value = fill_value.item()
+    return {
+        "shape": [int(value) for value in array.shape],
+        "chunks": [int(value) for value in array.chunks],
+        "dtype": np.dtype(array.dtype).str,
+        "fill_value": fill_value,
+        "order": str(getattr(array, "order", "C")),
+    }
 
-    root = zarr.open_group(str(output_path), mode="a" if output_path.exists() else "w")
+
+def _normalized_source_path(volume_path: str) -> str:
+    if "://" in volume_path:
+        return volume_path.rstrip("/")
+    return str(Path(volume_path).expanduser().resolve())
+
+
+def _build_download_plan(
+    source_group,
+    *,
+    volume_path: str,
+    volume_scale: int,
+    chunk_ids_by_scale: dict[int, tuple[tuple[int, int, int], ...]],
+    recompress: str,
+) -> dict[str, object]:
+    array_keys = sorted(
+        (str(key) for key in source_group.array_keys()),
+        key=lambda value: int(value) if value.isdigit() else value,
+    )
+    return {
+        "format": DOWNLOAD_PLAN_FORMAT,
+        "source": {
+            "volume_path": _normalized_source_path(volume_path),
+            "volume_scale": int(volume_scale),
+        },
+        "arrays": {
+            key: _array_schema(source_group[key])
+            for key in array_keys
+        },
+        "chunk_ids_by_scale": {
+            str(scale): [list(chunk_id) for chunk_id in chunk_ids_by_scale[scale]]
+            for scale in sorted(chunk_ids_by_scale)
+        },
+        "recompress": str(recompress),
+        "zarr_format": 2,
+    }
+
+
+def _progress_payload(
+    completed_chunk_ids_by_scale: dict[int, set[tuple[int, int, int]]],
+) -> dict[str, object]:
+    return {
+        "format": DOWNLOAD_PLAN_FORMAT,
+        "completed_chunk_ids_by_scale": {
+            str(scale): [list(chunk_id) for chunk_id in sorted(chunk_ids)]
+            for scale, chunk_ids in sorted(completed_chunk_ids_by_scale.items())
+        },
+    }
+
+
+def _write_progress(
+    output_path: Path,
+    completed_chunk_ids_by_scale: dict[int, set[tuple[int, int, int]]],
+) -> None:
+    root = zarr.open_group(str(output_path), mode="r+")
+    root.attrs[DOWNLOAD_PROGRESS_ATTR] = _progress_payload(
+        completed_chunk_ids_by_scale
+    )
+
+
+def _create_output_arrays(source_group, output_path: Path, recompress: str):
+    group_kwargs: dict[str, object] = {"mode": "w"}
+    zarr_v3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+    if zarr_v3:
+        group_kwargs["zarr_format"] = 2
+    root = zarr.open_group(str(output_path), **group_kwargs)
     compressor = compressor_from_recompress_preset(recompress)
-    try:
-        root.attrs.update(source_group.attrs.asdict())
-    except Exception:
-        pass
-    existing_array_keys = set(root.array_keys())
-    for key in sorted(source_group.array_keys(), key=lambda v: int(v) if str(v).isdigit() else str(v)):
+    root.attrs.update(dict(source_group.attrs))
+    array_keys = sorted(
+        (str(key) for key in source_group.array_keys()),
+        key=lambda value: int(value) if value.isdigit() else value,
+    )
+    for key in array_keys:
         source_array = source_group[key]
-        if str(key) in existing_array_keys:
-            out_array = root[str(key)]
+        create_kwargs = {
+            "shape": tuple(int(value) for value in source_array.shape),
+            "chunks": tuple(int(value) for value in source_array.chunks),
+            "dtype": source_array.dtype,
+            "compressor": compressor,
+            "fill_value": source_array.fill_value,
+            "filters": source_array.filters,
+            "order": getattr(source_array, "order", "C"),
+        }
+        if zarr_v3:
+            output_array = root.create_array(key, **create_kwargs)
         else:
-            out_array = root.create_dataset(
-                str(key),
-                shape=tuple(int(v) for v in source_array.shape),
-                chunks=tuple(int(v) for v in source_array.chunks),
-                dtype=source_array.dtype,
-                compressor=compressor,
-                fill_value=source_array.fill_value,
-                filters=source_array.filters,
-                order=getattr(source_array, "order", "C"),
-                overwrite=False,
-            )
-        try:
-            out_array.attrs.update(source_array.attrs.asdict())
-        except Exception:
-            pass
+            output_array = root.create_dataset(key, **create_kwargs)
+        output_array.attrs.update(dict(source_array.attrs))
     return root
 
 
-def _missing_chunk_ids_for_scale(
+def _validate_output_schema(output_path: Path, plan: dict[str, object]) -> None:
+    root_metadata = output_path / ".zgroup"
+    if not root_metadata.is_file() or json.loads(root_metadata.read_text())["zarr_format"] != 2:
+        raise ValueError(f"Existing sparse output is not an explicit Zarr-v2 group: {output_path}")
+    root = zarr.open_group(str(output_path), mode="r")
+    expected_arrays = plan["arrays"]
+    assert isinstance(expected_arrays, dict)
+    actual_keys = set(str(key) for key in root.array_keys())
+    if actual_keys != set(expected_arrays):
+        raise ValueError(
+            f"Existing sparse output array keys do not match its plan: "
+            f"expected={sorted(expected_arrays)} actual={sorted(actual_keys)}"
+        )
+    for key, expected_schema in expected_arrays.items():
+        actual_schema = _array_schema(root[key])
+        if actual_schema != expected_schema:
+            raise ValueError(
+                f"Existing sparse output schema for array {key!r} does not match "
+                f"its plan: expected={expected_schema!r} actual={actual_schema!r}"
+            )
+
+
+def _load_resume_progress(
     output_path: Path,
+    plan: dict[str, object],
+) -> dict[int, set[tuple[int, int, int]]]:
+    root = zarr.open_group(str(output_path), mode="r")
+    if DOWNLOAD_PLAN_ATTR not in root.attrs or DOWNLOAD_PROGRESS_ATTR not in root.attrs:
+        raise ValueError(
+            "Existing sparse output lacks its source/plan or progress manifest; "
+            f"use --overwrite to replace it: {output_path}"
+        )
+    stored_plan = root.attrs[DOWNLOAD_PLAN_ATTR]
+    if stored_plan != plan:
+        raise ValueError(
+            "Existing sparse output source, chunk plan, array schema, or "
+            f"recompression preset does not match this invocation: {output_path}"
+        )
+    _validate_output_schema(output_path, plan)
+    progress = root.attrs[DOWNLOAD_PROGRESS_ATTR]
+    if progress.get("format") != DOWNLOAD_PLAN_FORMAT:
+        raise ValueError(f"Existing sparse output progress has an unknown format: {output_path}")
+    raw_completed = progress.get("completed_chunk_ids_by_scale")
+    if not isinstance(raw_completed, dict):
+        raise ValueError(f"Existing sparse output progress is malformed: {output_path}")
+    planned = {
+        int(scale): {tuple(int(value) for value in chunk_id) for chunk_id in chunk_ids}
+        for scale, chunk_ids in plan["chunk_ids_by_scale"].items()
+    }
+    if set(raw_completed) != {str(scale) for scale in planned}:
+        raise ValueError(f"Existing sparse output progress scales do not match its plan: {output_path}")
+    completed = {
+        int(scale): {tuple(int(value) for value in chunk_id) for chunk_id in chunk_ids}
+        for scale, chunk_ids in raw_completed.items()
+    }
+    for scale, completed_ids in completed.items():
+        if not completed_ids.issubset(planned[scale]):
+            raise ValueError(
+                f"Existing sparse output progress contains unplanned chunks at scale {scale}"
+            )
+    return completed
+
+
+def _missing_chunk_ids_for_scale(
     *,
-    scale: int,
     chunk_ids: tuple[tuple[int, int, int], ...],
+    completed_chunk_ids: set[tuple[int, int, int]],
 ) -> tuple[tuple[int, int, int], ...]:
-    if not chunk_ids or not output_path.exists():
-        return chunk_ids
-
-    try:
-        output_array = zarr.open(str(output_path), path=str(int(scale)), mode="r")
-    except Exception:
-        return chunk_ids
-
-    store = getattr(output_array, "chunk_store", output_array.store)
-    missing_chunk_ids = []
-    for chunk_id in chunk_ids:
-        if output_array._chunk_key(tuple(int(v) for v in chunk_id)) not in store:
-            missing_chunk_ids.append(tuple(int(v) for v in chunk_id))
-    return tuple(missing_chunk_ids)
+    return tuple(chunk_id for chunk_id in chunk_ids if chunk_id not in completed_chunk_ids)
 
 
 def _init_chunk_copy_worker(volume_path: str, volume_scale: int, volume_auth_json: str | None, output_path: str):
     global _WORKER_SOURCE, _WORKER_DEST, _WORKER_CHUNK_SHAPE, _WORKER_ARRAY_SHAPE
     _WORKER_SOURCE = open_zarr(volume_path, volume_scale, auth=volume_auth_json)
-    _WORKER_DEST = zarr.open(str(output_path), path=str(int(volume_scale)), mode="r+")
+    _WORKER_DEST = zarr.open_group(str(output_path), mode="r+")[str(int(volume_scale))]
     _WORKER_CHUNK_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.chunks)
     _WORKER_ARRAY_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.shape)
 
 
-def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> int:
+def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> tuple[int, int, int]:
     if _WORKER_SOURCE is None or _WORKER_DEST is None:
         raise RuntimeError("Chunk copy worker is not initialized.")
 
@@ -457,11 +504,11 @@ def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> int:
         min(int(array_shape[2]), starts[2] + int(chunk_shape[2])),
     )
     if any(start >= stop for start, stop in zip(starts, stops)):
-        return 0
+        raise ValueError(f"Chunk id is outside source bounds: {chunk_id}")
 
     slices = tuple(slice(start, stop) for start, stop in zip(starts, stops))
     _WORKER_DEST[slices] = np.asarray(_WORKER_SOURCE[slices])
-    return 1
+    return tuple(int(value) for value in chunk_id)
 
 
 def copy_chunks_to_output(
@@ -477,21 +524,37 @@ def copy_chunks_to_output(
     recompress: str,
 ) -> dict[str, dict[int, int]]:
     source_group = open_zarr_group(volume_path, auth=volume_auth_json)
-    _build_output_arrays(
+    plan = _build_download_plan(
         source_group,
-        output_path,
-        overwrite=overwrite,
+        volume_path=volume_path,
+        volume_scale=volume_scale,
+        chunk_ids_by_scale=chunk_ids_by_scale,
         recompress=recompress,
     )
+    if output_path.exists() and overwrite:
+        if not output_path.is_dir():
+            raise ValueError(f"Sparse output exists and is not a directory: {output_path}")
+        shutil.rmtree(output_path)
+    if output_path.exists():
+        completed_chunk_ids_by_scale = _load_resume_progress(output_path, plan)
+    else:
+        output_root = _create_output_arrays(source_group, output_path, recompress)
+        output_root.attrs[DOWNLOAD_PLAN_ATTR] = plan
+        completed_chunk_ids_by_scale = {
+            int(scale): set() for scale in chunk_ids_by_scale
+        }
+        output_root.attrs[DOWNLOAD_PROGRESS_ATTR] = _progress_payload(
+            completed_chunk_ids_by_scale
+        )
 
     copied_counts_by_scale = {}
     existing_counts_by_scale = {}
     for scale in sorted(chunk_ids_by_scale):
         requested_chunk_ids = chunk_ids_by_scale[scale]
+        completed_chunk_ids = completed_chunk_ids_by_scale[int(scale)]
         chunk_ids = _missing_chunk_ids_for_scale(
-            output_path,
-            scale=scale,
             chunk_ids=requested_chunk_ids,
+            completed_chunk_ids=completed_chunk_ids,
         )
         copied_counts_by_scale[int(scale)] = 0
         existing_counts_by_scale[int(scale)] = int(len(requested_chunk_ids) - len(chunk_ids))
@@ -506,9 +569,15 @@ def copy_chunks_to_output(
                 output_path=str(output_path),
             )
             copied_count = 0
-            for chunk_id in tqdm(chunk_ids, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
-                copied_count += _copy_one_chunk(chunk_id)
-            copied_counts_by_scale[int(scale)] = int(copied_count)
+            try:
+                for chunk_id in tqdm(chunk_ids, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
+                    completed_chunk_ids.add(_copy_one_chunk(chunk_id))
+                    copied_count += 1
+                    if copied_count % 64 == 0:
+                        _write_progress(output_path, completed_chunk_ids_by_scale)
+            finally:
+                _write_progress(output_path, completed_chunk_ids_by_scale)
+            copied_counts_by_scale[int(scale)] = copied_count
             continue
 
         ctx = mp.get_context("spawn")
@@ -519,9 +588,15 @@ def copy_chunks_to_output(
         ) as pool:
             iterator = pool.imap_unordered(_copy_one_chunk, chunk_ids, chunksize=8)
             copied_count = 0
-            for copied in tqdm(iterator, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
-                copied_count += int(copied)
-            copied_counts_by_scale[int(scale)] = int(copied_count)
+            try:
+                for copied_chunk_id in tqdm(iterator, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
+                    completed_chunk_ids.add(copied_chunk_id)
+                    copied_count += 1
+                    if copied_count % 64 == 0:
+                        _write_progress(output_path, completed_chunk_ids_by_scale)
+            finally:
+                _write_progress(output_path, completed_chunk_ids_by_scale)
+            copied_counts_by_scale[int(scale)] = copied_count
 
     return {
         "copied_counts_by_scale": copied_counts_by_scale,
@@ -576,20 +651,21 @@ def _segment_patch_candidates(
     if patch_filter not in {"positive", "supervision"}:
         raise ValueError(f"Unsupported patch filter: {patch_filter!r}")
 
-    volume_auth = segment.config.get("volume_auth_json")
+    volume_auth = segment.data_config.volume_auth_json
     supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
     inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
 
     surface = int(supervision_mask.shape[0] // 2)
     patch_size = tuple(int(v) for v in segment.patch_size)
-    patch_finding_type = resolve_patch_finding_type(segment.config)
+    patch_finding = segment.data_config.patch_finding
+    patch_finding_type = patch_finding.kind
 
     if patch_finding_type == "default":
         ys, xs = np.nonzero(np.asarray(supervision_mask[surface]))
         if int(ys.size) == 0:
             raise ValueError(f"{segment.supervision_mask} contains no nonzero voxels")
 
-        stride = int(patch_size[1] * float(segment.config["patch_overlap"]))
+        stride = int(patch_size[1] * patch_finding.overlap)
         if stride <= 0:
             raise ValueError(f"patch_overlap produced non-positive stride={stride}")
 
@@ -601,10 +677,10 @@ def _segment_patch_candidates(
         return candidates, int(len(candidates))
 
     patch_size_yx = int(patch_size[1])
-    default_stride = int(patch_size_yx * float(segment.config["patch_overlap"]))
-    tile_size = int(segment.config.get("patch_finding_tile_size", patch_size_yx))
-    stride = int(segment.config.get("patch_finding_stride", default_stride))
-    filter_empty_tile = bool(segment.config.get("patch_finding_filter_empty_tile", False))
+    default_stride = int(patch_size_yx * patch_finding.overlap)
+    tile_size = patch_size_yx if patch_finding.tile_size is None else patch_finding.tile_size
+    stride = default_stride if patch_finding.stride is None else patch_finding.stride
+    filter_empty_tile = patch_finding.filter_empty_tile
     tile_mask = inklabels[surface] if patch_filter == "positive" else supervision_mask[surface]
     _, xyxys, _ = build_patch_index(
         mask=tile_mask,
@@ -626,7 +702,7 @@ def _build_segment_download_patches(
     patch_filter = str(patch_filter).strip().lower()
     candidates, candidate_count = _segment_patch_candidates(segment, patch_filter=patch_filter)
 
-    volume_auth = segment.config.get("volume_auth_json")
+    volume_auth = segment.data_config.volume_auth_json
     supervision_mask = open_zarr(segment.supervision_mask, resolution=segment.scale, auth=volume_auth)
     inklabels = open_zarr(segment.inklabels, resolution=segment.scale, auth=volume_auth)
     validation_mask = None
@@ -635,7 +711,7 @@ def _build_segment_download_patches(
 
     surface = int(supervision_mask.shape[0] // 2)
     patch_size = tuple(int(v) for v in segment.patch_size)
-    min_labeled_coverage = float(segment.config.get("patch_min_labeled_coverage", 0.0))
+    min_labeled_coverage = segment.data_config.patch_finding.min_labeled_coverage
     patch_tifxyz = tifxyz.read_tifxyz(segment.segment_dir)
     patch_tifxyz.use_full_resolution()
 
@@ -647,10 +723,10 @@ def _build_segment_download_patches(
             int(x0):int(x0) + patch_size[2],
         ]
         patch_zyxs = np.stack([flat_z, flat_y, flat_x], axis=-1)
-        native_world_bbox = compute_native_crop_bbox_from_patch_points(
+        native_world_bbox = compute_native_crop_bbox(
             patch_zyxs,
             flat_valid,
-            patch_size,
+            tuple(int(value) for value in patch_size),
         )
 
         if validation_mask is not None:
@@ -726,6 +802,13 @@ def _build_dataset_download_patches(
         "patch_min_labeled_coverage": float(patch_min_labeled_coverage),
         "volume_auth_json": source_spec.volume_auth_json,
         "label_version": label_version,
+        "datasets": [
+            {
+                "segments_path": str(dataset_dir),
+                "volume_scale": int(source_spec.volume_scale),
+                "volume_path": str(source_spec.volume_path),
+            }
+        ],
     }
     if patch_finding_tile_size is not None:
         config["patch_finding_tile_size"] = int(patch_finding_tile_size)
@@ -734,19 +817,21 @@ def _build_dataset_download_patches(
     if bool(patch_finding_filter_empty_tile):
         config["patch_finding_filter_empty_tile"] = True
 
+    data_config = InkDataConfig.from_mapping(config)
+    source = data_config.datasets[0]
     patches: list[dict] = []
     candidate_bbox_count = 0
     for segment_dir in _iter_segment_dirs(dataset_dir):
         segment = Segment(
-            config=config,
-            image_volume=Path(str(source_spec.volume_path)),
-            scale=int(source_spec.volume_scale),
+            data_config=data_config,
+            source=source,
             dataset_idx=0,
             segment_relpath=segment_dir.relative_to(dataset_dir).as_posix(),
             segment_dir=segment_dir,
             segment_name=segment_dir.name,
+            image_volume=str(source_spec.volume_path),
         )
-        segment.discover_labels(label_version=label_version, extension=".zarr")
+        segment = discover_segment_labels(segment, extension=".zarr", required=True)
         segment_patches, segment_candidate_count = _build_segment_download_patches(
             segment,
             patch_filter=patch_filter,
@@ -904,7 +989,7 @@ def _format_bytes(num_bytes: int) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description=(
             "Compute tifxyz patch-driven chunk coverage and download only the required "
             "chunks into <dataset>/<dataset>.zarr."
@@ -952,7 +1037,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stored-grid-pad",
         type=int,
         default=DEFAULT_STORED_GRID_PAD,
-        help="Stored grid padding passed into patchfinding.",
+        help="Accepted compatibility no-op; retained for frozen reference invocations.",
     )
     parser.add_argument(
         "--patch-finding-workers",

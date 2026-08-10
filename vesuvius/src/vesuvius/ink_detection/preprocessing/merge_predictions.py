@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Merge selected directional ink-prediction rasters into one uint8 image."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +16,8 @@ import numpy as np
 from PIL import Image
 import tifffile
 from tqdm.auto import tqdm
+
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 MATCH_TERMS = [
@@ -53,10 +57,12 @@ class FolderResult:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description=(
             "Recursively find preds folders, merge matching prediction files with a "
-            "selected aggregation method, and write merged outputs back into each preds folder."
+            "selected aggregation method, and write merged outputs back into each preds folder. "
+            "The frozen selection keeps the greatest checkpoint for each of betti, ema, and 640; "
+            "the command fails when no requested output is produced."
         )
     )
     parser.add_argument(
@@ -216,6 +222,8 @@ def normalize_prediction_array(array: np.ndarray, *, path: Path) -> np.ndarray:
         normalized = normalized[..., 0]
     if normalized.ndim != 2:
         raise ValueError(f"Expected a 2D prediction image in {path}, got shape={tuple(normalized.shape)}")
+    if np.issubdtype(normalized.dtype, np.floating) and not np.isfinite(normalized).all():
+        raise ValueError(f"Prediction image contains non-finite values: {path}")
     return normalized
 
 
@@ -237,7 +245,12 @@ def prepare_prediction(path: Path) -> PreparedPrediction:
                 raise RuntimeError(f"No TIFF pages found in {path}")
             memmap_array = tif.pages[0].asarray(out="memmap")
         normalized = normalize_prediction_array(memmap_array, path=path)
-        cleanup_path = Path(memmap_array.filename)
+        memmap_path = Path(memmap_array.filename)
+        cleanup_path = (
+            None
+            if memmap_path.resolve() == path.resolve()
+            else memmap_path
+        )
         return PreparedPrediction(path=path, array=normalized, cleanup_path=cleanup_path)
 
     with Image.open(path) as image:
@@ -266,8 +279,10 @@ def normalize_chunk_to_u8(chunk: np.ndarray) -> np.ndarray:
     if array.dtype == np.uint8:
         return array
     if np.issubdtype(array.dtype, np.floating):
-        max_value = float(np.nanmax(array))
-        min_value = float(np.nanmin(array))
+        if not np.isfinite(array).all():
+            raise ValueError("Prediction chunk contains non-finite values")
+        max_value = float(np.max(array))
+        min_value = float(np.min(array))
         if min_value >= 0.0 and max_value <= 1.0:
             return np.clip(np.rint(array * 255.0), 0, 255).astype(np.uint8)
         return np.clip(np.rint(array), 0, 255).astype(np.uint8)
@@ -395,10 +410,13 @@ def write_prediction_image(output_path: Path, output_array: np.ndarray) -> None:
 
 
 def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_method: str) -> None:
-    prepared_predictions = [prepare_prediction(path) for path in files]
+    prepared_predictions: list[PreparedPrediction] = []
     output_memmap_path: Path | None = None
     output_array: np.memmap | None = None
+    staged_output_path: Path | None = None
     try:
+        for path in files:
+            prepared_predictions.append(prepare_prediction(path))
         height, width = validate_prediction_shapes(prepared_predictions)
         row_chunk_size = choose_row_chunk_size(width, len(prepared_predictions))
         output_handle = tempfile.NamedTemporaryFile(prefix="merge_predictions_out_", suffix=".memmap", delete=False)
@@ -412,7 +430,16 @@ def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_me
             output_array[row_start:row_end, :] = merge_chunk(chunks, merge_method=merge_method)
 
         output_array.flush()
-        write_prediction_image(output_path, output_array)
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.stem}.",
+            suffix=output_path.suffix,
+            delete=False,
+        ) as stream:
+            staged_output_path = Path(stream.name)
+        write_prediction_image(staged_output_path, output_array)
+        staged_output_path.replace(output_path)
+        staged_output_path = None
     finally:
         if output_array is not None:
             try:
@@ -425,6 +452,8 @@ def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_me
                 output_memmap_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        if staged_output_path is not None:
+            staged_output_path.unlink(missing_ok=True)
 
 
 def directions_to_process(direction: str) -> tuple[str, ...]:
@@ -442,12 +471,23 @@ def process_preds_folder(
 ) -> FolderResult:
     direction_results: list[DirectionResult] = []
     for direction in directions_to_process(requested_direction):
+        directional_inputs = collect_matching_prediction_files(
+            preds_dir,
+            normalized_terms=(),
+            direction=direction,
+        )
         matched_files = collect_matching_prediction_files(
             preds_dir,
             normalized_terms=normalized_terms,
             direction=direction,
         )
         if not matched_files:
+            if directional_inputs:
+                raise ValueError(
+                    f"{preds_dir} contains {len(directional_inputs)} valid {direction} "
+                    "prediction file(s), but none match the frozen selection terms: "
+                    + ", ".join(normalized_terms)
+                )
             direction_results.append(
                 DirectionResult(
                     direction=direction,
@@ -532,6 +572,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             for result in tqdm(iterator, total=len(tasks), desc="Merging preds folders"):
                 results.append(result)
 
+    merged_outputs = sum(
+        direction.output_path is not None
+        for result in results
+        for direction in result.directions
+    )
+    if merged_outputs == 0:
+        raise RuntimeError(
+            "No matching prediction files were merged from the requested folders and directions"
+        )
     print(summarize_results(results))
     return 0
 

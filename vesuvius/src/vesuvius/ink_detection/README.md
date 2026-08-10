@@ -79,6 +79,14 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.composite_f
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_required_zarr_chunks --datasets-root DATASETS --volumes-json VOLUMES.json --output-root OUTPUT --dry-run
 ```
 
+The downloader always creates an explicit Zarr-v2 store and records its source,
+array schemas, exact chunk plan, and completed chunks in root attributes before
+allowing resume. `--stored-grid-pad` and `--patch-finding-workers` are accepted
+inert compatibility flags; they do not affect the plan. Prediction merging
+retains the reference `betti`/`ema`/`640` stem filter and fails when it produces
+no output. Label cleaning and composite TIFF publication are transactional.
+Every long option also accepts the opposite hyphen/underscore spelling.
+
 Train:
 
 ```bash

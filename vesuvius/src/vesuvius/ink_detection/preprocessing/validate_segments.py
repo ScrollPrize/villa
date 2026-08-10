@@ -16,6 +16,8 @@ import tifffile
 from tqdm.auto import tqdm
 import zarr
 
+from vesuvius.utils.cli import HyphenUnderscoreParser
+
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 LABEL_TIFF_NAME_RE = re.compile(
@@ -57,7 +59,7 @@ class TiffMetadata:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description=(
             "Scan scroll/segment folders and verify that each segment's .zarr spatial "
             "shape matches its relevant TIFF files, and that label TIFFs are binary "
@@ -447,16 +449,6 @@ def validate_root(
             state.issues.append(ShapeIssue(tiff_path, "label image has an alpha channel"))
         if _is_label_tiff(tiff_path):
             label_stage_items.append((state, tiff_path, metadata.raw_shape))
-
-    if any(state.issues for state in states.values()):
-        return [
-            SegmentResult(
-                segment_dir=state.segment_dir,
-                expected_shape=state.expected_shape,
-                issues=tuple(state.issues),
-            )
-            for state in sorted(states.values(), key=lambda value: value.segment_dir.as_posix())
-        ]
 
     progress = tqdm(total=len(label_stage_items), desc="Label contents", unit="file", disable=not show_progress)
     try:
