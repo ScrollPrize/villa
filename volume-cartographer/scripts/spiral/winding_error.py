@@ -202,6 +202,71 @@ def evaluate(phantom_model, mask, candidate, num_points, cut_margin, seed, devic
     return score(w_true, w_cand, torn, cut_ok)
 
 
+def load_finite_paint_truth(npz_path):
+    """Ground truth from a Diego-dcv finite_paint .npz (the consume path):
+    turn_id is int16 [Z,Y,X], 0=air, winding t stored as t+1. Returns
+    (winding_truth float32 [Z,Y,X] with 0-based winding on material voxels,
+    mask bool [Z,Y,X] = material). No transform is involved -- the raster IS
+    the truth, so our ruler becomes source-agnostic (any painter that emits a
+    per-voxel instance-id volume can be scored, not just synth_phantom).
+
+    NOTE: turn_id is a per-SHEET instance label (constant across a sheet's
+    finite thickness), so the scoring below reports switch rate -- whether a
+    candidate assigns each material voxel to the correct integer winding -- as
+    the primary metric; the continuous winding MAE carries an inherent
+    discretisation floor against integer labels.
+    """
+    data = np.load(npz_path)
+    if 'turn_id' not in data:
+        raise click.UsageError(
+            f'{npz_path} has no turn_id array (keys: {list(data.keys())}); '
+            'not a finite_paint-format phantom')
+    turn_id = data['turn_id']
+    if turn_id.ndim != 3:
+        raise click.UsageError(f'turn_id must be 3D [Z,Y,X], got {turn_id.shape}')
+    mask = turn_id > 0
+    winding = np.where(mask, turn_id.astype(np.float32) - 1.0, np.nan)
+    return winding, mask
+
+
+def score_turn_id(truth_winding, mask, candidate_winding, num_points, rng):
+    """Gauge-aligned instance-assignment scoring of a candidate winding raster
+    against per-voxel integer truth. switch = wrong-turn fraction (the metric
+    that matters for instance labels); mae/raw_mae are the continuous residual."""
+    idx = np.stack(np.nonzero(mask), axis=-1)
+    if len(idx) > num_points:
+        idx = idx[rng.integers(0, len(idx), size=num_points)]
+    z, y, x = idx[:, 0], idx[:, 1], idx[:, 2]
+    residual = candidate_winding[z, y, x] - truth_winding[z, y, x]
+    offset = float(np.median(residual))
+    aligned = residual - offset
+    per_turn = {}
+    turns = truth_winding[z, y, x].astype(np.int64)
+    for tval in np.unique(turns):
+        r = aligned[turns == tval]
+        per_turn[int(tval)] = {'n': int(len(r)), 'mae': float(np.abs(r).mean()),
+                               'switch_rate': float((np.abs(r) > 0.5).mean())}
+    return {
+        'source': 'finite_paint turn_id',
+        'gauge_offset': offset,
+        'raw_mae': float(np.abs(residual).mean()),
+        'overall': {'n': int(len(aligned)), 'mae': float(np.abs(aligned).mean()),
+                    'rmse': float(np.sqrt((aligned ** 2).mean())),
+                    'switch_rate': float((np.abs(aligned) > 0.5).mean())},
+        'per_turn': per_turn,
+    }
+
+
+def print_turn_id_report(result):
+    o = result['overall']
+    click.echo(f"scored against {result['source']}; gauge {result['gauge_offset']:+.3f}")
+    click.echo(f"overall  n={o['n']}  MAE {o['mae']:.4f}  RMSE {o['rmse']:.4f}  "
+               f"switch {o['switch_rate'] * 100:.2f}%   (raw MAE {result['raw_mae']:.4f})")
+    click.echo('per-turn switch%:')
+    for t, s in sorted(result['per_turn'].items()):
+        click.echo(f'  turn {t:3d}  {s["switch_rate"] * 100:6.2f}%  (n={s["n"]})')
+
+
 def load_tifxyz_candidates(path):
     """A single tifxyz directory (contains x.tif) or a directory of them."""
     if os.path.exists(os.path.join(path, 'x.tif')):
@@ -321,8 +386,13 @@ def run_self_test(phantom_dir, num_points, cut_margin, seed, device):
 
 
 @click.command()
-@click.option('--phantom', required=True, type=click.Path(exists=True, file_okay=False),
-              help='synth_phantom output directory (the ground truth).')
+@click.option('--phantom', default=None, type=click.Path(exists=True, file_okay=False),
+              help='synth_phantom output directory (the ground truth). Omit when '
+                   'using --truth-npz.')
+@click.option('--truth-npz', default=None, type=click.Path(exists=True, dir_okay=False),
+              help='finite_paint-format .npz (turn_id raster) as ground truth, '
+                   'scored against --candidate-winding-volume on the same grid. '
+                   'The source-agnostic consume path.')
 @click.option('--candidate-checkpoint', default=None,
               type=click.Path(exists=True, dir_okay=False),
               help='Candidate phantom or fit checkpoint to score.')
@@ -345,12 +415,14 @@ def run_self_test(phantom_dir, num_points, cut_margin, seed, device):
 @click.option('--self-test', is_flag=True,
               help='Ignore candidates; verify the harness on the phantom itself.')
 @click.option('--device', default='cpu', help="torch device ('cpu', 'cuda', ...).")
-def main(phantom, candidate_checkpoint, candidate_winding_volume,
+def main(phantom, truth_npz, candidate_checkpoint, candidate_winding_volume,
          candidate_tifxyz, umbilicus, num_points, cut_margin, seed, output,
          self_test, device):
     device = torch.device(device)
 
     if self_test:
+        if phantom is None:
+            raise click.UsageError('--self-test needs --phantom')
         raise SystemExit(0 if run_self_test(phantom, num_points, cut_margin,
                                             seed, device) else 1)
 
@@ -361,6 +433,26 @@ def main(phantom, candidate_checkpoint, candidate_winding_volume,
             'pass exactly one of --candidate-checkpoint / '
             '--candidate-winding-volume / --candidate-tifxyz')
 
+    # Consume path: external finite_paint turn_id truth, no synth_phantom model.
+    if truth_npz is not None:
+        if candidate_winding_volume is None:
+            raise click.UsageError(
+                '--truth-npz scores against --candidate-winding-volume')
+        truth_winding, mask = load_finite_paint_truth(truth_npz)
+        candidate = tifffile.imread(candidate_winding_volume)
+        if candidate.shape != mask.shape:
+            raise click.UsageError(
+                f'candidate shape {candidate.shape} != truth shape {mask.shape}')
+        result = score_turn_id(truth_winding, mask, candidate, num_points,
+                               np.random.default_rng(seed))
+        print_turn_id_report(result)
+        if output is not None:
+            with open(output, 'w') as f:
+                json.dump(result, f, indent=2)
+        return
+
+    if phantom is None:
+        raise click.UsageError('pass --phantom (or --truth-npz)')
     _, phantom_model, mask = load_phantom(phantom, device)
     if candidate_tifxyz is not None:
         result = evaluate_tifxyz(phantom_model,
