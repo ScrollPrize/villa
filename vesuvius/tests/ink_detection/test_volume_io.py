@@ -34,7 +34,7 @@ def _data_files(cache_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in cache_dir.iterdir()
-        if path.name != ".cache.lock" and not path.name.endswith(".tmp")
+        if not path.name.endswith(".tmp")
     )
 
 
@@ -110,7 +110,7 @@ def test_async_cache_serves_ranges_and_batches_from_complete_values(tmp_path):
     asyncio.run(scenario())
 
 
-def test_async_cache_evicts_to_ninety_percent_watermark(tmp_path):
+def test_async_cache_scans_only_after_local_size_crosses_budget(tmp_path, monkeypatch):
     prototype = default_buffer_prototype()
     at_limit_dir = tmp_path / "at-limit"
     at_limit_dir.mkdir()
@@ -123,27 +123,6 @@ def test_async_cache_evicts_to_ninety_percent_watermark(tmp_path):
         "second",
     ]
 
-    cache_dir = tmp_path / "bounded"
-    cache_dir.mkdir()
-    cached_values = (
-        ("old-a", b"a" * 2),
-        ("old-b", b"b" * 2),
-        ("recent-a", b"c" * 3),
-        ("recent-b", b"d" * 5),
-    )
-    for timestamp, (name, value) in enumerate(cached_values, start=1):
-        path = cache_dir / name
-        path.write_bytes(value)
-        os.utime(path, ns=(timestamp, timestamp))
-    (cache_dir / ".abandoned.tmp").write_bytes(b"x" * 100)
-    AsyncDiskCachedStore(source, cache_dir, max_bytes=10)
-    assert [path.name for path in _data_files(cache_dir)] == [
-        "recent-a",
-        "recent-b",
-    ]
-    assert sum(path.stat().st_size for path in _data_files(cache_dir)) == 8
-    assert not any(path.name.endswith(".tmp") for path in cache_dir.iterdir())
-
     async def scenario():
         insert_dir = tmp_path / "insert-bounded"
         inserted_values = (
@@ -155,11 +134,22 @@ def test_async_cache_evicts_to_ninety_percent_watermark(tmp_path):
         for key, value in inserted_values:
             await source.set(key, prototype.buffer.from_bytes(value))
         cache = AsyncDiskCachedStore(source, insert_dir, max_bytes=10)
+        snapshot_calls = 0
+        original_snapshot = volume_io._cache_snapshot
+
+        def counted_snapshot(cache_dir):
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return original_snapshot(cache_dir)
+
+        monkeypatch.setattr(volume_io, "_cache_snapshot", counted_snapshot)
         for timestamp, (key, _) in enumerate(inserted_values[:3], start=1):
             await cache.get(key, prototype)
             os.utime(cache._path(key), ns=(timestamp, timestamp))
         assert sum(path.stat().st_size for path in _data_files(insert_dir)) == 7
+        assert snapshot_calls == 0
         await cache.get("d/chunk", prototype)
+        assert snapshot_calls == 1
         data_files = _data_files(insert_dir)
         assert [path.name for path in data_files] == ["c__chunk", "d__chunk"]
         assert sum(path.stat().st_size for path in data_files) == 8
@@ -171,8 +161,27 @@ def test_async_cache_evicts_to_ninety_percent_watermark(tmp_path):
         value = await oversized.get("oversized", prototype)
         assert value.to_bytes() == b"x" * 6
         assert _data_files(tmp_path / "oversized") == []
+        assert not (insert_dir / ".cache.lock").exists()
 
     asyncio.run(scenario())
+
+
+def test_async_cache_initializes_counter_without_evicting_or_cleaning(tmp_path):
+    cache_dir = tmp_path / "existing"
+    cache_dir.mkdir()
+    (cache_dir / "first").write_bytes(b"a" * 5)
+    (cache_dir / "second").write_bytes(b"b" * 7)
+    abandoned = cache_dir / ".abandoned.tmp"
+    abandoned.write_bytes(b"temporary")
+
+    cache = AsyncDiskCachedStore(
+        _GuardedMemoryStore(), cache_dir, max_bytes=10
+    )
+
+    assert cache._size == 12
+    assert [path.name for path in _data_files(cache_dir)] == ["first", "second"]
+    assert abandoned.exists()
+    assert not (cache_dir / ".cache.lock").exists()
 
 
 def test_async_cache_zero_budget_retains_no_nonempty_values(tmp_path):
@@ -182,7 +191,8 @@ def test_async_cache_zero_budget_retains_no_nonempty_values(tmp_path):
     (cache_dir / "existing").write_bytes(b"x")
     source = _GuardedMemoryStore()
     cache = AsyncDiskCachedStore(source, cache_dir, max_bytes=0)
-    assert _data_files(cache_dir) == []
+    assert [path.name for path in _data_files(cache_dir)] == ["existing"]
+    assert cache._size == 1
 
     async def scenario():
         await source.set("value", prototype.buffer.from_bytes(b"value"))
@@ -193,11 +203,11 @@ def test_async_cache_zero_budget_retains_no_nonempty_values(tmp_path):
     asyncio.run(scenario())
 
 
-def test_async_cache_wrappers_share_one_lru_budget(tmp_path):
+def test_async_cache_wrappers_may_briefly_overshoot_shared_budget(tmp_path):
     async def scenario():
         prototype = default_buffer_prototype()
         source = _GuardedMemoryStore()
-        for key in ("a", "b", "c"):
+        for key in ("a", "b", "c", "d"):
             await source.set(key, prototype.buffer.from_bytes(key.encode() * 4))
         cache_dir = tmp_path / "shared"
         first = AsyncDiskCachedStore(source, cache_dir, max_bytes=10)
@@ -209,7 +219,10 @@ def test_async_cache_wrappers_share_one_lru_budget(tmp_path):
         assert (await first.get("a", prototype)).to_bytes() == b"a" * 4
         os.utime(first._path("a"), ns=(30, 30))
         await second.get("c", prototype)
-        assert [path.name for path in _data_files(cache_dir)] == ["a", "c"]
+        assert [path.name for path in _data_files(cache_dir)] == ["a", "b", "c"]
+        assert sum(path.stat().st_size for path in _data_files(cache_dir)) == 12
+        await second.get("d", prototype)
+        assert [path.name for path in _data_files(cache_dir)] == ["c", "d"]
         assert sum(path.stat().st_size for path in _data_files(cache_dir)) == 8
 
     asyncio.run(scenario())

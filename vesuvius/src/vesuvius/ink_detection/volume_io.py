@@ -7,7 +7,6 @@ import json
 import os
 import tempfile
 from collections.abc import MutableMapping
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -53,23 +52,10 @@ def normalize_volume_url(path: str | Path) -> tuple[str, bool]:
     return path_text, False
 
 
-@contextmanager
-def _locked_cache(cache_dir: Path):
-    import fcntl
-
-    lock_path = cache_dir / ".cache.lock"
-    with lock_path.open("a+b") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
 def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
     snapshot = []
     for entry in os.scandir(cache_dir):
-        if entry.name == ".cache.lock" or entry.name.endswith(".tmp"):
+        if entry.name.endswith(".tmp"):
             continue
         try:
             if not entry.is_file(follow_symlinks=False):
@@ -78,58 +64,52 @@ def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
         except FileNotFoundError:
             continue
         snapshot.append((stat.st_mtime_ns, stat.st_size, Path(entry.path)))
-    snapshot.sort(key=lambda item: (item[0], item[2].name))
+    snapshot.sort()
     return snapshot
 
 
-def _remove_temporary_files_locked(cache_dir: Path) -> None:
+def _cache_size(cache_dir: Path) -> int:
+    total = 0
     for entry in os.scandir(cache_dir):
-        if not entry.name.endswith(".tmp"):
+        if entry.name.endswith(".tmp"):
             continue
         try:
-            Path(entry.path).unlink()
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
         except FileNotFoundError:
             continue
+    return total
 
 
-def _evict_to_budget_locked(cache_dir: Path, max_bytes: int | None) -> None:
-    _remove_temporary_files_locked(cache_dir)
-    if max_bytes is None:
-        return
+def _evict_to_watermark(cache_dir: Path, max_bytes: int) -> int:
     snapshot = _cache_snapshot(cache_dir)
     total = sum(size for _, size, _ in snapshot)
-    if total <= max_bytes:
-        return
     target_bytes = 0.9 * max_bytes
-    while True:
-        snapshot = _cache_snapshot(cache_dir)
-        total = sum(size for _, size, _ in snapshot)
-        if total <= target_bytes or not snapshot:
-            return
+    for _, size, path in snapshot:
+        if total <= target_bytes:
+            break
         try:
-            snapshot[0][2].unlink()
+            path.unlink()
         except FileNotFoundError:
-            continue
+            pass
+        total -= size
+    return total
 
 
-def _install_cache_value(
-    cache_dir: Path, path: Path, value: bytes, max_bytes: int | None
-) -> None:
+def _install_cache_value(cache_dir: Path, path: Path, value: bytes) -> None:
     temporary_path: Path | None = None
     try:
-        with _locked_cache(cache_dir):
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=cache_dir,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as stream:
-                stream.write(value)
-                temporary_path = Path(stream.name)
-            os.replace(temporary_path, path)
-            temporary_path = None
-            _evict_to_budget_locked(cache_dir, max_bytes)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=cache_dir,
+            prefix=f".{path.name}.{os.getpid()}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            stream.write(value)
+            temporary_path = Path(stream.name)
+        os.replace(temporary_path, path)
+        temporary_path = None
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -278,7 +258,11 @@ if hasattr(zarr.storage, "WrapperStore"):
         raise ValueError(f"Unexpected byte_range, got {byte_range}.")
 
     class AsyncDiskCachedStore(zarr.storage.WrapperStore):
-        """Zarr-3 read-through cache for complete compressed store values."""
+        """Cache compressed values with lock-free atomic installs.
+
+        Size is tracked locally and trued up only during eviction. Concurrent
+        workers may briefly overshoot the budget; eviction targets 90%.
+        """
 
         def __init__(self, store, cache_dir: Path, max_bytes: int | None) -> None:
             super().__init__(store)
@@ -287,8 +271,9 @@ if hasattr(zarr.storage, "WrapperStore"):
             self.max_bytes = max_bytes
             if max_bytes is not None and max_bytes < 0:
                 raise ValueError("max_bytes must be nonnegative or None")
-            with _locked_cache(self.cache_dir):
-                _evict_to_budget_locked(self.cache_dir, self.max_bytes)
+            self._size = (
+                _cache_size(self.cache_dir) if max_bytes is not None else 0
+            )
 
         def _path(self, key: str) -> Path:
             return self.cache_dir / key.replace("/", "__")
@@ -305,9 +290,13 @@ if hasattr(zarr.storage, "WrapperStore"):
                 if source_value is None:
                     return None
                 value = source_value.to_bytes()
-                _install_cache_value(
-                    self.cache_dir, path, value, self.max_bytes
-                )
+                _install_cache_value(self.cache_dir, path, value)
+                if self.max_bytes is not None:
+                    self._size += len(value)
+                    if self._size > self.max_bytes:
+                        self._size = _evict_to_watermark(
+                            self.cache_dir, self.max_bytes
+                        )
             else:
                 try:
                     os.utime(path)
@@ -342,7 +331,11 @@ def load_volume_auth(auth_json_path: str | Path | None) -> tuple[str, str] | Non
 
 
 class DiskCachedMapping(MutableMapping[str, bytes]):
-    """Read-through compressed-byte cache with atomic writes and mtime LRU."""
+    """Cache compressed values with lock-free atomic installs.
+
+    Size is tracked locally and trued up only during eviction. Concurrent
+    workers may briefly overshoot the budget; eviction targets 90%.
+    """
 
     def __init__(
         self, source: MutableMapping[str, bytes], cache_dir: Path, max_bytes: int | None
@@ -353,8 +346,7 @@ class DiskCachedMapping(MutableMapping[str, bytes]):
         self.max_bytes = max_bytes
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("max_bytes must be nonnegative or None")
-        with _locked_cache(self.cache_dir):
-            _evict_to_budget_locked(self.cache_dir, self.max_bytes)
+        self._size = _cache_size(self.cache_dir) if max_bytes is not None else 0
 
     def _path(self, key: str) -> Path:
         return self.cache_dir / key.replace("/", "__")
@@ -365,7 +357,13 @@ class DiskCachedMapping(MutableMapping[str, bytes]):
             value = path.read_bytes()
         except FileNotFoundError:
             value = self.source[key]
-            _install_cache_value(self.cache_dir, path, value, self.max_bytes)
+            _install_cache_value(self.cache_dir, path, value)
+            if self.max_bytes is not None:
+                self._size += len(value)
+                if self._size > self.max_bytes:
+                    self._size = _evict_to_watermark(
+                        self.cache_dir, self.max_bytes
+                    )
             return value
         try:
             os.utime(path)

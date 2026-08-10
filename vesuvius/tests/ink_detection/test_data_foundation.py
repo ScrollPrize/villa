@@ -11,6 +11,7 @@ import pytest
 import torch
 import zarr
 
+from vesuvius.ink_detection import volume_io
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.geometry import (
@@ -407,7 +408,7 @@ def test_volume_resolution_padding_and_zarr3_disk_cache(tmp_path):
     assert any((tmp_path / "cache").rglob("*__*"))
 
 
-def test_disk_cache_is_read_through_atomic_and_lru_bounded(tmp_path):
+def test_disk_cache_is_read_through_atomic_and_lru_bounded(tmp_path, monkeypatch):
     class CountingSource(dict):
         def __init__(self):
             super().__init__({"a/chunk": b"a" * 8, "b/chunk": b"b" * 8})
@@ -419,17 +420,29 @@ def test_disk_cache_is_read_through_atomic_and_lru_bounded(tmp_path):
 
     source = CountingSource()
     cache = DiskCachedMapping(source, tmp_path / "bounded-cache", max_bytes=10)
+    snapshot_calls = 0
+    original_snapshot = volume_io._cache_snapshot
+
+    def counted_snapshot(cache_dir):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot(cache_dir)
+
+    monkeypatch.setattr(volume_io, "_cache_snapshot", counted_snapshot)
     assert cache["a/chunk"] == b"a" * 8
+    assert snapshot_calls == 0
     assert cache["b/chunk"] == b"b" * 8
+    assert snapshot_calls == 1
     assert cache["b/chunk"] == b"b" * 8
     assert source.reads == {"a/chunk": 1, "b/chunk": 1}
     cached_files = [
         path
         for path in (tmp_path / "bounded-cache").iterdir()
-        if path.name != ".cache.lock"
+        if not path.name.endswith(".tmp")
     ]
     assert [path.name for path in cached_files] == ["b__chunk"]
     assert not any(path.name.endswith(".tmp") for path in cached_files)
+    assert not ((tmp_path / "bounded-cache") / ".cache.lock").exists()
 
 
 def test_flat_jitter_and_dataset_sample_are_self_contained(tmp_path, monkeypatch):
