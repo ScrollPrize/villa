@@ -352,6 +352,70 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
         download_required_zarr_chunks.main(args)
 
 
+@pytest.mark.parametrize(
+    "dataset_name",
+    [
+        "",
+        ".",
+        "..",
+        "/tmp/escape",
+        "../escape",
+        "family/segment",
+        r"family\segment",
+        r"C:\escape",
+        r"C:relative",
+    ],
+)
+@pytest.mark.parametrize("list_style", [False, True])
+def test_downloader_rejects_dataset_paths_at_json_boundary(
+    tmp_path: Path,
+    dataset_name: str,
+    list_style: bool,
+) -> None:
+    volumes_json = tmp_path / "volumes.json"
+    entry = {"volume_path": "unused.zarr"}
+    payload = [{"dataset": dataset_name, **entry}] if list_style else {dataset_name: entry}
+    volumes_json.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="one directory name, not a path"):
+        download_required_zarr_chunks.load_dataset_sources(volumes_json)
+
+
+def test_downloader_accepts_dots_inside_dataset_basename(tmp_path: Path) -> None:
+    volumes_json = tmp_path / "volumes.json"
+    volumes_json.write_text(json.dumps({"dataset..v2": "source.zarr"}))
+
+    sources = download_required_zarr_chunks.load_dataset_sources(volumes_json)
+
+    assert sources["dataset..v2"].dataset_name == "dataset..v2"
+
+
+def test_downloader_overwrite_cannot_escape_output_root(tmp_path: Path) -> None:
+    datasets_root = tmp_path / "datasets"
+    datasets_root.mkdir()
+    output_root = tmp_path / "output"
+    escaped_output = tmp_path / "escape.zarr"
+    escaped_output.mkdir()
+    sentinel = escaped_output / "sentinel"
+    sentinel.write_text("preserve")
+    volumes_json = tmp_path / "volumes.json"
+    volumes_json.write_text(
+        json.dumps({"../escape": {"volume_path": "unused.zarr"}})
+    )
+
+    with pytest.raises(ValueError, match="one directory name, not a path"):
+        download_required_zarr_chunks.main(
+            [
+                "--datasets-root", str(datasets_root),
+                "--volumes-json", str(volumes_json),
+                "--output-root", str(output_root),
+                "--overwrite",
+            ]
+        )
+
+    assert sentinel.read_text() == "preserve"
+
+
 def test_downloader_records_only_completed_writes_and_resumes_after_failure(
     tmp_path: Path,
 ) -> None:

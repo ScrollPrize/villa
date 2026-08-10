@@ -5,7 +5,7 @@ import json
 import multiprocessing as mp
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Iterable
 
 import numpy as np
@@ -116,6 +116,23 @@ def _normalize_mapping_entry(dataset_name: str, entry) -> DatasetSourceSpec:
     )
 
 
+def _validate_dataset_name(value: object) -> str:
+    dataset_name = str(value)
+    windows_path = PureWindowsPath(dataset_name)
+    if (
+        dataset_name in {"", ".", ".."}
+        or "/" in dataset_name
+        or "\\" in dataset_name
+        or Path(dataset_name).is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+    ):
+        raise ValueError(
+            f"Dataset name must be one directory name, not a path: {dataset_name!r}."
+        )
+    return dataset_name
+
+
 def load_dataset_sources(mapping_json_path: str | Path) -> dict[str, DatasetSourceSpec]:
     with open(mapping_json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -128,15 +145,16 @@ def load_dataset_sources(mapping_json_path: str | Path) -> dict[str, DatasetSour
         for entry in raw:
             if not isinstance(entry, dict) or "dataset" not in entry:
                 raise ValueError("List-style JSON entries must contain a 'dataset' key.")
-            dataset_name = str(entry["dataset"])
+            dataset_name = _validate_dataset_name(entry["dataset"])
             normalized[dataset_name] = _normalize_mapping_entry(dataset_name, entry)
         return normalized
 
     if isinstance(raw, dict):
-        return {
-            str(dataset_name): _normalize_mapping_entry(str(dataset_name), entry)
-            for dataset_name, entry in raw.items()
-        }
+        normalized = {}
+        for raw_dataset_name, entry in raw.items():
+            dataset_name = _validate_dataset_name(raw_dataset_name)
+            normalized[dataset_name] = _normalize_mapping_entry(dataset_name, entry)
+        return normalized
 
     raise TypeError("Volumes JSON must be either an object mapping dataset names or a list of dataset objects.")
 
