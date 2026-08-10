@@ -1,81 +1,55 @@
-# Task log: process-parallel native accumulation
+# Task log: minimize manager staging and Atlas inference ingestion
 
-## Baseline
+## Planning findings
 
-- Current accumulation is synchronous in the coordinator. Real-run
-  `commit_sum` was 14.1 s for 294 processed tiles within 68.6 s inference.
-- Controlled four-channel 32x256x256 ring, eight-addition, five-iteration
-  benchmark: NumPy float32 0.0443 s mean with 32 MiB backing; NumPy float16
-  0.2931 s with 16 MiB backing (6.6x slower).
-- Target CPU is dual-socket Intel Xeon Platinum 8480+ (224 logical CPUs) with
-  AVX-512F, F16C, and AVX-512-FP16. The implementation must remain portable to
-  Ubuntu/macOS and amd64/arm64 through runtime dispatch and scalar fallback.
+- `upload-manifest.json` and `_INCOMPLETE` were introduced by Villa manager
+  commit `3379ea7a7`; they are not pre-existing Atlas formats.
+- The upload manifest is unnecessary because rclone already resumes/skips
+  transferred objects. `_INCOMPLETE` remains useful as the sole publication
+  guard.
+- Atlas data-sync reconstructs a source URI by joining
+  `AccessRoot.url.rstrip('/')` and `DataOrigin.path.lstrip('/')`; the relative
+  origin is therefore existing Atlas behavior, not a new unresolved path.
+- Public Atlas export filters origins to the target usage. The internal
+  `private-s3` staging origin is excluded from public metadata after data-sync
+  adds a `public-read` origin.
+- Portable inference provenance was unnecessarily duplicated into the new
+  Atlas entry's `creation_info`. The approved cleanup leaves provenance in
+  `inference.json` and reuses the lean existing `lasagna` entry shape.
+- Independent review confirmed relative-origin resolution and identified that
+  `_INCOMPLETE` is manager-enforced rather than Atlas-enforced. The plan now
+  requires failed staging never to invoke ingestion and keeps the marker name
+  reserved in local bundles.
+- Marker-only `rclone copy --size-only` intentionally gives up manifest-based
+  same-UUID content collision detection and does not delete stale objects. The
+  plan makes the immutable run UUID/bundle contract explicit and removes the
+  misleading `uploaded` boolean.
+- Cleanup must report, but not silently delete, any transaction manifest that
+  has already reached a canonical/public destination.
 
-## Plan review
+## Deviations
 
-Independent review required precise half-to-float add semantics, ISA-matched
-runtime dispatch, stable per-worker FIFO ownership, nonblocking submission with
-ack pumping, provisional activity failure safety, coordinator-owned ring
-generations, all-scale slot reference counts, flush-frontier invariants,
-strided/unaligned/tail validation, inspectable/forceable native backends,
-explicit cache/queue cleanup, backpressure diagnostics, adversarial ordering and
-failure tests, and separate kernel/pipeline benchmarks. The plan incorporates
-these requirements.
+- The user elected to delete existing remote `upload-manifest.json` objects;
+  implementation performed no S3 mutation.
+- Public/canonical destinations were not mutated. The user confirmed the
+  observed manifest was in private staging and owns its removal.
 
-## Implementation
+## Validation
 
-- Added `accumulator_add.cpp` as a second pybind11 extension. It accepts
-  arbitrary positive Y/Z strides with contiguous X rows, releases the GIL,
-  supports float16 and float32 destinations, and has forceable `scalar`,
-  `avx512`, and `auto` dispatch modes. AVX-512 is isolated behind GCC/Clang
-  target attributes and runtime AVX-512F+F16C detection; no global ISA flag is
-  used.
-- Added persistent spawn-context accumulator processes to the authoritative
-  shared runner. Queue items contain only shared-slot/mmap descriptors and
-  slices. Stable integer spatial ownership plus one bounded FIFO per worker
-  serializes every output chunk without locks.
-- The coordinator owns ring generation and activity metadata, retains result
-  slots until all task acknowledgements, pumps acknowledgements under queue
-  backpressure, and gates reservation at Z-row transitions. Activity is
-  committed only after successful worker completion, before canonical progress
-  and flush handling.
-- Added `--accumulator-workers` to both Fiber and Lasagna frontends, defaulting
-  to `min(CPU count, 32)`; zero uses the synchronous path. Added startup/backend
-  and task/work/queue/wall/rate diagnostics.
-- Product rings now default to float16; weights remain float32. Float32 remains
-  selectable explicitly.
-
-## Validation and measurements
-
-- Manual baseline-ISA build (Python 3.14, GCC, pybind11 headers from the local
-  build cache) succeeded; runtime backend on the Xeon 8480+ is `avx512`.
-- Exhaustive 65,536-value binary16 input validation for one float32 addition
-  matches NumPy bit-for-bit for all finite outputs in both forced scalar and
-  automatic AVX-512 modes; NaN masks also match. This found and corrected an
-  initial scalar subnormal exponent error.
-- Strided Y/Z, unaligned X, and 37-element tail views match NumPy for float16
-  and float32.
-- Focused shared-runner regression passed: synchronous versus two CPU device
-  workers plus two accumulator processes produced exactly equal output chunks
-  with float16 product rings; scratch mmaps were cleaned.
-- Kernel benchmark command used a `(16,512,512)` float16 destination and
-  float32 source, eight repeated adds, seven iterations. NumPy median was
-  142.507 ms (mean 142.316, min 141.391, max 143.150); AVX-512 median was
-  7.653 ms (mean 7.654, min 7.644, max 7.663), an 18.6x median kernel speedup.
-  Forced portable scalar median was 331.671 ms. This is a kernel benchmark, not
-  an end-to-end volume throughput claim.
-
-## Deviations and limitations
-
-- The serial baseline continues through the existing `_accumulate_group`
-  coordinator routine instead of being mechanically expressed as process task
-  descriptors; it does use the same native add primitive. This keeps the
-  zero-worker diagnostic path small while exact serial/process output coverage
-  validates the two planners.
-- The environment lacks `pytest`, so pytest suites were not run. Focused
-  `unittest` cases and Python compile checks passed. A full unittest-module run
-  was stopped after it made no progress in an unrelated early test; the focused
-  affected tests were rerun individually.
-- No representative full-volume eight-GPU run was launched by the agent. The
-  new accumulator diagnostics are intended for the user's next real inference
-  comparison; no end-to-end speedup is claimed here.
+- Villa: `62 passed` across manager, open-data staging, and portable provenance
+  tests; manager/provenance compile smoke passed with bytecode cache in `/tmp`.
+- Atlas: `5 passed` across inference-bundle and AtlasConfig tests; package
+  compile smoke passed with bytecode cache in `/tmp`.
+- Both completed local runs validate with the new manager path: PHerc0332 has
+  58,138 files and PHerc1299 has 83,679 files; both resolve existing model
+  `20260801084232-lasagna` with input level 1.
+- One-off local cleanup atomically removed upload manifest/digest/boolean fields
+  from both manager records. Their staging URL and completed lifecycle remain.
+- The two Atlas volume entries contain only type, private origin, numeric model
+  ID, and level; neither contains `creation_info`.
+- Independent implementation review found one stale cross-check constructing
+  the abandoned `fiber3d-prediction`/`creation_info` entry. It was removed as
+  duplicate of the authoritative Atlas adapter tests, and the failed-transfer
+  test was strengthened to exercise the bulk rclone path.
+- Source commits: Villa `ef09251e7` (marker-only staging) and Atlas `75a407e`
+  (lean entries plus the already registered model and two inference origins).

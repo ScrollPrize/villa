@@ -20,6 +20,7 @@ from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence, runtime
 import uuid
 
 import numpy as np
+import numcodecs
 import torch
 import torch.nn.functional as F
 import zarr
@@ -51,6 +52,15 @@ DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_INPUT_COPY_THREADS = 4
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
+DEFAULT_OME_COMPRESSOR = "blosc-zstd"
+OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
+_BLOSC_ZSTD_CONFIG = {
+	"id": "blosc",
+	"cname": "zstd",
+	"clevel": 3,
+	"shuffle": 1,
+	"blocksize": 0,
+}
 
 
 @dataclass(frozen=True)
@@ -1084,6 +1094,30 @@ def _omezarr_level_shape(
 	return z, y, x
 
 
+def omezarr_compressor_config(name: str) -> dict[str, Any] | None:
+	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice."""
+	value = str(name).strip().lower()
+	if value == DEFAULT_OME_COMPRESSOR:
+		return dict(_BLOSC_ZSTD_CONFIG)
+	if value == "none":
+		return None
+	raise ValueError(
+		f"unsupported OME-Zarr compressor {name!r}; expected one of "
+		f"{', '.join(OME_COMPRESSOR_CHOICES)}"
+	)
+
+
+def _omezarr_compressor(name: str) -> numcodecs.abc.Codec | None:
+	config = omezarr_compressor_config(name)
+	return numcodecs.get_codec(config) if config is not None else None
+
+
+def _read_level_compressor_config(path: str | Path, level: int) -> dict[str, Any] | None:
+	with (Path(path) / str(level) / ".zarray").open(encoding="utf-8") as handle:
+		metadata = json.load(handle)
+	return metadata.get("compressor")
+
+
 def _create_omezarr(
 	path: str,
 	base_shape_zyx: tuple[int, int, int],
@@ -1091,8 +1125,10 @@ def _create_omezarr(
 	n_levels: int,
 	chunk: int,
 	channel_name: str,
+	compressor: str = DEFAULT_OME_COMPRESSOR,
 ) -> zarr.Group:
 	"""Create an OME-Zarr group with pyramid level arrays."""
+	codec = _omezarr_compressor(compressor)
 	try:
 		g = zarr.open_group(str(path), mode="w", zarr_format=2)
 	except TypeError:
@@ -1106,6 +1142,7 @@ def _create_omezarr(
 				str(lv), shape=sh,
 				chunks=chunks,
 				dtype=np.uint8, fill_value=0, overwrite=True,
+				compressor=codec,
 				chunk_key_encoding={"name": "v2", "separator": "/"},
 			)
 		except (AttributeError, TypeError):
@@ -1114,6 +1151,7 @@ def _create_omezarr(
 					str(lv), shape=sh,
 					chunks=chunks,
 					dtype=np.uint8, fill_value=0, overwrite=True,
+					compressor=codec,
 					dimension_separator="/",
 				)
 			except TypeError:
@@ -1121,6 +1159,7 @@ def _create_omezarr(
 					str(lv), shape=sh,
 					chunks=chunks,
 					dtype=np.uint8, fill_value=0, overwrite=True,
+					compressor=codec,
 				)
 		datasets.append({
 			"path": str(lv),
@@ -1147,6 +1186,7 @@ def _open_or_create_omezarr(
 	n_levels: int,
 	chunk: int,
 	channel_name: str,
+	compressor: str = DEFAULT_OME_COMPRESSOR,
 ) -> zarr.Group:
 	"""Open existing OME-Zarr group or create a new one."""
 	if os.path.exists(path):
@@ -1166,6 +1206,23 @@ def _open_or_create_omezarr(
 							f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
 							"Delete and re-create the output."
 						)
+				requested = omezarr_compressor_config(compressor)
+				actual_by_level = {
+					int(level): _read_level_compressor_config(path, int(level))
+					for level in range(int(first_level), int(n_levels))
+					if (Path(path) / str(level) / ".zarray").is_file()
+				}
+				mismatched = {
+					level: actual for level, actual in actual_by_level.items()
+					if actual != requested
+				}
+				if mismatched:
+					print(
+						f"[predict3d] WARNING: preserving existing compressor(s) for "
+						f"{os.path.basename(path)} despite requested {requested}: "
+						f"{mismatched}",
+						flush=True,
+					)
 				print(f"[predict3d] reusing existing {os.path.basename(path)} "
 					  f"(level {first_level} shape={expected})", flush=True)
 				return g
@@ -1176,7 +1233,9 @@ def _open_or_create_omezarr(
 		print(f"[predict3d] {path} shape mismatch, recreating", flush=True)
 	print(f"[predict3d] creating new {os.path.basename(path)} "
 		  f"(levels {first_level}-{n_levels-1})", flush=True)
-	return _create_omezarr(path, base_shape_zyx, first_level, n_levels, chunk, channel_name)
+	return _create_omezarr(
+		path, base_shape_zyx, first_level, n_levels, chunk, channel_name, compressor,
+	)
 
 
 def create_product_omezarr_groups(
@@ -1185,6 +1244,7 @@ def create_product_omezarr_groups(
 	base_shape_zyx: tuple[int, int, int],
 	n_levels: int,
 	ome_chunk: int,
+	ome_compressor: str = DEFAULT_OME_COMPRESSOR,
 ) -> dict[str, zarr.Group]:
 	"""Create or open per-channel OME-Zarr groups for product specs."""
 	groups: dict[str, zarr.Group] = {}
@@ -1198,6 +1258,7 @@ def create_product_omezarr_groups(
 				int(n_levels),
 				int(ome_chunk),
 				channel.name,
+				ome_compressor,
 			)
 	return groups
 
@@ -1220,6 +1281,7 @@ def write_lasagna_product_manifest(
 	crop_xyzwhd_base: tuple[int, int, int, int, int, int] | None = None,
 	source_to_base: float = 1.0,
 	grad_mag_factor: float | None = None,
+	provenance_json: str | None = None,
 ) -> None:
 	"""Write a Lasagna manifest whose groups come directly from product specs."""
 	try:
@@ -1240,6 +1302,8 @@ def write_lasagna_product_manifest(
 		)
 	if grad_mag_factor is not None:
 		vol.grad_mag_factor = float(grad_mag_factor)
+	if provenance_json is not None:
+		vol.provenance_json = str(provenance_json)
 	if crop_xyzwhd_base is not None:
 		vol.add_crop(tuple(int(v) for v in crop_xyzwhd_base))
 	groups: dict[str, ChannelGroup] = {}
