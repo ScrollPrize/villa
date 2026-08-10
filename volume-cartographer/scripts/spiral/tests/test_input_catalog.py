@@ -1,7 +1,4 @@
-"""The declarative fit-input catalog: each consumer derives what the three
-historical maps (request-validation kinds/predicates in fit_session, the
-config-catalog path schema + plan_run fallback, and apply_config's
-outer_shell special case) used to encode."""
+"""The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
 from fit_session import (FIT_INPUT_CATALOG, FULL_REBUILD_DEPENDENCIES,
@@ -24,8 +21,8 @@ def test_catalog_covers_every_fit_input_path_field():
 def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
-    assert spec.runtime_impact == "shell_reload"
-    assert spec.dependencies == ("shell",)
+    assert spec.runtime_impact == "prepared_input_rebuild"
+    assert spec.dependencies == FULL_REBUILD_DEPENDENCIES
     # Enabled by either shell loss weight; the outer weight defaults on.
     assert spec.required({}) is True
     assert spec.required({"loss_weight_shell_outer": 0.0,
@@ -34,10 +31,9 @@ def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
                           "loss_weight_shell_patch_radius": 2.0}) is True
 
 
-def test_rebuild_scopes_match_the_historical_planning_map():
-    # outer_shell is the one device-rebuild (live) path; every other input,
-    # and any unknown path key, keeps the conservative full host rebuild.
-    assert input_change_impact("outer_shell") == ("shell_reload", ["shell"])
+def test_every_input_path_change_requires_a_full_host_rebuild():
+    assert input_change_impact("outer_shell") == (
+        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
     assert input_change_impact("verified_patches") == (
         "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
     assert input_change_impact("checkpoint") == (
@@ -45,10 +41,7 @@ def test_rebuild_scopes_match_the_historical_planning_map():
 
 
 def test_config_catalog_paths_derive_from_the_input_catalog():
-    assert input_path_schema() == {
-        "outer_shell": {"runtime_impact": "shell_reload",
-                        "dependencies": ["shell"]},
-    }
+    assert input_path_schema() == {}
     assert Config.catalog()["schema"]["paths"] == input_path_schema()
 
 

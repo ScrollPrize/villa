@@ -61,10 +61,9 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
             assert field["runtime_impact"] == "run_boundary"
         if key.startswith("shell_"):
             assert field["runtime_impact"] == "shell_reload"
-    assert schema["paths"]["outer_shell"] == {
-        "runtime_impact": "shell_reload",
-        "dependencies": ["shell"],
-    }
+    # Input identities are fixed for a resident session. Run-mutable shell
+    # settings still rebuild shell-derived state from the same outer shell.
+    assert schema["paths"] == {}
 
     mutable_tracks = {
         "track_min_sample_spacing", "track_max_sample_spacing",

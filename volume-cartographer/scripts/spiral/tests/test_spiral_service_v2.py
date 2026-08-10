@@ -45,7 +45,8 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             parse_session_name)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
-                         AutosaveError, SessionState, SpiralInputPaths,
+                         AutosaveError, FULL_REBUILD_DEPENDENCIES,
+                         SessionState, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
@@ -1744,8 +1745,8 @@ class UploadTests(unittest.TestCase):
         })
         self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
 
-    def test_outer_shell_path_is_a_shell_only_run_change(self):
-        session = self._session()
+    def test_outer_shell_path_change_requires_session_reload(self):
+        self._session()
         shell = self.dataset / "outer_shell_v2"
         shell.mkdir()
         inputs = self.state.session_paths.manifest()
@@ -1757,14 +1758,14 @@ class UploadTests(unittest.TestCase):
             "expected_session_revision": self.state.session_revision,
         })
 
-        self.assertFalse(plan["session_reload_required"])
-        self.assertEqual(plan["affected_prepared_inputs"], ["shell"])
+        self.assertTrue(plan["session_reload_required"])
+        self.assertEqual(
+            plan["affected_prepared_inputs"],
+            sorted(FULL_REBUILD_DEPENDENCIES))
         self.assertEqual(plan["input_changes"][0]["runtime_impact"],
-                         "shell_reload")
-        self.state.run({"plan_token": plan["plan_token"]})
-        self.assertEqual(session.path_change_calls[-1], {
-            "outer_shell": str(shell),
-        })
+                         "prepared_input_rebuild")
+        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
+            self.state.run({"plan_token": plan["plan_token"]})
 
     def test_non_shell_path_and_patch_erosion_still_require_reload(self):
         self._session()

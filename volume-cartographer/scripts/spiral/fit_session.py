@@ -210,9 +210,10 @@ class FitInputSpec:
     enabled: Callable[[Mapping[str, Any]], bool] = _always
     # required(config): the input must exist for this configuration.
     required: Callable[[Mapping[str, Any]], bool] = _never
-    # What a path change invalidates on a resident session:
-    # "prepared_input_rebuild" reloads host inputs (session reload);
-    # "shell_reload" rebuilds device shell state at a run boundary.
+    # What a path change invalidates on a resident session. Fit-input paths
+    # are static for the lifetime of a resident session, so the default is a
+    # host-input/session rebuild. More granular impacts remain representable
+    # for a future input type whose identity is explicitly session-mutable.
     runtime_impact: str = "prepared_input_rebuild"
     dependencies: tuple[str, ...] = FULL_REBUILD_DEPENDENCIES
     # Whether changing the input breaks checkpoint compatibility. No fit
@@ -234,8 +235,7 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("fibers", "directory", conventional_relative="fibers"),
     FitInputSpec("outer_shell", "directory",
                  conventional_relative="outer_shell",
-                 required=_shell_losses_enabled,
-                 runtime_impact="shell_reload", dependencies=("shell",)),
+                 required=_shell_losses_enabled),
     FitInputSpec("tracks_dbm", "dbm",
                  conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm"),
     FitInputSpec("pcls", "pcl-set", json_content=True),
