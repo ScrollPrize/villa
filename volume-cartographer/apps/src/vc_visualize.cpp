@@ -37,6 +37,10 @@ class SegmentRenderer {
 
     std::map<std::string, int> segment_color_map_;
 
+    // Surfaces that were requested but could not be loaded. They are skipped so
+    // the rest still renders, but main() needs to know they went missing.
+    int failed_surface_loads_ = 0;
+
     cv::Vec3b getColormapColor(int index, int total_count) {
         int gray_value = (index * 255) / std::max(1, total_count - 1);
 
@@ -112,6 +116,9 @@ class SegmentRenderer {
     }
 
 public:
+    // Number of requested surfaces that failed to load during the last render.
+    int failedSurfaceLoads() const { return failed_surface_loads_; }
+
     SegmentRenderer(const fs::path& volpkg_path, const std::string& volume_id) {
         if (fs::is_directory(volpkg_path)) {
             throw std::runtime_error(
@@ -348,6 +355,7 @@ private:
                 color_idx++;
             } else {
                 std::cerr << "Failed to load surface: " << surf_id << std::endl;
+                failed_surface_loads_++;
             }
         }
 
@@ -601,6 +609,13 @@ int main(int argc, char* argv[]) {
 
         SegmentRenderer renderer(volpkg_path, volume_id);
         renderer.render(segment_id, output_path, overlap_source, filter, stride);
+
+        if (renderer.failedSurfaceLoads() > 0) {
+            std::cerr << "Error: " << renderer.failedSurfaceLoads()
+                      << " requested surface(s) could not be loaded and are missing "
+                         "from the render\n";
+            return EXIT_FAILURE;
+        }
 
         return EXIT_SUCCESS;
 

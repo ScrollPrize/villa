@@ -183,7 +183,10 @@ static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
     return nsum;
 }
 
-static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
+// Returns false if the OBJ could not be written, so main() can fail instead of
+// reporting a clean conversion for a file that never made it to disk.
+static bool surf_write_obj(
+    QuadSurface* surf, const std::filesystem::path& out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
 {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
     
@@ -247,7 +250,7 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     std::ofstream out(out_fn);
     if (!out) {
         std::cerr << "Failed to open for write: " << out_fn << "\n";
-        return;
+        return false;
     }
     out << std::fixed << std::setprecision(6);
 
@@ -306,6 +309,11 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
                            << c01 << "/" << c01 << "/" << c01 << " "
                            << c11 << "/" << c11 << "/" << c11 << '\n';
             }
+
+    // Also report a write that started fine and then failed - a full disk shows
+    // up here rather than at open time.
+    out.flush();
+    return static_cast<bool>(out);
 }
 
 int main(int argc, char *argv[])
@@ -391,7 +399,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
+    if (!surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes)) {
+        std::cerr << "error: failed to write " << obj_path << std::endl;
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }

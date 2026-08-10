@@ -432,7 +432,8 @@ static void log_chunk_io(
 } // namespace
 
 void run_generate(const po::variables_map& vm);
-void run_convert(const po::variables_map& vm);
+// Returns non-zero if any file failed to convert.
+int run_convert(const po::variables_map& vm);
 void run_pyramid(const po::variables_map& vm);
 
 static void print_usage() {
@@ -600,7 +601,9 @@ int main(int argc, char* argv[]) {
             std::cout << convert_desc << std::endl;
             return 1;
         }
-        run_convert(convert_vm);
+        if (run_convert(convert_vm) != 0) {
+            return 1;
+        }
 
     } else if (cmd == "pyramid") {
         po::options_description pyramid_desc(
@@ -1000,7 +1003,8 @@ void run_pyramid(const po::variables_map& vm) {
     std::cout << "Pyramid complete: " << output_root << std::endl;
 }
 
-void run_convert(const po::variables_map& vm) {
+int run_convert(const po::variables_map& vm)
+{
     fs::path input_dir = vm["input"].as<std::string>();
     int new_grid_step = vm["grid-step"].as<int>();
     std::cout << "Scanning directory: " << input_dir << " with new grid step: " << new_grid_step << std::endl;
@@ -1081,8 +1085,12 @@ void run_convert(const po::variables_map& vm) {
               << ", Converted: " << converted_count
               << ", Skipped: " << skipped_count
               << ", Errors: " << error_count << std::endl;
-}
 
+    // Let the exit code carry what the summary already says. Every per-file
+    // failure was counted and printed, but a batch where every single file
+    // failed still exited 0, so a calling script could not tell.
+    return error_count > 0 ? 1 : 0;
+}
 
 void run_generate(const po::variables_map& vm) {
     const auto total_start = std::chrono::steady_clock::now();
