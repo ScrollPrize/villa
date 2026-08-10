@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import transforms
 from transforms import (
     GapExpanderParams,
     GapExpandingTransform,
@@ -47,6 +48,35 @@ def test_bilinear_border_forward_matches_grid_sample_on_cpu():
     actual = _bilinear_sample_2d_border(values, x, y)
     expected = grid_sample_reference(values, x, y)
     torch.testing.assert_close(actual, expected, rtol=2e-15, atol=5e-15)
+
+
+def test_gap_transform_keeps_grid_sample_path_on_cpu(monkeypatch):
+    params = GapExpanderParams(
+        resolution=4.0,
+        min_z=0.0,
+        max_z=32.0,
+        num_windings=7,
+        dr_per_winding=12.0,
+    )
+    transform = GapExpandingTransform(
+        params=params,
+        dr_per_winding=torch.tensor(12.0),
+        min_z=0.0,
+        max_z=32.0,
+        gap_expander_lr_scale=1.0,
+    )
+    theta = torch.linspace(0.0, 2 * torch.pi, 17)
+    z = torch.linspace(0.0, 32.0, 17)
+
+    def unexpected_custom_sampler(*_args, **_kwargs):
+        raise AssertionError('the deterministic fallback is CUDA-only')
+
+    monkeypatch.setattr(
+        transforms, '_bilinear_sample_2d_border', unexpected_custom_sampler)
+    with deterministic_algorithms():
+        sampled = transform.get_logits_by_winding(theta, z)
+    assert sampled.shape == (17, 6)
+    assert torch.isfinite(sampled).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')

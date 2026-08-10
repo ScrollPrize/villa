@@ -240,14 +240,15 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         winding_coords_normalised = (
             winding_coords / winding_first_logit_idx[-1] * 2 - 1)
         z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-        if torch.are_deterministic_algorithms_enabled():
+        logits = self._get_pinned_scaled_logits()
+        if logits.is_cuda and torch.are_deterministic_algorithms_enabled():
             return _bilinear_sample_2d_border(
-                self._get_pinned_scaled_logits(),
+                logits,
                 winding_coords_normalised,
                 z_normalised[..., None].expand(*theta.shape, num_windings),
             )
         return F.grid_sample(
-            self._get_pinned_scaled_logits(),
+            logits,
             torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
             mode='bilinear',
             padding_mode='border',
