@@ -1,9 +1,10 @@
-"""Typed data, augmentation, normalization, and sampling configuration."""
+"""Typed ink data, model, and training configuration."""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -330,6 +331,8 @@ class Full3DConfig:
     label_projection_half_thickness: float | None = None
     background_projection_half_thickness: float | None = None
     support_grid_max_distance: float | None = 64.0
+    label_dilation_distance: float = 0.0
+    supervision_dilation_distance: float = 0.0
 
     @classmethod
     def from_mapping(cls, authored: Mapping[str, Any]) -> "Full3DConfig":
@@ -354,6 +357,12 @@ class Full3DConfig:
             background_projection_half_thickness=background,
             support_grid_max_distance=(
                 None if max_distance is None else float(max_distance)
+            ),
+            label_dilation_distance=float(
+                full.get("label_dilation_distance", 0.0)
+            ),
+            supervision_dilation_distance=float(
+                full.get("supervision_dilation_distance", 0.0)
             ),
         )
 
@@ -988,3 +997,372 @@ class InkConfig:
         """Return an independent JSON-shaped copy in authored key order."""
 
         return _thaw_json(self._canonical)
+
+
+@dataclass(frozen=True)
+class EmaConfig:
+    """Resolved EMA settings that are persisted as one complete mapping."""
+
+    enabled: bool
+    decay: float
+    start_step: int
+    update_every_steps: int
+    validate: bool
+    save_in_checkpoint: bool
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "EmaConfig":
+        value = authored.get("ema") or {}
+        if not isinstance(value, Mapping):
+            raise TypeError("ema must be an object or null")
+        enabled = bool(value.get("enabled", False))
+        return cls(
+            enabled=enabled,
+            decay=float(value.get("decay", 0.999)),
+            start_step=int(value.get("start_step", 0)),
+            update_every_steps=int(value.get("update_every_steps", 1)),
+            validate=bool(value.get("validate", enabled)),
+            save_in_checkpoint=bool(value.get("save_in_checkpoint", enabled)),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "decay": self.decay,
+            "start_step": self.start_step,
+            "update_every_steps": self.update_every_steps,
+            "validate": self.validate,
+            "save_in_checkpoint": self.save_in_checkpoint,
+        }
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """Local inline-benchmark controls; absent defaults are never checkpointed."""
+
+    enabled: bool
+    warmup_steps: int
+    output_path: Path | None
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "BenchmarkConfig":
+        value = authored.get("benchmark") or {}
+        if not isinstance(value, Mapping):
+            raise TypeError("benchmark must be an object or null")
+        enabled = bool(value.get("enabled", False))
+        warmup_steps = int(value.get("warmup_steps", 0))
+        if enabled and not 0 <= warmup_steps < int(authored["num_iterations"]):
+            raise ValueError(
+                "benchmark warmup_steps must be in [0, num_iterations)"
+            )
+        output_path = value.get("output_path")
+        return cls(
+            enabled=enabled,
+            warmup_steps=warmup_steps,
+            output_path=(
+                None if output_path in (None, "") else Path(str(output_path))
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    """Local optimizer constructor view delegated to vesuvius's factory."""
+
+    name: str
+    learning_rate: float
+    weight_decay: float
+    betas: Any
+    momentum: Any
+    nesterov: Any
+    encoder_lr_mult: Any
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "OptimizerConfig":
+        return cls(
+            name=str(authored.get("optimizer", "sgd")),
+            learning_rate=float(authored.get("learning_rate", 0.01)),
+            weight_decay=float(authored.get("weight_decay", 3e-5)),
+            betas=authored.get("optimizer_betas", (0.9, 0.999)),
+            momentum=authored.get("optimizer_momentum", 0.99),
+            nesterov=authored.get("optimizer_nesterov", True),
+            encoder_lr_mult=authored.get("encoder_lr_mult", 1.0),
+        )
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    """Resolved scheduler settings with stable defaults and key locations."""
+
+    name: Literal[
+        "diffusers_cosine_warmup", "cosine_annealing", "one_cycle"
+    ]
+    t_max: int
+    eta_min: float
+    max_lr: float | None
+    total_steps: int
+    pct_start: float
+    final_div_factor: float
+    warmup_steps: int
+
+    @classmethod
+    def from_mapping(
+        cls, authored: Mapping[str, Any], *, max_steps: int
+    ) -> "SchedulerConfig":
+        value = authored.get("scheduler") or {}
+        if not isinstance(value, Mapping):
+            raise TypeError("scheduler must be an object or null")
+        name = str(value.get("name", "diffusers_cosine_warmup")).strip().lower()
+        allowed = {
+            "diffusers_cosine_warmup",
+            "cosine_annealing",
+            "one_cycle",
+        }
+        if name not in allowed:
+            raise ValueError(
+                f"Unsupported scheduler.name={name!r}; expected "
+                "'diffusers_cosine_warmup', 'cosine_annealing', or 'one_cycle'"
+            )
+        max_lr = None
+        t_max = max_steps
+        eta_min = 0.0
+        total_steps = max_steps
+        pct_start = 0.3
+        final_div_factor = 1e4
+        warmup_steps = 1000
+        if name == "cosine_annealing":
+            t_max = int(value.get("t_max", max_steps))
+            eta_min = float(value.get("eta_min", 0.0))
+        elif name == "one_cycle":
+            max_lr = float(value["max_lr"])
+            total_steps = int(value.get("total_steps", max_steps))
+            pct_start = float(value.get("pct_start", 0.3))
+            final_div_factor = float(value.get("final_div_factor", 1e4))
+        else:
+            warmup_steps = int(authored.get("warmup_steps", 1000))
+        return cls(
+            name=name,
+            t_max=t_max,
+            eta_min=eta_min,
+            max_lr=max_lr,
+            total_steps=total_steps,
+            pct_start=pct_start,
+            final_div_factor=final_div_factor,
+            warmup_steps=warmup_steps,
+        )
+
+
+def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply ordered training mutations before creating frozen views."""
+
+    if not isinstance(authored, Mapping):
+        raise TypeError("ink training config must be an object")
+    canonical = _canonical_model_mapping(authored)
+
+    ema = EmaConfig.from_mapping(canonical)
+    canonical["ema"] = ema.to_mapping()
+
+    mode = str(canonical.get("mode", "flat")).strip().lower()
+    native_mode = mode in {"full_3d", "full_3d_single_wrap"}
+    if native_mode:
+        raw_model_config = canonical.get("model_config")
+        if raw_model_config is None:
+            model_config: dict[str, Any] = {}
+            canonical["model_config"] = model_config
+        elif isinstance(raw_model_config, Mapping):
+            model_config = dict(raw_model_config)
+            canonical["model_config"] = model_config
+        else:
+            raise TypeError("model_config must be an object or null")
+        model_config["z_projection_mode"] = "none"
+        raw_targets = canonical.get("targets") or {}
+        if not isinstance(raw_targets, Mapping):
+            raise TypeError("targets must be an object")
+        targets = {
+            str(name): (
+                dict(value) if isinstance(value, Mapping) else value
+            )
+            for name, value in raw_targets.items()
+        }
+        canonical["targets"] = targets
+        for target in targets.values():
+            if isinstance(target, dict):
+                target["z_projection_mode"] = "none"
+                if isinstance(target.get("z_projection"), Mapping):
+                    projection = dict(target["z_projection"])
+                    projection["mode"] = "none"
+                    target["z_projection"] = projection
+        canonical["in_channels"] = (
+            2 if mode == "full_3d_single_wrap" else 1
+        )
+
+    canonical.setdefault("volume_auth_json", None)
+    requested_stitch_factor = int(canonical.get("stitch_factor", 1))
+    use_stitched_forward = bool(
+        canonical.get(
+            "use_stitched_forward", requested_stitch_factor > 1
+        )
+    )
+    if native_mode:
+        use_stitched_forward = False
+    stitch_factor = 1
+    if use_stitched_forward:
+        if requested_stitch_factor <= 0:
+            raise ValueError("stitch_factor must be positive")
+        stitch_factor = requested_stitch_factor
+    model_crop_size = list(_tuple3(canonical["patch_size"], name="patch_size"))
+    canonical["crop_size"] = model_crop_size
+    canonical["patch_size"] = list(model_crop_size)
+    canonical["stitch_factor"] = stitch_factor
+    canonical["use_stitched_forward"] = use_stitched_forward
+    canonical["stitched_gradient_checkpointing"] = bool(
+        canonical.get("stitched_gradient_checkpointing", True)
+    )
+    canonical["targets"]["ink"]["out_channels"] = 1
+    canonical["targets"]["ink"]["activation"] = "none"
+    return canonical
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Frozen local training views derived from one canonical InkConfig."""
+
+    ink: InkConfig
+    num_iterations: int
+    out_dir: Path
+    seed: int
+    batch_size: int
+    model_crop_size: tuple[int, int, int]
+    loader_patch_size: tuple[int, int, int]
+    stitch_factor: int
+    use_stitched_forward: bool
+    stitched_gradient_checkpointing: bool
+    ema: EmaConfig
+    benchmark: BenchmarkConfig
+    optimizer: OptimizerConfig
+    scheduler: SchedulerConfig
+    grad_acc_steps: int
+    grad_clip: float | None
+    max_steps: int
+    val_every: int
+    save_every: int
+    log_every: int
+    val_preview_batches: int
+    val_steps: int
+    best_checkpoint_metric: Literal[
+        "val_loss", "val_balanced_accuracy"
+    ] | None
+    mixed_precision: str
+    ddp_find_unused_parameters: bool
+    ddp_broadcast_buffers: bool
+    dataloader_workers: int
+    pin_memory: bool | None
+    prefetch_factor: int
+    sampling_audit_every: int
+    verify_finite_gradients_steps: int
+    max_amp_overflow_events: int
+
+    @classmethod
+    def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
+        ink = InkConfig.from_mapping(canonical)
+        num_iterations = int(canonical["num_iterations"])
+        seed = int(canonical["seed"])
+        batch_size = int(canonical["batch_size"])
+        grad_acc_steps = int(canonical.get("grad_acc_steps", 1))
+        max_steps = int(
+            canonical.get(
+                "max_steps", math.ceil(num_iterations / grad_acc_steps)
+            )
+        )
+        val_every = int(canonical.get("val_every", 500))
+        save_every = int(canonical.get("save_every", val_every))
+        best_metric = canonical.get("best_checkpoint_metric")
+        if best_metric not in (None, "val_loss", "val_balanced_accuracy"):
+            raise ValueError(
+                "best_checkpoint_metric must be one of "
+                "{null, 'val_loss', 'val_balanced_accuracy'}"
+            )
+        sampling_audit_every = int(
+            canonical.get("sampling_audit_every", save_every)
+        )
+        if sampling_audit_every <= 0:
+            raise ValueError("sampling_audit_every must be positive")
+        verify_finite = int(canonical.get("verify_finite_gradients_steps", 0))
+        if verify_finite < 0:
+            raise ValueError("verify_finite_gradients_steps cannot be negative")
+        max_overflows = int(canonical.get("max_amp_overflow_events", 0))
+        if max_overflows < 0:
+            raise ValueError("max_amp_overflow_events cannot be negative")
+        model_crop_size = ink.model.crop_size
+        stitch_factor = int(canonical["stitch_factor"])
+        loader_patch_size = (
+            model_crop_size[0],
+            model_crop_size[1] * stitch_factor,
+            model_crop_size[2] * stitch_factor,
+        )
+        pin_memory = (
+            None
+            if "pin_memory" not in canonical
+            else bool(canonical["pin_memory"])
+        )
+        return cls(
+            ink=ink,
+            num_iterations=num_iterations,
+            out_dir=Path(str(canonical["out_dir"])),
+            seed=seed,
+            batch_size=batch_size,
+            model_crop_size=model_crop_size,
+            loader_patch_size=loader_patch_size,
+            stitch_factor=stitch_factor,
+            use_stitched_forward=bool(canonical["use_stitched_forward"]),
+            stitched_gradient_checkpointing=bool(
+                canonical["stitched_gradient_checkpointing"]
+            ),
+            ema=EmaConfig.from_mapping(canonical),
+            benchmark=BenchmarkConfig.from_mapping(canonical),
+            optimizer=OptimizerConfig.from_mapping(canonical),
+            scheduler=SchedulerConfig.from_mapping(
+                canonical, max_steps=max_steps
+            ),
+            grad_acc_steps=grad_acc_steps,
+            grad_clip=(
+                None
+                if canonical.get("grad_clip") is None
+                else float(canonical["grad_clip"])
+            ),
+            max_steps=max_steps,
+            val_every=val_every,
+            save_every=save_every,
+            log_every=int(canonical.get("log_every", 50)),
+            val_preview_batches=int(canonical.get("val_preview_batches", 3)),
+            val_steps=int(canonical.get("val_steps", 10)),
+            best_checkpoint_metric=best_metric,
+            mixed_precision=str(canonical.get("mixed_precision", "fp16")),
+            ddp_find_unused_parameters=bool(
+                canonical.get("ddp_find_unused_parameters", False)
+            ),
+            ddp_broadcast_buffers=bool(
+                canonical.get("ddp_broadcast_buffers", False)
+            ),
+            dataloader_workers=int(canonical.get("dataloader_workers", 0)),
+            pin_memory=None if pin_memory is None else bool(pin_memory),
+            prefetch_factor=int(canonical.get("prefetch_factor", 2)),
+            sampling_audit_every=sampling_audit_every,
+            verify_finite_gradients_steps=verify_finite,
+            max_amp_overflow_events=max_overflows,
+        )
+
+    @classmethod
+    def from_authored_mapping(
+        cls, authored: Mapping[str, Any]
+    ) -> "TrainingConfig":
+        return cls.from_mapping(resolve_training_mapping(authored))
+
+    @property
+    def surface_mask_channel(self) -> bool:
+        return self.ink.data.mode == "full_3d_single_wrap"
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Return the canonical mapping persisted in training checkpoints."""
+
+        return self.ink.to_mapping()
