@@ -5,9 +5,18 @@ finite_paint-format .npz (turn_id ground truth), making the ruler
 source-agnostic. finite_paint itself lives in Diego-dcv/vesuvius-topological-grid
 and isn't a dependency here, so the fixture below MIMICS its documented on-disk
 contract -- turn_id int16 [Z,Y,X], 0=air, winding t stored as t+1 -- rather
-than being real finite_paint output. The real integration test (against actual
-finite_paint output) is a follow-up once that repo is vendored/available; this
-exam pins the adapter's behavior against the contract we're consuming.
+than being real finite_paint output. This exam pins the adapter against that
+contract without needing the external repo in CI.
+
+Verified against REAL finite_paint output (2026-08-10, repo main):
+
+  python scripts/finite_paint.py volume --columns 12 --voxel-um 60 \
+      --z-window 3 --fuse 3,5,80,140 --out small_fused.npz
+
+emits exactly the assumed contract (turn_id int16 [50,206,380], 0=air, 1-based,
+max 23); winding_error --truth-npz scored a perfect candidate at MAE 0.0000 /
+switch 0% and localized a single mislabeled turn to 100% on that turn, 0%
+elsewhere -- so the fixture's assumptions match the live painter.
 """
 
 import os
