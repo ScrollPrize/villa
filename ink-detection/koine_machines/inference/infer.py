@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 LOGGER = logging.getLogger("inference_ome_zarr")
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
-DEFAULT_OVERLAP = 0.25
+DEFAULT_OVERLAP = 0.5
 DEFAULT_SW_BATCH_SIZE = 4
 DEFAULT_PREFETCH_FACTOR = 2
 
@@ -421,7 +421,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_PREFETCH_FACTOR,
         help="Number of batches prefetched per worker when --num-workers > 0.",
     )
-    parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=DEFAULT_OVERLAP,
+        help="Sliding-window overlap fraction. Default: 0.5.",
+    )
     parser.add_argument(
         "--stride",
         type=int,
@@ -436,8 +441,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("auto", "constant", "gaussian", "hann"),
         default="auto",
         help=(
-            "Overlap-add importance window. 'auto' preserves the historical "
-            "behavior: constant without overlap, Gaussian otherwise."
+            "Overlap-add importance window. 'auto' selects constant without "
+            "overlap, Hann otherwise."
         ),
     )
     parser.add_argument("--layer-start", type=int, default=None)
@@ -1639,7 +1644,7 @@ def infer_single_zarr(
     )
     weight_mode = str(args.blend_mode)
     if weight_mode == "auto":
-        weight_mode = "constant" if patch_stride >= patch_size else "gaussian"
+        weight_mode = "constant" if patch_stride >= patch_size else "hann"
 
     tiff_tile_shape = (patch_size, patch_size)
     if tiff_tile_shape[0] % 16 != 0 or tiff_tile_shape[1] % 16 != 0:
