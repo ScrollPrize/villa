@@ -24,7 +24,10 @@ def _write_source(path: Path, data_ZYX: np.ndarray, *, level: str = "2") -> None
         kwargs["zarr_format"] = 2
     group = zarr.open_group(path, **kwargs)
     chunks = (21, *(2 for _ in data_ZYX.shape[1:]))
-    group.create_array(level, data=data_ZYX, chunks=chunks)
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        group.create_array(level, data=data_ZYX, chunks=chunks)
+    else:
+        group.create_dataset(level, data=data_ZYX, chunks=chunks)
 
 
 def test_centered_slice_places_an_odd_margin_before_the_slice():

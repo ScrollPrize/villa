@@ -214,9 +214,14 @@ def test_compile_status_is_false_when_compiler_is_unavailable(monkeypatch):
 
 def test_root_volume_view_and_level_selection_share_one_open(tmp_path):
     root_path = tmp_path / "pyramid.zarr"
-    root = zarr.open_group(root_path, mode="w", zarr_format=2)
-    root.create_array("0", shape=(3, 4, 5), chunks=(3, 4, 5), dtype="u1")
-    root.create_array("3", shape=(1, 1, 1), chunks=(1, 1, 1), dtype="u1")
+    kwargs = {"mode": "w"}
+    zarr3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+    if zarr3:
+        kwargs["zarr_format"] = 2
+    root = zarr.open_group(root_path, **kwargs)
+    create = root.create_array if zarr3 else root.create_dataset
+    create("0", shape=(3, 4, 5), chunks=(3, 4, 5), dtype="u1")
+    create("3", shape=(1, 1, 1), chunks=(1, 1, 1), dtype="u1")
 
     opened = open_volume_root(root_path)
 

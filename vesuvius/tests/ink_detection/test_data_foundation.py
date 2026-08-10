@@ -83,7 +83,10 @@ def _segment(
 
 def _write_pyramid(path: Path, array: np.ndarray) -> None:
     root = zarr.open_group(path, mode="w")
-    root.create_array("0", data=array, chunks=array.shape)
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        root.create_array("0", data=array, chunks=array.shape)
+    else:
+        root.create_dataset("0", data=array, chunks=array.shape)
 
 
 def test_config_rejects_undefined_subtiling_branch(tmp_path):
