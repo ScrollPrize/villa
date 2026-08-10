@@ -16,6 +16,62 @@ from geom_utils import expm_2x2, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
 
+def _bilinear_sample_2d_border(input_2d, x_normalised, y_normalised):
+    """Sample a single 2-D plane without CUDA grid-sampler atomics.
+
+    This is the ``N=C=1``, bilinear, border-padded, ``align_corners=True``
+    subset used by :class:`GapExpandingTransform`.  ``index_select`` has a
+    deterministic CUDA backward in supported PyTorch builds, whereas
+    ``grid_sample``'s CUDA input-gradient path does not.
+    """
+    if input_2d.ndim != 4 or input_2d.shape[:2] != (1, 1):
+        raise ValueError('deterministic gap sampling requires input shape [1, 1, H, W]')
+    if x_normalised.shape != y_normalised.shape:
+        raise ValueError('deterministic gap-sampling coordinates must have matching shapes')
+
+    height, width = input_2d.shape[-2:]
+    # Grid-sampler documents NaN grid coordinates as -1.  Infinite values are
+    # outside the domain and border padding maps them to the corresponding edge.
+    x_normalised = torch.nan_to_num(
+        x_normalised, nan=-1.0, posinf=1.0, neginf=-1.0)
+    y_normalised = torch.nan_to_num(
+        y_normalised, nan=-1.0, posinf=1.0, neginf=-1.0)
+    def clip_with_border_gradient(coordinate, upper):
+        # ATen's border sampler deliberately sets the coordinate derivative to
+        # zero at and beyond either edge.  torch.clamp alone has derivative one
+        # exactly on the edge, so preserve the clipped forward value while
+        # supplying ATen's strict-interior derivative.
+        clipped = coordinate.clamp(0, upper)
+        interior = ((coordinate > 0) & (coordinate < upper)).to(coordinate.dtype)
+        return clipped.detach() + (coordinate - coordinate.detach()) * interior
+
+    x = clip_with_border_gradient(
+        (x_normalised + 1) * 0.5 * (width - 1), width - 1)
+    y = clip_with_border_gradient(
+        (y_normalised + 1) * 0.5 * (height - 1), height - 1)
+
+    x0 = x.floor().to(torch.int64)
+    y0 = y.floor().to(torch.int64)
+    x1 = (x0 + 1).clamp(max=width - 1)
+    y1 = (y0 + 1).clamp(max=height - 1)
+    wx = x - x0.to(x.dtype)
+    wy = y - y0.to(y.dtype)
+
+    flat = input_2d.reshape(-1)
+
+    def gather(yi, xi):
+        indices = (yi * width + xi).reshape(-1)
+        return flat.index_select(0, indices).view_as(x)
+
+    v00 = gather(y0, x0)
+    v01 = gather(y0, x1)
+    v10 = gather(y1, x0)
+    v11 = gather(y1, x1)
+    top = torch.lerp(v00, v01, wx)
+    bottom = torch.lerp(v10, v11, wx)
+    return torch.lerp(top, bottom, wy)
+
+
 class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
 
     domain = pyro.distributions.constraints.real_vector
@@ -184,6 +240,12 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         winding_coords_normalised = (
             winding_coords / winding_first_logit_idx[-1] * 2 - 1)
         z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
+        if torch.are_deterministic_algorithms_enabled():
+            return _bilinear_sample_2d_border(
+                self._get_pinned_scaled_logits(),
+                winding_coords_normalised,
+                z_normalised[..., None].expand(*theta.shape, num_windings),
+            )
         return F.grid_sample(
             self._get_pinned_scaled_logits(),
             torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
