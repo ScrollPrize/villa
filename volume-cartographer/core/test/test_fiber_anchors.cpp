@@ -297,7 +297,7 @@ TEST_CASE("fiber anchor extraction handles a clipped global edge cell")
     CHECK(component.anchor.positionPredictionXYZ == cv::Vec3d{4.0, 4.0, 4.0});
 }
 
-TEST_CASE("fiber anchor artifacts keep prediction positions authoritative")
+TEST_CASE("fiber anchor artifacts expose only base-volume positions")
 {
     const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 4, 4}, 2.0};
     const auto report = vc::fiber_tracer::extractFiberAnchors(
@@ -311,11 +311,15 @@ TEST_CASE("fiber anchor artifacts keep prediction positions authoritative")
     artifact.glyphLengthBaseVoxels = 8.0;
     const auto json = vc::fiber_tracer::fiberAnchorReportJson(report, artifact);
     CHECK(json.at("version") == 1);
+    CHECK(json.at("coordinates").at("position_space") == "base_volume");
     CHECK(json.at("coordinates").at("prediction_to_base_scale") == 2.0);
+    CHECK(json.at("selection").contains("prediction_interval_origin_base_xyz"));
+    CHECK(json.at("selection").contains("prediction_interval_size_base_xyz"));
+    CHECK_FALSE(json.at("selection").contains("crop_origin_xyz"));
     REQUIRE(json.at("cells").size() == 1);
     const auto& anchor = json.at("cells").at(0).at("components").at(0);
-    CHECK(anchor.contains("position_prediction_xyz"));
-    CHECK_FALSE(anchor.contains("position_base_xyz"));
+    CHECK(anchor.contains("position_base_xyz"));
+    CHECK_FALSE(anchor.contains("position_prediction_xyz"));
     const std::string obj = vc::fiber_tracer::fiberAnchorReportObj(report, artifact);
     CHECK(obj.find("g cell_0_0_0_anchor_0") != std::string::npos);
     CHECK(obj.find("\nl 1 2\n") != std::string::npos);
@@ -330,6 +334,27 @@ TEST_CASE("fiber anchor artifacts keep prediction positions authoritative")
     CHECK(vc::fiber_tracer::fiberAnchorReportJson(parallelReport, artifact).dump() ==
           json.dump());
     CHECK(vc::fiber_tracer::fiberAnchorReportObj(parallelReport, artifact) == obj);
+}
+
+TEST_CASE("base-volume crop maps half-open point coordinates to prediction samples")
+{
+    const vc::fiber_tracer::FiberAnchorCrop aligned{{12, 24, 36}, {12, 12, 12}};
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(aligned, 3.0).originXYZ ==
+          std::array<size_t, 3>{4, 8, 12});
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(aligned, 3.0).sizeXYZ ==
+          std::array<size_t, 3>{4, 4, 4});
+
+    const vc::fiber_tracer::FiberAnchorCrop nonAligned{{13, 25, 37}, {10, 10, 10}};
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(nonAligned, 3.0).originXYZ ==
+          std::array<size_t, 3>{5, 9, 13});
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(nonAligned, 3.0).sizeXYZ ==
+          std::array<size_t, 3>{3, 3, 3});
+
+    const vc::fiber_tracer::FiberAnchorCrop decimalScale{{9, 18, 27}, {9, 9, 9}};
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(decimalScale, 1.5).originXYZ ==
+          std::array<size_t, 3>{6, 12, 18});
+    CHECK(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(decimalScale, 1.5).sizeXYZ ==
+          std::array<size_t, 3>{6, 6, 6});
 }
 
 TEST_CASE("fiber stored-grid sampling binds only canonical prediction channels")

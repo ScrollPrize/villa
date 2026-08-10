@@ -319,6 +319,41 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         throw std::invalid_argument("fiber anchor thread count must be positive");
 }
 
+FiberAnchorCrop fiberAnchorCropFromBaseVoxels(
+    const FiberAnchorCrop& baseCrop,
+    double predictionToBaseScale)
+{
+    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale))
+        throw std::invalid_argument("fiber anchor base crop requires a positive prediction-to-base scale");
+
+    FiberAnchorCrop predictionCrop;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        const size_t origin = baseCrop.originXYZ[axis];
+        const size_t extent = baseCrop.sizeXYZ[axis];
+        if (extent == 0 || origin > std::numeric_limits<size_t>::max() - extent)
+            throw std::invalid_argument("fiber anchor base crop must be non-empty and must not overflow");
+        const auto snappedCeil = [&](size_t baseBoundary) {
+            long double scaled = static_cast<long double>(baseBoundary) / predictionToBaseScale;
+            const long double nearest = std::round(scaled);
+            const long double tolerance = 1.0e-12L * std::max(1.0L, std::abs(scaled));
+            if (std::abs(scaled - nearest) <= tolerance)
+                scaled = nearest;
+            return std::ceil(scaled);
+        };
+        const long double predictionBegin = snappedCeil(origin);
+        const long double predictionEnd = snappedCeil(origin + extent);
+        if (predictionBegin < 0.0L ||
+            predictionEnd > static_cast<long double>(std::numeric_limits<size_t>::max())) {
+            throw std::invalid_argument("fiber anchor base crop exceeds the prediction index range");
+        }
+        predictionCrop.originXYZ[axis] = static_cast<size_t>(predictionBegin);
+        predictionCrop.sizeXYZ[axis] = static_cast<size_t>(predictionEnd - predictionBegin);
+        if (predictionCrop.sizeXYZ[axis] == 0)
+            throw std::invalid_argument("fiber anchor base crop contains no prediction-grid sample");
+    }
+    return predictionCrop;
+}
+
 FiberCellAnchorResult fitFiberCellAnchors(
     const std::array<size_t, 3>& cellZYX,
     const std::array<size_t, 3>& cellBeginZYX,
@@ -628,13 +663,21 @@ nlohmann::json fiberAnchorReportJson(
         {"coordinates", {
             {"position_order", "XYZ"},
             {"cell_index_order", "ZYX"},
-            {"position_space", "stored_prediction_grid"},
+            {"position_space", "base_volume"},
             {"prediction_to_base_scale", report.grid.predictionToBaseScale},
             {"prediction_shape_zyx", report.grid.shapeZYX},
         }},
         {"selection", {
-            {"crop_origin_xyz", report.selectedCrop.originXYZ},
-            {"crop_size_xyz", report.selectedCrop.sizeXYZ},
+            {"prediction_interval_origin_base_xyz", {
+                report.selectedCrop.originXYZ[0] * report.grid.predictionToBaseScale,
+                report.selectedCrop.originXYZ[1] * report.grid.predictionToBaseScale,
+                report.selectedCrop.originXYZ[2] * report.grid.predictionToBaseScale,
+            }},
+            {"prediction_interval_size_base_xyz", {
+                report.selectedCrop.sizeXYZ[0] * report.grid.predictionToBaseScale,
+                report.selectedCrop.sizeXYZ[1] * report.grid.predictionToBaseScale,
+                report.selectedCrop.sizeXYZ[2] * report.grid.predictionToBaseScale,
+            }},
             {"cell_begin_zyx", report.selectedCellBeginZYX},
             {"cell_end_zyx", report.selectedCellEndZYX},
         }},
@@ -674,10 +717,10 @@ nlohmann::json fiberAnchorReportJson(
             };
             if (component.retained) {
                 const auto& anchor = component.anchor;
-                componentJson["position_prediction_xyz"] = {
-                    anchor.positionPredictionXYZ[0],
-                    anchor.positionPredictionXYZ[1],
-                    anchor.positionPredictionXYZ[2]};
+                const cv::Vec3d positionBase =
+                    anchor.positionPredictionXYZ * report.grid.predictionToBaseScale;
+                componentJson["position_base_xyz"] = {
+                    positionBase[0], positionBase[1], positionBase[2]};
                 componentJson["axis_xyz"] = {
                     anchor.axisXYZ[0], anchor.axisXYZ[1], anchor.axisXYZ[2]};
                 componentJson["aligned_support"] = anchor.alignedSupport;

@@ -95,6 +95,10 @@ using FiberStoredPredictionBatchSampler = std::function<void(
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config);
 
+[[nodiscard]] FiberAnchorCrop fiberAnchorCropFromBaseVoxels(
+    const FiberAnchorCrop& baseCrop,
+    double predictionToBaseScale);
+
 [[nodiscard]] FiberCellAnchorResult fitFiberCellAnchors(
     const std::array<size_t, 3>& cellZYX,
     const std::array<size_t, 3>& cellBeginZYX,

@@ -2504,3 +2504,18 @@ threads.
   with `python -m pip install -e volume-cartographer --no-deps --break-system-packages`.
 - Production remote sampling should use the VC3D blocking sampler, not the
   fallback NumPy sampler.
+
+## C++ fiberlet extraction
+
+`volume-cartographer/core/src/fiber_tracer/FiberAnchors.cpp` extracts the
+versioned cell-anchor artifact. `FiberPaths.cpp` strictly reloads that artifact,
+enumerates fixed-radius cell-shell pairs, and solves integer prediction-voxel
+paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
+smoothness equations shared by the native greedy tracer and fiberlet DP.
+
+`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors` and `paths`.
+The latter requires the matching fiber manifest plus a separate regular
+Lasagna normal manifest and writes machine-readable `fiberlets.json` together
+with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ
+coordinates are base-volume coordinates; prediction coordinates are private to
+the anchor fit and DP implementations.

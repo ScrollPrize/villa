@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
+#include "vc/fiber_tracer/FiberLocalScoring.hpp"
 
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -647,19 +648,6 @@ void validateTraceConfig(const FiberTraceConfig& config)
     return excess * excess;
 }
 
-[[nodiscard]] float isotropicSmoothnessLoss(
-    const TraceVec& previousStepDirection,
-    const TraceVec& candidateStepDirection,
-    const FiberTraceConfig& config)
-{
-    const float freeAngle =
-        static_cast<float>(config.smoothnessFreeAngleDegrees) * kTracePi / 180.0f;
-    return static_cast<float>(config.smoothnessWeight) *
-           traceExcessAngleSquared(
-               traceAngleBetweenUnit(previousStepDirection, candidateStepDirection),
-               freeAngle);
-}
-
 [[nodiscard]] float smoothnessLoss(
     const TraceVec& previousStepDirection,
     const TraceVec& candidateStepDirection,
@@ -667,33 +655,18 @@ void validateTraceConfig(const FiberTraceConfig& config)
     bool normalValid,
     const FiberTraceConfig& config)
 {
-    const TraceVec& prev = previousStepDirection;
-    const TraceVec& cand = candidateStepDirection;
-    constexpr float kTraceEpsilon2 = kTraceEpsilon * kTraceEpsilon;
-    if (prev.dot(prev) <= kTraceEpsilon2 || cand.dot(cand) <= kTraceEpsilon2)
-        return 0.0f;
-
-    const float isotropic = isotropicSmoothnessLoss(prev, cand, config);
-    const TraceVec& n = normal;
-    const float normalWeight = static_cast<float>(config.smoothnessNormalWeight);
-    const float tangentWeight = static_cast<float>(config.smoothnessTangentWeight);
-    if (!normalValid || n.dot(n) <= kTraceEpsilon2)
-        return isotropic;
-
-    const float prevN = traceClampSignedUnit(prev.dot(n));
-    const float candN = traceClampSignedUnit(cand.dot(n));
-    const TraceVec prevT = traceNormalizedOrZero(prev - n * prevN);
-    const TraceVec candT = traceNormalizedOrZero(cand - n * candN);
-    const bool tangentOk =
-        prevT.dot(prevT) > kTraceEpsilon2 && candT.dot(candT) > kTraceEpsilon2;
-    const float tangentAngle = tangentOk
-        ? traceAngleBetweenUnit(prevT, candT)
-        : traceAngleBetweenUnit(prev, cand);
-    const float normalAngle = std::abs(std::asin(candN) - std::asin(prevN));
-    const float freeAngle =
-        static_cast<float>(config.smoothnessFreeAngleDegrees) * kTracePi / 180.0f;
-    return tangentWeight * traceExcessAngleSquared(tangentAngle, freeAngle) +
-           normalWeight * traceExcessAngleSquared(normalAngle, freeAngle);
+    return fiberLocalSmoothnessCost(
+               previousStepDirection,
+               candidateStepDirection,
+               normal,
+               normalValid,
+               FiberLocalSmoothnessConfig{
+                   static_cast<float>(config.smoothnessWeight),
+                   static_cast<float>(config.smoothnessNormalWeight),
+                   static_cast<float>(config.smoothnessTangentWeight),
+                   static_cast<float>(config.smoothnessFreeAngleDegrees) *
+                       kTracePi / 180.0f})
+        .total();
 }
 
 [[nodiscard]] float cumulativeTangentSmoothnessLoss(

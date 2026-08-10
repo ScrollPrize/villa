@@ -2498,9 +2498,12 @@
   a reference direction merely to use the trace sampling API.
 - Stored prediction indices are voxel centres. Cubic cells of integer side 2
   through 8 are anchored at prediction-grid origin zero and own half-open,
-  globally fixed ZYX index ranges. A crop selects intersecting complete global
-  cells and cannot recenter or truncate them. Clipping occurs only at the
-  global prediction-volume edge.
+  globally fixed ZYX index ranges. CLI spatial coordinates are always in base
+  voxels. The half-open `--crop` base box maps its two boundaries to point
+  indices with scale-aware `ceil(base/prediction_to_base_scale)`, then selects
+  intersecting complete global cells without recentering or truncating them.
+  A non-empty box containing no prediction sample and any selection outside the
+  global prediction volume are errors; there is no implicit clipping.
 - Each valid observation has fixed weight `g_i p_i`, where `g_i` is a Gaussian
   about the nominal global cell centre and `p_i` is presence. Invalid axes and
   presence below the inclusive floor contribute no numerator. The support
@@ -2521,10 +2524,79 @@
   zero, one, or two anchors.
 - Reductions, seeds, assignment ties, convergence, component ordering, and
   serialization sign are deterministic. Parallel work cannot change a
-  within-cell reduction. Machine output stores one prediction-grid XYZ
-  position and one prediction-to-base scale; OBJ coordinates are derived in
-  base voxels. Runtime timing and worker count are not scientific output, so
+  within-cell reduction. Machine output and OBJ store spatial positions only in
+  base-volume XYZ coordinates. Prediction shape/scale, cell indices, cell size,
+  and Gaussian sigma remain explicit lattice metadata and parameters. Runtime
+  timing and worker count are not scientific output, so
   artifacts remain byte-identical across worker counts.
-- The anchor stage does not connect anchors, search paths, filter paths,
-  deduplicate paths, or extend fiberlets. Those stages remain unspecified
-  until anchor density and calibration measurements are available.
+- The anchor command itself does not connect anchors. Its strict version-1
+  JSON is the authoritative input to the separate integer-DP path stage.
+
+# Integer-DP fiberlet paths
+
+- `vc_fiberlets paths` consumes a strict `vc_fiberlet_anchors` version-1 JSON,
+  its matching canonical fiber manifest, and a separate regular Lasagna normal
+  manifest. Format/version, retained component structure, finite unit axes,
+  cell ownership/order, grid shape, prediction-to-base scale, and materialized
+  fiber-manifest content hash must match. Malformed artifacts are rejected
+  without repair. The stored source locator is informational, so identical
+  manifest content may be relocated. Fiber prediction `nx/ny` must never be
+  used as Lasagna surface normals.
+- Candidate target cells lie on the deterministic half-open integer shell
+  `radius-0.5 <= norm(offset) < radius+0.5`, initially radius four. All retained
+  component pairs are considered once in canonical `(cell_zyx,component)`
+  order. Both unoriented endpoint axes must align to the chord within the
+  configured bound, initially 45 degrees. This stage does not impose degree,
+  mutual-best, overlap, or global graph constraints.
+- Searchable states are integer voxels of the stored prediction grid. Exact
+  fitted anchors remain virtual endpoints and connect to every in-bounds
+  integer voxel within `sqrt(3)` prediction voxels whose nonzero edge advances
+  along the chord and satisfies the endpoint-angle bound. Exact integer
+  endpoints use a zero-length attachment carrying the oriented endpoint axis.
+- A cubic Hermite reference uses the exact endpoints, chord-oriented axes, and
+  endpoint-distance derivative magnitudes. It is sampled with
+  `max(8,ceil(4*endpoint_distance))` segments. Corridor membership is exact
+  point-to-polyline-segment distance at the configured radius, defaulting to
+  one anchor-cell side; valid endpoint attachments are inserted explicitly.
+- The directed move stencil is the subset of the 26 nonzero offsets in
+  `{-1,0,1}^3` with strictly positive chord projection. The resulting graph is
+  acyclic. DP state is `(integer_voxel,incoming_move)` plus deterministic
+  source-attachment states. Sink selection scores the real final virtual edge.
+- For a valid sampled unoriented prediction axis `d`, the direction floor is
+  `theta_q=min_m acos(abs(dot(d,m)))` over the representable local move set.
+  Direction cost is
+  `direction_weight*max(0,theta-theta_q)^2*edge_length`; source virtual edges
+  use their own attachment-set floor. Presence cost is
+  `presence_weight*(1-clamp(p,0,1))*edge_length`. Edge-length weighting keeps
+  axial and diagonal data integration comparable.
+- An invalid fiber sample pays only
+  `invalid_prediction_cost_per_prediction_voxel*edge_length`, default 4.0. Presence and
+  direction components are then zero, while independently valid Lasagna
+  normals may still govern curvature. Invalid predictions are finite bridges,
+  not obstacles; without a quality threshold, a mostly invalid geometrically
+  reachable path may succeed and must report its invalid cost.
+- Direct local curvature shares the native 3D tracer's exact float
+  normal-aware equations. With a valid normal it emits tangent-plane and
+  normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
+  defaults are isotropic/normal/tangent weights `2/0.1/10` and a 45-degree
+  lattice free angle. The per-turn value is divided by
+  `max(1,(previous_edge_length+candidate_edge_length)/2)`. Cumulative history
+  smoothness is not part of this DP.
+- `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates, parameters,
+  diagnostics, every considered endpoint pair and reason, component cost
+  totals, and successful base-coordinate paths. `fiberlets.obj` contains
+  only successful base-coordinate line groups. Both are atomically replaced;
+  timing and worker count are not serialized, so repeated identical runs are
+  byte-identical.
+- A candidate has independent searched, score-valid, and accepted state. A
+  score becomes valid only when DP finds a sink path with a finite total;
+  feasibility failures never serialize a zero placeholder cost. `paths
+  --stats` reports retained anchors, candidate/search/unscored/accepted counts,
+  and min/mean/max for all scored paths and the accepted subset, using `n/a`
+  for an empty population. Until quality filtering exists, every scored path is
+  accepted and the two ranges match.
+- OBJ output uses one group per accepted fiberlet and one explicit two-index
+  line element per adjacent path edge for compatibility with MeshLab importers.
+- Continuous/sub-voxel search, learned path-quality rejection, overlap
+  deduplication, extension, global graph construction, H/V and winding labels,
+  CUDA batching, and production radius selection remain out of scope.

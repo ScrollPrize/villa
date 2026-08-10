@@ -1,3 +1,18 @@
+# 2026-08-10: integer-DP fiberlet paths
+
+- Added strict anchor-artifact loading, radius-four cell-shell pairing, and
+  deterministic integer prediction-voxel DP with exact virtual endpoints.
+- Added quantization-relative direction and edge-length presence costs, finite
+  invalid-prediction bridges, and shared native Lasagna-aware direct curvature.
+- Added `vc_fiberlets paths`, versioned JSON/OBJ output, focused regression
+  tests, and real-crop deterministic validation. Global graph construction,
+  deduplication, extension, and H/V/winding assignment remain deferred.
+- Made base-volume coordinates the only spatial contract exposed by the
+  unshipped fiberlet CLI and JSON/OBJ artifacts; no compatibility aliases or
+  legacy coordinate fields are retained.
+- Added `paths --stats`, explicit score-presence semantics, and
+  MeshLab-compatible two-index OBJ path edges.
+
 # 2026-08-10: C++ fiberlet cell anchors
 
 - Added deterministic cell-based extraction of zero, one, or two

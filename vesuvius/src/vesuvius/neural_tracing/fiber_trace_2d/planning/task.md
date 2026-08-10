@@ -1,54 +1,54 @@
-# Task: anchor-seeded fiberlet over-segmentation
+# Task: integer-DP fiberlet paths
 
-Build a staged C++ pipeline that over-segments a stored 3D fiber-prediction
-volume into short, reliable fiberlets.
+Extend the C++ anchor-seeded fiberlet pipeline with its first path-connection
+stage.
 
-## Overall approach
+For every retained cell anchor, inspect anchors in cells on a discrete
+approximately spherical shell at a fixed radius of four cell widths. Reject
+endpoint pairs whose unoriented axes are incompatible with their chord, but do
+not impose a final graph degree or global assignment yet.
 
-1. Partition the stored prediction grid into coarse 3D cells, initially
-   configurable from 2 to 8 stored-prediction voxels per side. Choose the
-   largest cell size for which two distinct, approximately parallel fibers
-   cannot occupy one cell. This represents the minimum sustained fiber/sheet
-   separation, not an implementation of conceptual 4D Lasagna data. All
-   low-level prediction arrays and coordinates remain 3D.
-2. Extract zero, one, or two supported anchors per cell. Each anchor has a
-   sub-voxel position and an unoriented principal fiber axis. Use Gaussian
-   spatial weighting, prediction presence, and sign-invariant directional
-   agreement. Jointly fit two arbitrary, potentially non-orthogonal directions
-   and then discard either result if it has insufficient aligned presence
-   support.
-3. In a later stage, consider nearby anchor pairs up to the maximum prediction
-   hole/confusion distance that the system is intended to bridge. Straighten
-   each local problem with the endpoint axes and solve a directed path problem
-   with no backtracking. The eventual path cost should retain prediction,
-   direction, tangent curvature, and normal curvature terms. Lasagna
-   tangent/normal geometry may constrain or prune the search volume. Batched
-   CUDA dynamic programming is a possible acceleration, not a requirement of
-   the anchor stage.
-4. Reject low-quality paths, deduplicate overlapping paths, and extend accepted
-   paths to produce the final fiberlet over-segmentation.
+For each remaining pair, solve a short directed path through the dense stored
+fiber-prediction volume. Search states must be integer prediction-grid voxels,
+not coarse cells or continuous/sub-voxel positions. Preserve fitted sub-voxel
+anchors as exact virtual endpoints. Use a deterministic 26-neighbour,
+forward-only dynamic program in a bounded corridor between the anchors.
 
-## Current stage: cell anchors only
+The initial objective must contain:
 
-Plan and then implement only cell construction and extraction/refinement of at
-most two anchors per cell from an existing local or remote fiber Lasagna
-manifest. Reuse the existing manifest, remote cache, compact-axis decoder, and
-`FiberPredictionField` sampling implementation.
+- low-presence cost;
+- unoriented fiber-direction disagreement with a per-prediction-axis
+  quantization floor, so the best direction representable by the discrete move
+  stencil has zero direction penalty;
+- direct one-step curvature, split into tangent-plane turn and normal tilt
+  using a separate regular Lasagna normal manifest, with the existing native
+  tracer equations shared rather than copied.
 
-The current stage must:
+Weight data costs by edge length so axial and diagonal moves are comparable.
+Leave cumulative/history smoothness out of this stage.
 
-- define cell size in stored prediction voxels and convert positions explicitly
-  between prediction-grid and base-volume coordinates;
-- treat every decoded direction as an unoriented axis;
-- use deterministic two-component Gaussian/presence-weighted directional
-  clustering with a weighted PCA update for each independently fitted line;
-- modulate presence support by squared unoriented direction alignment and
-  independently retain zero, one, or two fitted anchors by support;
-- produce a machine-readable anchor artifact and an OBJ visualization of the
-  accepted anchor axes;
-- expose enough diagnostics to choose the cell size and thresholds on a real
-  crop before the connection stage is designed.
+Consume the existing versioned `anchors.json` as the authoritative anchor
+input and verify it against the supplied fiber manifest. Produce a versioned
+machine-readable collection of successful/rejected candidate paths and an OBJ
+with one base-coordinate line group per successful fiberlet. The immediate
+validation target is manual inspection on a small crop.
 
-NML input, anchor connection, path search, CUDA, Lasagna-normal path costs,
-path-quality filtering, fiberlet deduplication, and path extension are out of
-scope for this stage.
+All spatial coordinates exposed by the CLI or its generated artifacts must be
+base-volume coordinates. Prediction-grid coordinates remain an internal solver
+representation. Discrete cell indices and parameters expressed as counts of
+prediction-grid cells or voxels remain in their native lattice units because
+they are not spatial coordinate values.
+
+Path-quality rejection beyond endpoint/path feasibility, overlapping-path
+deduplication, extension, global graph construction, H/V and winding labels,
+CUDA batching, and a production connection radius remain later stages.
+
+Add a `paths --stats` diagnostic flag reporting anchor and candidate counts,
+accepted fiberlets, and min/mean/max objective scores for every scored path and
+for the accepted subset. The report must state how many candidates have no DP
+score. Until a quality threshold exists, every successfully scored path is
+accepted, so the two score summaries are expected to match.
+
+Make diagnostic OBJ paths robust in MeshLab by emitting every adjacent path
+edge as an explicit two-index OBJ `l` element instead of relying on a
+multi-index polyline record.
