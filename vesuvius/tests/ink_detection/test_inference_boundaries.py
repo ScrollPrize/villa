@@ -30,6 +30,14 @@ from vesuvius.ink_detection.volume_io import (
     select_volume_level,
 )
 
+from .test_model_foundation import _config_mapping
+
+
+def _backbone_config(value: str) -> dict:
+    authored = _config_mapping()
+    authored["model_config"]["pretrained_backbone"] = value
+    return authored
+
 
 def test_inference_import_does_not_add_runtime_side_effects():
     source = """
@@ -98,22 +106,16 @@ def test_recursive_backbone_resolution_is_relative_cycle_safe_and_pure(tmp_path)
     terminal = nested_dir / "terminal.pth"
     middle = nested_dir / "middle.pth"
     torch.save(
-        {"config": {"model_config": {"pretrained_backbone": "dinov2"}}},
+        {"config": _backbone_config("dinov2")},
         terminal,
     )
     torch.save(
-        {
-            "config": {
-                "model_config": {"pretrained_backbone": terminal.name}
-            }
-        },
+        {"config": _backbone_config(terminal.name)},
         middle,
     )
     outer_path = tmp_path / "outer.pth"
-    authored = {
-        "model_config": {"pretrained_backbone": "nested/middle.pth"},
-        "untouched": [1, 2, 3],
-    }
+    authored = _backbone_config("nested/middle.pth")
+    authored["untouched"] = [1, 2, 3]
     before = deepcopy(authored)
 
     resolved = resolve_pretrained_backbone_config(
@@ -124,18 +126,14 @@ def test_recursive_backbone_resolution_is_relative_cycle_safe_and_pure(tmp_path)
     assert authored == before
 
     torch.save(
-        {
-            "config": {
-                "model_config": {"pretrained_backbone": "../outer.pth"}
-            }
-        },
+        {"config": _backbone_config("../outer.pth")},
         middle,
     )
     torch.save({"config": authored}, outer_path)
     with pytest.raises(ValueError, match="recursive pretrained_backbone"):
         resolve_pretrained_backbone_config(authored, checkpoint_path=outer_path)
 
-    missing = {"model_config": {"pretrained_backbone": "missing.pth"}}
+    missing = _backbone_config("missing.pth")
     with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
         resolve_pretrained_backbone_config(missing, checkpoint_path=outer_path)
 
@@ -145,13 +143,13 @@ def test_backbone_resolution_falls_back_to_current_directory(tmp_path, monkeypat
     checkpoint_dir.mkdir()
     terminal = tmp_path / "backbone.pth"
     torch.save(
-        {"config": {"model_config": {"pretrained_backbone": "dinov2"}}},
+        {"config": _backbone_config("dinov2")},
         terminal,
     )
     monkeypatch.chdir(tmp_path)
 
     resolved = resolve_pretrained_backbone_config(
-        {"model_config": {"pretrained_backbone": terminal.name}},
+        _backbone_config(terminal.name),
         checkpoint_path=checkpoint_dir / "model.pth",
     )
 
@@ -164,13 +162,13 @@ def test_backbone_resolution_expands_home_in_checkpoint_path(tmp_path, monkeypat
     run.mkdir(parents=True)
     terminal = run / "backbone.pth"
     torch.save(
-        {"config": {"model_config": {"pretrained_backbone": "dinov2"}}},
+        {"config": _backbone_config("dinov2")},
         terminal,
     )
     monkeypatch.setenv("HOME", str(home))
 
     resolved = resolve_pretrained_backbone_config(
-        {"model_config": {"pretrained_backbone": terminal.name}},
+        _backbone_config(terminal.name),
         checkpoint_path="~/run/model.pth",
     )
 

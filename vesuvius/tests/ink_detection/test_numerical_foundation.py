@@ -104,11 +104,15 @@ def test_robust_span_minmax_and_mad_degenerate_anchors():
         ),
     )
     assert empty.shape == (0,)
-    minmax_with_ignored_options = NormalizationConfig.from_value(
-        {"mode": "minmax", "percentile_lower": 100, "percentile_upper": 0}
+    with pytest.raises(ValueError, match="percentiles"):
+        NormalizationConfig.from_value(
+            {"mode": "minmax", "percentile_lower": 100, "percentile_upper": 0}
+        )
+    minmax = NormalizationConfig.from_value(
+        {"mode": "minmax", "percentile_lower": 0, "percentile_upper": 100}
     )
     np.testing.assert_allclose(
-        normalize_image(image.copy(), minmax_with_ignored_options),
+        normalize_image(image.copy(), minmax),
         (image - image.min()) / np.ptp(image),
     )
 

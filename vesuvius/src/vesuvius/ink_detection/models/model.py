@@ -14,24 +14,18 @@ from vesuvius.ink_detection.models.hybrid_3d2d import Local3DStem2DUNet
 def _build_network(config_dict: dict, *, op_dims: int) -> nn.Module:
     from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
-    model_config = dict(config_dict.get("model_config") or {})
+    model_config = dict(config_dict["model_config"])
     crop_size = config_dict["crop_size"]
     manager = SimpleNamespace(
         model_config=model_config,
         train_patch_size=tuple(crop_size),
-        train_batch_size=int(config_dict.get("batch_size", 1)),
+        train_batch_size=int(config_dict["batch_size"]),
         in_channels=int(config_dict["in_channels"]),
-        model_name=config_dict.get("model_name", "ink_det"),
-        autoconfigure=bool(
-            model_config.get(
-                "autoconfigure", config_dict.get("autoconfigure", True)
-            )
-        ),
-        spacing=model_config.get("spacing", [1, 1, 1]),
+        model_name=config_dict["model_name"],
+        autoconfigure=bool(config_dict["autoconfigure"]),
+        spacing=config_dict["spacing"],
         targets=config_dict["targets"],
-        enable_deep_supervision=bool(
-            config_dict.get("enable_deep_supervision", False)
-        ),
+        enable_deep_supervision=bool(config_dict["enable_deep_supervision"]),
         op_dims=int(op_dims),
     )
     model = NetworkFromConfig(manager)
@@ -78,12 +72,12 @@ class SliceChannel2DModel(nn.Module):
 def _base_build_mapping(config: InkConfig) -> dict:
     return {
         "crop_size": list(config.model.crop_size),
-        "patch_size": list(config.model.crop_size),
         "batch_size": config.model.batch_size,
         "in_channels": config.model.in_channels,
         "model_name": config.model.model_name,
         "autoconfigure": config.model.autoconfigure,
         "enable_deep_supervision": config.model.enable_deep_supervision,
+        "spacing": config.model.spacing,
         "model_config": config.model.model_settings_mapping(),
         "targets": {
             name: target.to_mapping()
@@ -96,18 +90,13 @@ def _make_2p5d_model(config: InkConfig) -> SliceChannel2DModel:
     input_depth = config.model.crop_size[0]
     network_config = _base_build_mapping(config)
     network_config["crop_size"] = list(config.model.crop_size[1:])
-    network_config["patch_size"] = list(network_config["crop_size"])
     network_config["in_channels"] = input_depth
 
-    model_config = dict(network_config.get("model_config") or {})
+    model_config = dict(network_config["model_config"])
     model_config.pop("input_pad_depth_to", None)
     model_config["z_projection_mode"] = "none"
-    spacing = model_config.get("spacing", [1, 1, 1])
-    if not isinstance(spacing, (list, tuple)) or len(spacing) not in {2, 3}:
-        raise ValueError(
-            f"2.5D model spacing must have two or three axes, got {spacing!r}"
-        )
-    model_config["spacing"] = [float(value) for value in spacing[-2:]]
+    network_config["spacing"] = config.model.spacing[-2:]
+    model_config["spacing"] = list(config.model.spacing[-2:])
     network_config["model_config"] = model_config
 
     targets = {}
@@ -130,21 +119,15 @@ def _make_2p5d_model(config: InkConfig) -> SliceChannel2DModel:
 def _make_3d_stem_2d_model(config: InkConfig) -> Local3DStem2DUNet:
     input_depth = config.model.crop_size[0]
     network_config = _base_build_mapping(config)
-    source_model_config = dict(network_config.get("model_config") or {})
+    source_model_config = dict(network_config["model_config"])
     source_model_config.pop("stem_channels", None)
     stem_channels = config.model.stem_channels
     source_model_config.pop("input_pad_depth_to", None)
     source_model_config["z_projection_mode"] = "none"
-    spacing = source_model_config.get("spacing", [1, 1, 1])
-    if not isinstance(spacing, (list, tuple)) or len(spacing) not in {2, 3}:
-        raise ValueError(
-            "3D-stem/2D-UNet spacing must have two or three axes, "
-            f"got {spacing!r}"
-        )
-    source_model_config["spacing"] = [float(value) for value in spacing[-2:]]
+    network_config["spacing"] = config.model.spacing[-2:]
+    source_model_config["spacing"] = list(config.model.spacing[-2:])
 
     network_config["crop_size"] = list(config.model.crop_size[1:])
-    network_config["patch_size"] = list(network_config["crop_size"])
     network_config["in_channels"] = 2 * stem_channels
     network_config["model_config"] = source_model_config
     network_config["targets"] = {

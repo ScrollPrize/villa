@@ -70,7 +70,9 @@ def stage_training_request(
     if not isinstance(authored, Mapping):
         raise TypeError("ink training config must contain a JSON object")
 
-    BenchmarkConfig.from_mapping(authored)
+    BenchmarkConfig.from_mapping(
+        authored, num_iterations=int(authored["num_iterations"])
+    )
     raw_checkpoint = authored.get("checkpoint")
     checkpoint_path = resolve_checkpoint_path(raw_checkpoint, config_path)
     checkpoint = (
@@ -294,8 +296,7 @@ def create_training_scheduler(optimizer, config: TrainingConfig):
 def initialize_training_model(model, config: TrainingConfig) -> bool:
     """Apply He initialization only when no pretrained backbone is configured."""
 
-    model_config = config.to_mapping().get("model_config") or {}
-    if model_config.get("pretrained_backbone"):
+    if config.ink.model.pretrained_backbone is not None:
         return False
     from vesuvius.models.utils import InitWeights_He
 
@@ -386,7 +387,7 @@ def build_training_checkpoint_payload(
         "config": canonical,
         "step": step,
         "wandb_run_id": (
-            run.id if run is not None else canonical.get("wandb_run_id")
+            run.id if run is not None else config.wandb_run_id
         ),
     }
     if validation_metrics is not None:
@@ -455,8 +456,8 @@ def _run_training(request: TrainingRequest) -> int:
             "entity": canonical["wandb_entity"],
             "config": canonical,
         }
-        if canonical.get("wandb_resume", False):
-            run_id = canonical.get("wandb_run_id")
+        if config.wandb_resume:
+            run_id = config.wandb_run_id
             if not run_id and request.checkpoint is not None:
                 run_id = request.checkpoint.get("wandb_run_id")
             if not run_id:
@@ -575,18 +576,7 @@ def _run_training(request: TrainingRequest) -> int:
         val_loader=val_loader,
     )
     unwrapped_model = accelerator.unwrap_model(model)
-    pretrained_backbone = (canonical.get("model_config") or {}).get(
-        "pretrained_backbone"
-    )
-    freeze_encoder = bool(
-        pretrained_backbone
-        and (
-            canonical.get("freeze_encoder", False)
-            or (canonical.get("model_config") or {}).get(
-                "freeze_encoder", False
-            )
-        )
-    )
+    freeze_encoder = config.ink.model.freeze_encoder
     frozen_encoder = unwrapped_model.shared_encoder if freeze_encoder else None
     ema_model = deepcopy(unwrapped_model) if config.ema.enabled else None
     if ema_model is not None:

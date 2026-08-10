@@ -6,11 +6,17 @@ import json
 
 import pytest
 
+import vesuvius.ink_detection.config as config_module
 from vesuvius.ink_detection.config import (
+    InkDataConfig,
     TrainingConfig,
     resolve_training_mapping,
 )
-from vesuvius.ink_detection.training.train import stage_training_request
+from vesuvius.ink_detection.data.dataset import InkDataset
+from vesuvius.ink_detection.training.train import (
+    stage_training_request,
+    training_dataset_config,
+)
 
 from .test_model_foundation import _config_mapping
 
@@ -81,7 +87,7 @@ def test_canonical_mutations_are_complete_without_local_default_materialization(
         "validate": False,
         "save_in_checkpoint": False,
     }
-    assert canonical["volume_auth_json"] is None
+    assert "volume_auth_json" not in canonical
     assert canonical["crop_size"] == [3, 8, 8]
     assert canonical["patch_size"] == [3, 8, 8]
     assert canonical["stitch_factor"] == 1
@@ -157,12 +163,14 @@ def test_diffusers_warmup_is_top_level_not_nested_scheduler_value():
     assert training.to_mapping()["scheduler"]["warmup_steps"] == 999
 
 
-def test_inactive_optimizer_and_scheduler_values_are_not_interpreted():
+def test_optimizer_values_are_typed_even_when_inactive():
     authored = _training_mapping()
     authored.update(
         optimizer="sgd",
-        optimizer_betas="unused-by-sgd",
-        encoder_lr_mult=None,
+        optimizer_betas=["0.8", "0.95"],
+        optimizer_momentum="0.75",
+        optimizer_nesterov=0,
+        encoder_lr_mult="0.25",
         scheduler={
             "name": "diffusers_cosine_warmup",
             "t_max": None,
@@ -174,9 +182,28 @@ def test_inactive_optimizer_and_scheduler_values_are_not_interpreted():
 
     training = _parse_training(authored)
 
-    assert training.optimizer.betas == "unused-by-sgd"
-    assert training.optimizer.encoder_lr_mult is None
+    assert training.optimizer.betas == (0.8, 0.95)
+    assert training.optimizer.momentum == 0.75
+    assert training.optimizer.nesterov is False
+    assert training.optimizer.encoder_lr_mult == 0.25
     assert training.scheduler.name == "diffusers_cosine_warmup"
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("optimizer_betas", "not-a-pair", "optimizer_betas"),
+        ("optimizer_betas", [0.9], "optimizer_betas"),
+        ("optimizer_momentum", None, "float"),
+        ("encoder_lr_mult", None, "float"),
+    ],
+)
+def test_optimizer_values_fail_at_the_config_boundary(key, value, message):
+    authored = _training_mapping()
+    authored[key] = value
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        _parse_training(authored)
 
 
 def test_pin_memory_distinguishes_absence_from_explicit_null():
@@ -186,3 +213,110 @@ def test_pin_memory_distinguishes_absence_from_explicit_null():
 
     assert absent.pin_memory is None
     assert _parse_training(explicit).pin_memory is False
+
+
+@pytest.mark.parametrize("targets", [None, {}, {"other": {}}])
+def test_training_target_presence_is_validated_before_mutation(targets):
+    authored = _training_mapping(mode="full_3d")
+    authored["targets"] = targets
+
+    with pytest.raises(
+        ValueError,
+        match="targets must be a non-empty object containing 'ink'",
+    ):
+        resolve_training_mapping(authored)
+
+
+def test_training_target_values_fail_factually_before_native_mutation():
+    authored = _training_mapping(mode="full_3d")
+    authored["targets"]["ink"] = "not-an-object"
+
+    with pytest.raises(TypeError, match="targets.ink must be an object"):
+        resolve_training_mapping(authored)
+
+
+def test_training_model_canonicalization_runs_once(monkeypatch):
+    calls = []
+    original = config_module._canonical_model_mapping
+
+    def counted(authored):
+        calls.append(authored)
+        return original(authored)
+
+    monkeypatch.setattr(config_module, "_canonical_model_mapping", counted)
+
+    _parse_training(_training_mapping())
+
+    assert len(calls) == 1
+
+
+def test_typed_runtime_fields_preserve_reference_precedence():
+    top_level = _training_mapping()
+    top_level["model_config"]["pretrained_backbone"] = "/weights.pth"
+    top_level["freeze_encoder"] = True
+    top_level["model_config"]["spacing"] = [2, 3, 4]
+    top_level["wandb_run_id"] = 123
+    top_level["wandb_resume"] = 1
+
+    training = _parse_training(top_level)
+
+    assert training.ink.model.pretrained_backbone == "/weights.pth"
+    assert training.ink.model.freeze_encoder is True
+    assert training.ink.model.spacing == (2.0, 3.0, 4.0)
+    assert training.wandb_run_id == "123"
+    assert training.wandb_resume is True
+
+    nested = _training_mapping()
+    nested["model_config"]["pretrained_backbone"] = "/weights.pth"
+    nested["model_config"]["freeze_encoder"] = True
+    assert _parse_training(nested).ink.model.freeze_encoder is True
+
+    no_backbone = _training_mapping()
+    no_backbone["freeze_encoder"] = True
+    no_backbone["model_config"]["freeze_encoder"] = True
+    assert _parse_training(no_backbone).ink.model.freeze_encoder is False
+
+    falsey = _training_mapping()
+    falsey["model_config"]["pretrained_backbone"] = False
+    falsey["wandb_run_id"] = 0
+    falsey_training = _parse_training(falsey)
+    assert falsey_training.ink.model.pretrained_backbone is None
+    assert falsey_training.wandb_run_id is None
+
+
+def test_data_and_training_defaults_remain_deliberately_forked():
+    authored = _training_mapping()
+    data_authored = dict(authored)
+    data_authored.pop("out_dir")
+    data_authored.pop("dataloader_workers", None)
+    data_authored.pop("seed")
+
+    data = InkDataConfig.from_mapping(data_authored)
+
+    assert (str(data.out_dir), data.dataloader_workers, data.seed) == (".", 8, 0)
+    assert _parse_training(authored).dataloader_workers == 0
+    for required in ("out_dir", "seed"):
+        missing = _training_mapping()
+        missing.pop(required)
+        with pytest.raises(KeyError, match=required):
+            _parse_training(missing)
+
+
+def test_training_config_constructs_a_synthetic_dataset(tmp_path):
+    authored = _training_mapping()
+    authored["out_dir"] = str(tmp_path / "output")
+    authored["datasets"][0]["segments_path"] = str(tmp_path / "segments")
+    config_path = tmp_path / "training.json"
+    config_path.write_text(json.dumps(authored), encoding="utf-8")
+
+    request = stage_training_request(config_path)
+    data_config = training_dataset_config(request.config)
+    dataset = InkDataset(
+        data_config,
+        do_augmentations=False,
+        patches=[],
+    )
+
+    assert dataset.config.patch_size == request.config.loader_patch_size
+    assert dataset.config.seed == request.config.seed
+    assert len(dataset) == 0

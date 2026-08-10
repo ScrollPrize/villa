@@ -22,17 +22,11 @@ def plan_optimizer_target(
 ) -> nn.Module | OptimizerParamGroupTarget:
     """Freeze or separately scale a configured pretrained shared encoder."""
 
-    model_mapping = config.ink.to_mapping()
-    model_config = model_mapping.get("model_config") or {}
-    pretrained_backbone = model_config.get("pretrained_backbone")
-    if not pretrained_backbone:
+    if config.ink.model.pretrained_backbone is None:
         return model
-    encoder_lr_mult = float(config.optimizer.encoder_lr_mult)
+    encoder_lr_mult = config.optimizer.encoder_lr_mult
 
-    freeze_encoder = bool(
-        model_mapping.get("freeze_encoder", False)
-        or model_config.get("freeze_encoder", False)
-    )
+    freeze_encoder = config.ink.model.freeze_encoder
     encoder_params = list(model.shared_encoder.parameters())
     if freeze_encoder:
         for parameter in encoder_params:

@@ -192,10 +192,8 @@ def resolve_pretrained_backbone_config(
     """Resolve checkpoint-backed backbone names without mutating saved config."""
 
     resolved = deepcopy(dict(authored))
-    model_config = resolved.get("model_config")
-    if not isinstance(model_config, Mapping):
-        return resolved
-    backbone = model_config.get("pretrained_backbone")
+    config = InkConfig.from_mapping(resolved)
+    backbone = config.model.pretrained_backbone
     if not _backbone_is_checkpoint(backbone):
         return resolved
 
@@ -223,18 +221,13 @@ def resolve_pretrained_backbone_config(
         checkpoint_path=backbone_path,
         seen_paths=visited | {backbone_path},
     )
-    nested_model = nested.get("model_config")
-    concrete = (
-        nested_model.get("pretrained_backbone")
-        if isinstance(nested_model, Mapping)
-        else None
-    )
+    concrete = InkConfig.from_mapping(nested).model.pretrained_backbone
     if not concrete or _backbone_is_checkpoint(concrete):
         raise ValueError(
             "Checkpoint-backed pretrained_backbone did not resolve to a "
             f"concrete backbone name: {backbone_path}"
         )
-    updated_model = dict(model_config)
+    updated_model = config.model.model_settings_mapping()
     updated_model["pretrained_backbone"] = concrete
     resolved["model_config"] = updated_model
     return resolved

@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+import vesuvius.models.build.build_network_from_config as network_builder
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.ink_detection.models.hybrid_3d2d import (
     Local3DStem2DUNet,
@@ -109,6 +110,41 @@ def test_unet_aliases_dispatch_to_the_same_model_families(model_type):
         assert isinstance(model, SliceChannel2DModel)
     else:
         assert isinstance(model, Local3DStem2DUNet)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_spacing"),
+    [
+        ("vesuvius_unet", (2.0, 3.0, 4.0)),
+        ("vesuvius_unet_2p5d", (3.0, 4.0)),
+        ("vesuvius_unet_3d_stem_2d", (3.0, 4.0)),
+    ],
+)
+def test_typed_spacing_is_forwarded_in_model_axis_order(
+    model_type,
+    expected_spacing,
+    monkeypatch,
+):
+    authored = _config_mapping(model_type, depth=3)
+    authored["model_config"]["spacing"] = [2, 3, 4]
+    observed = []
+    original = network_builder.get_pool_and_conv_props
+
+    def record_spacing(*, spacing, **kwargs):
+        observed.append(tuple(spacing))
+        return original(spacing=spacing, **kwargs)
+
+    monkeypatch.setattr(
+        network_builder,
+        "get_pool_and_conv_props",
+        record_spacing,
+    )
+
+    config = InkConfig.from_mapping(authored)
+    make_model(config)
+
+    assert config.model.spacing == (2.0, 3.0, 4.0)
+    assert observed == [expected_spacing]
 
 
 def test_depth_fusion_is_uniform_attention_weighted_sum_followed_by_maximum():
@@ -233,4 +269,13 @@ def test_config_rejects_nonpositive_padding_depth():
     mapping["model_config"]["input_pad_depth_to"] = 0
 
     with pytest.raises(ValueError, match="input_pad_depth_to must be positive"):
+        InkConfig.from_mapping(mapping)
+
+
+@pytest.mark.parametrize("spacing", [[1, 1], [1, 1, 1, 1], "1,1,1"])
+def test_config_rejects_spacing_without_three_axes(spacing):
+    mapping = _config_mapping()
+    mapping["model_config"]["spacing"] = spacing
+
+    with pytest.raises(ValueError, match="spacing.*three axes"):
         InkConfig.from_mapping(mapping)

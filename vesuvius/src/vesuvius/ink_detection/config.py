@@ -154,6 +154,7 @@ class NormalizationConfig:
         if mode in {
             "robust_mad",
             "robust_percentile_span",
+            "minmax",
             "percentile_minmax",
         }:
             lower = float(authored.get("percentile_lower", 1.0))
@@ -165,6 +166,8 @@ class NormalizationConfig:
                 )
         clip_min = authored.get("clip_min")
         clip_max = authored.get("clip_max")
+        mean = authored.get("mean")
+        std = authored.get("std")
         if mode == "clip_divide":
             clip_min = 0.0 if clip_min is None else float(clip_min)
             clip_max = 200.0 if clip_max is None else float(clip_max)
@@ -178,6 +181,17 @@ class NormalizationConfig:
                 raise ValueError(
                     "clip_zscore requires " + ", ".join(missing)
                 )
+            clip_min = float(clip_min)
+            clip_max = float(clip_max)
+            mean = float(mean)
+            std = float(std)
+            if not clip_min < clip_max:
+                raise ValueError(
+                    "clip_zscore requires clip_min < clip_max, "
+                    f"got {clip_min!r} and {clip_max!r}"
+                )
+            if std <= 0.0:
+                raise ValueError(f"clip_zscore requires std > 0, got {std!r}")
         result = cls(
             mode=mode,
             percentile_lower=lower,
@@ -185,12 +199,12 @@ class NormalizationConfig:
             clip_min=None if clip_min is None else float(clip_min),
             clip_max=None if clip_max is None else float(clip_max),
             divisor=float(authored.get("divisor", 255.0)),
-            mean=None if authored.get("mean") is None else float(authored["mean"]),
-            std=None if authored.get("std") is None else float(authored["std"]),
+            mean=None if mean is None else float(mean),
+            std=None if std is None else float(std),
         )
         if result.mode in {"divide", "clip_divide"} and result.divisor <= 0.0:
             raise ValueError(f"{result.mode} requires divisor > 0, got {result.divisor!r}")
-        if result.mode in {"clip_divide", "clip_zscore"} and not (
+        if result.mode == "clip_divide" and not (
             result.clip_min is not None
             and result.clip_max is not None
             and result.clip_min < result.clip_max
@@ -199,10 +213,6 @@ class NormalizationConfig:
                 f"{result.mode} requires clip_min < clip_max, "
                 f"got {result.clip_min!r} and {result.clip_max!r}"
             )
-        if result.mode == "clip_zscore" and not (
-            result.std is not None and result.std > 0.0
-        ):
-            raise ValueError(f"clip_zscore requires std > 0, got {result.std!r}")
         return result
 
 
@@ -298,6 +308,7 @@ class PatchFindingConfig:
             )
             default_stride = int(patch_y * result.overlap)
             effective_stride = default_stride if result.stride is None else result.stride
+            # A nonpositive stride would make subtiling discovery stop advancing.
             if effective_stride <= 0:
                 raise ValueError("patch_finding_stride must be positive for subtiling")
         return result
@@ -580,8 +591,11 @@ class InkDataConfig:
                 if authored.get("patch_cache_filename") in (None, "")
                 else Path(str(authored["patch_cache_filename"]))
             ),
+            # TrainingConfig requires out_dir instead of defaulting it.
             out_dir=Path(str(authored.get("out_dir", "."))),
+            # TrainingConfig defaults dataloader_workers to 0.
             dataloader_workers=int(authored.get("dataloader_workers", 8)),
+            # TrainingConfig requires seed instead of defaulting it.
             seed=int(authored.get("seed", 0)),
         )
 
@@ -681,6 +695,9 @@ class InkModelConfig:
     autoconfigure: bool
     enable_deep_supervision: bool
     model_config: Mapping[str, Any]
+    pretrained_backbone: str | None
+    freeze_encoder: bool
+    spacing: tuple[float, float, float]
     stem_channels: int
     input_pad_depth_to: int | None
 
@@ -748,6 +765,28 @@ class InkModelConfig:
         model_config = _FrozenMapping(
             {str(key): _freeze_json(value) for key, value in raw_model_config.items()}
         )
+        raw_pretrained_backbone = raw_model_config.get("pretrained_backbone")
+        pretrained_backbone = (
+            None if not raw_pretrained_backbone else str(raw_pretrained_backbone)
+        )
+        freeze_encoder = bool(
+            pretrained_backbone
+            and (
+                authored.get("freeze_encoder", False)
+                or raw_model_config.get("freeze_encoder", False)
+            )
+        )
+        raw_spacing = raw_model_config.get("spacing", (1.0, 1.0, 1.0))
+        if not isinstance(raw_spacing, (list, tuple)) or len(raw_spacing) != 3:
+            raise ValueError(
+                "model_config.spacing must contain exactly three axes, "
+                f"got {raw_spacing!r}"
+            )
+        spacing = (
+            float(raw_spacing[0]),
+            float(raw_spacing[1]),
+            float(raw_spacing[2]),
+        )
         crop_value = authored.get("crop_size", authored["patch_size"])
         crop_size = _tuple3(crop_value, name="crop_size")
         input_pad_depth_to = raw_model_config.get("input_pad_depth_to")
@@ -778,6 +817,9 @@ class InkModelConfig:
                 authored.get("enable_deep_supervision", False)
             ),
             model_config=model_config,
+            pretrained_backbone=pretrained_backbone,
+            freeze_encoder=freeze_encoder,
+            spacing=spacing,
             stem_channels=stem_channels,
             input_pad_depth_to=input_pad_depth_to,
         )
@@ -917,20 +959,24 @@ class CheckpointConfig:
         )
 
 
+def _normalize_model_config(canonical: dict[str, Any]) -> dict[str, Any]:
+    raw_model_config = canonical.get("model_config")
+    if raw_model_config is None:
+        model_config: dict[str, Any] = {}
+    elif isinstance(raw_model_config, Mapping):
+        model_config = dict(raw_model_config)
+    else:
+        raise TypeError("model_config must be an object or null")
+    canonical["model_config"] = model_config
+    return model_config
+
+
 def _canonical_model_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
     canonical = deepcopy(dict(authored))
     model_type = str(canonical["model_type"]).strip().lower()
     if model_type != "dinov2":
         return canonical
-    raw_model_config = canonical.get("model_config")
-    if raw_model_config is None:
-        model_config: dict[str, Any] = {}
-        canonical["model_config"] = model_config
-    elif isinstance(raw_model_config, Mapping):
-        model_config = dict(raw_model_config)
-        canonical["model_config"] = model_config
-    else:
-        raise TypeError("model_config must be an object or null")
+    model_config = _normalize_model_config(canonical)
     for key in ("pretrained_backbone", "pretrained_decoder_type"):
         if key in canonical:
             model_config.setdefault(key, canonical[key])
@@ -959,6 +1005,12 @@ class InkConfig:
         if not isinstance(authored, Mapping):
             raise TypeError("ink config must be an object")
         canonical = _canonical_model_mapping(authored)
+        return cls._from_canonical_mapping(canonical)
+
+    @classmethod
+    def _from_canonical_mapping(
+        cls, canonical: Mapping[str, Any]
+    ) -> "InkConfig":
         data = InkDataConfig.from_mapping(canonical)
         model = InkModelConfig.from_mapping(canonical)
         raw_targets = canonical.get("targets")
@@ -1043,13 +1095,15 @@ class BenchmarkConfig:
     output_path: Path | None
 
     @classmethod
-    def from_mapping(cls, authored: Mapping[str, Any]) -> "BenchmarkConfig":
+    def from_mapping(
+        cls, authored: Mapping[str, Any], *, num_iterations: int
+    ) -> "BenchmarkConfig":
         value = authored.get("benchmark") or {}
         if not isinstance(value, Mapping):
             raise TypeError("benchmark must be an object or null")
         enabled = bool(value.get("enabled", False))
         warmup_steps = int(value.get("warmup_steps", 0))
-        if enabled and not 0 <= warmup_steps < int(authored["num_iterations"]):
+        if enabled and not 0 <= warmup_steps < num_iterations:
             raise ValueError(
                 "benchmark warmup_steps must be in [0, num_iterations)"
             )
@@ -1070,21 +1124,24 @@ class OptimizerConfig:
     name: str
     learning_rate: float
     weight_decay: float
-    betas: Any
-    momentum: Any
-    nesterov: Any
-    encoder_lr_mult: Any
+    betas: tuple[float, float]
+    momentum: float
+    nesterov: bool
+    encoder_lr_mult: float
 
     @classmethod
     def from_mapping(cls, authored: Mapping[str, Any]) -> "OptimizerConfig":
+        raw_betas = authored.get("optimizer_betas", (0.9, 0.999))
+        if not isinstance(raw_betas, (list, tuple)) or len(raw_betas) != 2:
+            raise ValueError("optimizer_betas must contain exactly two values")
         return cls(
             name=str(authored.get("optimizer", "sgd")),
             learning_rate=float(authored.get("learning_rate", 0.01)),
             weight_decay=float(authored.get("weight_decay", 3e-5)),
-            betas=authored.get("optimizer_betas", (0.9, 0.999)),
-            momentum=authored.get("optimizer_momentum", 0.99),
-            nesterov=authored.get("optimizer_nesterov", True),
-            encoder_lr_mult=authored.get("encoder_lr_mult", 1.0),
+            betas=(float(raw_betas[0]), float(raw_betas[1])),
+            momentum=float(authored.get("optimizer_momentum", 0.99)),
+            nesterov=bool(authored.get("optimizer_nesterov", True)),
+            encoder_lr_mult=float(authored.get("encoder_lr_mult", 1.0)),
         )
 
 
@@ -1155,6 +1212,16 @@ def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
 
     if not isinstance(authored, Mapping):
         raise TypeError("ink training config must be an object")
+    raw_targets = authored.get("targets")
+    if (
+        not isinstance(raw_targets, Mapping)
+        or not raw_targets
+        or "ink" not in raw_targets
+    ):
+        raise ValueError("targets must be a non-empty object containing 'ink'")
+    for name, target in raw_targets.items():
+        if not isinstance(target, Mapping):
+            raise TypeError(f"targets.{name} must be an object")
     canonical = _canonical_model_mapping(authored)
 
     ema = EmaConfig.from_mapping(canonical)
@@ -1163,38 +1230,23 @@ def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
     mode = str(canonical.get("mode", "flat")).strip().lower()
     native_mode = mode in {"full_3d", "full_3d_single_wrap"}
     if native_mode:
-        raw_model_config = canonical.get("model_config")
-        if raw_model_config is None:
-            model_config: dict[str, Any] = {}
-            canonical["model_config"] = model_config
-        elif isinstance(raw_model_config, Mapping):
-            model_config = dict(raw_model_config)
-            canonical["model_config"] = model_config
-        else:
-            raise TypeError("model_config must be an object or null")
+        model_config = _normalize_model_config(canonical)
         model_config["z_projection_mode"] = "none"
-        raw_targets = canonical.get("targets") or {}
-        if not isinstance(raw_targets, Mapping):
-            raise TypeError("targets must be an object")
         targets = {
-            str(name): (
-                dict(value) if isinstance(value, Mapping) else value
-            )
-            for name, value in raw_targets.items()
+            str(name): dict(value)
+            for name, value in canonical["targets"].items()
         }
         canonical["targets"] = targets
         for target in targets.values():
-            if isinstance(target, dict):
-                target["z_projection_mode"] = "none"
-                if isinstance(target.get("z_projection"), Mapping):
-                    projection = dict(target["z_projection"])
-                    projection["mode"] = "none"
-                    target["z_projection"] = projection
+            target["z_projection_mode"] = "none"
+            if isinstance(target.get("z_projection"), Mapping):
+                projection = dict(target["z_projection"])
+                projection["mode"] = "none"
+                target["z_projection"] = projection
         canonical["in_channels"] = (
             2 if mode == "full_3d_single_wrap" else 1
         )
 
-    canonical.setdefault("volume_auth_json", None)
     requested_stitch_factor = int(canonical.get("stitch_factor", 1))
     use_stitched_forward = bool(
         canonical.get(
@@ -1229,6 +1281,8 @@ class TrainingConfig:
     num_iterations: int
     out_dir: Path
     seed: int
+    wandb_run_id: str | None
+    wandb_resume: bool
     batch_size: int
     model_crop_size: tuple[int, int, int]
     loader_patch_size: tuple[int, int, int]
@@ -1261,7 +1315,7 @@ class TrainingConfig:
 
     @classmethod
     def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
-        ink = InkConfig.from_mapping(canonical)
+        ink = InkConfig._from_canonical_mapping(canonical)
         num_iterations = int(canonical["num_iterations"])
         seed = int(canonical["seed"])
         batch_size = int(canonical["batch_size"])
@@ -1302,11 +1356,18 @@ class TrainingConfig:
             if "pin_memory" not in canonical
             else bool(canonical["pin_memory"])
         )
+        raw_wandb_run_id = canonical.get("wandb_run_id")
         return cls(
             ink=ink,
             num_iterations=num_iterations,
+            # InkDataConfig defaults out_dir to the current directory.
             out_dir=Path(str(canonical["out_dir"])),
+            # InkDataConfig defaults seed to 0.
             seed=seed,
+            wandb_run_id=(
+                None if not raw_wandb_run_id else str(raw_wandb_run_id)
+            ),
+            wandb_resume=bool(canonical.get("wandb_resume", False)),
             batch_size=batch_size,
             model_crop_size=model_crop_size,
             loader_patch_size=loader_patch_size,
@@ -1315,7 +1376,9 @@ class TrainingConfig:
                 canonical["stitched_gradient_checkpointing"]
             ),
             ema=EmaConfig.from_mapping(canonical),
-            benchmark=BenchmarkConfig.from_mapping(canonical),
+            benchmark=BenchmarkConfig.from_mapping(
+                canonical, num_iterations=num_iterations
+            ),
             optimizer=OptimizerConfig.from_mapping(canonical),
             scheduler=SchedulerConfig.from_mapping(
                 canonical, max_steps=max_steps
@@ -1340,8 +1403,9 @@ class TrainingConfig:
             ddp_broadcast_buffers=bool(
                 canonical.get("ddp_broadcast_buffers", False)
             ),
+            # InkDataConfig defaults dataloader_workers to 8.
             dataloader_workers=int(canonical.get("dataloader_workers", 0)),
-            pin_memory=None if pin_memory is None else bool(pin_memory),
+            pin_memory=pin_memory,
             prefetch_factor=int(canonical.get("prefetch_factor", 2)),
             sampling_audit_every=sampling_audit_every,
             verify_finite_gradients_steps=verify_finite,

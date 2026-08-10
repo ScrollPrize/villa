@@ -186,6 +186,7 @@ def test_checkpoint_payload_uses_canonical_mapping_and_optional_ema_state():
             "num_iterations": 6,
             "out_dir": "/tmp/ink-output",
             "seed": 9,
+            "wandb_run_id": "run-123",
             "ema": {"enabled": True, "save_in_checkpoint": True},
             "scheduler": {"name": "cosine_annealing"},
         }
@@ -221,6 +222,7 @@ def test_checkpoint_payload_uses_canonical_mapping_and_optional_ema_state():
         "ema_optimizer_step",
     ]
     assert payload["step"] == 2
+    assert payload["wandb_run_id"] == "run-123"
     assert payload["ema_optimizer_step"] == 3
     assert payload["validation_metrics"] == {"val_loss": 0.25}
     assert "learning_rate" not in payload["config"]

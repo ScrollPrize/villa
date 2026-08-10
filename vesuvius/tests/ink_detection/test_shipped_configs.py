@@ -29,6 +29,11 @@ def test_aligned21_hybrid_recipe_parses_with_frozen_values_and_layout():
     source = authored["datasets"][0]
 
     assert training.ink.model.model_type == "vesuvius_unet_3d_stem_2d"
+    assert training.ink.model.pretrained_backbone is None
+    assert training.ink.model.freeze_encoder is False
+    assert training.ink.model.spacing == (1.0, 1.0, 1.0)
+    assert training.wandb_run_id is None
+    assert training.wandb_resume is False
     assert training.model_crop_size == (17, 128, 128)
     assert training.ink.data.jitter.window_depth == 17
     assert training.ink.data.jitter.max_offset == 2
