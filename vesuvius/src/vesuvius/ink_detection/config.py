@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -26,6 +27,12 @@ class _FrozenMapping(Mapping):
             "_items",
             tuple(() if values is None else values.items()),
         )
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
+
+    def __delattr__(self, _name) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
 
     def __getitem__(self, key):
         for candidate, value in self._items:
@@ -66,6 +73,24 @@ def _string_mapping(value: Any, *, name: str) -> Mapping[str, str]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be an object")
     return _FrozenMapping({str(key): str(item) for key, item in value.items()})
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _FrozenMapping(
+            {str(key): _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, _FrozenMapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return deepcopy(value)
 
 
 @dataclass(frozen=True)
@@ -560,3 +585,406 @@ class InkDataConfig:
             if self.discovery_mode == "unlabeled"
             else self.datasets
         )
+
+
+@dataclass(frozen=True)
+class TargetConfig:
+    """One output head and its checkpointed activation/projection contract."""
+
+    name: Literal["ink"]
+    out_channels: int
+    activation: Literal["none"]
+    z_projection_mode: str
+    _settings: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        name: str,
+        authored: Any,
+        *,
+        model_config: Mapping[str, Any],
+    ) -> "TargetConfig":
+        if name != "ink":
+            raise ValueError(f"Unsupported target {name!r}; expected 'ink'")
+        if not isinstance(authored, Mapping):
+            raise TypeError("targets.ink must be an object")
+        out_channels = int(authored["out_channels"])
+        if out_channels != 1:
+            raise ValueError(
+                f"targets.ink.out_channels must be 1, got {out_channels!r}"
+            )
+        activation = str(authored["activation"]).strip().lower()
+        if activation != "none":
+            raise ValueError(
+                "targets.ink.activation must be 'none', "
+                f"got {activation!r}"
+            )
+
+        projection = authored.get("z_projection")
+        if projection is not None and not isinstance(projection, Mapping):
+            raise TypeError("targets.ink.z_projection must be an object")
+        if isinstance(projection, Mapping) and "mode" in projection:
+            projection_mode = str(projection["mode"]).strip().lower()
+        elif "z_projection_mode" in authored:
+            projection_mode = str(authored["z_projection_mode"]).strip().lower()
+        else:
+            projection_mode = str(
+                model_config.get("z_projection_mode", "none")
+            ).strip().lower()
+        if projection_mode in {"", "off", "false", "0"}:
+            projection_mode = "none"
+        allowed = {"none", "max", "mean", "logsumexp", "learned_mlp"}
+        if projection_mode not in allowed:
+            raise ValueError(
+                "Unsupported targets.ink z_projection mode "
+                f"{projection_mode!r}; allowed: {', '.join(sorted(allowed))}"
+            )
+        return cls(
+            name="ink",
+            out_channels=out_channels,
+            activation="none",
+            z_projection_mode=projection_mode,
+            _settings=_FrozenMapping(
+                {
+                    str(key): _freeze_json(value)
+                    for key, value in authored.items()
+                }
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Return the independent target mapping used by the model builder."""
+
+        return _thaw_json(self._settings)
+
+
+@dataclass(frozen=True)
+class InkModelConfig:
+    """Resolved model family and the values consumed by NetworkFromConfig."""
+
+    model_type: str
+    crop_size: tuple[int, int, int]
+    batch_size: int
+    in_channels: int
+    model_name: str
+    autoconfigure: bool
+    enable_deep_supervision: bool
+    model_config: Mapping[str, Any]
+    stem_channels: int
+    input_pad_depth_to: int | None
+
+    def model_settings_mapping(self) -> dict[str, Any]:
+        """Return independent model settings for NetworkFromConfig."""
+
+        return _thaw_json(self.model_config)
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "InkModelConfig":
+        model_type = str(authored["model_type"]).strip().lower()
+        allowed = {
+            "vesuvius_unet",
+            "unet",
+            "vesuvius_unet_2p5d",
+            "unet_2p5d",
+            "vesuvius_unet_3d_stem_2d",
+            "unet_3d_stem_2d",
+        }
+        if model_type == "resnet3d" or model_type.startswith("resnet3d-"):
+            raise ValueError(f"Unsupported model_type {model_type!r}: resnet3d")
+        if model_type not in allowed:
+            raise ValueError(
+                f"Unsupported model_type {model_type!r}; "
+                f"allowed: {', '.join(sorted(allowed))}"
+            )
+        raw_model_config = authored.get("model_config") or {}
+        if not isinstance(raw_model_config, Mapping):
+            raise TypeError("model_config must be an object or null")
+        architecture_type = str(
+            raw_model_config.get("architecture_type", "unet")
+        ).strip().lower()
+        if architecture_type.startswith("mednext"):
+            raise ValueError(
+                "model_config.architecture_type selects MedNeXt, which is not "
+                "supported by the ink checkpoint contract"
+            )
+        if raw_model_config.get("guide_backbone"):
+            raise ValueError(
+                "model_config.guide_backbone selects guided model construction, "
+                "which is not supported by the ink checkpoint contract"
+            )
+        upsample_mode = str(
+            raw_model_config.get("upsample_mode", "transpconv")
+        ).strip().lower()
+        if upsample_mode in {"pixelshuffle", "trilinear"}:
+            raise ValueError(
+                f"model_config.upsample_mode={upsample_mode!r} selects a decoder "
+                "path that is not supported by the ink checkpoint contract"
+            )
+        if raw_model_config.get("target_z_projection"):
+            raise ValueError(
+                "model_config.target_z_projection selects projection behavior "
+                "that is not supported by the ink checkpoint contract"
+            )
+        if (
+            raw_model_config.get("pretrained_backbone")
+            and raw_model_config.get("pretrained_backbone_config_path")
+        ):
+            raise ValueError(
+                "model_config.pretrained_backbone_config_path selects backbone "
+                "configuration behavior that is not supported by the ink "
+                "checkpoint contract"
+            )
+        model_config = _FrozenMapping(
+            {str(key): _freeze_json(value) for key, value in raw_model_config.items()}
+        )
+        crop_value = authored.get("crop_size", authored["patch_size"])
+        crop_size = _tuple3(crop_value, name="crop_size")
+        input_pad_depth_to = raw_model_config.get("input_pad_depth_to")
+        if input_pad_depth_to is not None:
+            input_pad_depth_to = int(input_pad_depth_to)
+            if input_pad_depth_to <= 0:
+                raise ValueError(
+                    "model_config.input_pad_depth_to must be positive, "
+                    f"got {input_pad_depth_to!r}"
+                )
+        stem_channels = int(raw_model_config.get("stem_channels", 16))
+        if stem_channels <= 0:
+            raise ValueError(
+                f"model_config.stem_channels must be positive, got {stem_channels!r}"
+            )
+        return cls(
+            model_type=model_type,
+            crop_size=crop_size,
+            batch_size=int(authored.get("batch_size", 1)),
+            in_channels=int(authored["in_channels"]),
+            model_name=str(authored.get("model_name", "ink_det")),
+            autoconfigure=bool(
+                raw_model_config.get(
+                    "autoconfigure", authored.get("autoconfigure", True)
+                )
+            ),
+            enable_deep_supervision=bool(
+                authored.get("enable_deep_supervision", False)
+            ),
+            model_config=model_config,
+            stem_channels=stem_channels,
+            input_pad_depth_to=input_pad_depth_to,
+        )
+
+
+@dataclass(frozen=True)
+class LossTermConfig:
+    """One weighted loss term in authored evaluation order."""
+
+    name: Literal["LabelSmoothedDCAndBCELoss"]
+    metric_name: str
+    weight: float
+    weight_dice: float
+    weight_ce: float
+    dice_label_smoothing: float
+    bce_label_smoothing: float
+    bce_kwargs: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class LossConfig:
+    """The ordered active terms used by the ink segmentation objective."""
+
+    terms: tuple[LossTermConfig, ...]
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "LossConfig":
+        raw_loss = authored.get("loss") or {}
+        if not isinstance(raw_loss, Mapping):
+            raise TypeError("loss must be an object or null")
+        raw_terms = raw_loss.get("terms")
+        if raw_terms is None:
+            term_values: list[Mapping[str, Any]] = [
+                {
+                    "name": "LabelSmoothedDCAndBCELoss",
+                    "metric_name": "base",
+                    "weight": 1.0,
+                    "weight_dice": float(raw_loss.get("dice_weight", 0.25)),
+                    "weight_ce": float(raw_loss.get("ce_weight", 1.0)),
+                    "dice_label_smoothing": float(
+                        raw_loss.get(
+                            "dice_label_smoothing",
+                            authored.get("dice_label_smoothing", 0.0),
+                        )
+                    ),
+                    "bce_label_smoothing": float(
+                        raw_loss.get(
+                            "bce_label_smoothing",
+                            authored.get("bce_label_smoothing", 0.0),
+                        )
+                    ),
+                }
+            ]
+        else:
+            if not isinstance(raw_terms, list) or not raw_terms:
+                raise ValueError("loss.terms must be a non-empty list when provided")
+            term_values = []
+            for index, value in enumerate(raw_terms):
+                if not isinstance(value, Mapping):
+                    raise TypeError(f"loss.terms[{index}] must be an object")
+                term_values.append(value)
+
+        terms = []
+        for index, value in enumerate(term_values):
+            if "name" not in value or not value["name"]:
+                raise ValueError(
+                    f"loss term at index {index} is missing required key 'name'"
+                )
+            name = str(value["name"])
+            if name == "BettiMatchingLoss":
+                raise ValueError(
+                    "Unsupported loss term 'BettiMatchingLoss': Betti matching"
+                )
+            if name != "LabelSmoothedDCAndBCELoss":
+                raise ValueError(
+                    f"Unsupported loss term {name!r}; supported: "
+                    "LabelSmoothedDCAndBCELoss"
+                )
+            weight = float(value.get("weight", 1.0))
+            if weight == 0.0:
+                continue
+            bce_kwargs = value.get("bce_kwargs") or {}
+            if not isinstance(bce_kwargs, Mapping):
+                raise TypeError(f"loss.terms[{index}].bce_kwargs must be an object")
+            terms.append(
+                LossTermConfig(
+                    name="LabelSmoothedDCAndBCELoss",
+                    metric_name=str(value.get("metric_name") or name),
+                    weight=weight,
+                    weight_dice=float(
+                        value.get("weight_dice", value.get("dice_weight", 1.0))
+                    ),
+                    weight_ce=float(
+                        value.get("weight_ce", value.get("ce_weight", 1.0))
+                    ),
+                    dice_label_smoothing=float(
+                        value.get(
+                            "dice_label_smoothing",
+                            authored.get("dice_label_smoothing", 0.0),
+                        )
+                    ),
+                    bce_label_smoothing=float(
+                        value.get(
+                            "bce_label_smoothing",
+                            authored.get("bce_label_smoothing", 0.0),
+                        )
+                    ),
+                    bce_kwargs=_FrozenMapping(
+                        {
+                            str(key): _freeze_json(item)
+                            for key, item in bce_kwargs.items()
+                        }
+                    ),
+                )
+            )
+        if not terms:
+            raise ValueError(
+                "All configured loss terms have zero weight; "
+                "at least one active term is required"
+            )
+        return cls(terms=tuple(terms))
+
+
+@dataclass(frozen=True)
+class CheckpointConfig:
+    """Training checkpoint selection authored by a JSON configuration."""
+
+    path: Path | None
+    weights_only: bool
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "CheckpointConfig":
+        value = authored.get("checkpoint")
+        return cls(
+            path=None if value in (None, "") else Path(str(value)),
+            weights_only=bool(authored.get("weights_only", False)),
+        )
+
+
+def _canonical_model_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
+    canonical = deepcopy(dict(authored))
+    model_type = str(canonical["model_type"]).strip().lower()
+    if model_type != "dinov2":
+        return canonical
+    raw_model_config = canonical.get("model_config")
+    if raw_model_config is None:
+        model_config: dict[str, Any] = {}
+        canonical["model_config"] = model_config
+    elif isinstance(raw_model_config, Mapping):
+        model_config = dict(raw_model_config)
+        canonical["model_config"] = model_config
+    else:
+        raise TypeError("model_config must be an object or null")
+    for key in ("pretrained_backbone", "pretrained_decoder_type"):
+        if key in canonical:
+            model_config.setdefault(key, canonical[key])
+    if not model_config.get("pretrained_backbone"):
+        raise ValueError(
+            "model_type='dinov2' requires model_config.pretrained_backbone "
+            "or a top-level pretrained_backbone entry"
+        )
+    canonical["model_type"] = "vesuvius_unet"
+    return canonical
+
+
+@dataclass(frozen=True)
+class InkConfig:
+    """Canonical checkpoint mapping with typed data, model, target, and loss views."""
+
+    data: InkDataConfig
+    model: InkModelConfig
+    targets: Mapping[str, TargetConfig]
+    loss: LossConfig
+    checkpoint: CheckpointConfig
+    _canonical: Mapping[str, Any] = field(repr=False)
+
+    @classmethod
+    def from_mapping(cls, authored: Mapping[str, Any]) -> "InkConfig":
+        if not isinstance(authored, Mapping):
+            raise TypeError("ink config must be an object")
+        canonical = _canonical_model_mapping(authored)
+        data = InkDataConfig.from_mapping(canonical)
+        model = InkModelConfig.from_mapping(canonical)
+        raw_targets = canonical.get("targets")
+        if not isinstance(raw_targets, Mapping) or not raw_targets:
+            raise ValueError("targets must be a non-empty object containing 'ink'")
+        unknown_targets = [str(name) for name in raw_targets if str(name) != "ink"]
+        if unknown_targets:
+            raise ValueError(
+                f"Unsupported target {unknown_targets[0]!r}; expected 'ink'"
+            )
+        if "ink" not in raw_targets:
+            raise ValueError("targets must contain 'ink'")
+        targets = _FrozenMapping(
+            {
+                "ink": TargetConfig.from_mapping(
+                    "ink",
+                    raw_targets["ink"],
+                    model_config=canonical.get("model_config") or {},
+                )
+            }
+        )
+        return cls(
+            data=data,
+            model=model,
+            targets=targets,
+            loss=LossConfig.from_mapping(canonical),
+            checkpoint=CheckpointConfig.from_mapping(canonical),
+            _canonical=_FrozenMapping(
+                {
+                    str(key): _freeze_json(value)
+                    for key, value in canonical.items()
+                }
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Return an independent JSON-shaped copy in authored key order."""
+
+        return _thaw_json(self._canonical)
