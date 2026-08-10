@@ -1,6 +1,7 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
 add_library(vc_core
+        src/AtomicFile.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -190,6 +191,7 @@ add_library(vc_atlas
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberAnchors.cpp
     src/fiber_tracer/FiberTrace.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)

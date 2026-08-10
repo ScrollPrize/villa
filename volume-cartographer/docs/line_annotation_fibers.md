@@ -1,5 +1,9 @@
 # VC3D Line Annotation Fibers
 
+Whole-volume prediction-grid anchor extraction for the later fiberlet pipeline
+is documented separately in [fiberlets.md](fiberlets.md). It reuses the same
+compact direction decoder and Lasagna cache but does not modify line annotations.
+
 VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
 `control_points` as objects with a required `position`. Every non-final control
 point owns a required `segment_to_next` descriptor for its span to control point

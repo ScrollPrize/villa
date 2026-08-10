@@ -2484,3 +2484,47 @@
 - `flush_workers=0` is the synchronous baseline and uses immediate ring release;
   both inference CLIs default to the available CPU count capped at 64 process
   workers.
+
+# Fiberlet anchor extraction
+
+- The initial C++ fiberlet stage consumes exactly the canonical 3D `uint8`
+  `presence/nx/ny` triplet from a Fiber Lasagna manifest. Each prediction-grid
+  voxel supplies one presence and one compact unoriented 3D direction. Extra
+  groups are not alternative observations. The channels must share shape and
+  effective spacing but may use different chunk layouts.
+- The manifest must contain an explicit positive numeric `source_to_base`.
+  Anchor extraction uses the existing local/remote Lasagna opener, compact-axis
+  decoder, persistent remote cache, and decoded chunk cache. It must not create
+  a reference direction merely to use the trace sampling API.
+- Stored prediction indices are voxel centres. Cubic cells of integer side 2
+  through 8 are anchored at prediction-grid origin zero and own half-open,
+  globally fixed ZYX index ranges. A crop selects intersecting complete global
+  cells and cannot recenter or truncate them. Clipping occurs only at the
+  global prediction-volume edge.
+- Each valid observation has fixed weight `g_i p_i`, where `g_i` is a Gaussian
+  about the nominal global cell centre and `p_i` is presence. Invalid axes and
+  presence below the inclusive floor contribute no numerator. The support
+  denominator is `sum g_i` over every owned cell voxel, including invalid,
+  missing, below-floor, and zero-presence samples.
+- Every non-empty cell attempts two independent, unoriented, potentially
+  non-orthogonal direction components. Exclusive assignment maximizes squared
+  alignment, and each fixed-assignment update is the principal eigenvector of
+  `sum g_i p_i d_i d_i^T` for that component. Deterministic multistart
+  assignment/PCA maximizes
+  `sum g_i p_i max_k((d_i dot u_k)^2) / sum g_i`. A single covariance's first
+  two orthogonal eigenvectors are not a valid replacement.
+- A component's aligned support is
+  `sum_assigned g_i p_i (d_i dot u_k)^2 / sum_cell g_i`; coherence divides the
+  same numerator by assigned `sum g_i p_i`; position is the aligned-support
+  centroid. Empty, degenerate, and below-threshold components are discarded
+  independently without reassigning or refitting a survivor. A cell emits
+  zero, one, or two anchors.
+- Reductions, seeds, assignment ties, convergence, component ordering, and
+  serialization sign are deterministic. Parallel work cannot change a
+  within-cell reduction. Machine output stores one prediction-grid XYZ
+  position and one prediction-to-base scale; OBJ coordinates are derived in
+  base voxels. Runtime timing and worker count are not scientific output, so
+  artifacts remain byte-identical across worker counts.
+- The anchor stage does not connect anchors, search paths, filter paths,
+  deduplicate paths, or extend fiberlets. Those stages remain unspecified
+  until anchor density and calibration measurements are available.

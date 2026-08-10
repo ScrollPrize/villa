@@ -1,3 +1,11 @@
+# 2026-08-10: C++ fiberlet cell anchors
+
+- Added deterministic cell-based extraction of zero, one, or two
+  non-orthogonal unoriented anchors from canonical Fiber Lasagna
+  `presence/nx/ny`, plus the cache-aware `vc_fiberlets anchors` command and
+  sparse JSON/base-coordinate OBJ artifacts. Connection and path stages remain
+  deferred.
+
 # 2026-08-03
 
 - Added experimental float16 shared raw-product accumulator rings while

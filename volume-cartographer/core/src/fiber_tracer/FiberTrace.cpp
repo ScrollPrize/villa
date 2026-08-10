@@ -3489,14 +3489,28 @@ public:
         bool sharedPresenceNxNy = false;
     };
 
-    Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes)
+    Impl(const vc::lasagna::LasagnaDataset& dataset,
+         size_t maxCachedBytes,
+         FiberPredictionFieldBindingMode bindingMode)
         : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
         const auto& manifest = dataset.manifest();
-        const auto prefixes = fiberPredictionPrefixes(manifest);
+        sourceScaleExplicit_ = manifest.raw.empty() ||
+            (manifest.raw.contains("source_to_base") &&
+             manifest.raw.at("source_to_base").is_number());
+        const auto availablePrefixes = fiberPredictionPrefixes(manifest);
+        const std::vector<std::string> prefixes =
+            bindingMode == FiberPredictionFieldBindingMode::CanonicalStoredGrid
+                ? (std::find(availablePrefixes.begin(), availablePrefixes.end(),
+                             std::string{}) != availablePrefixes.end()
+                       ? std::vector<std::string>{std::string{}}
+                       : std::vector<std::string>{})
+                : availablePrefixes;
         if (prefixes.empty())
             throw std::runtime_error(
-                "fiber inference dataset must contain presence/nx/ny channels");
+                bindingMode == FiberPredictionFieldBindingMode::CanonicalStoredGrid
+                    ? "anchor extraction requires canonical presence/nx/ny channels"
+                    : "fiber inference dataset must contain presence/nx/ny channels");
 
         cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(
             maxCachedBytes);
@@ -3525,6 +3539,28 @@ public:
                 cornerSamplingAvailable_ = false;
             }
             options_.push_back(std::move(option));
+            if (prefix.empty())
+                canonicalOptionIndex_ = options_.size() - 1;
+        }
+        if (canonicalOptionIndex_.has_value()) {
+            const auto& canonical = options_[*canonicalOptionIndex_];
+            const auto sameShape = canonical.presence.shapeZYX == canonical.nx.shapeZYX &&
+                canonical.presence.shapeZYX == canonical.ny.shapeZYX;
+            const auto closeSpacing = [](double a, double b) {
+                const double tolerance =
+                    1.0e-12 * std::max({1.0, std::abs(a), std::abs(b)});
+                return std::abs(a - b) <= tolerance;
+            };
+            if (!sameShape ||
+                !closeSpacing(canonical.presence.spacing, canonical.nx.spacing) ||
+                !closeSpacing(canonical.presence.spacing, canonical.ny.spacing)) {
+                throw std::runtime_error(
+                    "canonical fiber prediction presence/nx/ny channels must share shape and spacing");
+            }
+            canonicalGridInfo_.shapeZYX = canonical.presence.shapeZYX;
+            canonicalGridInfo_.predictionToBaseScale =
+                manifest.sourceToBase *
+                static_cast<double>(canonical.presence.group->scaleFactor());
         }
         optionGrids_.reserve(options_.size());
         for (const auto& option : options_) {
@@ -4448,18 +4484,135 @@ public:
 
     [[nodiscard]] size_t optionCount() const noexcept { return options_.size(); }
 
+    [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const
+    {
+        if (!canonicalOptionIndex_.has_value()) {
+            throw std::runtime_error(
+                "anchor extraction requires canonical presence/nx/ny channels");
+        }
+        if (!sourceScaleExplicit_) {
+            throw std::runtime_error(
+                "anchor extraction requires an explicit numeric source_to_base");
+        }
+        if (!(canonicalGridInfo_.predictionToBaseScale > 0.0) ||
+            !std::isfinite(canonicalGridInfo_.predictionToBaseScale)) {
+            throw std::runtime_error(
+                "anchor extraction requires a positive finite prediction-to-base scale");
+        }
+        return canonicalGridInfo_;
+    }
+
+    void sampleStoredGridBatch(
+        const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads,
+        std::vector<FiberStoredPredictionSample>& samples) const
+    {
+        (void)storedGridInfo();
+        const auto& option = options_[*canonicalOptionIndex_];
+        samples.assign(indicesZYX.size(), {});
+        const int workers = std::clamp(
+            parallelThreads > 0 ? parallelThreads : 1,
+            1,
+            static_cast<int>(std::max<size_t>(1, indicesZYX.size())));
+        const auto sampleOne = [&](
+            size_t index,
+            vc::lasagna::LasagnaLocalChunkResolver& presenceResolver,
+            vc::lasagna::LasagnaLocalChunkResolver& nxResolver,
+            vc::lasagna::LasagnaLocalChunkResolver& nyResolver) {
+            const auto& zyx = indicesZYX[index];
+            if (zyx[0] >= option.presence.shapeZYX[0] ||
+                zyx[1] >= option.presence.shapeZYX[1] ||
+                zyx[2] >= option.presence.shapeZYX[2]) {
+                throw std::out_of_range("fiber stored-grid sample index is outside the prediction volume");
+            }
+            const cv::Vec3d point{
+                static_cast<double>(zyx[2]) * option.presence.spacing,
+                static_cast<double>(zyx[1]) * option.presence.spacing,
+                static_cast<double>(zyx[0]) * option.presence.spacing,
+            };
+            auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                option.presence, point);
+            auto nxRequest = vc::lasagna::prepareLasagnaCubeRequest(option.nx, point);
+            auto nyRequest = vc::lasagna::prepareLasagnaCubeRequest(option.ny, point);
+            presenceResolver.resolve(presenceRequest);
+            nxResolver.resolve(nxRequest);
+            nyResolver.resolve(nyRequest);
+            const auto rawPresence =
+                vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
+            const auto direction = vc::lasagna::sampleLasagnaCompactAxisTensor(
+                option.nx, option.ny, nxRequest, nyRequest);
+            if (!rawPresence.has_value() || !direction.has_value())
+                return;
+            const double norm2 = direction->dot(*direction);
+            if (!(norm2 > kEpsilon * kEpsilon) || !std::isfinite(norm2))
+                return;
+            samples[index] = {
+                *direction / std::sqrt(norm2),
+                clamp01(*rawPresence / 255.0),
+                true,
+            };
+        };
+        const auto makeResolvers = [&]() {
+            return std::array{
+                vc::lasagna::LasagnaLocalChunkResolver(option.presence, *cache_),
+                vc::lasagna::LasagnaLocalChunkResolver(option.nx, *cache_),
+                vc::lasagna::LasagnaLocalChunkResolver(option.ny, *cache_),
+            };
+        };
+#ifdef _OPENMP
+        if (workers > 1) {
+            std::exception_ptr firstError;
+            std::atomic<bool> failed{false};
+            const auto count = static_cast<std::ptrdiff_t>(indicesZYX.size());
+            #pragma omp parallel num_threads(workers)
+            {
+                auto resolvers = makeResolvers();
+                #pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        sampleOne(
+                            static_cast<size_t>(rawIndex),
+                            resolvers[0], resolvers[1], resolvers[2]);
+                    } catch (...) {
+                        bool expected = false;
+                        if (failed.compare_exchange_strong(expected, true)) {
+                            #pragma omp critical(fiber_stored_grid_error)
+                            {
+                                if (!firstError)
+                                    firstError = std::current_exception();
+                            }
+                        }
+                    }
+                }
+            }
+            if (firstError)
+                std::rethrow_exception(firstError);
+            return;
+        }
+#endif
+        auto resolvers = makeResolvers();
+        for (size_t index = 0; index < indicesZYX.size(); ++index)
+            sampleOne(index, resolvers[0], resolvers[1], resolvers[2]);
+    }
+
 private:
     std::vector<Option> options_;
     std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
     bool cornerSamplingAvailable_ = true;
+    bool sourceScaleExplicit_ = false;
+    std::optional<size_t> canonicalOptionIndex_;
+    FiberPredictionGridInfo canonicalGridInfo_;
 };
 
 FiberPredictionField::FiberPredictionField(
     const vc::lasagna::LasagnaDataset& dataset,
-    size_t maxCachedBytes)
-    : impl_(std::make_unique<Impl>(dataset, maxCachedBytes))
+    size_t maxCachedBytes,
+    FiberPredictionFieldBindingMode bindingMode)
+    : impl_(std::make_unique<Impl>(dataset, maxCachedBytes, bindingMode))
 {
 }
 
@@ -4554,6 +4707,19 @@ FiberPredictionSample FiberPredictionField::sample(
     const cv::Vec3d& referenceDirection) const
 {
     return impl_->sample(volumePoint, referenceDirection);
+}
+
+FiberPredictionGridInfo FiberPredictionField::storedGridInfo() const
+{
+    return impl_->storedGridInfo();
+}
+
+void FiberPredictionField::sampleStoredGridBatch(
+    const std::vector<std::array<size_t, 3>>& indicesZYX,
+    int parallelThreads,
+    std::vector<FiberStoredPredictionSample>& samples) const
+{
+    impl_->sampleStoredGridBatch(indicesZYX, parallelThreads, samples);
 }
 
 size_t FiberPredictionField::optionCount() const noexcept

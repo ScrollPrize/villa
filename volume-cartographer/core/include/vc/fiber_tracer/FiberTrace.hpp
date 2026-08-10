@@ -219,6 +219,22 @@ struct FiberPredictionTraceScales {
     double predictionSpacingInTraceVoxels = 1.0;
 };
 
+struct FiberPredictionGridInfo {
+    std::array<size_t, 3> shapeZYX{0, 0, 0};
+    double predictionToBaseScale = 1.0;
+};
+
+struct FiberStoredPredictionSample {
+    cv::Vec3d direction{0.0, 0.0, 0.0};
+    double presence = 0.0;
+    bool valid = false;
+};
+
+enum class FiberPredictionFieldBindingMode {
+    TraceOptions,
+    CanonicalStoredGrid,
+};
+
 struct FiberTraceCoordinateAdapter {
     explicit FiberTraceCoordinateAdapter(double traceToBaseScale);
 
@@ -284,7 +300,9 @@ class FiberPredictionField final : public FiberPredictionSource {
 public:
     explicit FiberPredictionField(
         const vc::lasagna::LasagnaDataset& dataset,
-        size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
+        size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL,
+        FiberPredictionFieldBindingMode bindingMode =
+            FiberPredictionFieldBindingMode::TraceOptions);
     ~FiberPredictionField() override;
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
@@ -324,6 +342,11 @@ public:
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
+    [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const;
+    void sampleStoredGridBatch(
+        const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads,
+        std::vector<FiberStoredPredictionSample>& samples) const;
     [[nodiscard]] size_t optionCount() const noexcept;
 
 private:

@@ -823,6 +823,7 @@ if(VC_TESTING)
         test_lasagna_manifest
         test_lasagna_project_volumes
         test_fiber_trace3d
+        test_fiber_anchors
         test_open_data_manifest
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces

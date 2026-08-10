@@ -1,81 +1,86 @@
-# Task log: process-parallel native accumulation
+# Task log: anchor-seeded fiberlet over-segmentation
 
-## Baseline
+## 2026-08-10 implementation
 
-- Current accumulation is synchronous in the coordinator. Real-run
-  `commit_sum` was 14.1 s for 294 processed tiles within 68.6 s inference.
-- Controlled four-channel 32x256x256 ring, eight-addition, five-iteration
-  benchmark: NumPy float32 0.0443 s mean with 32 MiB backing; NumPy float16
-  0.2931 s with 16 MiB backing (6.6x slower).
-- Target CPU is dual-socket Intel Xeon Platinum 8480+ (224 logical CPUs) with
-  AVX-512F, F16C, and AVX-512-FP16. The implementation must remain portable to
-  Ubuntu/macOS and amd64/arm64 through runtime dispatch and scalar fallback.
+- Added `FiberPredictionField::storedGridInfo` and
+  `sampleStoredGridBatch`. The boundary binds only exact canonical
+  `presence/nx/ny`, returns the decoded unoriented axis without a fabricated
+  reference direction, accepts different channel chunk layouts, and retains
+  the existing local/remote Lasagna and decoded-chunk caches. Existing tracer
+  support for prefixed prediction options is unchanged.
+- Added reusable `FiberAnchors` types and a deterministic two-component
+  non-orthogonal directional PCA mixture. The fit uses exclusive squared-dot
+  assignment, fixed Gaussian/presence weights, compensated reductions,
+  deterministic multistart and ties, aligned-support centroids, independent
+  empty/degenerate/support rejection, and fixed-origin whole-cell crops.
+- Added `vc_fiberlets anchors`, sparse version-1 `anchors.json`, and
+  base-coordinate line-glyph `anchors.obj`. The source identity is a
+  credential-free local/remote manifest locator plus an `fnv1a64:` hash of the
+  materialized manifest bytes. JSON stores each component once rather than
+  duplicating anchor data. Timing and worker count remain stdout diagnostics
+  and are intentionally absent from artifacts so thread count cannot change
+  bytes.
+- Extracted the private project-save atomic string writer into shared
+  `vc::core::util::atomicWriteString`; `VolumePkg` and fiberlet artifacts now
+  use the same Windows/POSIX replacement behavior.
+- Added 13 focused tests covering empty and straight cells, arbitrary axis-sign
+  flips, 15/30/45/60/90-degree pairs, weak-component rejection, three-mode
+  selection, inclusive support, clipped edge cells, whole-cell crop identity,
+  thread-independent artifacts, canonical manifest binding, mixed chunk
+  layouts, explicit scale requirements, shape mismatch, and prefixed-only
+  rejection.
 
-## Plan review
+## Validation
 
-Independent review required precise half-to-float add semantics, ISA-matched
-runtime dispatch, stable per-worker FIFO ownership, nonblocking submission with
-ack pumping, provisional activity failure safety, coordinator-owned ring
-generations, all-scale slot reference counts, flush-frontier invariants,
-strided/unaligned/tail validation, inspectable/forceable native backends,
-explicit cache/queue cleanup, backpressure diagnostics, adversarial ordering and
-failure tests, and separate kernel/pipeline benchmarks. The plan incorporates
-these requirements.
+- Configure: `cmake -S . -B build` in `volume-cartographer` using the existing
+  cache. Result: Release, GCC 16.1.1, configuration succeeded.
+- Build: `cmake --build build --parallel 32 --target vc_fiberlets
+  test_fiber_anchors`. Result: succeeded.
+- Tests: `ctest --test-dir build --output-on-failure -R
+  '^(test_fiber_anchors|test_fiber_trace3d|test_lasagna_manifest|test_volume_pkg)$'`.
+  Result: 4/4 executables passed; anchor suite contains 13 cases and existing
+  native tracer contains 46 cases.
+- Compile coverage: `cmake --build build --parallel 32 --target vc_cli_all`.
+  Result: succeeded, including the registered `vc_fiberlets` target.
+- Determinism: ran the same real 8-cubed prediction crop at 1 and 32 threads,
+  then compared both artifacts with `cmp`. JSON and OBJ were byte-identical.
+- Diagnostic inspection: projected the size-4 OBJ glyphs in XY. The sparse
+  cell-local one/two-line topology and spatial distribution were coherent; no
+  malformed primitives were visible.
+- `git diff --check`: passed.
 
-## Implementation
+## Representative calibration
 
-- Added `accumulator_add.cpp` as a second pybind11 extension. It accepts
-  arbitrary positive Y/Z strides with contiguous X rows, releases the GIL,
-  supports float16 and float32 destinations, and has forceable `scalar`,
-  `avx512`, and `auto` dispatch modes. AVX-512 is isolated behind GCC/Clang
-  target attributes and runtime AVX-512F+F16C detection; no global ISA flag is
-  used.
-- Added persistent spawn-context accumulator processes to the authoritative
-  shared runner. Queue items contain only shared-slot/mmap descriptors and
-  slices. Stable integer spatial ownership plus one bounded FIFO per worker
-  serializes every output chunk without locks.
-- The coordinator owns ring generation and activity metadata, retains result
-  slots until all task acknowledgements, pumps acknowledgements under queue
-  backpressure, and gates reservation at Z-row transitions. Activity is
-  committed only after successful worker completion, before canonical progress
-  and flush handling.
-- Added `--accumulator-workers` to both Fiber and Lasagna frontends, defaulting
-  to `min(CPU count, 32)`; zero uses the synchronous path. Added startup/backend
-  and task/work/queue/wall/rate diagnostics.
-- Product rings now default to float16; weights remain float32. Float32 remains
-  selectable explicitly.
+Release command shape, repeated for cell sizes 2, 4, and 8:
 
-## Validation and measurements
+```bash
+/usr/bin/time -f 'wall=%e peak_kib=%M' build/bin/vc_fiberlets anchors \
+  /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json \
+  /tmp/vc_fiberlet_anchor_bench_sN \
+  --cell-size N \
+  --crop-prediction-xyzwhd 1696,2528,2264,32,32,32 \
+  --threads 32 --cache-gib 0.5
+```
 
-- Manual baseline-ISA build (Python 3.14, GCC, pybind11 headers from the local
-  build cache) succeeded; runtime backend on the Xeon 8480+ is `avx512`.
-- Exhaustive 65,536-value binary16 input validation for one float32 addition
-  matches NumPy bit-for-bit for all finite outputs in both forced scalar and
-  automatic AVX-512 modes; NaN masks also match. This found and corrected an
-  initial scalar subnormal exponent error.
-- Strided Y/Z, unaligned X, and 37-element tail views match NumPy for float16
-  and float32.
-- Focused shared-runner regression passed: synchronous versus two CPU device
-  workers plus two accumulator processes produced exactly equal output chunks
-  with float16 product rings; scratch mmaps were cleaned.
-- Kernel benchmark command used a `(16,512,512)` float16 destination and
-  float32 source, eight repeated adds, seven iterations. NumPy median was
-  142.507 ms (mean 142.316, min 141.391, max 143.150); AVX-512 median was
-  7.653 ms (mean 7.654, min 7.644, max 7.663), an 18.6x median kernel speedup.
-  Forced portable scalar median was 331.671 ms. This is a kernel benchmark, not
-  an end-to-end volume throughput claim.
+| Cell | Side/diagonal base vx | Cells | Anchors | Zero/one/two | Solver s | Wall s | Peak MiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 16.0 / 27.7 | 4096 | 4079 | 1646 / 821 / 1629 | 0.196 | 0.25 | 51.1 |
+| 4 | 32.0 / 55.4 | 512 | 542 | 148 / 186 / 178 | 0.272 | 0.29 | 47.5 |
+| 8 | 64.0 / 110.9 | 64 | 79 | 7 / 35 / 22 | 0.076 | 0.09 | 51.1 |
 
-## Deviations and limitations
+These are single warm-cache calibration runs, not performance benchmarks.
+No production cell size was selected: that requires overlaying the 3D OBJ on
+the volume and comparing the side and diagonal against an agreed minimum
+sustained sheet/fiber separation. The diagnostic XY projection is not a
+substitute for that domain decision.
 
-- The serial baseline continues through the existing `_accumulate_group`
-  coordinator routine instead of being mechanically expressed as process task
-  descriptors; it does use the same native add primitive. This keeps the
-  zero-worker diagnostic path small while exact serial/process output coverage
-  validates the two planners.
-- The environment lacks `pytest`, so pytest suites were not run. Focused
-  `unittest` cases and Python compile checks passed. A full unittest-module run
-  was stopped after it made no progress in an unrelated early test; the focused
-  affected tests were rerun individually.
-- No representative full-volume eight-GPU run was launched by the agent. The
-  new accumulator diagnostics are intended for the user's next real inference
-  comparison; no end-to-end speedup is claimed here.
+## Reuse and deferred work
+
+- Direct remote manifest caching and `lasagna-remote.json` sidecars are not
+  reimplemented. The CLI calls the existing `LasagnaDataset::openLocation`,
+  whose direct-remote cache/refresh and sidecar behavior remains covered by
+  `test_lasagna_manifest`; the new canonical stored-grid binding is covered
+  with local tiny Zarr arrays.
+- Connection search, directed DP/CUDA work, path-quality filtering,
+  deduplication, and extension remain intentionally deferred to the next
+  fiberlet stage, as specified in the task.

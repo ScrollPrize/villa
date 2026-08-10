@@ -19,21 +19,14 @@
 
 #include <cstdlib>
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
+#if !defined(_WIN32)
 #include <pwd.h>
 #include <unistd.h>
 #endif
 
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -77,21 +70,6 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 }
 
 namespace {
-
-void replaceFile(const fs::path& source, const fs::path& destination)
-{
-#if defined(_WIN32)
-    if (!::MoveFileExW(source.c_str(), destination.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code ec(static_cast<int>(::GetLastError()),
-                                 std::system_category());
-        throw fs::filesystem_error(
-            "cannot replace project file", source, destination, ec);
-    }
-#else
-    fs::rename(source, destination);
-#endif
-}
 
 std::string asciiLower(std::string value)
 {
@@ -407,20 +385,6 @@ fs::path& autosaveRootStorage()
 {
     static fs::path root;
     return root;
-}
-
-void atomicWriteString(const fs::path& target, const std::string& text)
-{
-    fs::create_directories(target.parent_path());
-    auto tmp = target;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot open " + tmp.string() + " for write");
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        if (!out) throw std::runtime_error("write failed for " + tmp.string());
-    }
-    replaceFile(tmp, target);
 }
 
 utils::Json entriesToJson(const std::vector<vc::project::Entry>& entries)
@@ -2286,7 +2250,7 @@ void VolumePkg::fromJson(const utils::Json& j)
 
 void VolumePkg::writeJsonTo(const fs::path& target) const
 {
-    atomicWriteString(target, toJson().dump(2));
+    vc::core::util::atomicWriteString(target, toJson().dump(2));
 }
 
 void VolumePkg::readJsonFrom(const fs::path& source)
