@@ -49,6 +49,8 @@ volume-only = [
 # Machine-learning & training stack
 models = [
     "torch>=2.12,<3",
+    "accelerate>=1.13.0",
+    "diffusers>=0.37.0",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -64,6 +66,7 @@ models = [
     "fvcore>=0.1.5.post20221221",
     "scikit-image>=0.24.0",
     "scipy>=1.13.1",
+    "connected-components-3d>=3.24.0",
     "pandas>=2.3.2",
     "tensorstore>=0.1.69",
     "tqdm>=4.67.1",
@@ -78,6 +81,9 @@ models = [
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
     "lxml>=6.0.2",
+    "opencv-python-headless>=4.11.0.86",
+    "tifffile>=2024.8.30",
+    "imagecodecs>=2026.3.6",
     "cucim-cu13>=26.6",
 ]
 # Rendering and geometry utilities
@@ -120,6 +126,8 @@ tests = ["pytest>=8.4.2"]
 all = [
     # Machine-learning & training stack
     "torch>=2.12,<3",
+    "accelerate>=1.13.0",
+    "diffusers>=0.37.0",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -151,6 +159,7 @@ all = [
     "connected-components-3d>=3.24.0",
     "simpleitk>=2.5.2",
     "tifffile>=2024.8.30",
+    "imagecodecs>=2026.3.6",
 
     # GUI and visualisation
     "napari>=0.5.6",
@@ -175,6 +184,7 @@ all = [
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
     "lxml>=6.0.2",
+    "cucim-cu13>=26.6",
 ]
 
 [project.urls]
@@ -204,7 +214,10 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-vesuvius = ["install/configs/*.yaml"]
+vesuvius = [
+    "install/configs/*.yaml",
+    "ink_detection/configs/*.json",
+]
 
 [tool.setuptools.cmdclass]
 install = "vesuvius.install.custom_install.CustomInstallCommand"
