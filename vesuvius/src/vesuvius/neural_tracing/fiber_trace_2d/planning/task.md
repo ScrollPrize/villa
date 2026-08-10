@@ -1,8 +1,16 @@
-# Task: process-parallel native product accumulation
+# Task: minimize manager staging and Atlas inference ingestion
 
-Implement the shared Lasagna/Fiber accumulator as a deterministic process
-pipeline and add one portable native in-place add extension with runtime
-AVX-512/F16C acceleration for float16 mmap storage. Preserve chunk ownership,
-rolling-ring safety, canonical tile ordering per chunk, bounded shared-memory
-slots, asynchronous flush, and float32 weights/flush arithmetic. Make the
-parallel/native solution useful for both float16 and float32 accumulators.
+Remove the manager-specific `upload-manifest.json` protocol. S3 staging must
+use rclone's normal resumable copy behavior with only `_INCOMPLETE` as the
+publication guard: create the marker before transfer and remove it only after
+rclone succeeds.
+
+Keep portable `inference.json` and all previously approved model metadata.
+Do not copy portable inference provenance into an Atlas data entry's
+`creation_info`. Reuse the existing Atlas `lasagna` copy-first representation
+without extending its data-entry schema: store only the private origin and the
+existing `model_id` and `level` parameters.
+
+Clean the already staged/ingested work-in-progress runs consistently, without
+changing their artifacts, model identities, origins, parameters, or public
+publication state.

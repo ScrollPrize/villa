@@ -72,6 +72,20 @@ class _FakeSparseChunkGroupCache:
 
 
 class FitDataManifestLazyTests(unittest.TestCase):
+	def test_lasagna_volume_preserves_provenance_and_unknown_fields(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			manifest = _write_manifest(Path(td), groups={})
+			raw = json.loads(manifest.read_text(encoding="utf-8"))
+			raw.update(provenance="inference.json", future_field={"value": 3})
+			manifest.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+			volume = LasagnaVolume.load(manifest)
+			volume.save()
+
+			saved = json.loads(manifest.read_text(encoding="utf-8"))
+			self.assertEqual(saved["provenance"], "inference.json")
+			self.assertEqual(saved["future_field"], {"value": 3})
+
 	def test_lasagna_volume_load_allows_missing_umbilicus_by_default(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
