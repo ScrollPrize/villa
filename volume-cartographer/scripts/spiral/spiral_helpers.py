@@ -108,9 +108,13 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
 
 
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
-    # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points are
-    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs. line_points
-    # are derived rendering geometry and must not be used as fitting constraints.
+    # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
+    # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
+    # JSONs. line_points is the dense traced polyline; the control points lie
+    # exactly on it, and the tracer extends it ~150 points past the first and
+    # last control point. We fit against the dense polyline, trimmed to the
+    # first-to-last control point span so the dangling ends don't act as
+    # constraints.
     with open(path, 'r') as f:
         data = json.load(f)
 
@@ -118,25 +122,42 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
     parsed = parse_vc3d_fiber_format(data, path=path)
-    points_xyz = parsed.control_points_xyz
 
-    points_xyz = np.asarray(points_xyz, dtype=np.float32)
-    if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
-        print(f'WARNING: fiber {path} points have shape {points_xyz.shape}; expected (N, 3); skipping')
+    control_xyz = np.asarray(parsed.control_points_xyz, dtype=np.float32)
+    if control_xyz.ndim != 2 or control_xyz.shape[1] != 3:
+        print(f'WARNING: fiber {path} control points have shape {control_xyz.shape}; expected (N, 3); skipping')
         return None
+    num_control_points = len(control_xyz)
+
+    line_xyz = np.asarray(parsed.line_points_xyz, dtype=np.float32)
+    if len(line_xyz) >= num_control_points and num_control_points >= 1:
+        # Map each control point to its nearest line point (exact coincidence in
+        # practice), then trim the polyline to the control-point span.
+        squared_distances = (
+            (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
+        control_line_indices = squared_distances.argmin(axis=1)
+        span_begin = int(control_line_indices.min())
+        span_end = int(control_line_indices.max())
+        points_xyz = line_xyz[span_begin:span_end + 1]
+        control_line_indices = control_line_indices - span_begin
+    else:
+        # No usable dense polyline (legacy or degenerate fiber): fall back to
+        # the control points themselves.
+        points_xyz = control_xyz
+        control_line_indices = np.arange(num_control_points)
 
     points_xyz = points_xyz * coordinate_scale
     original_num_points = len(points_xyz)
     # Force-keep this fiber's link endpoint control points through decimation so
-    # cross-fiber links (which reference original indices) resolve to the exact
-    # point rather than a surviving neighbour.
-    link_endpoint_indices = {
-        int(br.get('control_point_index', -1))
-        for br in (data.get('branches') or [])
-        if 0 <= int(br.get('control_point_index', -1)) < original_num_points
-    }
-    # Keep the surviving points' original control_point indices so cross-fiber
-    # links resolve exactly after decimation.
+    # cross-fiber links (which reference control_point indices) resolve to the
+    # exact point rather than a surviving neighbour.
+    link_endpoint_indices = set()
+    for br in (data.get('branches') or []):
+        control_index = int(br.get('control_point_index', -1))
+        if 0 <= control_index < num_control_points:
+            link_endpoint_indices.add(int(control_line_indices[control_index]))
+    # Keep the surviving points' pre-decimation (trimmed line) indices so
+    # cross-fiber links resolve exactly after decimation.
     points_xyz, kept_orig_indices = _decimate_ordered_points_min_spacing(
         points_xyz, min_point_spacing, return_indices=True,
         force_keep=link_endpoint_indices)
@@ -164,13 +185,16 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'input_coordinate_scale': coordinate_scale,
             'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
+            'fiber_num_control_points': num_control_points,
         },
         'color': color,
     }
-    # Map from an original control_point index -> retained point id, so cross-fiber
-    # links resolve exactly despite decimation. Retained point ids are 0..k-1 in
-    # kept order, i.e. the position within kept_orig_indices.
+    # Two-step index mapping for cross-fiber links (which reference control_point
+    # indices): control_line_indices maps a control_point index to its trimmed
+    # line-point index, kept_orig_indices maps that to the retained point id
+    # (0..k-1 in kept order, i.e. the position within kept_orig_indices).
     collection['kept_orig_indices'] = kept_orig_indices
+    collection['control_line_indices'] = control_line_indices
     for point_id, (p, orig_index) in enumerate(zip(points_xyz, kept_orig_indices)):
         collection['points'][point_id] = {
             'id': point_id,
@@ -242,12 +266,19 @@ def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
 def _point_id_for_orig_index(pcl, orig_index):
     """Map an original control_point index to the retained point id.
 
-    Retained point ids are the positions within kept_orig_indices, so the id is
-    the position of the kept original index nearest to orig_index (exact when
-    that index survived decimation; its nearest surviving neighbour otherwise).
+    Fiber collections hold decimated line points, so this is a two-step map:
+    control_point index -> trimmed line-point index (control_line_indices),
+    then to the position of the nearest kept index within kept_orig_indices
+    (exact when that index survived decimation; its nearest surviving
+    neighbour otherwise).
     """
     if orig_index < 0:
         return None
+    control_line = pcl.get('control_line_indices')
+    if control_line is not None and len(control_line):
+        if orig_index >= len(control_line):
+            return None
+        orig_index = int(control_line[orig_index])
     kept = pcl.get('kept_orig_indices')
     if kept is None or len(kept) == 0:
         return None
