@@ -71,6 +71,8 @@ private:
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
     QString pendingRebuildStage() const;
+    void setSessionCheckpoint(const QString& hostPath);
+    void refreshCheckpointChoices();
     void refreshReloadRequired();
     void persist() const;
     void restore();
@@ -106,6 +108,12 @@ private:
     // Read-only reports of what spiral-scroll.json specifies.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
+    // The checkpoint the resident fit was built from: reported, never typed,
+    // and carried back in a rebuild request unless the Checkpoint section
+    // replaces it.
+    QString _sessionCheckpoint;
+    QLabel* _sessionCheckpointLabel = nullptr;
+    QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
     QLineEdit* _pclPath = nullptr;
     QListWidget* _pclList = nullptr;

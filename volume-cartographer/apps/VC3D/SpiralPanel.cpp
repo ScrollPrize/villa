@@ -42,6 +42,9 @@
 
 namespace {
 const QString kLocalhostProfileId = QStringLiteral("localhost");
+// Marks a checkpoint entry that names a file on this computer rather than one
+// the service advertised; such an entry is uploaded before it can be loaded.
+constexpr int kLocalCheckpointRole = Qt::UserRole + 1;
 }
 
 SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
@@ -367,7 +370,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* outputForm = new QFormLayout(outputContents);
     outputGroup->contentLayout()->addWidget(outputContents);
     addPathRow(outputForm, "output_directory", tr("Output directory"), true);
-    addPathRow(outputForm, "checkpoint", tr("Checkpoint"), false);
     addPathRow(outputForm, "scroll_zarr", tr("Scroll/render Zarr"), true);
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
@@ -569,6 +571,82 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     }
     _displayDialog->adjustSize();
 
+    // Every checkpoint operation in one place: which checkpoint, loading it,
+    // saving one, and taking one away. They used to be spread across a path
+    // row in "Fit and output", a dialog behind a button, and two more buttons
+    // beside Run.
+    auto* checkpointGroup = makeSection(tr("Checkpoint"),
+                                        QStringLiteral("spiralCheckpointGroup"),
+                                        QStringLiteral("spiral/groups/checkpoint_expanded"));
+    auto* checkpointContents = new QWidget(checkpointGroup->contentWidget());
+    auto* checkpointLayout = new QVBoxLayout(checkpointContents);
+    checkpointGroup->contentLayout()->addWidget(checkpointContents);
+
+    // Read-only, and the only checkpoint fact about the live session: what it
+    // was actually loaded from, which the panel does not choose.
+    _sessionCheckpointLabel = new QLabel(tr("Not loaded from a checkpoint"),
+                                         checkpointContents);
+    _sessionCheckpointLabel->setObjectName(QStringLiteral("spiralSessionCheckpoint"));
+    _sessionCheckpointLabel->setWordWrap(true);
+    _sessionCheckpointLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _sessionCheckpointLabel->setToolTip(
+        tr("The checkpoint the resident fit was built from"));
+    checkpointLayout->addWidget(_sessionCheckpointLabel);
+
+    auto* checkpointChoiceRow = new QHBoxLayout;
+    _checkpointChoice = new QComboBox(checkpointContents);
+    _checkpointChoice->setObjectName(QStringLiteral("spiralCheckpointChoice"));
+    _checkpointChoice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    _checkpointChoice->setToolTip(
+        tr("Checkpoints the service can load, plus any local file browsed for here"));
+    auto* browseCheckpoint = new QToolButton(checkpointContents);
+    browseCheckpoint->setText(QStringLiteral("…"));
+    browseCheckpoint->setToolTip(tr("Choose a .ckpt file on this computer; it is "
+                                    "uploaded to the service before loading"));
+    checkpointChoiceRow->addWidget(_checkpointChoice, 1);
+    checkpointChoiceRow->addWidget(browseCheckpoint);
+    checkpointLayout->addLayout(checkpointChoiceRow);
+
+    auto* checkpointControls = new QHBoxLayout;
+    _loadCheckpoint = new QPushButton(tr("Load"), checkpointContents);
+    _loadCheckpoint->setEnabled(false);
+    _loadCheckpoint->setToolTip(
+        tr("Replace the resident model's weights, optimiser and RNG state from "
+           "this checkpoint. If it does not match the live model, the service "
+           "says what a rebuild would have to replace and asks before doing it."));
+    _save = new QPushButton(tr("Save on Service"), checkpointContents);
+    _save->setEnabled(false);
+    _downloadCheckpoint = new QPushButton(tr("Download…"), checkpointContents);
+    _downloadCheckpoint->setEnabled(false);
+    checkpointControls->addWidget(_loadCheckpoint);
+    checkpointControls->addWidget(_save);
+    checkpointControls->addWidget(_downloadCheckpoint);
+    checkpointControls->addStretch(1);
+    checkpointLayout->addLayout(checkpointControls);
+    _checkpointDownloadStatus = new QLabel(checkpointContents);
+    _checkpointDownloadStatus->setVisible(false);
+    _checkpointDownloadProgress = new QProgressBar(checkpointContents);
+    _checkpointDownloadProgress->setVisible(false);
+    checkpointLayout->addWidget(_checkpointDownloadStatus);
+    checkpointLayout->addWidget(_checkpointDownloadProgress);
+    connect(browseCheckpoint, &QToolButton::clicked, this, [this]() {
+        const QString chosen = QFileDialog::getOpenFileName(
+            this, tr("Choose a Spiral checkpoint"), QDir::homePath(),
+            tr("Checkpoint (*.ckpt)"));
+        if (chosen.isEmpty()) return;
+        // A local file joins the same list as the service's own, tagged so
+        // Load knows it has to be uploaded first.
+        const int existing = _checkpointChoice->findData(chosen);
+        if (existing >= 0) {
+            _checkpointChoice->setCurrentIndex(existing);
+            return;
+        }
+        _checkpointChoice->insertItem(0, tr("%1 (this computer)").arg(chosen),
+                                      chosen);
+        _checkpointChoice->setItemData(0, true, kLocalCheckpointRole);
+        _checkpointChoice->setCurrentIndex(0);
+    });
+
     auto* runGroup = makeSection(tr("Run and status"),
                                  QStringLiteral("spiralRunStatusGroup"),
                                  QStringLiteral("spiral/groups/run_status_expanded"));
@@ -587,28 +665,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     controls->addWidget(_load); controls->addWidget(_iterations); controls->addWidget(_run);
     controls->addWidget(_stop);
     runLayout->addLayout(controls);
-    auto* checkpointControls = new QHBoxLayout;
-    _save = new QPushButton(tr("Save Checkpoint on Service"), runContents); _save->setEnabled(false);
-    _downloadCheckpoint = new QPushButton(tr("Download Checkpoint…"), runContents);
-    _downloadCheckpoint->setEnabled(false);
-    _loadCheckpoint = new QPushButton(tr("Load Checkpoint into Fit…"), runContents);
-    _loadCheckpoint->setEnabled(false);
-    _loadCheckpoint->setToolTip(
-        tr("Replace the resident model's weights, optimiser and RNG state "
-           "from a checkpoint. The service refuses any checkpoint that is not "
-           "an exact match for the live model; use Rebuild Fit to change the "
-           "model domain or structure."));
-    checkpointControls->addWidget(_save);
-    checkpointControls->addWidget(_downloadCheckpoint);
-    checkpointControls->addWidget(_loadCheckpoint);
-    checkpointControls->addStretch(1);
-    runLayout->addLayout(checkpointControls);
-    _checkpointDownloadStatus = new QLabel(runContents);
-    _checkpointDownloadStatus->setVisible(false);
-    _checkpointDownloadProgress = new QProgressBar(runContents);
-    _checkpointDownloadProgress->setVisible(false);
-    runLayout->addWidget(_checkpointDownloadStatus);
-    runLayout->addWidget(_checkpointDownloadProgress);
     _checkpointDownloadTimer = new QTimer(this);
     _checkpointDownloadTimer->setInterval(1000);
     auto refreshCheckpointDownload = [this]() {
@@ -791,6 +847,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 _state->setText(tr("Service: %1").arg(text));
             });
+    connect(_service, &SpiralServiceManager::datasetResolved, this,
+            [this](const QJsonObject&) { refreshCheckpointChoices(); });
     connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
         // The scroll specification belongs to the dataset, not to a session, so
         // it is reported whether or not one is attached.
@@ -1016,36 +1074,56 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _service->downloadCheckpoint(path);
     });
     connect(_loadCheckpoint, &QPushButton::clicked, this, [this]() {
-        // The service lists the checkpoints it can load, so the user picks
-        // one instead of typing a path on a host that may not be this one.
-        // The remaining case is a checkpoint that only exists here, which is
-        // uploaded first; that is the same question in either mode.
-        const QString browse = tr("Choose a local file…");
-        QStringList choices = _service->serviceCheckpoints();
-        choices.push_back(browse);
-        bool accepted = false;
-        const QString choice = QInputDialog::getItem(
-            this, tr("Load Spiral checkpoint into the fit"),
-            tr("Checkpoint to load into the resident model:"), choices, 0,
-            false, &accepted);
-        if (!accepted || choice.isEmpty()) return;
-        QString localFile;
-        if (choice == browse) {
-            localFile = QFileDialog::getOpenFileName(
-                this, tr("Load Spiral checkpoint into the fit"),
-                QDir::homePath(), tr("Checkpoint (*.ckpt)"));
-            if (localFile.isEmpty()) return;
-        }
+        const QString selected =
+            _checkpointChoice->currentData().toString();
+        if (selected.isEmpty()) return;
+        const bool local =
+            _checkpointChoice->currentData(kLocalCheckpointRole).toBool();
         _loadCheckpoint->setEnabled(false);
         _warnings->setText(tr("Loading checkpoint into the resident fit…"));
-        if (localFile.isEmpty())
-            _service->loadServiceCheckpoint(choice);
-        else
-            _service->loadLocalCheckpointFile(localFile);
+        // One POST. A local file is uploaded on the way (the upload reuses an
+        // identical checkpoint already on the host), and a refusal comes back
+        // through checkpointLoadRefused with what a rebuild would take.
+        _service->loadCheckpoint(local ? QString() : selected,
+                                 local ? selected : QString());
     });
+    connect(_service, &SpiralServiceManager::checkpointLoadRefused, this,
+            [this](const QString& hostPath, const QString& localPath,
+                   const QStringList& reasons, const QString& stage,
+                   const QString& message) {
+                _loadCheckpoint->setEnabled(_connected && _sessionRunnable
+                                            && _checkpointChoice->count() > 0);
+                const QString detail =
+                    reasons.isEmpty() ? message : reasons.join(QStringLiteral("\n"));
+                _warnings->setText(detail);
+                if (stage.isEmpty()) {
+                    // Nothing a rebuild can do: offer nothing.
+                    QMessageBox::warning(
+                        this, tr("Checkpoint refused"),
+                        tr("The service cannot load this checkpoint into this "
+                           "fit:\n\n%1").arg(detail));
+                    return;
+                }
+                const bool wholeFit = stage != QStringLiteral("model");
+                QString question =
+                    tr("This checkpoint does not match the live model:\n\n%1\n\n")
+                        .arg(detail);
+                question += wholeFit
+                    ? tr("Loading it means rebuilding the whole fit — the "
+                         "dataset inputs are re-read, and any added inputs "
+                         "not committed to the dataset are discarded. Rebuild?")
+                    : tr("Loading it means rebuilding the model only. The "
+                         "loaded inputs, including everything already added to "
+                         "this fit, are kept. Rebuild?");
+                if (QMessageBox::question(this, tr("Rebuild to load this checkpoint"),
+                                          question) != QMessageBox::Yes)
+                    return;
+                _loadCheckpoint->setEnabled(false);
+                _warnings->setText(tr("Rebuilding the fit from the checkpoint…"));
+                _service->loadCheckpoint(hostPath, localPath, true);
+            });
     connect(_service, &SpiralServiceManager::checkpointLoaded, this,
             [this](const QString& hostPath, qint64 iteration) {
-                _paths[QStringLiteral("checkpoint")]->setText(hostPath);
                 _warnings->setText(
                     tr("Loaded %1 into the resident fit at iteration %2")
                         .arg(hostPath)
@@ -1291,21 +1369,15 @@ void SpiralPanel::setRemoteMode(bool remote)
     _remoteMode = remote;
     // Every service owns its base inputs (local and remote alike): the path
     // rows populate read-only from the service's advertised dataset
-    // resolution. The checkpoint and tracks selections stay editable because
-    // the client chooses among service-advertised values.
-    const QStringList clientSelectable{QStringLiteral("checkpoint"), QStringLiteral("tracks_dbm")};
+    // resolution. The tracks selection stays editable because the client
+    // chooses among service-advertised values; checkpoints have their own
+    // section and are never a path the client types here.
+    const QStringList clientSelectable{QStringLiteral("tracks_dbm")};
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        const bool selectable = clientSelectable.contains(it.key());
-        // The checkpoint browse button stays: a client-local .ckpt selected
-        // here is uploaded to the service before the load.
-        const bool browsable = it.key() == QStringLiteral("checkpoint");
-        it.value()->setReadOnly(!selectable);
+        it.value()->setReadOnly(!clientSelectable.contains(it.key()));
         if (_pathBrowseButtons.contains(it.key()))
-            _pathBrowseButtons[it.key()]->setVisible(browsable);
+            _pathBrowseButtons[it.key()]->setVisible(false);
     }
-    _paths[QStringLiteral("checkpoint")]->setToolTip(
-        tr("A service-advertised checkpoint, a service path under the output "
-           "directory, or a local .ckpt file to upload for resume"));
     // PCL collections are advertised by dataset resolution; extra collections
     // join a session through ephemeral uploads, not the load request.
     _pclRole->setEnabled(false);
@@ -1455,6 +1527,9 @@ QJsonObject SpiralPanel::sessionRequest() const
                                 {"required", item->data(Qt::UserRole + 2).toBool()}});
     }
     paths["pcls"] = pcls;
+    // Not a panel field: a rebuild resumes whatever the live session was
+    // built from unless the checkpoint section replaces it.
+    paths["checkpoint"] = _sessionCheckpoint;
     QJsonObject config = sessionAdvancedConfig();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -1509,8 +1584,7 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
     // A checkpoint-backed session starts from the checkpoint's own durable
     // configuration. A previously selected saved profile can be chosen again
     // after the checkpoint session is ready, but must not override its load.
-    const bool loadingCheckpoint =
-        !_paths.value(QStringLiteral("checkpoint"))->text().trimmed().isEmpty();
+    const bool loadingCheckpoint = !_sessionCheckpoint.isEmpty();
     QJsonObject config;
     if (_advancedProfiles->isDefaultProfile()
         && !_attachedAdvancedConfig.isEmpty()) {
@@ -1663,6 +1737,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(paths.value(it.key()).toString());
+    setSessionCheckpoint(paths.value(QStringLiteral("checkpoint")).toString());
 
     _pclList->clear();
     for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
@@ -1876,7 +1951,10 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _connected && runnable && !_checkpointDownloadActive);
     // An in-session load replaces resident model state, so it needs the same
     // idle session a run does.
-    _loadCheckpoint->setEnabled(_connected && runnable);
+    // Nothing to load until the service has advertised a checkpoint or a
+    // local one has been browsed for.
+    _loadCheckpoint->setEnabled(_connected && runnable
+                                && _checkpointChoice->count() > 0);
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
@@ -1928,6 +2006,40 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             : tr("Pending inputs join the fit on the next run"));
     else
         _commitHint->clear();
+}
+
+void SpiralPanel::setSessionCheckpoint(const QString& hostPath)
+{
+    _sessionCheckpoint = hostPath.trimmed();
+    _sessionCheckpointLabel->setText(
+        _sessionCheckpoint.isEmpty()
+            ? tr("Not loaded from a checkpoint")
+            : tr("Loaded from %1").arg(_sessionCheckpoint));
+}
+
+void SpiralPanel::refreshCheckpointChoices()
+{
+    // The service's own list, preserving both the current selection and any
+    // local file browsed for since the last refresh — neither is the
+    // service's to forget.
+    const QString selected = _checkpointChoice->currentData().toString();
+    QList<QPair<QString, QString>> local;
+    for (int index = 0; index < _checkpointChoice->count(); ++index)
+        if (_checkpointChoice->itemData(index, kLocalCheckpointRole).toBool())
+            local.push_back({_checkpointChoice->itemText(index),
+                             _checkpointChoice->itemData(index).toString()});
+
+    const QSignalBlocker blocker(_checkpointChoice);
+    _checkpointChoice->clear();
+    for (const auto& entry : local) {
+        _checkpointChoice->addItem(entry.first, entry.second);
+        _checkpointChoice->setItemData(_checkpointChoice->count() - 1, true,
+                                       kLocalCheckpointRole);
+    }
+    for (const QString& hostPath : _service->serviceCheckpoints())
+        _checkpointChoice->addItem(hostPath, hostPath);
+    const int restored = _checkpointChoice->findData(selected);
+    if (restored >= 0) _checkpointChoice->setCurrentIndex(restored);
 }
 
 QString SpiralPanel::pendingRebuildStage() const

@@ -811,35 +811,48 @@ QStringList SpiralServiceManager::serviceCheckpoints() const
     return paths;
 }
 
-void SpiralServiceManager::loadServiceCheckpoint(const QString& hostPath)
+void SpiralServiceManager::loadCheckpoint(const QString& hostPath,
+                                          const QString& localPath,
+                                          bool allowRebuild)
 {
-    sendLoadCheckpoint({{QStringLiteral("host_checkpoint"), hostPath}});
-}
-
-void SpiralServiceManager::loadLocalCheckpointFile(const QString& localPath)
-{
+    QJsonObject body;
+    if (allowRebuild) body[QStringLiteral("allow_rebuild")] = true;
+    if (localPath.isEmpty()) {
+        body[QStringLiteral("host_checkpoint")] = hostPath;
+        sendLoadCheckpoint(body, hostPath, localPath);
+        return;
+    }
+    // A local file has to exist on the service before the service can resolve
+    // it. The upload reuses an identical checkpoint already on the host, so
+    // escalating a refusal to a rebuild re-sends nothing.
     emit logMessage(tr("Uploading checkpoint %1 to the service…").arg(localPath));
     uploadCheckpointForResume(
         localPath,
-        [this](const QString& hostPath, const QString& error, bool reused) {
-            if (hostPath.isEmpty()) {
+        [this, body, localPath](const QString& uploaded, const QString& error,
+                                bool reused) mutable {
+            if (uploaded.isEmpty()) {
                 emit errorOccurred(tr("Checkpoint upload failed: %1").arg(error));
                 return;
             }
             emit logMessage(reused
-                                ? tr("Reusing checkpoint already on the service at %1").arg(hostPath)
-                                : tr("Checkpoint uploaded to service path %1").arg(hostPath));
-            sendLoadCheckpoint({{QStringLiteral("uploaded_checkpoint"), hostPath}});
+                                ? tr("Reusing checkpoint already on the service at %1").arg(uploaded)
+                                : tr("Checkpoint uploaded to service path %1").arg(uploaded));
+            body[QStringLiteral("uploaded_checkpoint")] = uploaded;
+            sendLoadCheckpoint(body, {}, localPath);
         });
 }
 
-void SpiralServiceManager::sendLoadCheckpoint(QJsonObject body)
+void SpiralServiceManager::sendLoadCheckpoint(QJsonObject body,
+                                              const QString& hostPath,
+                                              const QString& localPath)
 {
-    // The resident model stays; only its parameters, optimiser, scheduler and
-    // RNG state are replaced, and only if the service's preflight finds the
-    // checkpoint an exact match for the live model. Which checkpoint that is
-    // the service resolves: this only says whether the name came from its own
-    // advertisement or from an upload.
+    // Without allow_rebuild the resident model stays and only its parameters,
+    // optimiser, scheduler and RNG state are replaced, and only if the
+    // service's preflight finds the checkpoint an exact match. A refusal
+    // carries the reasons and the rebuild that would accept it, which the
+    // panel offers; with allow_rebuild the service performs that rebuild.
+    // Which checkpoint this is the service resolves: the body only says
+    // whether the name came from its own advertisement or from an upload.
     body[QStringLiteral("command_id")] = commandId();
     postWithRetry(QStringLiteral("/session/load-checkpoint"), body,
                   Timeout::Load, kMutationRetries,
@@ -854,9 +867,17 @@ void SpiralServiceManager::sendLoadCheckpoint(QJsonObject body)
                           response.value(QStringLiteral("restored_iteration"))
                               .toInteger(-1));
                   },
-                  [this](const QString& error) {
-                      emit errorOccurred(
-                          tr("Checkpoint load refused: %1").arg(error));
+                  {},
+                  [this, hostPath, localPath](const QString& message,
+                                              const QJsonObject& refusal) {
+                      QStringList reasons;
+                      for (const QJsonValue& value :
+                               refusal.value(QStringLiteral("reasons")).toArray())
+                          reasons.push_back(value.toString());
+                      emit checkpointLoadRefused(
+                          hostPath, localPath, reasons,
+                          refusal.value(QStringLiteral("stage")).toString(),
+                          message);
                   });
 }
 
@@ -1076,18 +1097,22 @@ void SpiralServiceManager::post(const QString& path, QJsonObject body, Timeout t
 void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, Timeout timeout,
                                          int retriesLeft,
                                          std::function<void(const QJsonObject&)> success,
-                                         std::function<void(const QString&)> failure)
+                                         std::function<void(const QString&)> failure,
+                                         DetailedFailure detailedFailure)
 {
     if (!isReady()) {
         const QString message = tr("Spiral service is not connected");
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, {});
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     QNetworkRequest request = makeRequest(path, static_cast<int>(timeout));
     auto* reply = _network->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     const quint64 generation = _connectionGeneration;
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, generation, path, body, timeout, retriesLeft, success, failure]() {
+            [this, reply, generation, path, body, timeout, retriesLeft, success,
+             failure, detailedFailure]() {
                 const QNetworkReply::NetworkError networkError = reply->error();
                 const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
                 // When a mutating request times out or the transport drops, it
@@ -1099,12 +1124,14 @@ void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, 
                     reply->deleteLater();
                     emit logMessage(tr("Retrying %1 with the same command id (%2 retries left)")
                                         .arg(path).arg(retriesLeft));
-                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft, success, failure]() {
-                        postWithRetry(path, body, timeout, retriesLeft - 1, success, failure);
+                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft,
+                                                    success, failure, detailedFailure]() {
+                        postWithRetry(path, body, timeout, retriesLeft - 1, success,
+                                      failure, detailedFailure);
                     });
                     return;
                 }
-                handleReply(reply, generation, success, failure);
+                handleReply(reply, generation, success, failure, detailedFailure);
             });
 }
 
@@ -1134,7 +1161,8 @@ void SpiralServiceManager::del(const QString& path, Timeout timeout,
 
 void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
                                        std::function<void(const QJsonObject&)> success,
-                                       std::function<void(const QString&)> failure)
+                                       std::function<void(const QString&)> failure,
+                                       DetailedFailure detailedFailure)
 {
     const QByteArray bytes = reply->readAll();
     const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -1147,7 +1175,9 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
     if (networkError != QNetworkReply::NoError && http == 0) {
         // Unreachable / timeout: distinguish from service-reported errors.
         const QString message = tr("Spiral service is unreachable: %1").arg(networkErrorString);
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, {});
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     if (!document.isObject() || http >= 400) {
@@ -1165,7 +1195,9 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
                 detailLines.push_back(field.isEmpty() ? description : QStringLiteral("%1: %2").arg(field, description));
         }
         if (!detailLines.isEmpty()) message += QStringLiteral("\n") + detailLines.join(QStringLiteral("\n"));
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, document.object());
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     if (success) success(document.object());

@@ -79,12 +79,15 @@ public:
     // Every checkpoint the service says it can load: GET /dataset's
     // session_checkpoints (newest first) followed by detected_checkpoints.
     QStringList serviceCheckpoints() const;
-    // Load a checkpoint into the resident session without replacing it. The
-    // service refuses anything that is not an exact match for the live model.
-    // The two verbs differ only in where the checkpoint comes from, and the
-    // service — which owns the filesystem — resolves it either way.
-    void loadServiceCheckpoint(const QString& hostPath);
-    void loadLocalCheckpointFile(const QString& localPath);
+    // Load a checkpoint into the fit. Exactly one of hostPath (a checkpoint
+    // the service advertised) and localPath (a file on this machine, uploaded
+    // first) is set; the service, which owns the filesystem, resolves it
+    // either way. Without allowRebuild the service refuses anything that is
+    // not an exact match for the live model, reporting the refusal through
+    // checkpointLoadRefused with the rebuild that would accept it; passing
+    // allowRebuild has the service perform that rebuild.
+    void loadCheckpoint(const QString& hostPath, const QString& localPath,
+                        bool allowRebuild = false);
     // Ask the session to export and publish one preview generation. Previews
     // are no longer a side effect of pausing or of resuming a checkpoint, so
     // this is what keeps VC3D's "see the fit after it stops" behaviour.
@@ -125,6 +128,13 @@ signals:
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     // A checkpoint was loaded into the live session at the given iteration.
     void checkpointLoaded(const QString& hostPath, qint64 restoredIteration);
+    // The service refused a checkpoint. ``stage`` is the rebuild that would
+    // accept it ("model" keeps the loaded inputs, "all" replaces everything);
+    // it is empty when no rebuild would help, which the service reports and
+    // the client must not offer to escalate.
+    void checkpointLoadRefused(const QString& hostPath, const QString& localPath,
+                               const QStringList& reasons, const QString& stage,
+                               const QString& message);
     void inputUploadFinished(const QString& inputId, const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
@@ -138,6 +148,12 @@ private:
         LongCommand = 240000,  // save-checkpoint blocks up to two minutes
         Load = 600000,         // session load tears down and validates datasets
     };
+
+    // Failure callback that also receives the parsed error body, for
+    // refusals whose structured fields the caller acts on rather than only
+    // displays. When set it replaces the plain failure callback.
+    using DetailedFailure = std::function<void(const QString& message,
+                                               const QJsonObject& body)>;
 
     QString findPython() const;
     QString findService() const;
@@ -153,7 +169,8 @@ private:
     void postWithRetry(const QString& path, QJsonObject body, Timeout timeout,
                        int retriesLeft,
                        std::function<void(const QJsonObject&)> success,
-                       std::function<void(const QString&)> failure = {});
+                       std::function<void(const QString&)> failure = {},
+                       DetailedFailure detailedFailure = {});
     void get(const QString& path, Timeout timeout,
              std::function<void(const QJsonObject&)> success,
              std::function<void(const QString&)> failure = {});
@@ -162,7 +179,8 @@ private:
              std::function<void(const QString&)> failure = {});
     void handleReply(QNetworkReply* reply, quint64 generation,
                      std::function<void(const QJsonObject&)> success,
-                     std::function<void(const QString&)> failure);
+                     std::function<void(const QString&)> failure,
+                     DetailedFailure detailedFailure = {});
     void pollStatus();
     // One structured event subscriber for every connection: GET /events with
     // a persisted cursor; the panel interleaves all record kinds and popups
@@ -176,7 +194,8 @@ private:
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
     void sendRebuildRequest(QJsonObject request);
-    void sendLoadCheckpoint(QJsonObject body);
+    void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
+                            const QString& localPath);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,
