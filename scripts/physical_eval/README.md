@@ -7,7 +7,7 @@ Two label volumes exist so far, built by registering the scroll pairs that have 
 - PHerc0139: 9.362 um frame, truth from the 1.129 um scan
 - PHerc1203 (Grand Prize list): 9.362 um frame, truth from the 2.403 um scan, including compressed and boundary-poor tissue
 
-The label volumes (uint8 bit flags: valid / material / centerline / recto_band, plus boundary_poor for PHerc1203, which flags material whose gap visibility falls under 0.40 and covers 72.8 percent of material voxels there rather than a small minority), the registration transforms, and the audit built on them are at
+The label volumes (uint8 bit flags: valid / material / centerline / recto_band, plus boundary_poor for PHerc1203, which flags material whose gap visibility falls under 0.40 and covers 74.6 percent of material voxels there rather than a small minority), the registration transforms, and the audit built on them are at
 https://github.com/7jycwjmbfn-eng/pherc0139-physical-audit (labels attached to the release).
 
 ## Usage
