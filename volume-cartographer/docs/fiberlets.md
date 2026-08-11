@@ -196,6 +196,33 @@ lies on that voxel center and extends half a prediction voxel beyond the first
 and last texture samples along both varying axes. Slices use presence directly
 and remain defined where a decoded fiber direction is invalid.
 
+For interactive 3D inspection of the dense presence prediction, the napari
+viewer accepts either the OME-Zarr pyramid root or a specific array level and a
+base-coordinate crop:
+
+```bash
+vesuvius.view_fiber_presence \
+  /path/to/fiber_presence.ome.zarr \
+  --crop 13568,20224,18112,512,512,1000 \
+  --anchors /path/to/anchors.obj \
+  --paths /path/to/fiberlets.obj
+```
+
+The first OME dataset is the default finest level; use `--level 4` to select a
+different one. The viewer passes a lazy Dask crop to napari, displays it in base
+coordinates using the OME scale and translation, and initially uses napari's
+`HiLo` colormap with attenuated maximum-intensity projection. It supports local
+OME-Zarr v2 stores only. Install the `vesuvius[gui]` optional dependencies to
+run it. The optional anchor and path OBJs are parsed as the line-only artifacts
+written by `vc_fiberlets`, converted from base XYZ to napari ZYX, filtered by
+group bounding-box intersection with the crop, and added as independently
+toggleable line layers. A docked clip control provides six base-coordinate
+sliders and numeric inputs, one for each minimum and maximum crop-box face. The
+resulting six GPU clipping planes are always applied to the presence volume,
+anchors, and paths without changing or reloading the underlying Zarr crop. The
+same panel provides runtime anchor and path width controls; slider changes are
+applied on release because changing shape width retriangulates the line meshes.
+
 Slice output is enabled by default for crop inspection. Use `--no-slices` for
 large or production path runs; this removes all three OBJ/MTL/PNG bundles from
 the output directory. The default export rejects more than one million total

@@ -4382,6 +4382,7 @@ blending = [
     { name = "tqdm" },
 ]
 gui = [
+    { name = "dask" },
     { name = "magic-class" },
     { name = "magicgui" },
     { name = "napari" },
@@ -4467,6 +4468,7 @@ requires-dist = [
     { name = "connected-components-3d", marker = "extra == 'render'", specifier = ">=3.24.0" },
     { name = "cucim-cu13", marker = "extra == 'models'", specifier = ">=26.6", index = "https://pypi.nvidia.com/" },
     { name = "dask", marker = "extra == 'all'", specifier = ">=2024.8.0" },
+    { name = "dask", marker = "extra == 'gui'", specifier = ">=2024.8.0" },
     { name = "dask", marker = "extra == 'models'", specifier = ">=2024.8.0" },
     { name = "dask-image", marker = "extra == 'all'", specifier = ">=2024.5.3" },
     { name = "dask-image", marker = "extra == 'models'", specifier = ">=2024.5.3" },

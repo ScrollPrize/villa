@@ -94,6 +94,7 @@ render = [
 # Graphical user interface and visualisation
 gui = [
     "napari>=0.5.6",
+    "dask>=2024.8.0",
     "magicgui>=0.10.1",
     "magic-class>=0.7.17",
     "pyqt6",
@@ -193,6 +194,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.train" = "vesuvius.models.training.train:main"
 "vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
+"vesuvius.view_fiber_presence" = "vesuvius.scripts.view_fiber_presence:main"
 
 [tool.setuptools]
 include-package-data = true
