@@ -63,6 +63,34 @@ Honest scope: n=12 variants, one fitter FAMILY (this reference fitter, not
 production fit_spiral), two scrolls, a classical-trace real reference with a
 ~0.6-winding floor. The benchmark reliably separates good configs from
 catastrophic ones; it does not yet finely rank within the good cluster.
+
+WHAT MAKES A RUNG DISCRIMINATE (design rationale, learned the hard way)
+A "rung" is a phantom corruption added to test whether phantom score ranks
+fitters like real scrolls (higher rho). Not every corruption does -- and the
+mechanism, not the amount, decides it. Three categories, by SIGN of the effect:
+
+  - MISSING evidence (holes, dropout, damage): removes constraints EQUALLY for
+    good and bad fitters. Nothing to resist -> no discrimination (rho ~ 0), and
+    it can wash out a real rung's signal. Don't use it to build a rung.
+  - GLOBAL-geometric distortion (a uniform crush / whole-cross-section affine):
+    can ANTI-discriminate (rho < 0). Handling a global distortion rewards a
+    strategy -- e.g. suppressing the deformation/flow field and letting a linear
+    stage absorb the ellipse -- that real scrolls PENALISE (they need that flow
+    for local deformation). The phantom then rewards what reality punishes.
+  - MISLEADING LOCAL evidence (labels that LIE where a global prior could
+    override them -- e.g. --index-noise-rate's +-1 winding flips, or fused /
+    switched windings): the ONLY kind that ranks fitters FORWARD. The
+    discriminator is "does the fit trust its global winding prior over a local
+    lie" -- exactly the capability real scrolls stress.
+
+Practical guidance: to add a discriminating rung, inject MISLEADING LOCAL label
+errors (start from --index-noise-rate), not missing data and not global
+geometric distortion. Emergent local pathologies of real material -- sheet
+fusion, sheet-switches, mis-indexed traces -- are all this misleading-local
+kind, which is why they discriminate; a global crush, though physically real,
+does not. (Fusion/crush specifics were measured on external finite_paint
+phantoms outside this repo, so only the qualitative principle is recorded here;
+the --index-noise-rate half is reproducible from this ladder directly.)
 """
 
 import json
