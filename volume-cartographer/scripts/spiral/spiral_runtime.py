@@ -1,12 +1,14 @@
-"""Resident adapter around the legacy fitter's optimizer loop.
+"""Resident owner of one FitContext per rank and its optimizer loop.
 
-Only the fitter thread calls Torch/CUDA. Other threads communicate through a
-condition variable and consume copied status snapshots.
+The fitter thread constructs the context, drives its load/build/step phases,
+and closes it; only that thread calls Torch/CUDA. Other threads communicate
+through a condition variable and consume copied status snapshots.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import multiprocessing
 import os
 from pathlib import Path
@@ -61,11 +63,10 @@ class InteractiveFitSession:
         self._preview_manifest = None
         self._preview_generation = 0
         self._preview_session_id = uuid.uuid4().hex
-        self._save_checkpoint = None
-        self._export_preview = None
-        self._incorporate_inputs = None
-        self._finish_run = None
-        self._configure_run = None
+        # The FitContext this session owns, set on the fitter thread once the
+        # device state is built. It doubles as the capability flag for the
+        # fitter operations (save/preview/incorporate/configure).
+        self._context = None
         self._idle_actions = []
         self.progress = ProgressReporter(
             self._progress_changed,
@@ -91,7 +92,7 @@ class InteractiveFitSession:
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
-                "supports_input_incorporation": self._incorporate_inputs is not None,
+                "supports_input_incorporation": self._context is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
                 "progress": self._progress_reporter().snapshot(),
             }
@@ -128,8 +129,8 @@ class InteractiveFitSession:
         self._publish_status()
 
     def _fit_main(self):
-        fitter = None
         wandb = None
+        context = None
         distributed_initialized = False
         try:
             self._progress_reporter().begin("loading", "Importing Torch and fitter")
@@ -137,10 +138,8 @@ class InteractiveFitSession:
             import wandb
             import fit_spiral as fitter
             from ddp_helpers import (maybe_destroy_distributed,
-                                     maybe_init_distributed,
-                                     split_counts_across_ranks)
-            from spiral_helpers import (
-                SAMPLING_COUNT_FLOORS, scale_counts_for_z_range)
+                                     maybe_init_distributed)
+            from spiral_helpers import scale_and_split_counts
 
             maybe_init_distributed()
             distributed_initialized = True
@@ -196,16 +195,13 @@ class InteractiveFitSession:
             fields = Config.catalog()["schema"]["fields"]
             count_keys = tuple(
                 key for key, spec in fields.items() if spec.get("scale_with_z"))
-            scale_counts_for_z_range(
+            scale_and_split_counts(
                 config, self.run_config.z_begin, self.run_config.z_end,
-                9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
-            split_counts_across_ranks(config, count_keys)
+                count_keys)
             if checkpoint_profile_config is None:
-                scale_counts_for_z_range(
+                scale_and_split_counts(
                     default_advanced_config, self.run_config.z_begin,
-                    self.run_config.z_end, 9500, count_keys,
-                    floors=SAMPLING_COUNT_FLOORS)
-                split_counts_across_ranks(default_advanced_config, count_keys)
+                    self.run_config.z_end, count_keys)
             config.update(explicit_sampling_counts)
             self.requested_config = dict(config)
             with self._condition:
@@ -258,7 +254,16 @@ class InteractiveFitSession:
             fitter.configure_losses(fitter.cfg, fitter.z_begin, fitter.z_end)
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._set_state("Loading", "Loading fit inputs and model")
-            fitter.main(interactive_driver=self, progress=self.progress)
+            # The runtime is the execution owner of the context: it constructs
+            # it, drives every phase on this fitter thread, and closes it.
+            context = fitter.FitContext(
+                interactive_driver=self, progress=self.progress)
+            context.load_host_inputs()
+            context.resolve_output_path()
+            context.build_device_state()
+            context.release_setup_only_tracks()
+            self._session_ready(context)
+            self._optimize(context)
         except BaseException as exc:
             with self._condition:
                 if self._shutdown and isinstance(exc, _SessionShutdown):
@@ -270,26 +275,28 @@ class InteractiveFitSession:
                 self._condition.notify_all()
             self._publish_status()
         finally:
-            if fitter is not None:
-                fitter.release_interactive_resources()
+            if context is not None:
+                # Resource release runs here, on the owning fitter thread.
+                context.close()
             if wandb is not None:
                 wandb.finish(quiet=True)
             if distributed_initialized:
                 maybe_destroy_distributed()
             self._progress_reporter().close()
 
-    # Fitter-thread callbacks.
-    def on_ready(self, *, completed_iterations, output_path,
-                 save_checkpoint, export_preview,
-                 incorporate_inputs=None, finish_run=None, configure_run=None):
+    # Fitter-thread session driver.
+    def _session_ready(self, context):
+        """Adopt the built context and publish Ready.
+
+        Runs on the fitter thread once build_device_state() has returned.
+        When the session was constructed from a checkpoint, the restored
+        model's preview is exported and published before Ready, exactly as
+        the legacy on_ready handoff did.
+        """
         with self._condition:
-            self._completed = self._target = completed_iterations
-            self._output_path = output_path
-            self._save_checkpoint = save_checkpoint
-            self._export_preview = export_preview
-            self._incorporate_inputs = incorporate_inputs
-            self._finish_run = finish_run
-            self._configure_run = configure_run
+            self._context = context
+            self._completed = self._target = context.start_iteration
+            self._output_path = context.out_path
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
             self._progress_reporter().begin(
@@ -297,6 +304,29 @@ class InteractiveFitSession:
             self._publish_preview()
         self._progress_reporter().clear()
         self._set_state("Ready", "Ready")
+
+    def _optimize(self, context):
+        """Drive the resident optimizer loop on the fitter thread.
+
+        A resident session has no natural end: the configured horizon defines
+        the learning-rate schedule but never caps how long the user may keep
+        optimizing. The loop exits only through the shutdown exception raised
+        at the wait_for_iteration pause boundary.
+        """
+        for iteration in itertools.count(context.start_iteration):
+            self.wait_for_iteration(iteration)
+            loss, losses, log_metrics, shell_metrics = context.step(iteration)
+            self.iteration_completed(
+                completed_iterations=iteration + 1,
+                total_loss=float(loss.detach().item()),
+                losses={name: float(value.detach().item())
+                        for name, value in losses.items()},
+                learning_rate=float(context.optimiser.param_groups[0]['lr']),
+                metrics={name: float(value)
+                         for name, value in log_metrics.items()},
+            )
+            context.log_step_metrics(
+                iteration, loss, losses, log_metrics, shell_metrics)
 
     def wait_for_iteration(self, iteration):
         while True:
@@ -308,7 +338,7 @@ class InteractiveFitSession:
                 action = self._idle_actions.pop(0) if self._idle_actions else None
                 if action is None:
                     if self._pending > 0:
-                        return True
+                        return
                     self._condition.wait()
                     continue
             if action[0] == "incorporate":
@@ -327,7 +357,7 @@ class InteractiveFitSession:
                     self._progress_reporter().begin(
                         "saving_checkpoint", "Saving checkpoint",
                         detail=Path(path).name)
-                    result["path"] = self._save_checkpoint(path, self._completed)
+                    result["path"] = self._context.save_checkpoint(path, self._completed)
                     self._progress_reporter().finish()
                 else:
                     result["error"] = f"Unknown idle action {kind}"
@@ -349,16 +379,23 @@ class InteractiveFitSession:
         queued run and surfaces a warning instead of tearing down the session.
         """
         try:
-            if self._incorporate_inputs is None:
+            if self._context is None:
                 raise RuntimeError(
                     "The resident fitter does not support adding inputs to a running session")
             with self._condition:
                 self._phase = "Incorporating new session inputs"
+                # run() set the pause-boundary target alongside the queued
+                # inputs; the context sizes its DT-free window from it.
+                current_iteration = self._completed
+                target_iteration = self._target
             self._progress_reporter().begin(
                 "incorporating_inputs", "Incorporating new session inputs",
                 step=0, total_steps=len(records), unit="inputs")
             self._publish_status()
-            self._incorporate_inputs(records, influence_config)
+            self._context.incorporate_interactive_inputs(
+                records, influence_config,
+                current_iteration=current_iteration,
+                target_iteration=target_iteration)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self._progress_reporter().clear()
@@ -387,7 +424,7 @@ class InteractiveFitSession:
             self, config, path_changes=None, previous_run_config=None):
         """Apply validated Run-scoped settings on the fitter thread."""
         try:
-            if self._configure_run is None:
+            if self._context is None:
                 raise RuntimeError(
                     "The resident fitter does not support Run configuration changes")
             path_changes = dict(path_changes or {})
@@ -396,10 +433,10 @@ class InteractiveFitSession:
                 detail=(
                     f"{len(config)} settings, {len(path_changes)} path changes"
                 ))
-            if path_changes:
-                self._configure_run(dict(config), dict(path_changes))
-            else:
-                self._configure_run(dict(config))
+            # An LR-schedule change realigns at the durable completed step.
+            self._context.apply_config(
+                dict(config), path_changes,
+                current_iteration=self.completed_iterations)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             self._progress_reporter().clear()
@@ -456,8 +493,8 @@ class InteractiveFitSession:
         self._progress_reporter().update(run_step)
         self._publish_status()
         if pause:
-            if self._finish_run is not None:
-                self._finish_run()
+            if self._context is not None:
+                self._context.clear_interactive_influence()
             if not getattr(self, "publishes_outputs", True):
                 self._progress_reporter().clear()
                 self._set_state("Paused", "Paused")
@@ -467,7 +504,7 @@ class InteractiveFitSession:
                 "saving_checkpoint", "Autosaving checkpoint",
                 detail="checkpoint_autosave.ckpt")
             autosave = str(Path(self._output_path) / "checkpoint_autosave.ckpt")
-            self._save_checkpoint(autosave, self._completed)
+            self._context.save_checkpoint(autosave, self._completed)
             self._set_state("ExportingPreview", "Exporting preview")
             self._progress_reporter().begin(
                 "exporting_preview", "Exporting preview")
@@ -481,7 +518,7 @@ class InteractiveFitSession:
         generation_path = (Path(self.paths.output_directory) / ".spiral-preview" /
                            self._preview_session_id / f"generation-{generation}")
         surface_id = f"spiral-output-generation-{generation}"
-        manifest = self._export_preview(str(generation_path), surface_id)
+        manifest = self._context.export_preview(str(generation_path), surface_id)
         with self._condition:
             self._preview_generation = generation
             self._preview_manifest = str(manifest["manifest_path"])
@@ -490,9 +527,6 @@ class InteractiveFitSession:
         # from the status callback, so clients cannot start another Run while
         # the downloadable preview is still being prepared.
         self._publish_status()
-
-    def session_finished(self):
-        raise RuntimeError("Interactive optimizer loop ended unexpectedly")
 
     # Coordinator-thread commands.
     def run(self, count, pending_inputs=None, mark_incorporated=None,
@@ -515,12 +549,12 @@ class InteractiveFitSession:
             # requested run fits within it. When a run would cross the horizon,
             # extend the horizon by the requested count and realign the
             # exponential curve at the durable completed step.
-            if (getattr(self, "_configure_run", None) is not None
+            if (getattr(self, "_context", None) is not None
                     and target > configured_horizon):
                 run_config["optimizer_num_training_steps"] = (
                     max(configured_horizon, self._completed) + count)
             if run_config or path_changes:
-                if self._configure_run is None:
+                if self._context is None:
                     raise RuntimeError(
                         "The resident fitter does not support Run configuration changes")
                 requested_config = dict(self.requested_config)
@@ -538,7 +572,7 @@ class InteractiveFitSession:
                      previous_run_config))
                 self._run_config.update(run_config)
             if pending_inputs:
-                if self._incorporate_inputs is None:
+                if self._context is None:
                     raise RuntimeError(
                         "The resident fitter does not support adding inputs to a running session")
                 self._idle_actions.append(

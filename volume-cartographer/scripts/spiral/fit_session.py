@@ -447,18 +447,3 @@ def parse_session_request(value: Mapping[str, Any]) -> tuple[SpiralInputPaths, S
         variant=str(preview_map.get("variant", "raw")),
     )
     return paths, run, preview
-
-
-class SpiralFitSession:
-    """Interface implemented by the resident fitter owned by the service worker."""
-
-    completed_iterations: int
-
-    def step(self, count: int, stop_event: Any, progress_callback: Any) -> Mapping[str, Any]:
-        raise NotImplementedError
-
-    def save_checkpoint(self, path: str) -> str:
-        raise NotImplementedError
-
-    def export_preview(self, generation_dir: str) -> Mapping[str, Any]:
-        raise NotImplementedError
