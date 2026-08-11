@@ -34,11 +34,15 @@ the configured (possibly smoothed) objective — `val_bce_unsmoothed` in
 ## Inference
 
 ```
-uv run python -m koine_machines.inference.infer <input.zarr> <checkpoint.pth> <output.tif>
+uv run python -m koine_machines.inference.infer \
+  <input.zarr> <checkpoint.pth> <output.tif> \
+  --overlap 0.5 --blend-mode hann
 ```
 
 Checkpoints embed their training config; inference rebuilds the model and its
-normalization contract from the checkpoint automatically.
+normalization contract from the checkpoint automatically. The inference CLI
+defaults to 50% overlap with Hann blending; the flags above state that contract
+explicitly for reproducible commands.
 
 The models expect ~9 µm isotropic surface volumes. Native ~9 µm renders work
 directly, local or by URL:
@@ -46,7 +50,8 @@ directly, local or by URL:
 ```
 uv run python -m koine_machines.inference.infer \
   https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/segments/20260112000000-w043_2026011217/surface-volumes/9.362um-1.2m-113keV-volume-20250728140407.zarr \
-  <checkpoint.pth> w043.tif
+  <checkpoint.pth> w043.tif \
+  --overlap 0.5 --blend-mode hann
 ```
 
 2.4 µm surface volumes must first be pooled to the ~9.6 µm isotropic 21-slice
