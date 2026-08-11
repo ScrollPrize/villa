@@ -7,7 +7,7 @@ Two label volumes exist so far, built by registering the scroll pairs that have 
 - PHerc0139: 9.362 um frame, truth from the 1.129 um scan
 - PHerc1203 (Grand Prize list): 9.362 um frame, truth from the 2.403 um scan, including compressed and boundary-poor tissue
 
-The label volumes (uint8 bit flags: valid / material / centerline / recto_band, plus boundary_poor for PHerc1203), the registration transforms, and the audit built on them are at
+The label volumes (uint8 bit flags: valid / material / centerline / recto_band, plus boundary_poor for PHerc1203, which flags material whose gap visibility falls under 0.40 and covers 72.8 percent of material voxels there rather than a small minority), the registration transforms, and the audit built on them are at
 https://github.com/7jycwjmbfn-eng/pherc0139-physical-audit (labels attached to the release).
 
 ## Usage
@@ -24,11 +24,13 @@ Reported metrics, each alongside a shifted-null control (the same prediction dis
 - arc-level recall and fully-missed rate over 1.2 mm sheet stretches
 - `side_inward`, the fraction of centerline points where the prediction sits on the inward (recto) side of the sheet, with both its shifted null and an ideal-recto ceiling built from the truth (`side_inward_null`, `side_inward_ideal`, `side_skill_of_ideal`)
 
-One metric stands outside that rule. `recto_side_ratio` is a raw mass-overlap quantity, prediction mass on the recto band against the verso side, and it carries no control; it is kept for continuity and is not the side metric the audit quotes. The estimator behind `side_inward` self-tests on synthetic stripes at four angles before any volume is read, and each of its three arms selects its own points under the same 3-voxel rule.
+One metric stands outside that rule. `recto_side_ratio` is a raw mass-overlap quantity, prediction mass on the recto band against the verso side, and it carries no control; it is kept for continuity and is not the side metric the audit quotes. The estimator behind `side_inward` self-tests on synthetic stripes at four angles before any volume is read.
+
+The side arms are conditioned, which matters if you plan to freeze against the calibrated skill. `side_inward` keeps coherent centerline points with the prediction within 3 voxels. `side_inward_null` and `side_inward_ideal` keep the subset of *those* points that also has their own band within 3 voxels, so the populations are real, real AND null, real AND ideal, and the calibration is a within-real comparison. This reproduces what the audit pass does. The `_full` variants of both controls drop the conditioning and select from the whole coherent centerline set; each arm reports its own decided count. `side_inward` is identical under either reading, since the real arm is the same set both ways, so un-nesting moves the controls only.
 
 The null control matters in dense tissue: on PHerc1203 the null alone reaches 64.6 percent point recall at 37 um, so radius metrics without it overread performance exactly where the hard failures live.
 
-Run against the published m7 volumes, the harness output is committed in the repository above at `results/eval_selfcheck_0139.json` and `results/1203/eval_selfcheck_1203.json`, so a rerun can be diffed against a file. The point and arc numbers match the audit to four decimals; the side arm agrees to three, because the audit took sheet normals from the registered high-resolution grayscale and the harness takes them from the packaged material mask.
+Run against the published m7 volumes, the harness output is committed in the repository above at `results/eval_selfcheck_0139.json` and `results/1203/eval_selfcheck_1203.json`, so a rerun can be diffed against a file. The point and arc numbers match the audit to four decimals, as does the side null; the inward fraction and ceiling agree to three. The harness takes sheet normals from the packaged material mask because the label package does not carry the high-resolution grayscale the audit used, which moves the decided count by 0.09 percent on PHerc0139.
 
 Label tarball hashes:
 

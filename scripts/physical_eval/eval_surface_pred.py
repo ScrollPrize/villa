@@ -121,47 +121,66 @@ def selftest_normal():
 def side_stats(acc, tb, pb, pbs, recto_k, ys, xs, cd):
     """Side-of-sheet placement with its shifted null and ideal ceiling.
 
-    Same instrument for all three arms: at truth centerline points that
-    have the band in question within 3 voxels, sample that band's distance
-    field 2 voxels to either side along the local sheet normal, oriented
-    inward by the radial sign, and count which side is closer. The ideal
-    arm reads the packaged recto_band, so the ceiling says how much side
-    signal a perfect recto prediction shows under this estimator.
+    At a truth centerline point, sample a band's distance field 2 voxels to
+    either side along the local sheet normal, oriented inward by the radial
+    sign, and count which side is closer. Points need local structure to
+    carry a normal at all, so every arm starts from the same coherence
+    floor. The ideal arm reads the packaged recto_band, so the ceiling says
+    how much side signal a perfect recto prediction shows here.
+
+    Which points each arm keeps is worth stating, because the report's pass
+    conditions and this reproduces that. The real arm keeps coherent points
+    with the prediction within 3 voxels. The `_null` and `_ideal` arms keep
+    the subset of THOSE points that also has their own band within 3
+    voxels, so the populations are real, real AND null, real AND ideal, and
+    the calibration is a within-real comparison. The `_full` variants of
+    both controls drop that conditioning and select from the whole coherent
+    centerline set instead, which is what un-nesting the arms would give.
+    The real arm is identical under either reading, so `side_inward` does
+    not move between them; only the controls do.
 
     One difference from the report's pass: there the normals came from the
-    registered 1.129 um grayscale, which the label package does not carry,
-    so here they come from the smoothed material mask instead.
+    registered high-resolution grayscale, which the label package does not
+    carry, so here they come from the smoothed material mask instead. On
+    PHerc0139 that shifts the decided count by 0.09 percent and leaves the
+    fractions where they were.
     """
     near = cd <= 3
     if near.sum() < 100:
         return
-    yn, xn = ys[near], xs[near]
     nyf, nxf, cohf = normal_field(
         ndi.gaussian_filter(tb.astype(np.float32), 1.5))
-    ny, nx = nyf[yn, xn], nxf[yn, xn]
+    coh = cohf[ys, xs] > SIDE_COH_MIN
+    if (near & coh).sum() < 100:
+        return
+    ya, xa = ys[coh], xs[coh]                 # whole coherent centerline set
+    ny, nx = nyf[ya, xa], nxf[ya, xa]
     m = np.nonzero(tb)
     cy, cx = m[0].mean(), m[1].mean()
-    flip = (ny * (yn - cy) + nx * (xn - cx)) < 0
+    flip = (ny * (ya - cy) + nx * (xa - cx)) < 0
     ny = np.where(flip, -ny, ny)
     nx = np.where(flip, -nx, nx)
-    ok = cohf[yn, xn] > SIDE_COH_MIN
-    if ok.sum() < 100:
-        return
-    yn, xn, ny, nx = yn[ok], xn[ok], ny[ok], nx[ok]
+    inner = near[coh]                         # real-near subset of it
+    yn, xn = ya[inner], xa[inner]
+    nyn, nxn = ny[inner], nx[inner]
     dpred = ndi.distance_transform_edt(~pb)
-    i, o = _inward_counts(dpred, yn, xn, ny, nx)
+    i, o = _inward_counts(dpred, yn, xn, nyn, nxn)
     acc["side_in"] += i
     acc["side_out"] += o
     for band, key in ((pbs, "null"), (recto_k, "ideal")):
         if not band.any():
             continue
         d = ndi.distance_transform_edt(~band)
-        sel = d[yn, xn] <= 3
-        if sel.sum() <= 100:
-            continue
-        i, o = _inward_counts(d, yn[sel], xn[sel], ny[sel], nx[sel])
-        acc[f"side_{key}_in"] += i
-        acc[f"side_{key}_out"] += o
+        sel = d[yn, xn] <= 3                  # conditioned, as the report
+        if sel.sum() > 100:
+            i, o = _inward_counts(d, yn[sel], xn[sel], nyn[sel], nxn[sel])
+            acc[f"side_{key}_in"] += i
+            acc[f"side_{key}_out"] += o
+        sela = d[ya, xa] <= 3                 # unconditioned
+        if sela.sum() > 100:
+            i, o = _inward_counts(d, ya[sela], xa[sela], ny[sela], nx[sela])
+            acc[f"side_{key}_full_in"] += i
+            acc[f"side_{key}_full_out"] += o
 
 
 def main(labels_path, pred_path, pred_level):
@@ -174,7 +193,9 @@ def main(labels_path, pred_path, pred_level):
                n_arc=0, arc_hit=0, arc_gone=0, narc_hit=0, narc_gone=0,
                pred_on_recto=0, pred_on_verso=0,
                side_in=0, side_out=0, side_null_in=0, side_null_out=0,
-               side_ideal_in=0, side_ideal_out=0)
+               side_ideal_in=0, side_ideal_out=0,
+               side_null_full_in=0, side_null_full_out=0,
+               side_ideal_full_in=0, side_ideal_full_out=0)
     step = 96
     for z0 in range(0, Z, step):
         z1 = min(z0 + step, Z)
@@ -245,17 +266,29 @@ def main(labels_path, pred_path, pred_level):
     dec = max(acc["side_in"] + acc["side_out"], 1)
     dec_n = max(acc["side_null_in"] + acc["side_null_out"], 1)
     dec_i = max(acc["side_ideal_in"] + acc["side_ideal_out"], 1)
+    dec_nf = max(acc["side_null_full_in"] + acc["side_null_full_out"], 1)
+    dec_if = max(acc["side_ideal_full_in"] + acc["side_ideal_full_out"], 1)
     inward = acc["side_in"] / dec
     null_inward = acc["side_null_in"] / dec_n
     ideal_inward = acc["side_ideal_in"] / dec_i
+    null_full = acc["side_null_full_in"] / dec_nf
+    ideal_full = acc["side_ideal_full_in"] / dec_if
     out.update(
         side_n_decided=dec,
         side_inward=round(inward, 4),
         side_inward_null=round(null_inward, 4),
+        side_n_null_decided=dec_n,
         side_inward_ideal=round(ideal_inward, 4),
+        side_n_ideal_decided=dec_i,
         side_skill_of_ideal=round(
             (inward - null_inward) / max(ideal_inward - null_inward, 1e-9),
-            4))
+            4),
+        side_inward_null_full=round(null_full, 4),
+        side_n_null_full_decided=dec_nf,
+        side_inward_ideal_full=round(ideal_full, 4),
+        side_n_ideal_full_decided=dec_if,
+        side_skill_of_ideal_full=round(
+            (inward - null_full) / max(ideal_full - null_full, 1e-9), 4))
     print(json.dumps(out, indent=1))
 
 
