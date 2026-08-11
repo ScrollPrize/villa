@@ -63,9 +63,16 @@ To get started, we recommend these notebooks that jump right in:
 `vesuvius` can be installed with `pip`.
 Then, before using the library for the first time, accept the license terms:
 ```sh
-$ pip install vesuvius
+$ pip install "vesuvius>=0.2.0"
 $ vesuvius.accept_terms --yes
 ```
+
+> **Note:** the `>=0.2.0` bound is deliberate. The published wheels support Python 3.10–3.13,
+> while this repository targets Python 3.14 (`.python-version`, `requires-python`). Without the
+> bound, `pip install vesuvius` on Python 3.14 prints `Successfully installed vesuvius-0.1.10`
+> and exits 0 — a December 2024 build from before the 0.2 API that provides 1 of the 12 console
+> scripts this package declares. With the bound, pip fails instead and lists which versions it
+> skipped and why. To run the code on `main`, use `uv sync` in this directory rather than `pip`.
 
 ___
 **Note:** 
