@@ -50,7 +50,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import Config
+from config import Config, durable_config
 
 
 class FakeSession:
@@ -72,6 +72,10 @@ class FakeSession:
             "track_min_walks_per_track": 2,
             "track_max_walks_per_track": 4,
         }
+        # The resolved configuration the fit is running, as a real session
+        # publishes it once it has one; a checkpoint refusal is analysed
+        # against this.
+        self.applied_config = None
         self.default_advanced_config = {
             "optimizer_learning_rate": 3e-5,
             "sample_count_patches_per_step": 360,
@@ -93,7 +97,10 @@ class FakeSession:
         self.progress = None
 
     def status(self):
+        applied = ({"applied_config": dict(self.applied_config)}
+                   if self.applied_config is not None else {})
         return {
+            **applied,
             "state": self.state, "phase": str(self.state),
             "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
@@ -1258,6 +1265,134 @@ class DatasetOwnershipTests(unittest.TestCase):
         status = self.state.status()
         self.assertFalse(status["preview_exporting"])
         self.assertIn("no space left", status["preview_publish_error"])
+
+    def _write_checkpoint(self, name, cfg, dataset_root=None):
+        """A checkpoint carrying the durable cfg a refusal is analysed from."""
+        import torch
+
+        path = self.output / name
+        torch.save({
+            # Checkpoints store the durable subset of the schema, and the
+            # refusal analysis compares against exactly that subset.
+            "schema_version": 2, "cfg": durable_config(cfg),
+            "input_manifest": {"dataset_root": str(
+                self.root if dataset_root is None else dataset_root)},
+        }, path)
+        return path
+
+    def _refuse_load(self, session, checkpoint, reason="model mismatch"):
+        session.load_refusal = reason
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
+        return caught.exception
+
+    def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+
+        # A checkpoint differing only in allowlisted model configuration is a
+        # model-stage rebuild away from being loadable.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "model.ckpt", {**live, "model_num_flow_stages": 3}))
+        self.assertEqual(error.status, 409)
+        self.assertEqual(error.payload["stage"], "model")
+        # The verdict's own text, unmodified.
+        self.assertEqual(error.payload["reasons"], ["model mismatch"])
+        self.assertNotIn("refused", error.payload)
+
+        # The stage comes from the whole cfg diff, so a checkpoint differing
+        # in a host-affecting key needs the whole build even when the
+        # preflight only complained about the model.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "host.ckpt", {**live, "model_num_flow_stages": 3,
+                          "track_exclusion_radius": 99.0}))
+        self.assertEqual(error.payload["stage"], "all")
+        # And a model z-domain mismatch reaches "all" through z_begin/z_end
+        # rather than through a rule of its own.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
+        self.assertEqual(error.payload["stage"], "all")
+
+    def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+
+        # Another dataset entirely.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "foreign.ckpt", dict(live), dataset_root="/somewhere/else"))
+        self.assertTrue(error.payload["refused"])
+        self.assertNotIn("stage", error.payload)
+
+        # A cfg key set that is not this schema's.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "stale.ckpt", {**live, "a_setting_that_no_longer_exists": 1}))
+        self.assertTrue(error.payload["refused"])
+
+        # A file that will not load at all.
+        unreadable = self.output / "unreadable.ckpt"
+        unreadable.write_bytes(b"PK\x03\x04not-a-checkpoint")
+        error = self._refuse_load(session, unreadable)
+        self.assertTrue(error.payload["refused"])
+
+    def test_allow_rebuild_rebuilds_onto_the_checkpoint_without_overrides(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+        # A live session request carrying an advanced profile, as a client
+        # that had been editing configuration would leave it.
+        paths, run, preview, _ = self.state._prepare_session_request({
+            "run": {"z_begin": 0, "z_end": 10,
+                    "config": {**_NO_DENSE_LOSSES, "model_num_flow_stages": 9}}})
+        self.state.session_paths = paths
+        self.state.session_request = {
+            "paths": paths.manifest(), "run": run.manifest(),
+            "preview": preview.manifest()}
+        checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
+
+        rebuilds = []
+        self.state.rebuild = lambda request: rebuilds.append(request) or {}
+        self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
+                                    "allow_rebuild": True})
+
+        self.assertEqual(len(rebuilds), 1)
+        self.assertEqual(rebuilds[0]["paths"]["checkpoint"], str(checkpoint))
+        # No advanced overrides: the runtime layers run.config on top of the
+        # checkpoint's own cfg, so resending the profile would re-impose the
+        # very keys the preflight just refused.
+        self.assertEqual(rebuilds[0]["run"]["config"], {})
+        self.assertEqual(rebuilds[0]["run"]["z_end"], 10)
+
+    def test_allow_rebuild_must_be_a_boolean(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
+                                        "allow_rebuild": "yes"})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_a_rebuild_refuses_overrides_its_checkpoint_contradicts(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
+        request = {
+            "paths": {"checkpoint": str(checkpoint)},
+            "run": {"z_begin": 0, "z_end": 10,
+                    "config": {**_NO_DENSE_LOSSES,
+                               "model_flow_bounds_radius": 128}},
+        }
+        with self.assertRaises(ApiError) as caught:
+            self.state.rebuild(request)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual([detail["field"] for detail in caught.exception.details],
+                         ["run.config.model_flow_bounds_radius"])
+        # Everything else stays a legitimate change to make while resuming.
+        request["run"]["config"] = {**_NO_DENSE_LOSSES,
+                                    "loss_weight_patch_radius": 1.0}
+        self.state._reject_overrides_the_checkpoint_contradicts(
+            str(checkpoint), request["run"]["config"])
 
     def test_load_checkpoint_requires_an_idle_session(self):
         session = _attach_fake_session(self.state, self.output, self.root)

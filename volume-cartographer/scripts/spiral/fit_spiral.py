@@ -35,7 +35,8 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import Config, FitConfig, durable_config
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+                    durable_config)
 from fit_session import fit_input
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
@@ -117,18 +118,6 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 configure_torch_threads_from_env()
 
-
-# Configuration keys that shape the model's parameter tensors. A checkpoint
-# whose stored value for any of them differs describes a different model, and
-# is refused rather than reshaped: a domain/structure change is the explicit
-# rebuild path's job.
-CHECKPOINT_MODEL_SHAPE_KEYS = (
-    'model_num_flow_integration_steps', 'model_flow_integration_solver',
-    'model_num_flow_timesteps', 'model_flow_bounds_z_margin',
-    'model_flow_bounds_radius', 'model_flow_voxel_resolution',
-    'model_flow_field_type', 'model_gap_expander_logit_resolution',
-    'model_gap_expander_num_windings', 'model_linear_z_resolution',
-)
 
 # Fields of a surf-SDT fingerprint that describe where the store lives and how
 # much of it has been built, rather than what it contains.

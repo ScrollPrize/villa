@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 import copy
 import dataclasses
 import errno
@@ -69,7 +70,8 @@ from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          parse_session_request, resolve_dataset_root,
                          select_startup_autosave, validate_autosave,
                          validate_session_request)
-from config import Config, rebuild_stage
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
+                    rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
@@ -882,6 +884,9 @@ class ServiceState:
                     "A defaults rebuild takes no other request fields")
             request = self.startup_session_request(resume=False)
         paths, run, preview, scroll = self._prepare_session_request(request)
+        if paths.checkpoint and run.config:
+            self._reject_overrides_the_checkpoint_contradicts(
+                paths.checkpoint, run.config)
         with self.lock:
             # Idle|Error -> Loading. A resident session that is mid-operation
             # has to settle first, and a build already in flight is its own
@@ -1456,14 +1461,32 @@ class ServiceState:
         return str(resolved)
 
     def load_checkpoint(self, request):
-        """Load a checkpoint into the resident model, strictly.
+        """Load a checkpoint into the resident fit; rebuild only on request.
 
-        The session keeps its model, its inputs and its identity: this verb
-        only replaces model/optimiser/scheduler/RNG state, and only when the
-        checkpoint matches the live model exactly. A checkpoint describing a
-        different model domain or structure is refused here rather than
-        rebuilt behind the client's back; that is what a new fit is for.
+        One verb, three outcomes. Without ``allow_rebuild`` this is the strict
+        in-place load it has always been: the session keeps its model, its
+        inputs and its identity, this replaces only
+        model/optimiser/scheduler/RNG state, and a checkpoint that does not
+        match the live model exactly is refused rather than rebuilt behind the
+        client's back. The refusal carries the preflight's own reasons and,
+        when a rebuild could accept the checkpoint, the stage that rebuild
+        would need; when nothing a rebuild can do would help it says
+        ``refused`` instead, and offers nothing.
+
+        With ``allow_rebuild`` the service performs that rebuild itself, from
+        the live session request with this checkpoint set and the advanced
+        overrides dropped — see ``_rebuild_onto_checkpoint``.
+
+        The preflight therefore runs twice on the escalation path: once to
+        refuse, once inside the rebuild. That is a real cost, it is only paid
+        on a refusal the client chose to escalate, and it buys a single
+        client-side code path.
         """
+        request = dict(request or {})
+        allow_rebuild = request.pop("allow_rebuild", False)
+        if not isinstance(allow_rebuild, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "allow_rebuild must be true or false")
         session = self._require_session()
         path = self._resolve_load_source(request)
         state = session.status().get("state")
@@ -1472,6 +1495,8 @@ class ServiceState:
                 HTTPStatus.CONFLICT,
                 f"Loading a checkpoint requires an idle session (state is "
                 f"{SessionState(state).name})")
+        if allow_rebuild:
+            return self._rebuild_onto_checkpoint(path)
         try:
             result = session.load_checkpoint(path)
         except ApiError:
@@ -1483,8 +1508,7 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     f"Checkpoint load failed after preflight: {exc}") from exc
-            raise ApiError(HTTPStatus.CONFLICT,
-                           f"Checkpoint refused: {exc}") from exc
+            raise self._checkpoint_refusal(path, exc) from exc
         with self.lock:
             if self.session_paths is not None:
                 self.session_paths = dataclasses.replace(
@@ -1499,6 +1523,124 @@ class ServiceState:
         return {**self.status(), "loaded": True, "checkpoint_path": path,
                 "restored_iteration": result.get("completed_iterations"),
                 "config_revision": result.get("config_revision")}
+
+    def _checkpoint_durable_cfg(self, path):
+        """The durable configuration and dataset a checkpoint records.
+
+        CPU-only and read afresh: the same bytes an escalated rebuild would
+        apply, so nothing here can go stale between the refusal and the
+        rebuild the client may ask for next. A file that will not load at all
+        reports no configuration, which every caller treats as "no rebuild
+        can help".
+        """
+        from checkpoint_io import load_checkpoint_cpu
+        try:
+            payload = load_checkpoint_cpu(path)
+        except Exception:
+            return None, ""
+        try:
+            if not isinstance(payload, dict):
+                return None, ""
+            cfg = payload.get("cfg")
+            manifest = payload.get("input_manifest") or {}
+            return (dict(cfg) if isinstance(cfg, Mapping) else None,
+                    str(manifest.get("dataset_root") or ""))
+        finally:
+            # A refusal must not leave a whole model + optimiser archive
+            # mapped for the lifetime of the service.
+            del payload
+
+    def _checkpoint_refusal(self, path, cause):
+        """Turn a preflight refusal into the 409 a client can act on.
+
+        The stage comes from the *whole* cfg diff, not from the invariants the
+        preflight named. Two reasons. Some model-shaping keys the preflight
+        reports (model_flow_bounds_z_margin) are read during host preparation,
+        so "only shape keys mismatched" would not imply a model-stage rebuild.
+        And a checkpoint's stored cfg overrides host-affecting keys the
+        preflight never checks, so a checkpoint differing in, say, a track_*
+        setting needs the whole build even though it reported no
+        incompatibility there. A model z-domain mismatch reaches "all" through
+        z_begin/z_end on this same path rather than through a special case.
+        """
+        reasons = [line for line in str(cause).splitlines() if line.strip()]
+        checkpoint_cfg, checkpoint_dataset = self._checkpoint_durable_cfg(path)
+        with self.lock:
+            status = self.session.status() if self.session else {}
+            dataset_root = str(
+                getattr(self.session_paths, "dataset_root", "") or "")
+        live = durable_config(status.get("applied_config") or {})
+        # What no rebuild can fix: a checkpoint from another dataset, or one
+        # whose configuration is not this schema's at all.
+        if checkpoint_cfg is None or (
+                set(checkpoint_cfg) - set(live)
+                or set(live) - set(checkpoint_cfg) - {"z_begin", "z_end"}):
+            return ApiError(
+                HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+                payload={"reasons": reasons, "refused": True})
+        if checkpoint_dataset and dataset_root \
+                and checkpoint_dataset != dataset_root:
+            return ApiError(
+                HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+                payload={"reasons": reasons, "refused": True})
+        changed = {key for key, value in checkpoint_cfg.items()
+                   if live.get(key) != value}
+        return ApiError(
+            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+            payload={"reasons": reasons, "stage": rebuild_stage(changed)})
+
+    def _reject_overrides_the_checkpoint_contradicts(self, path, overrides):
+        """Refuse a rebuild whose overrides fight the checkpoint it resumes.
+
+        The runtime applies ``run.config`` on top of the checkpoint's stored
+        cfg, so an override of a model-shaping key wins for the session's
+        configuration while the model it is resuming is still the
+        checkpoint's. The build's own preflight then refuses it from inside a
+        session build, where the only possible outcome is a failed session.
+        Say so as a request error instead.
+
+        Only the model-shaping keys are restricted. Every other override —
+        loss weights, sample counts, schedules — is a legitimate change to
+        make while resuming, and the fit is built to take them.
+        """
+        checkpoint_cfg, _ = self._checkpoint_durable_cfg(path)
+        if not checkpoint_cfg:
+            return
+        conflicts = sorted(
+            key for key in CHECKPOINT_MODEL_SHAPE_KEYS
+            if key in overrides and key in checkpoint_cfg
+            and checkpoint_cfg[key] != overrides[key])
+        if conflicts:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "The checkpoint this rebuild resumes disagrees with the "
+                "advanced configuration it carries; drop these overrides, or "
+                "rebuild without the checkpoint",
+                [{"field": f"run.config.{key}",
+                  "message": (f"The checkpoint was written with "
+                              f"{checkpoint_cfg[key]!r}")}
+                 for key in conflicts])
+
+    def _rebuild_onto_checkpoint(self, path):
+        """Rebuild the session with this checkpoint as its resume path.
+
+        The escalated request is the live one with the checkpoint set and
+        ``run.config`` emptied. Emptying it is not a simplification:
+        spiral_runtime applies run.config on top of the checkpoint's stored
+        cfg, so resending the advanced profile that just failed the preflight
+        would re-impose exactly the mismatching keys, and the rebuild would
+        fail the same preflight from inside a session build.
+        """
+        with self.lock:
+            current = copy.deepcopy(self.session_request or {})
+        if not current:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "There is no session request to rebuild from")
+        paths = dict(current.get("paths") or {})
+        paths["checkpoint"] = path
+        run = dict(current.get("run") or {})
+        run["config"] = {}
+        return self.rebuild({**current, "paths": paths, "run": run})
 
     def download_checkpoint(self):
         """Create a checkpoint and publish it as a downloadable artifact."""
@@ -2204,7 +2346,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, response)
         except ApiError as exc:
             payload = self.server.state._base()
-            payload.update({"error": exc.message, "details": exc.details})
+            payload.update({"error": exc.message, "details": exc.details,
+                            **exc.payload})
             # The request body may not have been fully consumed; do not reuse
             # the connection after an error.
             self._send(exc.status, payload, close=True)

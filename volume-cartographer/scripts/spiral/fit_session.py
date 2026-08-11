@@ -86,7 +86,14 @@ from config import Config
 # restated something the dataset root already specifies and silently won over
 # it, so a client could mislabel outputs, scale a fit against a resolution the
 # dataset contradicts, or read the Lasagna stores at the wrong zarr level.
-API_VERSION = 27
+# Version 28 gives a rebuild two stages and folds the checkpoint rebuild into
+# the load. POST /session/rebuild reports the "stage" it took ("model" keeps
+# the loaded inputs and the brick pools; "all" is the whole build), and
+# /configuration advertises schema.model_stage_keys so a client can say in
+# advance which it would get. POST /session/load-checkpoint takes
+# "allow_rebuild", and its 409 carries the preflight's "reasons" with either
+# the "stage" a rebuild would need or "refused" when none would help.
+API_VERSION = 28
 
 
 class SessionState(str, Enum):

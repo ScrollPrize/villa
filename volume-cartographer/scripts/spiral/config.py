@@ -87,6 +87,20 @@ _Z_RANGE_DESCRIPTIONS = {
              "rendering, and model/checkpoint z-domain compatibility.",
 }
 
+# Configuration keys that shape the model's parameter tensors. A checkpoint
+# whose stored value for any of them differs describes a different model, and
+# is refused rather than reshaped: a domain/structure change is the explicit
+# rebuild path's job. Configuration metadata, so it lives here beside the
+# rest of it and is readable without importing the fitter.
+CHECKPOINT_MODEL_SHAPE_KEYS = (
+    "model_num_flow_integration_steps", "model_flow_integration_solver",
+    "model_num_flow_timesteps", "model_flow_bounds_z_margin",
+    "model_flow_bounds_radius", "model_flow_voxel_resolution",
+    "model_flow_field_type", "model_gap_expander_logit_resolution",
+    "model_gap_expander_num_windings", "model_linear_z_resolution",
+)
+
+
 # Configuration keys whose every consumer is built by
 # FitContext._build_model_state(). A rebuild that changes only these can keep
 # the host inputs and the dense stores and re-run the model stage alone; see

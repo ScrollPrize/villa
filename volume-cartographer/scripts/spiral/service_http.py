@@ -19,11 +19,15 @@ SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
 
 
 class ApiError(Exception):
-    def __init__(self, status, message, details=None):
+    def __init__(self, status, message, details=None, payload=None):
         super().__init__(message)
         self.status = int(status)
         self.message = message
         self.details = details
+        # Extra fields merged into the error response body, for refusals that
+        # carry structured facts a client acts on rather than only displays
+        # (see ServiceState.load_checkpoint's stage/reasons/refused).
+        self.payload = dict(payload or {})
 
 
 def sha256_file(path):
