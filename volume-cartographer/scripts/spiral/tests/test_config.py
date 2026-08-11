@@ -1,8 +1,9 @@
+import inspect
 import json
 
 import pytest
 
-from config import Config, FitConfig
+from config import Config, FitConfig, MODEL_STAGE_KEYS, rebuild_stage
 
 
 def test_fit_config_wraps_a_resolved_mapping_with_dict_style_access():
@@ -89,6 +90,49 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                    "track_crossing_precompute_max", "track_crossing_mode",
                    "track_exclusion_radius",
                })
+
+
+def test_rebuild_stage_is_model_only_for_the_allowlist():
+    assert rebuild_stage([]) == "model"
+    assert rebuild_stage(["model_num_flow_integration_steps"]) == "model"
+    assert rebuild_stage(["model_num_flow_integration_steps",
+                          "model_linear_z_resolution"]) == "model"
+    # One unlisted key in the set is enough to demand the whole build.
+    assert rebuild_stage(["model_num_flow_integration_steps",
+                          "z_begin"]) == "all"
+    assert rebuild_stage(["optimizer_random_seed"]) == "all"
+    assert rebuild_stage(["model_flow_bounds_z_margin"]) == "all"
+    # Unaudited/unknown keys fail safe rather than raising.
+    assert rebuild_stage(["not_a_setting"]) == "all"
+
+
+def test_the_allowlist_is_a_subset_of_the_new_fit_settings():
+    fields = Config.catalog()["schema"]["fields"]
+    assert MODEL_STAGE_KEYS <= set(fields)
+    assert all(fields[key]["runtime_impact"] == "new_fit"
+               for key in MODEL_STAGE_KEYS)
+
+
+def test_no_allowlisted_key_is_named_while_loading_host_inputs():
+    # The mechanism behind the allowlist's promise: a model-stage rebuild
+    # retains whatever host preparation produced, so a key host preparation
+    # reads cannot be on the list. This is exactly the leak
+    # model_flow_bounds_z_margin (the host-side ShellPolarMap) and
+    # optimizer_random_seed (the host RNG seeding) would have introduced.
+    import fit_spiral
+
+    context = fit_spiral.FitContext
+    source = "".join(inspect.getsource(member) for member in (
+        context.load_host_inputs,
+        context._load_patches_from_dir,
+        context._prepare_patch_sampling_cache,
+        context._rebuild_pcl_sampling_strata,
+    ))
+    # The positive control: both keys the audit disqualified are named here,
+    # so a scan that stops matching fails rather than silently passing.
+    assert "model_flow_bounds_z_margin" in source
+    assert "optimizer_random_seed" in source
+    assert not [key for key in MODEL_STAGE_KEYS if key in source]
 
 
 def test_mapping_and_json_overrides_and_validation(tmp_path):

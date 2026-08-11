@@ -87,6 +87,55 @@ _Z_RANGE_DESCRIPTIONS = {
              "rendering, and model/checkpoint z-domain compatibility.",
 }
 
+# Configuration keys whose every consumer is built by
+# FitContext._build_model_state(). A rebuild that changes only these can keep
+# the host inputs and the dense stores and re-run the model stage alone; see
+# rebuild_stage() below and FitContext.rebuild_model_state().
+#
+# This is an audited allowlist, not a prefix rule, because two model-shaped
+# keys are read during host preparation:
+#   - model_flow_bounds_z_margin sizes the host-side ShellPolarMap that
+#     load_host_inputs() filters tracks with;
+#   - optimizer_random_seed seeds np.random and torch.random at the top of
+#     load_host_inputs() and the pool generators below it, so it reaches
+#     every RNG-order-sensitive host decision.
+# Both are therefore absent, and a key nobody has audited is absent by
+# construction — the safe answer.
+MODEL_STAGE_KEYS = frozenset({
+    "model_num_flow_integration_steps",
+    "model_flow_integration_solver",
+    "model_num_flow_timesteps",
+    "model_num_flow_stages",
+    "model_flow_bounds_radius",
+    "model_flow_voxel_resolution",
+    "model_flow_field_type",
+    "model_flow_field_high_res_lr_scale_initial",
+    "model_flow_field_high_res_lr_scale_final",
+    "model_flow_field_high_res_lr_ramp_start_step",
+    "model_flow_field_high_res_lr_ramp_steps",
+    "model_flow_field_direct_lr",
+    "model_gap_expander_logit_resolution",
+    "model_gap_expander_num_windings",
+    "model_gap_expander_lr_scale",
+    "model_linear_z_resolution",
+    "model_initial_dr_per_winding",
+    "model_sym_dirichlet_finite_difference_epsilon",
+})
+
+
+def rebuild_stage(changed_keys):
+    """The build stage a set of changed configuration keys requires.
+
+    ``"model"`` when every changed key is on MODEL_STAGE_KEYS, ``"all"``
+    otherwise. The stages are one ordinal, not a graph: "all" is the whole
+    build as it has always run, and "model" is a strict suffix of it.
+
+    Anything unrecognised falls to "all", so this fails safe: a new key gets
+    today's behaviour until somebody audits its consumers.
+    """
+    return "model" if MODEL_STAGE_KEYS.issuperset(changed_keys) else "all"
+
+
 def _runtime_impact(key):
     if key in _Z_RANGE_DESCRIPTIONS:
         # Changing the z-range invalidates host inputs, dense stores, and the
