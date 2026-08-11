@@ -813,9 +813,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _connectButton->setEnabled(state == CS::Disconnected || state == CS::Failed);
                 _disconnectButton->setEnabled(state != CS::Disconnected);
                 // Connection must succeed before dataset resolution or fit
-                // controls are enabled.
-                _load->setEnabled(_connected);
+                // controls are enabled. Nothing is enabled from here: the
+                // status poll decides which verbs the resident session can
+                // take, and Rebuild is one of them.
                 if (!_connected) {
+                    _load->setEnabled(false);
                     _run->setEnabled(false);
                     _stop->setEnabled(false);
                     _save->setEnabled(false);
@@ -988,6 +990,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         guardSessionExit([this]() {
+            // Nothing to apply: this would discard the trained model and build
+            // the same session again. Still allowed — starting a fit over is a
+            // legitimate thing to want — but not by accident. A failed session
+            // is exempt: rebuilding an identical request is the recovery.
+            if (!_reloadRequired && _sessionState != QStringLiteral("Error")
+                && QMessageBox::question(
+                       this, tr("Rebuild Fit"),
+                       tr("No fit input or session setting has changed. Rebuilding "
+                          "discards everything this session has trained and builds "
+                          "it again from the same request. Continue?"))
+                       != QMessageBox::Yes)
+                return;
             // A model-stage rebuild keeps the loaded host inputs, and with
             // them everything already incorporated into the fit, so there is
             // nothing to warn about; only a full rebuild discards them.
@@ -1944,6 +1958,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
     const bool runnable = idle;
     _sessionRunnable = runnable;
+    // A rebuild tears the session down, so it needs the same idle session
+    // every other mutation does — the service answers 409 otherwise. Error is
+    // the exception and the reason the button exists there: a session that
+    // failed to build has nothing running to protect.
+    _load->setEnabled(_connected
+                      && (runnable || state == QStringLiteral("Error")));
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
