@@ -58,7 +58,13 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    void loadSession(QJsonObject request);
+    // Rebuild the always-loaded session: the service holds one from
+    // startup, so this replaces it rather than creating it. It is also the
+    // only verb that may change the model domain or structural config.
+    void rebuildSession(QJsonObject request);
+    // Rebuild from the service's own launch defaults, ignoring any autosave.
+    // This is how a service stuck in Error recovers.
+    void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
                        const QJsonObject& runConfig,
                        const QJsonObject& inputs = {});
@@ -68,7 +74,14 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
-    void deleteSession();
+    // Load a checkpoint into the resident session without replacing it. The
+    // service refuses anything that is not an exact match for the live model;
+    // a client-local file is uploaded first.
+    void loadCheckpointIntoSession(const QString& checkpoint);
+    // Ask the session to export and publish one preview generation. Previews
+    // are no longer a side effect of pausing or of resuming a checkpoint, so
+    // this is what keeps VC3D's "see the fit after it stops" behaviour.
+    void requestPreview();
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
@@ -103,6 +116,8 @@ signals:
                                     qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
+    // A checkpoint was loaded into the live session at the given iteration.
+    void checkpointLoaded(const QString& hostPath, qint64 restoredIteration);
     void inputUploadFinished(const QString& inputId, const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
@@ -151,7 +166,7 @@ private:
     QString endpointFingerprint() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
-    void sendLoadRequest(QJsonObject request);
+    void sendRebuildRequest(QJsonObject request);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,
@@ -187,6 +202,10 @@ private:
     qint64 _sessionRevision = 0;
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;
+    // True once a run has been observed; the following Idle is the pause the
+    // panel wants a preview of.
+    bool _sawRunningSinceIdle = false;
+    bool _previewRequestInFlight = false;
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;

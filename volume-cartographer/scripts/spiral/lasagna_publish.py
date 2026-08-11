@@ -466,6 +466,113 @@ def stop_process_group(process):
             pass
 
 
+class PreviewPublication:
+    """The one record of preview publication state a service keeps.
+
+    Preview publication used to be tracked by three service-side generation
+    counters (registered/processed/publishing), a progress dictionary that
+    carried a fourth copy of the generation, a separate error field, a stage
+    start time and a subprocess handle. They all describe one thing: which
+    raw preview generation is being published, how far it has got, and what
+    it produced. That is this record.
+
+    The authoritative generation number is still the session's
+    ``preview_generation``; this record only tracks what the host has done
+    with it. Every field is guarded by the owning service's lock.
+    """
+
+    __slots__ = ("generation", "completed_generation", "session_id",
+                 "artifact", "error", "process", "previous_raw_manifest",
+                 "stage_started", "progress")
+
+    def __init__(self):
+        #: Generation currently being published, or 0 when nothing is.
+        self.generation = 0
+        #: Highest generation the host has finished handling (published or
+        #: failed); a generation is never published twice.
+        self.completed_generation = 0
+        self.session_id = None
+        #: Registered artifact reference for the newest published generation.
+        self.artifact = None
+        self.error = None
+        #: Temporary Lasagna subprocess, so shutdown can stop it.
+        self.process = None
+        #: Newest successful raw generation's manifest; the next
+        #: run-difference overlay is built against it.
+        self.previous_raw_manifest = None
+        self.stage_started = None
+        self.progress = None
+
+    def reset_session_scope(self):
+        """Forget everything session-scoped; return the raw manifest to drop."""
+        previous_raw = self.previous_raw_manifest
+        self.generation = 0
+        self.completed_generation = 0
+        self.session_id = None
+        self.artifact = None
+        self.error = None
+        self.previous_raw_manifest = None
+        self.stage_started = None
+        self.progress = None
+        return previous_raw
+
+    def claim(self, session_id, generation):
+        """Take ownership of one generation, or refuse a stale/duplicate one."""
+        if (not generation
+                or generation <= self.completed_generation
+                or generation <= self.generation):
+            return False
+        self.generation = generation
+        self.session_id = session_id
+        self.error = None
+        return True
+
+    def owns(self, generation):
+        return self.generation == generation and generation != 0
+
+    def record_progress(self, generation, values):
+        """Merge one progress report; return the snapshot, or None if stale."""
+        if not self.owns(generation):
+            return None
+        current = dict(self.progress or {})
+        next_stage = values.get("stage_name", current.get("stage_name"))
+        if next_stage != current.get("stage_name"):
+            self.stage_started = time.monotonic()
+        current.update(values)
+        current["generation"] = generation
+        self.progress = current
+        return dict(current)
+
+    def finish(self, generation):
+        """Mark one generation handled, whatever the outcome."""
+        self.completed_generation = max(self.completed_generation, generation)
+        if self.generation == generation:
+            self.generation = 0
+        self.progress = None
+        self.stage_started = None
+
+    def status_progress(self):
+        """The ``publishing_preview`` progress block, or None."""
+        if not self.progress:
+            return None
+        stage_name = str(self.progress.get("stage_name") or "").strip()
+        if not stage_name:
+            return None
+        elapsed = (max(0.0, time.monotonic() - self.stage_started)
+                   if self.stage_started is not None else 0.0)
+        step = self.progress.get("step")
+        total = self.progress.get("total_steps")
+        return {
+            "operation": "publishing_preview",
+            "stage_name": stage_name,
+            "detail": None,
+            "step": int(step) if step is not None else None,
+            "total_steps": int(total) if total is not None else None,
+            "unit": "steps",
+            "elapsed_seconds": elapsed,
+        }
+
+
 class LasagnaPublisher:
     """Publish one flattened preview generation.
 

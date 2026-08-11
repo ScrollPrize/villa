@@ -554,7 +554,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    _load = new QPushButton(tr("Start Fit"), runContents);
+    // The service holds a session from startup, so this never creates one:
+    // it applies the panel's inputs and configuration by rebuilding.
+    _load = new QPushButton(tr("Rebuild Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
     _run = new QPushButton(tr("Run"), runContents);
@@ -567,8 +569,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _save = new QPushButton(tr("Save Checkpoint on Service"), runContents); _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download Checkpoint…"), runContents);
     _downloadCheckpoint->setEnabled(false);
+    _loadCheckpoint = new QPushButton(tr("Load Checkpoint into Fit…"), runContents);
+    _loadCheckpoint->setEnabled(false);
+    _loadCheckpoint->setToolTip(
+        tr("Replace the resident model's weights, optimiser and RNG state "
+           "from a checkpoint. The service refuses any checkpoint that is not "
+           "an exact match for the live model; use Rebuild Fit to change the "
+           "model domain or structure."));
     checkpointControls->addWidget(_save);
     checkpointControls->addWidget(_downloadCheckpoint);
+    checkpointControls->addWidget(_loadCheckpoint);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
     _checkpointDownloadStatus = new QLabel(runContents);
@@ -721,6 +731,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _stop->setEnabled(false);
                     _save->setEnabled(false);
                     _downloadCheckpoint->setEnabled(false);
+                    _loadCheckpoint->setEnabled(false);
                     _removeInput->setEnabled(false);
                     if (_checkpointDownloadActive) {
                         _checkpointDownloadActive = false;
@@ -880,12 +891,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 && QMessageBox::question(
                        this, tr("Uncommitted inputs"),
                        tr("The current session has %1 added input(s) that were not committed "
-                          "to the dataset. Reloading discards them. Continue?").arg(_uncommittedCount))
+                          "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
                        != QMessageBox::Yes)
                 return;
             persist();
             emit pythonOutputRequested();
-            _service->loadSession(sessionRequest());
+            _service->rebuildSession(sessionRequest());
         });
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
@@ -934,6 +945,29 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _warnings->setText(tr("Preparing checkpoint download…"));
         _service->downloadCheckpoint(path);
     });
+    connect(_loadCheckpoint, &QPushButton::clicked, this, [this]() {
+        const QString initial = _paths[QStringLiteral("checkpoint")]->text().isEmpty()
+            ? _paths[QStringLiteral("output_directory")]->text()
+            : _paths[QStringLiteral("checkpoint")]->text();
+        const QString path = _remoteMode
+            ? QInputDialog::getText(
+                  this, tr("Load Spiral checkpoint into the resident fit"),
+                  tr("Service-host checkpoint path:"), QLineEdit::Normal, initial)
+            : QFileDialog::getOpenFileName(this, tr("Load Spiral checkpoint into the fit"),
+                                           initial, tr("Checkpoint (*.ckpt)"));
+        if (path.isEmpty()) return;
+        _loadCheckpoint->setEnabled(false);
+        _warnings->setText(tr("Loading checkpoint into the resident fit…"));
+        _service->loadCheckpointIntoSession(path);
+    });
+    connect(_service, &SpiralServiceManager::checkpointLoaded, this,
+            [this](const QString& hostPath, qint64 iteration) {
+                _paths[QStringLiteral("checkpoint")]->setText(hostPath);
+                _warnings->setText(
+                    tr("Loaded %1 into the resident fit at iteration %2")
+                        .arg(hostPath)
+                        .arg(iteration));
+            });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
         if (QMessageBox::question(this, tr("Commit inputs"),
                                   tr("Move the added inputs into the dataset? Patches go to "
@@ -1599,8 +1633,11 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
-    _load->setText(status.value(QStringLiteral("session_id")).toString().isEmpty()
-                       ? tr("Start Fit") : tr("New Fit"));
+    // The service is always loaded, so the button is always a rebuild; it
+    // names the recovery case explicitly when the session failed to build.
+    _load->setText(status.value(QStringLiteral("state")).toString()
+                           == QStringLiteral("Error")
+                       ? tr("Rebuild Fit (recover)") : tr("Rebuild Fit"));
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
     const QJsonObject runConfigLimits =
         status.value(QStringLiteral("run_config_limits")).toObject();
@@ -1640,19 +1677,17 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     }
 
     const QString state = status.value("state").toString();
-    if (state == QStringLiteral("Empty")) {
-        _hasSession = false;
-        _loadedSessionRequest = {};
-        _attachedAdvancedConfig = {};
-        _reloadRequired = false;
-        _advancedSessionGeneration = -1;
-        _runConfigKeys.clear();
-    }
+    // There is no state in which the service has no session, so nothing
+    // here has to un-adopt one. A rebuild advances session_generation and
+    // the adopted configuration is re-synchronized from that.
     const QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
-    QString stateText = progress.isEmpty()
-        ? tr("Session: %1 — %2")
-              .arg(state, status.value("phase").toString())
+    const bool idle = state == QStringLiteral("Idle");
+    const QString phase = status.value(QStringLiteral("phase")).toString();
+    // An idle session reports "Idle" as both its state and its phase, so the
+    // phase is only worth appending when it says something the state does not.
+    QString stateText = (progress.isEmpty() && !phase.isEmpty() && phase != state)
+        ? tr("Session: %1 — %2").arg(state, phase)
         : tr("Session: %1").arg(state);
     if (state == QStringLiteral("Running"))
         stateText += tr(" — iteration %1/%2")
@@ -1752,13 +1787,16 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         if (!text.isEmpty()) diagnostics.push_back(text);
     }
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
-    const bool runnable = state == "Ready" || state == "Paused";
+    const bool runnable = idle;
     _sessionRunnable = runnable;
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
+    // An in-session load replaces resident model state, so it needs the same
+    // idle session a run does.
+    _loadCheckpoint->setEnabled(_connected && runnable);
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();

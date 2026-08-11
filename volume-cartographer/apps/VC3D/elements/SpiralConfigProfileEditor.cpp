@@ -122,7 +122,7 @@ QString impactLabel(const QString& impact)
     if (impact == QStringLiteral("shell_reload")) return QObject::tr("Reload shell");
     if (impact == QStringLiteral("prepared_input_rebuild"))
         return QObject::tr("Reload fit inputs");
-    if (impact == QStringLiteral("new_fit")) return QObject::tr("Start New Fit");
+    if (impact == QStringLiteral("new_fit")) return QObject::tr("Rebuild Fit");
     return impact;
 }
 

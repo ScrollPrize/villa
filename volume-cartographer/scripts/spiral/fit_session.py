@@ -8,8 +8,10 @@ stack in the service worker.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import datetime
 from enum import Enum
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +29,77 @@ from config import Config
 # Version 18 adds the structured /events stream and stops synthesizing
 # eta_seconds inside the /session/status progress snapshot: clients derive
 # the ETA from the raw step/total/elapsed fields.
-API_VERSION = 18
+# Version 19 replaces the Ready/Paused session states with a single Idle
+# state, reported as both the state and the phase: a session that has never
+# run and a session paused after N iterations are the same lifecycle state,
+# and the difference is not one a user acts on. Clients that want to report
+# how much work has happened read current_iteration.
+# Version 20 adds POST /session/load-checkpoint: a strict, two-phase,
+# all-rank load of a checkpoint into the resident model, valid in Idle. The
+# service refuses (409) any checkpoint that is not an exact match for the
+# live model domain and structure instead of rebuilding the model behind the
+# client's back; a domain change stays the job of a new fit. An accepted load
+# restores the checkpoint's completed_iterations and publishes it.
+# Version 21 makes previews and pause-time saving explicit. POST
+# /session/export-preview exports and publishes one preview generation on
+# request; resuming from a checkpoint and pausing after a run no longer
+# export one by themselves, so inspecting a checkpoint costs a load rather
+# than a load plus a preview. The run request carries autosave_on_pause
+# (default true), which decides whether that run's pause writes the durable
+# autosave.
+# Version 22 makes the session eager and always loaded. The service creates
+# its runtime asynchronously at startup and reports Loading (then Idle, or
+# Error with the cause) without any client request; there is no "Empty"
+# state and DELETE /session is gone. POST /session/load is replaced by
+# POST /session/rebuild, the only verb that may replace the model domain or
+# structural configuration: it tears the resident session down and builds a
+# fresh one (Idle|Error -> Loading), and with {"defaults": true} it rebuilds
+# from launch defaults, ignoring any autosave. A startup autosave is chosen
+# from explicit metadata sidecars (session namespace, dataset identity,
+# completed iterations), never from filename ordering.
+# Version 22 also drops the status fields nothing consumed:
+# service_generation (the constant 1; process identity is /health's
+# process_id), command_generation (replay is keyed by operation and command
+# ID), session_replacement_in_progress and replacement_old_session_released.
+# The counters that remain are session_generation (session identity),
+# session_revision (configuration/input revision) and generation (status
+# ordering).
+API_VERSION = 22
+
+
+class SessionState(str, Enum):
+    """Lifecycle state of one resident fit session.
+
+    The wire form is the member name; the member is a ``str`` so a status
+    snapshot serializes and compares exactly like the string it replaces.
+
+    Ready and Paused are one state: an idle session that has never stepped
+    and an idle session paused after N iterations differ only in
+    ``completed_iterations``. Operation phase and progress are reported
+    separately (``phase``/``progress``) and are not part of this enum.
+
+    ``Empty`` is deliberately absent: it describes a service with no
+    session at all, not a state a session can be in.
+    """
+
+    Loading = "Loading"
+    Idle = "Idle"
+    Running = "Running"
+    Saving = "Saving"
+    ExportingPreview = "ExportingPreview"
+    Error = "Error"
+    Closing = "Closing"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
+
+
+# States in which a session is executing something on the fitter thread and
+# cannot accept a new run, a save, or a replacement.
+SESSION_BUSY_STATES = frozenset({
+    SessionState.Loading, SessionState.Running, SessionState.Saving,
+    SessionState.ExportingPreview,
+})
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -606,6 +678,217 @@ def validate_checkpoint_container(path: str | Path) -> None:
         raise ValueError("Legacy pickle checkpoints are not supported; resave as a modern torch.save archive")
     if not zipfile.is_zipfile(checkpoint):
         raise ValueError("checkpoint is an incomplete or corrupt PyTorch ZIP archive")
+
+
+# ---------------------------------------------------------------------------
+# Autosave metadata and startup selection
+# ---------------------------------------------------------------------------
+#
+# A pause writes ``checkpoint_autosave.ckpt`` into that run's output directory
+# and, beside it, a metadata sidecar naming what the file *is*. An
+# always-loaded service picks its startup autosave from those sidecars alone:
+# a bare ``.ckpt`` with no metadata is never selected, and the winner is the
+# one with the most completed iterations, never the last filename in sort
+# order.
+
+AUTOSAVE_CHECKPOINT_NAME = "checkpoint_autosave.ckpt"
+AUTOSAVE_METADATA_NAME = "checkpoint_autosave.json"
+AUTOSAVE_METADATA_SCHEMA = "spiral-autosave/1"
+_AUTOSAVE_DIGEST_CHUNK = 1 << 20
+
+
+class AutosaveError(RuntimeError):
+    """The autosave selected for startup cannot be used, and why."""
+
+
+@dataclass(frozen=True)
+class AutosaveCandidate:
+    """One autosave that named itself through a metadata sidecar."""
+
+    checkpoint: str
+    metadata_path: str
+    session_namespace: str
+    dataset_root: str
+    completed_iterations: int
+    created: str
+    sha256: str
+    size: int
+
+    def manifest(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AutosaveSelection:
+    """The startup autosave decision, and every candidate that lost."""
+
+    selected: AutosaveCandidate | None = None
+    #: ``(metadata or checkpoint path, reason)`` for each rejected candidate.
+    rejected: tuple[tuple[str, str], ...] = ()
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "selected": self.selected.manifest() if self.selected else None,
+            "rejected": [{"path": path, "reason": reason}
+                         for path, reason in self.rejected],
+        }
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(_AUTOSAVE_DIGEST_CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_autosave_metadata(
+    checkpoint_path: str | Path,
+    *,
+    session_namespace: str | Path,
+    dataset_root: str | Path,
+    completed_iterations: int,
+) -> str:
+    """Record what an autosave is, next to it, atomically.
+
+    ``session_namespace`` is the service output root the autosave belongs to
+    (``<output>/<session-name>`` for a named service); an autosave written
+    under a different namespace is never a startup candidate for this one.
+    """
+    checkpoint = Path(checkpoint_path)
+    metadata_path = checkpoint.with_name(AUTOSAVE_METADATA_NAME)
+    document = {
+        "schema": AUTOSAVE_METADATA_SCHEMA,
+        "session_namespace": _normalise_path(session_namespace),
+        "dataset_root": _normalise_path(dataset_root),
+        "checkpoint": checkpoint.name,
+        "completed_iterations": int(completed_iterations),
+        "created": datetime.datetime.now(datetime.timezone.utc)
+                   .replace(microsecond=0).isoformat(),
+        "size": checkpoint.stat().st_size,
+        "sha256": file_sha256(checkpoint),
+        "api_version": API_VERSION,
+    }
+    temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(document, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, metadata_path)
+    return str(metadata_path)
+
+
+def read_autosave_metadata(path: str | Path) -> AutosaveCandidate:
+    """Parse one sidecar strictly; a malformed sidecar is not a candidate."""
+    metadata_path = Path(path)
+    with metadata_path.open("r", encoding="utf-8") as stream:
+        document = json.load(stream)
+    if not isinstance(document, dict):
+        raise ValueError("autosave metadata is not a JSON object")
+    schema = str(document.get("schema") or "")
+    if schema != AUTOSAVE_METADATA_SCHEMA:
+        raise ValueError(
+            f"unsupported autosave metadata schema {schema!r} "
+            f"(expected {AUTOSAVE_METADATA_SCHEMA!r})")
+    name = str(document.get("checkpoint") or "")
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError("autosave metadata does not name a sibling checkpoint")
+    for key in ("session_namespace", "dataset_root", "sha256"):
+        if not str(document.get(key) or "").strip():
+            raise ValueError(f"autosave metadata is missing {key}")
+    return AutosaveCandidate(
+        checkpoint=str(metadata_path.parent / name),
+        metadata_path=str(metadata_path),
+        session_namespace=_normalise_path(document["session_namespace"]),
+        dataset_root=_normalise_path(document["dataset_root"]),
+        completed_iterations=int(document.get("completed_iterations", 0)),
+        created=str(document.get("created") or ""),
+        sha256=str(document["sha256"]),
+        size=int(document.get("size", -1)),
+    )
+
+
+def validate_autosave(candidate: AutosaveCandidate) -> None:
+    """Check container and checkpoint identity; raise ``AutosaveError``."""
+    checkpoint = Path(candidate.checkpoint)
+    if not checkpoint.is_file():
+        raise AutosaveError(
+            f"the autosave named by {candidate.metadata_path} is missing "
+            f"({candidate.checkpoint})")
+    size = checkpoint.stat().st_size
+    if candidate.size >= 0 and size != candidate.size:
+        raise AutosaveError(
+            f"{candidate.checkpoint} is {size} bytes; its metadata records "
+            f"{candidate.size}")
+    try:
+        validate_checkpoint_container(checkpoint)
+    except (OSError, ValueError) as exc:
+        raise AutosaveError(f"{candidate.checkpoint}: {exc}") from exc
+    digest = file_sha256(checkpoint)
+    if digest != candidate.sha256:
+        raise AutosaveError(
+            f"{candidate.checkpoint} has digest {digest}; its metadata "
+            f"records {candidate.sha256}")
+
+
+def discover_autosave_metadata(output_root: str | Path) -> list[Path]:
+    """Every autosave sidecar under a service output root, run dirs included."""
+    root = Path(output_root)
+    if not root.is_dir():
+        return []
+    found = {root / AUTOSAVE_METADATA_NAME}
+    found.update(root.glob(f"*/{AUTOSAVE_METADATA_NAME}"))
+    return sorted(path for path in found if path.is_file())
+
+
+def select_startup_autosave(
+    output_root: str | Path,
+    *,
+    session_namespace: str | Path,
+    dataset_root: str | Path,
+) -> AutosaveSelection:
+    """Choose the autosave an always-loaded service should resume from.
+
+    Selection is by metadata: the sidecar must parse, must carry this
+    service's session namespace, and must have been written against this
+    dataset root. Among the survivors the one with the most completed
+    iterations wins (ties broken by the recorded creation time), so the
+    result never depends on filename ordering. Container and identity
+    validation happens after selection, in ``validate_autosave``: a selected
+    autosave that fails it is an error, not a reason to silently resume from
+    an older one.
+    """
+    namespace = _normalise_path(session_namespace)
+    dataset = _normalise_path(dataset_root)
+    candidates: list[AutosaveCandidate] = []
+    rejected: list[tuple[str, str]] = []
+    for metadata_path in discover_autosave_metadata(output_root):
+        try:
+            candidate = read_autosave_metadata(metadata_path)
+        except (OSError, ValueError, TypeError) as exc:
+            rejected.append((str(metadata_path), f"unreadable metadata: {exc}"))
+            continue
+        if candidate.session_namespace != namespace:
+            rejected.append((
+                str(metadata_path),
+                f"belongs to session namespace {candidate.session_namespace}"))
+            continue
+        if candidate.dataset_root != dataset:
+            rejected.append((
+                str(metadata_path),
+                f"was written against dataset root {candidate.dataset_root}"))
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        return AutosaveSelection(rejected=tuple(rejected))
+    selected = max(candidates,
+                   key=lambda item: (item.completed_iterations, item.created))
+    rejected.extend(
+        (candidate.metadata_path,
+         f"superseded by {selected.checkpoint} at "
+         f"{selected.completed_iterations} iterations")
+        for candidate in candidates if candidate is not selected)
+    return AutosaveSelection(selected=selected, rejected=tuple(rejected))
 
 
 def _dbm_candidates(root: Path) -> list[str]:

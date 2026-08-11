@@ -43,13 +43,18 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
-from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
+from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
+                         AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
+                         AutosaveError, SessionState, SpiralInputPaths,
+                         SpiralPreviewConfig, SpiralRunConfig,
+                         resolve_dataset_root, select_startup_autosave,
+                         validate_autosave, write_autosave_metadata)
 from config import Config
 
 
 class FakeSession:
     def __init__(self):
-        self.state = "Paused"
+        self.state = SessionState.Idle
         self.run_calls = []
         self.run_config = {
             "sample_count_patches_per_step": 360,
@@ -75,13 +80,18 @@ class FakeSession:
             "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
+        self.autosave_calls = []
+        self.previews = 0
+        self.loaded = []
+        self.load_refusal = None
         self.closed = False
         self.path_change_calls = []
         self.progress = None
 
     def status(self):
         return {
-            "state": self.state, "phase": self.state, "current_iteration": 5,
+            "state": self.state, "phase": str(self.state),
+            "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "supports_input_incorporation": True,
@@ -92,10 +102,12 @@ class FakeSession:
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None, path_changes=None):
+            influence_config=None, run_config=None, path_changes=None,
+            autosave_on_pause=True):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
         self.path_change_calls.append(dict(path_changes or {}))
+        self.autosave_calls.append(autosave_on_pause)
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -105,8 +117,42 @@ class FakeSession:
         self.saved.append(path)
         return path
 
+    def load_checkpoint(self, path, timeout=600.0):
+        if self.load_refusal is not None:
+            raise RuntimeError(self.load_refusal)
+        self.loaded.append(path)
+        return {"completed_iterations": 4200, "config_revision": 1,
+                "path": path}
+
+    def export_preview(self, timeout=600.0):
+        self.previews += 1
+        return {"preview_generation": self.previews,
+                "preview_manifest_path": f"/preview/{self.previews}"}
+
     def close(self):
         self.closed = True
+
+
+# The minimal test dataset carries no Lasagna zarr groups, so the launch
+# defaults these fixtures start from zero-weight the dense losses that would
+# require them.
+_NO_DENSE_LOSSES = {
+    "dense_spacing_mode": "grad_mag",
+    "loss_weight_dense_spacing": 0,
+    "loss_weight_dense_normals": 0,
+    "loss_weight_shell_outer": 0,
+    "loss_weight_shell_patch_radius": 0,
+}
+
+
+def _await_build(state, timeout=10.0):
+    """Wait for the asynchronous session build to settle, and report how."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if state.session is not None or state._session_state == SessionState.Error:
+            return state.status()
+        time.sleep(0.01)
+    raise AssertionError("the session build did not settle")
 
 
 def _write_scroll_spec(root):
@@ -173,13 +219,13 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertNotIn("eta_seconds", state.status()["progress"])
 
         # The preview-publication progress block is also served raw.
-        state._publishing_preview_generation = 2
-        state._preview_publish = {
-            "generation": 2, "state": "running",
+        state._preview.claim("spiral-test-1", 2)
+        state._preview.record_progress(2, {
+            "state": "running",
             "stage_name": "Flattening preview surface",
             "step": 5, "total_steps": 10,
-        }
-        state._preview_progress_started = None
+        })
+        state._preview.stage_started = None
         progress = state.status()["progress"]
         self.assertEqual(progress["operation"], "publishing_preview")
         self.assertNotIn("eta_seconds", progress)
@@ -197,7 +243,7 @@ def _planned_run(state, request):
         "influence": request.pop("influence_config", {}),
         "expected_session_revision": state.session_revision,
     })
-    return state.run({"plan_token": plan["plan_token"]})
+    return state.run({"plan_token": plan["plan_token"], **request})
 
 
 def _digest(data):
@@ -388,7 +434,11 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertIn("service_name", health)
         self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
-        self.assertIn("service_generation", health)
+        # Process identity is process_id; there is no service_generation
+        # counter (it was the constant 1 and nothing read it).
+        self.assertIn("process_id", health)
+        self.assertNotIn("service_generation", health)
+        self.assertNotIn("command_generation", health)
 
 
 class RestartTests(HttpServiceFixture):
@@ -430,6 +480,16 @@ class RouteTableTests(HttpServiceFixture):
                          spiral_service.Idempotency.COMMAND_ID)
         self.assertTrue(route.reads_body)
 
+        # Logical mutations: command-ID idempotent, so a retried load or
+        # preview export replays instead of acting twice.
+        for path, operation in (("/session/load-checkpoint", "load_checkpoint"),
+                                ("/session/export-preview", "export_preview")):
+            route, args = spiral_service.resolve_route("POST", path)
+            self.assertEqual((route.operation, args), (operation, ()))
+            self.assertEqual(route.idempotency,
+                             spiral_service.Idempotency.COMMAND_ID)
+            self.assertTrue(route.reads_body)
+
         upload_id = "a" * 32
         route, args = spiral_service.resolve_route(
             "PUT", f"/session/inputs/{upload_id}/files/meta.json")
@@ -462,17 +522,32 @@ class RouteTableTests(HttpServiceFixture):
         self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
 
         # A command-ID route still refuses an unstamped request, and reaches
-        # the operation (which has no session) when it is stamped.
+        # the operation (whose session is still being built) when stamped.
         status, payload, _ = self.request("POST", "/session/stop", body={})
         self.assertEqual(status, 400)
         self.assertIn("command_id", json.loads(payload)["error"])
         status, payload, _ = self.request("POST", "/session/stop",
                                           body={"command_id": "stop-1"})
         self.assertEqual(status, 409)
-        self.assertIn("No fit session", json.loads(payload)["error"])
+        self.assertIn("still loading", json.loads(payload)["error"])
 
         status, _, _ = self.request("GET", "/nonexistent")
         self.assertEqual(status, 404)
+
+    def test_session_deletion_is_not_part_of_the_surface(self):
+        # The service always holds a session; there is no verb that removes
+        # one, so the path resolves for nothing but its own sub-resources.
+        self.assertEqual(spiral_service.resolve_route("DELETE", "/session"),
+                         (None, ()))
+        self.assertIsNone(
+            spiral_service.resolve_route("POST", "/session/load")[0])
+        status, _, _ = self.request("DELETE", "/session",
+                                    body={"command_id": "delete-1"})
+        self.assertEqual(status, 404)
+        route, _ = spiral_service.resolve_route("POST", "/session/rebuild")
+        self.assertEqual(route.operation, "session_rebuild")
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.COMMAND_ID)
 
     def test_malformed_post_body_is_reported_before_the_route_is_known(self):
         request = urllib.request.Request(self.base + "/nonexistent",
@@ -482,6 +557,70 @@ class RouteTableTests(HttpServiceFixture):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(request, data=b"{not json", timeout=10)
         self.assertEqual(caught.exception.code, 400)
+
+
+class CounterSurfaceTests(unittest.TestCase):
+    """What each surviving counter is for, and what no longer exists."""
+
+    def test_only_the_three_load_bearing_counters_are_published(self):
+        state = ServiceState()
+        base = state.status()
+        # Session identity, configuration/input revision, status ordering.
+        for key in ("session_generation", "session_revision", "generation"):
+            self.assertIn(key, base)
+        # Removed: nothing read them. Process identity is process_id.
+        for key in ("service_generation", "command_generation",
+                    "session_replacement_in_progress",
+                    "replacement_old_session_released"):
+            self.assertNotIn(key, base)
+        self.assertIn("process_id", state.health())
+
+    def test_command_replay_no_longer_stamps_a_counter(self):
+        state = ServiceState()
+        calls = []
+
+        def operation():
+            calls.append(1)
+            return {"ok": True}
+
+        first = state.replay_command("session_stop", "cmd-1", operation)
+        second = state.replay_command("session_stop", "cmd-1", operation)
+        # Deduplication is keyed by (operation, command ID); the counter it
+        # used to publish alongside the response was never a key.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first, second)
+        self.assertNotIn("command_generation", first)
+
+    def test_preview_publication_state_lives_in_one_record(self):
+        state = ServiceState()
+        for legacy in ("_registered_preview_generation",
+                       "_processed_preview_generation",
+                       "_publishing_preview_generation",
+                       "_preview_publish", "_preview_publish_error",
+                       "_preview_progress_started", "_preview_process",
+                       "_preview_artifact", "_previous_raw_preview_manifest"):
+            self.assertFalse(hasattr(state, legacy), legacy)
+
+        publication = state._preview
+        self.assertTrue(publication.claim("session-a", 4))
+        # One generation is published once: neither a replay of the same
+        # generation nor an older one claims it again.
+        self.assertFalse(publication.claim("session-a", 4))
+        self.assertFalse(publication.claim("session-a", 3))
+        self.assertEqual(state.status()["preview_publish"], None)
+        publication.record_progress(4, {"stage_name": "Flattening",
+                                        "step": 1, "total_steps": 4})
+        self.assertEqual(state.status()["preview_publish"]["generation"], 4)
+        self.assertEqual(state.status()["progress"]["operation"],
+                         "publishing_preview")
+        # A stale generation cannot write into the live record.
+        self.assertIsNone(publication.record_progress(3, {"step": 9}))
+
+        publication.finish(4)
+        self.assertEqual(publication.generation, 0)
+        self.assertEqual(publication.completed_generation, 4)
+        self.assertFalse(publication.claim("session-a", 4))
+        self.assertIsNone(state.status()["preview_publish"])
 
 
 class CommandReplayTests(unittest.TestCase):
@@ -731,7 +870,9 @@ class DatasetOwnershipTests(unittest.TestCase):
             resolve_dataset_root(self.root), self.output, self.cache)
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
-                                  dataset_resolution=self.resolution)
+                                  dataset_resolution=self.resolution,
+                                  startup_run={"z_begin": 0, "z_end": 10,
+                                               "config": _NO_DENSE_LOSSES})
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -797,18 +938,18 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertTrue(ephemeral.is_relative_to(self.output))
         self.assertFalse(ephemeral.is_relative_to(self.root))
 
-    def test_load_rejects_client_base_input_paths(self):
+    def test_rebuild_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.load({"paths": {"umbilicus": "/attacker/umbilicus.json"},
-                             "run": {"z_begin": 0, "z_end": 10}})
+            self.state.rebuild({"paths": {"umbilicus": "/attacker/umbilicus.json"},
+                                "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
         fields = {detail["field"] for detail in caught.exception.details}
         self.assertEqual(fields, {"umbilicus"})
 
-    def test_load_rejects_unadvertised_checkpoint(self):
+    def test_rebuild_rejects_unadvertised_checkpoint(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.load({"paths": {"checkpoint": "/attacker/model.ckpt"},
-                             "run": {"z_begin": 0, "z_end": 10}})
+            self.state.rebuild({"paths": {"checkpoint": "/attacker/model.ckpt"},
+                                "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
     def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
@@ -840,7 +981,14 @@ class DatasetOwnershipTests(unittest.TestCase):
         }
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            response = self.state.load(request)
+            # A rebuild is accepted immediately; the runtime is constructed
+            # off the request thread (the fake finishes instantly, so the
+            # accepted response may already report Idle rather than Loading).
+            response = self.state.rebuild(request)
+            self.assertTrue(response["rebuilding"])
+            self.assertIn(response["state"],
+                          {SessionState.Loading, SessionState.Idle})
+            _await_build(self.state)
 
         attached = response["session_request"]
         self.assertEqual(attached, self.state.status()["session_request"])
@@ -855,10 +1003,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
 
-        self.state.delete()
-        self.assertIsNone(self.state.status()["session_request"])
-
-    def test_failed_load_does_not_advertise_a_session_request(self):
+    def test_a_failed_build_reports_error_and_a_rebuild_recovers(self):
         request = {
             "run": {
                 "z_begin": 0,
@@ -874,11 +1019,23 @@ class DatasetOwnershipTests(unittest.TestCase):
         }
         with mock.patch("spiral_runtime.create_session",
                         side_effect=RuntimeError("startup failed")):
-            with self.assertRaisesRegex(RuntimeError, "startup failed"):
-                self.state.load(request)
-        status = self.state.status()
-        self.assertIsNone(status["session_id"])
-        self.assertIsNone(status["session_request"])
+            self.state.rebuild(request)
+            status = _await_build(self.state)
+        # A build that fails is Error with the cause, not a service that has
+        # quietly stopped having a session.
+        self.assertEqual(status["state"], SessionState.Error)
+        self.assertIn("startup failed", status["error"])
+        with self.assertRaises(ApiError) as caught:
+            self.state.stop()
+        self.assertIn("startup failed", caught.exception.message)
+
+        # Rebuild with defaults is the documented recovery.
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            self.state.rebuild({"defaults": True})
+            status = _await_build(self.state)
+        self.assertEqual(status["state"], SessionState.Idle)
+        self.assertIsNone(status["error"])
 
     def test_save_checkpoint_is_constrained_to_output_directory(self):
         _attach_fake_session(self.state, self.output, self.root)
@@ -888,6 +1045,362 @@ class DatasetOwnershipTests(unittest.TestCase):
         response = self.state.save_checkpoint(
             {"path": str(self.output / "manual.ckpt")})
         self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
+
+    def test_load_checkpoint_reads_only_service_owned_checkpoints(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        outside = self.root / "elsewhere.ckpt"
+        outside.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(outside)})
+        self.assertEqual(caught.exception.status, 400)
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint(
+                {"path": str(self.output / "absent.ckpt")})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(session.loaded, [])
+
+    def test_load_checkpoint_reports_the_restored_iteration(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        checkpoint = self.output / "uploaded-checkpoints" / "a.ckpt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        revision = self.state.session_revision
+
+        response = self.state.load_checkpoint({"path": str(checkpoint)})
+
+        self.assertTrue(response["loaded"])
+        self.assertEqual(response["restored_iteration"], 4200)
+        self.assertEqual(session.loaded, [str(checkpoint)])
+        self.assertEqual(self.state.session_paths.checkpoint, str(checkpoint))
+        self.assertEqual(
+            self.state.session_request["paths"]["checkpoint"], str(checkpoint))
+        self.assertEqual(self.state.session_revision, revision + 1)
+
+    def test_a_refused_checkpoint_is_a_conflict_and_changes_nothing(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.load_refusal = "checkpoint model z-domain [0, 10) is not..."
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        revision = self.state.session_revision
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(checkpoint)})
+
+        self.assertEqual(caught.exception.status, 409)
+        self.assertIn("z-domain", caught.exception.message)
+        self.assertEqual(self.state.session_revision, revision)
+        self.assertEqual(self.state.session_paths.checkpoint, "")
+
+    def test_autosave_on_pause_is_a_run_request_flag_defaulting_on(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+
+        _planned_run(self.state, {"iterations": 4})
+        self.assertEqual(session.autosave_calls, [True])
+
+        _planned_run(self.state, {"iterations": 4, "autosave_on_pause": False})
+        self.assertEqual(session.autosave_calls, [True, False])
+
+        with self.assertRaises(ApiError) as caught:
+            _planned_run(self.state,
+                         {"iterations": 4, "autosave_on_pause": "no"})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_export_preview_is_an_explicit_verb_valid_when_idle(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+
+        response = self.state.export_preview()
+
+        self.assertTrue(response["exported"])
+        self.assertEqual(response["preview_generation"], 1)
+        self.assertEqual(session.previews, 1)
+
+        session.state = SessionState.Running
+        with self.assertRaises(ApiError) as caught:
+            self.state.export_preview()
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(session.previews, 1)
+
+    def test_load_checkpoint_requires_an_idle_session(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.state = SessionState.Running
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"path": str(checkpoint)})
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(session.loaded, [])
+
+
+def _write_autosave(directory, *, iterations, namespace, dataset_root,
+                    payload=b"payload", corrupt=False):
+    """Write one autosave plus the metadata that makes it selectable."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    checkpoint = directory / AUTOSAVE_CHECKPOINT_NAME
+    checkpoint.write_bytes(_zip_checkpoint_bytes(payload))
+    write_autosave_metadata(checkpoint, session_namespace=namespace,
+                            dataset_root=dataset_root,
+                            completed_iterations=iterations)
+    if corrupt:
+        # Truncate the archive after the sidecar recorded it: the metadata
+        # still claims a valid container of a known size and digest.
+        checkpoint.write_bytes(b"PK\x03\x04truncated")
+    return checkpoint
+
+
+class StartupAutosaveSelectionTests(unittest.TestCase):
+    """The startup autosave is chosen from metadata, never from filenames."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.output = Path(self.temporary.name) / "output" / "session-a"
+        self.output.mkdir(parents=True)
+        self.dataset = str(Path(self.temporary.name) / "dataset")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _select(self):
+        return select_startup_autosave(
+            self.output, session_namespace=self.output,
+            dataset_root=self.dataset)
+
+    def test_the_furthest_autosave_wins_regardless_of_filename_order(self):
+        # "aaa-run" sorts first and "zzz-run" sorts last; neither ordering
+        # decides anything. The completed iteration count does.
+        _write_autosave(self.output / "zzz-run", iterations=40,
+                        namespace=self.output, dataset_root=self.dataset)
+        winner = _write_autosave(self.output / "aaa-run", iterations=900,
+                                 namespace=self.output,
+                                 dataset_root=self.dataset)
+        selection = self._select()
+        self.assertEqual(selection.selected.checkpoint, str(winner))
+        self.assertEqual(selection.selected.completed_iterations, 900)
+        self.assertEqual(
+            [reason for _, reason in selection.rejected],
+            [f"superseded by {winner} at 900 iterations"])
+
+    def test_a_checkpoint_without_metadata_is_never_selected(self):
+        # A bare autosave file is inert: nothing says which session
+        # namespace or dataset it belongs to, so it is not a candidate.
+        run = self.output / "run"
+        run.mkdir()
+        (run / AUTOSAVE_CHECKPOINT_NAME).write_bytes(_zip_checkpoint_bytes())
+        self.assertIsNone(self._select().selected)
+
+    def test_another_namespace_or_dataset_is_rejected_not_selected(self):
+        _write_autosave(self.output / "other-namespace", iterations=10,
+                        namespace=Path(self.temporary.name) / "output" / "b",
+                        dataset_root=self.dataset)
+        _write_autosave(self.output / "other-dataset", iterations=20,
+                        namespace=self.output,
+                        dataset_root=self.dataset + "-elsewhere")
+        selection = self._select()
+        self.assertIsNone(selection.selected)
+        reasons = sorted(reason for _, reason in selection.rejected)
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("belongs to session namespace", reasons[0])
+        self.assertIn("was written against dataset root", reasons[1])
+
+    def test_unreadable_metadata_is_rejected_with_its_reason(self):
+        run = self.output / "run"
+        run.mkdir()
+        (run / AUTOSAVE_METADATA_NAME).write_text("{not json")
+        stale = self.output / "stale"
+        stale.mkdir()
+        (stale / AUTOSAVE_METADATA_NAME).write_text(
+            json.dumps({"schema": "spiral-autosave/0"}))
+        selection = self._select()
+        self.assertIsNone(selection.selected)
+        self.assertEqual(len(selection.rejected), 2)
+        for _, reason in selection.rejected:
+            self.assertIn("unreadable metadata", reason)
+
+    def test_a_selected_autosave_must_match_its_recorded_identity(self):
+        _write_autosave(self.output / "run", iterations=10,
+                        namespace=self.output, dataset_root=self.dataset,
+                        corrupt=True)
+        selected = self._select().selected
+        self.assertIsNotNone(selected)
+        with self.assertRaises(AutosaveError) as caught:
+            validate_autosave(selected)
+        self.assertIn("bytes", str(caught.exception))
+
+        # Same size, different content: the digest still catches it.
+        checkpoint = _write_autosave(
+            self.output / "run2", iterations=20, namespace=self.output,
+            dataset_root=self.dataset, payload=b"payload")
+        checkpoint.write_bytes(_zip_checkpoint_bytes(b"payloaX"))
+        with self.assertRaises(AutosaveError) as caught:
+            validate_autosave(self._select().selected)
+        self.assertIn("digest", str(caught.exception))
+
+    def test_a_valid_autosave_passes_identity_validation(self):
+        _write_autosave(self.output / "run", iterations=7,
+                        namespace=self.output, dataset_root=self.dataset)
+        validate_autosave(self._select().selected)
+
+
+class AlwaysLoadedSessionTests(HttpServiceFixture):
+    """The service is up, and answers, before and without a session."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        base = Path(self.temporary.name)
+        self.dataset = base / "dataset"
+        self.dataset.mkdir()
+        _write_scroll_spec(self.dataset)
+        (self.dataset / "umbilicus.json").write_text("{}")
+        (self.dataset / "verified_patches").mkdir()
+        self.output = base / "output" / "session-a"
+        self.output.mkdir(parents=True)
+        self.cache = base / "cache"
+        self.resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.dataset), self.output, self.cache)
+        self.state = ServiceState(
+            dataset_root=str(self.dataset),
+            dataset_resolution=self.resolution,
+            startup_run={"z_begin": 0, "z_end": 10,
+                         "config": _NO_DENSE_LOSSES})
+        SpiralServer.allow_reuse_address = False
+        self.server = SpiralServer(("127.0.0.1", 0), ["secret-key"], self.state)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+        self.temporary.cleanup()
+
+    def _assert_service_answers(self, expected_state):
+        status, payload, _ = self.request("GET", "/session/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["state"], expected_state)
+        for path in ("/health", "/dataset", "/configuration"):
+            status, payload, _ = self.request("GET", path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
+        status, payload, _ = self.request("GET", "/events")
+        self.assertEqual(status, 200)
+        self.assertIn("events", json.loads(payload))
+        # Checkpoint upload and the recovery command stay reachable too.
+        status, _, _ = self.request(
+            "POST", "/session/inputs",
+            body={"kind": "checkpoint", "id": "resume.ckpt",
+                  "files": [{"name": "resume.ckpt", "size": 1,
+                             "sha256": "0" * 64}]})
+        self.assertNotIn(status, (404, 405, 500))
+
+    def test_every_read_endpoint_answers_while_the_session_is_loading(self):
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def slow_create(*_args, **_kwargs):
+            blocked.set()
+            release.wait(10)
+            return FakeSession()
+
+        with mock.patch("spiral_runtime.create_session", slow_create):
+            self.state.start_initial_session()
+            self.assertTrue(blocked.wait(10))
+            # The HTTP surface is fully responsive while CUDA and the model
+            # are being built.
+            self._assert_service_answers(SessionState.Loading)
+            health = json.loads(self.request("GET", "/health")[1])
+            self.assertIsNone(health["cuda_ready"])
+            release.set()
+            _await_build(self.state)
+        self.assertEqual(self.state.status()["state"], SessionState.Idle)
+
+    def test_every_read_endpoint_answers_while_the_session_is_in_error(self):
+        with mock.patch("spiral_runtime.create_session",
+                        side_effect=RuntimeError("no CUDA device")):
+            self.state.start_initial_session()
+            status = _await_build(self.state)
+        self.assertEqual(status["state"], SessionState.Error)
+        self.assertIn("no CUDA device", status["error"])
+        self._assert_service_answers(SessionState.Error)
+        health = json.loads(self.request("GET", "/health")[1])
+        self.assertIs(health["cuda_ready"], False)
+
+    def test_startup_resumes_the_autosave_metadata_selects(self):
+        _write_autosave(self.output / "old-run", iterations=5,
+                        namespace=self.output, dataset_root=self.dataset)
+        chosen = _write_autosave(self.output / "new-run", iterations=500,
+                                 namespace=self.output,
+                                 dataset_root=self.dataset)
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()) as create:
+            self.state.start_initial_session()
+            _await_build(self.state)
+        self.assertEqual(create.call_args.args[0].checkpoint, str(chosen))
+        self.assertEqual(
+            self.state.status()["autosave_selection"]["selected"]["checkpoint"],
+            str(chosen))
+
+    def test_a_corrupt_startup_autosave_is_an_error_a_rebuild_recovers(self):
+        _write_autosave(self.output / "run", iterations=50,
+                        namespace=self.output, dataset_root=self.dataset,
+                        corrupt=True)
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()) as create:
+            self.state.start_initial_session()
+            status = _await_build(self.state)
+            # The service does not silently start from scratch, and does not
+            # fall back to an older autosave: it says what is wrong.
+            self.assertEqual(status["state"], SessionState.Error)
+            self.assertIn("Startup autosave cannot be loaded", status["error"])
+            self.assertEqual(create.call_count, 0)
+            self._assert_service_answers(SessionState.Error)
+
+            # Rebuild with defaults ignores every autosave and recovers.
+            status, payload, _ = self.request(
+                "POST", "/session/rebuild",
+                body={"command_id": "rebuild-1", "defaults": True})
+            self.assertEqual(status, 200, payload)
+            settled = _await_build(self.state)
+        self.assertEqual(settled["state"], SessionState.Idle)
+        self.assertIsNone(settled["error"])
+        self.assertEqual(create.call_args.args[0].checkpoint, "")
+
+    def test_no_client_request_is_needed_to_get_a_session(self):
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            self.state.start_initial_session()
+            _await_build(self.state)
+        status = json.loads(self.request("GET", "/session/status")[1])
+        self.assertEqual(status["state"], SessionState.Idle)
+        self.assertTrue(status["session_id"])
+
+    def test_only_a_rebuild_may_replace_the_model_domain(self):
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            self.state.start_initial_session()
+            _await_build(self.state)
+
+            # A run plan that changes a new-fit configuration key reports it
+            # and the run is refused: the resident model keeps its domain.
+            configuration = Config({**_NO_DENSE_LOSSES,
+                                    "model_num_flow_stages": 3}).as_dict()
+            plan = self.state.plan_run({
+                "configuration": configuration,
+                "iterations": 3,
+                "expected_session_revision": self.state.session_revision,
+            })
+            self.assertTrue(plan["new_fit_required"])
+            with self.assertRaisesRegex(ApiError, "Start New Fit"):
+                self.state.run({"plan_token": plan["plan_token"]})
+
+            # The same change through a rebuild is accepted; it is the one
+            # path that tears the model down and builds a new domain.
+            self.state.rebuild({"run": {"z_begin": 0, "z_end": 10,
+                                        "config": configuration}})
+            _await_build(self.state)
+        applied = self.state.status()["session_request"]["run"]["config"]
+        self.assertEqual(applied["model_num_flow_stages"], 3)
 
 
 class UploadTests(unittest.TestCase):
@@ -1226,13 +1739,21 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
             self.state.run({"plan_token": plan["plan_token"]})
 
-    def test_new_session_does_not_see_previous_ephemeral_inputs(self):
+    def test_a_rebuilt_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
         ephemeral_dir = self.state._session_ephemeral_dir()
         self.assertTrue(ephemeral_dir.exists())
-        self.state.delete()
+        # A rebuild is the only way a session is replaced now; it closes the
+        # old one and takes its ephemeral scope with it.
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            self.state._begin_build(
+                self.state.session_paths,
+                SpiralRunConfig(z_begin=0, z_end=10),
+                SpiralPreviewConfig(), None)
+            _await_build(self.state)
         self.assertEqual(self.state.ephemeral_records, [])
         self.assertFalse(ephemeral_dir.exists())
 
@@ -1261,7 +1782,8 @@ class CheckpointUploadTests(unittest.TestCase):
             resolve_dataset_root(self.root), self.output, base / "cache")
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
-                                  dataset_resolution=self.resolution)
+                                  dataset_resolution=self.resolution,
+                                  startup_run={"z_begin": 0, "z_end": 10})
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -1345,7 +1867,8 @@ class CheckpointUploadTests(unittest.TestCase):
     def test_checkpoint_deduplication_survives_service_restart(self):
         first = self._upload_checkpoint("resume.ckpt")
         restarted = ServiceState(dataset_root=str(self.root),
-                                 dataset_resolution=self.resolution)
+                                 dataset_resolution=self.resolution,
+                                 startup_run={"z_begin": 0, "z_end": 10})
         data = _zip_checkpoint_bytes()
         begin = restarted.begin_upload({
             "kind": "checkpoint",
@@ -1843,8 +2366,8 @@ class MappedPreviewArtifactTests(unittest.TestCase):
             current_manifest.write_text("{}")
             state = ServiceState()
             state.session_id = "session"
-            state._previous_raw_preview_manifest = str(previous_manifest)
-            state._preview_artifact = {"id": "previous-preview"}
+            state._preview.previous_raw_manifest = str(previous_manifest)
+            state._preview.artifact = {"id": "previous-preview"}
 
             with mock.patch.object(
                     state, "_publish_flattened_preview",
@@ -1855,10 +2378,17 @@ class MappedPreviewArtifactTests(unittest.TestCase):
                 })
 
             self.assertEqual(
-                state._preview_artifact, {"id": "previous-preview"})
+                state._preview.artifact, {"id": "previous-preview"})
             self.assertTrue(previous.exists())
             self.assertFalse(current.exists())
-            self.assertIn("flatten failed", state._preview_publish_error)
+            self.assertIn("flatten failed", state._preview.error)
+            # One record holds the whole outcome: the failed generation is
+            # finished (never retried), nothing is in flight, and the
+            # previous successful raw generation is still the overlay base.
+            self.assertEqual(state._preview.generation, 0)
+            self.assertEqual(state._preview.completed_generation, 1)
+            self.assertEqual(state._preview.previous_raw_manifest,
+                             str(previous_manifest))
 
     def test_winding_membership_uses_flatten_correspondence(self):
         manifest = {
