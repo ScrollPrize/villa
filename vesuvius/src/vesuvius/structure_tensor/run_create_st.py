@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import zarr
 import numpy as np
 
-from vesuvius.data.utils import open_zarr
+from vesuvius.data.utils import create_group_array, open_zarr, open_zarr_group
 from numcodecs import Blosc
 
 def get_available_gpus():
@@ -95,14 +95,15 @@ def create_shared_output_store(args, input_shape, patch_size):
     print(f"Chunk shape: {output_chunks}")
     
     # Create the root group
-    root_store = zarr.open_group(
+    root_store = open_zarr_group(
         main_store_path,
         mode='w',
         storage_options={'anon': False} if main_store_path.startswith('s3://') else None
     )
-    
+
     # Create the structure_tensor array within the group
-    structure_tensor_arr = root_store.create_dataset(
+    structure_tensor_arr = create_group_array(
+        root_store,
         'structure_tensor',
         shape=output_shape,
         chunks=output_chunks,

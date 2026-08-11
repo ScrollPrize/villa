@@ -1,12 +1,18 @@
 # tests/test_structure_tensor.py
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 import numpy as np
+import numcodecs
 import zarr
 import os
 from math import isfinite
 
+from vesuvius.data.utils import create_group_array, open_zarr_group
 from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     components_to_matrix,
@@ -20,6 +26,28 @@ from vesuvius.structure_tensor.create_st import (
     _compute_eigenvectors,
     _finalize_structure_tensor_torch
 )
+
+
+def _stored_format(path) -> int:
+    """Read the zarr format an array was written in, off disk."""
+    path = Path(path)
+    if (path / ".zarray").exists():
+        return json.loads((path / ".zarray").read_text())["zarr_format"]
+    return json.loads((path / "zarr.json").read_text())["zarr_format"]
+
+
+def _write_structure_tensor(zarr_path, st, chunks):
+    """Write a `structure_tensor` array the way the pipeline writes it.
+
+    Uses the package's own helpers so the store is the v2 layout the eigenanalysis
+    stage produces, on both supported zarr versions.
+    """
+    root = open_zarr_group(zarr_path, mode="w")
+    arr = create_group_array(
+        root, "structure_tensor", shape=st.shape, chunks=chunks, dtype=np.float32
+    )
+    arr[...] = st
+    return arr
 
 
 @pytest.fixture
@@ -273,7 +301,6 @@ def test_border_trim_math_matches_patch_extent():
         f"Trimmed shape {tuple(J.shape)} != expected {(1,6,*patch)}"
     )
 
-'''
 def test_eigenanalysis_right_handed_and_oriented(tmp_path):
     """
     End-to-end check of _finalize_structure_tensor_torch:
@@ -291,13 +318,7 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
 
     # Write a zarr group with 'structure_tensor'
     zarr_path = os.path.join(tmp_path, "st.zarr")
-    root = zarr.open_group(zarr_path, mode="w")
-    root.create_dataset(
-        "structure_tensor",
-        data=st,
-        chunks=(1, Z, Y, X),   # small chunks OK
-        dtype="f4"
-    )
+    _write_structure_tensor(zarr_path, st, chunks=(1, Z, Y, X))
 
     # Run eigenanalysis on CPU with small chunks
     _finalize_structure_tensor_torch(
@@ -308,6 +329,7 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
         verbose=False,
         swap_eigenvectors=False,
         device="cpu",
+        keep_eigen=True,
     )
 
     # Load results and validate
@@ -323,7 +345,6 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
     # 2) Orientation: mean x-component of first eigenvector is >= 0
     mean_x = v[0, 0, ...].mean().item()
     assert mean_x >= -1e-6, f"First eigenvector should point on average toward +X, got mean {mean_x}"
-'''
 
 def test_eigh_and_sanitize_handles_nans_infs():
     # A small batch of 3x3 matrices with NaNs/Infs
