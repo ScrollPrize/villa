@@ -37,11 +37,13 @@ _PREPARED_INPUT_FIELDS = {
     "output_winding_margin",
     "output_step_size",
     "output_num_slices_for_visualization",
-}
-
-_DENSE_LOSS_ONLY_FIELDS = {
-    "dense_spacing_density_lambda",
-    "dense_spacing_density_soft_mass_min_gap_wv",
+    # These values define the discretised outer-shell lookup/atlas. Unlike
+    # ordinary shell loss parameters they cannot be changed on an existing
+    # prepared shell.
+    "shell_num_theta_bins",
+    "shell_table_smooth_sigma_z",
+    "shell_table_smooth_sigma_theta",
+    "shell_min_confidence",
 }
 
 _SCALE_WITH_Z_FIELDS = {
@@ -85,10 +87,67 @@ _Z_RANGE_DESCRIPTIONS = {
              "rendering, and model/checkpoint z-domain compatibility.",
 }
 
-_Z_RANGE_DEPENDENCIES = [
-    "patch_pcl", "trusted_geometry", "tracks",
-    "dense_stores", "dense_losses", "shell", "preview_output",
-]
+# Configuration keys that shape the model's parameter tensors. A checkpoint
+# whose stored value for any of them differs describes a different model, and
+# is refused rather than reshaped: a domain/structure change is the explicit
+# rebuild path's job. Configuration metadata, so it lives here beside the
+# rest of it and is readable without importing the fitter.
+CHECKPOINT_MODEL_SHAPE_KEYS = (
+    "model_num_flow_integration_steps", "model_flow_integration_solver",
+    "model_num_flow_timesteps", "model_flow_bounds_z_margin",
+    "model_flow_bounds_radius", "model_flow_voxel_resolution",
+    "model_flow_field_type", "model_gap_expander_logit_resolution",
+    "model_gap_expander_num_windings", "model_linear_z_resolution",
+)
+
+
+# Configuration keys whose every consumer is built by
+# FitContext._build_model_state(). A rebuild that changes only these can keep
+# the host inputs and the dense stores and re-run the model stage alone; see
+# rebuild_stage() below and FitContext.rebuild_model_state().
+#
+# This is an audited allowlist, not a prefix rule, because two model-shaped
+# keys are read during host preparation:
+#   - model_flow_bounds_z_margin sizes the host-side ShellPolarMap that
+#     load_host_inputs() filters tracks with;
+#   - optimizer_random_seed seeds np.random and torch.random at the top of
+#     load_host_inputs() and the pool generators below it, so it reaches
+#     every RNG-order-sensitive host decision.
+# Both are therefore absent, and a key nobody has audited is absent by
+# construction — the safe answer.
+MODEL_STAGE_KEYS = frozenset({
+    "model_num_flow_integration_steps",
+    "model_flow_integration_solver",
+    "model_num_flow_timesteps",
+    "model_num_flow_stages",
+    "model_flow_bounds_radius",
+    "model_flow_voxel_resolution",
+    "model_flow_field_type",
+    "model_flow_field_high_res_lr_scale_initial",
+    "model_flow_field_high_res_lr_scale_final",
+    "model_flow_field_high_res_lr_ramp_start_step",
+    "model_flow_field_high_res_lr_ramp_steps",
+    "model_flow_field_direct_lr",
+    "model_gap_expander_logit_resolution",
+    "model_gap_expander_num_windings",
+    "model_gap_expander_lr_scale",
+    "model_linear_z_resolution",
+    "model_initial_dr_per_winding",
+    "model_sym_dirichlet_finite_difference_epsilon",
+})
+
+
+def rebuild_stage(changed_keys):
+    """The build stage a set of changed configuration keys requires.
+
+    ``"model"`` when every changed key is on MODEL_STAGE_KEYS, ``"all"``
+    otherwise. The stages are one ordinal, not a graph: "all" is the whole
+    build as it has always run, and "model" is a strict suffix of it.
+
+    Anything unrecognised falls to "all", so this fails safe: a new key gets
+    today's behaviour until somebody audits its consumers.
+    """
+    return "model" if MODEL_STAGE_KEYS.issuperset(changed_keys) else "all"
 
 
 def _runtime_impact(key):
@@ -96,32 +155,11 @@ def _runtime_impact(key):
         # Changing the z-range invalidates host inputs, dense stores, and the
         # model's flow-field domain: a new fit, never a run-boundary tweak.
         return "new_fit"
-    if key.startswith("shell_"):
-        return "shell_reload"
     if key.startswith("model_") or key == "optimizer_random_seed":
         return "new_fit"
     if key.startswith(("input_", "pcl_")) or key in _PREPARED_INPUT_FIELDS:
-        return "prepared_input_rebuild"
+        return "new_fit"
     return "run_boundary"
-
-
-def _dependencies(key):
-    if key in _Z_RANGE_DESCRIPTIONS:
-        return list(_Z_RANGE_DEPENDENCIES)
-    if key.startswith(("patch_", "pcl_")):
-        return ["patch_pcl", "trusted_geometry", "tracks"]
-    if key.startswith("track_"):
-        return ["tracks"]
-    if key.startswith("dense_"):
-        return (["dense_losses"] if key in _DENSE_LOSS_ONLY_FIELDS
-                else ["dense_stores", "dense_losses"])
-    if key.startswith("dt_"):
-        return ["patch_pcl", "tracks", "dense_losses"]
-    if key.startswith("shell_"):
-        return ["shell"]
-    if key.startswith("output_") and key != "output_save_png_visualizations":
-        return ["preview_output"]
-    return []
 
 
 def _field_spec(key, default):
@@ -148,7 +186,6 @@ def _field_spec(key, default):
         "nullable": nullable,
         "label": key.split("_", 1)[-1].replace("_", " ").title(),
         "runtime_impact": _runtime_impact(key),
-        "dependencies": _dependencies(key),
     }
     if kind in ("integer", "number"):
         spec.update(
@@ -429,16 +466,18 @@ class Config:
             path.stem: cls(path).as_dict()
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
-        # The advertised path entries derive from the declarative fit-input
-        # catalog (imported lazily: fit_session imports Config). Only inputs
-        # a resident session can take live appear; every other path change
-        # implies the prepared-input-rebuild default.
-        from fit_session import input_path_schema
-
         return {
             "defaults": defaults,
             "schema": {
-                "paths": input_path_schema(),
+                # No input path can be taken by a resident session: every path
+                # change implies a rebuild, which is the client's default for
+                # a path it finds no entry for.
+                "paths": {},
+                # The keys a rebuild can apply without reloading the session's
+                # inputs, advertised so a client can say in advance which kind
+                # of rebuild its pending changes would cause. Authoritative
+                # answers still come from the service (see rebuild_stage).
+                "model_stage_keys": sorted(MODEL_STAGE_KEYS),
                 "fields": fields,
             },
             "presets": presets,

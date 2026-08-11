@@ -64,7 +64,36 @@ from config import Config
 # The counters that remain are session_generation (session identity),
 # session_revision (configuration/input revision) and generation (status
 # ordering).
-API_VERSION = 22
+# Version 23 removes the verbs no client called — GET /logs (every line it
+# carried is already a log-kind /events record), POST /session/export-full (a
+# 501 stub) and DELETE /session/inputs/<id> (abandoned uploads expire on
+# their own) — and POST /service/restart, whose only remaining job was
+# recovering a wedged process that an operator restarts directly.
+# POST /session/save-checkpoint now takes {"name"} instead of {"path"}: a
+# checkpoint was only ever allowed under the session output directory, so
+# the service resolves it and the client stops guessing host paths.
+# POST /session/export-preview accepts and returns instead of blocking for
+# the whole export; status carries preview_exporting while it runs.
+# dataset_owned is gone from /health and /session/status: --dataset is
+# required, so it was always true.
+# Version 25 makes the startup-resolved input manifest strictly read-only.
+# Version 26 removes the stateful run-plan handshake. POST /session/run carries
+# the complete request and rejects configuration that requires a rebuild;
+# run-boundary configuration is applied directly.
+# Version 27 makes spiral-scroll.json the only source of the facts it carries.
+# The run block no longer carries scroll_name, voxel_size_um, lasagna_group or
+# lasagna_scale, and a request that names any of them is rejected. Each
+# restated something the dataset root already specifies and silently won over
+# it, so a client could mislabel outputs, scale a fit against a resolution the
+# dataset contradicts, or read the Lasagna stores at the wrong zarr level.
+# Version 28 gives a rebuild two stages and folds the checkpoint rebuild into
+# the load. POST /session/rebuild reports the "stage" it took ("model" keeps
+# the loaded inputs and the brick pools; "all" is the whole build), and
+# /configuration advertises schema.model_stage_keys so a client can say in
+# advance which it would get. POST /session/load-checkpoint takes
+# "allow_rebuild", and its 409 carries the preflight's "reasons" with either
+# the "stage" a rebuild would need or "refused" when none would help.
+API_VERSION = 28
 
 
 class SessionState(str, Enum):
@@ -105,12 +134,11 @@ SESSION_BUSY_STATES = frozenset({
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
     fields = Config.catalog()["schema"]["fields"]
     return {key: value for key, value in config.items()
-            if fields[key]["runtime_impact"] in {"run_boundary", "shell_reload"}}
+            if fields[key]["runtime_impact"] == "run_boundary"}
 
 
 class PclRole(str, Enum):
     ABSOLUTE = "absolute"
-    PATCH_OVERLAP = "patch_overlap"
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
     DRAWN_CONTROL_POINTS = "drawn_control_points"
@@ -122,16 +150,11 @@ class PclRole(str, Enum):
 #
 # One description of every fit input, consumed by request validation
 # (validate_session_request), dataset resolution (resolve_dataset_root /
-# conventional_input_paths), run planning (spiral_service.plan_run), and the
-# resident fitter's impact analysis (FitContext.apply_config). Each entry
-# records the input's path kind, its enabling/required predicates over the
-# run configuration, what must be rebuilt when the path changes, and whether
-# a change breaks checkpoint compatibility.
-
-# A path change whose input has no specific rebuild scope invalidates every
-# prepared-input family: the session must be reloaded with fresh host inputs.
-FULL_REBUILD_DEPENDENCIES = (
-    "dense_stores", "patch_pcl", "tracks", "shell", "preview_output")
+# conventional_input_paths) and run admission
+# (spiral_service.ServiceState.run). Each entry records the input's path kind
+# and its enabling/required predicates over the run configuration. Fit-input
+# paths are static for the lifetime of a resident session, so an entry says
+# nothing about rebuild scope: changing any of them rebuilds the session.
 
 
 def _always(config: Mapping[str, Any]) -> bool:
@@ -198,11 +221,6 @@ class FitInputSpec:
     enabled: Callable[[Mapping[str, Any]], bool] = _always
     # required(config): the input must exist for this configuration.
     required: Callable[[Mapping[str, Any]], bool] = _never
-    # What a path change invalidates on a resident session:
-    # "prepared_input_rebuild" reloads host inputs (session reload);
-    # "shell_reload" rebuilds device shell state at a run boundary.
-    runtime_impact: str = "prepared_input_rebuild"
-    dependencies: tuple[str, ...] = FULL_REBUILD_DEPENDENCIES
     # Whether changing the input breaks checkpoint compatibility. No fit
     # input does today: the checkpoint domain is set by "new_fit" config
     # keys (z-range, model shape, optimizer seed), never by an input path.
@@ -222,8 +240,7 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("fibers", "directory", conventional_relative="fibers"),
     FitInputSpec("outer_shell", "directory",
                  conventional_relative="outer_shell",
-                 required=_shell_losses_enabled,
-                 runtime_impact="shell_reload", dependencies=("shell",)),
+                 required=_shell_losses_enabled),
     FitInputSpec("tracks_dbm", "dbm",
                  conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm"),
     FitInputSpec("pcls", "pcl-set", json_content=True),
@@ -248,43 +265,18 @@ def fit_input(key: str) -> FitInputSpec | None:
     return _FIT_INPUTS_BY_KEY.get(key)
 
 
-def input_change_impact(key: str) -> tuple[str, list[str]]:
-    """Rebuild scope of changing one input path on a resident session.
-
-    Unknown keys get the conservative full-rebuild scope, exactly as run
-    planning has always treated paths it had no specific knowledge of.
-    """
-    spec = _FIT_INPUTS_BY_KEY.get(key)
-    if spec is None:
-        return "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES)
-    return spec.runtime_impact, list(spec.dependencies)
-
-
-def input_path_schema() -> dict[str, dict[str, Any]]:
-    """Path entries advertised in the configuration catalog schema.
-
-    Only inputs a resident session can take live (without a session reload)
-    are advertised; everything else uses the implicit
-    prepared-input-rebuild default.
-    """
-    return {
-        spec.key: {"runtime_impact": spec.runtime_impact,
-                   "dependencies": list(spec.dependencies)}
-        for spec in FIT_INPUT_CATALOG
-        if spec.runtime_impact != "prepared_input_rebuild"
-    }
-
-
-# PCL point-collection inputs: (role, conventional filename, discovered).
-# "discovered" = resolve_dataset_root probes for the file; patch-overlap
-# collections are conventional for the headless CLI but are not advertised
-# by dataset resolution (matching the historical maps).
-PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str, bool], ...] = (
-    (PclRole.ABSOLUTE, "abs_winding.json", True),
-    (PclRole.PATCH_OVERLAP, "patch-overlap-pcls.json", False),
-    (PclRole.RELATIVE, "relative_windings.json", True),
-    (PclRole.SAME_WINDING, "same_windings.json", True),
-    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", True),
+# PCL point-collection inputs: (role, conventional filename). One filename
+# per role serves both directions: dataset resolution probes for it, and
+# committing an uploaded collection of that role merges into it. Every role
+# is discovered by resolve_dataset_root and listed by
+# conventional_input_paths; an absent file is simply skipped at load time
+# (load_point_collection warns and continues), since all of these are
+# optional annotations.
+PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str], ...] = (
+    (PclRole.ABSOLUTE, "abs_winding.json"),
+    (PclRole.RELATIVE, "relative_windings.json"),
+    (PclRole.SAME_WINDING, "same_windings.json"),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json"),
 )
 
 
@@ -349,14 +341,29 @@ class SpiralInputPaths:
         return result
 
 
+# Run-block keys the scroll specification owns, mapped to the ScrollSpec field
+# each one used to shadow. A request that carries one is rejected rather than
+# ignored: silently dropping it would let a client believe it had renamed a
+# scroll, changed its resolution, or moved the Lasagna stores.
+SCROLL_SPEC_OWNED_RUN_KEYS = {
+    "scroll_name": "name",
+    "voxel_size_um": "voxel_size_um",
+    "lasagna_group": "normal_zarr_group",
+    "lasagna_scale": "lasagna_scale",
+}
+
+
 @dataclass(frozen=True)
 class SpiralRunConfig:
+    """Deployment and presentation settings of one fit run.
+
+    Nothing spiral-scroll.json specifies is here — not the scroll's physical
+    facts (name, voxel size, outward sense) and not the dataset's Lasagna store
+    layout. That file is the single source for all of it (see ``ScrollSpec``).
+    """
+
     z_begin: int
     z_end: int
-    scroll_name: str = "scroll"
-    voxel_size_um: float = 9.6
-    lasagna_group: str = "4"
-    lasagna_scale: int = 4
     storage_backend: str = "sparse_cuda"
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
@@ -368,10 +375,6 @@ class SpiralRunConfig:
         return cls(
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
-            scroll_name=str(value.get("scroll_name", "scroll")),
-            voxel_size_um=float(value.get("voxel_size_um", 9.6)),
-            lasagna_group=str(value.get("lasagna_group", "4")),
-            lasagna_scale=int(value.get("lasagna_scale", 4)),
             storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
@@ -449,7 +452,7 @@ _CONVENTIONAL_INPUT_RELATIVES = {
 }
 
 _CONVENTIONAL_PCL_INPUTS = tuple(
-    (filename, role) for role, filename, _ in PCL_ROLE_CONVENTIONS)
+    (filename, role) for role, filename in PCL_ROLE_CONVENTIONS)
 
 
 class ScrollSpecError(ValueError):
@@ -955,9 +958,7 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append(input_spec.key)
 
-    for role, relative, discovered in PCL_ROLE_CONVENTIONS:
-        if not discovered:
-            continue
+    for role, relative in PCL_ROLE_CONVENTIONS:
         candidate = root / relative
         if candidate.is_file() and os.access(candidate, os.R_OK):
             result.pcl_inputs.append({
@@ -1083,8 +1084,6 @@ def validate_session_request(
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
-    if run.lasagna_scale <= 0:
-        errors.append({"field": "lasagna_scale", "message": "Must be positive"})
     if run.storage_backend != "sparse_cuda":
         errors.append({
             "field": "storage_backend",

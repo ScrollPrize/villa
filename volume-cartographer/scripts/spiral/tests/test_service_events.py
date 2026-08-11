@@ -176,13 +176,8 @@ class EventIngestTests(unittest.TestCase):
         logs.write("stdout", "PROGRESS Optimizing — 1/10 iterations\n")
         logs.write("stdout", "step 200: loss = 12.5, patch = 3.0\n")
         logs.write("stdout", "useful fitter output\n")
-        # The /logs compatibility relay keeps every console line…
-        self.assertEqual(
-            [entry["text"] for entry in logs.read_after(0)["entries"]],
-            ["PROGRESS Optimizing — 1/10 iterations",
-             "step 200: loss = 12.5, patch = 3.0",
-             "useful fitter output"])
-        # …but only lines not covered by structured records become events.
+        # Only lines not already covered by structured progress/metric
+        # records become log events.
         log_events = [record for record in events.read_after(0)["events"]
                       if record["kind"] == "log"]
         self.assertEqual([record["text"] for record in log_events],
@@ -315,17 +310,16 @@ class EventHttpTests(HttpServiceFixture):
         self.assertEqual([e["text"] for e in page["events"]], ["0", "1"])
         self.assertEqual(page["latest_sequence"], 3)
 
-    def test_logs_endpoint_schema_is_unchanged(self):
+    def test_console_lines_reach_clients_only_as_log_events(self):
+        """The tee has no relay of its own; /events is the whole surface."""
+        self.assertEqual(self.request("GET", "/logs?after=0")[0], 404)
         self.state.logs.write("stdout", "hello\n")
-        status, payload, _ = self.request("GET", "/logs?after=0")
+        status, payload, _ = self.request("GET", "/events?cursor=0")
         self.assertEqual(status, 200)
-        response = json.loads(payload)
-        self.assertEqual(set(response),
-                         {"entries", "next_sequence", "latest_sequence",
-                          "dropped", "cursor_reset"})
-        self.assertEqual(set(response["entries"][0]),
-                         {"sequence", "stream", "text"})
-        self.assertEqual(response["entries"][0]["text"], "hello")
+        records = [record for record in json.loads(payload)["events"]
+                   if record["kind"] == "log"]
+        self.assertEqual([record["text"] for record in records], ["hello"])
+        self.assertEqual(records[0]["source"], "stdout")
 
 
 if __name__ == "__main__":

@@ -104,10 +104,17 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
+# How long one requested preview export may take. The window covers the whole
+# operation, not just the render: the host service Lasagna-flattens and hashes
+# the generation synchronously from the status callback, inside the session's
+# ExportingPreview window. Exceeding it reports a failure for an export that
+# usually goes on to publish anyway, so it is sized for the largest fits.
+PREVIEW_EXPORT_TIMEOUT_S = 1200.0
+
 
 # All-rank commands that only a rank with nothing outstanding may enter.
 _QUIESCENT_COMMANDS = frozenset({
-    "run", "preflight_checkpoint", "apply_checkpoint",
+    "run", "preflight_checkpoint", "apply_checkpoint", "rebuild_model",
 })
 
 
@@ -376,6 +383,21 @@ class ConfigureCommand(SessionCommand):
 
 
 @dataclasses.dataclass
+class RebuildModelCommand(SessionCommand):
+    """Replace the model stage without reloading the session's inputs.
+
+    Carries the request the rebuilt session is to be resolved from, because
+    the whole point is that the configuration changes: the fitter thread
+    installs these and re-derives its applied configuration from them.
+    """
+
+    kind: ClassVar[str] = "rebuild_model"
+
+    paths: Any = None
+    run: Any = None
+
+
+@dataclasses.dataclass
 class IncorporateCommand(SessionCommand):
     """Append newly uploaded ephemeral inputs to the resident fit."""
 
@@ -459,6 +481,10 @@ class InteractiveFitSession:
         self.world_size = int(world_size)
         self.local_rank = int(local_rank)
         self._rendezvous = rendezvous
+        # The world size the fitter thread actually joined, which is what
+        # per-rank count splitting divides by. Set once the process group
+        # exists; until then nothing resolves a configuration.
+        self._dist_world_size = self.world_size
         self.paths = paths
         self.run_config = run
         self.scroll = scroll
@@ -665,7 +691,6 @@ class InteractiveFitSession:
             from ddp_helpers import (DistributedContext,
                                      maybe_destroy_distributed,
                                      maybe_init_distributed)
-            from spiral_helpers import scale_and_split_counts
 
             # Explicit identity, and an endpoint the parent owns for the whole
             # session: no environment lookup and no free-port race.
@@ -675,129 +700,16 @@ class InteractiveFitSession:
                                    local_rank=self.local_rank),
                 rendezvous=self._rendezvous)
 
-
-            config = Config().as_dict()
-            checkpoint_profile_config = None
-            if self.paths.checkpoint:
-                self._progress_reporter().begin(
-                    "loading", "Reading checkpoint configuration",
-                    detail=Path(self.paths.checkpoint).name)
-                from checkpoint_io import load_checkpoint_cpu
-                checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
-                try:
-                    if not isinstance(checkpoint_config, dict) or not isinstance(
-                            checkpoint_config.get('cfg'), Mapping):
-                        raise ValueError("Checkpoint has no current Spiral configuration")
-                    durable = dict(checkpoint_config['cfg'])
-                    # Checkpoints store the durable subset of the schema
-                    # (see config.durable_config), so key sets compare
-                    # against that subset. z_begin/z_end joined the schema
-                    # after many checkpoints were written: a stored cfg
-                    # lacking exactly those keys is accepted with defaults
-                    # from the session request; every other key-set
-                    # mismatch stays a strict error.
-                    durable_schema = set(durable_config(config))
-                    missing = durable_schema - set(durable)
-                    if set(durable) - durable_schema or missing - {"z_begin", "z_end"}:
-                        raise ValueError(
-                            "Checkpoint configuration does not match the current schema")
-                    if missing:
-                        assumed = {
-                            "z_begin": int(self.run_config.z_begin),
-                            "z_end": int(self.run_config.z_end),
-                        }
-                        durable.update(
-                            {key: assumed[key] for key in missing})
-                        warning = (
-                            f"Checkpoint {self.paths.checkpoint} predates "
-                            "z_begin/z_end in the stored configuration; "
-                            "assuming "
-                            + ", ".join(f"{key}={assumed[key]}"
-                                        for key in sorted(missing))
-                            + " from the session request")
-                        print(warning)
-                        with self._condition:
-                            self._warnings.append(warning)
-                    durable = Config(durable).as_dict()
-                    # The optimisation z window is owned by the session
-                    # request; the checkpoint's stored range only documents
-                    # what it trained with.
-                    durable["z_begin"] = int(self.run_config.z_begin)
-                    durable["z_end"] = int(self.run_config.z_end)
-                    config.update(durable)
-                    # The session-scoped profile initially reproduces the
-                    # checkpoint without applying scaling twice.
-                    checkpoint_profile_config = copy.deepcopy(durable)
-                finally:
-                    # This first load exists only to resolve configuration.  Do
-                    # not retain a complete model + optimiser checkpoint for the
-                    # lifetime of the resident fitter thread.
-                    del checkpoint_config
-            # The session request's z window is authoritative for this fit,
-            # both for the applied configuration and the Default profile.
-            config["z_begin"] = int(self.run_config.z_begin)
-            config["z_end"] = int(self.run_config.z_end)
-            unknown = sorted(set(self.run_config.config) - set(config))
-            if unknown:
-                raise ValueError(f"Unknown advanced config keys: {unknown}")
-            if checkpoint_profile_config is not None:
-                default_advanced_config = checkpoint_profile_config
-            else:
-                # Without a checkpoint, Default is the Python baseline.
-                default_advanced_config = copy.deepcopy(config)
-            # Explicit sample-count overrides are literal active counts. This
-            # lets VC3D round-trip the host's post-scaling values through a
-            # reload without applying the z-range/DDP transforms twice.
-            # Checkpoint cfg values are resolved fitter values too, so give
-            # their counts the same treatment.
-            explicit_sampling_counts = {
-                key: value for key, value in (checkpoint_profile_config or {}).items()
-                if key.startswith("sample_count_")
-            }
-            explicit_sampling_counts.update({
-                key: value for key, value in self.run_config.config.items()
-                if key.startswith("sample_count_")
-            })
-            config.update(self.run_config.config)
-            config["z_begin"] = int(self.run_config.z_begin)
-            config["z_end"] = int(self.run_config.z_end)
-            fields = Config.catalog()["schema"]["fields"]
-            count_keys = tuple(
-                key for key, spec in fields.items() if spec.get("scale_with_z"))
-            scale_and_split_counts(
-                config, self.run_config.z_begin, self.run_config.z_end,
-                count_keys, world_size=dist_context.world_size)
-            if checkpoint_profile_config is None:
-                scale_and_split_counts(
-                    default_advanced_config, self.run_config.z_begin,
-                    self.run_config.z_end, count_keys,
-                    world_size=dist_context.world_size)
-            config.update(explicit_sampling_counts)
-            self.requested_config = dict(config)
-            with self._condition:
-                self._applied_config = copy.deepcopy(config)
-                self._run_config = run_mutable_config(config)
-                self._run_config_limits = {
-                    'track_max_track_crossing_per_step': max(
-                        int(config.get('track_crossing_precompute_max', 0)),
-                        int(config.get('track_max_track_crossing_per_step', 0))),
-                }
-                self._default_advanced_config = default_advanced_config
-            self._publish_status()
+            self._dist_world_size = dist_context.world_size
+            config = self._resolve_session_config(self._dist_world_size)
 
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._transition(SessionState.Loading, "Loading fit inputs and model")
-            # The scroll specification supplies the physical facts (including
-            # the outward sense, which is not part of the load request). The
-            # session request may still override the request-carried scroll
-            # values it historically owned.
-            scroll = dataclasses.replace(
-                self.scroll,
-                name=self.run_config.scroll_name,
-                voxel_size_um=self.run_config.voxel_size_um,
-                normal_zarr_group=self.run_config.lasagna_group,
-                lasagna_scale=self.run_config.lasagna_scale,
-            )
+            # The scroll specification is used exactly as the dataset root
+            # states it: its physical facts (name, resolution, outward sense)
+            # and its Lasagna store layout. A session request may not restate
+            # any of them, so there is nothing left here to override.
+            scroll = self.scroll
             # The runtime is the execution owner of the context: it constructs
             # it, drives every phase on this fitter thread, and closes it.
             # Configuration, the scroll facts, the resolved input paths, and
@@ -840,6 +752,129 @@ class InteractiveFitSession:
             if dist_context is not None:
                 maybe_destroy_distributed(dist_context)
             self._progress_reporter().close()
+
+    def _resolve_session_config(self, world_size):
+        """Resolve this session's fitter configuration and publish it.
+
+        The one place a session's applied configuration is derived, so a
+        model-stage rebuild reproduces exactly the chain the initial build
+        ran: the Python defaults, the resume checkpoint's stored ``cfg``, the
+        request's advanced overrides, z-range/DDP count scaling, and finally
+        the explicit sample counts that must not be scaled twice. It reads
+        ``self.paths`` and ``self.run_config``, so replacing either and
+        calling it again is all a rebuild needs.
+        """
+        from spiral_helpers import scale_and_split_counts
+
+        config = Config().as_dict()
+        checkpoint_profile_config = None
+        if self.paths.checkpoint:
+            self._progress_reporter().begin(
+                "loading", "Reading checkpoint configuration",
+                detail=Path(self.paths.checkpoint).name)
+            from checkpoint_io import load_checkpoint_cpu
+            checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
+            try:
+                if not isinstance(checkpoint_config, dict) or not isinstance(
+                        checkpoint_config.get('cfg'), Mapping):
+                    raise ValueError("Checkpoint has no current Spiral configuration")
+                durable = dict(checkpoint_config['cfg'])
+                # Checkpoints store the durable subset of the schema
+                # (see config.durable_config), so key sets compare
+                # against that subset. z_begin/z_end joined the schema
+                # after many checkpoints were written: a stored cfg
+                # lacking exactly those keys is accepted with defaults
+                # from the session request; every other key-set
+                # mismatch stays a strict error.
+                durable_schema = set(durable_config(config))
+                missing = durable_schema - set(durable)
+                if set(durable) - durable_schema or missing - {"z_begin", "z_end"}:
+                    raise ValueError(
+                        "Checkpoint configuration does not match the current schema")
+                if missing:
+                    assumed = {
+                        "z_begin": int(self.run_config.z_begin),
+                        "z_end": int(self.run_config.z_end),
+                    }
+                    durable.update(
+                        {key: assumed[key] for key in missing})
+                    warning = (
+                        f"Checkpoint {self.paths.checkpoint} predates "
+                        "z_begin/z_end in the stored configuration; "
+                        "assuming "
+                        + ", ".join(f"{key}={assumed[key]}"
+                                    for key in sorted(missing))
+                        + " from the session request")
+                    print(warning)
+                    with self._condition:
+                        self._warnings.append(warning)
+                durable = Config(durable).as_dict()
+                # The optimisation z window is owned by the session
+                # request; the checkpoint's stored range only documents
+                # what it trained with.
+                durable["z_begin"] = int(self.run_config.z_begin)
+                durable["z_end"] = int(self.run_config.z_end)
+                config.update(durable)
+                # The session-scoped profile initially reproduces the
+                # checkpoint without applying scaling twice.
+                checkpoint_profile_config = copy.deepcopy(durable)
+            finally:
+                # This first load exists only to resolve configuration.  Do
+                # not retain a complete model + optimiser checkpoint for the
+                # lifetime of the resident fitter thread.
+                del checkpoint_config
+        # The session request's z window is authoritative for this fit,
+        # both for the applied configuration and the Default profile.
+        config["z_begin"] = int(self.run_config.z_begin)
+        config["z_end"] = int(self.run_config.z_end)
+        unknown = sorted(set(self.run_config.config) - set(config))
+        if unknown:
+            raise ValueError(f"Unknown advanced config keys: {unknown}")
+        if checkpoint_profile_config is not None:
+            default_advanced_config = checkpoint_profile_config
+        else:
+            # Without a checkpoint, Default is the Python baseline.
+            default_advanced_config = copy.deepcopy(config)
+        # Explicit sample-count overrides are literal active counts. This
+        # lets VC3D round-trip the host's post-scaling values through a
+        # reload without applying the z-range/DDP transforms twice.
+        # Checkpoint cfg values are resolved fitter values too, so give
+        # their counts the same treatment.
+        explicit_sampling_counts = {
+            key: value for key, value in (checkpoint_profile_config or {}).items()
+            if key.startswith("sample_count_")
+        }
+        explicit_sampling_counts.update({
+            key: value for key, value in self.run_config.config.items()
+            if key.startswith("sample_count_")
+        })
+        config.update(self.run_config.config)
+        config["z_begin"] = int(self.run_config.z_begin)
+        config["z_end"] = int(self.run_config.z_end)
+        fields = Config.catalog()["schema"]["fields"]
+        count_keys = tuple(
+            key for key, spec in fields.items() if spec.get("scale_with_z"))
+        scale_and_split_counts(
+            config, self.run_config.z_begin, self.run_config.z_end,
+            count_keys, world_size=world_size)
+        if checkpoint_profile_config is None:
+            scale_and_split_counts(
+                default_advanced_config, self.run_config.z_begin,
+                self.run_config.z_end, count_keys,
+                world_size=world_size)
+        config.update(explicit_sampling_counts)
+        self.requested_config = dict(config)
+        with self._condition:
+            self._applied_config = copy.deepcopy(config)
+            self._run_config = run_mutable_config(config)
+            self._run_config_limits = {
+                'track_max_track_crossing_per_step': max(
+                    int(config.get('track_crossing_precompute_max', 0)),
+                    int(config.get('track_max_track_crossing_per_step', 0))),
+            }
+            self._default_advanced_config = default_advanced_config
+        self._publish_status()
+        return config
 
     # Fitter-thread session driver.
     def _session_ready(self, context):
@@ -916,6 +951,11 @@ class InteractiveFitSession:
                 continue
             if isinstance(command, ConfigureCommand):
                 self._run_configuration(command)
+                continue
+            if isinstance(command, RebuildModelCommand):
+                # Not guarded past the point of release, for the same reason
+                # apply_checkpoint is not: see _run_model_rebuild.
+                self._run_model_rebuild(command)
                 continue
             if isinstance(command, PreflightCheckpointCommand):
                 self._run_checkpoint_preflight(command)
@@ -1226,6 +1266,79 @@ class InteractiveFitSession:
             else:
                 self._progress_reporter().clear()
 
+    def _run_model_rebuild(self, command):
+        """Rebuild the model stage in place, on the fitter thread.
+
+        The session object, its thread, its output directory, its loaded host
+        inputs and its brick pools all survive; the model, optimiser,
+        scheduler and everything constructed after them are replaced from the
+        request this command carries, and the session's iteration returns to
+        whatever the rebuilt model resumed from — the state a full rebuild
+        with the same request would have left.
+
+        Resolving the new configuration can fail, and does so harmlessly: the
+        live model is still the one the session had. From the moment
+        rebuild_model_state() releases it there is no unchanged session left
+        to refuse into, so a failure there is re-raised and takes the fitter
+        thread (and, under DDP, its siblings) down rather than leaving a rank
+        without a model.
+        """
+        try:
+            if self._context is None:
+                raise RuntimeError(
+                    "The resident fitter does not support rebuilding the model")
+            with self._condition:
+                self._transition_locked(
+                    SessionState.Loading, "Rebuilding the model",
+                    reason=f"model rebuild {command.command_id}")
+            self._publish_status()
+            self._progress_reporter().begin("loading", "Rebuilding the model")
+            paths, run = command.paths, command.run
+            previous_paths, previous_run = self.paths, self.run_config
+            self.paths, self.run_config = paths, run
+            try:
+                config = self._resolve_session_config(self._dist_world_size)
+            except BaseException:
+                self.paths, self.run_config = previous_paths, previous_run
+                self._resolve_session_config(self._dist_world_size)
+                raise
+        except Exception as exc:
+            self._progress_reporter().clear()
+            with self._condition:
+                self._warnings.append(f"Model rebuild failed: {exc}")
+                self._transition_locked(
+                    SessionState.Idle, IDLE_PHASE,
+                    reason="model rebuild refused")
+            command.fail(f"{type(exc).__name__}: {exc}")
+            self._publish_status()
+            return
+        context = self._context
+        context.config.update(config)
+        context.paths = paths
+        context.resume_path = paths.checkpoint or None
+        context.resume_step = (run.legacy_checkpoint_step
+                               if paths.checkpoint else 0)
+        try:
+            context.rebuild_model_state()
+        except BaseException as exc:
+            error = (f"Rebuilding the model failed after the previous one was "
+                     f"released; this session has no model: "
+                     f"{type(exc).__name__}: {exc}")
+            command.fail(error)
+            raise RuntimeError(error) from exc
+        self._progress_reporter().clear()
+        with self._condition:
+            self.input_manifest = paths.manifest()
+            self._completed = self._target = context.start_iteration
+            self._pending = 0
+            self._config_revision += 1
+            if command.epoch is not None:
+                self._step_config_revision = self._config_revision
+            self._transition_locked(SessionState.Idle, IDLE_PHASE)
+        command.complete(config_revision=self._config_revision,
+                         current_iteration=context.start_iteration)
+        self._publish_status()
+
     def _begin_optimization_progress(self):
         with self._condition:
             run_start = getattr(
@@ -1417,6 +1530,25 @@ class InteractiveFitSession:
             raise RuntimeError(command.error)
         return dict(command.result)
 
+    def rebuild_model(self, paths, run, timeout=1800.0, barrier=None):
+        """Rebuild the model stage of this rank against retained inputs.
+
+        Valid only in Idle, like every other command that replaces the
+        resident model.
+        """
+        with self._condition:
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Rebuilding the model is not allowed while session state "
+                    f"is {self._state.name}")
+            epoch = self._enter_epoch_locked("rebuild_model", barrier)
+            command = RebuildModelCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed,
+                expected_config_revision=self._config_revision,
+                paths=paths, run=run)
+        return self._queue_command(command, timeout)
+
     def preflight_checkpoint(self, path, timeout=600.0, barrier=None):
         """Phase 1 of an in-session load, on this rank.
 
@@ -1456,7 +1588,7 @@ class InteractiveFitSession:
                 session_generation=self.session_generation, epoch=epoch)
         return self._queue_command(command, timeout)
 
-    def export_preview(self, timeout=600.0):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
         """Export and publish one preview generation, on request.
 
         A coordinator sub-operation: only the publishing rank exports, so it
@@ -1559,7 +1691,11 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
                     result = session.export_preview(
-                        arguments.get("timeout", 600.0))
+                        arguments.get("timeout", PREVIEW_EXPORT_TIMEOUT_S))
+                elif name == "rebuild_model":
+                    result = session.rebuild_model(
+                        arguments["paths"], arguments["run"],
+                        arguments.get("timeout", 1800.0), barrier=barrier)
                 elif name == "preflight_checkpoint":
                     result = session.preflight_checkpoint(
                         arguments["path"], arguments.get("timeout", 600.0),
@@ -2016,7 +2152,7 @@ class DistributedInteractiveFitSession:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
 
-    def export_preview(self, timeout=600.0):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Preview export is not allowed in {state}")
@@ -2025,6 +2161,16 @@ class DistributedInteractiveFitSession:
         return self._call("export_preview", {"timeout": timeout}, ranks=(0,),
                           timeout=timeout + COMMAND_ACK_GRACE_S,
                           collective=False)
+
+    def rebuild_model(self, paths, run, timeout=1800.0):
+        """Rebuild the model stage on every rank against retained inputs."""
+        state = self.status()["state"]
+        if state != SessionState.Idle:
+            raise RuntimeError(
+                f"Rebuilding the model is not allowed in {state}")
+        return self._call("rebuild_model",
+                          {"paths": paths, "run": run, "timeout": timeout},
+                          timeout=timeout + COMMAND_ACK_GRACE_S)
 
     def load_checkpoint(self, path, timeout=600.0):
         """Coordinate a strict two-phase checkpoint load across every rank.

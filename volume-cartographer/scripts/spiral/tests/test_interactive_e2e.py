@@ -51,8 +51,6 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 "outer_shell": f"{DATASET}/outer_shell",
                 "pcls": [
                     {"path": f"{DATASET}/abs_winding.json", "role": "absolute"},
-                    {"path": f"{DATASET}/patch-overlap-pcls.json",
-                     "role": "patch_overlap"},
                     {"path": f"{DATASET}/relative_windings.json",
                      "role": "relative"},
                     {"path": f"{DATASET}/same_windings.json",
@@ -68,7 +66,6 @@ class InteractiveEndToEndTests(unittest.TestCase):
             run = SpiralRunConfig.from_mapping({
                 "z_begin": 10_000,
                 "z_end": 11_000,
-                "scroll_name": "s1",
                 "config": {
                     "dense_spacing_mode": "grad_mag",
                     "loss_weight_dense_spacing_density": 0.0,

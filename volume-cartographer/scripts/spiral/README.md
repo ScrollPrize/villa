@@ -216,10 +216,18 @@ populate read-only from the service's advertised dataset resolution; run
 parameters (z range, iterations, advanced config) stay editable and persist
 per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
-filesystem is needed. Optional: set the profile's path map
-(service prefix → local prefix) if this machine mounts the same dataset, so
-input surface overlays (verified/unverified/shell) can be displayed locally;
-without a mapping those overlays are simply marked unavailable.
+filesystem is needed. Optional: set the profile's **Local dataset path** if
+this machine mounts the same dataset, so input surface overlays
+(verified/unverified/shell) can be displayed locally. It is assumed to
+correspond to the dataset root the service advertises, which is the prefix
+service paths are translated from; without it those overlays are simply marked
+unavailable.
+
+`spiral-scroll.json` in the dataset root is the only source of the scroll's
+name and voxel resolution and of the Lasagna store layout (zarr groups,
+coordinate scale). None of them are panel settings: the panel reports them
+read-only, and the service rejects a session request that carries
+`scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
 
 While a session is active you can right-click a patch in the Surface panel or
 a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
@@ -238,16 +246,30 @@ without reloading the resident session. The **Disable DT** percentage controls
 how much of that run suppresses directional DT losses after incorporating its
 pending inputs.
 
-**Resume checkpoints on a remote profile:** the Checkpoint field accepts a
-service-advertised checkpoint (a `*.ckpt` at the dataset root), a service path
-under the output directory (for example the autosave), or a **client-local
-`.ckpt` file** — use the browse button. A local file is uploaded to the
-service's `<output>/uploaded-checkpoints/` directory before the session loads
-(the panel shows progress; the transfer restarts if interrupted). Checkpoints
-are identified by SHA-256, so selecting content the service already retains
-reuses it without transferring the file again. The service validates new
-archives and keeps the newest few unique uploaded checkpoints. To bring a fit
-result back to the client, use *Download Checkpoint…*.
+**Checkpoints** are one panel section, and loading one is one button. It lists
+what the service advertises (checkpoints at the dataset root, and those under
+the output directory such as the autosave) plus any **client-local `.ckpt`**
+you browse for; a local file is uploaded to the service's
+`<output>/uploaded-checkpoints/` directory on the way (the panel shows
+progress and the transfer restarts if interrupted). Checkpoints are identified
+by SHA-256, so choosing content the service already retains reuses it without
+transferring the file again, and the service validates new archives and keeps
+the newest few unique uploads.
+
+*Load* replaces the resident model's weights, optimiser and RNG state in
+place. When the checkpoint does not match the live model the service refuses
+it and says what a rebuild would have to replace: rebuilding the **model only**
+keeps the loaded dataset inputs and everything already added to the fit, while
+a **whole-fit** rebuild re-reads the dataset and discards added inputs that
+were never committed. The panel reports the reasons and asks; a checkpoint no
+rebuild can accept — one written against another dataset, or against a
+configuration schema this service does not have — is reported and nothing is
+offered. A checkpoint-backed session takes its durable configuration from the
+checkpoint, so the local advanced-config profile does not override it.
+
+The section also holds *Save on Service* and *Download…*, and reports the
+checkpoint the resident fit was actually built from. That report is read-only:
+it is not a field, and a rebuild carries it forward by itself.
 
 ### Shutdown and logs
 

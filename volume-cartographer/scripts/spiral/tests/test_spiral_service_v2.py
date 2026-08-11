@@ -45,11 +45,12 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             parse_session_name)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
+                         SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, SessionState, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import Config
+from config import Config, durable_config
 
 
 class FakeSession:
@@ -71,6 +72,10 @@ class FakeSession:
             "track_min_walks_per_track": 2,
             "track_max_walks_per_track": 4,
         }
+        # The resolved configuration the fit is running, as a real session
+        # publishes it once it has one; a checkpoint refusal is analysed
+        # against this.
+        self.applied_config = None
         self.default_advanced_config = {
             "optimizer_learning_rate": 3e-5,
             "sample_count_patches_per_step": 360,
@@ -82,14 +87,20 @@ class FakeSession:
         self.saved = []
         self.autosave_calls = []
         self.previews = 0
+        self.preview_gate = None
+        self.preview_failure = None
         self.loaded = []
         self.load_refusal = None
         self.closed = False
         self.path_change_calls = []
+        self.model_rebuilds = []
         self.progress = None
 
     def status(self):
+        applied = ({"applied_config": dict(self.applied_config)}
+                   if self.applied_config is not None else {})
         return {
+            **applied,
             "state": self.state, "phase": str(self.state),
             "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
@@ -125,9 +136,19 @@ class FakeSession:
                 "path": path}
 
     def export_preview(self, timeout=600.0):
+        # The real export blocks its caller for minutes; these let a test
+        # hold it open, or fail it, the way a real one can.
+        if self.preview_gate is not None:
+            self.preview_gate.wait(5)
+        if self.preview_failure is not None:
+            raise RuntimeError(self.preview_failure)
         self.previews += 1
         return {"preview_generation": self.previews,
                 "preview_manifest_path": f"/preview/{self.previews}"}
+
+    def rebuild_model(self, paths, run, timeout=1800.0):
+        self.model_rebuilds.append((paths, run))
+        return {"config_revision": 1, "current_iteration": 0}
 
     def close(self):
         self.closed = True
@@ -237,13 +258,13 @@ class ProgressStatusTests(unittest.TestCase):
 def _planned_run(state, request):
     request = dict(request)
     configuration = Config(request.pop("run_config", {})).as_dict()
-    plan = state.plan_run({
+    return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
         "influence": request.pop("influence_config", {}),
         "expected_session_revision": state.session_revision,
+        **request,
     })
-    return state.run({"plan_token": plan["plan_token"], **request})
 
 
 def _digest(data):
@@ -269,7 +290,7 @@ def _commit_pcl_process(dataset, output, input_id, ready, start, result):
         state = ServiceState()
         _attach_fake_session(state, output, dataset)
         upload_id = _upload_input(
-            state, "pcl", input_id, PCL_FILES, role="patch_overlap")
+            state, "pcl", input_id, PCL_FILES, role="relative")
         state.finalize_upload(upload_id)
         ready.put(input_id)
         if not start.wait(10):
@@ -439,33 +460,6 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertIn("process_id", health)
         self.assertNotIn("service_generation", health)
         self.assertNotIn("command_generation", health)
-
-
-class RestartTests(HttpServiceFixture):
-    def test_restart_requires_authentication_and_command_id(self):
-        status, _, _ = self.request(
-            "POST", "/service/restart", token=None,
-            body={"command_id": "restart-1"})
-        self.assertEqual(status, 401)
-        self.assertFalse(self.server.restart_requested.is_set())
-
-        status, payload, _ = self.request("POST", "/service/restart", body={})
-        self.assertEqual(status, 400)
-        self.assertIn("command_id", json.loads(payload)["error"])
-        self.assertFalse(self.server.restart_requested.is_set())
-
-    def test_restart_is_acknowledged_and_duplicate_requests_are_idempotent(self):
-        body = {"command_id": "restart-1"}
-        status, payload, _ = self.request("POST", "/service/restart", body=body)
-        self.assertEqual(status, 200)
-        self.assertTrue(json.loads(payload)["restarting"])
-
-        status, duplicate, _ = self.request("POST", "/service/restart", body=body)
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(duplicate), json.loads(payload))
-
-        self.assertTrue(self.server._restart_scheduled)
-        self.assertTrue(self.server.restart_requested.wait(2))
 
 
 class RouteTableTests(HttpServiceFixture):
@@ -656,55 +650,33 @@ class CommandReplayTests(unittest.TestCase):
                                      lambda: {"accepted": True})
 
 
-class LogStreamingTests(HttpServiceFixture):
-    def test_authenticated_log_reads_are_incremental(self):
+class ConsoleRelayTests(HttpServiceFixture):
+    """The tee's whole client surface is the log-kind records in /events.
+
+    There is no /logs relay any more: it retained every console line a
+    second time for a client that never read it.
+    """
+
+    def relayed(self, buffer=None):
+        events = (buffer or self.state.events).read_after(0)["events"]
+        return [(record["source"], record["text"]) for record in events
+                if record["kind"] == "log"]
+
+    def test_console_lines_are_relayed_as_events_and_logs_is_gone(self):
         self.state.logs.write("stdout", "loading inputs\n")
         self.state.logs.write("stderr", "iteration 1\niteration 2\n")
 
-        status, payload, _ = self.request("GET", "/logs?after=0")
-        self.assertEqual(status, 200)
-        first = json.loads(payload)
-        self.assertEqual(
-            [(entry["stream"], entry["text"]) for entry in first["entries"]],
-            [("stdout", "loading inputs"),
-             ("stderr", "iteration 1"),
-             ("stderr", "iteration 2")])
-        self.assertEqual(first["next_sequence"], 3)
-
-        self.state.logs.write("stdout", "iteration 3\n")
-        status, payload, _ = self.request(
-            "GET", f"/logs?after={first['next_sequence']}")
-        self.assertEqual(status, 200)
-        second = json.loads(payload)
-        self.assertEqual([entry["text"] for entry in second["entries"]],
-                         ["iteration 3"])
-        self.assertEqual(second["next_sequence"], 4)
-
-    def test_log_cursor_validation_and_authentication(self):
-        status, _, _ = self.request("GET", "/logs?after=not-a-number")
-        self.assertEqual(status, 400)
-        status, _, _ = self.request("GET", "/logs?after=-1")
-        self.assertEqual(status, 400)
-        status, _, _ = self.request("GET", "/logs?after=0", token=None)
-        self.assertEqual(status, 401)
-
-    def test_bounded_log_buffer_reports_dropped_entries_and_cursor_reset(self):
-        logs = ServiceLogBuffer(max_entries=2)
-        logs.write("stdout", "one\ntwo\nthree\n")
-        result = logs.read_after(0)
-        self.assertEqual([entry["text"] for entry in result["entries"]],
-                         ["two", "three"])
-        self.assertEqual(result["dropped"], 1)
-
-        restarted_client = logs.read_after(100)
-        self.assertTrue(restarted_client["cursor_reset"])
-        self.assertEqual([entry["text"] for entry in restarted_client["entries"]],
-                         ["two", "three"])
+        self.assertEqual(self.relayed(),
+                         [("stdout", "loading inputs"),
+                          ("stderr", "iteration 1"),
+                          ("stderr", "iteration 2")])
+        status, _, _ = self.request("GET", "/logs?after=0")
+        self.assertEqual(status, 404)
 
     def test_successful_polling_requests_are_suppressed_at_the_source(self):
-        # The handler's log_request override keeps successful status, log,
-        # and event polls out of the terminal (and therefore out of every
-        # relay); failed polls and other requests still log.
+        # The handler's log_request override keeps successful status and
+        # event polls out of the terminal (and therefore out of the relay);
+        # failed polls and other requests still log.
         handler = spiral_service.SpiralHandler.__new__(
             spiral_service.SpiralHandler)
         logged = []
@@ -717,7 +689,6 @@ class LogStreamingTests(HttpServiceFixture):
             handler.log_request(code)
 
         probe("GET", "/session/status", 200)
-        probe("GET", "/logs?after=4", 200)
         probe("GET", "/events?cursor=9", 200)
         self.assertEqual(logged, [])
         probe("GET", "/session/status", 401)
@@ -725,29 +696,41 @@ class LogStreamingTests(HttpServiceFixture):
         probe("POST", "/session/run", 200)
         self.assertEqual(len(logged), 3)
 
-    def test_log_buffer_no_longer_string_filters_access_lines(self):
-        logs = ServiceLogBuffer()
+    def test_relay_no_longer_string_filters_access_lines(self):
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
         logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -\n')
         logs.write("stderr", "useful fitter warning\n")
-        self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
-                         ['SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -',
-                          "useful fitter warning"])
+        self.assertEqual(
+            self.relayed(events),
+            [("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -'),
+             ("stderr", "useful fitter warning")])
 
     def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
-        logs = ServiceLogBuffer()
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
         logs.write("stderr", "\rloading patches:  25%|██▌       | 1/4")
         logs.write("stderr", "\rloading patches: 100%|██████████| 4/4\n")
         logs.write("stderr", "\r 40%|████      | 400/1000")
         logs.write("stderr", "\r100%|██████████| 1000/1000\n")
 
         self.assertEqual(
-            [entry["text"] for entry in logs.read_after(0)["entries"]],
+            [text for _, text in self.relayed(events)],
             [
                 "loading patches:  25%|██▌       | 1/4",
                 "loading patches: 100%|██████████| 4/4",
                 " 40%|████      | 400/1000",
                 "100%|██████████| 1000/1000",
             ])
+
+    def test_oversized_lines_are_truncated_before_the_ring(self):
+        events = spiral_service.ServiceEventBuffer()
+        logs = ServiceLogBuffer(events=events)
+        logs.write("stdout", "x" * (spiral_service.MAX_LOG_ENTRY_CHARS + 50)
+                   + "\n")
+        text = self.relayed(events)[0][1]
+        self.assertTrue(text.endswith(" … [truncated]"))
+        self.assertEqual(text.count("x"), spiral_service.MAX_LOG_ENTRY_CHARS)
 
 
 class ArtifactHttpTests(HttpServiceFixture):
@@ -952,6 +935,87 @@ class DatasetOwnershipTests(unittest.TestCase):
                                 "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
+    def _attach_session_for_request(self, config=None):
+        """Attach a fake session whose canonical request the service produced."""
+        session = _attach_fake_session(self.state, self.output, self.root)
+        request = {"run": {"z_begin": 0, "z_end": 10,
+                           "config": {**_NO_DENSE_LOSSES, **(config or {})}}}
+        paths, run, preview, _ = self.state._prepare_session_request(request)
+        self.state.session_paths = paths
+        self.state.session_request = {
+            "paths": paths.manifest(), "run": run.manifest(),
+            "preview": preview.manifest()}
+        return session
+
+    def _stage_for(self, request):
+        paths, run, preview, _ = self.state._prepare_session_request(request)
+        with self.state.lock:
+            return self.state._rebuild_stage_locked(
+                paths, run, preview, SessionState.Idle)
+
+    def _base_request(self, config=None, **run):
+        return {"run": {"z_begin": 0, "z_end": 10,
+                        "config": {**_NO_DENSE_LOSSES, **(config or {})},
+                        **run}}
+
+    def test_only_allowlisted_configuration_keeps_the_loaded_inputs(self):
+        self._attach_session_for_request()
+        self.assertEqual(self._stage_for(self._base_request()), "model")
+        self.assertEqual(
+            self._stage_for(self._base_request(
+                {"model_num_flow_integration_steps": 5})),
+            "model")
+        # An unaudited key alongside an allowlisted one is still the whole
+        # build, and so is anything outside run.config.
+        self.assertEqual(
+            self._stage_for(self._base_request({
+                "model_num_flow_integration_steps": 5,
+                "optimizer_random_seed": 7})),
+            "all")
+        self.assertEqual(
+            self._stage_for(self._base_request({"loss_weight_patch_radius": 1.0})),
+            "all")
+        self.assertEqual(
+            self._stage_for(self._base_request(run_tag="second")), "all")
+        self.assertEqual(
+            self._stage_for({"run": {"z_begin": 0, "z_end": 20,
+                                     "config": dict(_NO_DENSE_LOSSES)}}),
+            "all")
+
+    def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
+        self._attach_session_for_request()
+        paths, run, preview, _ = self.state._prepare_session_request(
+            self._base_request({"model_num_flow_integration_steps": 5}))
+        with self.state.lock:
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    paths, run, preview, SessionState.Error),
+                "all")
+
+    def test_a_model_stage_rebuild_keeps_the_session_and_its_inputs(self):
+        session = self._attach_session_for_request()
+        generation = self.state.session_generation
+        response = self.state.rebuild(
+            self._base_request({"model_num_flow_integration_steps": 5}))
+        self.assertEqual(response["stage"], "model")
+        deadline = time.monotonic() + 5.0
+        while self.state._building and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.state._building)
+        # The same session object, not a replacement: its host inputs, and
+        # everything incorporated into them, are still resident.
+        self.assertIs(self.state.session, session)
+        self.assertFalse(session.closed)
+        self.assertEqual(self.state.session_generation, generation)
+        self.assertEqual(len(session.model_rebuilds), 1)
+        rebuilt_paths, rebuilt_run = session.model_rebuilds[0]
+        self.assertEqual(rebuilt_run.config["model_num_flow_integration_steps"], 5)
+        self.assertEqual(rebuilt_paths.manifest(),
+                         self.state.session_request["paths"])
+        self.assertEqual(
+            self.state.session_request["run"]["config"]
+            ["model_num_flow_integration_steps"], 5)
+
     def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
         request = self.state._dataset_session_request({
             "run": {"z_begin": 0, "z_end": 10},
@@ -974,7 +1038,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             "run": {
                 "z_begin": 100,
                 "z_end": 900,
-                "scroll_name": "attached-scroll",
                 "config": config,
             },
             "preview": {"first_winding": 12, "variant": "raw"},
@@ -998,10 +1061,23 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["paths"]["fibers"], "")
         self.assertEqual(attached["run"]["z_begin"], 100)
         self.assertEqual(attached["run"]["z_end"], 900)
-        self.assertEqual(attached["run"]["scroll_name"], "attached-scroll")
+        for key in SCROLL_SPEC_OWNED_RUN_KEYS:
+            self.assertNotIn(key, attached["run"])
         self.assertEqual(attached["run"]["config"], config)
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
+
+    def test_a_rebuild_refuses_run_keys_the_scroll_spec_owns(self):
+        for key, value in (("scroll_name", "renamed"), ("voxel_size_um", 4.0),
+                           ("lasagna_group", "8"), ("lasagna_scale", 2)):
+            with self.subTest(key=key):
+                with self.assertRaises(ApiError) as caught:
+                    self.state.rebuild({"run": {"z_begin": 100, "z_end": 900,
+                                                key: value}})
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual([detail["field"] for detail
+                                  in caught.exception.details],
+                                 [f"run.{key}"])
 
     def test_a_failed_build_reports_error_and_a_rebuild_recovers(self):
         request = {
@@ -1037,27 +1113,63 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(status["state"], SessionState.Idle)
         self.assertIsNone(status["error"])
 
-    def test_save_checkpoint_is_constrained_to_output_directory(self):
+    def test_save_checkpoint_names_a_file_the_service_places(self):
+        """The client names the checkpoint; the service owns the location."""
         _attach_fake_session(self.state, self.output, self.root)
-        with self.assertRaises(ApiError) as caught:
-            self.state.save_checkpoint({"path": str(self.root / "elsewhere.ckpt")})
-        self.assertEqual(caught.exception.status, 400)
-        response = self.state.save_checkpoint(
-            {"path": str(self.output / "manual.ckpt")})
-        self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
+        for name in ("", "   ", "../escape.ckpt", "sub/dir.ckpt", "..",
+                     "/absolute.ckpt"):
+            with self.assertRaises(ApiError) as caught:
+                self.state.save_checkpoint({"name": name})
+            self.assertEqual(caught.exception.status, 400, name)
+
+        response = self.state.save_checkpoint({"name": "manual.ckpt"})
+        expected = self.output / "checkpoints" / "manual.ckpt"
+        self.assertEqual(response["checkpoint_path"], str(expected))
+        self.assertTrue(expected.parent.is_dir())
+
+        # A bare name gains the conventional suffix.
+        response = self.state.save_checkpoint({"name": "second"})
+        self.assertEqual(response["checkpoint_path"],
+                         str(self.output / "checkpoints" / "second.ckpt"))
 
     def test_load_checkpoint_reads_only_service_owned_checkpoints(self):
         session = _attach_fake_session(self.state, self.output, self.root)
         outside = self.root / "elsewhere.ckpt"
         outside.write_bytes(b"PK\x03\x04checkpoint")
-        with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(outside)})
-        self.assertEqual(caught.exception.status, 400)
-        with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint(
-                {"path": str(self.output / "absent.ckpt")})
-        self.assertEqual(caught.exception.status, 400)
+        uploaded = self.output / "uploaded-checkpoints" / "a.ckpt"
+        uploaded.parent.mkdir(parents=True, exist_ok=True)
+        uploaded.write_bytes(b"PK\x03\x04checkpoint")
+        # A host checkpoint must be one this service advertises, and an
+        # uploaded one must live in the upload store; neither field takes an
+        # arbitrary path, and a load names exactly one of them.
+        for request in ({"host_checkpoint": str(outside)},
+                        {"host_checkpoint": str(self.output / "absent.ckpt")},
+                        # The upload store is not advertised, so the two
+                        # sources name disjoint sets.
+                        {"host_checkpoint": str(uploaded)},
+                        {"uploaded_checkpoint": str(outside)},
+                        {"uploaded_checkpoint": str(self.output / "a.ckpt")},
+                        {"host_checkpoint": str(uploaded),
+                         "uploaded_checkpoint": str(uploaded)},
+                        {}):
+            with self.subTest(request=request):
+                with self.assertRaises(ApiError) as caught:
+                    self.state.load_checkpoint(request)
+                self.assertEqual(caught.exception.status, 400)
         self.assertEqual(session.loaded, [])
+
+    def test_dataset_advertises_the_checkpoints_a_load_may_name(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        saved = self.state.save_checkpoint({"name": "manual"})["checkpoint_path"]
+        staging = self.output / ".spiral-artifacts" / "checkpoint-abc"
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "checkpoint.ckpt").write_bytes(b"PK\x03\x04checkpoint")
+
+        listed = self.state.dataset()["session_checkpoints"]
+
+        self.assertIn(saved, listed)
+        # Artifact staging is transfer plumbing, not a user choice.
+        self.assertNotIn(str(staging / "checkpoint.ckpt"), listed)
 
     def test_load_checkpoint_reports_the_restored_iteration(self):
         session = _attach_fake_session(self.state, self.output, self.root)
@@ -1066,7 +1178,8 @@ class DatasetOwnershipTests(unittest.TestCase):
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
         revision = self.state.session_revision
 
-        response = self.state.load_checkpoint({"path": str(checkpoint)})
+        response = self.state.load_checkpoint(
+            {"uploaded_checkpoint": str(checkpoint)})
 
         self.assertTrue(response["loaded"])
         self.assertEqual(response["restored_iteration"], 4200)
@@ -1084,7 +1197,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         revision = self.state.session_revision
 
         with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(checkpoint)})
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
 
         self.assertEqual(caught.exception.status, 409)
         self.assertIn("z-domain", caught.exception.message)
@@ -1105,13 +1218,33 @@ class DatasetOwnershipTests(unittest.TestCase):
                          {"iterations": 4, "autosave_on_pause": "no"})
         self.assertEqual(caught.exception.status, 400)
 
-    def test_export_preview_is_an_explicit_verb_valid_when_idle(self):
+    def test_export_preview_accepts_and_runs_off_the_request_thread(self):
+        """A preview costs minutes; the verb accepts it and returns.
+
+        Holding the request open outlived every client transfer timeout, so
+        a preview that succeeded was reported as a failure. The client
+        follows preview_exporting in the status it already polls.
+        """
         session = _attach_fake_session(self.state, self.output, self.root)
+        release = threading.Event()
+        session.preview_gate = release
 
         response = self.state.export_preview()
+        self.assertTrue(response["accepted"])
+        self.assertNotIn("exported", response)
+        self.assertTrue(response["preview_exporting"])
 
-        self.assertTrue(response["exported"])
-        self.assertEqual(response["preview_generation"], 1)
+        # Single-flight while the export is still running.
+        with self.assertRaises(ApiError) as caught:
+            self.state.export_preview()
+        self.assertEqual(caught.exception.status, 409)
+
+        release.set()
+        deadline = time.monotonic() + 5.0
+        while self.state.status()["preview_exporting"] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.state.status()["preview_exporting"])
         self.assertEqual(session.previews, 1)
 
         session.state = SessionState.Running
@@ -1120,13 +1253,154 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.previews, 1)
 
+    def test_a_failed_preview_export_is_reported_through_status(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        session.preview_failure = "OSError: no space left on device"
+
+        self.state.export_preview()
+        deadline = time.monotonic() + 5.0
+        while self.state.status()["preview_exporting"] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = self.state.status()
+        self.assertFalse(status["preview_exporting"])
+        self.assertIn("no space left", status["preview_publish_error"])
+
+    def _write_checkpoint(self, name, cfg, dataset_root=None):
+        """A checkpoint carrying the durable cfg a refusal is analysed from."""
+        import torch
+
+        path = self.output / name
+        torch.save({
+            # Checkpoints store the durable subset of the schema, and the
+            # refusal analysis compares against exactly that subset.
+            "schema_version": 2, "cfg": durable_config(cfg),
+            "input_manifest": {"dataset_root": str(
+                self.root if dataset_root is None else dataset_root)},
+        }, path)
+        return path
+
+    def _refuse_load(self, session, checkpoint, reason="model mismatch"):
+        session.load_refusal = reason
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
+        return caught.exception
+
+    def test_a_refusal_reports_the_rebuild_that_would_accept_the_checkpoint(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+
+        # A checkpoint differing only in allowlisted model configuration is a
+        # model-stage rebuild away from being loadable.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "model.ckpt", {**live, "model_num_flow_stages": 3}))
+        self.assertEqual(error.status, 409)
+        self.assertEqual(error.payload["stage"], "model")
+        # The verdict's own text, unmodified.
+        self.assertEqual(error.payload["reasons"], ["model mismatch"])
+        self.assertNotIn("refused", error.payload)
+
+        # The stage comes from the whole cfg diff, so a checkpoint differing
+        # in a host-affecting key needs the whole build even when the
+        # preflight only complained about the model.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "host.ckpt", {**live, "model_num_flow_stages": 3,
+                          "track_exclusion_radius": 99.0}))
+        self.assertEqual(error.payload["stage"], "all")
+        # And a model z-domain mismatch reaches "all" through z_begin/z_end
+        # rather than through a rule of its own.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
+        self.assertEqual(error.payload["stage"], "all")
+
+    def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+
+        # Another dataset entirely.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "foreign.ckpt", dict(live), dataset_root="/somewhere/else"))
+        self.assertTrue(error.payload["refused"])
+        self.assertNotIn("stage", error.payload)
+
+        # A cfg key set that is not this schema's.
+        error = self._refuse_load(session, self._write_checkpoint(
+            "stale.ckpt", {**live, "a_setting_that_no_longer_exists": 1}))
+        self.assertTrue(error.payload["refused"])
+
+        # A file that will not load at all.
+        unreadable = self.output / "unreadable.ckpt"
+        unreadable.write_bytes(b"PK\x03\x04not-a-checkpoint")
+        error = self._refuse_load(session, unreadable)
+        self.assertTrue(error.payload["refused"])
+
+    def test_allow_rebuild_rebuilds_onto_the_checkpoint_without_overrides(self):
+        session = _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+        # A live session request carrying an advanced profile, as a client
+        # that had been editing configuration would leave it.
+        paths, run, preview, _ = self.state._prepare_session_request({
+            "run": {"z_begin": 0, "z_end": 10,
+                    "config": {**_NO_DENSE_LOSSES, "model_num_flow_stages": 9}}})
+        self.state.session_paths = paths
+        self.state.session_request = {
+            "paths": paths.manifest(), "run": run.manifest(),
+            "preview": preview.manifest()}
+        checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
+
+        rebuilds = []
+        self.state.rebuild = lambda request: rebuilds.append(request) or {}
+        self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
+                                    "allow_rebuild": True})
+
+        self.assertEqual(len(rebuilds), 1)
+        self.assertEqual(rebuilds[0]["paths"]["checkpoint"], str(checkpoint))
+        # No advanced overrides: the runtime layers run.config on top of the
+        # checkpoint's own cfg, so resending the profile would re-impose the
+        # very keys the preflight just refused.
+        self.assertEqual(rebuilds[0]["run"]["config"], {})
+        self.assertEqual(rebuilds[0]["run"]["z_end"], 10)
+
+    def test_allow_rebuild_must_be_a_boolean(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        checkpoint = self.output / "a.ckpt"
+        checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
+                                        "allow_rebuild": "yes"})
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_a_rebuild_refuses_overrides_its_checkpoint_contradicts(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        live = Config().as_dict()
+        checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
+        request = {
+            "paths": {"checkpoint": str(checkpoint)},
+            "run": {"z_begin": 0, "z_end": 10,
+                    "config": {**_NO_DENSE_LOSSES,
+                               "model_flow_bounds_radius": 128}},
+        }
+        with self.assertRaises(ApiError) as caught:
+            self.state.rebuild(request)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual([detail["field"] for detail in caught.exception.details],
+                         ["run.config.model_flow_bounds_radius"])
+        # Everything else stays a legitimate change to make while resuming.
+        request["run"]["config"] = {**_NO_DENSE_LOSSES,
+                                    "loss_weight_patch_radius": 1.0}
+        self.state._reject_overrides_the_checkpoint_contradicts(
+            str(checkpoint), request["run"]["config"])
+
     def test_load_checkpoint_requires_an_idle_session(self):
         session = _attach_fake_session(self.state, self.output, self.root)
         session.state = SessionState.Running
         checkpoint = self.output / "a.ckpt"
         checkpoint.write_bytes(b"PK\x03\x04checkpoint")
         with self.assertRaises(ApiError) as caught:
-            self.state.load_checkpoint({"path": str(checkpoint)})
+            self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.loaded, [])
 
@@ -1381,18 +1655,16 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
             self.state.start_initial_session()
             _await_build(self.state)
 
-            # A run plan that changes a new-fit configuration key reports it
-            # and the run is refused: the resident model keeps its domain.
+            # A run that changes a new-fit configuration key is refused: the
+            # resident model keeps its domain.
             configuration = Config({**_NO_DENSE_LOSSES,
                                     "model_num_flow_stages": 3}).as_dict()
-            plan = self.state.plan_run({
-                "configuration": configuration,
-                "iterations": 3,
-                "expected_session_revision": self.state.session_revision,
-            })
-            self.assertTrue(plan["new_fit_required"])
-            with self.assertRaisesRegex(ApiError, "Start New Fit"):
-                self.state.run({"plan_token": plan["plan_token"]})
+            with self.assertRaisesRegex(ApiError, "requires rebuilding"):
+                self.state.run({
+                    "configuration": configuration,
+                    "iterations": 3,
+                    "expected_session_revision": self.state.session_revision,
+                })
 
             # The same change through a rebuild is accepted; it is the one
             # path that tears the model down and builds a new domain.
@@ -1509,8 +1781,6 @@ class UploadTests(unittest.TestCase):
                 upload_id, "fiber.json",
                 io.BytesIO(FIBER_FILES["fiber.json"]),
                 len(FIBER_FILES["fiber.json"]))
-        with self.assertRaisesRegex(ApiError, "finalized"):
-            self.state.delete_upload(upload_id)
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -1542,7 +1812,7 @@ class UploadTests(unittest.TestCase):
             self.state.finalize_upload(upload_id)
         bad_pcl = {"pcl.json": json.dumps({"some": "json"}).encode()}
         upload_id = _upload_input(self.state, "pcl", "bad-pcl", bad_pcl,
-                                  role="patch_overlap")
+                                  role="relative")
         with self.assertRaisesRegex(ApiError, "vc_pointcollections"):
             self.state.finalize_upload(upload_id)
 
@@ -1594,13 +1864,21 @@ class UploadTests(unittest.TestCase):
         finally:
             spiral_service.EPHEMERAL_QUOTA_BYTES = original
 
-    def test_deleted_and_aborted_uploads_leave_no_partial_data(self):
+    def test_abandoned_uploads_leave_no_partial_data(self):
+        """An abandoned transfer expires; there is no cancel verb.
+
+        DELETE /session/inputs/<id> existed for a client that never called
+        it, so garbage collection is the whole story.
+        """
         self._session()
         upload_id = _upload_input(self.state, "patch", "aborted", PATCH_FILES)
         staging = self.output / ".spiral-upload-staging" / upload_id
         self.assertTrue(staging.exists())
-        self.state.delete_upload(upload_id)
+        self.state.uploads[upload_id].created -= \
+            spiral_service.UPLOAD_GC_SECONDS + 1
+        self.state.gc_uploads()
         self.assertFalse(staging.exists())
+        self.assertNotIn(upload_id, self.state.uploads)
 
     def test_expired_uploads_are_garbage_collected(self):
         self._session()
@@ -1672,7 +1950,7 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(session.run_calls[-1][4], config)
         self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
-        with self.assertRaisesRegex(ApiError, "Start New Fit"):
+        with self.assertRaisesRegex(ApiError, "requires rebuilding"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "model_num_flow_stages": 2,
             }})
@@ -1698,46 +1976,33 @@ class UploadTests(unittest.TestCase):
         })
         self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
 
-    def test_outer_shell_path_is_a_shell_only_run_change(self):
-        session = self._session()
+    def test_outer_shell_path_change_requires_session_reload(self):
+        self._session()
         shell = self.dataset / "outer_shell_v2"
         shell.mkdir()
         inputs = self.state.session_paths.manifest()
         inputs["outer_shell"] = str(shell)
-        plan = self.state.plan_run({
-            "configuration": Config().as_dict(),
-            "iterations": 3,
-            "inputs": inputs,
-            "expected_session_revision": self.state.session_revision,
-        })
+        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+            self.state.run({
+                "configuration": Config().as_dict(),
+                "iterations": 3,
+                "inputs": inputs,
+                "expected_session_revision": self.state.session_revision,
+            })
+        self.assertEqual(caught.exception.status, 409)
 
-        self.assertFalse(plan["session_reload_required"])
-        self.assertEqual(plan["affected_prepared_inputs"], ["shell"])
-        self.assertEqual(plan["input_changes"][0]["runtime_impact"],
-                         "shell_reload")
-        self.state.run({"plan_token": plan["plan_token"]})
-        self.assertEqual(session.path_change_calls[-1], {
-            "outer_shell": str(shell),
-        })
-
-    def test_non_shell_path_and_patch_erosion_still_require_reload(self):
+    def test_any_other_static_path_change_is_also_rejected(self):
         self._session()
         inputs = self.state.session_paths.manifest()
         inputs["verified_patches"] = str(self.dataset / "other-patches")
-        configuration = Config({
-            "patch_erode_patches": (
-                Config().patch_erode_patches + 1),
-        }).as_dict()
-        plan = self.state.plan_run({
-            "configuration": configuration,
-            "iterations": 3,
-            "inputs": inputs,
-            "expected_session_revision": self.state.session_revision,
-        })
-
-        self.assertTrue(plan["session_reload_required"])
-        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
-            self.state.run({"plan_token": plan["plan_token"]})
+        with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
+            self.state.run({
+                "configuration": Config().as_dict(),
+                "iterations": 3,
+                "inputs": inputs,
+                "expected_session_revision": self.state.session_revision,
+            })
+        self.assertEqual(caught.exception.status, 409)
 
     def test_a_rebuilt_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
@@ -2081,9 +2346,9 @@ class CommitTests(unittest.TestCase):
         self._finalize("fiber", "fiber-9", FIBER_FILES)
         existing = {"vc_pointcollections_json_version": "1",
                     "collections": {"3": {"name": "old", "points": {}}}}
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps(existing))
-        self._finalize("pcl", "pcl-9", PCL_FILES, role="patch_overlap")
+        self._finalize("pcl", "pcl-9", PCL_FILES, role="relative")
         response = self.state.commit_inputs()
         self.assertEqual(sorted(response["committed"]),
                          ["fiber-9", "patch-9", "pcl-9"])
@@ -2091,7 +2356,7 @@ class CommitTests(unittest.TestCase):
         self.assertTrue((self.dataset / "fibers" / "fiber-9.json").is_file())
         merged = json.loads(target.read_text())
         self.assertEqual(len(merged["collections"]), 2)
-        backups = list(self.dataset.glob("patch-overlap-pcls.json.*.bak"))
+        backups = list(self.dataset.glob("relative_windings.json.*.bak"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text()), existing)
         # Still-pending inputs stay queued for the next run after a commit.
@@ -2149,12 +2414,12 @@ class CommitTests(unittest.TestCase):
         state_b = ServiceState()
         _attach_fake_session(state_b, output_b, self.dataset)
         upload_a = _upload_input(
-            self.state, "pcl", "pcl-a", PCL_FILES, role="patch_overlap")
+            self.state, "pcl", "pcl-a", PCL_FILES, role="relative")
         upload_b = _upload_input(
-            state_b, "pcl", "pcl-b", PCL_FILES, role="patch_overlap")
+            state_b, "pcl", "pcl-b", PCL_FILES, role="relative")
         self.state.finalize_upload(upload_a)
         state_b.finalize_upload(upload_b)
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps({
             "vc_pointcollections_json_version": "1", "collections": {},
         }))
@@ -2201,7 +2466,7 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(len(merged["collections"]), 2)
 
     def test_independent_processes_preserve_both_pcl_commits(self):
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps({
             "vc_pointcollections_json_version": "1", "collections": {},
         }))
@@ -2298,7 +2563,7 @@ class CommitTests(unittest.TestCase):
     def test_remove_pending_input_deletes_the_staged_copy(self):
         record = self._finalize("fiber", "fiber-9", FIBER_FILES)
         staged = Path(record["path"])
-        response = self.state.remove_input({"kind": "fiber", "id": "fiber-9"})
+        response = self.state.remove_input("fiber", "fiber-9")
         self.assertEqual(response["removed"], "fiber-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertFalse(staged.exists())
@@ -2311,13 +2576,13 @@ class CommitTests(unittest.TestCase):
         _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
-            self.state.remove_input({"kind": "patch", "id": "patch-9"})
+            self.state.remove_input("patch", "patch-9")
         self.assertEqual(caught.exception.status, 409)
 
     def test_remove_committed_pending_input_keeps_the_dataset_copy(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
         self.state.commit_inputs()
-        self.state.remove_input({"kind": "patch", "id": "patch-9"})
+        self.state.remove_input("patch", "patch-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertTrue((self.dataset / "verified_patches" / "patch-9" / "meta.json").is_file())
 
@@ -2661,50 +2926,13 @@ class ServiceProcessTests(unittest.TestCase):
                     health = json.loads(response.read())
                 self.assertEqual(health["api_version"], API_VERSION)
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/logs?after=0",
+                    f"http://127.0.0.1:{port}/events?cursor=0",
                     headers={"Authorization": f"Bearer {key}"})
                 with urllib.request.urlopen(request, timeout=10) as response:
-                    logs = json.loads(response.read())
-                self.assertIn(
-                    ready, [entry["text"] for entry in logs["entries"]])
-            finally:
-                process.terminate()
-                process.wait(10)
-                process.stdout.close()
-
-    def test_restart_reexecs_in_place_and_reuses_the_fixed_port(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "key"
-            with socket.socket() as reservation:
-                reservation.bind(("127.0.0.1", 0))
-                port = reservation.getsockname()[1]
-            process = self._launch(
-                ["--port", str(port), "--api-key-file", str(key_file)]
-                + self._dataset_arguments(temporary),
-                temporary)
-            try:
-                self._read_until_ready(process)
-                original_pid = process.pid
-                key = key_file.read_text().strip()
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/service/restart",
-                    method="POST",
-                    data=json.dumps({"command_id": "restart-integration"}).encode(),
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json",
-                    })
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    acknowledgement = json.loads(response.read())
-                self.assertTrue(acknowledgement["restarting"])
-
-                self._read_until_ready(process)
-                self.assertEqual(process.pid, original_pid)
-                health_request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/health",
-                    headers={"Authorization": f"Bearer {key}"})
-                with urllib.request.urlopen(health_request, timeout=10) as response:
-                    self.assertTrue(json.loads(response.read())["ready"])
+                    events = json.loads(response.read())
+                self.assertIn(ready, [record["text"]
+                                      for record in events["events"]
+                                      if record["kind"] == "log"])
             finally:
                 process.terminate()
                 process.wait(10)

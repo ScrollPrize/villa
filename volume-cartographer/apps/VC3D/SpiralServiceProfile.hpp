@@ -20,9 +20,10 @@ struct SpiralServiceProfile
     int remoteServicePort = 0; // Tunnel: fixed loopback port of the host service
     QString apiKey;            // held separately from the persisted profile fields
     bool autoLaunch = false;   // launch and own a local service process (Localhost only)
-    // Optional service-root -> viewer-root prefix mapping so input overlays can
-    // be loaded locally when both machines mount the same dataset.
-    QString serviceRootPrefix;
+    // Optional local mount of the dataset root the service advertises, so input
+    // overlays can be loaded locally when both machines mount the same dataset.
+    // The service side of the mapping is never configured here: it is whatever
+    // /dataset advertises as its root.
     QString localRootPrefix;
     // Local launch bindings: the owned service is started with
     // --dataset/--output/--cache from these values (dataset is required;
@@ -65,7 +66,6 @@ struct SpiralServiceProfile
         settings.setValue(QStringLiteral("base_url"), baseUrl.toString());
         settings.setValue(QStringLiteral("ssh_destination"), sshDestination);
         settings.setValue(QStringLiteral("remote_service_port"), remoteServicePort);
-        settings.setValue(QStringLiteral("service_root_prefix"), serviceRootPrefix);
         settings.setValue(QStringLiteral("local_root_prefix"), localRootPrefix);
         settings.setValue(QStringLiteral("dataset_root"), datasetRoot);
         settings.setValue(QStringLiteral("output_root"), outputRoot);
@@ -86,7 +86,6 @@ struct SpiralServiceProfile
         profile.baseUrl = QUrl(settings.value(QStringLiteral("base_url")).toString());
         profile.sshDestination = settings.value(QStringLiteral("ssh_destination")).toString();
         profile.remoteServicePort = settings.value(QStringLiteral("remote_service_port"), 0).toInt();
-        profile.serviceRootPrefix = settings.value(QStringLiteral("service_root_prefix")).toString();
         profile.localRootPrefix = settings.value(QStringLiteral("local_root_prefix")).toString();
         profile.datasetRoot = settings.value(QStringLiteral("dataset_root")).toString();
         profile.outputRoot = settings.value(QStringLiteral("output_root")).toString();

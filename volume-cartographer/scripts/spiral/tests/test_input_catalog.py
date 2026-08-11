@@ -1,13 +1,9 @@
-"""The declarative fit-input catalog: each consumer derives what the three
-historical maps (request-validation kinds/predicates in fit_session, the
-config-catalog path schema + plan_run fallback, and apply_config's
-outer_shell special case) used to encode."""
+"""The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
-from fit_session import (FIT_INPUT_CATALOG, FULL_REBUILD_DEPENDENCIES,
-                         PCL_ROLE_CONVENTIONS, SCROLL_SPEC_PATH_OVERRIDE_KEYS,
-                         SpiralInputPaths, fit_input, input_change_impact,
-                         input_path_schema)
+from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS, PclRole,
+                         SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
+                         fit_input)
 
 
 def test_catalog_covers_every_fit_input_path_field():
@@ -24,8 +20,6 @@ def test_catalog_covers_every_fit_input_path_field():
 def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
-    assert spec.runtime_impact == "shell_reload"
-    assert spec.dependencies == ("shell",)
     # Enabled by either shell loss weight; the outer weight defaults on.
     assert spec.required({}) is True
     assert spec.required({"loss_weight_shell_outer": 0.0,
@@ -34,29 +28,12 @@ def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
                           "loss_weight_shell_patch_radius": 2.0}) is True
 
 
-def test_rebuild_scopes_match_the_historical_planning_map():
-    # outer_shell is the one device-rebuild (live) path; every other input,
-    # and any unknown path key, keeps the conservative full host rebuild.
-    assert input_change_impact("outer_shell") == ("shell_reload", ["shell"])
-    assert input_change_impact("verified_patches") == (
-        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
-    assert input_change_impact("checkpoint") == (
-        "prepared_input_rebuild", list(FULL_REBUILD_DEPENDENCIES))
+def test_no_input_path_is_advertised_as_takeable_by_a_resident_session():
+    assert Config.catalog()["schema"]["paths"] == {}
 
 
-def test_config_catalog_paths_derive_from_the_input_catalog():
-    assert input_path_schema() == {
-        "outer_shell": {"runtime_impact": "shell_reload",
-                        "dependencies": ["shell"]},
-    }
-    assert Config.catalog()["schema"]["paths"] == input_path_schema()
-
-
-def test_no_input_is_checkpoint_domain_but_new_fit_config_keys_are():
+def test_model_configuration_is_a_new_fit_change():
     assert not any(spec.checkpoint_domain for spec in FIT_INPUT_CATALOG)
-    assert all(input_change_impact(spec.key)[0] != "new_fit"
-               for spec in FIT_INPUT_CATALOG)
-    # The checkpoint domain is set by new_fit configuration keys instead.
     fields = Config.catalog()["schema"]["fields"]
     assert fields["z_begin"]["runtime_impact"] == "new_fit"
     assert fields["model_num_flow_stages"]["runtime_impact"] == "new_fit"
@@ -98,10 +75,16 @@ def test_patch_inputs_follow_the_disable_switch():
     assert unverified.required({}) is False
 
 
-def test_pcl_role_conventions_carry_discovery_flags():
-    roles = {role.value: (filename, discovered)
-             for role, filename, discovered in PCL_ROLE_CONVENTIONS}
-    assert roles["absolute"] == ("abs_winding.json", True)
-    # Conventional for the headless CLI, but not probed by dataset
-    # resolution (the historical _PCL_ENTRIES omission).
-    assert roles["patch_overlap"] == ("patch-overlap-pcls.json", False)
+def test_every_pcl_role_has_one_conventional_file():
+    roles = {role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
+    # One filename per role, serving both discovery and commit; the set is
+    # exactly the role vocabulary, so no role can be uploaded without a
+    # commit target and none is silently undiscoverable.
+    assert roles == {
+        "absolute": "abs_winding.json",
+        "relative": "relative_windings.json",
+        "same_winding": "same_windings.json",
+        "drawn_control_points": "drawn_control_points.json",
+    }
+    assert set(roles) == {role.value for role in PclRole}
+    assert len(set(roles.values())) == len(roles)

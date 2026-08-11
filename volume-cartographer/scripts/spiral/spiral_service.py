@@ -24,12 +24,26 @@ checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
 (patches, fibers, PCL documents) can be uploaded into a session-scoped
 ephemeral folder and later committed into the dataset.
+
+Host filesystem paths are the service's business. A client never invents
+one: a saved checkpoint is a name the service places under the session
+output directory, uploads land in service-chosen staging, and everything
+read back is an artifact ID. The one path a client does send — the
+checkpoint to load into the resident fit — has to be one this service
+advertised or wrote itself.
+
+Long operations accept and return. A preview export costs minutes, so
+``POST /session/export-preview`` starts one and answers immediately; the
+client follows it through ``/session/status``, which it already polls. The
+only verbs that hold a request open are the ones that are genuinely quick.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+from collections.abc import Mapping
+import copy
 import dataclasses
 import errno
 import json
@@ -49,17 +63,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
+                         SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, ScrollSpecError, SessionState,
-                         SpiralInputPaths, default_user_cache_dir, fit_input,
-                         input_change_impact, load_scroll_spec,
+                         SpiralInputPaths, default_user_cache_dir,
+                         load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          select_startup_autosave, validate_autosave,
                          validate_session_request)
-from config import Config
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
+                    rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
-from service_uploads import (EphemeralLedger, PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_KEPT,
+from service_uploads import (EphemeralLedger, PCL_ROLE_FILES,
+                             UPLOADED_CHECKPOINTS_DIRNAME,
+                             UPLOADED_CHECKPOINTS_KEPT,
                              UPLOAD_GC_SECONDS, UploadEnvironment,
                              UploadManager, _copy_publish,
                              _merge_pcl_documents, _utc_stamp)
@@ -74,21 +92,20 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
                              _validate_tifxyz_output_step)
 
 
-SERVICE_VERSION = "6.1.0"
+SERVICE_VERSION = "9.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
+# Upper bound on the checkpoint listing /dataset advertises. A client offers
+# this as a choice, so it is a menu, not an inventory.
+SESSION_CHECKPOINTS_LISTED = 200
 EPHEMERAL_QUOTA_BYTES = int(os.environ.get("SPIRAL_EPHEMERAL_QUOTA_BYTES",
                                            4 * 1024 * 1024 * 1024))
-# This buffer is also the reconnect/late-attach history for a remote VC3D
-# client.  tqdm produces one entry for each carriage-return redraw, so leave
-# enough room for the loading bars and a substantial portion of a long fit.
-MAX_LOG_ENTRIES = 20000
-MAX_LOG_READ_ENTRIES = 1000
 MAX_LOG_ENTRY_CHARS = 8192
-# Structured event ring served through /events. Sized like the log relay so
-# a reconnecting client can recover a comparable window of history.
+# Structured event ring served through /events. This is the whole of what a
+# reconnecting client can recover, so it is sized to hold the loading bars
+# plus a substantial portion of a long fit.
 MAX_EVENT_ENTRIES = 20000
 MAX_EVENT_READ_ENTRIES = 1000
 # High-frequency event kinds (per-iteration metrics, progress redraws)
@@ -254,7 +271,7 @@ def _validate_run_influence_config(value):
         enabled = value["influence_enabled"]
         if not isinstance(enabled, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "interactive_influence_enabled must be boolean")
+                           "influence_enabled must be boolean")
         result["influence_enabled"] = enabled
     ranges = {
         "influence_z": (1.0, 1_000_000.0),
@@ -295,9 +312,9 @@ def _validate_run_influence_config(value):
 
 # Console lines whose information is already published as structured
 # /events records: ProgressReporter console snapshots and the fitter's
-# periodic step-metric prints. They stay on the terminal and in the /logs
-# compatibility relay, but the event stream must not double-report them as
-# log records next to the structured progress/metric records.
+# periodic step-metric prints. They stay on the terminal, but the event
+# stream must not double-report them as log records next to the structured
+# progress/metric records.
 _STRUCTURED_CONSOLE_LINE = re.compile(r"^(?:PROGRESS |step \d+: loss = )")
 
 
@@ -416,63 +433,42 @@ class ServiceEventBuffer:
 
 
 class ServiceLogBuffer:
-    """Bounded, incremental copy of the service's stdout and stderr lines.
+    """Splits the service's stdout and stderr into whole console lines.
 
-    When an event buffer is attached, every complete non-structured console
-    line is also published as a ``log``-kind event record; lines already
-    covered by structured progress/metric events are kept out of the event
-    stream so the same information is never double-reported.
+    Every complete non-structured line is published to the event buffer as a
+    ``log``-kind record; lines already covered by structured
+    progress/metric events are kept out of the event stream so the same
+    information is never double-reported.
+
+    This used to also retain its own ring for a ``GET /logs`` relay. Nothing
+    read it: ``/events`` carries these same lines, with a cursor, a
+    session generation and an overrun signal that the log cursor never had,
+    and retaining every line twice was the single largest thing this process
+    held for the benefit of no client.
     """
 
-    def __init__(self, max_entries=MAX_LOG_ENTRIES, events=None):
+    def __init__(self, events=None):
         self._lock = threading.Lock()
-        self._entries = deque(maxlen=max_entries)
         self._pending = {"stdout": "", "stderr": ""}
-        self._next_sequence = 1
         self._events = events
 
     def write(self, stream, text):
-        if not text:
+        if not text or self._events is None:
             return
         # Carriage-return progress displays should still give remote clients
         # useful snapshots even though they overwrite one terminal line.
         text = str(text).replace("\r", "\n")
+        # Splitting and publishing stay under one lock so concurrently
+        # written streams cannot interleave their lines in the event ring.
         with self._lock:
             parts = (self._pending.get(stream, "") + text).split("\n")
             self._pending[stream] = parts.pop()
             for line in parts:
-                if not line:
+                if not line or _STRUCTURED_CONSOLE_LINE.match(line):
                     continue
                 if len(line) > MAX_LOG_ENTRY_CHARS:
                     line = line[:MAX_LOG_ENTRY_CHARS] + " … [truncated]"
-                self._entries.append({
-                    "sequence": self._next_sequence,
-                    "stream": stream,
-                    "text": line,
-                })
-                self._next_sequence += 1
-                if self._events is not None \
-                        and not _STRUCTURED_CONSOLE_LINE.match(line):
-                    self._events.append("log", line, source=stream)
-
-    def read_after(self, after):
-        with self._lock:
-            latest = self._next_sequence - 1
-            cursor_reset = after > latest
-            if cursor_reset:
-                after = 0
-            oldest = self._entries[0]["sequence"] if self._entries else self._next_sequence
-            dropped = max(0, oldest - max(0, after + 1))
-            entries = [dict(entry) for entry in self._entries
-                       if entry["sequence"] > after][:MAX_LOG_READ_ENTRIES]
-            next_sequence = entries[-1]["sequence"] if entries else min(after, latest)
-        return {
-            "entries": entries,
-            "next_sequence": next_sequence,
-            "latest_sequence": latest,
-            "dropped": dropped,
-            "cursor_reset": cursor_reset,
-        }
+                self._events.append("log", line, source=stream)
 
 
 class _TeeStream:
@@ -508,7 +504,7 @@ class ServiceState:
     or advances a copy of it.
 
     What the service does own is service-scoped bookkeeping — session and
-    command generations, artifacts, uploads, run plans.
+    command generations, artifacts, and uploads.
     """
 
     def __init__(self, dataset_root=None, dataset_resolution=None,
@@ -538,8 +534,8 @@ class ServiceState:
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
-        self.logs = logs if logs is not None else ServiceLogBuffer()
         self.events = events if events is not None else ServiceEventBuffer()
+        self.logs = logs if logs is not None else ServiceLogBuffer(self.events)
         # Log-kind records produced by the console tee carry the current
         # session generation. Reading the attribute is lock-free by design;
         # the provider runs under the event buffer's own lock.
@@ -557,9 +553,12 @@ class ServiceState:
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
+        # A preview export runs off the HTTP thread (it costs minutes); this
+        # is what makes the verb single-flight and what /session/status
+        # reports so a client reconnecting mid-export can see one is running.
+        self._preview_export_active = False
         self.config_catalog = Config.catalog()
         self.session_revision = 0
-        self.run_plans = {}
 
     # ------------------------------------------------------------------
     # Status and health
@@ -575,8 +574,8 @@ class ServiceState:
             stamps log and fitter event records, and is what a client uses
             to notice that the session it adopted has been replaced.
         ``session_revision``
-            Which configuration/input revision the session is at. Run plans
-            are computed against it and refused when it moves.
+            Which configuration/input revision the session is at. Mutations
+            carrying an older revision are refused.
         ``generation`` (the status revision)
             Ordering for status snapshots, so a client can drop a reply that
             overtook a newer one.
@@ -661,7 +660,7 @@ class ServiceState:
             available, reason = self._commit_availability()
             response["commit_available"] = available
             response["commit_unavailable_reason"] = reason
-            response["dataset_owned"] = self.dataset_resolution is not None
+            response["preview_exporting"] = self._preview_export_active
             return response
 
     def session_state(self):
@@ -680,7 +679,6 @@ class ServiceState:
         response.update({
             "ready": True,
             "process_id": os.getpid(),
-            "dataset_owned": self.dataset_resolution is not None,
             "dataset_root": self.dataset_root,
             "session_state": state,
             "cuda_ready": None if state == SessionState.Loading
@@ -692,10 +690,43 @@ class ServiceState:
         return {**self._base(), **self.config_catalog}
 
     def dataset(self):
+        return {**self._base(), **self.dataset_resolution.to_dict(),
+                "session_checkpoints": self.session_checkpoints()}
+
+    @property
+    def scroll_spec(self):
+        """The parsed spiral-scroll.json manifest, or None if it is invalid."""
         if self.dataset_resolution is None:
-            raise ApiError(HTTPStatus.NOT_FOUND,
-                           "This service was not launched with --dataset")
-        return {**self._base(), **self.dataset_resolution.to_dict()}
+            return None
+        return self.dataset_resolution.scroll_spec
+
+    def session_checkpoints(self):
+        """Checkpoints under the session output directory, newest first.
+
+        Between this and ``detected_checkpoints`` a client has the whole set
+        of checkpoints it may name: the dataset root holds the ones that came
+        with the dataset, and the output directory holds everything this
+        service wrote or received (saves, autosaves, uploads). Advertising
+        both is what lets a client offer a choice instead of asking the user
+        to type a path on a host it may never have seen.
+        """
+        root = self._output_root()
+        if root is None or not root.is_dir():
+            return []
+        found = []
+        for path in root.glob("**/*.ckpt"):
+            relative = path.relative_to(root)
+            # Artifact staging is transfer plumbing, and the upload store
+            # holds digest-named copies a client already has a handle on
+            # (``uploaded_checkpoint``). Neither is something a user picks
+            # from, which also keeps the two load sources disjoint.
+            if any(part.startswith(".") for part in relative.parts) \
+                    or relative.parts[0] == UPLOADED_CHECKPOINTS_DIRNAME:
+                continue
+            if path.is_file():
+                found.append((path.stat().st_mtime, str(path)))
+        found.sort(key=lambda entry: (-entry[0], entry[1]))
+        return [path for _, path in found[:SESSION_CHECKPOINTS_LISTED]]
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -752,9 +783,29 @@ class ServiceState:
 
     def _prepare_session_request(self, request):
         """Validate one session request into the arguments a build needs."""
+        # The scroll specification in the dataset root owns these. A request
+        # that names one is refused rather than quietly overruled by the file.
+        scroll_owned = sorted(
+            key for key in SCROLL_SPEC_OWNED_RUN_KEYS
+            if key in (request.get("run") or {}))
+        if scroll_owned:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
+                "values; the request must not carry them",
+                [{"field": f"run.{key}",
+                  "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
+                              f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
+                 for key in scroll_owned])
         if self.dataset_resolution is not None:
             request = self._dataset_session_request(request)
-        paths, run, preview = parse_session_request(request)
+        try:
+            paths, run, preview = parse_session_request(request)
+        except (KeyError, TypeError, ValueError) as exc:
+            # An unparseable request field (an unknown PCL role, say) is the
+            # caller's error, not a service fault.
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Malformed session request: {exc}") from exc
         errors = validate_session_request(paths, run)
         # The scroll specification is resolved from the dataset root; it
         # carries the physical scroll facts (including the outward sense,
@@ -813,13 +864,18 @@ class ServiceState:
                          daemon=True).start()
 
     def rebuild(self, request):
-        """Tear the resident session down and build a fresh one.
+        """Rebuild the resident session, from the model stage or from nothing.
 
         This is the only verb that may replace the model domain or the
         structural configuration: teardown is visible as ``Loading`` instead
         of hidden inside a load. ``{"defaults": true}`` rebuilds from the
         launch defaults and ignores every autosave, which is how a service
         stuck in ``Error`` recovers.
+
+        A request that changes nothing but model configuration keeps the
+        loaded host inputs and the brick pools and replaces the model stage
+        alone (see ``_rebuild_stage_locked``); everything else is the full
+        teardown and reconstruction it has always been.
         """
         request = dict(request or {})
         request.pop("command_id", None)
@@ -834,6 +890,9 @@ class ServiceState:
                     "A defaults rebuild takes no other request fields")
             request = self.startup_session_request(resume=False)
         paths, run, preview, scroll = self._prepare_session_request(request)
+        if paths.checkpoint and run.config:
+            self._reject_overrides_the_checkpoint_contradicts(
+                paths.checkpoint, run.config)
         with self.lock:
             # Idle|Error -> Loading. A resident session that is mid-operation
             # has to settle first, and a build already in flight is its own
@@ -847,8 +906,89 @@ class ServiceState:
                     HTTPStatus.CONFLICT,
                     f"A rebuild requires an idle or failed session (state is "
                     f"{SessionState(state).name})")
-        self._begin_build(paths, run, preview, scroll)
-        return {**self.status(), "accepted": True, "rebuilding": True}
+            stage = ("all" if defaults
+                     else self._rebuild_stage_locked(paths, run, preview, state))
+        if stage == "model":
+            self._begin_model_rebuild(paths, run, preview)
+        else:
+            self._begin_build(paths, run, preview, scroll)
+        return {**self.status(), "accepted": True, "rebuilding": True,
+                "stage": stage}
+
+    def _rebuild_stage_locked(self, paths, run, preview, state):
+        """How much of the resident session this request has to replace.
+
+        Everything outside ``run.config`` is ``all``. Paths name host inputs
+        whose contents another process may have changed, so retaining a stage
+        across one would need a content fingerprint nothing computes; the
+        preview block, the run tag, the z window and the storage backend are
+        read before or outside the model. Within ``run.config`` the answer is
+        ``config.rebuild_stage`` over the keys whose requested value differs
+        from the live session's, which is "model" only for the audited
+        allowlist and "all" for everything else.
+
+        Call with the lock held.
+        """
+        current = self.session_request
+        if (self.session is None or current is None
+                or state != SessionState.Idle):
+            # Nothing to keep: there is no resident session, or it has no
+            # model to rebuild around (Error), or it is not quiescent.
+            return "all"
+        if (paths.manifest() != current.get("paths")
+                or preview.manifest() != current.get("preview")):
+            return "all"
+        live_run = dict(current.get("run") or {})
+        new_run = run.manifest()
+        live_config = dict(live_run.pop("config", None) or {})
+        new_config = dict(new_run.pop("config", None) or {})
+        if live_run != new_run:
+            return "all"
+        changed = {
+            key for key in set(live_config) | set(new_config)
+            if live_config.get(key) != new_config.get(key)
+        }
+        return rebuild_stage(changed)
+
+    def _begin_model_rebuild(self, paths, run, preview):
+        """Publish the new request and rebuild the model off the HTTP thread.
+
+        The session object, its generation and its whole session scope
+        survive: the host inputs the ephemeral uploads were incorporated into
+        are retained, so neither the ephemeral ledger nor the uploaded files
+        behind it are reset here, and the session reports its own ``Loading``
+        while the fitter thread works.
+        """
+        with self.lock:
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
+            self._building = True
+            self.session_paths = paths
+            self.session_request = {
+                "paths": paths.manifest(),
+                "run": run.manifest(),
+                "preview": preview.manifest(),
+            }
+            self.session_revision += 1
+            self.status_generation += 1
+            session_id = self.session_id
+            session = self.session
+        threading.Thread(
+            target=self._rebuild_model,
+            args=(session_id, session, paths, run),
+            name="spiral-model-rebuild", daemon=True).start()
+
+    def _rebuild_model(self, session_id, session, paths, run):
+        """Ask the resident session to replace its model stage."""
+        try:
+            session.rebuild_model(paths, run)
+        except BaseException as exc:
+            self._fail_session(session_id, _cause(exc))
+            return
+        with self.lock:
+            self._building = False
+            self.status_generation += 1
 
     def _begin_build(self, paths, run, preview, scroll):
         """Publish ``Loading`` and construct the runtime off the HTTP thread."""
@@ -869,7 +1009,6 @@ class ServiceState:
                 "preview": preview.manifest(),
             }
             self.session_revision += 1
-            self.run_plans.clear()
             self._reset_session_scope()
             self._session_state = SessionState.Loading
             self._session_phase = "Building the fit session"
@@ -930,6 +1069,7 @@ class ServiceState:
                            operation="building_session")
 
     def _reset_session_scope(self):
+        self._preview_export_active = False
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
@@ -1103,28 +1243,58 @@ class ServiceState:
             payload=snapshot, coalesce_key=("preview-publish",))
 
     def run(self, request):
-        token = request.get("plan_token")
         autosave_on_pause = request.get("autosave_on_pause", True)
         if not isinstance(autosave_on_pause, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "autosave_on_pause must be true or false")
-        with self.lock:
-            plan = self.run_plans.pop(token, None)
-        if not plan or plan["expires"] < time.monotonic():
-            raise ApiError(HTTPStatus.CONFLICT, "Run plan is missing or expired")
-        if plan["revision"] != self.session_revision:
-            raise ApiError(HTTPStatus.CONFLICT, "Run plan is stale")
-        if plan["new_fit_required"]:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "This plan requires Start New Fit")
-        if plan["session_reload_required"]:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "This plan requires reloading fit inputs")
         session = self._require_session()
-        status = session.status()
+        if session.status().get("state") != SessionState.Idle:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "Running requires an idle session")
+        expected = request.get("expected_session_revision")
+        if expected != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
+        configuration = request.get("configuration")
+        if not isinstance(configuration, dict) or \
+                set(configuration) != set(self.config_catalog["defaults"]):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Running requires a complete configuration")
+        try:
+            configuration = Config(configuration).as_dict()
+            iterations = int(request.get("iterations", 0))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if iterations < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "iterations must be at least 1")
+        current = session.status().get("applied_config")
+        if current is None:
+            current = Config(
+                (self.session_request.get("run") or {}).get("config") or {}
+            ).as_dict()
+        changes = {key: value for key, value in configuration.items()
+                   if current.get(key) != value}
+        fields = self.config_catalog["schema"]["fields"]
+        forbidden = {
+            key: fields[key]["runtime_impact"] for key in changes
+            if fields[key]["runtime_impact"] != "run_boundary"
+        }
+        if forbidden:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "The requested configuration requires rebuilding the fit",
+                [{"field": f"configuration.{key}",
+                  "message": f"Runtime impact is {impact}"}
+                 for key, impact in sorted(forbidden.items())])
+        current_manifest = self.session_paths.manifest()
+        input_manifest = request.get("inputs")
+        if input_manifest is not None and input_manifest != current_manifest:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Static dataset inputs cannot be changed by a run")
         influence_config = _validate_run_influence_config(
-            plan["influence"])
-        run_config = plan["configuration_changes"]
+            request.get("influence") or {})
+        run_config = changes
         with self.lock:
             # The fitter (and, under DDP, its child ranks) receives plain
             # records; the ledger maps them back to its own entries when the
@@ -1148,122 +1318,10 @@ class ServiceState:
                 # nothing about the model, so it needs no planning round.
                 "autosave_on_pause": autosave_on_pause,
         }
-        if plan["path_changes"]:
-            run_arguments["path_changes"] = plan["path_changes"]
-        target = session.run(plan["iterations"], **run_arguments)
+        target = session.run(iterations, **run_arguments)
         with self.lock:
-            self.run_plans.clear()
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
-
-    def plan_run(self, request):
-        session = self._require_session()
-        if session.status().get("state") != SessionState.Idle:
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "Run planning requires a paused session")
-        expected = request.get("expected_session_revision")
-        if expected != self.session_revision:
-            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
-        configuration = request.get("configuration")
-        if not isinstance(configuration, dict) or \
-                set(configuration) != set(self.config_catalog["defaults"]):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Run planning requires a complete configuration")
-        try:
-            configuration = Config(configuration).as_dict()
-        except ValueError as exc:
-            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
-        iterations = int(request.get("iterations", 0))
-        if iterations < 1:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "iterations must be at least 1")
-        current = session.status().get("applied_config")
-        if current is None:
-            current = Config(
-                (self.session_request.get("run") or {}).get("config") or {}
-            ).as_dict()
-        changes = {
-            key: value for key, value in configuration.items()
-            if current.get(key) != value
-        }
-        fields = self.config_catalog["schema"]["fields"]
-        impacts = {fields[key]["runtime_impact"] for key in changes}
-        dependencies = sorted({
-            dependency for key in changes
-            for dependency in fields[key]["dependencies"]
-        })
-        current_manifest = self.session_paths.manifest()
-        input_manifest = request.get("inputs")
-        if input_manifest is None:
-            input_manifest = current_manifest
-        if not isinstance(input_manifest, dict):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "inputs must be a path manifest object")
-        path_changes = {
-            key: input_manifest.get(key)
-            for key in set(current_manifest) | set(input_manifest)
-            if input_manifest.get(key) != current_manifest.get(key)
-        }
-        input_changes = []
-        for key, value in sorted(path_changes.items()):
-            impact, path_dependencies = input_change_impact(key)
-            impacts.add(impact)
-            dependencies.extend(path_dependencies)
-            input_changes.append({
-                "key": key,
-                "before": current_manifest.get(key),
-                "after": value,
-                "runtime_impact": impact,
-            })
-        # Path changes a resident session takes live (without a session
-        # reload) are validated eagerly against their catalog kind; changes
-        # that force a reload are validated when the session reloads.
-        for key in sorted(path_changes):
-            spec = fit_input(key)
-            if spec is None or spec.runtime_impact == "prepared_input_rebuild":
-                continue
-            value = str(path_changes[key] or "").strip()
-            if spec.kind in ("directory", "zarr-group") and (
-                    not value or not Path(value).is_dir()):
-                label = spec.key.replace("_", " ").capitalize()
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{label} path is not a readable directory",
-                    [{"field": spec.key,
-                      "message": "Path is not a directory"}])
-        dependencies = sorted(set(dependencies))
-        token = secrets.token_urlsafe(24)
-        new_fit = "new_fit" in impacts
-        session_reload_required = "prepared_input_rebuild" in impacts
-        plan = {
-            "revision": self.session_revision,
-            "expires": time.monotonic() + 60.0,
-            "iterations": iterations,
-            "influence": request.get("influence") or {},
-            "configuration_changes": changes,
-            "path_changes": path_changes,
-            "changes": [
-                {"key": key, "before": current.get(key), "after": value,
-                 "runtime_impact": fields[key]["runtime_impact"]}
-                for key, value in changes.items()
-            ],
-            "affected_prepared_inputs": dependencies,
-            "model_state_preserved": not new_fit,
-            "optimizer_state_preserved": not new_fit,
-            "new_fit_required": new_fit,
-            "session_reload_required": session_reload_required,
-            "input_changed": bool(path_changes),
-            "input_changes": input_changes,
-        }
-        with self.lock:
-            self.run_plans[token] = plan
-        return {
-            **self._base(), "plan_token": token,
-            "expires_in_seconds": 60,
-            **{key: value for key, value in plan.items()
-               if key not in {"expires", "configuration_changes", "path_changes",
-                              "iterations", "influence", "revision"}},
-        }
 
     def stop(self):
         self._require_session().stop()
@@ -1272,89 +1330,179 @@ class ServiceState:
         return {**self.status(), "accepted": True}
 
     def save_checkpoint(self, request):
+        """Write a named checkpoint into this session's checkpoint folder.
+
+        The client names the file; the service decides where it lives. A
+        checkpoint has only ever been allowed under the session output
+        directory, so asking the client for an absolute path on a host it may
+        never have seen only ever meant "type the prefix I am about to check
+        for". A name says the same thing without the path policing, and it is
+        the same name ``/session/status`` reports back as
+        ``checkpoint_path``.
+        """
         session = self._require_session()
-        path = request.get("path")
-        if not path:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "Checkpoint path is required")
-        resolved = Path(path).expanduser().resolve(strict=False)
-        if self.dataset_resolution is not None:
-            output_root = Path(self.session_paths.output_directory).resolve(strict=False)
-            if not resolved.is_relative_to(output_root):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "This service only saves checkpoints under the "
-                               "session output directory")
-        saved = session.save_checkpoint(str(resolved))
+        name = self._checkpoint_file_name(request.get("name"))
+        with self.lock:
+            root = Path(self.session_paths.output_directory) / "checkpoints"
+        root.mkdir(parents=True, exist_ok=True)
+        saved = session.save_checkpoint(str(root / name))
         return {**self.status(), "checkpoint_path": saved}
 
+    @staticmethod
+    def _checkpoint_file_name(value):
+        """One safe file name for a client-named checkpoint."""
+        name = str(value or "").strip()
+        if not name:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Checkpoint name is required")
+        if "/" in name or not is_safe_relative_name(name):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "Checkpoint name must be a single file name",
+                [{"field": "name",
+                  "message": "Not a valid checkpoint file name"}])
+        return name if name.endswith(".ckpt") else f"{name}.ckpt"
+
     def export_preview(self):
-        """Export and publish one preview generation, on request.
+        """Start one preview generation; do not wait for it.
 
         Previews are not a side effect of pausing or of resuming from a
         checkpoint any more: they cost minutes, and a client that wants one
-        asks for one. Publication (Lasagna flattening and packaging) still
-        follows the session's preview status, so this returns as soon as the
-        session has exported and published the new generation.
+        asks for one. Because they cost minutes, this verb accepts the work
+        and returns. Holding the request open for the whole export and its
+        Lasagna publication meant every real preview outlived the client's
+        transfer timeout, and each retry then queued behind the original on
+        the command-replay condition and timed out in turn — so a preview
+        that in fact succeeded was reported as a failure.
+
+        What the client watches instead is the status it already polls:
+        ``preview_exporting`` while this is running, ``preview_publish`` for
+        publication progress, then ``preview_artifact`` for the result or
+        ``preview_publish_error`` for the cause.
         """
         session = self._require_session()
-        state = session.status().get("state")
-        if state != SessionState.Idle:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                f"Exporting a preview requires an idle session (state is "
-                f"{SessionState(state).name})")
-        result = session.export_preview()
         with self.lock:
+            if self._preview_export_active:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A preview export is already in progress")
+            state = session.status().get("state")
+            if state != SessionState.Idle:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"Exporting a preview requires an idle session (state is "
+                    f"{SessionState(state).name})")
+            self._preview_export_active = True
             self.status_generation += 1
-        return {**self.status(), "exported": True,
-                "preview_generation": result.get("preview_generation")}
+            session_id = self.session_id
+        threading.Thread(
+            target=self._export_preview, args=(session, session_id),
+            name="spiral-preview-export", daemon=True).start()
+        return {**self.status(), "accepted": True}
 
-    def _resolve_loadable_checkpoint(self, path):
-        """Where an in-session load may read a checkpoint from.
+    def _export_preview(self, session, session_id):
+        """Run one export off the HTTP thread and report it through status.
 
-        The same rule the session-load request uses: a checkpoint this
-        service advertises, or one under the session output directory (which
-        is where uploaded checkpoints and autosaves land).
+        Publication follows the session's preview status on the fitter
+        thread, so this returns only once the whole generation is published;
+        nothing but this thread is waiting on it.
         """
-        if not path:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Checkpoint path is required")
-        resolved = Path(path).expanduser().resolve(strict=False)
-        if not resolved.is_file():
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "Checkpoint does not exist on the service host",
-                           [{"field": "path", "message": "No such file"}])
-        if self.dataset_resolution is not None:
+        try:
+            session.export_preview()
+        except BaseException as exc:
+            error = _cause(exc)
+            print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
+            self.events.append(
+                "error", f"Preview export failed: {error}", severity="error",
+                source="service", operation="exporting_preview")
+            with self.lock:
+                if self.session_id == session_id:
+                    self._preview.error = error
+        finally:
+            with self.lock:
+                self._preview_export_active = False
+                self.status_generation += 1
+
+    def _resolve_load_source(self, request):
+        """The single checkpoint a load request names, resolved by its host.
+
+        A load names exactly one of two things, and both are strings this
+        service handed out: ``host_checkpoint`` is one of the checkpoints
+        ``/dataset`` advertises, and ``uploaded_checkpoint`` is the path a
+        checkpoint upload returned. Neither asks the client to reason about a
+        filesystem it may never have seen — that is why they are separate
+        fields rather than one free path: they are checked against different
+        sets, and the client knows which it has without inspecting the string.
+        """
+        host = str(request.get("host_checkpoint") or "").strip()
+        uploaded = str(request.get("uploaded_checkpoint") or "").strip()
+        if bool(host) == bool(uploaded):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "A load names exactly one of host_checkpoint or "
+                "uploaded_checkpoint")
+        if host:
             advertised = set(
-                self.dataset_resolution.to_dict().get("detected_checkpoints", []))
-            output_root = Path(
-                self.session_paths.output_directory).resolve(strict=False)
-            if (str(resolved) not in advertised
-                    and not resolved.is_relative_to(output_root)):
+                self.dataset_resolution.to_dict()["detected_checkpoints"])
+            advertised.update(self.session_checkpoints())
+            if host not in advertised:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "Checkpoint must be one the service advertises or one "
-                    "under the session output directory",
-                    [{"field": "path",
+                    "host_checkpoint must be one of the checkpoints /dataset "
+                    "advertises",
+                    [{"field": "host_checkpoint",
                       "message": "Not a service-advertised checkpoint"}])
+            return host
+        root = self._output_root()
+        store = None if root is None \
+            else (root / UPLOADED_CHECKPOINTS_DIRNAME).resolve(strict=False)
+        resolved = Path(uploaded).expanduser().resolve(strict=False)
+        if store is None or not resolved.is_relative_to(store) \
+                or not resolved.is_file():
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "uploaded_checkpoint must be a path a checkpoint upload "
+                "returned",
+                [{"field": "uploaded_checkpoint",
+                  "message": "Not an uploaded checkpoint"}])
         return str(resolved)
 
     def load_checkpoint(self, request):
-        """Load a checkpoint into the resident model, strictly.
+        """Load a checkpoint into the resident fit; rebuild only on request.
 
-        The session keeps its model, its inputs and its identity: this verb
-        only replaces model/optimiser/scheduler/RNG state, and only when the
-        checkpoint matches the live model exactly. A checkpoint describing a
-        different model domain or structure is refused here rather than
-        rebuilt behind the client's back; that is what a new fit is for.
+        One verb, three outcomes. Without ``allow_rebuild`` this is the strict
+        in-place load it has always been: the session keeps its model, its
+        inputs and its identity, this replaces only
+        model/optimiser/scheduler/RNG state, and a checkpoint that does not
+        match the live model exactly is refused rather than rebuilt behind the
+        client's back. The refusal carries the preflight's own reasons and,
+        when a rebuild could accept the checkpoint, the stage that rebuild
+        would need; when nothing a rebuild can do would help it says
+        ``refused`` instead, and offers nothing.
+
+        With ``allow_rebuild`` the service performs that rebuild itself, from
+        the live session request with this checkpoint set and the advanced
+        overrides dropped — see ``_rebuild_onto_checkpoint``.
+
+        The preflight therefore runs twice on the escalation path: once to
+        refuse, once inside the rebuild. That is a real cost, it is only paid
+        on a refusal the client chose to escalate, and it buys a single
+        client-side code path.
         """
+        request = dict(request or {})
+        allow_rebuild = request.pop("allow_rebuild", False)
+        if not isinstance(allow_rebuild, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "allow_rebuild must be true or false")
         session = self._require_session()
-        path = self._resolve_loadable_checkpoint(request.get("path"))
+        path = self._resolve_load_source(request)
         state = session.status().get("state")
         if state != SessionState.Idle:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 f"Loading a checkpoint requires an idle session (state is "
                 f"{SessionState(state).name})")
+        if allow_rebuild:
+            return self._rebuild_onto_checkpoint(path)
         try:
             result = session.load_checkpoint(path)
         except ApiError:
@@ -1366,8 +1514,7 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     f"Checkpoint load failed after preflight: {exc}") from exc
-            raise ApiError(HTTPStatus.CONFLICT,
-                           f"Checkpoint refused: {exc}") from exc
+            raise self._checkpoint_refusal(path, exc) from exc
         with self.lock:
             if self.session_paths is not None:
                 self.session_paths = dataclasses.replace(
@@ -1376,13 +1523,130 @@ class ServiceState:
                 paths = dict(self.session_request.get("paths") or {})
                 paths["checkpoint"] = path
                 self.session_request = {**self.session_request, "paths": paths}
-            # Plans computed against the replaced model are stale.
-            self.run_plans.clear()
+            # Loading replaces the model state represented by this revision.
             self.session_revision += 1
             self.status_generation += 1
         return {**self.status(), "loaded": True, "checkpoint_path": path,
                 "restored_iteration": result.get("completed_iterations"),
                 "config_revision": result.get("config_revision")}
+
+    def _checkpoint_durable_cfg(self, path):
+        """The durable configuration and dataset a checkpoint records.
+
+        CPU-only and read afresh: the same bytes an escalated rebuild would
+        apply, so nothing here can go stale between the refusal and the
+        rebuild the client may ask for next. A file that will not load at all
+        reports no configuration, which every caller treats as "no rebuild
+        can help".
+        """
+        from checkpoint_io import load_checkpoint_cpu
+        try:
+            payload = load_checkpoint_cpu(path)
+        except Exception:
+            return None, ""
+        try:
+            if not isinstance(payload, dict):
+                return None, ""
+            cfg = payload.get("cfg")
+            manifest = payload.get("input_manifest") or {}
+            return (dict(cfg) if isinstance(cfg, Mapping) else None,
+                    str(manifest.get("dataset_root") or ""))
+        finally:
+            # A refusal must not leave a whole model + optimiser archive
+            # mapped for the lifetime of the service.
+            del payload
+
+    def _checkpoint_refusal(self, path, cause):
+        """Turn a preflight refusal into the 409 a client can act on.
+
+        The stage comes from the *whole* cfg diff, not from the invariants the
+        preflight named. Two reasons. Some model-shaping keys the preflight
+        reports (model_flow_bounds_z_margin) are read during host preparation,
+        so "only shape keys mismatched" would not imply a model-stage rebuild.
+        And a checkpoint's stored cfg overrides host-affecting keys the
+        preflight never checks, so a checkpoint differing in, say, a track_*
+        setting needs the whole build even though it reported no
+        incompatibility there. A model z-domain mismatch reaches "all" through
+        z_begin/z_end on this same path rather than through a special case.
+        """
+        reasons = [line for line in str(cause).splitlines() if line.strip()]
+        checkpoint_cfg, checkpoint_dataset = self._checkpoint_durable_cfg(path)
+        with self.lock:
+            status = self.session.status() if self.session else {}
+            dataset_root = str(
+                getattr(self.session_paths, "dataset_root", "") or "")
+        live = durable_config(status.get("applied_config") or {})
+        # What no rebuild can fix: a checkpoint from another dataset, or one
+        # whose configuration is not this schema's at all.
+        if checkpoint_cfg is None or (
+                set(checkpoint_cfg) - set(live)
+                or set(live) - set(checkpoint_cfg) - {"z_begin", "z_end"}):
+            return ApiError(
+                HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+                payload={"reasons": reasons, "refused": True})
+        if checkpoint_dataset and dataset_root \
+                and checkpoint_dataset != dataset_root:
+            return ApiError(
+                HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+                payload={"reasons": reasons, "refused": True})
+        changed = {key for key, value in checkpoint_cfg.items()
+                   if live.get(key) != value}
+        return ApiError(
+            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+            payload={"reasons": reasons, "stage": rebuild_stage(changed)})
+
+    def _reject_overrides_the_checkpoint_contradicts(self, path, overrides):
+        """Refuse a rebuild whose overrides fight the checkpoint it resumes.
+
+        The runtime applies ``run.config`` on top of the checkpoint's stored
+        cfg, so an override of a model-shaping key wins for the session's
+        configuration while the model it is resuming is still the
+        checkpoint's. The build's own preflight then refuses it from inside a
+        session build, where the only possible outcome is a failed session.
+        Say so as a request error instead.
+
+        Only the model-shaping keys are restricted. Every other override —
+        loss weights, sample counts, schedules — is a legitimate change to
+        make while resuming, and the fit is built to take them.
+        """
+        checkpoint_cfg, _ = self._checkpoint_durable_cfg(path)
+        if not checkpoint_cfg:
+            return
+        conflicts = sorted(
+            key for key in CHECKPOINT_MODEL_SHAPE_KEYS
+            if key in overrides and key in checkpoint_cfg
+            and checkpoint_cfg[key] != overrides[key])
+        if conflicts:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "The checkpoint this rebuild resumes disagrees with the "
+                "advanced configuration it carries; drop these overrides, or "
+                "rebuild without the checkpoint",
+                [{"field": f"run.config.{key}",
+                  "message": (f"The checkpoint was written with "
+                              f"{checkpoint_cfg[key]!r}")}
+                 for key in conflicts])
+
+    def _rebuild_onto_checkpoint(self, path):
+        """Rebuild the session with this checkpoint as its resume path.
+
+        The escalated request is the live one with the checkpoint set and
+        ``run.config`` emptied. Emptying it is not a simplification:
+        spiral_runtime applies run.config on top of the checkpoint's stored
+        cfg, so resending the advanced profile that just failed the preflight
+        would re-impose exactly the mismatching keys, and the rebuild would
+        fail the same preflight from inside a session build.
+        """
+        with self.lock:
+            current = copy.deepcopy(self.session_request or {})
+        if not current:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "There is no session request to rebuild from")
+        paths = dict(current.get("paths") or {})
+        paths["checkpoint"] = path
+        run = dict(current.get("run") or {})
+        run["config"] = {}
+        return self.rebuild({**current, "paths": paths, "run": run})
 
     def download_checkpoint(self):
         """Create a checkpoint and publish it as a downloadable artifact."""
@@ -1440,9 +1704,9 @@ class ServiceState:
         """
         with self.lock:
             output_directory = self.session_paths.output_directory
-            voxel_size_um = (
-                (self.session_request or {}).get("run") or {}
-            ).get("voxel_size_um")
+        # The physical resolution of the preview is the scroll's own, read from
+        # the specification the dataset root carries.
+        voxel_size_um = (self.scroll_spec or {}).get("voxel_size_um")
 
         def attach_process(process):
             with self.lock:
@@ -1562,10 +1826,6 @@ class ServiceState:
         return {**self.status(), "input": dict(finalized.record),
                 "accepted": True}
 
-    def delete_upload(self, upload_id):
-        self.uploads_manager.delete(upload_id)
-        return {**self._base(), "deleted": True}
-
     def gc_uploads(self):
         self.uploads_manager.collect_garbage()
 
@@ -1599,7 +1859,6 @@ class ServiceState:
                         HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
                 records = self.ephemeral_records.uncommitted()
                 paths = self.session_paths
-            dataset_root = Path(paths.dataset_root)
             patches_dir = Path(paths.verified_patches) if paths.verified_patches \
                 else dataset_root / "verified_patches"
             fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
@@ -1675,9 +1934,7 @@ class ServiceState:
         finally:
             commit_lock.release()
 
-    def remove_input(self, request):
-        kind = str(request.get("kind") or "").strip()
-        input_id = str(request.get("id") or "").strip()
+    def remove_input(self, kind, input_id):
         with self.lock:
             self._require_session()
             record = self.ephemeral_records.find(kind, input_id)
@@ -1735,10 +1992,6 @@ class ServiceState:
                 self.inflight_commands.discard(key)
                 self.command_condition.notify_all()
 
-    def deduplicated(self, command_id, operation):
-        """Replay an unnamed command; kept for callers outside the routes."""
-        return self.replay_command("command", command_id, operation)
-
     def close(self):
         with self.lock:
             session = self.session
@@ -1759,19 +2012,6 @@ class SpiralServer(ThreadingHTTPServer):
         super().__init__(address, SpiralHandler)
         self.credentials = list(credentials)
         self.state = state
-        self.restart_requested = threading.Event()
-        self._restart_lock = threading.Lock()
-        self._restart_scheduled = False
-
-    def request_restart(self):
-        """Acknowledge first, then ask main() to close and re-exec the service."""
-        with self._restart_lock:
-            if not self._restart_scheduled:
-                self._restart_scheduled = True
-                timer = threading.Timer(0.1, self.restart_requested.set)
-                timer.daemon = True
-                timer.start()
-        return {**self.state._base(), "restarting": True}
 
 
 class Idempotency:
@@ -1838,19 +2078,6 @@ class Route:
         self.reads_body = reads_body
 
 
-def _route_logs(ctx):
-    values = ctx.query.get("after", ["0"])
-    try:
-        after = int(values[-1])
-    except (TypeError, ValueError):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The log cursor must be an integer")
-    if after < 0:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "The log cursor must not be negative")
-    return ctx.state.logs.read_after(after)
-
-
 def _route_events(ctx):
     try:
         cursor = int(ctx.query.get("cursor", ["0"])[-1])
@@ -1885,12 +2112,6 @@ def _route_upload_file(ctx):
         ctx.args[0], ctx.args[1], handler.rfile, length)
 
 
-def _route_export_full(_ctx):
-    raise ApiError(HTTPStatus.NOT_IMPLEMENTED,
-                   "Full diagnostic export is not implemented by the "
-                   "interactive service")
-
-
 _UPLOAD_ID = r"[0-9a-f]{32}"
 
 # The whole HTTP surface, declared once. Dispatch walks this table; there is
@@ -1903,7 +2124,6 @@ ROUTES = (
           lambda ctx: ctx.state.configuration_catalog(), Idempotency.NONE),
     Route("GET", "/session/status", "session_status",
           lambda ctx: ctx.state.status(), Idempotency.NONE),
-    Route("GET", "/logs", "logs", _route_logs, Idempotency.NONE),
     Route("GET", "/events", "events", _route_events, Idempotency.NONE),
     Route("GET", "/dataset", "dataset",
           lambda ctx: ctx.state.dataset(), Idempotency.NONE),
@@ -1919,28 +2139,25 @@ ROUTES = (
 
     # There is deliberately no DELETE /session: the service always holds a
     # session, and replacing one is POST /session/rebuild.
-    Route("DELETE", "/session/ephemeral-inputs", "ephemeral_input_remove",
-          lambda ctx: ctx.state.remove_input(ctx.body), Idempotency.COMMAND_ID,
-          reads_body=True),
-    Route("DELETE", re.compile(rf"/session/inputs/({_UPLOAD_ID})"),
-          "upload_delete", lambda ctx: ctx.state.delete_upload(ctx.args[0]),
+    #
+    # A removal names its target in the path, so it needs no body: the
+    # operation is already idempotent (a second DELETE finds nothing to
+    # remove), and clients do not retry it.
+    Route("DELETE",
+          re.compile(r"/session/ephemeral-inputs/([a-z]+)/([A-Za-z0-9._-]+)"),
+          "ephemeral_input_remove",
+          lambda ctx: ctx.state.remove_input(ctx.args[0], ctx.args[1]),
           Idempotency.NONE),
 
     Route("POST", re.compile(rf"/session/inputs/({_UPLOAD_ID})/finalize"),
           "upload_finalize",
           lambda ctx: ctx.state.finalize_upload(ctx.args[0]),
           Idempotency.UPLOAD_ID, reads_body=True),
-    Route("POST", "/service/restart", "service_restart",
-          lambda ctx: ctx.handler.server.request_restart(),
-          Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
           reads_body=True),
     Route("POST", "/session/rebuild", "session_rebuild",
           lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
-          reads_body=True),
-    Route("POST", "/session/run/plan", "run_plan",
-          lambda ctx: ctx.state.plan_run(ctx.body), Idempotency.NONE,
           reads_body=True),
     Route("POST", "/session/run", "session_run",
           lambda ctx: ctx.state.run(ctx.body), Idempotency.COMMAND_ID,
@@ -1963,8 +2180,6 @@ ROUTES = (
     Route("POST", "/session/commit-inputs", "commit_inputs",
           lambda ctx: ctx.state.commit_inputs(), Idempotency.COMMAND_ID,
           reads_body=True),
-    Route("POST", "/session/export-full", "export_full", _route_export_full,
-          Idempotency.NONE, reads_body=True),
 )
 
 # Methods whose body is read before the route is resolved, so a malformed or
@@ -2002,9 +2217,9 @@ class SpiralHandler(BaseHTTPRequestHandler):
     def log_request(self, code="-", size="-"):
         """Suppress successful polling requests at the source.
 
-        Status, log, and event reads arrive several times a second from
-        every connected client; logging them would drown the terminal and
-        the relay buffers in access lines. Failed polls still log.
+        Status and event reads arrive several times a second from every
+        connected client; logging them would drown the terminal and the
+        event ring in access lines. Failed polls still log.
         """
         try:
             status = int(code)
@@ -2012,7 +2227,7 @@ class SpiralHandler(BaseHTTPRequestHandler):
             status = 0
         if self.command == "GET" and 200 <= status < 400:
             path = urlparse(self.path).path.rstrip("/")
-            if path in ("/session/status", "/logs", "/events"):
+            if path in ("/session/status", "/events"):
                 return
         super().log_request(code, size)
 
@@ -2137,7 +2352,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.OK, response)
         except ApiError as exc:
             payload = self.server.state._base()
-            payload.update({"error": exc.message, "details": exc.details})
+            payload.update({"error": exc.message, "details": exc.details,
+                            **exc.payload})
             # The request body may not have been fully consumed; do not reuse
             # the connection after an error.
             self._send(exc.status, payload, close=True)
@@ -2407,8 +2623,6 @@ def main(argv=None):
     server.timeout = 0.5
     try:
         while not shutdown.is_set():
-            if server.restart_requested.is_set():
-                break
             server.handle_request()
     finally:
         server.server_close()
@@ -2418,10 +2632,6 @@ def main(argv=None):
             if session_lease is not None:
                 session_lease.release()
             sys.stdout, sys.stderr = original_stdout, original_stderr
-    if server.restart_requested.is_set():
-        restart_args = list(sys.argv[1:] if argv is None else argv)
-        os.execv(sys.executable,
-                 [sys.executable, str(Path(__file__).resolve()), *restart_args])
     return 0
 
 

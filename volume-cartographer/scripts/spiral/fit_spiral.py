@@ -9,6 +9,7 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
+import gc
 import json
 import glob
 from collections.abc import Mapping
@@ -34,8 +35,9 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import Config, FitConfig, durable_config
-from fit_session import fit_input, input_change_impact
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+                    durable_config)
+from fit_session import fit_input
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
@@ -116,18 +118,6 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 configure_torch_threads_from_env()
 
-
-# Configuration keys that shape the model's parameter tensors. A checkpoint
-# whose stored value for any of them differs describes a different model, and
-# is refused rather than reshaped: a domain/structure change is the explicit
-# rebuild path's job.
-CHECKPOINT_MODEL_SHAPE_KEYS = (
-    'model_num_flow_integration_steps', 'model_flow_integration_solver',
-    'model_num_flow_timesteps', 'model_flow_bounds_z_margin',
-    'model_flow_bounds_radius', 'model_flow_voxel_resolution',
-    'model_flow_field_type', 'model_gap_expander_logit_resolution',
-    'model_gap_expander_num_windings', 'model_linear_z_resolution',
-)
 
 # Fields of a surf-SDT fingerprint that describe where the store lives and how
 # much of it has been built, rather than what it contains.
@@ -828,7 +818,7 @@ class FitContext:
 
     def shell_losses_enabled(self):
         # The outer-shell enabling predicate is fit-input catalog data,
-        # shared with request validation and run planning.
+        # shared with request validation and run admission.
         return fit_input('outer_shell').required(self.config)
 
     def _load_patches_from_dir(self, path, label='patches'):
@@ -932,11 +922,17 @@ class FitContext:
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
-        builds the sampling caches, the host-resident patch atlases, and
-        the trusted-geometry index. Requires no device state: the patch
-        atlases are host-resident (their `device` only selects where each
-        lookup's interpolated points are delivered), and the CUDA stores,
-        model, and optimiser are built later by build_device_state().
+        builds the sampling caches, the host-resident patch atlases, the
+        trusted-geometry index, the interactive influence anchor stash and
+        the whole-object DT target samples. Requires no device state: the
+        patch atlases are host-resident (their `device` only selects where
+        each lookup's interpolated points are delivered), and the CUDA
+        stores, model, and optimiser are built later by
+        build_device_state().
+
+        Everything the device stages read from here they only read: nothing
+        below the cut consumes or releases a host structure, so the model
+        stage can be re-run against inputs this method loaded once.
 
         The loaded inputs stay readable as attributes afterwards, so
         analysis tools can construct a context, call this, and read:
@@ -949,8 +945,8 @@ class FitContext:
           link_distance_tolerance
         - sampling: patch_sampling_probabilities, patch_atlas,
           unverified_patch_sampling_probabilities, unverified_patch_atlas
-        - trusted geometry: verified_patches_and_pcls_cpu / _np,
-          trusted_geometry_tree
+        - trusted geometry: trusted_geometry_tree,
+          influence_anchor_geometry
         - tracks: tracks, track_families, track_source_ids,
           track_crossing_cache, track_graph, track_reload_source /
           _families / _source_ids, track_sampling_config, using_tracks,
@@ -1499,12 +1495,54 @@ class FitContext:
         self.num_verified_patches = num_verified_patches
         self.patch_atlas = patch_atlas
         self.using_tracks = using_tracks
-        self.verified_patches_and_pcls_cpu = verified_patches_and_pcls_cpu
-        self.verified_patches_and_pcls_np = verified_patches_and_pcls_np
         self.trusted_geometry_tree = trusted_geometry_tree
         self.unverified_patches_list = unverified_patches_list
         self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
         self.unverified_patch_atlas = unverified_patch_atlas
+
+        # A compact subsample of the trusted cloud seeds a future Run's
+        # influence anchor bank. Keep it for every interactive session because
+        # influence can be enabled or disabled independently on each Run
+        # request. The generator is seeded explicitly, so the stash is
+        # deterministic without perturbing the training RNG streams.
+        self.influence_anchor_geometry = None
+        if self.interactive_driver is not None:
+            stash_generator = torch.Generator()
+            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
+            self.influence_anchor_geometry = subsample_rows(
+                verified_patches_and_pcls_cpu,
+                int(self.config['sample_count_influence_anchor_geometry_points']),
+                stash_generator,
+            ).clone()
+        # The trusted cloud itself stays local: the cKDTree above and that
+        # stash are all anything downstream reads it for, and consuming it
+        # here rather than in build_device_state() is what leaves the device
+        # stages with nothing of the host's to release.
+        del verified_patches_and_pcls_cpu, verified_patches_and_pcls_np
+
+        # ==========================================================================
+        # Whole-object DT target caches (see dt_targets.py)
+        # ==========================================================================
+
+        # Deterministic sparse samples over each patch's own grid: host work on
+        # host inputs, so it belongs here rather than beside the model that
+        # eventually reads the caches these seed.
+        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
+            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
+        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
+        if self.dt_target_whole_object:
+            progress.begin(
+                'loading', 'Preparing distance-target samples',
+                detail=(
+                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
+                    'patches'))
+            prepare_patch_dt_target_samples(
+                self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
+            )
+            if self.unverified_patches_list:
+                prepare_patch_dt_target_samples(
+                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
+                )
 
     def _phase_mode_active(self):
         return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
@@ -1601,6 +1639,20 @@ class FitContext:
         resume-checkpoint restore and the distributed reseed consume and
         overwrite the host RNG streams, so relative order is load-bearing.
         Requires load_host_inputs() to have run and self.out_path to be set.
+
+        The two stages below are one ordinal, not a graph: everything the
+        model stage needs from the store stage the store stage has already
+        built, so a rebuild that only changes the model re-runs the second
+        alone (see rebuild_model_state()).
+        """
+        self._build_store_state()
+        self._build_model_state()
+
+    def _build_store_state(self):
+        """Materialise the Lasagna and surf-SDT brick pools.
+
+        The expensive half of the device build, and the half nothing but the
+        z window, the store paths and the dense-loss mode can invalidate.
         """
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
@@ -1654,6 +1706,19 @@ class FitContext:
                 self._scalar_stores.append(self.sdt_volume['store'])
 
         self._sdt_inactive_warned = set()
+
+    def _build_model_state(self):
+        """Construct the model, the optimiser, and everything after them.
+
+        Reads the host inputs and the stores; owns the umbilicus device
+        tensors, the flow-field corners, the model and its resume, the shell
+        loss structures, the optimiser and LR scheduler, the prepared device
+        track tables, and the distributed bookkeeping. Nothing here consumes
+        or releases a host structure, which is what lets rebuild_model_state()
+        run it a second time.
+        """
+        interactive_driver = self.interactive_driver
+        progress = progress_or_null(self.progress)
 
         self.num_slices_for_visualisation = self.config.get('output_num_slices_for_visualization', 20)
         self.device = torch.device('cuda')
@@ -1859,9 +1924,17 @@ class FitContext:
         # Track training inputs
         # ==========================================================================
 
-        self.prepared_main_tracks = None
-        self.preview_extent_tracks = self.tracks
-        if self.using_tracks:
+        # A resident session drops the per-track input arrays once the tables
+        # exist (release_setup_only_tracks), so on a model-stage rebuild there
+        # is nothing left to prepare them from. Nothing is lost: the tables are
+        # a function of the host tracks and of track_* settings, and no track
+        # setting is on MODEL_STAGE_KEYS, so the tables already in hand are
+        # exactly what preparing them again would produce.
+        retained_tracks = self.using_tracks and self.tracks is None
+        if not retained_tracks:
+            self.prepared_main_tracks = None
+            self.preview_extent_tracks = self.tracks
+        if self.using_tracks and not retained_tracks:
             progress.begin(
                 'loading', 'Preparing tracks for optimization',
                 detail=f'{len(self.tracks):,} tracks')
@@ -1893,49 +1966,15 @@ class FitContext:
                 if self.prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                     self.preview_extent_tracks = (self.prepared_main_tracks['flat_zyx_cpu'],)
 
-        # A compact subsample of the trusted cloud seeds a future Run's influence
-        # anchor bank. Keep it for every interactive session because influence can
-        # be enabled or disabled independently on each Run request.
-        self.influence_anchor_geometry = None
-        if interactive_driver is not None:
-            stash_generator = torch.Generator()
-            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
-            self.influence_anchor_geometry = subsample_rows(
-                self.verified_patches_and_pcls_cpu,
-                int(self.config['sample_count_influence_anchor_geometry_points']),
-                stash_generator,
-            ).clone()
-
-        # The trusted cloud and its double-precision cKDTree are setup-only data.
+        # The trusted cloud's double-precision cKDTree is setup-only data on a
+        # one-shot fit; prepare_main_phase_tracks above is its last reader.
         # Track sampling retains its own compact offsets and coordinates.
         if interactive_driver is None:
             self.trusted_geometry_tree = None
-        self.verified_patches_and_pcls_cpu = None
-        self.verified_patches_and_pcls_np = None
 
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
 
-        # ==========================================================================
-        # Whole-object DT target caches (see dt_targets.py)
-        # ==========================================================================
-
-        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
-            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
-        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
-        if self.dt_target_whole_object:
-            progress.begin(
-                'loading', 'Preparing distance-target samples',
-                detail=(
-                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
-                    'patches'))
-            prepare_patch_dt_target_samples(
-                self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-            )
-            if self.unverified_patches_list:
-                prepare_patch_dt_target_samples(
-                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-                )
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
         def report_first_dt_target_cache(kind, cache):
@@ -1971,6 +2010,54 @@ class FitContext:
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
         self.interactive_dt_resume_iteration = None
+
+    # What _build_model_state() constructs, and therefore what
+    # rebuild_model_state() releases before running it again. Written out
+    # rather than derived, so device state added to the model stage without a
+    # decision about its release is a visible omission instead of a leak.
+    # prepared_main_tracks/preview_extent_tracks are deliberately absent: see
+    # the retained_tracks note in _build_model_state.
+    _MODEL_STAGE_ATTRIBUTES = (
+        'num_slices_for_visualisation', 'device', 'umbilicus_zyx',
+        'start_iteration', 'model_z_begin', 'model_z_end',
+        'flow_field_radius', 'flow_min_corner_spiral_zyx',
+        'flow_max_corner_spiral_zyx', 'num_training_steps',
+        '_initial_num_training_steps', 'spiral_and_transform', 'shell_map',
+        'shell_valid_zyxs_gpu', 'shell_outer_winding_idx',
+        '_dense_inactive_warned', 'low_res_flow_params',
+        'high_res_flow_params', 'gap_expander_params', 'optimiser',
+        'influence_state', 'interactive_influence_loss_weight',
+        'interactive_influence_anchor_samples', 'lr_scheduler', 'profiler',
+        'slice_to_spiral_transform', 'dr_per_winding',
+        'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
+        'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
+        'interactive_dt_resume_iteration',
+    )
+
+    def rebuild_model_state(self):
+        """Replace the model stage, keeping the host inputs and the stores.
+
+        The cheap rebuild: a configuration change confined to
+        config.MODEL_STAGE_KEYS reaches nothing load_host_inputs() or
+        _build_store_state() produced, so this releases exactly what
+        _build_model_state() owns and runs it again, against a model built
+        from the current configuration and resumed from the current
+        resume_path — the same session a full rebuild would have produced,
+        without re-reading the dataset or re-materialising the brick pools.
+
+        Fitter-thread only: the CUDA tensors released here are freed by the
+        thread that owns them, as every other release in this class is.
+        """
+        if getattr(self, 'profiler', None) is not None:
+            self.profiler.stop()
+        for name in self._MODEL_STAGE_ATTRIBUTES:
+            setattr(self, name, None)
+        # The optimiser state and the flow-field lattices are the session's
+        # largest allocations; hand the arena back before asking for their
+        # replacements rather than peaking at twice the model.
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._build_model_state()
 
     # ==========================================================================
     # Checkpoint save/load
@@ -2783,78 +2870,15 @@ class FitContext:
         old_values = {key: self.config[key] for key in config}
         self.config.update(config)
         try:
-            # The fit-input catalog names which path changes rebuild device
-            # shell state (today: exactly the outer-shell input).
-            shell_path_key = next(
-                (key for key in path_changes
-                 if input_change_impact(key)[0] == 'shell_reload'), None)
-            shell_changed = (
-                bool(changed & {
-                    key for key in self.config.keys()
-                    if str(key).startswith('shell_')
-                })
-                or shell_path_key is not None
-            )
+            # Static path changes are rejected by the service. Shell atlas
+            # construction settings are classified as prepared-input changes
+            # and likewise never reach this live boundary; ordinary shell
+            # parameters are just run configuration.
             rebuilt_tracks = None
             replace_prepared_tracks = False
-            rebuilt_track_rows = self.tracks
-            rebuilt_families = self.track_families
-            rebuilt_source_ids = self.track_source_ids
-            rebuilt_shell_patch = self.shell_patch
             rebuilt_shell_map = self.shell_map
-            rebuilt_shell_envelope = self.shell_envelope
             rebuilt_shell_outer = self.shell_outer_winding_idx
             rebuilt_shell_valid = self.shell_valid_zyxs_gpu
-            requested_shell_path = str(
-                path_changes.get(shell_path_key, self.shell_path) or '')
-
-            if shell_changed:
-                if not requested_shell_path:
-                    raise ValueError(
-                        'shell configuration requires an outer shell path')
-                rebuilt_shell_patch = load_tifxyz(requested_shell_path)
-                rebuilt_shell_envelope = (
-                    ShellPolarMap(
-                        rebuilt_shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device='cpu', config=self.config)
-                    if self.filter_tracks_by_shell else None
-                )
-                if self.filter_tracks_by_shell and self.track_reload_source is not None:
-                    (rebuilt_track_rows, rebuilt_families,
-                     kept_track_indices) = filter_tracks_to_outer_shell(
-                        self.track_reload_source, rebuilt_shell_envelope,
-                        self.track_reload_families, return_indices=True)
-                    rebuilt_source_ids = (
-                        self.track_reload_source_ids[kept_track_indices]
-                        if self.track_reload_source_ids is not None else None)
-                    rebuilt_tracks = prepare_main_phase_tracks(
-                        rebuilt_track_rows, None,
-                        float(self.config['track_exclusion_radius']), self.device,
-                        anchor_tree=self.trusted_geometry_tree,
-                        sampling_config=validate_track_sampling_config(self.config),
-                        track_families=rebuilt_families,
-                        track_source_ids=rebuilt_source_ids,
-                        crossing_cache=self.track_crossing_cache,
-                        track_graph=self.track_graph)
-                    replace_prepared_tracks = True
-
-                rebuilt_shell_map = (
-                    ShellPolarMap(
-                        rebuilt_shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device=self.device, config=self.config)
-                    if self.config['loss_weight_shell_outer'] > 0 else None
-                )
-                rebuilt_shell_valid = (
-                    self._subsample_shell_radius_pool(rebuilt_shell_patch)
-                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
-                )
-                rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
 
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
@@ -2904,6 +2928,28 @@ class FitContext:
                     self.unverified_patch_sampling_probabilities
                 rebuilt_unverified_atlas = self.unverified_patch_atlas
 
+            # Loss weights are live settings. If a shell loss is enabled for
+            # the first time, construct only the resident structure that loss
+            # needs; disabling it releases that structure. Atlas-shaping
+            # settings themselves require a full prepared-input rebuild.
+            if 'loss_weight_shell_outer' in changed:
+                rebuilt_shell_map = (
+                    ShellPolarMap(
+                        self.shell_patch, self.umbilicus,
+                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
+                        num_theta_bins=self.config['shell_num_theta_bins'],
+                        device=self.device, config=self.config)
+                    if self.config['loss_weight_shell_outer'] > 0 else None
+                )
+            if 'loss_weight_shell_patch_radius' in changed:
+                rebuilt_shell_valid = (
+                    self._subsample_shell_radius_pool(self.shell_patch)
+                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
+                )
+            if 'shell_outer_winding_idx' in changed:
+                rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
+
             dt_preparation_changed = bool(changed & {
                 'dt_target_mode', 'dt_target_max_stride',
                 'sample_count_patch_dt_target_points',
@@ -2937,16 +2983,9 @@ class FitContext:
             self.config.update(old_values)
             raise
 
-        if shell_changed:
-            self.shell_path = requested_shell_path
-            self.shell_patch = rebuilt_shell_patch
-            self.shell_map = rebuilt_shell_map
-            self.shell_envelope = rebuilt_shell_envelope
-            self.shell_outer_winding_idx = rebuilt_shell_outer
-            self.shell_valid_zyxs_gpu = rebuilt_shell_valid
-            self.tracks = rebuilt_track_rows
-            self.track_families = rebuilt_families
-            self.track_source_ids = rebuilt_source_ids
+        self.shell_map = rebuilt_shell_map
+        self.shell_outer_winding_idx = rebuilt_shell_outer
+        self.shell_valid_zyxs_gpu = rebuilt_shell_valid
         if replace_prepared_tracks:
             self.prepared_main_tracks = rebuilt_tracks
             self.preview_extent_tracks = (

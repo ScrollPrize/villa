@@ -48,7 +48,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Role -> conventional filename for ephemeral PCL uploads, from the
 # declarative fit-input catalog.
 PCL_ROLE_FILES = {
-    role.value: filename for role, filename, _ in PCL_ROLE_CONVENTIONS}
+    role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
 
 
 def _utc_stamp():
@@ -762,17 +762,6 @@ class UploadManager:
     # ------------------------------------------------------------------
     # Removal
     # ------------------------------------------------------------------
-
-    def delete(self, upload_id):
-        with self._lock:
-            upload = self.uploads.get(upload_id)
-            if upload is None:
-                raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
-            if upload.record is not None:
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "The upload is finalized; it is now a session input")
-            del self.uploads[upload_id]
-        shutil.rmtree(upload.staging_dir, ignore_errors=True)
 
     def collect_garbage(self):
         expired = []
