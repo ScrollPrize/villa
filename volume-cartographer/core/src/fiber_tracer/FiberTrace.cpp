@@ -87,11 +87,6 @@ using TraceClock = std::chrono::steady_clock;
     return std::clamp(value, -1.0f, 1.0f);
 }
 
-[[nodiscard]] float traceClampedPositiveDot(const TraceVec& a, const TraceVec& b)
-{
-    return traceClamp01(a.dot(b));
-}
-
 [[nodiscard]] float traceAngleBetweenUnit(const TraceVec& a, const TraceVec& b)
 {
     return std::acos(traceClampSignedUnit(a.dot(b)));
@@ -972,15 +967,12 @@ void buildCandidateTasksForOrderedParents(
         const TraceVec& currentSample = beam.currentSampleDirection;
         const TraceVec& currentStep = candidateDirection;
 
-        float score = presence;
-        score *= traceClampedPositiveDot(prevStep, currentStep);
-        score *= traceClampedPositiveDot(prevStep, currentSample);
-        score *= traceClampedPositiveDot(prevStep, candidateSampleDirection);
-        score *= traceClampedPositiveDot(currentSample, currentStep);
-        score *= traceClampedPositiveDot(currentSample, candidateSampleDirection);
-        score *= traceClampedPositiveDot(currentStep, candidateSampleDirection);
-
-        const float loss = (1.0f - score) +
+        const float loss = fiberLocalAlignmentLoss(
+                               presence,
+                               prevStep,
+                               currentStep,
+                               currentSample,
+                               candidateSampleDirection) +
             smoothnessLoss(prevStep, currentStep, smoothNormal, smoothNormalValid, config) +
             cumulativeTangentSmoothnessLoss(
                 beam.historyDirection,
@@ -1099,15 +1091,12 @@ void decodePredictionAndNormalCornerPoint(
             selectedCurrent = {alignedDirection, presence, true};
         }
 
-        float score = presence;
-        score *= traceClampedPositiveDot(prevStep, currentStep);
-        score *= traceClampedPositiveDot(prevStep, currentSample);
-        score *= traceClampedPositiveDot(prevStep, alignedDirection);
-        score *= traceClampedPositiveDot(currentSample, currentStep);
-        score *= traceClampedPositiveDot(currentSample, alignedDirection);
-        score *= traceClampedPositiveDot(currentStep, alignedDirection);
-
-        const float loss = (1.0f - score) +
+        const float loss = fiberLocalAlignmentLoss(
+                               presence,
+                               prevStep,
+                               currentStep,
+                               currentSample,
+                               alignedDirection) +
             smoothnessLoss(
                 prevStep,
                 currentStep,
@@ -3201,6 +3190,27 @@ CandidateScoreDebug debugCandidateLossFromCorners(
         beam,
         toTraceVec(candidateDirection),
         config);
+    return {
+        score.loss,
+        toVec3d(score.selectedCurrentDirection),
+        score.selectedPresence,
+        score.valid};
+}
+
+CandidateScoreDebug debugCandidateLossFromSample(
+    const FiberPredictionSample& sample,
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& currentSampleDirection,
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateDirection,
+    const FiberTraceConfig& config)
+{
+    BeamState beam;
+    beam.previousStepDirection = toTraceVec(previousStepDirection);
+    beam.currentSampleDirection = toTraceVec(currentSampleDirection);
+    beam.historyDirection = toTraceVec(historyDirection);
+    const CandidateScore score = candidateLossFromSample(
+        sample, beam, toTraceVec(candidateDirection), config);
     return {
         score.loss,
         toVec3d(score.selectedCurrentDirection),

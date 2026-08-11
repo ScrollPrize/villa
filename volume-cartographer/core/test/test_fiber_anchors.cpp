@@ -63,6 +63,23 @@ cv::Vec3d directionAtDegrees(double degrees)
     return {std::cos(radians), std::sin(radians), 0.0};
 }
 
+template <typename Sample>
+std::vector<FiberAnchorObservation> boxObservations(
+    const std::array<int, 3>& beginZYX,
+    const std::array<int, 3>& endZYX,
+    Sample&& sample)
+{
+    std::vector<FiberAnchorObservation> observations;
+    for (int z = beginZYX[0]; z < endZYX[0]; ++z) {
+        for (int y = beginZYX[1]; y < endZYX[1]; ++y) {
+            for (int x = beginZYX[2]; x < endZYX[2]; ++x) {
+                observations.push_back(sample(x, y, z));
+            }
+        }
+    }
+    return observations;
+}
+
 size_t occurrenceCount(const std::string& text, const std::string& needle)
 {
     size_t count = 0;
@@ -169,10 +186,14 @@ TEST_CASE("fiber anchor extraction fits two non-orthogonal direction modes")
         const auto result = vc::fiber_tracer::fitFiberCellAnchors({0, 0, 0}, {0, 0, 0}, {4, 4, 4}, cellObservations(4, first, second), config());
         REQUIRE_MESSAGE(result.retainedAnchorCount == 2, std::string("angle=") + std::to_string(degrees));
         const auto axes = retainedAxes(result);
+        CAPTURE(
+            degrees,
+            axes[0][0], axes[0][1], axes[0][2],
+            axes[1][0], axes[1][1], axes[1][2]);
         const double firstMatch = std::max(axialDot(axes[0], first), axialDot(axes[1], first));
         const double secondMatch = std::max(axialDot(axes[0], second), axialDot(axes[1], second));
-        CHECK_MESSAGE(firstMatch > 1.0 - 1.0e-10, std::string("angle=") + std::to_string(degrees));
-        CHECK_MESSAGE(secondMatch > 1.0 - 1.0e-10, std::string("angle=") + std::to_string(degrees));
+        CHECK_MESSAGE(firstMatch > 1.0 - 1.0e-10, std::string("angle=") + std::to_string(degrees) + " match=" + std::to_string(firstMatch));
+        CHECK_MESSAGE(secondMatch > 1.0 - 1.0e-10, std::string("angle=") + std::to_string(degrees) + " match=" + std::to_string(secondMatch));
     }
 }
 
@@ -320,6 +341,349 @@ TEST_CASE("fiber anchor support threshold is inclusive")
     options.minimumAlignedSupport = baseline.components[0].anchor.alignedSupport;
     const auto boundary = vc::fiber_tracer::fitFiberCellAnchors({0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options);
     CHECK(boundary.retainedAnchorCount == 1);
+}
+
+TEST_CASE("fiber anchor refinement centers an off-center halo-supported fiber without axial motion")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const auto observations = boxObservations(
+        {0, 0, 0}, {12, 12, 12}, [](int x, int y, int z) {
+            return FiberAnchorObservation{
+                cv::Vec3d{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)},
+                {1.0, 0.0, 0.0},
+                y == 7 && z == 6 ? 1.0 : 0.0,
+                true,
+            };
+        });
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
+    REQUIRE(result.retainedAnchorCount == 1);
+    const auto& anchor = result.components[0].anchor;
+    CHECK(anchor.positionPredictionXYZ[0] == doctest::Approx(5.5).epsilon(1.0e-12));
+    CHECK(anchor.positionPredictionXYZ[1] == doctest::Approx(7.0).epsilon(1.0e-8));
+    CHECK(anchor.positionPredictionXYZ[2] == doctest::Approx(6.0).epsilon(1.0e-8));
+    CHECK(std::abs((anchor.positionPredictionXYZ - cv::Vec3d{5.5, 5.5, 5.5}).dot(anchor.axisXYZ)) < 1.0e-10);
+    CHECK(anchor.refinementIterations > 0);
+}
+
+TEST_CASE("fiber anchor refinement clamps a distant local mode to its transverse window")
+{
+    auto options = config();
+    options.gaussianSigmaPredictionVoxels = 4.0;
+    options.localWindowRadiusPredictionVoxels = 2.0;
+    options.minimumAlignedSupport = 0.001;
+    const auto observations = boxObservations(
+        {0, 0, 0}, {12, 12, 12}, [](int x, int y, int z) {
+            return FiberAnchorObservation{
+                cv::Vec3d{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)},
+                {1.0, 0.0, 0.0},
+                z == 6 && y == 9 ? 1.0 :
+                    (z == 6 && y == 7 ? 0.2 : 0.0),
+                true,
+            };
+        });
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
+    REQUIRE(result.retainedAnchorCount == 1);
+    const auto& anchor = result.components[0].anchor;
+    const cv::Vec3d pivot{5.5, 5.5, 5.5};
+    const cv::Vec3d offset = anchor.positionPredictionXYZ - pivot;
+    CHECK(std::sqrt(offset.dot(offset)) == doctest::Approx(2.0).epsilon(1.0e-8));
+    CHECK(std::abs(offset.dot(anchor.axisXYZ)) < 1.0e-10);
+}
+
+TEST_CASE("fiber anchor refinement rotates its cell-center plane with direction")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const cv::Vec3d diagonal = directionAtDegrees(35.0);
+    const auto observations = boxObservations(
+        {0, 0, 0}, {12, 12, 12}, [&](int x, int y, int z) {
+            const bool owned = x >= 4 && x < 8 && y >= 4 && y < 8 && z >= 4 && z < 8;
+            const bool haloLine = z == 6 && std::abs(y - (6 + static_cast<int>(std::round((x - 6) * std::tan(35.0 * std::acos(-1.0) / 180.0))))) <= 0;
+            return FiberAnchorObservation{
+                cv::Vec3d{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)},
+                owned ? cv::Vec3d{1.0, 0.0, 0.0} : diagonal,
+                haloLine ? (owned ? 0.2 : 1.0) : 0.0,
+                true,
+            };
+        });
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
+    REQUIRE(result.retainedAnchorCount == 1);
+    const auto& anchor = result.components[0].anchor;
+    CHECK(axialDot(anchor.axisXYZ, diagonal) > axialDot(cv::Vec3d{1.0, 0.0, 0.0}, diagonal));
+    CHECK(std::abs((anchor.positionPredictionXYZ - cv::Vec3d{5.5, 5.5, 5.5}).dot(anchor.axisXYZ)) < 1.0e-8);
+}
+
+TEST_CASE("fiber anchor local refinement does not leave a weak mode for a stronger separated fiber")
+{
+    auto options = config();
+    options.gaussianSigmaPredictionVoxels = 0.75;
+    options.localWindowRadiusPredictionVoxels = 4.0;
+    options.minimumAlignedSupport = 0.001;
+    const auto observations = boxObservations(
+        {0, 0, 0}, {12, 12, 12}, [](int x, int y, int z) {
+            double presence = 0.0;
+            if (y == 5 && z == 6)
+                presence = 0.35;
+            else if (y == 9 && z == 6)
+                presence = 1.0;
+            return FiberAnchorObservation{
+                cv::Vec3d{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)},
+                {1.0, 0.0, 0.0}, presence, true};
+        });
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
+    REQUIRE(result.retainedAnchorCount == 1);
+    CHECK(result.components[0].anchor.positionPredictionXYZ[1] < 6.0);
+}
+
+TEST_CASE("fiber anchor truncated edge pivot remains feasible for an oblique direction")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const cv::Vec3d direction{1.0 / std::sqrt(3.0), 1.0 / std::sqrt(3.0), 1.0 / std::sqrt(3.0)};
+    const auto observations = boxObservations(
+        {0, 0, 0}, {5, 5, 5}, [&](int x, int y, int z) {
+            return FiberAnchorObservation{
+                cv::Vec3d{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)},
+                direction,
+                x == 4 && y == 4 && z == 4 ? 1.0 : 0.0,
+                true};
+        });
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {1, 1, 1}, {4, 4, 4}, {5, 5, 5}, observations, options);
+    REQUIRE(result.retainedAnchorCount == 1);
+    CHECK(result.components[0].anchor.positionPredictionXYZ == cv::Vec3d{4.0, 4.0, 4.0});
+}
+
+TEST_CASE("fiber anchor NMS suppresses transverse duplicates but keeps longitudinal anchors")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 8, 8}, 1.0};
+    const auto report = vc::fiber_tracer::extractFiberAnchors(
+        grid, options,
+        [](const auto& indices, int, auto& samples) {
+            samples.clear();
+            for (const auto& index : indices) {
+                const bool fiber = index[1] == 3 || index[1] == 4;
+                samples.push_back({{1.0, 0.0, 0.0}, fiber ? 1.0 : 0.0, true});
+            }
+        });
+    CHECK(report.diagnostics.nmsSuppressedComponents >= 1);
+    CHECK(report.diagnostics.oneAnchorCells == 2);
+    CHECK(report.nonEmptyCells.size() == 2);
+    CHECK(report.nonEmptyCells[0].cellZYX[2] != report.nonEmptyCells[1].cellZYX[2]);
+}
+
+TEST_CASE("fiber anchor NMS preserves crossing directions")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 4, 4}, 1.0};
+    const auto report = vc::fiber_tracer::extractFiberAnchors(
+        grid, options,
+        [](const auto& indices, int, auto& samples) {
+            samples.clear();
+            for (const auto& index : indices) {
+                samples.push_back({
+                    index[2] < 2 ? cv::Vec3d{1.0, 0.0, 0.0} : cv::Vec3d{0.0, 1.0, 0.0},
+                    1.0,
+                    true});
+            }
+        });
+    REQUIRE(report.nonEmptyCells.size() == 1);
+    CHECK(report.nonEmptyCells[0].retainedAnchorCount == 2);
+    CHECK(report.diagnostics.nmsSuppressedComponents == 0);
+}
+
+TEST_CASE("fiber anchor local-max NMS uses inclusive geometry and original candidates")
+{
+    auto options = config();
+    options.localWindowRadiusPredictionVoxels = 2.0;
+    options.nmsLongitudinalRadiusPredictionVoxels = 1.0;
+    const auto candidate = [](size_t cellX, cv::Vec3d position, cv::Vec3d axis, double support) {
+        vc::fiber_tracer::FiberCellAnchorResult cell;
+        cell.cellZYX = {0, 0, cellX};
+        cell.retainedAnchorCount = 1;
+        auto& component = cell.components[0];
+        component.retained = true;
+        component.anchor.cellZYX = cell.cellZYX;
+        component.anchor.positionPredictionXYZ = position;
+        component.anchor.axisXYZ = axis;
+        component.anchor.alignedSupport = support;
+        component.anchor.directionalCoherence = 1.0;
+        component.anchor.refinementScore = support;
+        component.rejectionReason.clear();
+        cell.components[1].rejectionReason = "empty";
+        return cell;
+    };
+
+    std::vector<vc::fiber_tracer::FiberCellAnchorResult> chain{
+        candidate(0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.9),
+        candidate(1, {0.0, 1.5, 0.0}, {1.0, 0.0, 0.0}, 0.8),
+        candidate(2, {0.0, 3.0, 0.0}, {1.0, 0.0, 0.0}, 0.7),
+    };
+    vc::fiber_tracer::suppressFiberAnchorDuplicates(chain, options);
+    CHECK(chain[0].retainedAnchorCount == 1);
+    CHECK(chain[1].retainedAnchorCount == 0);
+    CHECK(chain[2].retainedAnchorCount == 0);
+
+    std::vector<vc::fiber_tracer::FiberCellAnchorResult> thresholds{
+        candidate(0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.9),
+        candidate(1, {1.0, 2.0, 0.0}, {1.0, 0.0, 0.0}, 0.8),
+        candidate(2, {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.7),
+        candidate(3, {3.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.6),
+    };
+    vc::fiber_tracer::suppressFiberAnchorDuplicates(thresholds, options);
+    CHECK(thresholds[0].retainedAnchorCount == 1);
+    CHECK(thresholds[1].retainedAnchorCount == 0);
+    CHECK(thresholds[2].retainedAnchorCount == 1);
+    CHECK(thresholds[3].retainedAnchorCount == 1);
+}
+
+TEST_CASE("fiber anchor default falloff gives approximately uniform interior lattice coverage")
+{
+    const auto options = config();
+    const double cellSize = options.cellSizePredictionVoxels;
+    const double cutoff = options.gaussianCutoffSigmas *
+        options.gaussianSigmaPredictionVoxels;
+    for (const cv::Vec3d axis : std::array{
+             cv::Vec3d{1.0, 0.0, 0.0},
+             cv::Vec3d{1.0 / std::sqrt(2.0), 1.0 / std::sqrt(2.0), 0.0},
+             cv::Vec3d{1.0 / std::sqrt(3.0), 1.0 / std::sqrt(3.0), 1.0 / std::sqrt(3.0)}}) {
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = 0.0;
+        for (int z = 8; z < 12; ++z) {
+            for (int y = 8; y < 12; ++y) {
+                for (int x = 8; x < 12; ++x) {
+                    double coverage = 0.0;
+                    const cv::Vec3d point{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)};
+                    for (int cz = -2; cz < 6; ++cz) {
+                        for (int cy = -2; cy < 6; ++cy) {
+                            for (int cx = -2; cx < 6; ++cx) {
+                                const cv::Vec3d center{
+                                    cx * cellSize + (cellSize - 1.0) * 0.5,
+                                    cy * cellSize + (cellSize - 1.0) * 0.5,
+                                    cz * cellSize + (cellSize - 1.0) * 0.5,
+                                };
+                                const cv::Vec3d delta = point - center;
+                                const double axial = delta.dot(axis);
+                                if (std::abs(axial) > options.axialSupportHalfWidthPredictionVoxels)
+                                    continue;
+                                const cv::Vec3d transverse = delta - axis * axial;
+                                const double distanceSquared = transverse.dot(transverse);
+                                if (distanceSquared > cutoff * cutoff)
+                                    continue;
+                                coverage += std::exp(-distanceSquared /
+                                    (2.0 * options.gaussianSigmaPredictionVoxels *
+                                     options.gaussianSigmaPredictionVoxels));
+                            }
+                        }
+                    }
+                    minimum = std::min(minimum, coverage);
+                    maximum = std::max(maximum, coverage);
+                }
+            }
+        }
+        CHECK(maximum / minimum <= 1.35);
+    }
+}
+
+TEST_CASE("fiber anchor cropped NMS includes suppressors outside the selected cells")
+{
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 8, 4}, 1.0};
+    const auto sampler = [](const auto& indices, int, auto& samples) {
+        samples.clear();
+        for (const auto& index : indices) {
+            const bool fiber = index[1] == 3 || index[1] == 4;
+            samples.push_back({{1.0, 0.0, 0.0}, fiber ? 1.0 : 0.0, true});
+        }
+    };
+    const auto full = vc::fiber_tracer::extractFiberAnchors(grid, options, sampler);
+    const auto cropped = vc::fiber_tracer::extractFiberAnchors(
+        grid, options, sampler,
+        vc::fiber_tracer::FiberAnchorCrop{{0, 4, 0}, {4, 4, 4}});
+    REQUIRE(full.diagnostics.nmsSuppressedComponents >= 1);
+    CHECK(cropped.diagnostics.totalCells == 1);
+    CHECK(cropped.diagnostics.zeroAnchorCells == 1);
+    CHECK(cropped.diagnostics.nmsSuppressedComponents == 1);
+    CHECK(cropped.nonEmptyCells.empty());
+}
+
+TEST_CASE("fiber anchor artifacts are deterministic across block and worker counts")
+{
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{8, 8, 8}, 2.0};
+    const auto sampler = [](const auto& indices, int, auto& samples) {
+        samples.clear();
+        for (const auto& index : indices) {
+            const bool fiber = index[1] == 3 || index[1] == 4;
+            samples.push_back({{1.0, 0.0, 0.0}, fiber ? 1.0 : 0.0, true});
+        }
+    };
+    auto one = config();
+    one.minimumAlignedSupport = 0.001;
+    one.processingBlockCellSide = 1;
+    one.parallelThreads = 1;
+    auto two = one;
+    two.processingBlockCellSide = 2;
+    two.parallelThreads = 7;
+    const auto first = vc::fiber_tracer::extractFiberAnchors(grid, one, sampler);
+    const auto second = vc::fiber_tracer::extractFiberAnchors(grid, two, sampler);
+    vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
+    artifact.sourceLocator = "/tmp/fiber.lasagna.json";
+    artifact.manifestContentHash = "fnv1a64:0123456789abcdef";
+    const auto firstJson = vc::fiber_tracer::fiberAnchorReportJson(first, artifact);
+    const auto secondJson = vc::fiber_tracer::fiberAnchorReportJson(second, artifact);
+    CHECK(firstJson.dump() == secondJson.dump());
+    CHECK(vc::fiber_tracer::fiberAnchorReportObj(first, artifact) ==
+        vc::fiber_tracer::fiberAnchorReportObj(second, artifact));
+
+    const auto firstDirectory = temporaryDirectory("block_one");
+    const auto secondDirectory = temporaryDirectory("block_two");
+    vc::fiber_tracer::writeFiberAnchorArtifacts(firstDirectory, first, artifact);
+    vc::fiber_tracer::writeFiberAnchorArtifacts(secondDirectory, second, artifact);
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    for (const auto* name : {"anchors.json", "anchors.obj", "anchors_0.obj", "anchors_1.obj"})
+        CHECK(read(firstDirectory / name) == read(secondDirectory / name));
+    std::filesystem::remove_all(firstDirectory);
+    std::filesystem::remove_all(secondDirectory);
+}
+
+TEST_CASE("fiber anchor extraction enforces its bounded sample block budget")
+{
+    auto options = config();
+    options.maximumSampleBlockBytes = 1;
+    bool sampled = false;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::extractFiberAnchors(
+            {{8, 8, 8}, 1.0}, options,
+            [&](const auto&, int, auto&) { sampled = true; }),
+        doctest::Contains("byte limit"),
+        std::runtime_error);
+    CHECK_FALSE(sampled);
+}
+
+TEST_CASE("fiber anchor extraction keeps owned voxels with a narrower custom support kernel")
+{
+    auto options = config();
+    options.gaussianSigmaPredictionVoxels = 0.1;
+    options.localWindowRadiusPredictionVoxels = 0.1;
+    options.axialSupportHalfWidthPredictionVoxels = 0.1;
+    CHECK_NOTHROW(vc::fiber_tracer::extractFiberAnchors(
+        {{4, 4, 4}, 1.0}, options,
+        [](const auto& indices, int, auto& samples) {
+            samples.assign(indices.size(), {
+                cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+        }));
 }
 
 TEST_CASE("fiber anchor crops select complete globally anchored cells")

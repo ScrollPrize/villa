@@ -38,10 +38,11 @@ struct CliOptions {
     vc::fiber_tracer::FiberletPathConfig paths;
     std::optional<vc::fiber_tracer::FiberAnchorCrop> baseCrop;
     std::optional<double> corridorRadiusBaseVoxels;
+    std::optional<double> falloffSigmaBaseVoxels;
+    std::optional<double> localWindowBaseVoxels;
     std::optional<double> baseVoxelSizeUm;
     double glyphLengthBaseVoxels = 16.0;
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
-    bool sigmaExplicit = false;
     bool printStats = false;
     bool writePresenceSlices = true;
 };
@@ -65,7 +66,8 @@ void usage(const char* executable)
               << "  --base-voxel-size-um N        optional physical reporting metadata\n\n"
               << "Anchor options:\n"
               << "  --cell-size N                 prediction-grid cell side, 2..8 [4]\n"
-              << "  --gaussian-sigma N            Gaussian sigma [cell-size/2]\n"
+              << "  --falloff N                   normal-plane sigma in base voxels [cell-side/2]\n"
+              << "  --window N                    refinement/NMS radius in base voxels [cell-side]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
               << "  --merge-angle-deg N           maximum duplicate-axis angle [10]\n"
@@ -81,8 +83,6 @@ void usage(const char* executable)
               << "  --shell-half-width N          candidate shell half-width [0.5]\n"
               << "  --endpoint-angle-degrees N    endpoint/chord and attachment bound [45]\n"
               << "  --corridor-radius N           base voxels [one anchor-cell width]\n"
-              << "  --presence-weight N           low-presence cost weight [1]\n"
-              << "  --direction-weight N          quantization-relative direction weight [1]\n"
               << "  --invalid-prediction-cost N   invalid cost per prediction-grid voxel [4]\n"
               << "  --smoothness-weight N         invalid-normal isotropic weight [2]\n"
               << "  --smoothness-normal-weight N  normal-tilt weight [0.1]\n"
@@ -194,9 +194,12 @@ CliOptions parseArgs(int argc, char** argv)
             options.baseVoxelSizeUm = parseDouble(valueAfter(index, argc, argv, "base-voxel-size-um"), "base-voxel-size-um");
         } else if (argument == "--cell-size" && options.command == Command::Anchors) {
             options.anchors.cellSizePredictionVoxels = parseInt(valueAfter(index, argc, argv, "cell-size"), "cell-size");
-        } else if (argument == "--gaussian-sigma" && options.command == Command::Anchors) {
-            options.anchors.gaussianSigmaPredictionVoxels = parseDouble(valueAfter(index, argc, argv, "gaussian-sigma"), "gaussian-sigma");
-            options.sigmaExplicit = true;
+        } else if (argument == "--falloff" && options.command == Command::Anchors) {
+            options.falloffSigmaBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "falloff"), "falloff");
+        } else if (argument == "--window" && options.command == Command::Anchors) {
+            options.localWindowBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "window"), "window");
         } else if (argument == "--presence-floor" && options.command == Command::Anchors) {
             options.anchors.observationPresenceFloor = parseDouble(valueAfter(index, argc, argv, "presence-floor"), "presence-floor");
         } else if (argument == "--minimum-support" && options.command == Command::Anchors) {
@@ -238,10 +241,6 @@ CliOptions parseArgs(int argc, char** argv)
             options.printStats = true;
         } else if (argument == "--no-slices" && options.command == Command::Paths) {
             options.writePresenceSlices = false;
-        } else if (argument == "--presence-weight" && options.command == Command::Paths) {
-            options.paths.presenceWeight = parseDouble(valueAfter(index, argc, argv, "presence-weight"), "presence-weight");
-        } else if (argument == "--direction-weight" && options.command == Command::Paths) {
-            options.paths.directionWeight = parseDouble(valueAfter(index, argc, argv, "direction-weight"), "direction-weight");
         } else if (argument == "--invalid-prediction-cost" && options.command == Command::Paths) {
             options.paths.invalidPredictionCostPerVoxel =
                 parseDouble(valueAfter(index, argc, argv, "invalid-prediction-cost"), "invalid-prediction-cost");
@@ -263,10 +262,12 @@ CliOptions parseArgs(int argc, char** argv)
     if (options.baseVoxelSizeUm.has_value() && !(*options.baseVoxelSizeUm > 0.0))
         fail("--base-voxel-size-um must be positive");
     if (options.command == Command::Anchors) {
-        if (!options.sigmaExplicit) {
-            options.anchors.gaussianSigmaPredictionVoxels = static_cast<double>(options.anchors.cellSizePredictionVoxels) * 0.5;
-        }
-        vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
+        if (options.falloffSigmaBaseVoxels.has_value() &&
+            !(*options.falloffSigmaBaseVoxels > 0.0))
+            fail("--falloff must be positive");
+        if (options.localWindowBaseVoxels.has_value() &&
+            !(*options.localWindowBaseVoxels > 0.0))
+            fail("--window must be positive");
     } else {
         if (options.normalManifestLocation.empty())
             fail("paths requires --normal-manifest");
@@ -337,6 +338,22 @@ int main(int argc, char** argv)
         const auto grid = field.storedGridInfo();
 
         if (options.command == Command::Anchors) {
+            const double cellSideBase =
+                options.anchors.cellSizePredictionVoxels *
+                grid.predictionToBaseScale;
+            options.anchors.gaussianSigmaPredictionVoxels =
+                options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
+                grid.predictionToBaseScale;
+            options.anchors.localWindowRadiusPredictionVoxels =
+                options.localWindowBaseVoxels.value_or(cellSideBase) /
+                grid.predictionToBaseScale;
+            options.anchors.axialSupportHalfWidthPredictionVoxels =
+                1.5 * options.anchors.cellSizePredictionVoxels;
+            options.anchors.nmsLongitudinalRadiusPredictionVoxels =
+                0.5 * options.anchors.cellSizePredictionVoxels;
+            options.anchors.nmsMaximumAngleDegrees =
+                options.anchors.mergeMaximumAngleDegrees;
+            vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
             const auto crop = options.baseCrop.has_value()
                                   ? std::make_optional(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(*options.baseCrop, grid.predictionToBaseScale))
                                   : std::nullopt;
@@ -352,13 +369,15 @@ int main(int argc, char** argv)
             artifact.baseVoxelSizeUm = options.baseVoxelSizeUm;
             vc::fiber_tracer::writeFiberAnchorArtifacts(options.outputDirectory, report, artifact);
 
-            const double cellSideBase = options.anchors.cellSizePredictionVoxels * grid.predictionToBaseScale;
             std::cout << "prediction_shape_zyx=" << grid.shapeZYX[0] << ',' << grid.shapeZYX[1] << ',' << grid.shapeZYX[2]
                       << " prediction_to_base=" << grid.predictionToBaseScale << " cell_side_base_voxels=" << cellSideBase
+                      << " falloff_sigma_base_voxels=" << options.anchors.gaussianSigmaPredictionVoxels * grid.predictionToBaseScale
+                      << " local_window_base_voxels=" << options.anchors.localWindowRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells
                       << " zero=" << report.diagnostics.zeroAnchorCells << " one=" << report.diagnostics.oneAnchorCells
                       << " two=" << report.diagnostics.twoAnchorCells << " merged=" << report.diagnostics.mergedComponentPairs
+                      << " nms_suppressed=" << report.diagnostics.nmsSuppressedComponents
                       << " elapsed_seconds=" << report.elapsedSeconds << '\n';
             if (options.baseVoxelSizeUm.has_value()) {
                 std::cout << "cell_side_um=" << cellSideBase * *options.baseVoxelSizeUm
@@ -456,8 +475,11 @@ int main(int argc, char** argv)
                     std::cout << " min=" << *scores.minimum << " mean=" << *scores.mean << " max=" << *scores.maximum << '\n';
                 }
             };
-            printScores("fiberlet_scores_all", statistics.allScores);
-            printScores("fiberlet_scores_accepted", statistics.acceptedScores);
+            printScores("fiberlet_total_loss_all", statistics.allScores);
+            printScores("fiberlet_total_loss_accepted", statistics.acceptedScores);
+            printScores(
+                "fiberlet_loss_per_prediction_voxel_accepted",
+                statistics.acceptedLossDensities);
         }
         return 0;
     } catch (const std::exception& error) {

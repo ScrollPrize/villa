@@ -522,9 +522,25 @@ TEST_CASE("native fiber tracer scores persisted corners without materialized sam
         {1.0, 0.0, 0.0},
         {1.0, 0.0, 0.0},
         config);
+    vc::fiber_tracer::FiberPredictionSample sample;
+    sample.options.push_back(
+        {{1.0, 0.0, 0.0}, 128.0 / 255.0, true});
+    sample.options.push_back({{0.0, 1.0, 0.0}, 1.0, true});
+    const auto sampleScore =
+        vc::fiber_tracer::testing::debugCandidateLossFromSample(
+            sample,
+            {1.0, 0.0, 0.0},
+            {1.0, 0.0, 0.0},
+            {1.0, 0.0, 0.0},
+            {1.0, 0.0, 0.0},
+            config);
 
     REQUIRE(score.valid);
+    REQUIRE(sampleScore.valid);
     CHECK(score.loss == doctest::Approx(1.0 - 128.0 / 255.0));
+    CHECK(score.loss == sampleScore.loss);
+    CHECK(score.selectedPresence == sampleScore.selectedPresence);
+    CHECK(score.selectedDirection == sampleScore.selectedDirection);
     CHECK(score.selectedPresence == doctest::Approx(128.0 / 255.0));
     CHECK(score.selectedDirection[0] == doctest::Approx(1.0));
     CHECK(score.selectedDirection[1] == doctest::Approx(0.0));

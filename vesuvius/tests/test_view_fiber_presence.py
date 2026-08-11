@@ -9,6 +9,8 @@ from vesuvius.scripts.view_fiber_presence import (
     common_shape_edge_width,
     crop_clipping_planes_in_base,
     crop_clipping_planes_in_layer_data,
+    fiberlet_colormap_names,
+    fiberlet_quality_colormap_spec,
     open_lazy_crop,
     parse_crop,
     read_line_obj,
@@ -16,6 +18,27 @@ from vesuvius.scripts.view_fiber_presence import (
     select_base_crop,
     set_common_shape_edge_width,
 )
+
+
+def test_fiberlet_quality_colormap_spec_is_red_yellow_green():
+    name, colors, controls = fiberlet_quality_colormap_spec()
+
+    assert name == "red-yellow-green"
+    np.testing.assert_allclose(
+        colors,
+        [
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ],
+    )
+    np.testing.assert_allclose(controls, [0.0, 0.5, 1.0])
+
+
+def test_fiberlet_colormap_names_are_custom_first_sorted_and_unique():
+    assert fiberlet_colormap_names(
+        ["viridis", "magma", "viridis", "red-yellow-green"]
+    ) == ("red-yellow-green", "magma", "viridis")
 
 
 @pytest.mark.parametrize(
@@ -136,28 +159,98 @@ def test_reads_and_crops_grouped_fiberlet_obj(tmp_path):
     obj = tmp_path / "fiberlets.obj"
     obj.write_text(
         """# vc_fiberlets version 1
+# trace_quality_population successful_scored_fiberlets
+# trace_loss_density_unit prediction_voxel
+# trace_quality_formula inverse_min_max_low_loss_is_one
+# trace_quality_count 2
+# trace_loss_density_min 1
+# trace_loss_density_max 3
 g inside_explicit_edges
+# trace_loss_total 4
+# trace_loss_per_prediction_voxel 1
+# trace_quality_relative 1
 v 10 20 30
 v 11 21 31
 v 12 22 32
 l 1 2
 l 2 3
-g outside_multi_index
+g outside_explicit_edges
+# trace_loss_total 12
+# trace_loss_per_prediction_voxel 3
+# trace_quality_relative 0
 v 100 200 300
 v 101 201 301
 v 102 202 302
-l 4 5 6
+l 4 5
+l 5 6
 """
     )
-
     geometry = read_line_obj(obj, "paths", (0, 0, 0, 50, 50, 50))
 
     assert geometry.total_groups == 2
     assert len(geometry.paths_zyx) == 1
+    assert geometry.trace_loss_total == [4.0]
+    assert geometry.loss_per_prediction_voxel == [1.0]
+    assert geometry.relative_quality == [1.0]
     np.testing.assert_array_equal(
         geometry.paths_zyx[0],
         np.asarray([[30, 20, 10], [31, 21, 11], [32, 22, 12]], dtype=np.float32),
     )
+
+
+def test_rejects_obsolete_fiberlet_material_records(tmp_path):
+    obj = tmp_path / "fiberlets.obj"
+    obj.write_text(
+        """# vc_fiberlets version 1
+mtllib fiberlets.mtl
+"""
+    )
+
+    with pytest.raises(ValueError, match="unsupported OBJ record 'mtllib'"):
+        read_line_obj(obj, "paths", (0, 0, 0, 10, 10, 10))
+
+
+def test_fiberlet_crop_keeps_geometry_and_metrics_aligned(tmp_path):
+    groups = [
+        ("outside_first", 100.0, 4.0, 0.0),
+        ("inside_first", 10.0, 2.0, 2.0 / 3.0),
+        ("outside_between", 200.0, 3.0, 1.0 / 3.0),
+        ("partially_inside", -1.0, 1.0, 1.0),
+    ]
+    obj_lines = [
+        "# vc_fiberlets version 1",
+        "# trace_quality_population successful_scored_fiberlets",
+        "# trace_loss_density_unit prediction_voxel",
+        "# trace_quality_formula inverse_min_max_low_loss_is_one",
+        "# trace_quality_count 4",
+        "# trace_loss_density_min 1",
+        "# trace_loss_density_max 4",
+    ]
+    vertex = 1
+    for name, x, density, quality in groups:
+        obj_lines.extend(
+            [
+                f"g {name}",
+                f"# trace_loss_total {density * 2}",
+                f"# trace_loss_per_prediction_voxel {density}",
+                f"# trace_quality_relative {quality!r}",
+                f"v {x} 1 1",
+                f"v {x + 2} 1 1",
+                f"l {vertex} {vertex + 1}",
+            ]
+        )
+        vertex += 2
+    (tmp_path / "fiberlets.obj").write_text("\n".join(obj_lines) + "\n")
+
+    geometry = read_line_obj(
+        tmp_path / "fiberlets.obj", "paths", (0, 0, 0, 50, 50, 50)
+    )
+
+    assert geometry.total_groups == 4
+    assert len(geometry.paths_zyx) == 2
+    assert geometry.trace_loss_total == [4.0, 2.0]
+    assert geometry.loss_per_prediction_voxel == [2.0, 1.0]
+    np.testing.assert_allclose(geometry.relative_quality, [2.0 / 3.0, 1.0])
 
 
 def test_rejects_disconnected_line_records(tmp_path):
@@ -176,6 +269,42 @@ l 3 4
 
     with pytest.raises(ValueError, match="do not form one ordered path"):
         read_line_obj(obj, "anchors", (0, 0, 0, 10, 10, 10))
+
+
+def test_anchor_geometry_has_no_fiberlet_metrics(tmp_path):
+    obj = tmp_path / "anchors.obj"
+    obj.write_text(
+        """# vc_fiberlet_anchors version 1
+g anchor
+v 0 0 0
+v 1 0 0
+l 1 2
+"""
+    )
+    geometry = read_line_obj(obj, "anchors", (0, 0, 0, 10, 10, 10))
+    assert geometry.trace_loss_total == []
+    assert geometry.loss_per_prediction_voxel == []
+    assert geometry.relative_quality == []
+
+
+def test_empty_fiberlet_geometry_has_no_metrics(tmp_path):
+    obj = tmp_path / "fiberlets.obj"
+    obj.write_text(
+        """# vc_fiberlets version 1
+# trace_quality_population successful_scored_fiberlets
+# trace_loss_density_unit prediction_voxel
+# trace_quality_formula inverse_min_max_low_loss_is_one
+# trace_quality_count 0
+# trace_loss_density_min none
+# trace_loss_density_max none
+"""
+    )
+    geometry = read_line_obj(obj, "paths", (0, 0, 0, 10, 10, 10))
+
+    assert geometry.paths_zyx == []
+    assert geometry.trace_loss_total == []
+    assert geometry.loss_per_prediction_voxel == []
+    assert geometry.relative_quality == []
 
 
 def make_presence_pyramid(tmp_path):

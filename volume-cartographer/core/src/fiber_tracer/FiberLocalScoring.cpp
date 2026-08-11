@@ -17,6 +17,13 @@ float clampUnit(float value)
     return std::clamp(value, -1.0f, 1.0f);
 }
 
+float clampPositiveUnit(float value)
+{
+    if (!std::isfinite(value))
+        return 0.0f;
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
 cv::Vec3f normalizedOrZero(const cv::Vec3f& value)
 {
     const float length = std::sqrt(value.dot(value));
@@ -37,6 +44,23 @@ float excessAngleSquared(float angle, float freeAngle)
 }
 
 }  // namespace
+
+float fiberLocalAlignmentLoss(
+    float presence,
+    const cv::Vec3f& previousStepDirection,
+    const cv::Vec3f& candidateStepDirection,
+    const cv::Vec3f& currentPredictionDirection,
+    const cv::Vec3f& candidatePredictionDirection)
+{
+    float score = clampPositiveUnit(presence);
+    score *= clampPositiveUnit(previousStepDirection.dot(candidateStepDirection));
+    score *= clampPositiveUnit(previousStepDirection.dot(currentPredictionDirection));
+    score *= clampPositiveUnit(previousStepDirection.dot(candidatePredictionDirection));
+    score *= clampPositiveUnit(currentPredictionDirection.dot(candidateStepDirection));
+    score *= clampPositiveUnit(currentPredictionDirection.dot(candidatePredictionDirection));
+    score *= clampPositiveUnit(candidateStepDirection.dot(candidatePredictionDirection));
+    return 1.0f - score;
+}
 
 FiberLocalSmoothnessCost fiberLocalSmoothnessCost(
     const cv::Vec3f& previousStepDirection, const cv::Vec3f& candidateStepDirection, const cv::Vec3f& normal, bool normalValid, const FiberLocalSmoothnessConfig& config)

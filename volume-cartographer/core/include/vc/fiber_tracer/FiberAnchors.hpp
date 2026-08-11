@@ -26,6 +26,12 @@ struct FiberAnchorObservation {
 struct FiberAnchorConfig {
     int cellSizePredictionVoxels = 4;
     double gaussianSigmaPredictionVoxels = 2.0;
+    double gaussianCutoffSigmas = 3.0;
+    double localWindowRadiusPredictionVoxels = 4.0;
+    double axialSupportHalfWidthPredictionVoxels = 6.0;
+    double positionConvergenceTolerancePredictionVoxels = 1.0e-4;
+    double nmsMaximumAngleDegrees = 10.0;
+    double nmsLongitudinalRadiusPredictionVoxels = 2.0;
     double observationPresenceFloor = 0.05;
     double minimumAlignedSupport = 0.05;
     double mergeMaximumAngleDegrees = 10.0;
@@ -34,6 +40,8 @@ struct FiberAnchorConfig {
     size_t maximumSeedCount = 8;
     int maximumIterations = 64;
     double convergenceTolerance = 1.0e-12;
+    size_t processingBlockCellSide = 4;
+    size_t maximumSampleBlockBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     int parallelThreads = 1;
 };
 
@@ -48,6 +56,8 @@ struct FiberAnchor {
     cv::Vec3d axisXYZ{1.0, 0.0, 0.0};
     double alignedSupport = 0.0;
     double directionalCoherence = 0.0;
+    double refinementScore = 0.0;
+    size_t refinementIterations = 0;
 };
 
 struct FiberAnchorComponent {
@@ -83,6 +93,7 @@ struct FiberAnchorExtractionDiagnostics {
     size_t degenerateComponents = 0;
     size_t belowSupportComponents = 0;
     size_t mergedComponentPairs = 0;
+    size_t nmsSuppressedComponents = 0;
 };
 
 struct FiberAnchorExtractionReport {
@@ -122,6 +133,10 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const FiberAnchorConfig& config,
     const FiberStoredPredictionBatchSampler& sampler,
     std::optional<FiberAnchorCrop> crop = std::nullopt);
+
+void suppressFiberAnchorDuplicates(
+    std::vector<FiberCellAnchorResult>& cells,
+    const FiberAnchorConfig& config);
 
 [[nodiscard]] nlohmann::json fiberAnchorReportJson(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 

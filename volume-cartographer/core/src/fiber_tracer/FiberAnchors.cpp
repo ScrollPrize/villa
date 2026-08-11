@@ -7,8 +7,10 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -53,6 +55,29 @@ struct FitState {
     std::vector<uint8_t> assignments;
     double objectiveNumerator = -1.0;
     size_t iteration = 0;
+};
+
+constexpr uint8_t kUnassignedComponent = 2;
+
+struct RefinedComponentState {
+    cv::Vec3d axis{1.0, 0.0, 0.0};
+    cv::Vec3d position{0.0, 0.0, 0.0};
+};
+
+struct RefinedEvaluation {
+    std::vector<uint8_t> assignments;
+    std::array<double, 2> denominators{0.0, 0.0};
+    std::array<double, 2> numerators{0.0, 0.0};
+    std::array<double, 2> presenceMasses{0.0, 0.0};
+    std::array<size_t, 2> assignedCounts{0, 0};
+    double objective = 0.0;
+};
+
+struct RefinedFitState {
+    std::array<RefinedComponentState, 2> components;
+    RefinedEvaluation evaluation;
+    size_t activeComponents = 0;
+    size_t acceptedIterations = 0;
 };
 
 [[nodiscard]] bool finiteVector(const cv::Vec3d& value)
@@ -210,6 +235,294 @@ struct FitState {
     return 1.0 - std::clamp(std::abs(before.dot(after)), 0.0, 1.0);
 }
 
+[[nodiscard]] cv::Vec3d projectToConstraintPlane(
+    const cv::Vec3d& point,
+    const cv::Vec3d& pivot,
+    const cv::Vec3d& axis)
+{
+    return point - axis * ((point - pivot).dot(axis));
+}
+
+[[nodiscard]] cv::Vec3d clampToWindow(
+    const cv::Vec3d& point,
+    const cv::Vec3d& pivot,
+    const cv::Vec3d& axis,
+    double radius,
+    const cv::Vec3d& lower,
+    const cv::Vec3d& upper)
+{
+    cv::Vec3d offset = projectToConstraintPlane(point, pivot, axis) - pivot;
+    const double length = std::sqrt(std::max(0.0, offset.dot(offset)));
+    if (length > radius)
+        offset *= radius / length;
+    double scale = 1.0;
+    for (int coordinate = 0; coordinate < 3; ++coordinate) {
+        if (offset[coordinate] > 0.0) {
+            scale = std::min(
+                scale, (upper[coordinate] - pivot[coordinate]) /
+                    offset[coordinate]);
+        } else if (offset[coordinate] < 0.0) {
+            scale = std::min(
+                scale, (lower[coordinate] - pivot[coordinate]) /
+                    offset[coordinate]);
+        }
+    }
+    return pivot + offset * std::clamp(scale, 0.0, 1.0);
+}
+
+[[nodiscard]] double transverseGaussian(
+    const FiberAnchorObservation& observation,
+    const RefinedComponentState& component,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    if (!finiteVector(observation.positionPredictionXYZ))
+        return 0.0;
+    const double axial = (observation.positionPredictionXYZ - pivot).dot(component.axis);
+    if (std::abs(axial) > config.axialSupportHalfWidthPredictionVoxels)
+        return 0.0;
+    const cv::Vec3d offset = observation.positionPredictionXYZ - component.position;
+    const cv::Vec3d transverse = offset - component.axis * offset.dot(component.axis);
+    const double distanceSquared = transverse.dot(transverse);
+    const double cutoff = config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
+    if (distanceSquared > cutoff * cutoff)
+        return 0.0;
+    return std::exp(-distanceSquared /
+        (2.0 * config.gaussianSigmaPredictionVoxels *
+         config.gaussianSigmaPredictionVoxels));
+}
+
+[[nodiscard]] RefinedEvaluation evaluateRefinedState(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    RefinedEvaluation evaluation;
+    evaluation.assignments.assign(observations.size(), kUnassignedComponent);
+    std::array<CompensatedSum, 2> denominators;
+    std::array<CompensatedSum, 2> numerators;
+    std::array<CompensatedSum, 2> presenceMasses;
+    for (size_t index = 0; index < observations.size(); ++index) {
+        const auto& observation = observations[index];
+        std::array<double, 2> gaussian{0.0, 0.0};
+        std::array<double, 2> evidence{0.0, 0.0};
+        for (size_t component = 0; component < activeComponents; ++component) {
+            gaussian[component] = transverseGaussian(
+                observation, components[component], pivot, config);
+            denominators[component].add(gaussian[component]);
+            if (!(gaussian[component] > 0.0) || !observation.valid ||
+                !finiteVector(observation.direction) ||
+                !std::isfinite(observation.presence) ||
+                observation.presence < config.observationPresenceFloor ||
+                observation.presence < 0.0 || observation.presence > 1.0) {
+                continue;
+            }
+            const cv::Vec3d direction = normalized(observation.direction);
+            if (direction.dot(direction) <= kMatrixEpsilon)
+                continue;
+            const double dot = direction.dot(components[component].axis);
+            evidence[component] = observation.presence * dot * dot;
+        }
+        uint8_t assigned = kUnassignedComponent;
+        if (activeComponents == 1) {
+            if (evidence[0] > 0.0)
+                assigned = 0;
+        } else if (evidence[0] > 0.0 || evidence[1] > 0.0) {
+            assigned = evidence[0] >= evidence[1] ? 0 : 1;
+        }
+        evaluation.assignments[index] = assigned;
+        if (assigned == kUnassignedComponent)
+            continue;
+        const auto& component = components[assigned];
+        const cv::Vec3d direction = normalized(observation.direction);
+        const double dot = direction.dot(component.axis);
+        numerators[assigned].add(
+            gaussian[assigned] * observation.presence * dot * dot);
+        presenceMasses[assigned].add(
+            gaussian[assigned] * observation.presence);
+        ++evaluation.assignedCounts[assigned];
+    }
+    CompensatedSum numeratorTotal;
+    CompensatedSum denominatorTotal;
+    for (size_t component = 0; component < activeComponents; ++component) {
+        evaluation.denominators[component] = denominators[component].sum;
+        evaluation.numerators[component] = numerators[component].sum;
+        evaluation.presenceMasses[component] = presenceMasses[component].sum;
+        numeratorTotal.add(numerators[component].sum);
+        denominatorTotal.add(denominators[component].sum);
+    }
+    evaluation.objective = denominatorTotal.sum > 0.0
+        ? numeratorTotal.sum / denominatorTotal.sum
+        : 0.0;
+    return evaluation;
+}
+
+[[nodiscard]] RefinedFitState refineLocalComponents(
+    const std::vector<FiberAnchorObservation>& observations,
+    const cv::Vec3d& pivot,
+    const std::array<cv::Vec3d, 2>& seedAxes,
+    size_t activeComponents,
+    const FiberAnchorConfig& config)
+{
+    RefinedFitState state;
+    state.activeComponents = activeComponents;
+    for (size_t component = 0; component < activeComponents; ++component) {
+        state.components[component].axis = canonicalAxis(seedAxes[component]);
+        state.components[component].position = pivot;
+    }
+    cv::Vec3d lower{
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+    };
+    cv::Vec3d upper{
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const auto& observation : observations) {
+        if (!finiteVector(observation.positionPredictionXYZ))
+            continue;
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            lower[coordinate] = std::min(
+                lower[coordinate], observation.positionPredictionXYZ[coordinate]);
+            upper[coordinate] = std::max(
+                upper[coordinate], observation.positionPredictionXYZ[coordinate]);
+        }
+    }
+    state.evaluation = evaluateRefinedState(
+        observations, state.components, activeComponents, pivot, config);
+
+    for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
+        auto proposed = state.components;
+        for (size_t component = 0; component < activeComponents; ++component) {
+            std::array<CompensatedSum, 9> tensorSums;
+            for (size_t index = 0; index < observations.size(); ++index) {
+                if (state.evaluation.assignments[index] != component)
+                    continue;
+                const auto& observation = observations[index];
+                const double gaussian = transverseGaussian(
+                    observation, state.components[component], pivot, config);
+                const cv::Vec3d direction = normalized(observation.direction);
+                const double weight = gaussian * observation.presence;
+                for (int row = 0; row < 3; ++row) {
+                    for (int column = 0; column < 3; ++column) {
+                        tensorSums[static_cast<size_t>(row * 3 + column)].add(
+                            weight * direction[row] * direction[column]);
+                    }
+                }
+            }
+            cv::Matx33d tensor;
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column)
+                    tensor(row, column) = tensorSums[static_cast<size_t>(row * 3 + column)].sum;
+            }
+            const PrincipalAxis principal = principalAxis(tensor);
+            if (principal.unique)
+                proposed[component].axis = principal.axis;
+
+            const cv::Vec3d projectedCurrent = projectToConstraintPlane(
+                state.components[component].position,
+                pivot,
+                proposed[component].axis);
+            std::array<CompensatedSum, 3> centroid;
+            CompensatedSum centroidMass;
+            RefinedComponentState centered{
+                proposed[component].axis,
+                projectedCurrent,
+            };
+            for (size_t index = 0; index < observations.size(); ++index) {
+                if (state.evaluation.assignments[index] != component)
+                    continue;
+                const auto& observation = observations[index];
+                const double gaussian = transverseGaussian(
+                    observation, centered, pivot, config);
+                const cv::Vec3d direction = normalized(observation.direction);
+                const double dot = direction.dot(centered.axis);
+                const double weight = gaussian * observation.presence * dot * dot;
+                centroidMass.add(weight);
+                for (int axis = 0; axis < 3; ++axis)
+                    centroid[axis].add(weight * observation.positionPredictionXYZ[axis]);
+            }
+            if (centroidMass.sum > 0.0) {
+                const cv::Vec3d mean{
+                    centroid[0].sum / centroidMass.sum,
+                    centroid[1].sum / centroidMass.sum,
+                    centroid[2].sum / centroidMass.sum,
+                };
+                proposed[component].position = clampToWindow(
+                    mean, pivot, proposed[component].axis,
+                    config.localWindowRadiusPredictionVoxels, lower, upper);
+            } else {
+                proposed[component].position = clampToWindow(
+                    projectedCurrent, pivot, proposed[component].axis,
+                    config.localWindowRadiusPredictionVoxels, lower, upper);
+            }
+        }
+
+        bool accepted = false;
+        RefinedFitState candidate = state;
+        double acceptedDirectionUpdate = 0.0;
+        double acceptedPositionUpdate = 0.0;
+        for (int backtrack = 0; backtrack <= 8; ++backtrack) {
+            const double fraction = std::ldexp(1.0, -backtrack);
+            auto interpolated = state.components;
+            for (size_t component = 0; component < activeComponents; ++component) {
+                cv::Vec3d targetAxis = proposed[component].axis;
+                if (state.components[component].axis.dot(targetAxis) < 0.0)
+                    targetAxis *= -1.0;
+                interpolated[component].axis = canonicalAxis(normalized(
+                    state.components[component].axis * (1.0 - fraction) +
+                    targetAxis * fraction));
+                const cv::Vec3d offset =
+                    (state.components[component].position - pivot) * (1.0 - fraction) +
+                    (proposed[component].position - pivot) * fraction;
+                interpolated[component].position = clampToWindow(
+                    pivot + offset, pivot, interpolated[component].axis,
+                    config.localWindowRadiusPredictionVoxels, lower, upper);
+            }
+            RefinedEvaluation evaluation = evaluateRefinedState(
+                observations, interpolated, activeComponents, pivot, config);
+            const double tolerance = config.convergenceTolerance *
+                std::max(1.0, std::abs(state.evaluation.objective));
+            if (evaluation.objective <= state.evaluation.objective + tolerance)
+                continue;
+            candidate.components = interpolated;
+            candidate.evaluation = std::move(evaluation);
+            candidate.acceptedIterations = state.acceptedIterations + 1;
+            for (size_t component = 0; component < activeComponents; ++component) {
+                acceptedDirectionUpdate = std::max(
+                    acceptedDirectionUpdate,
+                    projectiveUpdate(
+                        state.components[component].axis,
+                        candidate.components[component].axis));
+                const cv::Vec3d delta =
+                    candidate.components[component].position -
+                    state.components[component].position;
+                acceptedPositionUpdate = std::max(
+                    acceptedPositionUpdate,
+                    std::sqrt(std::max(0.0, delta.dot(delta))));
+            }
+            accepted = true;
+            break;
+        }
+        if (!accepted)
+            break;
+        const bool assignmentsUnchanged =
+            candidate.evaluation.assignments == state.evaluation.assignments;
+        state = std::move(candidate);
+        if (assignmentsUnchanged &&
+            acceptedDirectionUpdate <= config.convergenceTolerance &&
+            acceptedPositionUpdate <=
+                config.positionConvergenceTolerancePredictionVoxels) {
+            break;
+        }
+    }
+    return state;
+}
+
 [[nodiscard]] bool betterState(const FitState& candidate, const FitState& current)
 {
     return candidate.objectiveNumerator > current.objectiveNumerator;
@@ -287,6 +600,126 @@ struct FitState {
     return value / divisor + (value % divisor != 0 ? 1 : 0);
 }
 
+struct NmsCandidate {
+    FiberCellAnchorResult* cell = nullptr;
+    size_t componentIndex = 0;
+};
+
+[[nodiscard]] bool nmsRankedBefore(
+    const NmsCandidate& left,
+    const NmsCandidate& right)
+{
+    const auto& leftAnchor = left.cell->components[left.componentIndex].anchor;
+    const auto& rightAnchor = right.cell->components[right.componentIndex].anchor;
+    if (leftAnchor.alignedSupport != rightAnchor.alignedSupport)
+        return leftAnchor.alignedSupport > rightAnchor.alignedSupport;
+    if (leftAnchor.directionalCoherence != rightAnchor.directionalCoherence)
+        return leftAnchor.directionalCoherence > rightAnchor.directionalCoherence;
+    if (left.cell->cellZYX != right.cell->cellZYX)
+        return left.cell->cellZYX < right.cell->cellZYX;
+    return left.componentIndex < right.componentIndex;
+}
+
+[[nodiscard]] bool nmsNeighbors(
+    const FiberAnchor& left,
+    const FiberAnchor& right,
+    const FiberAnchorConfig& config)
+{
+    double dot = std::clamp(left.axisXYZ.dot(right.axisXYZ), -1.0, 1.0);
+    const double axialDot = std::abs(dot);
+    const double minimumDot = std::cos(
+        config.nmsMaximumAngleDegrees * std::acos(-1.0) / 180.0);
+    if (axialDot < minimumDot)
+        return false;
+    cv::Vec3d alignedRight = right.axisXYZ;
+    if (dot < 0.0)
+        alignedRight *= -1.0;
+    cv::Vec3d averageAxis = normalized(left.axisXYZ + alignedRight);
+    if (averageAxis.dot(averageAxis) <= kMatrixEpsilon)
+        averageAxis = left.axisXYZ;
+    const cv::Vec3d delta = right.positionPredictionXYZ -
+        left.positionPredictionXYZ;
+    const double longitudinal = std::abs(delta.dot(averageAxis));
+    const cv::Vec3d transverseVector =
+        delta - averageAxis * delta.dot(averageAxis);
+    const double transverse = std::sqrt(std::max(
+        0.0, transverseVector.dot(transverseVector)));
+    return longitudinal <= config.nmsLongitudinalRadiusPredictionVoxels &&
+        transverse <= config.localWindowRadiusPredictionVoxels;
+}
+
+void applyLocalMaximumNms(
+    std::vector<FiberCellAnchorResult>& cells,
+    const FiberAnchorConfig& config)
+{
+    std::vector<NmsCandidate> candidates;
+    for (auto& cell : cells) {
+        for (size_t component = 0; component < cell.components.size(); ++component) {
+            if (cell.components[component].retained)
+                candidates.push_back({&cell, component});
+        }
+    }
+    if (candidates.empty())
+        return;
+    const double binSize = std::max(
+        1.0e-12,
+        std::hypot(
+            config.localWindowRadiusPredictionVoxels,
+            config.nmsLongitudinalRadiusPredictionVoxels));
+    using Bin = std::array<int64_t, 3>;
+    std::map<Bin, std::vector<size_t>> bins;
+    const auto binFor = [binSize](const cv::Vec3d& position) {
+        return Bin{
+            static_cast<int64_t>(std::floor(position[0] / binSize)),
+            static_cast<int64_t>(std::floor(position[1] / binSize)),
+            static_cast<int64_t>(std::floor(position[2] / binSize)),
+        };
+    };
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const auto& anchor = candidates[index].cell->components[
+            candidates[index].componentIndex].anchor;
+        bins[binFor(anchor.positionPredictionXYZ)].push_back(index);
+    }
+    std::vector<bool> suppressed(candidates.size(), false);
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
+        const auto& anchor = candidate.cell->components[
+            candidate.componentIndex].anchor;
+        const Bin ownBin = binFor(anchor.positionPredictionXYZ);
+        for (int dz = -1; dz <= 1 && !suppressed[index]; ++dz) {
+            for (int dy = -1; dy <= 1 && !suppressed[index]; ++dy) {
+                for (int dx = -1; dx <= 1 && !suppressed[index]; ++dx) {
+                    const auto found = bins.find(Bin{
+                        ownBin[0] + dx, ownBin[1] + dy, ownBin[2] + dz});
+                    if (found == bins.end())
+                        continue;
+                    for (const size_t otherIndex : found->second) {
+                        if (otherIndex == index)
+                            continue;
+                        const auto& other = candidates[otherIndex];
+                        const auto& otherAnchor = other.cell->components[
+                            other.componentIndex].anchor;
+                        if (nmsRankedBefore(other, candidate) &&
+                            nmsNeighbors(anchor, otherAnchor, config)) {
+                            suppressed[index] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        if (!suppressed[index])
+            continue;
+        auto& component = candidates[index].cell->components[
+            candidates[index].componentIndex];
+        component.retained = false;
+        component.rejectionReason = "nms_suppressed";
+        --candidates[index].cell->retainedAnchorCount;
+    }
+}
+
 } // namespace
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config)
@@ -296,6 +729,31 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
     if (!(config.gaussianSigmaPredictionVoxels > 0.0) ||
         !std::isfinite(config.gaussianSigmaPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor Gaussian sigma must be positive and finite");
+    }
+    if (!(config.gaussianCutoffSigmas > 0.0) ||
+        !std::isfinite(config.gaussianCutoffSigmas)) {
+        throw std::invalid_argument("fiber anchor Gaussian cutoff must be positive and finite");
+    }
+    if (!(config.localWindowRadiusPredictionVoxels > 0.0) ||
+        !std::isfinite(config.localWindowRadiusPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor local window must be positive and finite");
+    }
+    if (!(config.axialSupportHalfWidthPredictionVoxels > 0.0) ||
+        !std::isfinite(config.axialSupportHalfWidthPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor axial support must be positive and finite");
+    }
+    if (!(config.positionConvergenceTolerancePredictionVoxels >= 0.0) ||
+        !std::isfinite(config.positionConvergenceTolerancePredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor position tolerance must be finite and non-negative");
+    }
+    if (!(config.nmsMaximumAngleDegrees >= 0.0) ||
+        !(config.nmsMaximumAngleDegrees <= 90.0) ||
+        !std::isfinite(config.nmsMaximumAngleDegrees)) {
+        throw std::invalid_argument("fiber anchor NMS angle must be in [0, 90]");
+    }
+    if (!(config.nmsLongitudinalRadiusPredictionVoxels >= 0.0) ||
+        !std::isfinite(config.nmsLongitudinalRadiusPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor NMS longitudinal radius must be finite and non-negative");
     }
     if (!(config.observationPresenceFloor >= 0.0) ||
         !(config.observationPresenceFloor <= 1.0) ||
@@ -328,6 +786,12 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !std::isfinite(config.convergenceTolerance)) {
         throw std::invalid_argument("fiber anchor convergence tolerance must be finite and non-negative");
     }
+    if (config.processingBlockCellSide < 1 ||
+        config.processingBlockCellSide > 64) {
+        throw std::invalid_argument("fiber anchor processing block side must be in [1, 64]");
+    }
+    if (config.maximumSampleBlockBytes == 0)
+        throw std::invalid_argument("fiber anchor sample block byte limit must be positive");
     if (config.parallelThreads < 1)
         throw std::invalid_argument("fiber anchor thread count must be positive");
 }
@@ -367,6 +831,14 @@ FiberAnchorCrop fiberAnchorCropFromBaseVoxels(
     return predictionCrop;
 }
 
+void suppressFiberAnchorDuplicates(
+    std::vector<FiberCellAnchorResult>& cells,
+    const FiberAnchorConfig& config)
+{
+    validateFiberAnchorConfig(config);
+    applyLocalMaximumNms(cells, config);
+}
+
 FiberCellAnchorResult fitFiberCellAnchors(
     const std::array<size_t, 3>& cellZYX,
     const std::array<size_t, 3>& cellBeginZYX,
@@ -379,21 +851,33 @@ FiberCellAnchorResult fitFiberCellAnchors(
         (cellEndZYX[0] - cellBeginZYX[0]) *
         (cellEndZYX[1] - cellBeginZYX[1]) *
         (cellEndZYX[2] - cellBeginZYX[2]);
-    if (input.size() != expected)
-        throw std::invalid_argument("fiber anchor cell observations do not cover the owned cell voxels");
+    const auto isOwned = [&cellBeginZYX, &cellEndZYX](const cv::Vec3d& position) {
+        return position[0] >= static_cast<double>(cellBeginZYX[2]) &&
+            position[0] < static_cast<double>(cellEndZYX[2]) &&
+            position[1] >= static_cast<double>(cellBeginZYX[1]) &&
+            position[1] < static_cast<double>(cellEndZYX[1]) &&
+            position[2] >= static_cast<double>(cellBeginZYX[0]) &&
+            position[2] < static_cast<double>(cellEndZYX[0]);
+    };
+    const size_t ownedCount = static_cast<size_t>(std::count_if(
+        input.begin(), input.end(), [&](const auto& observation) {
+            return finiteVector(observation.positionPredictionXYZ) &&
+                isOwned(observation.positionPredictionXYZ);
+        }));
+    if (ownedCount != expected)
+        throw std::invalid_argument("fiber anchor observations do not cover the owned cell voxels exactly once");
 
     FiberCellAnchorResult result;
     result.cellZYX = cellZYX;
     for (auto& component : result.components)
         component.anchor.cellZYX = cellZYX;
-    const double size = static_cast<double>(config.cellSizePredictionVoxels);
     const cv::Vec3d center{
-        static_cast<double>(cellZYX[2] * config.cellSizePredictionVoxels) +
-            (size - 1.0) * 0.5,
-        static_cast<double>(cellZYX[1] * config.cellSizePredictionVoxels) +
-            (size - 1.0) * 0.5,
-        static_cast<double>(cellZYX[0] * config.cellSizePredictionVoxels) +
-            (size - 1.0) * 0.5,
+        (static_cast<double>(cellBeginZYX[2]) +
+            static_cast<double>(cellEndZYX[2]) - 1.0) * 0.5,
+        (static_cast<double>(cellBeginZYX[1]) +
+            static_cast<double>(cellEndZYX[1]) - 1.0) * 0.5,
+        (static_cast<double>(cellBeginZYX[0]) +
+            static_cast<double>(cellEndZYX[0]) - 1.0) * 0.5,
     };
     const double invTwoSigma2 = 1.0 /
         (2.0 * config.gaussianSigmaPredictionVoxels *
@@ -403,10 +887,14 @@ FiberCellAnchorResult fitFiberCellAnchors(
     observations.reserve(input.size());
     for (size_t index = 0; index < input.size(); ++index) {
         const auto& candidate = input[index];
+        if (!finiteVector(candidate.positionPredictionXYZ) ||
+            !isOwned(candidate.positionPredictionXYZ)) {
+            continue;
+        }
         const cv::Vec3d delta = candidate.positionPredictionXYZ - center;
         const double gaussian = std::exp(-delta.dot(delta) * invTwoSigma2);
         denominator.add(gaussian);
-        if (!candidate.valid || !finiteVector(candidate.positionPredictionXYZ) ||
+        if (!candidate.valid ||
             !finiteVector(candidate.direction) || !std::isfinite(candidate.presence) ||
             candidate.presence < config.observationPresenceFloor ||
             candidate.presence < 0.0 || candidate.presence > 1.0) {
@@ -481,7 +969,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
             }
         }
     }
-    result.objective = denominator.sum > 0.0
+    const double seededObjective = denominator.sum > 0.0
         ? bestFit.objectiveNumerator / denominator.sum
         : 0.0;
 
@@ -519,65 +1007,68 @@ FiberCellAnchorResult fitFiberCellAnchors(
         };
     }
 
-    const auto populateComponent = [&result, &observations, &config, &denominator](
-                                       uint8_t componentIndex,
-                                       const cv::Vec3d& axis,
-                                       const std::vector<uint8_t>* assignments) {
-        auto& component = result.components[componentIndex];
-        component.anchor.axisXYZ = canonicalAxis(axis);
-        CompensatedSum aligned;
-        CompensatedSum presenceMass;
-        std::array<CompensatedSum, 3> position;
-        for (size_t index = 0; index < observations.size(); ++index) {
-            if (assignments != nullptr && (*assignments)[index] != componentIndex)
-                continue;
-            ++component.assignedObservationCount;
-            const auto& observation = observations[index];
-            const double dot = observation.direction.dot(component.anchor.axisXYZ);
-            const double alignedWeight = observation.weight * dot * dot;
-            aligned.add(alignedWeight);
-            presenceMass.add(observation.weight);
-            for (int axis = 0; axis < 3; ++axis)
-                position[axis].add(alignedWeight * observation.position[axis]);
-        }
-        if (component.assignedObservationCount == 0 || !(aligned.sum > 0.0)) {
-            component.rejectionReason = "empty";
-            return;
-        }
-        component.anchor.alignedSupport = aligned.sum / denominator.sum;
-        component.anchor.directionalCoherence = aligned.sum / presenceMass.sum;
-        component.anchor.positionPredictionXYZ = {
-            position[0].sum / aligned.sum,
-            position[1].sum / aligned.sum,
-            position[2].sum / aligned.sum,
-        };
-        if (component.anchor.alignedSupport < config.minimumAlignedSupport) {
-            component.rejectionReason = "below_support";
-            return;
-        }
-        component.retained = true;
-        ++result.retainedAnchorCount;
-    };
-
     if (mergeComponents) {
         result.objective = result.mergeEvaluation->jointObjective;
-        populateComponent(0, global.axis, nullptr);
-        result.components[1].rejectionReason = "merged_same_direction";
+    } else {
+        result.objective = seededObjective;
+    }
+
+    std::array<cv::Vec3d, 2> seedAxes{};
+    size_t activeComponents = 0;
+    if (mergeComponents) {
+        seedAxes[activeComponents++] = global.axis;
     } else {
         for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
             const auto& fitted = fittedComponents[componentIndex];
-            if (!fitted.unique) {
+            if (fitted.unique) {
+                seedAxes[activeComponents++] = fitted.axis;
+            } else {
                 result.components[componentIndex].rejectionReason = std::any_of(
                     bestFit.assignments.begin(), bestFit.assignments.end(),
                     [componentIndex](uint8_t assigned) {
                         return assigned == componentIndex;
                     }) ? "degenerate" : "empty";
-                continue;
             }
-            populateComponent(
-                componentIndex, fitted.axis, &bestFit.assignments);
         }
     }
+    if (activeComponents == 0)
+        return result;
+
+    const RefinedFitState refined = refineLocalComponents(
+        input, center, seedAxes, activeComponents, config);
+    result.objective = refined.evaluation.objective;
+    for (size_t componentIndex = 0; componentIndex < activeComponents; ++componentIndex) {
+        auto& component = result.components[componentIndex];
+        const double denominatorValue = refined.evaluation.denominators[componentIndex];
+        const double numeratorValue = refined.evaluation.numerators[componentIndex];
+        const double presenceMass = refined.evaluation.presenceMasses[componentIndex];
+        component.assignedObservationCount =
+            refined.evaluation.assignedCounts[componentIndex];
+        component.anchor.axisXYZ =
+            canonicalAxis(refined.components[componentIndex].axis);
+        component.anchor.positionPredictionXYZ =
+            refined.components[componentIndex].position;
+        component.anchor.alignedSupport = denominatorValue > 0.0
+            ? numeratorValue / denominatorValue
+            : 0.0;
+        component.anchor.directionalCoherence = presenceMass > 0.0
+            ? numeratorValue / presenceMass
+            : 0.0;
+        component.anchor.refinementScore = component.anchor.alignedSupport;
+        component.anchor.refinementIterations = refined.acceptedIterations;
+        if (component.assignedObservationCount == 0 || !(numeratorValue > 0.0)) {
+            component.rejectionReason = "empty";
+        } else if (component.anchor.alignedSupport < config.minimumAlignedSupport) {
+            component.rejectionReason = "below_support";
+        } else {
+            component.retained = true;
+            ++result.retainedAnchorCount;
+        }
+    }
+    if (mergeComponents)
+        result.components[1].rejectionReason = "merged_same_direction";
+    else if (activeComponents == 1 && result.components[1].rejectionReason.empty())
+        result.components[1].rejectionReason = "empty";
     if (componentLess(result.components[1], result.components[0]))
         std::swap(result.components[0], result.components[1]);
     return result;
@@ -635,75 +1126,257 @@ FiberAnchorExtractionReport extractFiberAnchors(
         report.selectedCellEndZYX[axis] = ceilDivide(cropEndZYX[axis], cellSize);
     }
 
+    const auto checkedProduct = [](const std::array<size_t, 3>& size,
+                                    const char* description) {
+        size_t result = 1;
+        for (const size_t extent : size) {
+            if (extent != 0 && result > std::numeric_limits<size_t>::max() / extent)
+                throw std::overflow_error(std::string(description) + " size overflows");
+            result *= extent;
+        }
+        return result;
+    };
+    const std::array<size_t, 3> totalCellsZYX{
+        ceilDivide(grid.shapeZYX[0], cellSize),
+        ceilDivide(grid.shapeZYX[1], cellSize),
+        ceilDivide(grid.shapeZYX[2], cellSize),
+    };
+    const double maximumTransverseSupport =
+        config.localWindowRadiusPredictionVoxels +
+        config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
+    const double maximumSupportRadius = std::hypot(
+        maximumTransverseSupport,
+        config.axialSupportHalfWidthPredictionVoxels);
+    const size_t sampleHalo = static_cast<size_t>(std::ceil(maximumSupportRadius));
+    const auto selectedCell = [&report](const std::array<size_t, 3>& cell) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+            if (cell[axis] < report.selectedCellBeginZYX[axis] ||
+                cell[axis] >= report.selectedCellEndZYX[axis]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     const auto start = std::chrono::steady_clock::now();
-    for (size_t cz = report.selectedCellBeginZYX[0];
-         cz < report.selectedCellEndZYX[0]; ++cz) {
-        for (size_t cy = report.selectedCellBeginZYX[1];
-             cy < report.selectedCellEndZYX[1]; ++cy) {
-            for (size_t cx = report.selectedCellBeginZYX[2];
-                 cx < report.selectedCellEndZYX[2]; ++cx) {
-                const std::array<size_t, 3> cellZYX{cz, cy, cx};
-                const std::array<size_t, 3> begin{
-                    cz * cellSize, cy * cellSize, cx * cellSize};
+    const size_t blockSide = config.processingBlockCellSide;
+    const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells, bool tallySelectedDiagnostics) {
+        using CellIndex = std::array<size_t, 3>;
+        std::map<CellIndex, std::vector<CellIndex>> cellsByBlock;
+        for (const auto& cell : requestedCells) {
+            cellsByBlock[CellIndex{
+                             cell[0] / blockSide,
+                             cell[1] / blockSide,
+                             cell[2] / blockSide,
+                         }]
+                .push_back(cell);
+        }
+
+        std::vector<FiberCellAnchorResult> results;
+        for (const auto& [blockIndex, blockCells] : cellsByBlock) {
+            const CellIndex blockCellBegin{
+                blockIndex[0] * blockSide,
+                blockIndex[1] * blockSide,
+                blockIndex[2] * blockSide,
+            };
+            const CellIndex blockCellEnd{
+                std::min(totalCellsZYX[0], blockCellBegin[0] + blockSide),
+                std::min(totalCellsZYX[1], blockCellBegin[1] + blockSide),
+                std::min(totalCellsZYX[2], blockCellBegin[2] + blockSide),
+            };
+            const CellIndex blockBegin{
+                blockCellBegin[0] * cellSize,
+                blockCellBegin[1] * cellSize,
+                blockCellBegin[2] * cellSize,
+            };
+            const std::array<size_t, 3> blockEnd{
+                std::min(blockCellEnd[0] * cellSize, grid.shapeZYX[0]),
+                std::min(blockCellEnd[1] * cellSize, grid.shapeZYX[1]),
+                std::min(blockCellEnd[2] * cellSize, grid.shapeZYX[2]),
+            };
+            std::array<size_t, 3> sampleBegin{};
+            std::array<size_t, 3> sampleEnd{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                sampleBegin[axis] = blockBegin[axis] > sampleHalo ? blockBegin[axis] - sampleHalo : 0;
+                sampleEnd[axis] = std::min(grid.shapeZYX[axis], blockEnd[axis] + std::min(sampleHalo, grid.shapeZYX[axis] - blockEnd[axis]));
+            }
+            const std::array<size_t, 3> sampleShape{
+                sampleEnd[0] - sampleBegin[0],
+                sampleEnd[1] - sampleBegin[1],
+                sampleEnd[2] - sampleBegin[2],
+            };
+            std::vector<std::array<size_t, 3>> indices;
+            const size_t sampleCount = checkedProduct(sampleShape, "fiber anchor sample block");
+            constexpr size_t bytesPerSample = sizeof(std::array<size_t, 3>) + sizeof(FiberStoredPredictionSample) + sizeof(FiberAnchorObservation);
+            if (sampleCount > config.maximumSampleBlockBytes / bytesPerSample) {
+                throw std::runtime_error("fiber anchor sample block exceeds the configured byte limit");
+            }
+            indices.reserve(sampleCount);
+            for (size_t z = sampleBegin[0]; z < sampleEnd[0]; ++z) {
+                for (size_t y = sampleBegin[1]; y < sampleEnd[1]; ++y) {
+                    for (size_t x = sampleBegin[2]; x < sampleEnd[2]; ++x)
+                        indices.push_back({z, y, x});
+                }
+            }
+            std::vector<FiberStoredPredictionSample> samples;
+            sampler(indices, config.parallelThreads, samples);
+            if (samples.size() != indices.size()) {
+                throw std::runtime_error("fiber stored prediction sampler returned the wrong sample count");
+            }
+            std::vector<FiberAnchorObservation> observations;
+            observations.reserve(samples.size());
+            for (size_t index = 0; index < samples.size(); ++index) {
+                observations.push_back({
+                    cv::Vec3d{
+                        static_cast<double>(indices[index][2]),
+                        static_cast<double>(indices[index][1]),
+                        static_cast<double>(indices[index][0]),
+                    },
+                    samples[index].direction,
+                    samples[index].presence,
+                    samples[index].valid,
+                });
+            }
+            for (const auto& cellZYX : blockCells) {
+                const size_t cz = cellZYX[0];
+                const size_t cy = cellZYX[1];
+                const size_t cx = cellZYX[2];
+                const std::array<size_t, 3> begin{cz * cellSize, cy * cellSize, cx * cellSize};
                 const std::array<size_t, 3> end{
                     std::min(begin[0] + cellSize, grid.shapeZYX[0]),
                     std::min(begin[1] + cellSize, grid.shapeZYX[1]),
                     std::min(begin[2] + cellSize, grid.shapeZYX[2]),
                 };
-                std::vector<std::array<size_t, 3>> indices;
-                indices.reserve(
-                    (end[0] - begin[0]) * (end[1] - begin[1]) *
-                    (end[2] - begin[2]));
-                for (size_t z = begin[0]; z < end[0]; ++z) {
-                    for (size_t y = begin[1]; y < end[1]; ++y) {
-                        for (size_t x = begin[2]; x < end[2]; ++x)
-                            indices.push_back({z, y, x});
+                const cv::Vec3d pivot{
+                    (static_cast<double>(begin[2]) + static_cast<double>(end[2]) - 1.0) * 0.5,
+                    (static_cast<double>(begin[1]) + static_cast<double>(end[1]) - 1.0) * 0.5,
+                    (static_cast<double>(begin[0]) + static_cast<double>(end[0]) - 1.0) * 0.5,
+                };
+                std::vector<FiberAnchorObservation> cellObservations;
+                for (const auto& observation : observations) {
+                    const cv::Vec3d delta = observation.positionPredictionXYZ - pivot;
+                    const auto& position = observation.positionPredictionXYZ;
+                    const bool owned =
+                        position[0] >= static_cast<double>(begin[2]) && position[0] < static_cast<double>(end[2]) &&
+                        position[1] >= static_cast<double>(begin[1]) && position[1] < static_cast<double>(end[1]) &&
+                        position[2] >= static_cast<double>(begin[0]) && position[2] < static_cast<double>(end[0]);
+                    if (owned || delta.dot(delta) <= maximumSupportRadius * maximumSupportRadius + 1.0e-12) {
+                        cellObservations.push_back(observation);
                     }
                 }
-                std::vector<FiberStoredPredictionSample> samples;
-                sampler(indices, config.parallelThreads, samples);
-                if (samples.size() != indices.size()) {
-                    throw std::runtime_error(
-                        "fiber stored prediction sampler returned the wrong sample count");
-                }
-                std::vector<FiberAnchorObservation> observations;
-                observations.reserve(samples.size());
-                for (size_t index = 0; index < samples.size(); ++index) {
-                    observations.push_back({
-                        cv::Vec3d{
-                            static_cast<double>(indices[index][2]),
-                            static_cast<double>(indices[index][1]),
-                            static_cast<double>(indices[index][0]),
-                        },
-                        samples[index].direction,
-                        samples[index].presence,
-                        samples[index].valid,
-                    });
-                }
-                FiberCellAnchorResult cell = fitFiberCellAnchors(
-                    cellZYX, begin, end, observations, config);
-                ++report.diagnostics.totalCells;
-                if (cell.retainedAnchorCount == 0)
-                    ++report.diagnostics.zeroAnchorCells;
-                else if (cell.retainedAnchorCount == 1)
-                    ++report.diagnostics.oneAnchorCells;
-                else
-                    ++report.diagnostics.twoAnchorCells;
-                for (const auto& component : cell.components) {
-                    if (component.rejectionReason == "empty")
-                        ++report.diagnostics.emptyComponents;
-                    else if (component.rejectionReason == "degenerate")
-                        ++report.diagnostics.degenerateComponents;
-                    else if (component.rejectionReason == "below_support")
-                        ++report.diagnostics.belowSupportComponents;
-                    else if (component.rejectionReason == "merged_same_direction")
+                FiberCellAnchorResult cell = fitFiberCellAnchors(cellZYX, begin, end, cellObservations, config);
+                if (tallySelectedDiagnostics) {
+                    if (cell.mergeEvaluation.has_value() && cell.mergeEvaluation->merged) {
                         ++report.diagnostics.mergedComponentPairs;
+                    }
+                    for (const auto& component : cell.components) {
+                        if (component.rejectionReason == "empty")
+                            ++report.diagnostics.emptyComponents;
+                        else if (component.rejectionReason == "degenerate")
+                            ++report.diagnostics.degenerateComponents;
+                        else if (component.rejectionReason == "below_support")
+                            ++report.diagnostics.belowSupportComponents;
+                    }
                 }
                 if (cell.retainedAnchorCount > 0)
-                    report.nonEmptyCells.push_back(std::move(cell));
+                    results.push_back(std::move(cell));
+            }
+        }
+        return results;
+    };
+
+    std::vector<std::array<size_t, 3>> selectedCells;
+    for (size_t cz = report.selectedCellBeginZYX[0]; cz < report.selectedCellEndZYX[0]; ++cz) {
+        for (size_t cy = report.selectedCellBeginZYX[1]; cy < report.selectedCellEndZYX[1]; ++cy) {
+            for (size_t cx = report.selectedCellBeginZYX[2]; cx < report.selectedCellEndZYX[2]; ++cx) {
+                selectedCells.push_back({cz, cy, cx});
             }
         }
     }
+    std::vector<FiberCellAnchorResult> contextResults = processCells(selectedCells, true);
+
+    const double nmsDistance = std::hypot(config.localWindowRadiusPredictionVoxels, config.nmsLongitudinalRadiusPredictionVoxels);
+    const double contextPivotDistance = config.localWindowRadiusPredictionVoxels + nmsDistance;
+    const size_t contextCellRadius = static_cast<size_t>(std::ceil(contextPivotDistance / static_cast<double>(cellSize))) + 1;
+    std::set<std::array<size_t, 3>> externalContextCells;
+    for (const auto& cell : contextResults) {
+        for (const auto& component : cell.components) {
+            if (!component.retained)
+                continue;
+            const auto& position = component.anchor.positionPredictionXYZ;
+            const std::array<double, 3> positionZYX{position[2], position[1], position[0]};
+            std::array<size_t, 3> centerCell{};
+            std::array<size_t, 3> beginCell{};
+            std::array<size_t, 3> endCell{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                centerCell[axis] = std::min(totalCellsZYX[axis] - 1, static_cast<size_t>(positionZYX[axis]) / cellSize);
+                beginCell[axis] = centerCell[axis] > contextCellRadius ? centerCell[axis] - contextCellRadius : 0;
+                endCell[axis] =
+                    std::min(totalCellsZYX[axis], centerCell[axis] + std::min(contextCellRadius + 1, totalCellsZYX[axis] - centerCell[axis]));
+            }
+            for (size_t cz = beginCell[0]; cz < endCell[0]; ++cz) {
+                for (size_t cy = beginCell[1]; cy < endCell[1]; ++cy) {
+                    for (size_t cx = beginCell[2]; cx < endCell[2]; ++cx) {
+                        const std::array<size_t, 3> candidate{cz, cy, cx};
+                        if (selectedCell(candidate))
+                            continue;
+                        const std::array<size_t, 3> candidateBegin{cz * cellSize, cy * cellSize, cx * cellSize};
+                        const std::array<size_t, 3> candidateEnd{
+                            std::min(candidateBegin[0] + cellSize, grid.shapeZYX[0]),
+                            std::min(candidateBegin[1] + cellSize, grid.shapeZYX[1]),
+                            std::min(candidateBegin[2] + cellSize, grid.shapeZYX[2]),
+                        };
+                        const cv::Vec3d pivot{
+                            (static_cast<double>(candidateBegin[2]) + static_cast<double>(candidateEnd[2]) - 1.0) * 0.5,
+                            (static_cast<double>(candidateBegin[1]) + static_cast<double>(candidateEnd[1]) - 1.0) * 0.5,
+                            (static_cast<double>(candidateBegin[0]) + static_cast<double>(candidateEnd[0]) - 1.0) * 0.5,
+                        };
+                        const cv::Vec3d delta = pivot - position;
+                        if (delta.dot(delta) <= contextPivotDistance * contextPivotDistance + 1.0e-12) {
+                            externalContextCells.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const std::vector<std::array<size_t, 3>> externalCells(
+        externalContextCells.begin(), externalContextCells.end());
+    auto externalResults = processCells(externalCells, false);
+    contextResults.insert(
+        contextResults.end(),
+        std::make_move_iterator(externalResults.begin()),
+        std::make_move_iterator(externalResults.end()));
+    std::sort(contextResults.begin(), contextResults.end(),
+        [](const auto& left, const auto& right) {
+            return left.cellZYX < right.cellZYX;
+    });
+    suppressFiberAnchorDuplicates(contextResults, config);
+    report.diagnostics.totalCells = checkedProduct({
+        report.selectedCellEndZYX[0] - report.selectedCellBeginZYX[0],
+        report.selectedCellEndZYX[1] - report.selectedCellBeginZYX[1],
+        report.selectedCellEndZYX[2] - report.selectedCellBeginZYX[2],
+    }, "selected fiber anchor cell");
+    for (auto& cell : contextResults) {
+        if (!selectedCell(cell.cellZYX))
+            continue;
+        for (const auto& component : cell.components) {
+            if (component.rejectionReason == "nms_suppressed")
+                ++report.diagnostics.nmsSuppressedComponents;
+        }
+        if (componentLess(cell.components[1], cell.components[0]))
+            std::swap(cell.components[0], cell.components[1]);
+        if (cell.retainedAnchorCount == 1) {
+            ++report.diagnostics.oneAnchorCells;
+        } else if (cell.retainedAnchorCount == 2) {
+            ++report.diagnostics.twoAnchorCells;
+        }
+        if (cell.retainedAnchorCount > 0)
+            report.nonEmptyCells.push_back(std::move(cell));
+    }
+    report.diagnostics.zeroAnchorCells =
+        report.diagnostics.totalCells - report.diagnostics.oneAnchorCells -
+        report.diagnostics.twoAnchorCells;
     report.elapsedSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     return report;
@@ -746,6 +1419,12 @@ nlohmann::json fiberAnchorReportJson(
         {"parameters", {
             {"cell_size_prediction_voxels", report.config.cellSizePredictionVoxels},
             {"gaussian_sigma_prediction_voxels", report.config.gaussianSigmaPredictionVoxels},
+            {"gaussian_cutoff_sigmas", report.config.gaussianCutoffSigmas},
+            {"local_window_radius_prediction_voxels", report.config.localWindowRadiusPredictionVoxels},
+            {"axial_support_half_width_prediction_voxels", report.config.axialSupportHalfWidthPredictionVoxels},
+            {"position_convergence_tolerance_prediction_voxels", report.config.positionConvergenceTolerancePredictionVoxels},
+            {"nms_maximum_angle_degrees", report.config.nmsMaximumAngleDegrees},
+            {"nms_longitudinal_radius_prediction_voxels", report.config.nmsLongitudinalRadiusPredictionVoxels},
             {"observation_presence_floor", report.config.observationPresenceFloor},
             {"minimum_aligned_support", report.config.minimumAlignedSupport},
             {"merge_maximum_angle_degrees", report.config.mergeMaximumAngleDegrees},
@@ -764,6 +1443,7 @@ nlohmann::json fiberAnchorReportJson(
             {"degenerate_components", report.diagnostics.degenerateComponents},
             {"below_support_components", report.diagnostics.belowSupportComponents},
             {"merged_component_pairs", report.diagnostics.mergedComponentPairs},
+            {"nms_suppressed_components", report.diagnostics.nmsSuppressedComponents},
         }},
         {"cells", nlohmann::json::array()},
     };
@@ -803,6 +1483,9 @@ nlohmann::json fiberAnchorReportJson(
                 componentJson["aligned_support"] = anchor.alignedSupport;
                 componentJson["directional_coherence"] =
                     anchor.directionalCoherence;
+                componentJson["refinement_score"] = anchor.refinementScore;
+                componentJson["refinement_iterations"] =
+                    anchor.refinementIterations;
             } else {
                 componentJson["reason"] = component.rejectionReason;
             }

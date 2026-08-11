@@ -522,6 +522,14 @@ struct CandidateScoreDebug {
     const cv::Vec3d& candidateDirection,
     const FiberTraceConfig& config);
 
+[[nodiscard]] CandidateScoreDebug debugCandidateLossFromSample(
+    const FiberPredictionSample& sample,
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& currentSampleDirection,
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateDirection,
+    const FiberTraceConfig& config);
+
 [[nodiscard]] size_t debugExactLookaheadRequiredParentCount(
     const std::vector<double>& parentLowerBounds,
     std::optional<double> resultThreshold,

@@ -2504,24 +2504,37 @@
   intersecting complete global cells without recentering or truncating them.
   A non-empty box containing no prediction sample and any selection outside the
   global prediction volume are errors; there is no implicit clipping.
-- Each valid observation has fixed weight `g_i p_i`, where `g_i` is a Gaussian
-  about the nominal global cell centre and `p_i` is presence. Invalid axes and
-  presence below the inclusive floor contribute no numerator. The support
-  denominator is `sum g_i` over every owned cell voxel, including invalid,
-  missing, below-floor, and zero-presence samples.
 - Every non-empty cell attempts two independent, unoriented, potentially
   non-orthogonal direction components. Exclusive assignment maximizes squared
   alignment, and each fixed-assignment update is the principal eigenvector of
   `sum g_i p_i d_i d_i^T` for that component. Deterministic multistart
-  assignment/PCA maximizes
-  `sum g_i p_i max_k((d_i dot u_k)^2) / sum g_i`. A single covariance's first
-  two orthogonal eigenvectors are not a valid replacement.
-- A component's aligned support is
-  `sum_assigned g_i p_i (d_i dot u_k)^2 / sum_cell g_i`; coherence divides the
-  same numerator by assigned `sum g_i p_i`; position is the aligned-support
-  centroid. Empty, degenerate, and below-threshold components are discarded
-  independently without reassigning or refitting a survivor. A cell emits
-  zero, one, or two anchors.
+  assignment/PCA supplies only initial directions. A single covariance's first
+  two orthogonal eigenvectors are not a valid replacement. Initial component
+  positions are the centre of the clipped owned-cell voxel range.
+- Direction and position are then refined jointly from a bounded halo. For
+  anchor `(p_k,u_k)`, the transverse Gaussian is recentered at `p_k`, uses the
+  distance to the line through `p_k` along `u_k`, and is truncated at three
+  sigma. Evidence is also restricted to a symmetric axial slab about the plane
+  through the fixed cell pivot normal to `u_k`. Invalid axes and presence below
+  the inclusive floor contribute no numerator. Direction-mode assignment uses
+  `p_i (d_i dot u_k)^2` among components whose finite kernels contain the site;
+  zero-evidence sites remain unassigned.
+- Each component direction update is the principal eigenvector of its assigned
+  `g_ik p_i d_i d_i^T`. Its position update is the assigned
+  `g_ik p_i (d_i dot u_k)^2` centroid projected onto the plane through the cell
+  pivot normal to the updated direction. The plane therefore rotates with the
+  direction, but the anchor never advances along the fiber through the cell.
+  Transverse displacement is clamped to the local window and the prediction
+  grid. The next iteration recomputes falloff about the new position.
+- Proposed joint updates use deterministic backtracking and are accepted only
+  when the normalized joint objective strictly improves. This bounded monotonic
+  mode search stops at a local maximum and cannot cross a lower-response valley
+  merely to reach a stronger neighboring fiber. A component's denominator is
+  `sum g_ik` over every lattice site in its finite kernel, including invalid,
+  below-floor, zero-presence, and unassigned sites. Aligned support is assigned
+  aligned evidence divided by that denominator; coherence divides by assigned
+  `sum g_ik p_i`. Empty, degenerate, and below-threshold components are
+  discarded independently. A cell emits zero, one, or two anchors.
 - When both fitted components and their joint PCA are unique, near-duplicate
   components are evaluated before support rejection. Let `O2` be the sum of
   the two fixed-assignment principal eigenvalues divided by `sum_cell g_i` and
@@ -2530,19 +2543,34 @@
   `max(0, O2-O1) <= max(0.01, 0.05 O1)` by default. All comparisons are
   inclusive and all three limits are configurable. A merge rebuilds axis,
   position, support, coherence, and assigned count from every usable
-  observation, then applies the ordinary minimum-support test. Exact collapse
-  that already leaves the second component empty is not a merge.
+  observation through the same rotating-plane refinement, then applies the
+  ordinary minimum-support test. Exact collapse that already leaves the second
+  component empty is not a merge.
+- After all local fits, deterministic local-maximum NMS removes cross-cell
+  duplicates with compatible unoriented directions. Two anchors interact only
+  within the configured angular, transverse, and longitudinal limits measured
+  around their sign-aligned average axis. Ranking is aligned support, coherence,
+  then cell/component identity. Every decision compares against the original
+  candidate set, not only surviving candidates. Crossing directions and
+  sequential anchors along a fiber therefore remain distinct. Cropped runs fit
+  the exact external pivot cells that can directly compete with a selected
+  anchor, but serialize and count only selected cells.
 - Reductions, seeds, assignment ties, convergence, component ordering, and
   serialization sign are deterministic. Parallel work cannot change a
-  within-cell reduction. Machine output and OBJ store spatial positions only in
-  base-volume XYZ coordinates. Prediction shape/scale, cell indices, cell size,
-  and Gaussian sigma remain explicit lattice metadata and parameters. Runtime
-  timing and worker count are not scientific output, so
-  artifacts remain byte-identical across worker counts.
+  within-cell reduction. Extraction uses bounded deterministic cell blocks and
+  one halo sample per block; block size and worker count are operational only.
+  Machine output and OBJ store spatial positions only in base-volume XYZ
+  coordinates. Prediction shape/scale, cell indices, cell size, falloff,
+  cutoff, local window, axial slab, convergence, and NMS limits remain explicit
+  lattice metadata and parameters. Runtime timing and worker count are not
+  scientific output, so artifacts remain byte-identical across worker counts
+  and block sizes.
 - The anchor command itself does not connect anchors. Its strict version-1
   JSON is the authoritative input to the separate integer-DP path stage. It
-  requires the merge parameters, aggregate merge count, and auditable per-cell
-  merge evaluations where applicable; older experimental artifacts must be
+  requires the refinement/NMS and merge parameters, aggregate diagnostics,
+  per-anchor refinement fields, and auditable per-cell merge evaluations where
+  applicable. Positions are validated against the prediction grid, rotating
+  pivot plane, and local window. Older experimental artifacts must be
   regenerated. `anchors.obj` contains all retained anchors, while
   `anchors_0.obj` and `anchors_1.obj` contain deterministic post-sort
   per-cell component slots. These slots are not global H/V classes.
@@ -2598,19 +2626,29 @@
   `{-1,0,1}^3` with strictly positive chord projection. The resulting graph is
   acyclic. DP state is `(integer_voxel,incoming_move)` plus deterministic
   source-attachment states. Sink selection scores the real final virtual edge.
-- For a valid sampled unoriented prediction axis `d`, the direction floor is
-  `theta_q=min_m acos(abs(dot(d,m)))` over the representable local move set.
-  Direction cost is
-  `direction_weight*max(0,theta-theta_q)^2*edge_length`; source virtual edges
-  use their own attachment-set floor. Presence cost is
-  `presence_weight*(1-clamp(p,0,1))*edge_length`. Edge-length weighting keeps
-  axial and diagonal data integration comparable.
+- Valid-data scoring shares the regular native tracer's exact ordered float
+  multiplicative alignment loss. For incoming step `a`, outgoing step `b`,
+  current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
+  aligned to `b`, and candidate presence `p`, `score` is `clamp01(p)` times the
+  six positive-clamped dots `a.b`, `a.c`, `a.d`, `c.b`, `c.d`, and `b.d` in
+  that order. Alignment cost is `(1-score)*edge_length`; edge-length weighting
+  keeps axial and diagonal lattice integration comparable. The former lattice
+  direction floor and independent presence/direction weights do not exist.
+- A nonzero source attachment uses the fitted start axis as both `a` and `c`,
+  the attachment as `b`, and the dense destination prediction as `d`. A
+  nonzero sink attachment uses the current dense prediction and incoming step,
+  the attachment as `b`, and the fitted target axis at presence one as `d`.
+  Zero-length attachments add no alignment cost but establish/use the fitted
+  endpoint axis.
 - An invalid fiber sample pays only
   `invalid_prediction_cost_per_prediction_voxel*edge_length`, default 4.0. Presence and
-  direction components are then zero, while independently valid Lasagna
-  normals may still govern curvature. Invalid predictions are finite bridges,
-  not obstacles; without a quality threshold, a mostly invalid geometrically
-  reachable path may succeed and must report its invalid cost.
+  alignment components are then zero, while independently valid Lasagna
+  normals may still govern curvature. When leaving an invalid current voxel,
+  the incoming step substitutes for the unavailable current prediction and the
+  first valid destination pays normal multiplicative alignment. Invalid
+  predictions are finite bridges, not obstacles; without a quality threshold,
+  a mostly invalid geometrically reachable path may succeed and must report its
+  invalid cost.
 - Direct local curvature shares the native 3D tracer's exact float
   normal-aware equations. With a valid normal it emits tangent-plane and
   normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
@@ -2618,21 +2656,42 @@
   lattice free angle. The per-turn value is divided by
   `max(1,(previous_edge_length+candidate_edge_length)/2)`. Cumulative history
   smoothness is not part of this DP.
-- `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates, parameters,
-  diagnostics, every considered endpoint pair and reason, component cost
-  totals, and successful base-coordinate paths. `fiberlets.obj` contains
-  only successful base-coordinate line groups. Both are atomically replaced;
-  timing and worker count are not serialized, so repeated identical runs are
-  byte-identical.
+- `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates,
+  parameters, diagnostics, every considered endpoint pair and reason, component
+  cost totals, and successful base-coordinate paths. Every successful scored
+  path also stores its base-voxel arc length, total loss divided by prediction-
+  voxel arc length, and report-relative visual quality.
+  Smoothness terms remain included in the density even though their existing
+  per-turn integration differs from the edge-integrated data terms. These are
+  reporting values only and cannot change path selection or acceptance.
+- Relative visual quality is computed over exactly the successful scored paths
+  in canonical report order as inverse min-max normalized loss density: the
+  lowest density is one and the highest is zero. Equal densities all map to one;
+  an empty population has null bounds. This is an artifact-relative display
+  value, not absolute confidence. Display color is napari runtime state.
+- `fiberlets.obj` contains only successful base-coordinate line groups and
+  report comments declare the density population, unit, bounds, and formula;
+  each group records total loss, loss density, and relative quality. Path MTL,
+  materials, and serialized RGB do not exist, and publication removes a stale
+  `fiberlets.mtl`. JSON and OBJ use individual atomic replacements; the pair is
+  not transactionally atomic. Timing and worker count are not serialized, so
+  repeated identical runs are byte-identical.
 - A candidate has independent searched, score-valid, and accepted state. A
   score becomes valid only when DP finds a sink path with a finite total;
   feasibility failures never serialize a zero placeholder cost. `paths
   --stats` reports retained anchors, candidate/search/unscored/accepted counts,
-  and min/mean/max for all scored paths and the accepted subset, using `n/a`
-  for an empty population. Until quality filtering exists, every scored path is
-  accepted and the two ranges match.
+  min/mean/max integrated total loss for all scored paths and the accepted
+  subset, and min/mean/max accepted loss density, using `n/a` for an empty
+  population. Until quality filtering exists, every scored path is accepted
+  and the two total-loss ranges match.
 - OBJ output uses one group per accepted fiberlet and one explicit two-index
-  line element per adjacent path edge for compatibility with MeshLab importers.
+  line element per adjacent path edge. Napari is the supported path viewer. It
+  strictly validates OBJ report/group metrics, rejects obsolete material
+  records, crop-filters geometry and properties together, and exposes total
+  loss, density, and relative quality as Shapes features. Quality is mapped
+  over fixed `[0,1]`; a dock selector defaults to a custom red-yellow-green map
+  and offers napari's available colormaps in deterministic order. Selection is
+  display-only. Anchor OBJ parsing remains unchanged.
 - By default, `paths` writes separate `fiber_presence_{xy,xz,yz}` OBJ/MTL/PNG
   bundles. Each OBJ is one base-coordinate textured quad on the lower central
   prediction voxel of the whole-cell-expanded selected region and can be loaded

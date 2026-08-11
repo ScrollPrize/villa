@@ -27,6 +27,13 @@ struct FiberLocalSmoothnessCost {
     [[nodiscard]] float total() const noexcept { return isotropic + normal + tangent; }
 };
 
+[[nodiscard]] float fiberLocalAlignmentLoss(
+    float presence,
+    const cv::Vec3f& previousStepDirection,
+    const cv::Vec3f& candidateStepDirection,
+    const cv::Vec3f& currentPredictionDirection,
+    const cv::Vec3f& candidatePredictionDirection);
+
 [[nodiscard]] FiberLocalSmoothnessCost fiberLocalSmoothnessCost(
     const cv::Vec3f& previousStepDirection, const cv::Vec3f& candidateStepDirection, const cv::Vec3f& normal, bool normalValid, const FiberLocalSmoothnessConfig& config);
 

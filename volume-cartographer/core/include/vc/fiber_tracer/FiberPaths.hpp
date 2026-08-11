@@ -35,8 +35,6 @@ struct FiberletPathConfig {
     double shellHalfWidthCells = 0.5;
     double maximumEndpointAngleDegrees = 45.0;
     double corridorRadiusPredictionVoxels = 0.0;
-    double presenceWeight = 1.0;
-    double directionWeight = 1.0;
     double invalidPredictionCostPerVoxel = 4.0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
@@ -47,8 +45,7 @@ struct FiberletPathConfig {
 
 struct FiberletPathCost {
     double invalidPrediction = 0.0;
-    double presence = 0.0;
-    double direction = 0.0;
+    double alignment = 0.0;
     double isotropicSmoothness = 0.0;
     double tangentSmoothness = 0.0;
     double normalSmoothness = 0.0;
@@ -90,6 +87,21 @@ struct FiberletPathStatistics {
     size_t unscored = 0;
     FiberletScoreStatistics allScores;
     FiberletScoreStatistics acceptedScores;
+    FiberletScoreStatistics acceptedLossDensities;
+};
+
+struct FiberletPathVisualMetric {
+    size_t candidateIndex = 0;
+    double pathLengthPredictionVoxels = 0.0;
+    double totalLoss = 0.0;
+    double lossPerPredictionVoxel = 0.0;
+    double relativeQuality = 0.0;
+};
+
+struct FiberletPathVisualReport {
+    std::vector<FiberletPathVisualMetric> paths;
+    std::optional<double> minimumLossPerPredictionVoxel;
+    std::optional<double> maximumLossPerPredictionVoxel;
 };
 
 struct FiberPresenceSlicePixel {
@@ -177,6 +189,8 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
     const FiberletPathProgressCallback& progressCallback = {});
 
 [[nodiscard]] FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report);
+
+[[nodiscard]] FiberletPathVisualReport fiberletPathVisualMetrics(const FiberletPathReport& report);
 
 [[nodiscard]] FiberAnchorCrop fiberAnchorCellCoverageCrop(const LoadedFiberAnchorArtifact& anchors);
 

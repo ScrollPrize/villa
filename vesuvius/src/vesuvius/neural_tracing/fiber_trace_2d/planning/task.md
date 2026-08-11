@@ -1,22 +1,14 @@
-# Task: preload and parallelize fiberlet DP
+# Task: regular-tracer fiberlet loss and napari colormap selector
 
-Accelerate the experimental C++ `vc_fiberlets paths` stage for current small
-test crops without changing its candidate set, objective, accepted paths, or
-deterministic artifacts.
+Replace the fiberlet DP's simplified additive presence/direction objective with
+the regular native fiber tracer's multiplicative local alignment loss. Keep the
+fiberlet-specific integer graph, edge-length integration, finite invalid-data
+bridges, normal-aware direct smoothness, and the previously agreed omission of
+cumulative-history smoothness.
 
-For now:
-
-1. Load the complete scoring region once before any DP searches. Every stored
-   prediction voxel needed by any accepted candidate corridor must have its
-   fiber direction/presence and Lasagna normal sampled exactly once into an
-   immutable in-memory volume.
-2. Solve independent candidate paths concurrently with the requested fixed
-   worker count. Sampling may use that count during the one preload, but there
-   must be no nested per-candidate sampling/thread teams.
-3. Print monotonic path-search progress from the CLI, including completed and
-   total candidate searches, percentage, elapsed time, processing rate, and ETA.
-   Rate-limit updates while guaranteeing a final completed update.
-
-The complete scoring region may be represented densely because current test
-crops are small. Preserve paths that leave the anchor selection box by using
-the union of actual candidate-corridor bounds, clipped to the prediction grid.
+Remove the mistakenly added napari green/red loss endpoint controls. Add a
+colormap selector for fiberlet quality instead, with red-yellow-green as the
+default and napari's available colormaps as alternatives. Napari is the only
+supported viewer for these experimental path artifacts: remove MTL/material
+colors and let napari own display color. Visualization changes must not modify
+serialized metrics.

@@ -29,34 +29,58 @@ interior cells. Prediction-grid coordinates remain private solver values.
 
 ## Fit
 
-For a voxel direction `d_i`, presence `p_i`, fixed cell-centred Gaussian
-`g_i`, and two unoriented axes `u_0,u_1`, the solver maximizes
+The existing deterministic two-mode non-orthogonal PCA fit supplies initial
+directions. Both anchor positions start at the center of the clipped owned-cell
+voxel range. They are then jointly refined using halo observations.
+
+For a current anchor position `p_k`, direction `u_k`, observation position
+`x_i`, direction `d_i`, and presence `q_i`, its transverse weight is
 
 ```text
-sum_i g_i p_i max_k((d_i dot u_k)^2) / sum_cell_voxels g_i.
+g_ik = exp(-|(I - u_k u_k^T)(x_i - p_k)|^2 / (2 sigma^2)).
 ```
 
-Assignment uses the larger squared dot with a deterministic component-zero
-tie. Each component update is the principal eigenvector of its assigned
-weighted direction dyads. Deterministic multistart assignment/PCA permits the
-two lines to be non-orthogonal. It is not the first two, necessarily
-orthogonal eigenvectors of one covariance matrix.
+The Gaussian is truncated at three sigma. A symmetric finite axial slab is
+measured from the plane through the fixed cell pivot normal to `u_k`. Assignment
+uses the larger positive `q_i (d_i dot u_k)^2` among components whose kernels
+contain the sample; unusable and zero-evidence samples remain unassigned. This
+keeps nearby non-orthogonal modes from being assigned solely by which moving
+Gaussian is closer.
 
-Component support and position use the same `g_i p_i dot^2` mass. The support
-denominator includes all owned cell voxels, including invalid and zero-presence
-samples. Empty, degenerate, and below-threshold components are discarded
-independently; the remaining component is not refitted after rejection. The
-output is therefore zero, one, or two anchors.
+Each direction update is the principal eigenvector of its assigned
+`g_ik q_i d_i d_i^T`. The aligned-evidence centroid is projected onto the plane
+through the cell pivot normal to that updated direction and clamped to the
+local transverse window. The constraint plane rotates as the direction is
+refined, while continuing to pass through the fixed pivot. The next iteration
+recomputes the falloff around the new anchor position.
+
+Only a strict normalized-objective improvement is accepted, with deterministic
+backtracking. Refinement therefore stops at a bounded local response maximum
+instead of migrating across a weak-response valley to a stronger distant
+fiber. Support denominators include all lattice sites in each finite kernel,
+including invalid, zero-presence, and unassigned sites. Empty, degenerate, and
+below-threshold components are discarded independently. The output is zero,
+one, or two anchors per cell before duplicate suppression.
 
 After fitting, two valid components are merged when their unoriented angle is
 at most `--merge-angle-deg` (10 degrees by default) and replacing them with a
 joint PCA loses at most
 `max(--merge-abs-loss, --merge-rel-loss * joint_objective)`. The defaults are
 0.01 absolute and 0.05 relative normalized objective loss. The comparison is
-inclusive. A merge refits support and position from all usable observations;
-the joint anchor can still fail the normal minimum-support check. Exact
+inclusive. A merge refits support, direction, and position through the same
+halo-backed refinement; the joint anchor can still fail the normal
+minimum-support check. Exact
 single-direction cells, where the second fit is empty, are not counted as
 merges.
+
+Finally, local-maximum NMS suppresses cross-cell copies of the same anchor.
+Candidates must agree in unoriented direction and be within both the transverse
+window and half-cell longitudinal limit around their sign-aligned average axis.
+They are ranked by support, coherence, then stable cell/component identity.
+NMS compares every candidate with the original candidate set, preserving
+crossings and longitudinally separated anchors. Crops evaluate only the exact
+external cells that can directly suppress a selected anchor; those context
+cells are not written to the output.
 
 ## Command
 
@@ -66,10 +90,14 @@ volume-cartographer/build/bin/vc_fiberlets anchors \
   --crop 13568,20224,18112,256,256,256
 ```
 
-Cell size is restricted to 2 through 8 stored prediction voxels. If omitted,
-Gaussian sigma is half the selected cell size. The presence floor and aligned
-support threshold are inclusive. `--base-voxel-size-um` adds optional physical
-reporting metadata but never changes the solve.
+Cell size is restricted to 2 through 8 stored prediction voxels. `--falloff`
+sets the transverse Gaussian sigma in base voxels and defaults to half the cell
+side. `--window` sets the transverse refinement/NMS radius in base voxels and
+defaults to one cell side. The axial slab defaults to 1.5 cell sides, the NMS
+longitudinal limit to half a cell side, and the NMS angle to the merge angle.
+The presence floor and aligned support threshold are inclusive.
+`--base-voxel-size-um` adds optional physical reporting metadata but never
+changes the solve.
 
 `--crop` is the half-open base-volume box `X,Y,Z,W,H,D`. Because stored
 prediction indices are point centres, both boundaries map with
@@ -77,8 +105,8 @@ prediction indices are point centres, both boundaries map with
 boundaries. The resulting interval selects complete global anchor cells. A crop
 outside the prediction grid or containing no stored prediction sample fails.
 
-The command prints prediction/base scale, cell side and diagonal in base
-voxels, counts, and elapsed time. It writes:
+The command prints prediction/base scale, cell side, falloff, window, cell
+diagonal, retained/NMS counts, and elapsed time. It writes:
 
 - `anchors.json`: versioned machine input for later fiberlet stages. It stores
   a credential-free manifest locator and content hash, coordinate contract,
@@ -92,12 +120,15 @@ sorting. They are visualization layers, not global H/V or winding classes, and
 none of the OBJ files is an input to later stages.
 
 All artifacts use same-directory temporary files followed by atomic replacement.
-Timing and worker count are not stored because they are operational values;
-identical inputs and numerical parameters produce byte-identical artifacts
-across worker counts.
+Timing, worker count, and processing-block size are not stored because they are
+operational values; identical inputs and numerical parameters produce
+byte-identical artifacts across worker counts and block sizes.
 
-Anchor artifacts are experimental and parsed strictly. Regenerate an older
-`anchors.json` that lacks the current merge parameters and diagnostics.
+Anchor artifacts are experimental and parsed strictly. They include every
+effective refinement/NMS parameter, per-anchor refinement score/iteration
+fields, and aggregate suppression diagnostics. Retained positions must satisfy
+the prediction-grid, rotating pivot-plane, and local-window invariants.
+Regenerate an older `anchors.json`; no repair or compatibility path exists.
 
 ## Calibration
 
@@ -169,32 +200,72 @@ cubic-Hermite reference bounds the corridor, and 26-neighbour moves must have
 strictly positive chord progress. DP state retains the incoming move, allowing
 one-step curvature without a cumulative history state.
 
-At each valid prediction voxel, the best direction available in the discrete
-forward stencil has zero direction penalty. Other directions pay squared angle
-excess above that local quantization floor. Low presence and direction costs
-are integrated by edge length. Curvature uses the native tracer's shared
+Valid-data scoring uses the regular native tracer's multiplicative local
+alignment loss. It multiplies presence by six positive-clamped dots among the
+incoming and outgoing steps and the sign-aligned current and next prediction
+axes, then charges `1-score`. This jointly penalizes trajectory turns,
+prediction discontinuities, and trajectory/prediction disagreement. The DP
+multiplies that loss by lattice-edge length so axial and diagonal integration
+remain comparable. There is no separate presence/direction weight or local
+direction quantization floor.
+
+Source and sink virtual edges use the fitted endpoint axes as their endpoint
+predictions; sink presence is one. Curvature uses the native tracer's shared
 Lasagna-normal tangent-plane/normal-tilt split, with isotropic fallback for an
-invalid normal. Invalid fiber predictions have a finite default cost of 4 per
-prediction voxel, allowing short gaps to be bridged.
+invalid normal. Its 45-degree free angle remains the integer-lattice adaptation.
+Cumulative history smoothness remains excluded from the DP state. Invalid
+destination predictions pay only the finite default cost of 4 per prediction
+voxel plus curvature, allowing short gaps to be bridged. On leaving a gap, the
+incoming step substitutes for the unavailable current prediction.
 
 The command writes:
 
 - `fiberlets.json`: every shell pair, rejection/failure reason, objective
-  breakdown, and successful base-coordinate polyline.
-- `fiberlets.obj`: one named successful polyline per group in base coordinates.
+  breakdown, and successful base-coordinate polyline, plus per-successful-path
+  length and loss/quality visualization metadata.
+- `fiberlets.obj`: one named successful polyline per group in base coordinates,
+  with strict loss-density and relative-quality comments for napari.
 - `fiber_presence_xy.{obj,mtl,png}`, `fiber_presence_xz.{obj,mtl,png}`, and
   `fiber_presence_yz.{obj,mtl,png}`: three independently loadable textured
   quads through the center of the complete selected anchor-cell region. Each
   grayscale PNG contains one pixel per stored prediction voxel; black is zero
   presence and white is one.
 
-Load `fiberlets.obj` and any of the three slice OBJ files as separate MeshLab
-layers to view or hide each prediction plane independently. Each OBJ references
-only its matching MTL and PNG by basename. For an even crop extent, the lower
-of the two central prediction voxels is selected deterministically. The quad
+The central slice OBJ bundles remain standalone diagnostic artifacts; napari
+loads the dense presence Zarr directly and does not consume them. Each slice
+OBJ references only its matching MTL and PNG by basename. For an even crop
+extent, the lower of the two central prediction voxels is selected
+deterministically. The quad
 lies on that voxel center and extends half a prediction voxel beyond the first
 and last texture samples along both varying axes. Slices use presence directly
 and remain defined where a decoded fiber direction is invalid.
+
+Fiberlet quality compares loss per traced prediction voxel, not raw integrated
+loss, so a longer trace is not automatically shown as worse. For successful
+path `j`:
+
+```text
+density_j = total_loss_j / polyline_length_in_prediction_voxels
+quality_j = (maximum_density - density_j) /
+            (maximum_density - minimum_density)
+```
+
+The normalization population is all successful scored paths in that artifact.
+Equal densities all receive quality one. Quality is therefore relative to the
+current output, not model confidence and not an acceptance threshold. The OBJ
+comments and JSON retain raw total, density, bounds, formula, and quality;
+display color is selected in napari. Smoothness terms remain part of total loss
+even though their existing per-turn integration differs from the edge-
+integrated alignment term.
+
+This density is useful for ranking paths generated with the same parameters,
+but it is not a calibrated correctness score. Its components have configured
+weights and different integration rules, and it changes with prediction and
+normal availability, lattice discretization, and the search corridor. The
+artifact-relative min-max quality is additionally sensitive to outliers and to
+which other paths happen to be present, so values and colors are not directly
+comparable across runs. Since every feasible path is currently accepted, a
+high displayed quality does not establish that a fiberlet is correct.
 
 For interactive 3D inspection of the dense presence prediction, the napari
 viewer accepts either the OME-Zarr pyramid root or a specific array level and a
@@ -216,11 +287,15 @@ OME-Zarr v2 stores only. Install the `vesuvius[gui]` optional dependencies to
 run it. The optional anchor and path OBJs are parsed as the line-only artifacts
 written by `vc_fiberlets`, converted from base XYZ to napari ZYX, filtered by
 group bounding-box intersection with the crop, and added as independently
-toggleable line layers. A docked clip control provides six base-coordinate
+toggleable line layers. Fiberlet paths expose `trace_loss_total`,
+`loss_per_prediction_voxel`, and `relative_quality` as per-shape features. A
+`Path colormap` selector maps quality over fixed `[0,1]`; it defaults to red-
+yellow-green and offers napari's available colormaps. Changing it affects only
+display state. The same dock provides six base-coordinate
 sliders and numeric inputs, one for each minimum and maximum crop-box face. The
 resulting six GPU clipping planes are always applied to the presence volume,
-anchors, and paths without changing or reloading the underlying Zarr crop. The
-same panel provides runtime anchor and path width controls; slider changes are
+anchors, and paths without changing or reloading the underlying Zarr crop. It
+also provides runtime anchor and path width controls; slider changes are
 applied on release because changing shape width retriangulates the line meshes.
 
 Slice output is enabled by default for crop inspection. Use `--no-slices` for
@@ -229,17 +304,24 @@ the output directory. The default export rejects more than one million total
 texture pixels instead of producing unexpectedly large files.
 
 `--stats` prints retained anchors, candidate pairs, pre-DP rejections,
-searched-but-unscored failures, scored paths, accepted fiberlets, and
-min/mean/max total objective scores for all scored and accepted paths. Rejected
+searched-but-unscored failures, scored paths, accepted fiberlets,
+min/mean/max integrated total loss for all scored and accepted paths, and
+min/mean/max accepted loss per prediction voxel. Rejected
 endpoint pairs and failed searches have no path score and are counted as
 unscored, never as zero. Empty score ranges print `n/a`. There is currently no
 quality cutoff, so every scored path is accepted and the two score ranges are
 expected to match. It also reports whether slice output is enabled and the
 number of emitted slice pixels.
 
-For MeshLab compatibility, each fiberlet OBJ group writes every adjacent path
-edge as an explicit two-vertex `l a b` element. It does not rely on support for
-multi-index OBJ polyline records.
+Each fiberlet OBJ group writes every adjacent path edge as an explicit two-
+vertex `l a b` element. Path MTL/material output is not supported; rewriting an
+output directory deletes a stale `fiberlets.mtl`. JSON and OBJ replacements are
+individually atomic, but the pair is not transactional.
+
+Fiberlet path visualization artifacts are experimental and parsed strictly by
+the napari viewer. Regenerate older `fiberlets.obj` output that lacks the
+quality report comments or per-group metrics; there is no repair or
+compatibility path. Obsolete `mtllib` or `usemtl` records are rejected.
 
 This is an overcomplete diagnostic collection. There is no path-quality cutoff,
 degree selection, overlap deduplication, extension, H/V or winding assignment,

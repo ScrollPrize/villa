@@ -6,6 +6,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -65,8 +66,8 @@ public:
 vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
     cv::Vec3d firstAxis = {1.0, 0.0, 0.0},
     cv::Vec3d secondAxis = {1.0, 0.0, 0.0},
-    cv::Vec3d firstPosition = {2.25, 4.25, 4.25},
-    cv::Vec3d secondPosition = {10.25, 4.25, 4.25})
+    cv::Vec3d firstPosition = {2.5, 4.5, 4.5},
+    cv::Vec3d secondPosition = {10.5, 4.5, 4.5})
 {
     vc::fiber_tracer::LoadedFiberAnchorArtifact artifact;
     artifact.artifact.sourceLocator = "/tmp/fiber.lasagna.json";
@@ -74,6 +75,9 @@ vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
     artifact.report.grid = {{16, 16, 16}, 2.0};
     artifact.report.config.cellSizePredictionVoxels = 2;
     artifact.report.config.gaussianSigmaPredictionVoxels = 1.0;
+    artifact.report.config.localWindowRadiusPredictionVoxels = 2.0;
+    artifact.report.config.axialSupportHalfWidthPredictionVoxels = 3.0;
+    artifact.report.config.nmsLongitudinalRadiusPredictionVoxels = 1.0;
     artifact.report.config.observationPresenceFloor = 0.05;
     artifact.report.config.minimumAlignedSupport = 0.05;
     artifact.report.config.parallelThreads = 1;
@@ -90,10 +94,12 @@ vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
         cell.components[0].anchor.axisXYZ = std::get<2>(entry);
         cell.components[0].anchor.alignedSupport = 1.0;
         cell.components[0].anchor.directionalCoherence = 1.0;
+        cell.components[0].anchor.refinementScore = 1.0;
         cell.components[1].rejectionReason = "empty";
         artifact.report.nonEmptyCells.push_back(cell);
     }
-    artifact.report.diagnostics.totalCells = 2;
+    artifact.report.diagnostics.totalCells = 512;
+    artifact.report.diagnostics.zeroAnchorCells = 510;
     artifact.report.diagnostics.oneAnchorCells = 2;
     artifact.report.selectedCrop = {{0, 0, 0}, {16, 16, 16}};
     artifact.report.selectedCellBeginZYX = {0, 0, 0};
@@ -112,7 +118,8 @@ vc::fiber_tracer::LoadedFiberAnchorArtifact twoPathArtifact()
         cell.components[0].anchor.positionPredictionXYZ[1] += 8.0;
         artifact.report.nonEmptyCells.push_back(std::move(cell));
     }
-    artifact.report.diagnostics.totalCells = 4;
+    artifact.report.diagnostics.totalCells = 512;
+    artifact.report.diagnostics.zeroAnchorCells = 508;
     artifact.report.diagnostics.oneAnchorCells = 4;
     return artifact;
 }
@@ -188,6 +195,27 @@ TEST_CASE("fiber local smoothness preserves native split equations")
     CHECK(vc::fiber_tracer::fiberLocalSmoothnessCost({1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {}, false, free).total() == doctest::Approx(0.0f));
 }
 
+TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")
+{
+    using vc::fiber_tracer::fiberLocalAlignmentLoss;
+    const cv::Vec3f x{1.0f, 0.0f, 0.0f};
+    const cv::Vec3f y{0.0f, 1.0f, 0.0f};
+    CHECK(fiberLocalAlignmentLoss(1.0f, x, x, x, x) == 0.0f);
+    CHECK(fiberLocalAlignmentLoss(0.25f, x, x, x, x) == 0.75f);
+    CHECK(fiberLocalAlignmentLoss(1.0f, x, x, x, y) == 1.0f);
+    const float invSqrt2 = static_cast<float>(std::sqrt(0.5));
+    const cv::Vec3f diagonal{invSqrt2, invSqrt2, 0.0f};
+    float score = 0.5f;
+    score *= x.dot(diagonal);
+    score *= x.dot(x);
+    score *= x.dot(diagonal);
+    score *= x.dot(diagonal);
+    score *= x.dot(diagonal);
+    score *= diagonal.dot(diagonal);
+    CHECK(fiberLocalAlignmentLoss(0.5f, x, diagonal, x, diagonal) ==
+        1.0f - score);
+}
+
 TEST_CASE("fiberlet radius-four shell is symmetric and not axis-only")
 {
     const auto offsets = vc::fiber_tracer::fiberletCellShellOffsets(4, 0.5);
@@ -227,7 +255,7 @@ TEST_CASE("fiberlet DP emits exact endpoints and integer monotone interior")
         CHECK(point[2] == std::round(point[2]));
         CHECK(point[0] > path.pointsPredictionXYZ[index - 1][0]);
     }
-    CHECK(path.cost.direction == doctest::Approx(0.0).epsilon(1.0e-10));
+    CHECK(path.cost.alignment >= 0.0);
     REQUIRE(progress.size() == 1);
     CHECK(progress.back().completed == 1);
     CHECK(progress.back().total == 1);
@@ -299,6 +327,8 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     artifact.anchorArtifactLocator = "/tmp/anchors.json";
     artifact.anchorArtifactContentHash = "fnv1a64:3333333333333333";
     CHECK(vc::fiber_tracer::fiberletPathReportJson(serial, artifact).dump() == vc::fiber_tracer::fiberletPathReportJson(parallel, artifact).dump());
+    CHECK(vc::fiber_tracer::fiberletPathReportObj(serial) ==
+        vc::fiber_tracer::fiberletPathReportObj(parallel));
 }
 
 TEST_CASE("fiberlet pairing rejects an incompatible unoriented endpoint axis")
@@ -344,7 +374,13 @@ TEST_CASE("fiberlet progress callback failures are rethrown after search")
 
 TEST_CASE("fiberlet invalid prediction slabs remain finite bridge costs")
 {
-    const auto anchors = twoAnchorArtifact();
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {2.0, 4.0, 4.0},
+        {10.0, 4.0, 4.0});
+    auto config = pathConfig();
+    config.corridorRadiusPredictionVoxels = 0.01;
     const ConstantNormalSampler normals;
     const auto sampler = [](const auto& indices, int, auto& samples) {
         samples.clear();
@@ -353,10 +389,78 @@ TEST_CASE("fiberlet invalid prediction slabs remain finite bridge costs")
             samples.push_back({{1.0, 0.0, 0.0}, 1.0, !invalid});
         }
     };
-    const auto report = vc::fiber_tracer::traceFiberletPaths(anchors, anchors.report.grid, pathConfig(), sampler, normals);
+    const auto report = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, config, sampler, normals);
     REQUIRE_MESSAGE(report.diagnostics.successfulPaths == 1, report.candidates[0].reason);
-    CHECK(report.candidates[0].cost.invalidPrediction > 0.0);
-    CHECK(std::isfinite(report.candidates[0].cost.total()));
+    CHECK(report.candidates[0].cost.invalidPrediction == 4.0);
+    CHECK(report.candidates[0].cost.alignment == 0.0);
+    CHECK(report.candidates[0].cost.isotropicSmoothness == 0.0);
+    CHECK(report.candidates[0].cost.tangentSmoothness == 0.0);
+    CHECK(report.candidates[0].cost.normalSmoothness == 0.0);
+    CHECK(report.candidates[0].cost.total() == 4.0);
+}
+
+TEST_CASE("fiberlet DP uses multiplicative presence and unoriented predictions")
+{
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {2.0, 4.0, 4.0},
+        {10.0, 4.0, 4.0});
+    auto config = pathConfig();
+    config.corridorRadiusPredictionVoxels = 0.01;
+    const ConstantNormalSampler normals;
+    const auto report = vc::fiber_tracer::traceFiberletPaths(
+        anchors,
+        anchors.report.grid,
+        config,
+        constantPredictions({-1.0, 0.0, 0.0}, 0.5),
+        normals);
+
+    REQUIRE_MESSAGE(report.diagnostics.successfulPaths == 1, report.candidates[0].reason);
+    CHECK(report.candidates[0].cost.invalidPrediction == 0.0);
+    CHECK(report.candidates[0].cost.alignment == 3.5);
+    CHECK(report.candidates[0].cost.total() == 3.5);
+}
+
+TEST_CASE("fiberlet multiplicative alignment changes the selected route")
+{
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {2.0, 4.0, 4.0},
+        {10.0, 4.0, 4.0});
+    const float invSqrt2 = static_cast<float>(std::sqrt(0.5));
+    const auto sampler = [=](const auto& indices, int, auto& samples) {
+        samples.clear();
+        for (const auto& zyx : indices) {
+            const size_t y = zyx[1];
+            const size_t x = zyx[2];
+            cv::Vec3d direction{0.0, 1.0, 0.0};
+            if (y == 5) {
+                if (x == 3)
+                    direction = {invSqrt2, invSqrt2, 0.0};
+                else
+                    direction = {1.0, 0.0, 0.0};
+            }
+            samples.push_back({direction, 1.0, true});
+        }
+    };
+    const ConstantNormalSampler normals;
+    auto narrowConfig = pathConfig();
+    narrowConfig.corridorRadiusPredictionVoxels = 0.01;
+    const auto narrow = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, narrowConfig, sampler, normals);
+    const auto wide = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, pathConfig(), sampler, normals);
+
+    REQUIRE(narrow.diagnostics.successfulPaths == 1);
+    REQUIRE(wide.diagnostics.successfulPaths == 1);
+    CHECK(wide.candidates[0].cost.total() < narrow.candidates[0].cost.total());
+    CHECK(std::any_of(
+        wide.candidates[0].pointsPredictionXYZ.begin(),
+        wide.candidates[0].pointsPredictionXYZ.end(),
+        [](const cv::Vec3d& point) { return point[1] == 5.0; }));
 }
 
 TEST_CASE("fiberlet narrow disconnected corridor reports no path")
@@ -392,15 +496,126 @@ TEST_CASE("fiberlet path JSON and OBJ are deterministic and scaled")
     CHECK_FALSE(json.at("parameters").contains("corridor_radius_prediction_voxels"));
     const auto& candidate = json.at("candidates").at(0);
     CHECK(candidate.at("score_valid") == true);
-    CHECK(candidate.at("start_position_base_xyz") == nlohmann::json::array({4.5, 8.5, 8.5}));
+    CHECK(candidate.at("start_position_base_xyz") == nlohmann::json::array({5.0, 9.0, 9.0}));
     CHECK(candidate.contains("points_base_xyz"));
     CHECK_FALSE(candidate.contains("points_prediction_xyz"));
+    CHECK(candidate.at("path_length_base_voxels").get<double>() > 0.0);
+    CHECK(candidate.at("loss_per_prediction_voxel").get<double>() >= 0.0);
+    CHECK(candidate.at("relative_visual_quality") == 1.0);
+    CHECK_FALSE(candidate.contains("visual_color_rgb"));
+    CHECK_FALSE(candidate.contains("visual_material"));
+    CHECK(candidate.at("cost").contains("alignment"));
+    CHECK_FALSE(candidate.at("cost").contains("presence"));
+    CHECK_FALSE(candidate.at("cost").contains("direction"));
+    CHECK(json.at("trace_quality_visualization").at("count") == 1);
+    CHECK_FALSE(json.at("trace_quality_visualization").contains("color_ramp"));
     const std::string obj = vc::fiber_tracer::fiberletPathReportObj(first);
+    CHECK(obj == vc::fiber_tracer::fiberletPathReportObj(second));
+    CHECK(obj.find("mtllib") == std::string::npos);
+    CHECK(obj.find("# trace_quality_count 1") != std::string::npos);
+    CHECK(obj.find("# trace_loss_per_prediction_voxel ") != std::string::npos);
+    CHECK(obj.find("usemtl") == std::string::npos);
     CHECK(obj.find("g fiberlet_2_2_1_0__2_2_5_0") != std::string::npos);
-    CHECK(obj.find("v 4.5 8.5 8.5") != std::string::npos);
+    CHECK(obj.find("v 5 9 9") != std::string::npos);
     CHECK(obj.find("\nl ") != std::string::npos);
     REQUIRE(first.candidates.size() == 1);
     CHECK(occurrenceCount(obj, "\nl ") == first.candidates[0].pointsPredictionXYZ.size() - 1);
+
+    const auto directory = temporaryDirectory("quality_artifacts");
+    {
+        std::ofstream stale(directory / "fiberlets.mtl");
+        stale << "obsolete material artifact\n";
+    }
+    vc::fiber_tracer::writeFiberletPathArtifacts(directory, first, artifact);
+    CHECK(readText(directory / "fiberlets.json") == json.dump(2) + "\n");
+    CHECK(readText(directory / "fiberlets.obj") == obj);
+    CHECK_FALSE(std::filesystem::exists(directory / "fiberlets.mtl"));
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("fiberlet relative visual quality normalizes loss density")
+{
+    vc::fiber_tracer::FiberletPathReport report;
+    report.grid = {{16, 16, 16}, 2.0};
+    for (size_t index = 0; index < 3; ++index) {
+        vc::fiber_tracer::FiberletCandidateResult candidate;
+        candidate.start.cellZYX = {0, 0, index};
+        candidate.target.cellZYX = {0, 1, index};
+        candidate.searched = true;
+        candidate.scoreValid = true;
+        candidate.success = true;
+        candidate.reason = "success";
+        candidate.pointsPredictionXYZ = {
+            {0.0, static_cast<double>(index), 0.0},
+            {2.0, static_cast<double>(index), 0.0},
+        };
+        candidate.cost.alignment = 2.0 * static_cast<double>(index + 1);
+        report.candidates.push_back(candidate);
+    }
+    const auto visual = vc::fiber_tracer::fiberletPathVisualMetrics(report);
+    REQUIRE(visual.paths.size() == 3);
+    CHECK(visual.minimumLossPerPredictionVoxel == 1.0);
+    CHECK(visual.maximumLossPerPredictionVoxel == 3.0);
+    CHECK(visual.paths[0].relativeQuality == 1.0);
+    CHECK(visual.paths[1].relativeQuality == 0.5);
+    CHECK(visual.paths[2].relativeQuality == 0.0);
+}
+
+TEST_CASE("fiberlet equal-density and empty visual reports are deterministic")
+{
+    vc::fiber_tracer::FiberletPathReport equal;
+    equal.grid = {{8, 8, 8}, 1.0};
+    for (size_t index = 0; index < 2; ++index) {
+        vc::fiber_tracer::FiberletCandidateResult candidate;
+        candidate.start.cellZYX = {0, 0, index};
+        candidate.target.cellZYX = {0, 1, index};
+        candidate.scoreValid = true;
+        candidate.success = true;
+        candidate.pointsPredictionXYZ = {{0.0, 0.0, 0.0}, {1.0 + index, 0.0, 0.0}};
+        candidate.cost.alignment = 1.0 + index;
+        equal.candidates.push_back(candidate);
+    }
+    const auto equalVisual = vc::fiber_tracer::fiberletPathVisualMetrics(equal);
+    REQUIRE(equalVisual.paths.size() == 2);
+    CHECK(equalVisual.paths[0].relativeQuality == 1.0);
+    CHECK(equalVisual.paths[1].relativeQuality == 1.0);
+
+    vc::fiber_tracer::FiberletPathReport empty;
+    empty.grid = {{1, 1, 1}, 1.0};
+    const auto emptyVisual = vc::fiber_tracer::fiberletPathVisualMetrics(empty);
+    CHECK(emptyVisual.paths.empty());
+    CHECK_FALSE(emptyVisual.minimumLossPerPredictionVoxel.has_value());
+    CHECK(vc::fiber_tracer::fiberletPathReportObj(empty).find(
+              "# trace_loss_density_min none") != std::string::npos);
+}
+
+TEST_CASE("fiberlet visual metrics reject invalid geometry loss and identifiers")
+{
+    vc::fiber_tracer::FiberletPathReport report;
+    report.grid = {{8, 8, 8}, 1.0};
+    vc::fiber_tracer::FiberletCandidateResult candidate;
+    candidate.start.cellZYX = {0, 0, 0};
+    candidate.target.cellZYX = {0, 0, 1};
+    candidate.scoreValid = true;
+    candidate.success = true;
+    candidate.pointsPredictionXYZ = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
+    candidate.cost.alignment = 1.0;
+    report.candidates.push_back(candidate);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::fiberletPathVisualMetrics(report),
+        doctest::Contains("non-positive path length"), std::runtime_error);
+
+    report.candidates[0].pointsPredictionXYZ[1] = {2.0, 1.0, 1.0};
+    report.candidates[0].cost.alignment = -1.0;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::fiberletPathVisualMetrics(report),
+        doctest::Contains("component loss"), std::runtime_error);
+
+    report.candidates[0].cost.alignment = 1.0;
+    report.candidates.push_back(report.candidates[0]);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::fiberletPathVisualMetrics(report),
+        doctest::Contains("duplicate path identifier"), std::runtime_error);
 }
 
 TEST_CASE("fiberlet statistics separate unscored scored and accepted candidates")
@@ -411,11 +626,14 @@ TEST_CASE("fiberlet statistics separate unscored scored and accepted candidates"
     report.candidates[1].searched = true;
     report.candidates[2].searched = true;
     report.candidates[2].scoreValid = true;
-    report.candidates[2].cost.presence = 3.0;
+    report.candidates[2].cost.alignment = 3.0;
     report.candidates[3].searched = true;
     report.candidates[3].scoreValid = true;
     report.candidates[3].success = true;
-    report.candidates[3].cost.presence = 1.0;
+    report.candidates[3].cost.alignment = 1.0;
+    report.candidates[3].pointsPredictionXYZ = {
+        {0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}};
+    report.grid = {{4, 4, 4}, 1.0};
 
     const auto statistics = vc::fiber_tracer::fiberletPathStatistics(report);
     CHECK(statistics.anchors == 7);
@@ -432,8 +650,13 @@ TEST_CASE("fiberlet statistics separate unscored scored and accepted candidates"
     CHECK(statistics.acceptedScores.minimum == 1.0);
     CHECK(statistics.acceptedScores.mean == 1.0);
     CHECK(statistics.acceptedScores.maximum == 1.0);
+    CHECK(statistics.acceptedLossDensities.minimum == 0.5);
+    CHECK(statistics.acceptedLossDensities.mean == 0.5);
+    CHECK(statistics.acceptedLossDensities.maximum == 0.5);
 
-    const auto empty = vc::fiber_tracer::fiberletPathStatistics({});
+    vc::fiber_tracer::FiberletPathReport emptyReport;
+    emptyReport.grid = {{1, 1, 1}, 1.0};
+    const auto empty = vc::fiber_tracer::fiberletPathStatistics(emptyReport);
     CHECK(empty.allScores.count == 0);
     CHECK_FALSE(empty.allScores.minimum.has_value());
     CHECK_FALSE(empty.allScores.mean.has_value());
@@ -589,6 +812,38 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     {
         std::ofstream output(path);
         output << missingMergeParameter.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto missingRefinementParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingRefinementParameter["parameters"].erase("gaussian_cutoff_sigmas");
+    {
+        std::ofstream output(path);
+        output << missingRefinementParameter.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto missingRefinementValue = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingRefinementValue["cells"][0]["components"][0].erase("refinement_score");
+    {
+        std::ofstream output(path);
+        output << missingRefinementValue.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto offPlane = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    offPlane["cells"][0]["components"][0]["position_base_xyz"][0] = 5.5;
+    {
+        std::ofstream output(path);
+        output << offPlane.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("rotating-plane window"), std::runtime_error);
+
+    auto missingNmsDiagnostic = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingNmsDiagnostic["diagnostics"].erase("nms_suppressed_components");
+    {
+        std::ofstream output(path);
+        output << missingNmsDiagnostic.dump(2);
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 

@@ -1,17 +1,33 @@
+# 2026-08-11: fiber-centered anchor refinement
+
+- Replaced fixed cell-centroid anchor positions with bounded halo-backed joint
+  direction/position refinement on a rotating plane through each cell pivot.
+- Added deterministic direction-compatible local-maximum NMS across cells,
+  exact crop-boundary context, strict refinement metadata, and focused
+  convergence, locality, determinism, and artifact validation.
+
+# 2026-08-11: fiberlet loss/quality visualization
+
+- Added length-normalized per-fiberlet trace loss, report-relative visual
+  quality, strict napari metric parsing, per-shape features, a runtime napari
+  colormap selector, and density CLI statistics. Path MTL/material output was
+  removed in favor of napari-owned display color.
+
 # 2026-08-10: integer-DP fiberlet paths
 
 - Added strict anchor-artifact loading, radius-four cell-shell pairing, and
   deterministic integer prediction-voxel DP with exact virtual endpoints.
-- Added quantization-relative direction and edge-length presence costs, finite
-  invalid-prediction bridges, and shared native Lasagna-aware direct curvature.
+- Added the native tracer's shared multiplicative local alignment loss with
+  lattice-edge integration, finite invalid-prediction bridges, and shared
+  native Lasagna-aware direct curvature.
 - Added `vc_fiberlets paths`, versioned JSON/OBJ output, focused regression
   tests, and real-crop deterministic validation. Global graph construction,
   deduplication, extension, and H/V/winding assignment remain deferred.
 - Made base-volume coordinates the only spatial contract exposed by the
   unshipped fiberlet CLI and JSON/OBJ artifacts; no compatibility aliases or
   legacy coordinate fields are retained.
-- Added `paths --stats`, explicit score-presence semantics, and
-  MeshLab-compatible two-index OBJ path edges.
+- Added `paths --stats`, explicit score-presence semantics, and two-index OBJ
+  path edges.
 - Added independently loadable central XY/XZ/YZ fiber-presence textured-quad
   OBJ/MTL/PNG context, with direct presence sampling and `--no-slices` opt-out.
 - Materialized each small crop's fiber/normal scoring volume once and moved

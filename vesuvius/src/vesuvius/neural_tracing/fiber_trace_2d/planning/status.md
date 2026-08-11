@@ -1,15 +1,9 @@
-# Status: preload and parallelize fiberlet DP
+# Status: regular-tracer fiberlet loss and napari colormap selector
 
-- [x] Capture task and exact-output constraints.
-- [x] Inspect candidate generation, sampling, corridor, and DP threading.
-- [x] Record a Release reference baseline.
-- [x] Draft implementation, testing, specification, and documentation plan.
+- [x] Compare the regular tracer and fiberlet DP objectives.
+- [x] Draft the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Implement one-time dense scoring preload.
-- [x] Implement deterministic candidate-level worker pool.
-- [x] Add focused regression tests.
-- [x] Update specs, docs, changelog, and task log.
-- [x] Build and run focused tests.
-- [x] Benchmark one-thread and default-thread reference runs.
-- [x] Add monotonic path progress and ETA output.
-- [x] Test progress and rerun focused validation.
+- [x] Extract and adopt shared multiplicative alignment scoring.
+- [x] Replace the mistaken endpoint controls with a colormap selector.
+- [x] Update tests, strict artifacts, specs, docs, and changelog.
+- [x] Build and run focused validation.

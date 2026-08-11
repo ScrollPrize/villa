@@ -37,12 +37,38 @@ class CropSelection:
 class LineObjGeometry:
     paths_zyx: list[np.ndarray]
     total_groups: int
+    trace_loss_total: list[float]
+    loss_per_prediction_voxel: list[float]
+    relative_quality: list[float]
 
 
 _LINE_OBJ_HEADERS = {
     "anchors": "# vc_fiberlet_anchors version 1",
     "paths": "# vc_fiberlets version 1",
 }
+
+
+_FIBERLET_QUALITY_COLORMAP = "red-yellow-green"
+
+
+def fiberlet_quality_colormap_spec() -> tuple[str, np.ndarray, np.ndarray]:
+    """Return the default quality colormap without importing napari."""
+    return (
+        _FIBERLET_QUALITY_COLORMAP,
+        np.asarray(
+            [[1.0, 0.0, 0.0, 1.0], [1.0, 1.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]],
+            dtype=np.float32,
+        ),
+        np.asarray([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+
+
+def fiberlet_colormap_names(available: Sequence[str]) -> tuple[str, ...]:
+    """Put the custom quality ramp first and sort unique napari names."""
+    return (
+        _FIBERLET_QUALITY_COLORMAP,
+        *sorted(set(available) - {_FIBERLET_QUALITY_COLORMAP}),
+    )
 
 
 def parse_crop(value: str) -> tuple[int, int, int, int, int, int]:
@@ -87,13 +113,21 @@ def read_line_obj(
 
     obj_path = Path(path).expanduser()
     expected_header = _LINE_OBJ_HEADERS[kind]
+    paths_have_quality = kind == "paths"
     paths_zyx: list[np.ndarray] = []
+    trace_loss_total: list[float] = []
+    loss_per_prediction_voxel: list[float] = []
+    relative_quality: list[float] = []
     total_groups = 0
     vertex_count = 0
     group_name: str | None = None
     group_vertices: dict[int, tuple[float, float, float]] = {}
     group_lines: list[list[int]] = []
+    group_metrics: dict[str, float] = {}
     header_seen = False
+    report_metadata: dict[str, str] = {}
+    group_records: list[tuple[np.ndarray, bool, str, float, float, float]] = []
+    group_names: set[str] = set()
 
     def fail(line_number: int, message: str) -> ValueError:
         return ValueError(f"{obj_path}:{line_number}: {message}")
@@ -130,7 +164,44 @@ def read_line_obj(
         if xyz.shape[0] < 2:
             raise fail(line_number, f"group {group_name!r} has fewer than two points")
         path_zyx = xyz[:, ::-1].copy()
-        if _path_intersects_crop(path_zyx, crop_xyzwhd):
+        intersects = _path_intersects_crop(path_zyx, crop_xyzwhd)
+        if paths_have_quality:
+            required_metrics = {
+                "trace_loss_total",
+                "trace_loss_per_prediction_voxel",
+                "trace_quality_relative",
+            }
+            if set(group_metrics) != required_metrics:
+                raise fail(
+                    line_number,
+                    f"group {group_name!r} has incomplete trace-quality metadata",
+                )
+            total = group_metrics["trace_loss_total"]
+            density = group_metrics["trace_loss_per_prediction_voxel"]
+            quality = group_metrics["trace_quality_relative"]
+            if (
+                not math.isfinite(total)
+                or total < 0.0
+                or not math.isfinite(density)
+                or density < 0.0
+                or not math.isfinite(quality)
+                or not 0.0 <= quality <= 1.0
+            ):
+                raise fail(
+                    line_number,
+                    f"group {group_name!r} trace-quality values are invalid",
+                )
+            group_records.append(
+                (
+                    path_zyx,
+                    intersects,
+                    group_name,
+                    total,
+                    density,
+                    quality,
+                )
+            )
+        elif intersects:
             paths_zyx.append(path_zyx)
 
     try:
@@ -140,7 +211,47 @@ def read_line_obj(
                 if not line:
                     continue
                 if line.startswith("#"):
-                    header_seen = header_seen or line == expected_header
+                    if line == expected_header:
+                        if header_seen:
+                            raise fail(line_number, "duplicate OBJ header")
+                        header_seen = True
+                        continue
+                    if not paths_have_quality:
+                        continue
+                    fields = line[1:].strip().split()
+                    if not fields:
+                        continue
+                    key = fields[0]
+                    report_keys = {
+                        "trace_quality_population",
+                        "trace_loss_density_unit",
+                        "trace_quality_formula",
+                        "trace_quality_count",
+                        "trace_loss_density_min",
+                        "trace_loss_density_max",
+                    }
+                    metric_keys = {
+                        "trace_loss_total",
+                        "trace_loss_per_prediction_voxel",
+                        "trace_quality_relative",
+                    }
+                    if key in report_keys:
+                        if group_name is not None or len(fields) != 2:
+                            raise fail(line_number, f"invalid report metadata {key!r}")
+                        if key in report_metadata:
+                            raise fail(line_number, f"duplicate report metadata {key!r}")
+                        report_metadata[key] = fields[1]
+                    elif key in metric_keys:
+                        if group_name is None or len(fields) != 2:
+                            raise fail(line_number, f"invalid group metadata {key!r}")
+                        if key in group_metrics:
+                            raise fail(line_number, f"duplicate group metadata {key!r}")
+                        try:
+                            group_metrics[key] = float(fields[1])
+                        except ValueError as exc:
+                            raise fail(line_number, f"group metadata {key!r} must be numeric") from exc
+                    else:
+                        raise fail(line_number, f"unsupported path OBJ comment {key!r}")
                     continue
 
                 fields = line.split()
@@ -152,8 +263,12 @@ def read_line_obj(
                         )
                     finish_group(line_number)
                     group_name = fields[1]
+                    if group_name in group_names:
+                        raise fail(line_number, f"duplicate group {group_name!r}")
+                    group_names.add(group_name)
                     group_vertices = {}
                     group_lines = []
+                    group_metrics = {}
                 elif record == "v":
                     if group_name is None:
                         raise fail(line_number, "vertex appears before the first group")
@@ -172,10 +287,11 @@ def read_line_obj(
                 elif record == "l":
                     if group_name is None:
                         raise fail(line_number, "line appears before the first group")
-                    if len(fields) < 3:
+                    if len(fields) < 3 or (paths_have_quality and len(fields) != 3):
                         raise fail(
-                            line_number,
-                            "line record must reference at least two vertices",
+                            line_number, "path line record must reference exactly two vertices"
+                            if paths_have_quality
+                            else "line record must reference at least two vertices",
                         )
                     try:
                         indices = [int(value) for value in fields[1:]]
@@ -194,7 +310,81 @@ def read_line_obj(
 
     if not header_seen:
         raise ValueError(f"{obj_path} is not a supported {kind} OBJ")
-    return LineObjGeometry(paths_zyx=paths_zyx, total_groups=total_groups)
+    if paths_have_quality:
+        required_report = {
+            "trace_quality_population",
+            "trace_loss_density_unit",
+            "trace_quality_formula",
+            "trace_quality_count",
+            "trace_loss_density_min",
+            "trace_loss_density_max",
+        }
+        if set(report_metadata) != required_report:
+            raise ValueError(f"{obj_path}: incomplete trace-quality report metadata")
+        expected_values = {
+            "trace_quality_population": "successful_scored_fiberlets",
+            "trace_loss_density_unit": "prediction_voxel",
+            "trace_quality_formula": "inverse_min_max_low_loss_is_one",
+        }
+        for key, expected in expected_values.items():
+            if report_metadata[key] != expected:
+                raise ValueError(f"{obj_path}: unsupported {key} value")
+        try:
+            expected_count = int(report_metadata["trace_quality_count"])
+        except ValueError as exc:
+            raise ValueError(f"{obj_path}: trace_quality_count must be an integer") from exc
+        if expected_count < 0 or expected_count != total_groups:
+            raise ValueError(f"{obj_path}: trace-quality count does not match groups")
+        densities = [record[4] for record in group_records]
+        minimum_text = report_metadata["trace_loss_density_min"]
+        maximum_text = report_metadata["trace_loss_density_max"]
+        if expected_count == 0:
+            if minimum_text != "none" or maximum_text != "none":
+                raise ValueError(f"{obj_path}: empty trace-quality bounds must be none")
+            minimum = maximum = None
+        else:
+            try:
+                minimum = float(minimum_text)
+                maximum = float(maximum_text)
+            except ValueError as exc:
+                raise ValueError(f"{obj_path}: trace-quality bounds must be numeric") from exc
+            if (
+                not math.isfinite(minimum)
+                or not math.isfinite(maximum)
+                or minimum < 0.0
+                or minimum > maximum
+                or min(densities) != minimum
+                or max(densities) != maximum
+            ):
+                raise ValueError(f"{obj_path}: trace-quality bounds do not match groups")
+        for path_zyx, intersects, name, total, density, quality in group_records:
+            expected_quality = (
+                1.0
+                if minimum == maximum
+                else (maximum - density) / (maximum - minimum)
+            )
+            if not math.isclose(quality, expected_quality, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError(f"{obj_path}: group {name!r} quality is inconsistent")
+            if intersects:
+                paths_zyx.append(path_zyx)
+                trace_loss_total.append(total)
+                loss_per_prediction_voxel.append(density)
+                relative_quality.append(quality)
+    lengths = {
+        len(paths_zyx),
+        len(trace_loss_total) if paths_have_quality else len(paths_zyx),
+        len(loss_per_prediction_voxel) if paths_have_quality else len(paths_zyx),
+        len(relative_quality) if paths_have_quality else len(paths_zyx),
+    }
+    if len(lengths) != 1:
+        raise ValueError(f"{obj_path}: cropped fiberlet geometry and metrics are misaligned")
+    return LineObjGeometry(
+        paths_zyx=paths_zyx,
+        total_groups=total_groups,
+        trace_loss_total=trace_loss_total,
+        loss_per_prediction_voxel=loss_per_prediction_voxel,
+        relative_quality=relative_quality,
+    )
 
 
 def clipping_plane_in_layer_data(
@@ -293,9 +483,11 @@ def add_clipping_controls(
     anchors_layer,
     paths_layer,
     crop_xyzwhd: tuple[int, int, int, int, int, int],
+    path_quality_colormaps: dict[str, object] | None = None,
 ) -> None:
     from qtpy.QtCore import Qt
     from qtpy.QtWidgets import (
+        QComboBox,
         QDoubleSpinBox,
         QFormLayout,
         QHBoxLayout,
@@ -355,6 +547,11 @@ def add_clipping_controls(
 
     anchors_width = add_width_control("Anchor width", anchors_layer)
     paths_width = add_width_control("Path width", paths_layer)
+    quality_colormap_combo: QComboBox | None = None
+    if paths_layer is not None and path_quality_colormaps:
+        quality_colormap_combo = QComboBox()
+        quality_colormap_combo.addItems(path_quality_colormaps)
+        form.addRow("Path colormap", quality_colormap_combo)
     reset_button = QPushButton("Reset")
     form.addRow(reset_button)
 
@@ -446,6 +643,13 @@ def add_clipping_controls(
     connect_width_control(anchors_width, anchors_layer)
     connect_width_control(paths_width, paths_layer)
 
+    if quality_colormap_combo is not None and path_quality_colormaps is not None:
+        def quality_colormap_changed(name: str) -> None:
+            paths_layer.edge_colormap = path_quality_colormaps[name]
+            paths_layer.refresh_colors()
+
+        quality_colormap_combo.currentTextChanged.connect(quality_colormap_changed)
+
     def reset_bounds(*_args) -> None:
         nonlocal updating_bounds
         updating_bounds = True
@@ -456,6 +660,8 @@ def add_clipping_controls(
                 spin.setValue(value)
         updating_bounds = False
         update_clipping()
+        if quality_colormap_combo is not None:
+            quality_colormap_combo.setCurrentIndex(0)
 
     reset_button.clicked.connect(reset_bounds)
     update_clipping()
@@ -651,6 +857,8 @@ def launch_viewer(
 ) -> None:
     try:
         import napari
+        from napari.utils import Colormap
+        from napari.utils.colormaps import AVAILABLE_COLORMAPS
     except ImportError as exc:
         raise RuntimeError(
             "napari is not installed; install the vesuvius GUI extra"
@@ -710,12 +918,38 @@ def launch_viewer(
             face_color="transparent",
         )
     paths_layer = None
+    path_quality_colormaps: dict[str, object] | None = None
     if fiberlets is not None and fiberlets.paths_zyx:
+        custom_name, custom_colors, custom_controls = (
+            fiberlet_quality_colormap_spec()
+        )
+        custom_colormap = Colormap(
+            custom_colors,
+            controls=custom_controls,
+            name=custom_name,
+        )
+        path_quality_colormaps = {
+            name: custom_colormap if name == custom_name else name
+            for name in fiberlet_colormap_names(tuple(AVAILABLE_COLORMAPS))
+        }
         paths_layer = viewer.add_shapes(
             fiberlets.paths_zyx,
             shape_type="path",
             name="fiberlet paths",
-            edge_color="magenta",
+            features={
+                "trace_loss_total": np.asarray(
+                    fiberlets.trace_loss_total, dtype=np.float64
+                ),
+                "loss_per_prediction_voxel": np.asarray(
+                    fiberlets.loss_per_prediction_voxel, dtype=np.float64
+                ),
+                "relative_quality": np.asarray(
+                    fiberlets.relative_quality, dtype=np.float64
+                ),
+            },
+            edge_color="relative_quality",
+            edge_colormap=custom_colormap,
+            edge_contrast_limits=(0.0, 1.0),
             edge_width=2,
             face_color="transparent",
         )
@@ -725,6 +959,7 @@ def launch_viewer(
         anchors_layer,
         paths_layer,
         crop_xyzwhd,
+        path_quality_colormaps,
     )
     viewer.reset_view()
     napari.run()
