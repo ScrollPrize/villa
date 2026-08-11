@@ -662,8 +662,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _run = new QPushButton(tr("Run"), runContents);
     _run->setEnabled(false);
     _stop = new QPushButton(tr("Stop after iteration"), runContents); _stop->setEnabled(false);
-    controls->addWidget(_load); controls->addWidget(_iterations); controls->addWidget(_run);
+    // Running is what this row is for. Rebuilding replaces the session the
+    // others act on, and it is rarely the thing to reach for, so it sits at
+    // the far end with the stretch between them.
+    controls->addWidget(new QLabel(tr("Iterations"), runContents));
+    controls->addWidget(_iterations);
+    controls->addWidget(_run);
     controls->addWidget(_stop);
+    controls->addStretch(1);
+    controls->addWidget(_load);
     runLayout->addLayout(controls);
     _checkpointDownloadTimer = new QTimer(this);
     _checkpointDownloadTimer->setInterval(1000);
