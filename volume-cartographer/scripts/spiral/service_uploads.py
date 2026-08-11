@@ -48,7 +48,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Role -> conventional filename for ephemeral PCL uploads, from the
 # declarative fit-input catalog.
 PCL_ROLE_FILES = {
-    role.value: filename for role, filename, _ in PCL_ROLE_CONVENTIONS}
+    role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
 
 
 def _utc_stamp():

@@ -1,7 +1,7 @@
 """The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
-from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS,
+from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS, PclRole,
                          SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
                          fit_input)
 
@@ -75,10 +75,16 @@ def test_patch_inputs_follow_the_disable_switch():
     assert unverified.required({}) is False
 
 
-def test_pcl_role_conventions_carry_discovery_flags():
-    roles = {role.value: (filename, discovered)
-             for role, filename, discovered in PCL_ROLE_CONVENTIONS}
-    assert roles["absolute"] == ("abs_winding.json", True)
-    # Conventional for the headless CLI, but not probed by dataset
-    # resolution (the historical _PCL_ENTRIES omission).
-    assert roles["patch_overlap"] == ("patch-overlap-pcls.json", False)
+def test_every_pcl_role_has_one_conventional_file():
+    roles = {role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
+    # One filename per role, serving both discovery and commit; the set is
+    # exactly the role vocabulary, so no role can be uploaded without a
+    # commit target and none is silently undiscoverable.
+    assert roles == {
+        "absolute": "abs_winding.json",
+        "relative": "relative_windings.json",
+        "same_winding": "same_windings.json",
+        "drawn_control_points": "drawn_control_points.json",
+    }
+    assert set(roles) == {role.value for role in PclRole}
+    assert len(set(roles.values())) == len(roles)

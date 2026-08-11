@@ -139,7 +139,6 @@ def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 class PclRole(str, Enum):
     ABSOLUTE = "absolute"
-    PATCH_OVERLAP = "patch_overlap"
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
     DRAWN_CONTROL_POINTS = "drawn_control_points"
@@ -266,16 +265,18 @@ def fit_input(key: str) -> FitInputSpec | None:
     return _FIT_INPUTS_BY_KEY.get(key)
 
 
-# PCL point-collection inputs: (role, conventional filename, discovered).
-# "discovered" = resolve_dataset_root probes for the file; patch-overlap
-# collections are conventional for the headless CLI but are not advertised
-# by dataset resolution (matching the historical maps).
-PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str, bool], ...] = (
-    (PclRole.ABSOLUTE, "abs_winding.json", True),
-    (PclRole.PATCH_OVERLAP, "patch-overlap-pcls.json", False),
-    (PclRole.RELATIVE, "relative_windings.json", True),
-    (PclRole.SAME_WINDING, "same_windings.json", True),
-    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", True),
+# PCL point-collection inputs: (role, conventional filename). One filename
+# per role serves both directions: dataset resolution probes for it, and
+# committing an uploaded collection of that role merges into it. Every role
+# is discovered by resolve_dataset_root and listed by
+# conventional_input_paths; an absent file is simply skipped at load time
+# (load_point_collection warns and continues), since all of these are
+# optional annotations.
+PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str], ...] = (
+    (PclRole.ABSOLUTE, "abs_winding.json"),
+    (PclRole.RELATIVE, "relative_windings.json"),
+    (PclRole.SAME_WINDING, "same_windings.json"),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json"),
 )
 
 
@@ -451,7 +452,7 @@ _CONVENTIONAL_INPUT_RELATIVES = {
 }
 
 _CONVENTIONAL_PCL_INPUTS = tuple(
-    (filename, role) for role, filename, _ in PCL_ROLE_CONVENTIONS)
+    (filename, role) for role, filename in PCL_ROLE_CONVENTIONS)
 
 
 class ScrollSpecError(ValueError):
@@ -957,9 +958,7 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append(input_spec.key)
 
-    for role, relative, discovered in PCL_ROLE_CONVENTIONS:
-        if not discovered:
-            continue
+    for role, relative in PCL_ROLE_CONVENTIONS:
         candidate = root / relative
         if candidate.is_file() and os.access(candidate, os.R_OK):
             result.pcl_inputs.append({

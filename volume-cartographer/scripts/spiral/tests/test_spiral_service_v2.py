@@ -290,7 +290,7 @@ def _commit_pcl_process(dataset, output, input_id, ready, start, result):
         state = ServiceState()
         _attach_fake_session(state, output, dataset)
         upload_id = _upload_input(
-            state, "pcl", input_id, PCL_FILES, role="patch_overlap")
+            state, "pcl", input_id, PCL_FILES, role="relative")
         state.finalize_upload(upload_id)
         ready.put(input_id)
         if not start.wait(10):
@@ -1812,7 +1812,7 @@ class UploadTests(unittest.TestCase):
             self.state.finalize_upload(upload_id)
         bad_pcl = {"pcl.json": json.dumps({"some": "json"}).encode()}
         upload_id = _upload_input(self.state, "pcl", "bad-pcl", bad_pcl,
-                                  role="patch_overlap")
+                                  role="relative")
         with self.assertRaisesRegex(ApiError, "vc_pointcollections"):
             self.state.finalize_upload(upload_id)
 
@@ -2346,9 +2346,9 @@ class CommitTests(unittest.TestCase):
         self._finalize("fiber", "fiber-9", FIBER_FILES)
         existing = {"vc_pointcollections_json_version": "1",
                     "collections": {"3": {"name": "old", "points": {}}}}
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps(existing))
-        self._finalize("pcl", "pcl-9", PCL_FILES, role="patch_overlap")
+        self._finalize("pcl", "pcl-9", PCL_FILES, role="relative")
         response = self.state.commit_inputs()
         self.assertEqual(sorted(response["committed"]),
                          ["fiber-9", "patch-9", "pcl-9"])
@@ -2356,7 +2356,7 @@ class CommitTests(unittest.TestCase):
         self.assertTrue((self.dataset / "fibers" / "fiber-9.json").is_file())
         merged = json.loads(target.read_text())
         self.assertEqual(len(merged["collections"]), 2)
-        backups = list(self.dataset.glob("patch-overlap-pcls.json.*.bak"))
+        backups = list(self.dataset.glob("relative_windings.json.*.bak"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text()), existing)
         # Still-pending inputs stay queued for the next run after a commit.
@@ -2414,12 +2414,12 @@ class CommitTests(unittest.TestCase):
         state_b = ServiceState()
         _attach_fake_session(state_b, output_b, self.dataset)
         upload_a = _upload_input(
-            self.state, "pcl", "pcl-a", PCL_FILES, role="patch_overlap")
+            self.state, "pcl", "pcl-a", PCL_FILES, role="relative")
         upload_b = _upload_input(
-            state_b, "pcl", "pcl-b", PCL_FILES, role="patch_overlap")
+            state_b, "pcl", "pcl-b", PCL_FILES, role="relative")
         self.state.finalize_upload(upload_a)
         state_b.finalize_upload(upload_b)
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps({
             "vc_pointcollections_json_version": "1", "collections": {},
         }))
@@ -2466,7 +2466,7 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(len(merged["collections"]), 2)
 
     def test_independent_processes_preserve_both_pcl_commits(self):
-        target = self.dataset / "patch-overlap-pcls.json"
+        target = self.dataset / "relative_windings.json"
         target.write_text(json.dumps({
             "vc_pointcollections_json_version": "1", "collections": {},
         }))

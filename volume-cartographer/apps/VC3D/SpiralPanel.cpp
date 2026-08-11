@@ -256,7 +256,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pclRole = new QComboBox(pclContainer);
     _pclRole->setObjectName(QStringLiteral("spiralPclRole"));
     _pclRole->addItem(tr("Absolute"), QStringLiteral("absolute"));
-    _pclRole->addItem(tr("Patch overlap"), QStringLiteral("patch_overlap"));
     _pclRole->addItem(tr("Relative"), QStringLiteral("relative"));
     _pclRole->addItem(tr("Same winding"), QStringLiteral("same_winding"));
     _pclRole->addItem(tr("Drawn control points"), QStringLiteral("drawn_control_points"));
@@ -1457,7 +1456,10 @@ void SpiralPanel::addPclItem(const QString& path, const QString& role, bool requ
 {
     if (path.trimmed().isEmpty()) return;
     const int roleIndex = _pclRole->findData(role);
-    const QString roleLabel = roleIndex >= 0 ? _pclRole->itemText(roleIndex) : role;
+    // A role the service no longer accepts (a retired role in settings saved
+    // by an older build) is dropped: sending it would fail session validation.
+    if (roleIndex < 0) return;
+    const QString roleLabel = _pclRole->itemText(roleIndex);
     auto* item = new QListWidgetItem(tr("%1 — %2").arg(roleLabel, path), _pclList);
     item->setData(Qt::UserRole, path);
     item->setData(Qt::UserRole + 1, role);
@@ -2181,9 +2183,10 @@ void SpiralPanel::restore()
                        item.value(QStringLiteral("required")).toBool());
         }
     } else if (legacy) {
-        // Import settings written by the original four-row PCL UI once.
+        // Import settings written by the original four-row PCL UI once. The
+        // retired patch-overlap row is deliberately not imported.
         for (const auto& pair : std::initializer_list<std::pair<const char*, const char*>>{
-                 {"pcl_absolute", "absolute"}, {"pcl_patch_overlap", "patch_overlap"},
+                 {"pcl_absolute", "absolute"},
                  {"pcl_relative", "relative"}, {"pcl_same_winding", "same_winding"},
                  {"pcl_drawn_control_points", "drawn_control_points"}}) {
             const QString path = settings.value(

@@ -799,7 +799,13 @@ class ServiceState:
                  for key in scroll_owned])
         if self.dataset_resolution is not None:
             request = self._dataset_session_request(request)
-        paths, run, preview = parse_session_request(request)
+        try:
+            paths, run, preview = parse_session_request(request)
+        except (KeyError, TypeError, ValueError) as exc:
+            # An unparseable request field (an unknown PCL role, say) is the
+            # caller's error, not a service fault.
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Malformed session request: {exc}") from exc
         errors = validate_session_request(paths, run)
         # The scroll specification is resolved from the dataset root; it
         # carries the physical scroll facts (including the outward sense,

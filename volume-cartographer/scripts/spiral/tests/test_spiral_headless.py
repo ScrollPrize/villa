@@ -156,7 +156,7 @@ class DatasetResolverTests(unittest.TestCase):
             (root / "abs_winding.json").write_text("{}")
             (root / "relative_windings.json").write_text("{}")
             (root / "same_windings.json").write_text("{}")
-            (root / "patch-overlap-pcls.json").write_text("{}")
+            (root / "drawn_control_points.json").write_text("{}")
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
             self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
@@ -165,7 +165,8 @@ class DatasetResolverTests(unittest.TestCase):
             self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
             self.assertNotIn("unverified_patches", result.resolved)
             self.assertEqual([item["role"] for item in result.pcl_inputs],
-                             ["absolute", "relative", "same_winding"])
+                             ["absolute", "relative", "same_winding",
+                              "drawn_control_points"])
             self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
                              str(root / "tracks" / "only.dbm"))
 

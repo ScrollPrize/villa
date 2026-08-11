@@ -51,8 +51,6 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 "outer_shell": f"{DATASET}/outer_shell",
                 "pcls": [
                     {"path": f"{DATASET}/abs_winding.json", "role": "absolute"},
-                    {"path": f"{DATASET}/patch-overlap-pcls.json",
-                     "role": "patch_overlap"},
                     {"path": f"{DATASET}/relative_windings.json",
                      "role": "relative"},
                     {"path": f"{DATASET}/same_windings.json",
