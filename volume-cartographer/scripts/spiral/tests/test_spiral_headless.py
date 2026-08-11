@@ -10,12 +10,103 @@ import unittest
 import numpy as np
 import torch
 
-from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
+from fit_session import (PclInputSpec, PclRole, ScrollSpecError,
+                         load_scroll_spec, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 from spiral_runtime import DistributedInteractiveFitSession, InteractiveFitSession
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
+
+
+def write_scroll_spec(root, **extra):
+    document = {
+        "schema_version": 1,
+        "name": "s1",
+        "voxel_size_um": 9.6,
+        "spiral_outward_sense": "CW",
+        **extra,
+    }
+    (Path(root) / "spiral-scroll.json").write_text(json.dumps(document))
+
+
+class ScrollSpecTests(unittest.TestCase):
+    def test_missing_file_names_the_conventional_filename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ScrollSpecError, "spiral-scroll.json"):
+                load_scroll_spec(temporary)
+
+    def test_schema_version_is_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
+                "name": "s1", "voxel_size_um": 9.6,
+                "spiral_outward_sense": "CW"}))
+            with self.assertRaisesRegex(ScrollSpecError, "schema_version"):
+                load_scroll_spec(temporary)
+
+    def test_unknown_keys_are_rejected_by_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, render_volume_scale=16)
+            with self.assertRaisesRegex(
+                    ScrollSpecError, r"unknown keys: \['render_volume_scale'\]"):
+                load_scroll_spec(temporary)
+
+    def test_unknown_path_override_keys_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, paths={"scroll_zarr": "volume.zarr"})
+            with self.assertRaisesRegex(
+                    ScrollSpecError, r"unknown path override keys: \['scroll_zarr'\]"):
+                load_scroll_spec(temporary)
+
+    def test_required_physical_facts_and_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
+                "schema_version": 1, "name": "s1"}))
+            with self.assertRaisesRegex(
+                    ScrollSpecError,
+                    r"missing required keys: \['spiral_outward_sense', "
+                    r"'voxel_size_um'\]"):
+                load_scroll_spec(temporary)
+            write_scroll_spec(temporary)
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.name, "s1")
+            self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
+            self.assertEqual(spec.normal_zarr_group, "4")
+            self.assertEqual(spec.surf_sdt_zarr_group, "1")
+            self.assertEqual(spec.lasagna_scale, 4)
+            self.assertEqual(spec.path_overrides, ())
+
+    def test_relative_path_overrides_resolve_against_dataset_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(
+                temporary,
+                paths={"umbilicus": "annotations/umbilicus.json",
+                       "tracks_dbm": "/elsewhere/tracks.dbm"})
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(
+                spec.path_override("umbilicus"),
+                str(Path(temporary).resolve() / "annotations" / "umbilicus.json"))
+            self.assertEqual(spec.path_override("tracks_dbm"),
+                             "/elsewhere/tracks.dbm")
+
+    def test_dataset_resolution_requires_and_honors_the_spec(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "annotations").mkdir()
+            (root / "annotations" / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            missing = resolve_dataset_root(root)
+            self.assertIn("scroll_spec", missing.missing_required)
+            self.assertTrue(any("spiral-scroll.json" in warning
+                                for warning in missing.warnings))
+            write_scroll_spec(
+                root, paths={"umbilicus": "annotations/umbilicus.json"})
+            result = resolve_dataset_root(root)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.scroll_spec["name"], "s1")
+            self.assertEqual(result.resolved["umbilicus"],
+                             str(root.resolve() / "annotations" / "umbilicus.json"))
 
 
 class DatasetResolverTests(unittest.TestCase):
@@ -36,6 +127,7 @@ class DatasetResolverTests(unittest.TestCase):
     def test_conventional_resolution_and_logical_dbm_suffix(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            write_scroll_spec(root)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
             (root / "unverified_patches").mkdir()
@@ -61,6 +153,7 @@ class DatasetResolverTests(unittest.TestCase):
     def test_dbm_ambiguity_is_deterministic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            write_scroll_spec(root)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
             (root / "tracks").mkdir()

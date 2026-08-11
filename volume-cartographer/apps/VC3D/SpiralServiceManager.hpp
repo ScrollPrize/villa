@@ -58,7 +58,6 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    void resolveDataset(const QString& root);
     void loadSession(QJsonObject request);
     void runIterations(int iterations, const QJsonObject& influenceConfig,
                        const QJsonObject& runConfig,
@@ -141,7 +140,10 @@ private:
                      std::function<void(const QJsonObject&)> success,
                      std::function<void(const QString&)> failure);
     void pollStatus();
-    void pollRemoteLogs();
+    // One structured event subscriber for every connection: GET /events with
+    // a persisted cursor; the panel interleaves all record kinds and popups
+    // are reserved for error severity.
+    void pollEvents();
     void handleStatus(const QJsonObject& status);
     void syncArtifacts(const QJsonObject& status);
     void fetchAdvertisedDataset();
@@ -159,11 +161,12 @@ private:
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
+    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache of _process
     QNetworkAccessManager* _network = nullptr;
     SpiralSshTunnel* _tunnel = nullptr;
     SpiralArtifactCache* _artifactCache = nullptr;
     QTimer* _poll = nullptr;
-    QTimer* _remoteLogPoll = nullptr;
+    QTimer* _eventPoll = nullptr;
     QUrl _baseUrl;
     QString _credential;
     QString _clientId;
@@ -173,11 +176,11 @@ private:
     int _statusFailures = 0;
     bool _hasActiveSession = false;
     bool _serviceOwnsDataset = false;
-    bool _remoteLogsInFlight = false;
+    bool _eventsInFlight = false;
     bool _restartInProgress = false;
     QElapsedTimer _restartElapsed;
-    int _remoteLogFailures = 0;
-    qint64 _lastRemoteLogSequence = 0;
+    int _eventFailures = 0;
+    qint64 _lastEventCursor = 0;
     QJsonObject _advertisedDataset;
     QJsonObject _configurationDefaults;
     QJsonObject _appliedConfiguration;

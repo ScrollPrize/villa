@@ -63,7 +63,39 @@ _SCALE_WITH_Z_FIELDS = {
 }
 
 
+# z_begin/z_end are deliberately heavyweight settings; their metadata records
+# every effect so nothing treats them as cheap run-boundary knobs:
+#   - host input filtering: patches, PCLs, unattached strips, and tracks are
+#     loaded/kept only where they intersect [z_begin, z_end);
+#   - dense-store coverage: the Lasagna normal/grad-mag and surf-SDT brick
+#     pools are materialised for exactly this z window;
+#   - count scaling: every scale_with_z sample count is scaled by the number
+#     of slices in the range relative to the 9500-slice reference;
+#   - rendering/preview: the preview/export z window and the output-directory
+#     name derive from the range;
+#   - model/checkpoint-domain compatibility: the flow-field parameter shapes
+#     cover the range (plus margin), so resuming a checkpoint requires the
+#     optimisation range to lie within the checkpoint's stored model z-range.
+_Z_RANGE_DESCRIPTIONS = {
+    "z_begin": "First z slice (inclusive) of the fit. Affects host input "
+               "filtering, dense-store coverage, per-step count scaling, "
+               "rendering, and model/checkpoint z-domain compatibility.",
+    "z_end": "One past the last z slice of the fit. Affects host input "
+             "filtering, dense-store coverage, per-step count scaling, "
+             "rendering, and model/checkpoint z-domain compatibility.",
+}
+
+_Z_RANGE_DEPENDENCIES = [
+    "patch_pcl", "trusted_geometry", "tracks",
+    "dense_stores", "dense_losses", "shell", "preview_output",
+]
+
+
 def _runtime_impact(key):
+    if key in _Z_RANGE_DESCRIPTIONS:
+        # Changing the z-range invalidates host inputs, dense stores, and the
+        # model's flow-field domain: a new fit, never a run-boundary tweak.
+        return "new_fit"
     if key.startswith("shell_"):
         return "shell_reload"
     if key.startswith("model_") or key == "optimizer_random_seed":
@@ -74,6 +106,8 @@ def _runtime_impact(key):
 
 
 def _dependencies(key):
+    if key in _Z_RANGE_DESCRIPTIONS:
+        return list(_Z_RANGE_DEPENDENCIES)
     if key.startswith(("patch_", "pcl_")):
         return ["patch_pcl", "trusted_geometry", "tracks"]
     if key.startswith("track_"):
@@ -131,11 +165,18 @@ def _field_spec(key, default):
         spec["length"] = 3 if key == "track_length_bin_weights" else len(default)
     if key in _SCALE_WITH_Z_FIELDS:
         spec["scale_with_z"] = True
+    if key in _Z_RANGE_DESCRIPTIONS:
+        spec["description"] = _Z_RANGE_DESCRIPTIONS[key]
     return spec
 
 
 class Config:
     def __init__(self, overrides=None):
+        # The optimisation z window (see _Z_RANGE_DESCRIPTIONS for the full
+        # effect list). Defaults match the historical fit_spiral module
+        # globals for the production PHercParis4 dataset.
+        self.z_begin = 4000
+        self.z_end = 17000
         self.optimizer_random_seed = 1
         self.optimizer_distributed_split_batch = True
         self.optimizer_learning_rate = 3e-05
@@ -388,16 +429,81 @@ class Config:
             path.stem: cls(path).as_dict()
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
+        # The advertised path entries derive from the declarative fit-input
+        # catalog (imported lazily: fit_session imports Config). Only inputs
+        # a resident session can take live appear; every other path change
+        # implies the prepared-input-rebuild default.
+        from fit_session import input_path_schema
+
         return {
             "defaults": defaults,
             "schema": {
-                "paths": {
-                    "outer_shell": {
-                        "runtime_impact": "shell_reload",
-                        "dependencies": ["shell"],
-                    },
-                },
+                "paths": input_path_schema(),
                 "fields": fields,
             },
             "presets": presets,
         }
+
+
+def durable_config(values):
+    """The checkpoint-durable subset of a configuration.
+
+    Interactive influence state is session-scoped and the anchor weight only
+    exists while an influence window is active, so neither is stored in (or
+    expected from) a checkpoint's cfg/requested_config/resolved_config.
+    Checkpoint compatibility checks must compare stored key sets against
+    this durable subset of the schema, not the raw schema.
+    """
+    return {
+        key: item for key, item in dict(values).items()
+        if not key.startswith("interactive_influence_")
+        and key != "loss_weight_anchor"
+    }
+
+
+class FitConfig:
+    """The one explicit fitter configuration: a resolved key -> value mapping.
+
+    A thin dict-style wrapper handed to FitContext, replacing the module
+    global `wandb.config` object the fitter used to read. Values must
+    already be fully resolved (Config defaults + overrides + any z-range
+    scaling); FitConfig performs no resolution of its own because the
+    resolution policies legitimately differ per entry point (the CLI
+    scales-and-splits for DDP, the interactive runtime round-trips
+    checkpoint counts, the golden driver scales without splitting).
+
+    Construction copies the mapping. update() mutates in place, so every
+    holder of the same FitConfig (the context, its losses call sites, a
+    driver that recorded it) observes run-boundary configuration changes,
+    matching the former shared-wandb.config semantics.
+    """
+
+    def __init__(self, values):
+        self._values = dict(values)
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __contains__(self, key):
+        return key in self._values
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+    def keys(self):
+        return self._values.keys()
+
+    def items(self):
+        return self._values.items()
+
+    def update(self, values):
+        self._values.update(values)
+
+    def __repr__(self):
+        return f"FitConfig({self._values!r})"

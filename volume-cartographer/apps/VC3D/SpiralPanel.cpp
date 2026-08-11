@@ -131,6 +131,47 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     apiKeyLayout->addWidget(_apiKey);
     serviceForm->addRow(tr("API key"), _apiKeyRow);
 
+    // Local launch binding: the owned service is started with these values as
+    // --dataset/--output/--cache; selecting a different dataset restarts the
+    // bound service instance. Remote services advertise their immutable paths
+    // through /dataset instead.
+    auto makeLaunchRow = [this, serviceContents, serviceForm](
+                             QLineEdit*& edit, QWidget*& row,
+                             const QString& label, const QString& placeholder) {
+        row = new QWidget(serviceContents);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        edit = new QLineEdit(row);
+        edit->setPlaceholderText(placeholder);
+        auto* browse = new QToolButton(row);
+        browse->setText(QStringLiteral("…"));
+        rowLayout->addWidget(edit, 1);
+        rowLayout->addWidget(browse);
+        serviceForm->addRow(label, row);
+        connect(browse, &QToolButton::clicked, this, [this, edit]() {
+            const QString chosen = QFileDialog::getExistingDirectory(
+                this, tr("Select directory"), edit->text());
+            if (!chosen.isEmpty()) {
+                edit->setText(chosen);
+                emit edit->editingFinished();
+            }
+        });
+    };
+    makeLaunchRow(_datasetRoot, _datasetRow, tr("Dataset"),
+                  tr("Dataset root (required for the local service)"));
+    _datasetRoot->setToolTip(tr("Inputs-only dataset root the local service is "
+                                "bound to at launch (--dataset)"));
+    makeLaunchRow(_outputRoot, _outputRow, tr("Output"),
+                  tr("Generated state root (default: per-dataset app data dir)"));
+    _outputRoot->setToolTip(tr("Root for all generated state (--output); must be "
+                               "outside the dataset root. Empty derives a "
+                               "per-dataset default under the VC3D data directory."));
+    makeLaunchRow(_cacheRoot, _cacheRow, tr("Cache"),
+                  tr("Derived cache root (default: ~/.cache/vc3d/spiral)"));
+    _cacheRoot->setToolTip(tr("Derived host cache directory (--cache); must be "
+                              "outside the dataset root. Empty uses the "
+                              "documented user cache default."));
+
     _mappingRow = new QWidget(serviceContents);
     auto* mappingLayout = new QHBoxLayout(_mappingRow);
     mappingLayout->setContentsMargins(0, 0, 0, 0);
@@ -179,8 +220,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
     addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
-    _refill = new QPushButton(tr("Refill from Dataset Root"), pathsContents);
-    pathsForm->addRow(_refill);
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
 
     auto* pclContainer = new QWidget(pathsContents);
@@ -310,7 +349,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
     _scrollName = new QLineEdit(QStringLiteral("s1"), outputContents);
-    _outwardSense = new QComboBox(outputContents); _outwardSense->addItems({QStringLiteral("CW"), QStringLiteral("ACW")});
     _voxelSize = new QDoubleSpinBox(outputContents); _voxelSize->setRange(0.001, 10000); _voxelSize->setDecimals(4); _voxelSize->setValue(9.6);
     _legacyCheckpointStep = new QSpinBox(outputContents); _legacyCheckpointStep->setRange(0, 1000000000);
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
@@ -347,7 +385,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
     outputForm->addRow(tr("Scroll name"), _scrollName);
-    outputForm->addRow(tr("Outward sense"), _outwardSense);
     outputForm->addRow(tr("Voxel size (µm)"), _voxelSize);
     outputForm->addRow(tr("Legacy checkpoint step"), _legacyCheckpointStep);
     outputForm->addRow(tr("Run tag"), _runTag);
@@ -618,17 +655,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     // ------------------------------------------------------------------
     // Wiring
     // ------------------------------------------------------------------
-    connect(_paths["dataset_root"], &QLineEdit::editingFinished, this, [this]() {
-        if (_remoteMode) return;
-        _pendingDatasetRoot = _paths["dataset_root"]->text();
-        if (_service->isReady()) _service->resolveDataset(_pendingDatasetRoot);
-    });
-    connect(_refill, &QPushButton::clicked, this, [this]() {
-        if (_remoteMode) return;
-        _pendingDatasetRoot = _paths["dataset_root"]->text();
-        if (_service->isReady()) _service->resolveDataset(_pendingDatasetRoot);
-        else _connectionStatus->setText(tr("Connect to the service to resolve datasets"));
-    });
+    // A changed local launch binding (dataset/output/cache) restarts the
+    // owned service: it is bound to one dataset for its whole lifetime.
+    auto launchBindingEdited = [this]() {
+        if (_currentProfileId != kLocalhostProfileId) return;
+        const SpiralServiceProfile& active = _service->profile();
+        if (active.datasetRoot.trimmed() == _datasetRoot->text().trimmed()
+            && active.outputRoot.trimmed() == _outputRoot->text().trimmed()
+            && active.cacheRoot.trimmed() == _cacheRoot->text().trimmed())
+            return;
+        if (!_service->isReady()) return; // Connect applies the new binding
+        guardSessionExit([this]() { connectToSelectedProfile(); });
+    };
+    for (QLineEdit* edit : {_datasetRoot, _outputRoot, _cacheRoot})
+        connect(edit, &QLineEdit::editingFinished, this, launchBindingEdited);
     auto appendPcl = [this]() {
         const QString path = _pclPath->text().trimmed();
         if (path.isEmpty()) return;
@@ -703,16 +743,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _runConfigKeys.clear();
                 }
                 _state->setText(tr("Service: %1").arg(text));
-                if (_connected && !_remoteMode && !_pendingDatasetRoot.isEmpty())
-                    _service->resolveDataset(_pendingDatasetRoot);
             });
     connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
         // A service-owned dataset advertisement describes what a future load
         // would use. Once attached, the resident session's canonical request
         // is authoritative and may intentionally differ.
         if (!_hasSession)
-            applyResolution(value, _remoteMode || !_hasManualEdits);
-        _pendingDatasetRoot.clear();
+            applyResolution(value, true);
     });
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
             _advancedProfiles, &SpiralConfigProfileEditor::setCatalog);
@@ -928,8 +965,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 [this](double) { refreshReloadRequired(); });
     for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
-    connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
@@ -1072,7 +1107,7 @@ void SpiralPanel::selectProfile(const QString& profileId)
         _profileCombo->setCurrentIndex(index);
     }
     SpiralServiceProfile profile = profileId == kLocalhostProfileId
-        ? SpiralServiceProfile::localhostProfile()
+        ? SpiralServiceProfile::localhostProfile(&settings)
         : SpiralServiceProfile::load(settings, profileId);
     applyProfileFields(profile);
     setRemoteMode(profile.isRemote());
@@ -1090,6 +1125,14 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
     // An SSH profile's credential is read from the host over SSH.
     _apiKeyRow->setVisible(!localhost && !ssh);
     _mappingRow->setVisible(!localhost);
+    // The launch binding only exists for the locally owned service; remote
+    // profiles display the service's advertised paths instead.
+    _datasetRow->setVisible(localhost);
+    _outputRow->setVisible(localhost);
+    _cacheRow->setVisible(localhost);
+    _datasetRoot->setText(profile.datasetRoot);
+    _outputRoot->setText(profile.outputRoot);
+    _cacheRoot->setText(profile.cacheRoot);
     _endpointUrl->setText(profile.baseUrl.toString());
     _sshDestination->setText(profile.sshDestination);
     if (profile.remoteServicePort > 0) _sshPort->setValue(profile.remoteServicePort);
@@ -1101,8 +1144,13 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
 SpiralServiceProfile SpiralPanel::profileFromFields() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    if (_currentProfileId == kLocalhostProfileId)
-        return SpiralServiceProfile::localhostProfile();
+    if (_currentProfileId == kLocalhostProfileId) {
+        SpiralServiceProfile profile = SpiralServiceProfile::localhostProfile();
+        profile.datasetRoot = _datasetRoot->text().trimmed();
+        profile.outputRoot = _outputRoot->text().trimmed();
+        profile.cacheRoot = _cacheRoot->text().trimmed();
+        return profile;
+    }
     SpiralServiceProfile profile = SpiralServiceProfile::load(settings, _currentProfileId);
     profile.baseUrl = QUrl(_endpointUrl->text().trimmed());
     profile.sshDestination = _sshDestination->text().trimmed();
@@ -1116,10 +1164,8 @@ SpiralServiceProfile SpiralPanel::profileFromFields() const
 void SpiralPanel::connectToSelectedProfile()
 {
     SpiralServiceProfile profile = profileFromFields();
-    if (profile.isRemote()) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        profile.save(settings); // never persists the API key
-    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    profile.save(settings); // never persists the API key
     _service->connectToService(profile);
 }
 
@@ -1141,35 +1187,33 @@ void SpiralPanel::setRemoteMode(bool remote)
     _remoteMode = remote;
     _restartServiceButton->setVisible(remote);
     _restartServiceButton->setEnabled(remote && _service->isReady());
-    // Remote services own their base inputs: the path rows populate read-only
-    // from the service's advertised dataset resolution, and there is nothing
-    // local to browse. The checkpoint and tracks selections stay editable
-    // because the client chooses among service-advertised values.
+    // Every service owns its base inputs (local and remote alike): the path
+    // rows populate read-only from the service's advertised dataset
+    // resolution. The checkpoint and tracks selections stay editable because
+    // the client chooses among service-advertised values.
     const QStringList clientSelectable{QStringLiteral("checkpoint"), QStringLiteral("tracks_dbm")};
     for (auto it = _paths.begin(); it != _paths.end(); ++it) {
         const bool selectable = clientSelectable.contains(it.key());
-        // The checkpoint browse button stays in remote mode: a client-local
-        // .ckpt selected here is uploaded to the service before the load.
-        const bool browsable = !remote || it.key() == QStringLiteral("checkpoint");
-        it.value()->setReadOnly(remote && !selectable);
+        // The checkpoint browse button stays: a client-local .ckpt selected
+        // here is uploaded to the service before the load.
+        const bool browsable = it.key() == QStringLiteral("checkpoint");
+        it.value()->setReadOnly(!selectable);
         if (_pathBrowseButtons.contains(it.key()))
             _pathBrowseButtons[it.key()]->setVisible(browsable);
     }
     _paths[QStringLiteral("checkpoint")]->setToolTip(
-        remote ? tr("A service-advertised checkpoint, a service path under the output "
-                    "directory, or a local .ckpt file to upload for resume")
-               : QString());
-    _refill->setVisible(!remote);
-    _pclRole->setEnabled(!remote);
-    _pclPath->setEnabled(!remote);
-    _addPclButton->setEnabled(!remote);
-    _browsePclButton->setVisible(!remote);
-    _removePcl->setEnabled(!remote && _pclList->currentItem() != nullptr);
+        tr("A service-advertised checkpoint, a service path under the output "
+           "directory, or a local .ckpt file to upload for resume"));
+    // PCL collections are advertised by dataset resolution; extra collections
+    // join a session through ephemeral uploads, not the load request.
+    _pclRole->setEnabled(false);
+    _pclPath->setEnabled(false);
+    _addPclButton->setEnabled(false);
+    _browsePclButton->setVisible(false);
+    _removePcl->setEnabled(false);
     _save->setVisible(true);
-    if (remote) {
-        for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
-            edit->setToolTip(tr("Service-host path, owned by the service"));
-    }
+    for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
+        edit->setToolTip(tr("Service-host path, owned by the service"));
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1248,10 +1292,8 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     }
     const QJsonObject before = sessionRequest();
     _applyingResolution = true;
-    if (_remoteMode) {
-        const QString root = resolution.value(QStringLiteral("root")).toString();
-        if (!root.isEmpty()) _paths[QStringLiteral("dataset_root")]->setText(root);
-    }
+    const QString root = resolution.value(QStringLiteral("root")).toString();
+    if (!root.isEmpty()) _paths[QStringLiteral("dataset_root")]->setText(root);
     const QJsonObject resolved = resolution.value("resolved").toObject();
     for (auto it = resolved.begin(); it != resolved.end(); ++it)
         if (_paths.contains(it.key())) _paths[it.key()]->setText(it.value().toString());
@@ -1270,7 +1312,7 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     QStringList notes;
     if (!missing.isEmpty()) notes << tr("Missing required: %1").arg(missing.join(", "));
     const QStringList checkpoints = resolution.value("detected_checkpoints").toVariant().toStringList();
-    if (_remoteMode && !checkpoints.isEmpty())
+    if (!checkpoints.isEmpty())
         notes << tr("Detected resume checkpoints on the service: %1").arg(checkpoints.join(", "));
     _warnings->setText(notes.join(QStringLiteral("\n")));
 }
@@ -1290,7 +1332,7 @@ QJsonObject SpiralPanel::sessionRequest() const
     paths["pcls"] = pcls;
     QJsonObject config = sessionAdvancedConfig();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
-                    {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
+                    {"scroll_name", _scrollName->text()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
                     {"lasagna_scale", _lasagnaScale->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
@@ -1512,9 +1554,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
     _scrollName->setText(
         run.value(QStringLiteral("scroll_name")).toString(_scrollName->text()));
-    _outwardSense->setCurrentText(
-        run.value(QStringLiteral("outward_sense")).toString(
-            _outwardSense->currentText()));
     _voxelSize->setValue(
         run.value(QStringLiteral("voxel_size_um")).toDouble(_voxelSize->value()));
     _lasagnaGroup->setText(
@@ -1634,8 +1673,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             progress.value(QStringLiteral("detail")).toString();
         const double elapsed =
             progress.value(QStringLiteral("elapsed_seconds")).toDouble();
-        const QJsonValue etaValue =
-            progress.value(QStringLiteral("eta_seconds"));
+        // The service publishes raw progress fields only; the ETA is a
+        // client-side presentation value derived from them.
+        double eta = -1.0;
+        if (step > 0 && total > step && elapsed >= 2.0)
+            eta = elapsed * double(total - step) / double(step);
+        else if (total > 0 && step >= total)
+            eta = 0.0;
         const auto durationText = [](double value) {
             const qint64 seconds = qMax<qint64>(
                 0, qRound64(value));
@@ -1654,9 +1698,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         if (!detail.isEmpty())
             progressText += QStringLiteral(" — ") + detail;
         progressText += tr(" — elapsed %1").arg(durationText(elapsed));
-        if (etaValue.isDouble())
-            progressText += tr(" — ETA %1")
-                .arg(durationText(etaValue.toDouble()));
+        if (eta >= 0.0)
+            progressText += tr(" — ETA %1").arg(durationText(eta));
         stateText += QStringLiteral("\n") + progressText;
         _previewProgress->setVisible(true);
         if (total > 0) {
@@ -1797,6 +1840,10 @@ void SpiralPanel::refreshReloadRequired()
 void SpiralPanel::persist() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    // The local launch binding lives on the profile, next to the other
+    // connection settings.
+    if (_currentProfileId == kLocalhostProfileId)
+        profileFromFields().save(settings);
     const QString prefix = formSettingsPrefix();
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
@@ -1812,7 +1859,6 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
     settings.setValue(prefix + "scroll_name", _scrollName->text());
-    settings.setValue(prefix + "outward_sense", _outwardSense->currentText());
     settings.setValue(prefix + "voxel_size_um", _voxelSize->value());
     settings.setValue(prefix + "lasagna_group", _lasagnaGroup->text());
     settings.setValue(prefix + "lasagna_scale", _lasagnaScale->value());
@@ -1871,7 +1917,6 @@ void SpiralPanel::restore()
     _zBegin->setValue(settings.value(valuePrefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(valuePrefix + "z_end", 17000).toInt());
     _scrollName->setText(settings.value(valuePrefix + "scroll_name", "s1").toString());
-    _outwardSense->setCurrentText(settings.value(valuePrefix + "outward_sense", "CW").toString());
     _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
     _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
     _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());

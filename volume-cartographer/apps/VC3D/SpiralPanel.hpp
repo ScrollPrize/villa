@@ -112,7 +112,6 @@ private:
     QPushButton* _removePcl = nullptr;
     QPushButton* _addPclButton = nullptr;
     QToolButton* _browsePclButton = nullptr;
-    QComboBox* _outwardSense = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QDoubleSpinBox* _trackShortWeight = nullptr;
@@ -133,6 +132,12 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    QLineEdit* _datasetRoot = nullptr;
+    QLineEdit* _outputRoot = nullptr;
+    QLineEdit* _cacheRoot = nullptr;
+    QWidget* _datasetRow = nullptr;
+    QWidget* _outputRow = nullptr;
+    QWidget* _cacheRow = nullptr;
     QLabel* _checkpointDownloadStatus = nullptr;
     QProgressBar* _checkpointDownloadProgress = nullptr;
     QTimer* _checkpointDownloadTimer = nullptr;
@@ -140,7 +145,6 @@ private:
     QString _checkpointDownloadPhase;
     qint64 _checkpointBytesReceived = 0;
     qint64 _checkpointTotalBytes = 0;
-    QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
     QProgressBar* _previewProgress = nullptr;
     QLabel* _metrics = nullptr;
@@ -178,7 +182,6 @@ private:
 
     QString _currentProfileId;
     QStringList _profileIds;
-    QString _pendingDatasetRoot;
     bool _applyingResolution = false;
     bool _hasManualEdits = false;
     bool _hasSession = false;

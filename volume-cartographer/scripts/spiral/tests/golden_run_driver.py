@@ -55,43 +55,6 @@ Z_RANGE_SCALED_COUNT_KEYS = (
 REFERENCE_Z_RANGE_NUM_SLICES = 9500  # mirrors spiral_helpers.REFERENCE_Z_RANGE_NUM_SLICES
 
 
-def derive_module_globals(spec):
-    """Dataset-derived module globals, mirroring fit_spiral's conventions."""
-    dataset = spec['dataset_path']
-    return {
-        'dataset_path': dataset,
-        'scroll_zarr_path': None,
-        # The golden run intentionally runs without the Lasagna input stores
-        # (dense losses are zero-weighted in the spec's config overrides).
-        'normal_nx_zarr_path': None,
-        'normal_ny_zarr_path': None,
-        'grad_mag_zarr_path': None,
-        'normal_zarr_group': '4',
-        'surf_sdt_zarr_path': f'{dataset}/lasagna_inputs/las_008_surf_sdt.ome.zarr',
-        'surf_sdt_zarr_group': '1',
-        'pcl_json_paths': [
-            f'{dataset}/abs_winding.json',
-            f'{dataset}/patch-overlap-pcls.json',
-            f'{dataset}/relative_windings.json',
-            f'{dataset}/same_windings.json',
-            f'{dataset}/drawn_control_points.json',
-        ],
-        'pcl_input_specs': None,
-        'fibers_path': f'{dataset}/fibers',
-        'verified_patches_path': f'{dataset}/verified_patches',
-        'unverified_patches_path': None,
-        'shell_path': f'{dataset}/outer_shell',
-        'tracks_dbm_path': f'{dataset}/tracks/2um_ds2_ps256_surf_v2.dbm',
-        'spiral_outward_sense': 'CW',
-        'scroll_name': 's1',
-        'z_begin': spec['z_begin'],
-        'z_end': spec['z_end'],
-        'voxel_size_um': 9.6,
-        'lasagna_scale': 4,
-        'lasagna_storage_backend': 'sparse_cuda',
-    }
-
-
 def _hash_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -207,42 +170,42 @@ def run(spec_path, result_path, out_dir):
         spec = json.load(spec_file)
 
     os.makedirs(out_dir, exist_ok=True)
-    os.environ['FIT_SPIRAL_OUT_DIR'] = out_dir
     # Mesh export is slow and exercises no fitting behavior; keep the golden
     # run focused on the training loop and checkpoint.
     os.environ.setdefault('FIT_SPIRAL_SKIP_SAVE_MESH', '1')
-    if spec.get('cache_path'):
-        os.environ['FIT_SPIRAL_CACHE_DIR'] = spec['cache_path']
 
     import torch
     import wandb
 
     import fit_spiral as fs
-    from config import Config
+    from config import Config, FitConfig
+    from fit_session import conventional_input_paths, load_scroll_spec
     from spiral_helpers import SAMPLING_COUNT_FLOORS, scale_counts_for_z_range
 
-    module_globals = derive_module_globals(spec)
-    for name, value in module_globals.items():
-        assert hasattr(fs, name), f'fit_spiral no longer defines {name}'
-        setattr(fs, name, value)
+    # The dataset's spiral-scroll.json supplies the physical scroll facts;
+    # inputs follow the conventional layout it describes.
     dataset = spec['dataset_path']
-    fs.umbilicus_z_to_yx = lambda: fs.json_umbilicus_z_to_yx(
-        f'{dataset}/umbilicus.json', coordinate_scale=1.0)
+    scroll = load_scroll_spec(dataset)
+    paths = conventional_input_paths(dataset, scroll)
 
-    # Mirror fit_spiral.__main__ (single process, no DDP): resolve config,
-    # scale per-step counts for the z-range, then hand wandb.config to main().
+    # Mirror fit_spiral.__main__ (single process, no DDP): resolve config
+    # (the z window is the Config's z_begin/z_end now), scale per-step counts
+    # for the z-range, then hand an explicit FitConfig to main(). wandb stays
+    # exactly as the CLI uses it: an optional (disabled) logging sink, never
+    # a source of configuration.
     config = Config().as_dict()
     config.update(spec.get('config_overrides', {}))
+    config['z_begin'] = spec['z_begin']
+    config['z_end'] = spec['z_end']
     config['optimizer_num_training_steps'] = spec['iterations']
     scale_counts_for_z_range(
-        config, fs.z_begin, fs.z_end,
+        config, config['z_begin'], config['z_end'],
         REFERENCE_Z_RANGE_NUM_SLICES, Z_RANGE_SCALED_COUNT_KEYS,
         floors=SAMPLING_COUNT_FLOORS,
     )
+    fit_config = FitConfig(config)
 
     wandb.init(project='scrolls', config=config, mode='disabled')
-    fs.cfg = wandb.config
-    fs.configure_losses(fs.cfg, fs.z_begin, fs.z_end)
 
     # The training loop reports per-loss-family values through wandb.log every
     # 200 iterations; capture those payloads instead of parsing stdout.
@@ -257,7 +220,15 @@ def run(spec_path, result_path, out_dir):
 
     wandb.log = capture_log
 
-    fs.main(progress=None)
+    fs.main(
+        fit_config,
+        scroll=scroll,
+        paths=paths,
+        progress=None,
+        out_base_dir=out_dir,
+        run_name=wandb.run.name if wandb.run is not None else None,
+        cache_dir=spec.get('cache_path') or '../cache',
+    )
 
     checkpoints = glob.glob(f'{out_dir}/*/checkpoint_fitted.ckpt')
     assert len(checkpoints) == 1, f'expected one final checkpoint, found {checkpoints}'
@@ -270,7 +241,7 @@ def run(spec_path, result_path, out_dir):
 
     result = {
         'spec': spec,
-        'resolved_config': dict(fs.cfg),
+        'resolved_config': dict(fit_config),
         'metrics': [
             {'iteration': index * 200, 'values': values}
             for index, values in enumerate(logged)

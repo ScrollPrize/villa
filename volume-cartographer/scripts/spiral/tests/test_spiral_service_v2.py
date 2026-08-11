@@ -33,7 +33,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
+from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
+                            ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _mapped_winding_ids,
                             _load_flatten_correspondence,
@@ -108,6 +109,15 @@ class FakeSession:
         self.closed = True
 
 
+def _write_scroll_spec(root):
+    (Path(root) / "spiral-scroll.json").write_text(json.dumps({
+        "schema_version": 1,
+        "name": "s1",
+        "voxel_size_um": 9.6,
+        "spiral_outward_sense": "CW",
+    }))
+
+
 def _attach_fake_session(state, output_directory, dataset_root=""):
     state.session = FakeSession()
     state.session_generation += 1
@@ -144,8 +154,35 @@ class ProgressStatusTests(unittest.TestCase):
 
         status = state.status()
 
-        self.assertEqual(status["progress"], session.progress)
+        # The snapshot carries the raw progress facts; eta_seconds is a
+        # presentation value the client derives, never served.
+        expected = {key: value for key, value in session.progress.items()
+                    if key != "eta_seconds"}
+        self.assertEqual(status["progress"], expected)
         self.assertEqual(status["progress"]["stage_name"], "Loading tracks")
+
+    def test_status_never_synthesizes_eta(self):
+        state = spiral_service.ServiceState()
+        session = _attach_fake_session(state, "/tmp/spiral-progress-test")
+        session.progress = {
+            "operation": "optimizing", "stage_name": "Optimizing",
+            "detail": None, "step": 5, "total_steps": 10,
+            "unit": "iterations", "elapsed_seconds": 30.0,
+            "eta_seconds": 30.0,
+        }
+        self.assertNotIn("eta_seconds", state.status()["progress"])
+
+        # The preview-publication progress block is also served raw.
+        state._publishing_preview_generation = 2
+        state._preview_publish = {
+            "generation": 2, "state": "running",
+            "stage_name": "Flattening preview surface",
+            "step": 5, "total_steps": 10,
+        }
+        state._preview_progress_started = None
+        progress = state.status()["progress"]
+        self.assertEqual(progress["operation"], "publishing_preview")
+        self.assertNotIn("eta_seconds", progress)
 
     def test_empty_status_has_explicit_null_progress(self):
         self.assertIsNone(spiral_service.ServiceState().status()["progress"])
@@ -249,22 +286,33 @@ class NamedSessionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_session_name(value)
 
-    def test_named_resolution_isolates_output_but_shares_cache(self):
+    def test_resolution_describes_inputs_only_until_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary) / "dataset"
+            root.mkdir()
+            _write_scroll_spec(root)
             (root / "umbilicus.json").write_text("{}")
             (root / "verified_patches").mkdir()
-            unnamed = resolve_dataset_root(root)
-            alice = resolve_dataset_root(root, session_name="alice")
-            bob = resolve_dataset_root(root, session_name="bob")
-            self.assertEqual(unnamed.resolved["output_directory"],
-                             str(root / "spiral_output"))
-            self.assertEqual(alice.resolved["output_directory"],
-                             str(root / "spiral_output" / "alice"))
-            self.assertEqual(bob.resolved["output_directory"],
-                             str(root / "spiral_output" / "bob"))
-            self.assertEqual(alice.resolved["cache_directory"],
-                             bob.resolved["cache_directory"])
+            resolution = resolve_dataset_root(root)
+            self.assertNotIn("output_directory", resolution.resolved)
+            self.assertNotIn("cache_directory", resolution.resolved)
+            output = Path(temporary) / "output" / "alice"
+            cache = Path(temporary) / "cache"
+            spiral_service.bind_service_paths(resolution, output, cache)
+            self.assertEqual(resolution.resolved["output_directory"], str(output))
+            self.assertEqual(resolution.resolved["cache_directory"], str(cache))
+
+    def test_default_user_cache_dir_honours_xdg_and_is_stable(self):
+        from fit_session import default_user_cache_dir
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": temporary}):
+                self.assertEqual(default_user_cache_dir(),
+                                 str(Path(temporary).resolve() / "vc3d" / "spiral"))
+            with mock.patch.dict(os.environ, clear=True):
+                os.environ["HOME"] = temporary
+                self.assertEqual(
+                    default_user_cache_dir(),
+                    str(Path(temporary).resolve() / ".cache" / "vc3d" / "spiral"))
 
     def test_exclusive_lock_rejects_duplicate_live_owner_and_releases(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -370,6 +418,105 @@ class RestartTests(HttpServiceFixture):
         self.assertTrue(self.server.restart_requested.wait(2))
 
 
+class RouteTableTests(HttpServiceFixture):
+    def test_routes_resolve_from_the_declarative_table(self):
+        route, args = spiral_service.resolve_route("GET", "/session/status")
+        self.assertEqual((route.operation, args), ("session_status", ()))
+        self.assertEqual(route.idempotency, spiral_service.Idempotency.NONE)
+
+        route, args = spiral_service.resolve_route("POST", "/session/stop")
+        self.assertEqual((route.operation, args), ("session_stop", ()))
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.COMMAND_ID)
+        self.assertTrue(route.reads_body)
+
+        upload_id = "a" * 32
+        route, args = spiral_service.resolve_route(
+            "PUT", f"/session/inputs/{upload_id}/files/meta.json")
+        self.assertEqual((route.operation, args),
+                         ("upload_file", (upload_id, "meta.json")))
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.CONTENT)
+
+        route, _ = spiral_service.resolve_route(
+            "POST", f"/session/inputs/{upload_id}/finalize")
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.UPLOAD_ID)
+
+        # A path is only reachable through the method that declares it.
+        self.assertEqual(spiral_service.resolve_route("GET", "/session/stop"),
+                         (None, ()))
+        self.assertEqual(spiral_service.resolve_route("GET", "/nope"),
+                         (None, ()))
+        for route in spiral_service.ROUTES:
+            self.assertIn(route.idempotency,
+                          {spiral_service.Idempotency.NONE,
+                           spiral_service.Idempotency.COMMAND_ID,
+                           spiral_service.Idempotency.CONTENT,
+                           spiral_service.Idempotency.UPLOAD_ID},
+                          route.operation)
+
+    def test_dispatch_serves_read_and_mutating_routes_unchanged(self):
+        status, payload, _ = self.request("GET", "/session/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
+
+        # A command-ID route still refuses an unstamped request, and reaches
+        # the operation (which has no session) when it is stamped.
+        status, payload, _ = self.request("POST", "/session/stop", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("command_id", json.loads(payload)["error"])
+        status, payload, _ = self.request("POST", "/session/stop",
+                                          body={"command_id": "stop-1"})
+        self.assertEqual(status, 409)
+        self.assertIn("No fit session", json.loads(payload)["error"])
+
+        status, _, _ = self.request("GET", "/nonexistent")
+        self.assertEqual(status, 404)
+
+    def test_malformed_post_body_is_reported_before_the_route_is_known(self):
+        request = urllib.request.Request(self.base + "/nonexistent",
+                                         method="POST")
+        request.add_header("Authorization", "Bearer secret-key")
+        request.add_header("Content-Type", "application/json")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, data=b"{not json", timeout=10)
+        self.assertEqual(caught.exception.code, 400)
+
+
+class CommandReplayTests(unittest.TestCase):
+    def test_replay_is_namespaced_per_operation(self):
+        state = ServiceState()
+        calls = []
+
+        def action(name):
+            def run():
+                calls.append(name)
+                return {"accepted": True, "operation": name}
+            return run
+
+        first = state.replay_command("session_stop", "shared-id",
+                                     action("stop"))
+        repeat = state.replay_command("session_stop", "shared-id",
+                                      action("stop-again"))
+        self.assertEqual(repeat, first)
+        self.assertEqual(calls, ["stop"])
+
+        # A different operation carrying the same command ID is its own
+        # command; it must not replay the first operation's response.
+        other = state.replay_command("session_load", "shared-id",
+                                     action("load"))
+        self.assertEqual(other["operation"], "load")
+        self.assertEqual(calls, ["stop", "load"])
+
+    def test_command_id_is_required(self):
+        state = ServiceState()
+        for command_id in (None, "", "   ", 7):
+            with self.assertRaisesRegex(ApiError, "command_id"):
+                state.replay_command("session_stop", command_id,
+                                     lambda: {"accepted": True})
+
+
 class LogStreamingTests(HttpServiceFixture):
     def test_authenticated_log_reads_are_incremental(self):
         self.state.logs.write("stdout", "loading inputs\n")
@@ -415,13 +562,37 @@ class LogStreamingTests(HttpServiceFixture):
         self.assertEqual([entry["text"] for entry in restarted_client["entries"]],
                          ["two", "three"])
 
-    def test_routine_poll_access_lines_do_not_fill_the_log_buffer(self):
+    def test_successful_polling_requests_are_suppressed_at_the_source(self):
+        # The handler's log_request override keeps successful status, log,
+        # and event polls out of the terminal (and therefore out of every
+        # relay); failed polls and other requests still log.
+        handler = spiral_service.SpiralHandler.__new__(
+            spiral_service.SpiralHandler)
+        logged = []
+        handler.log_message = lambda fmt, *args: logged.append(fmt % args)
+        handler.requestline = "GET /session/status HTTP/1.1"
+
+        def probe(command, path, code):
+            handler.command = command
+            handler.path = path
+            handler.log_request(code)
+
+        probe("GET", "/session/status", 200)
+        probe("GET", "/logs?after=4", 200)
+        probe("GET", "/events?cursor=9", 200)
+        self.assertEqual(logged, [])
+        probe("GET", "/session/status", 401)
+        probe("GET", "/health", 200)
+        probe("POST", "/session/run", 200)
+        self.assertEqual(len(logged), 3)
+
+    def test_log_buffer_no_longer_string_filters_access_lines(self):
         logs = ServiceLogBuffer()
-        logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 200 -\n')
-        logs.write("stderr", 'SPIRAL_HTTP "GET /logs?after=4 HTTP/1.1" 200 -\n')
+        logs.write("stderr", 'SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -\n')
         logs.write("stderr", "useful fitter warning\n")
         self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
-                         ["useful fitter warning"])
+                         ['SPIRAL_HTTP "GET /session/status HTTP/1.1" 401 -',
+                          "useful fitter warning"])
 
     def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
         logs = ServiceLogBuffer()
@@ -547,11 +718,17 @@ class ArtifactHttpTests(HttpServiceFixture):
 class DatasetOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        base = Path(self.temporary.name)
+        self.root = base / "dataset"
+        self.root.mkdir()
+        _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
-        (self.root / "spiral_output").mkdir()
-        self.resolution = resolve_dataset_root(self.root)
+        self.output = base / "output"
+        self.output.mkdir()
+        self.cache = base / "cache"
+        self.resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
                                   dataset_resolution=self.resolution)
@@ -563,9 +740,15 @@ class DatasetOwnershipTests(unittest.TestCase):
         response = self.state.dataset()
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
+        # The startup-bound deployment roots are part of the advertisement.
+        self.assertEqual(response["resolved"]["output_directory"],
+                         str(self.output))
+        self.assertEqual(response["resolved"]["cache_directory"],
+                         str(self.cache))
 
     def test_dataset_endpoint_advertises_named_session(self):
-        resolution = resolve_dataset_root(self.root, session_name="alice")
+        resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output / "alice", self.cache)
         state = ServiceState(
             dataset_root=str(self.root), dataset_resolution=resolution,
             session_name="alice")
@@ -573,7 +756,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["session_name"], "alice")
         self.assertEqual(
             response["resolved"]["output_directory"],
-            str(self.root / "spiral_output" / "alice"))
+            str(self.output / "alice"))
 
     def test_dataset_resolution_discovers_drawn_control_points(self):
         drawn = self.root / "drawn_control_points.json"
@@ -601,13 +784,18 @@ class DatasetOwnershipTests(unittest.TestCase):
             "path": str(same_winding), "role": "same_winding", "required": False,
         }])
 
-    def test_arbitrary_root_resolution_is_refused(self):
-        with self.assertRaises(ApiError) as caught:
-            self.state.resolve("/somewhere/else")
-        self.assertEqual(caught.exception.status, 403)
-        # The launch dataset itself (or an empty root) returns the resolution.
-        self.assertEqual(self.state.resolve("")["root"], str(self.root))
-        self.assertEqual(self.state.resolve(str(self.root))["root"], str(self.root))
+    def test_generated_state_roots_live_under_the_output_root(self):
+        # Every generated-state family hangs off the bound --output root and
+        # never off the dataset.
+        self.assertEqual(self.state._output_root(), self.output)
+        self.assertEqual(self.state._staging_root(),
+                         self.output / ".spiral-upload-staging")
+        self.assertEqual(self.state._checkpoint_upload_root(),
+                         self.output / "uploaded-checkpoints")
+        _attach_fake_session(self.state, self.output, self.root)
+        ephemeral = self.state._session_ephemeral_dir()
+        self.assertTrue(ephemeral.is_relative_to(self.output))
+        self.assertFalse(ephemeral.is_relative_to(self.root))
 
     def test_load_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
@@ -693,12 +881,12 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertIsNone(status["session_request"])
 
     def test_save_checkpoint_is_constrained_to_output_directory(self):
-        _attach_fake_session(self.state, self.root / "spiral_output", self.root)
+        _attach_fake_session(self.state, self.output, self.root)
         with self.assertRaises(ApiError) as caught:
             self.state.save_checkpoint({"path": str(self.root / "elsewhere.ckpt")})
         self.assertEqual(caught.exception.status, 400)
         response = self.state.save_checkpoint(
-            {"path": str(self.root / "spiral_output" / "manual.ckpt")})
+            {"path": str(self.output / "manual.ckpt")})
         self.assertTrue(response["checkpoint_path"].endswith("manual.ckpt"))
 
 
@@ -755,6 +943,61 @@ class UploadTests(unittest.TestCase):
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
                          "patch-1")
+
+    def test_upload_put_retries_are_content_addressed(self):
+        self._session()
+        data = PATCH_FILES["meta.json"]
+        upload_id = self.state.begin_upload({
+            "kind": "patch", "id": "retried", "files": [
+                {"name": name, "size": len(payload),
+                 "sha256": _digest(payload)}
+                for name, payload in PATCH_FILES.items()],
+        })["upload_id"]
+        staging = self.output / ".spiral-upload-staging" / upload_id
+
+        # An upload PUT carries no command ID: the manifest's size and digest
+        # decide the outcome, so repeating one is safe and converges.
+        for _ in range(3):
+            response = self.state.receive_upload_file(
+                upload_id, "meta.json", io.BytesIO(data), len(data))
+            self.assertEqual(response["received"], "meta.json")
+        self.assertEqual((staging / "meta.json").read_bytes(), data)
+
+        # A retry that delivers different bytes is refused and never replaces
+        # the staged copy that already matched the manifest.
+        corrupted = b"!" * len(data)
+        with self.assertRaisesRegex(ApiError, "SHA-256"):
+            self.state.receive_upload_file(
+                upload_id, "meta.json", io.BytesIO(corrupted), len(corrupted))
+        self.assertEqual((staging / "meta.json").read_bytes(), data)
+        self.assertEqual([path.name for path in staging.iterdir()],
+                         ["meta.json"])
+
+        for name in ("x.tif", "y.tif", "z.tif"):
+            payload = PATCH_FILES[name]
+            self.state.receive_upload_file(
+                upload_id, name, io.BytesIO(payload), len(payload))
+        record = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(record["id"], "retried")
+
+    def test_finalize_is_idempotent_per_upload_id(self):
+        self._session()
+        upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
+        first = self.state.finalize_upload(upload_id)["input"]
+        second = self.state.finalize_upload(upload_id)["input"]
+        self.assertEqual(first, second)
+        # The replay publishes nothing a second time.
+        self.assertEqual(
+            [record["id"] for record in self.state.status()["ephemeral_inputs"]],
+            ["fiber-1"])
+        # A finalized upload is a session input, not a transfer any more.
+        with self.assertRaisesRegex(ApiError, "already finalized"):
+            self.state.receive_upload_file(
+                upload_id, "fiber.json",
+                io.BytesIO(FIBER_FILES["fiber.json"]),
+                len(FIBER_FILES["fiber.json"]))
+        with self.assertRaisesRegex(ApiError, "finalized"):
+            self.state.delete_upload(upload_id)
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -1006,11 +1249,16 @@ def _zip_checkpoint_bytes(payload=b"payload"):
 class CheckpointUploadTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        base = Path(self.temporary.name)
+        self.root = base / "dataset"
+        self.root.mkdir()
+        _write_scroll_spec(self.root)
         (self.root / "umbilicus.json").write_text("{}")
         (self.root / "verified_patches").mkdir()
-        (self.root / "spiral_output").mkdir()
-        self.resolution = resolve_dataset_root(self.root)
+        self.output = base / "output"
+        self.output.mkdir()
+        self.resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, base / "cache")
         self.assertTrue(self.resolution.ok)
         self.state = ServiceState(dataset_root=str(self.root),
                                   dataset_resolution=self.resolution)
@@ -1064,8 +1312,8 @@ class CheckpointUploadTests(unittest.TestCase):
                                   {"bad.ckpt": b"not a torch archive"})
         with self.assertRaisesRegex(ApiError, "Invalid checkpoint"):
             self.state.finalize_upload(upload_id)
-        self.assertFalse(any((self.root / "spiral_output" / "uploaded-checkpoints").glob("*"))
-                         if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
+        self.assertFalse(any((self.output / "uploaded-checkpoints").glob("*"))
+                         if (self.output / "uploaded-checkpoints").exists()
                          else False)
 
     def test_identical_checkpoint_is_reused_without_an_upload(self):
@@ -1112,7 +1360,7 @@ class CheckpointUploadTests(unittest.TestCase):
         self.assertEqual(begin["input"]["path"], first["path"])
 
     def test_legacy_named_checkpoint_is_found_by_digest(self):
-        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root = self.output / "uploaded-checkpoints"
         root.mkdir()
         data = _zip_checkpoint_bytes()
         legacy = root / "resume-before-v7.ckpt"
@@ -1148,7 +1396,7 @@ class CheckpointUploadTests(unittest.TestCase):
         first = self.state.finalize_upload(first_id)["input"]
         second = self.state.finalize_upload(second_id)["input"]
         self.assertEqual(first["path"], second["path"])
-        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root = self.output / "uploaded-checkpoints"
         self.assertEqual([Path(first["path"])], list(root.iterdir()))
 
     def test_reusing_a_checkpoint_refreshes_retention_recency(self):
@@ -1202,6 +1450,87 @@ class CheckpointUploadTests(unittest.TestCase):
             spiral_service.EPHEMERAL_QUOTA_BYTES = original
 
 
+class EphemeralLedgerTests(unittest.TestCase):
+    """Incorporation and persistence are independent, typed states."""
+
+    def _ledger(self):
+        ledger = EphemeralLedger(threading.RLock())
+        ledger.add({"id": "patch-1", "kind": "patch", "role": None,
+                    "path": "/staged/patch-1", "bytes": 12,
+                    "upload_id": "a" * 32})
+        return ledger
+
+    def test_new_input_is_pending_and_ephemeral(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("pending", "ephemeral"))
+        self.assertEqual(ledger.pending(), [record])
+        self.assertEqual(ledger.uncommitted(), [record])
+        self.assertEqual(ledger.committed_not_incorporated(), [])
+        self.assertEqual(ledger.bytes_in_use(), 12)
+        self.assertEqual(record.status_entry(), {
+            "id": "patch-1", "kind": "patch", "role": None,
+            "state": "pending", "bytes": 12, "committed": False})
+
+    def test_the_two_states_move_independently(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+
+        ledger.mark_committed([record])
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("pending", "committed"))
+        # Committed but not yet part of the fit: still queued for the run,
+        # no longer a commit candidate, and called out as such.
+        self.assertEqual(ledger.pending(), [record])
+        self.assertEqual(ledger.uncommitted(), [])
+        self.assertEqual(ledger.committed_not_incorporated(), [record])
+
+        # Incorporating it settles both states, so it leaves the ledger.
+        ledger.mark_incorporated([record])
+        self.assertEqual(ledger.records, [])
+
+    def test_incorporation_can_precede_persistence(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        ledger.mark_incorporated([record])
+        self.assertEqual((record.incorporation, record.persistence),
+                         ("incorporated", "ephemeral"))
+        self.assertEqual(ledger.pending(), [])
+        self.assertEqual(ledger.uncommitted(), [record])
+        ledger.mark_committed([record])
+        self.assertEqual(ledger.records, [])
+
+    def test_incorporation_failure_keeps_the_record_with_its_error(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        ledger.mark_incorporated([record], error="RuntimeError: boom")
+        self.assertEqual(record.incorporation, "error")
+        self.assertEqual(record.error, "RuntimeError: boom")
+        # An errored input is neither queued for the fit nor committable.
+        self.assertEqual(ledger.pending(), [])
+        self.assertEqual(ledger.uncommitted(), [])
+        self.assertEqual(record.status_entry()["state"], "error")
+
+    def test_fitter_payloads_resolve_back_to_their_records(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        payload = record.payload()
+        self.assertEqual(payload["path"], "/staged/patch-1")
+        self.assertEqual(payload["state"], "pending")
+        # The fitter (and its DDP children) hand back plain records.
+        self.assertEqual(ledger.resolve([dict(payload)]), [record])
+        ledger.mark_incorporated(ledger.resolve([dict(payload)]))
+        self.assertTrue(record.incorporated)
+
+    def test_removal_and_reset_clear_the_ledger(self):
+        ledger = self._ledger()
+        ledger.remove(ledger.find("patch", "patch-1"))
+        self.assertEqual(ledger.records, [])
+        self.assertFalse(ledger.contains("patch", "patch-1"))
+        self._ledger().clear()
+
+
 class CommitTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1248,6 +1577,48 @@ class CommitTests(unittest.TestCase):
                          {"patch-9", "fiber-9", "pcl-9"})
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
+
+    def test_status_names_committed_but_not_incorporated_inputs(self):
+        self._finalize("patch", "patch-9", PATCH_FILES)
+        self._finalize("fiber", "fiber-9", FIBER_FILES)
+        status = self.state.status()
+        self.assertEqual(status["committed_not_incorporated"], [])
+
+        self.state.commit_inputs()
+        status = self.state.status()
+        # The dataset holds both, but the resident fit has taken neither.
+        self.assertEqual(
+            sorted(record["id"]
+                   for record in status["committed_not_incorporated"]),
+            ["fiber-9", "patch-9"])
+        self.assertEqual(
+            {record["kind"]
+             for record in status["committed_not_incorporated"]},
+            {"patch", "fiber"})
+        self.assertFalse(status["commit_available"])
+        self.assertIn("already committed", status["commit_unavailable_reason"])
+
+        # Running incorporates them; a committed and incorporated input is
+        # fully settled and drops out of the ephemeral bookkeeping.
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+        self.assertEqual(sorted(record["id"] for record in pending),
+                         ["fiber-9", "patch-9"])
+        mark(pending)
+        status = self.state.status()
+        self.assertEqual(status["committed_not_incorporated"], [])
+        self.assertEqual(status["ephemeral_inputs"], [])
+
+    def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
+        record = self._finalize("patch", "patch-9", PATCH_FILES)
+        shutil.rmtree(record["path"])
+        with self.assertRaisesRegex(ApiError, "staged copy"):
+            self.state.commit_inputs()
+        # Validation happens before anything is published, so the dataset is
+        # untouched and the record keeps its ephemeral state.
+        self.assertFalse((self.dataset / "verified_patches" / "patch-9").exists())
+        self.assertEqual(self.state.status()["ephemeral_inputs"][0]["committed"],
+                         False)
 
     def test_concurrent_service_commits_serialize_pcl_merges(self):
         output_b = self.root / "output-b"
@@ -1700,12 +2071,32 @@ class LasagnaSurfaceCleanupTests(unittest.TestCase):
 class ServiceProcessTests(unittest.TestCase):
     """End-to-end launch of the real service process (no torch import)."""
 
-    def _launch(self, arguments, temporary):
+    def _launch(self, arguments, temporary, env=None):
         script = Path(__file__).resolve().parents[1] / "spiral_service.py"
+        merged_env = None
+        if env is not None:
+            merged_env = dict(os.environ)
+            merged_env.update(env)
         return subprocess.Popen(
             [sys.executable, str(script)] + arguments,
-            cwd=str(script.parent),
+            cwd=str(script.parent), env=merged_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    @staticmethod
+    def _make_dataset(temporary):
+        """A minimal valid dataset plus a sibling output root."""
+        dataset = Path(temporary) / "dataset"
+        dataset.mkdir(exist_ok=True)
+        _write_scroll_spec(dataset)
+        (dataset / "umbilicus.json").write_text("{}")
+        (dataset / "verified_patches").mkdir(exist_ok=True)
+        output = Path(temporary) / "output"
+        output.mkdir(exist_ok=True)
+        return dataset, output
+
+    def _dataset_arguments(self, temporary):
+        dataset, output = self._make_dataset(temporary)
+        return ["--dataset", str(dataset), "--output", str(output)]
 
     def _read_until_ready(self, process, deadline=30.0):
         lines = []
@@ -1722,7 +2113,8 @@ class ServiceProcessTests(unittest.TestCase):
     def test_ready_line_is_version_agnostic_and_health_negotiates(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            process = self._launch(["--port", "0", "--api-key-file", str(key_file)],
+            process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
+                                   + self._dataset_arguments(temporary),
                                    temporary)
             try:
                 lines = self._read_until_ready(process)
@@ -1757,7 +2149,8 @@ class ServiceProcessTests(unittest.TestCase):
                 reservation.bind(("127.0.0.1", 0))
                 port = reservation.getsockname()[1]
             process = self._launch(
-                ["--port", str(port), "--api-key-file", str(key_file)],
+                ["--port", str(port), "--api-key-file", str(key_file)]
+                + self._dataset_arguments(temporary),
                 temporary)
             try:
                 self._read_until_ready(process)
@@ -1793,7 +2186,7 @@ class ServiceProcessTests(unittest.TestCase):
             process = self._launch([
                 "--port", "0", "--api-key-file", str(key_file),
                 "--gpus", "3,1",
-            ], temporary)
+            ] + self._dataset_arguments(temporary), temporary)
             try:
                 lines = self._read_until_ready(process)
                 ready = next(line for line in lines
@@ -1814,8 +2207,9 @@ class ServiceProcessTests(unittest.TestCase):
     def test_explicit_port_can_be_rebound_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            process = self._launch(["--port", "0", "--api-key-file", str(key_file)],
-                                   temporary)
+            arguments = self._dataset_arguments(temporary)
+            process = self._launch(["--port", "0", "--api-key-file", str(key_file)]
+                                   + arguments, temporary)
             try:
                 ready = [line for line in self._read_until_ready(process)
                          if line.startswith("SPIRAL_SERVICE_READY")][0]
@@ -1825,7 +2219,8 @@ class ServiceProcessTests(unittest.TestCase):
                 process.wait(10)
             # Restart on the same, now-explicit port straight away.
             process = self._launch(["--port", str(port),
-                                    "--api-key-file", str(key_file)], temporary)
+                                    "--api-key-file", str(key_file)]
+                                   + arguments, temporary)
             try:
                 self._read_until_ready(process)
             finally:
@@ -1837,23 +2232,106 @@ class ServiceProcessTests(unittest.TestCase):
             key_file = Path(temporary) / "key"
             empty = Path(temporary) / "empty-dataset"
             empty.mkdir()
+            output_root = Path(temporary) / "output"
             process = self._launch(["--port", "0", "--api-key-file", str(key_file),
-                                    "--dataset", str(empty)], temporary)
+                                    "--dataset", str(empty),
+                                    "--output", str(output_root)], temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
             self.assertIn("missing required", output)
 
+    def test_dataset_and_output_are_required_arguments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            process = self._launch(["--port", "0"], temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--dataset", output)
+            self.assertIn("--output", output)
+
+            dataset, _ = self._make_dataset(temporary)
+            process = self._launch(["--port", "0", "--dataset", str(dataset)],
+                                   temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--output", output)
+
+    def test_output_inside_the_dataset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset, _ = self._make_dataset(temporary)
+            for inside in (dataset, dataset / "spiral_output"):
+                process = self._launch(["--port", "0",
+                                        "--dataset", str(dataset),
+                                        "--output", str(inside)], temporary)
+                output, _ = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 2)
+                self.assertIn("--output must resolve outside the dataset root",
+                              output)
+
+    def test_cache_inside_the_dataset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset, output_root = self._make_dataset(temporary)
+            process = self._launch(["--port", "0",
+                                    "--dataset", str(dataset),
+                                    "--output", str(output_root),
+                                    "--cache", str(dataset / ".spiral-cache")],
+                                   temporary)
+            output, _ = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 2)
+            self.assertIn("--cache must resolve outside the dataset root",
+                          output)
+
+    def test_dataset_advertises_bound_output_and_default_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            dataset, output_root = self._make_dataset(temporary)
+            xdg_cache = Path(temporary) / "xdg-cache"
+            process = self._launch(
+                ["--port", "0", "--api-key-file", str(key_file),
+                 "--dataset", str(dataset), "--output", str(output_root)],
+                temporary, env={"XDG_CACHE_HOME": str(xdg_cache)})
+            try:
+                lines = self._read_until_ready(process)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/dataset",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    advertised = json.loads(response.read())
+                resolved = advertised["resolved"]
+                self.assertEqual(resolved["output_directory"],
+                                 str(output_root.resolve()))
+                self.assertEqual(
+                    resolved["cache_directory"],
+                    str(xdg_cache.resolve() / "vc3d" / "spiral"))
+                # The browse endpoint is gone: resolution happens once at
+                # startup and /dataset advertises the result.
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/dataset/resolve",
+                    method="POST",
+                    data=json.dumps({"dataset_root": str(dataset)}).encode(),
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=10)
+                self.assertEqual(caught.exception.code, 404)
+                caught.exception.close()
+            finally:
+                process.terminate()
+                process.wait(10)
+                process.stdout.close()
+
     def test_named_dataset_service_has_exclusive_restartable_ownership(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            dataset = root / "dataset"
-            dataset.mkdir()
-            (dataset / "umbilicus.json").write_text("{}")
-            (dataset / "verified_patches").mkdir()
+            dataset, output_root = self._make_dataset(temporary)
             key_file = root / "key"
             arguments = [
                 "--port", "0", "--api-key-file", str(key_file),
-                "--dataset", str(dataset), "--session-name", "alice",
+                "--dataset", str(dataset), "--output", str(output_root),
+                "--session-name", "alice",
             ]
             first = self._launch(arguments, temporary)
             try:
@@ -1869,6 +2347,9 @@ class ServiceProcessTests(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=10) as response:
                     health = json.loads(response.read())
                 self.assertEqual(health["session_name"], "alice")
+                # The exclusive lease lives under the named output namespace.
+                self.assertTrue(
+                    (output_root / "alice" / ".spiral-service.lock").is_file())
 
                 duplicate = self._launch(arguments, temporary)
                 output, _ = duplicate.communicate(timeout=30)
@@ -1886,15 +2367,6 @@ class ServiceProcessTests(unittest.TestCase):
                 restarted.terminate()
                 restarted.wait(10)
                 restarted.stdout.close()
-
-    def test_non_loopback_bind_requires_dataset(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            key_file = Path(temporary) / "key"
-            process = self._launch(["--bind", "0.0.0.0", "--port", "0",
-                                    "--api-key-file", str(key_file)], temporary)
-            output, _ = process.communicate(timeout=30)
-            self.assertNotEqual(process.returncode, 0)
-            self.assertIn("--dataset", output)
 
 
 if __name__ == "__main__":

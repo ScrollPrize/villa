@@ -31,8 +31,10 @@ VC3D connects to a Spiral service in one of three modes, all speaking the same
 authenticated HTTP protocol:
 
 - **Localhost** — VC3D launches and owns the service on loopback. Nothing to
-  set up beyond the Python environment; this preserves the fully local
-  workflow where every input path is editable.
+  set up beyond the Python environment; the dataset (plus optional output and
+  cache roots) is chosen in the connection panel and VC3D launches the bound
+  service with those values. Selecting a different dataset restarts the owned
+  service — one service instance is bound to one dataset.
 - **Remote (SSH)** — the supported internet flow. SSH access to the host is
   the only client-side prerequisite: VC3D opens and manages its own SSH
   tunnel, reads the service's auto-generated API key over SSH, and attaches to
@@ -42,11 +44,14 @@ authenticated HTTP protocol:
   service's auto-generated API key. No reverse proxies, VPNs, or manual
   tunnels are ever required.
 
-In both remote modes the service — not the client — owns the base inputs: it
-is launched with `--dataset`, resolves it at startup, and advertises the
-resolution to clients. Remote clients can add ephemeral inputs, commit them,
-and change run parameters, but cannot repoint the session at different host
-paths.
+In every mode the service — not the client — owns the base inputs: it is
+launched with `--dataset` (inputs) and `--output` (all generated state),
+resolves the dataset once at startup, and advertises the result through
+`/dataset`. `--output` must resolve outside the dataset root; the optional
+`--cache` (derived host caches) defaults to the documented user cache,
+`$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients can add
+ephemeral inputs, commit them, and change run parameters, but cannot repoint
+the session at different host paths.
 
 ### Creating the Spiral Python environment
 
@@ -89,10 +94,12 @@ Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
 tmux new -s spiral-alice 'python scripts/spiral/spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --gpus 0 --session-name alice'
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
+    --gpus 0 --session-name alice'
 
 tmux new -s spiral-bob 'python scripts/spiral/spiral_service.py --port 8766 \
-    --dataset /data/scrolls/s1 --gpus 1 --session-name bob'
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
+    --gpus 1 --session-name bob'
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
@@ -101,7 +108,7 @@ host-side list:
 
 ```sh
 python scripts/spiral/spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --gpus 0,1,2,3
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 --gpus 0,1,2,3
 ```
 
 Multi-GPU sessions run one fitter rank per listed device and split the configured
@@ -109,11 +116,11 @@ per-step sample counts across those ranks by default. The device list is fixed f
 the lifetime of the service; restart it to change the selection.
 
 A named service writes autosaves, previews, artifacts, uploaded checkpoints,
-Lasagna output, and ephemeral inputs beneath
-`<dataset>/spiral_output/<session-name>/`. Permanent dataset inputs and the
-dataset-derived `.spiral-cache` remain shared. Two live services cannot own the
-same dataset/session-name pair. Launches without `--session-name` retain the
-legacy `<dataset>/spiral_output/` layout.
+Lasagna output, and ephemeral inputs beneath `<output>/<session-name>/`, held
+under an exclusive lease: two live services cannot own the same
+output/session-name pair. Launches without `--session-name` use `<output>/`
+directly. Permanent dataset inputs and the shared user cache stay untouched —
+nothing generated is ever written under the dataset root.
 
 Every completed Spiral preview is flattened by the host's Lasagna service
 before it becomes downloadable in VC3D. The published grid uses a fixed
@@ -153,12 +160,12 @@ attached terminal is not disconnected.
 
 ```sh
 python scripts/spiral/spiral_service.py --bind 0.0.0.0 --port 8765 \
-    --dataset /data/scrolls/s1
+    --dataset /data/scrolls/s1 --output /data/spiral-output/s1
 ```
 
 Copy the API key printed at startup into the *Remote (LAN)* profile's API key
 field (or export `SPIRAL_API_KEY` before starting VC3D). A non-loopback bind
-always requires both an API key (auto-generated when absent) and `--dataset`.
+always requires an API key (auto-generated when absent).
 
 **Plaintext-HTTP risk note:** direct HTTP is not encrypted — on-path observers
 can read the API key and the transferred data, so use it only on networks the
@@ -176,25 +183,38 @@ validation and never ignores certificate errors.
   ready line — the console print at startup is the intended way to obtain it.
 - `--nonce` is only for processes launched and owned by VC3D.
 
-### Datasets and output
+### Datasets, output, and cache
 
-`--dataset` must point at a dataset root containing at least `umbilicus.json`
-and `verified_patches/`; the service refuses to start when required entries
-are missing and prints what was missing. Output goes to
-`<dataset>/spiral_output` by default, or its named child when the service uses
-`--session-name` (from the same resolution VC3D shows).
-Make sure that directory's filesystem has room for checkpoints and previews.
+`--dataset` must point at a dataset root containing at least `umbilicus.json`,
+`verified_patches/`, and `spiral-scroll.json`; the service refuses to start
+when required entries are missing and prints what was missing. The dataset
+holds inputs only.
+
+`--output` is required and must resolve outside the dataset root. Every piece
+of generated state — run directories, autosaves, previews, published
+artifacts, ephemeral inputs, upload staging, and uploaded checkpoints — lives
+under it (under `<output>/<session-name>` for a named service). Make sure its
+filesystem has room for checkpoints and previews.
+
+`--cache` holds derived host caches (content-addressed, shareable between
+datasets). It defaults to `$XDG_CACHE_HOME/vc3d/spiral`
+(`~/.cache/vc3d/spiral`) and must also resolve outside the dataset root. The
+headless `fit_spiral.py` CLI accepts the same `--cache` with the same default
+(`FIT_SPIRAL_CACHE_DIR` still overrides it for the CLI).
+
 If the dataset root is read-only the fit still works, but *Commit current
-inputs* is unavailable and the cache falls back to the user cache directory.
+inputs* is unavailable (committing writes inputs into the dataset).
 
 ### Connecting from VC3D
 
 Open the Spiral workspace and pick the profile in the *Spiral Service*
-section. Connection must succeed (an authenticated `/health` handshake and an
-API-version check) before session controls enable. In remote modes the
-base-input rows populate read-only from the service's advertised dataset
-resolution; run parameters (z range, iterations, advanced config) stay
-editable and persist per profile. Generated previews, geometry, and
+section. For the local profile, set the dataset root (and optionally output
+and cache roots) there — VC3D launches its owned service bound to those
+values. Connection must succeed (an authenticated `/health` handshake and an
+API-version check) before session controls enable. The base-input rows always
+populate read-only from the service's advertised dataset resolution; run
+parameters (z range, iterations, advanced config) stay editable and persist
+per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
 filesystem is needed. Optional: set the profile's path map
 (service prefix → local prefix) if this machine mounts the same dataset, so
@@ -253,7 +273,8 @@ Description=VC3D Spiral fitting service
 WorkingDirectory=%h/volume-cartographer
 ExecStart=%h/volume-cartographer/scripts/spiral/.venv/bin/python \
     %h/volume-cartographer/scripts/spiral/spiral_service.py \
-    --port 8765 --dataset /data/scrolls/s1 --gpus 0
+    --port 8765 --dataset /data/scrolls/s1 \
+    --output /data/spiral-output/s1 --gpus 0
 Restart=on-failure
 
 [Install]

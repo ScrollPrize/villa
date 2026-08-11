@@ -24,17 +24,32 @@ struct SpiralServiceProfile
     // be loaded locally when both machines mount the same dataset.
     QString serviceRootPrefix;
     QString localRootPrefix;
+    // Local launch bindings: the owned service is started with
+    // --dataset/--output/--cache from these values (dataset is required;
+    // empty output derives a per-dataset default outside the dataset; empty
+    // cache uses the service's documented user-cache default). Remote
+    // profiles never carry these — their paths are advertised by /dataset.
+    QString datasetRoot;
+    QString outputRoot;
+    QString cacheRoot;
 
     bool isLocalhost() const { return autoLaunch; }
     bool isRemote() const { return !autoLaunch; }
 
-    static SpiralServiceProfile localhostProfile()
+    static SpiralServiceProfile localhostProfile(QSettings* settings = nullptr)
     {
         SpiralServiceProfile profile;
         profile.id = QStringLiteral("localhost");
         profile.name = QObject::tr("Local (this computer)");
         profile.transport = Transport::Direct;
         profile.autoLaunch = true;
+        if (settings) {
+            settings->beginGroup(QStringLiteral("spiral/profiles/localhost"));
+            profile.datasetRoot = settings->value(QStringLiteral("dataset_root")).toString();
+            profile.outputRoot = settings->value(QStringLiteral("output_root")).toString();
+            profile.cacheRoot = settings->value(QStringLiteral("cache_root")).toString();
+            settings->endGroup();
+        }
         return profile;
     }
 
@@ -52,6 +67,9 @@ struct SpiralServiceProfile
         settings.setValue(QStringLiteral("remote_service_port"), remoteServicePort);
         settings.setValue(QStringLiteral("service_root_prefix"), serviceRootPrefix);
         settings.setValue(QStringLiteral("local_root_prefix"), localRootPrefix);
+        settings.setValue(QStringLiteral("dataset_root"), datasetRoot);
+        settings.setValue(QStringLiteral("output_root"), outputRoot);
+        settings.setValue(QStringLiteral("cache_root"), cacheRoot);
         settings.endGroup();
     }
 
@@ -70,6 +88,9 @@ struct SpiralServiceProfile
         profile.remoteServicePort = settings.value(QStringLiteral("remote_service_port"), 0).toInt();
         profile.serviceRootPrefix = settings.value(QStringLiteral("service_root_prefix")).toString();
         profile.localRootPrefix = settings.value(QStringLiteral("local_root_prefix")).toString();
+        profile.datasetRoot = settings.value(QStringLiteral("dataset_root")).toString();
+        profile.outputRoot = settings.value(QStringLiteral("output_root")).toString();
+        profile.cacheRoot = settings.value(QStringLiteral("cache_root")).toString();
         settings.endGroup();
         return profile;
     }
