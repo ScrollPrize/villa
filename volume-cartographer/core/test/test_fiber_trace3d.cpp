@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <cmath>
@@ -1449,4 +1450,92 @@ TEST_CASE("native fiber extrapolation fails at invalid start or first step")
     CHECK(result.reason == "no_valid_candidates");
     REQUIRE(result.points.size() == 1);
     CHECK(result.points.front()[0] == doctest::Approx(4.0));
+}
+
+TEST_CASE("polyline matching is monotone, bounded, and preserves repeated vertices")
+{
+    const auto geometry = vc::fiber_tracer::makePolylineArcGeometry({
+        {0.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0},
+        {0.0, 4.0, 0.0},
+    });
+    CHECK(geometry.length() == doctest::Approx(12.0));
+
+    const auto first = vc::fiber_tracer::projectPointToPolylineArc(
+        geometry, {0.0, 0.1, 0.0}, 0.0, 5.0);
+    CHECK(first.arc == doctest::Approx(0.0));
+    CHECK(first.segmentIndex == 0);
+
+    const auto repeated = vc::fiber_tracer::projectPointToPolylineArc(
+        geometry, {0.0, 0.1, 0.0}, 7.0, 12.0);
+    CHECK(repeated.arc == doctest::Approx(8.1));
+    CHECK(repeated.segmentIndex == 3);
+
+    const auto slice = vc::fiber_tracer::slicePolylineArc(geometry, 3.0, 9.0);
+    REQUIRE(slice.size() == 5);
+    CHECK(slice.front()[0] == doctest::Approx(3.0));
+    CHECK(slice.back()[1] == doctest::Approx(1.0));
+}
+
+TEST_CASE("greedy replay detects a dense-line failure and retains exact postroll")
+{
+    SlantedPrediction predictions;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {
+        {0.0, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+    };
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.traceToBaseScale = 1.0;
+    request.errorThresholdBaseVoxels = 1.0;
+    request.matchRefineSteps = 1.0;
+    request.postrollSteps = 2;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberReplay(
+        predictions, request);
+
+    CHECK(result.status == vc::fiber_tracer::FiberReplayStatus::FailureWithPostroll);
+    REQUIRE(result.failureTracePointIndex.has_value());
+    CHECK(result.completedPostrollSteps == 2);
+    CHECK(result.tracePointsBase.size() == *result.failureTracePointIndex + 3);
+    CHECK(result.cumulativeLosses.size() == result.tracePointsBase.size());
+    REQUIRE_FALSE(result.matches.empty());
+    for (size_t index = 1; index < result.matches.size(); ++index) {
+        CHECK(result.matches[index].matchedReferenceArcBase >=
+              result.matches[index - 1].matchedReferenceArcBase);
+        CHECK(result.matches[index].matchedReferenceArcBase <=
+              result.matches[index].searchEndArcBase);
+    }
+    CHECK(result.matches.back().errorBaseVoxels > 1.0);
+}
+
+TEST_CASE("replay reports an invalid initial prediction without throwing")
+{
+    InvalidStartPrediction predictions;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {{0.0, 0.0, 0.0}, {20.0, 0.0, 0.0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.config.beamWidth = 1;
+    request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberReplay(predictions, request);
+    CHECK(result.status ==
+          vc::fiber_tracer::FiberReplayStatus::TraceTerminatedBeforeFailure);
+    CHECK(result.terminationReason == "invalid_initial_prediction");
+    REQUIRE(result.tracePointsBase.size() == 1);
 }

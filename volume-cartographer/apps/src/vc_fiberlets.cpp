@@ -1,10 +1,13 @@
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
+#include "FiberTraceCli.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -25,12 +28,14 @@ namespace
 enum class Command {
     Anchors,
     Paths,
+    FiberReplay,
 };
 
 struct CliOptions {
     Command command = Command::Anchors;
     std::string manifestLocation;
     std::filesystem::path anchorArtifact;
+    std::filesystem::path fiberJson;
     std::string normalManifestLocation;
     std::filesystem::path outputDirectory;
     std::filesystem::path remoteCacheDirectory;
@@ -45,6 +50,14 @@ struct CliOptions {
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool printStats = false;
     bool writePresenceSlices = true;
+    int inferenceScaledownPower = 2;
+    double failureThresholdBaseVoxels = 20.0;
+    int postrollSteps = 100;
+    double alongBaseVoxels = 512.0;
+    double radiusBaseVoxels = 128.0;
+    double matchRefineSteps = 1.0;
+    vc::fiber_tracer::FiberTraceConfig trace;
+    vc::fiber_tracer::cli::SeenOptions seenTraceOptions;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -58,6 +71,9 @@ void usage(const char* executable)
               << "  " << executable << " anchors <fiber.lasagna.json-or-url> <output-dir> [options]\n"
               << "  " << executable
               << " paths <fiber.lasagna.json-or-url> <anchors.json> <output-dir>"
+                 " --normal-manifest <lasagna.json-or-url> [options]\n\n"
+              << "  " << executable
+              << " fiber-replay <fiber.lasagna.json-or-url> <fiber.json> <output-dir>"
                  " --normal-manifest <lasagna.json-or-url> [options]\n\n"
               << "Common options:\n"
               << "  --threads N                   decode/search workers [hardware]\n"
@@ -90,6 +106,13 @@ void usage(const char* executable)
               << "  --smoothness-free-angle N     lattice free angle in degrees [45]\n"
               << "  --stats                       print path-count and score statistics\n"
               << "  --no-slices                   skip central presence-slice outputs\n";
+    std::cerr << "\nReplay options:\n"
+              << "  --fail N                      dense-reference failure distance in base voxels [20]\n"
+              << "  --after N                     greedy steps retained after failure [100]\n"
+              << "  --along N                     reference distance each side of failure [512]\n"
+              << "  --radius N                    extraction tube radius in base voxels [128]\n"
+              << "  --match-refine N              forward match refinement in trace steps [1]\n"
+              << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
 }
 
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
@@ -167,6 +190,16 @@ CliOptions parseArgs(int argc, char** argv)
         options.anchorArtifact = argv[3];
         options.outputDirectory = argv[4];
         firstOption = 5;
+    } else if (command == "fiber-replay") {
+        if (argc < 5) {
+            usage(argv[0]);
+            std::exit(2);
+        }
+        options.command = Command::FiberReplay;
+        options.manifestLocation = argv[2];
+        options.fiberJson = argv[3];
+        options.outputDirectory = argv[4];
+        firstOption = 5;
     } else {
         usage(argv[0]);
         std::exit(2);
@@ -174,6 +207,7 @@ CliOptions parseArgs(int argc, char** argv)
     const int workers = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
     options.anchors.parallelThreads = workers;
     options.paths.parallelThreads = workers;
+    options.trace.parallelThreads = workers;
     for (int index = firstOption; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
@@ -183,6 +217,7 @@ CliOptions parseArgs(int argc, char** argv)
             const int value = parseInt(valueAfter(index, argc, argv, "threads"), "threads");
             options.anchors.parallelThreads = value;
             options.paths.parallelThreads = value;
+            options.trace.parallelThreads = value;
         } else if (argument == "--cache-gib") {
             const double gib = parseDouble(valueAfter(index, argc, argv, "cache-gib"), "cache-gib");
             if (!(gib > 0.0) || gib > 1024.0)
@@ -192,40 +227,52 @@ CliOptions parseArgs(int argc, char** argv)
             options.remoteCacheDirectory = valueAfter(index, argc, argv, "remote-cache-dir");
         } else if (argument == "--base-voxel-size-um") {
             options.baseVoxelSizeUm = parseDouble(valueAfter(index, argc, argv, "base-voxel-size-um"), "base-voxel-size-um");
-        } else if (argument == "--cell-size" && options.command == Command::Anchors) {
+        } else if (argument == "--normal-manifest" && options.command != Command::Anchors) {
+            options.normalManifestLocation = valueAfter(index, argc, argv, "normal-manifest");
+        } else if (argument == "--fail" && options.command == Command::FiberReplay) {
+            options.failureThresholdBaseVoxels = parseDouble(valueAfter(index, argc, argv, "fail"), "fail");
+        } else if (argument == "--after" && options.command == Command::FiberReplay) {
+            options.postrollSteps = parseInt(valueAfter(index, argc, argv, "after"), "after");
+        } else if (argument == "--along" && options.command == Command::FiberReplay) {
+            options.alongBaseVoxels = parseDouble(valueAfter(index, argc, argv, "along"), "along");
+        } else if (argument == "--radius" && options.command == Command::FiberReplay) {
+            options.radiusBaseVoxels = parseDouble(valueAfter(index, argc, argv, "radius"), "radius");
+        } else if (argument == "--match-refine" && options.command == Command::FiberReplay) {
+            options.matchRefineSteps = parseDouble(valueAfter(index, argc, argv, "match-refine"), "match-refine");
+        } else if (argument == "--inference-scaledown-power" && options.command == Command::FiberReplay) {
+            options.inferenceScaledownPower = parseInt(valueAfter(index, argc, argv, "inference-scaledown-power"), "inference-scaledown-power");
+        } else if (argument == "--cell-size" && options.command != Command::Paths) {
             options.anchors.cellSizePredictionVoxels = parseInt(valueAfter(index, argc, argv, "cell-size"), "cell-size");
-        } else if (argument == "--falloff" && options.command == Command::Anchors) {
+        } else if (argument == "--falloff" && options.command != Command::Paths) {
             options.falloffSigmaBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "falloff"), "falloff");
-        } else if (argument == "--window" && options.command == Command::Anchors) {
+        } else if (argument == "--window" && options.command != Command::Paths) {
             options.localWindowBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "window"), "window");
-        } else if (argument == "--presence-floor" && options.command == Command::Anchors) {
+        } else if (argument == "--presence-floor" && options.command != Command::Paths) {
             options.anchors.observationPresenceFloor = parseDouble(valueAfter(index, argc, argv, "presence-floor"), "presence-floor");
-        } else if (argument == "--minimum-support" && options.command == Command::Anchors) {
+        } else if (argument == "--minimum-support" && options.command != Command::Paths) {
             options.anchors.minimumAlignedSupport = parseDouble(valueAfter(index, argc, argv, "minimum-support"), "minimum-support");
-        } else if (argument == "--merge-angle-deg" && options.command == Command::Anchors) {
+        } else if (argument == "--merge-angle-deg" && options.command != Command::Paths) {
             options.anchors.mergeMaximumAngleDegrees = parseDouble(valueAfter(index, argc, argv, "merge-angle-deg"), "merge-angle-deg");
-        } else if (argument == "--merge-abs-loss" && options.command == Command::Anchors) {
+        } else if (argument == "--merge-abs-loss" && options.command != Command::Paths) {
             options.anchors.mergeMaximumAbsoluteObjectiveLoss =
                 parseDouble(valueAfter(index, argc, argv, "merge-abs-loss"), "merge-abs-loss");
-        } else if (argument == "--merge-rel-loss" && options.command == Command::Anchors) {
+        } else if (argument == "--merge-rel-loss" && options.command != Command::Paths) {
             options.anchors.mergeMaximumRelativeObjectiveLoss =
                 parseDouble(valueAfter(index, argc, argv, "merge-rel-loss"), "merge-rel-loss");
-        } else if (argument == "--maximum-seeds" && options.command == Command::Anchors) {
+        } else if (argument == "--maximum-seeds" && options.command != Command::Paths) {
             const int value = parseInt(valueAfter(index, argc, argv, "maximum-seeds"), "maximum-seeds");
             if (value <= 0)
                 fail("--maximum-seeds must be positive");
             options.anchors.maximumSeedCount = static_cast<size_t>(value);
-        } else if (argument == "--maximum-iterations" && options.command == Command::Anchors) {
+        } else if (argument == "--maximum-iterations" && options.command != Command::Paths) {
             options.anchors.maximumIterations = parseInt(valueAfter(index, argc, argv, "maximum-iterations"), "maximum-iterations");
         } else if (argument == "--crop" && options.command == Command::Anchors) {
             options.baseCrop = parseCrop(valueAfter(index, argc, argv, "crop"));
         } else if (argument == "--glyph-length-base-voxels" && options.command == Command::Anchors) {
             options.glyphLengthBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "glyph-length-base-voxels"), "glyph-length-base-voxels");
-        } else if (argument == "--normal-manifest" && options.command == Command::Paths) {
-            options.normalManifestLocation = valueAfter(index, argc, argv, "normal-manifest");
         } else if (argument == "--cell-radius" && options.command == Command::Paths) {
             options.paths.cellRadius = parseInt(valueAfter(index, argc, argv, "cell-radius"), "cell-radius");
         } else if (argument == "--shell-half-width" && options.command == Command::Paths) {
@@ -255,26 +302,45 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--smoothness-free-angle" && options.command == Command::Paths) {
             options.paths.smoothnessFreeAngleDegrees =
                 parseDouble(valueAfter(index, argc, argv, "smoothness-free-angle"), "smoothness-free-angle");
+        } else if (options.command == Command::FiberReplay &&
+                   vc::fiber_tracer::cli::parseTraceOption(
+                       argument, index, argc, argv, options.trace,
+                       &options.seenTraceOptions)) {
+            continue;
         } else {
             fail("unknown option for selected command: " + argument);
         }
     }
     if (options.baseVoxelSizeUm.has_value() && !(*options.baseVoxelSizeUm > 0.0))
         fail("--base-voxel-size-um must be positive");
-    if (options.command == Command::Anchors) {
+    if (options.command != Command::Paths) {
         if (options.falloffSigmaBaseVoxels.has_value() &&
             !(*options.falloffSigmaBaseVoxels > 0.0))
             fail("--falloff must be positive");
         if (options.localWindowBaseVoxels.has_value() &&
             !(*options.localWindowBaseVoxels > 0.0))
             fail("--window must be positive");
-    } else {
+    }
+    if (options.command != Command::Anchors) {
         if (options.normalManifestLocation.empty())
-            fail("paths requires --normal-manifest");
+            fail("paths and fiber-replay require --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
+    if (options.command == Command::FiberReplay) {
+        if (!(options.failureThresholdBaseVoxels >= 0.0) || options.postrollSteps < 0 ||
+            !(options.alongBaseVoxels >= 0.0) || !(options.radiusBaseVoxels > 0.0) ||
+            !(options.matchRefineSteps >= 0.0) || options.inferenceScaledownPower < 0 ||
+            options.inferenceScaledownPower > 30) {
+            fail("fiber-replay options are outside their valid range");
+        }
+        vc::fiber_tracer::cli::validateTraceOptions(options.trace);
+        if ((options.seenTraceOptions.beamWidth && options.trace.beamWidth != 1) ||
+            (options.seenTraceOptions.beamLookahead && options.trace.beamLookaheadSteps != 1)) {
+            fail("fiber-replay only supports --beam-width 1 and --beam-lookahead-steps 1");
+        }
+    }
     const bool remote = vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
-                        (options.command == Command::Paths && vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation));
+                        (options.command != Command::Anchors && vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation));
     if (remote && options.remoteCacheDirectory.empty())
         fail("direct remote manifests require --remote-cache-dir");
     return options;
@@ -297,6 +363,18 @@ std::string fileHash(const std::filesystem::path& path)
     }
     if (!input.eof())
         throw std::runtime_error("failed while hashing file: " + path.string());
+    std::ostringstream output;
+    output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return output.str();
+}
+
+std::string stringHash(const std::string& value)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
     std::ostringstream output;
     output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16) << hash;
     return output.str();
@@ -325,6 +403,64 @@ std::string datasetLocator(const vc::lasagna::LasagnaDataset& dataset)
                                      : std::filesystem::absolute(manifest.manifestPath).lexically_normal().string();
 }
 
+void printRateProgress(
+    const char* prefix,
+    const std::string& phase,
+    const char* rateName,
+    size_t completed,
+    size_t total,
+    double elapsedSeconds)
+{
+    const double percent = total == 0
+        ? 100.0
+        : 100.0 * static_cast<double>(completed) / static_cast<double>(total);
+    const double rate = elapsedSeconds > 0.0
+        ? static_cast<double>(completed) / elapsedSeconds
+        : 0.0;
+    const double eta = completed >= total
+        ? 0.0
+        : rate > 0.0
+            ? static_cast<double>(total - completed) / rate
+            : std::numeric_limits<double>::infinity();
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(1) << prefix;
+    if (!phase.empty())
+        line << " phase=" << phase;
+    line << " completed=" << completed
+         << " total=" << total
+         << " percent=" << percent
+         << " elapsed_seconds=" << elapsedSeconds
+         << ' ' << rateName << '=' << rate
+         << " eta_seconds=";
+    if (std::isfinite(eta))
+        line << eta;
+    else
+        line << "n/a";
+    std::cerr << line.str() << '\n';
+}
+
+void printAnchorProgress(const vc::fiber_tracer::FiberAnchorProgress& progress)
+{
+    printRateProgress(
+        "fiber_anchor_progress",
+        progress.phase,
+        "cells_per_second",
+        progress.completed,
+        progress.total,
+        progress.elapsedSeconds);
+}
+
+void printFiberletProgress(const vc::fiber_tracer::FiberletPathProgress& progress)
+{
+    printRateProgress(
+        "fiberlet_progress",
+        {},
+        "candidates_per_second",
+        progress.completed,
+        progress.total,
+        progress.elapsedSeconds);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -336,6 +472,260 @@ int main(int argc, char** argv)
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
         const vc::fiber_tracer::FiberPredictionField field(dataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
         const auto grid = field.storedGridInfo();
+
+        if (options.command == Command::FiberReplay) {
+            const auto traceSetupStart = std::chrono::steady_clock::now();
+            std::cerr << "fiber_replay_stage stage=trace_setup status=started\n";
+            const auto scales = vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                dataset.manifest(), options.inferenceScaledownPower);
+            auto traceManifest = dataset.manifest();
+            traceManifest.workingToBaseScale = scales.traceToBaseScale;
+            const vc::lasagna::LasagnaDataset traceDataset(std::move(traceManifest));
+            const vc::fiber_tracer::FiberPredictionField traceField(
+                traceDataset,
+                options.decodedCacheBytes,
+                vc::fiber_tracer::FiberPredictionFieldBindingMode::TraceOptions);
+
+            vc::lasagna::LasagnaDatasetOpenOptions traceNormalOptions;
+            traceNormalOptions.workingToBaseScale = scales.traceToBaseScale;
+            traceNormalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto traceNormalDataset = vc::lasagna::LasagnaDataset::openLocation(
+                options.normalManifestLocation, traceNormalOptions);
+            const vc::lasagna::LasagnaNormalSampler traceNormalSampler(
+                traceNormalDataset,
+                vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+
+            const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
+            const auto requestedTrace = options.trace;
+            auto effectiveTrace = requestedTrace;
+            effectiveTrace.beamWidth = 1;
+            effectiveTrace.beamLookaheadSteps = 1;
+            effectiveTrace.traceToBaseScale = scales.traceToBaseScale;
+            vc::fiber_tracer::FiberReplayTraceRequest replayRequest;
+            replayRequest.fiber = fiber;
+            replayRequest.traceToBaseScale = scales.traceToBaseScale;
+            replayRequest.errorThresholdBaseVoxels =
+                options.failureThresholdBaseVoxels;
+            replayRequest.matchRefineSteps = options.matchRefineSteps;
+            replayRequest.postrollSteps = options.postrollSteps;
+            replayRequest.config = effectiveTrace;
+
+            std::cerr << "fiber_replay_stage stage=trace_setup status=completed"
+                      << " elapsed_seconds="
+                      << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - traceSetupStart)
+                             .count()
+                      << '\n';
+            const auto traceStart = std::chrono::steady_clock::now();
+            std::cerr << "fiber_replay_stage stage=trace status=started\n";
+            const auto replay = vc::fiber_tracer::traceFiberReplay(
+                traceField,
+                replayRequest,
+                &traceNormalSampler,
+                [](const vc::fiber_tracer::FiberTraceProgress& event) {
+                    if (event.step == event.maxSteps || event.step % 100 == 0) {
+                        std::cerr << "fiber_replay_progress step=" << event.step
+                                  << '/' << event.maxSteps
+                                  << " reason=" << event.reason << '\n';
+                    }
+                });
+            std::cerr << "fiber_replay_stage stage=trace status=completed"
+                      << " elapsed_seconds="
+                      << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - traceStart)
+                             .count()
+                      << " result=" << vc::fiber_tracer::fiberReplayStatusName(
+                             replay.status)
+                      << '\n';
+
+            const auto reference = vc::fiber_tracer::makePolylineArcGeometry(
+                fiber.linePointsXyzBase);
+            const double startArc = reference.vertexArcs.at(
+                fiber.controlPointLineIndices.front());
+            vc::fiber_tracer::FiberReplayBundleInput bundle;
+            bundle.request = replayRequest;
+            bundle.replay = replay;
+            bundle.referenceGeometryBase = vc::fiber_tracer::slicePolylineArc(
+                reference, startArc, reference.length());
+            bundle.sources = {
+                {"fiber_manifest", datasetLocator(dataset)},
+                {"fiber_manifest_content_hash", fileHash(dataset.manifest().manifestPath)},
+                {"normal_manifest", datasetLocator(traceNormalDataset)},
+                {"normal_manifest_content_hash", fileHash(traceNormalDataset.manifest().manifestPath)},
+                {"fiber_json", std::filesystem::absolute(options.fiberJson).lexically_normal().string()},
+                {"fiber_json_content_hash", fileHash(options.fiberJson)},
+            };
+            bundle.traceBinding = {
+                {"mode", "trace_options"},
+                {"trace_to_base_scale", scales.traceToBaseScale},
+                {"prediction_to_base_scale", scales.predictionToBaseScale},
+                {"prediction_spacing_trace_voxels", scales.predictionSpacingInTraceVoxels},
+            };
+            bundle.predictionBinding = {
+                {"mode", "canonical_stored_grid"},
+                {"prediction_to_base_scale", grid.predictionToBaseScale},
+                {"prediction_shape_zyx", grid.shapeZYX},
+            };
+            bundle.requestedTraceConfig =
+                vc::fiber_tracer::cli::traceConfigJson(requestedTrace);
+            bundle.effectiveTraceConfig =
+                vc::fiber_tracer::cli::traceConfigJson(effectiveTrace);
+
+            const bool failed =
+                replay.status == vc::fiber_tracer::FiberReplayStatus::FailureWithPostroll ||
+                replay.status == vc::fiber_tracer::FiberReplayStatus::FailureTruncated;
+            if (failed) {
+                const auto tubeStart = std::chrono::steady_clock::now();
+                std::cerr << "fiber_replay_stage stage=tube status=started\n";
+                const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+                    fiber.linePointsXyzBase,
+                    *replay.failureReferenceArcBase,
+                    options.alongBaseVoxels,
+                    options.radiusBaseVoxels,
+                    grid,
+                    options.anchors.cellSizePredictionVoxels);
+                bundle.tube = tube;
+                bundle.referenceGeometryBase = tube.referenceIntervalBase;
+                std::cerr << "fiber_replay_stage stage=tube status=completed"
+                          << " elapsed_seconds="
+                          << std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - tubeStart)
+                                 .count()
+                          << " cells=" << tube.cellsZYX.size() << '\n';
+
+                const double cellSideBase =
+                    options.anchors.cellSizePredictionVoxels *
+                    grid.predictionToBaseScale;
+                options.anchors.gaussianSigmaPredictionVoxels =
+                    options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
+                    grid.predictionToBaseScale;
+                options.anchors.localWindowRadiusPredictionVoxels =
+                    options.localWindowBaseVoxels.value_or(cellSideBase) /
+                    grid.predictionToBaseScale;
+                options.anchors.axialSupportHalfWidthPredictionVoxels =
+                    1.5 * options.anchors.cellSizePredictionVoxels;
+                options.anchors.nmsLongitudinalRadiusPredictionVoxels =
+                    0.5 * options.anchors.cellSizePredictionVoxels;
+                options.anchors.nmsMaximumAngleDegrees =
+                    options.anchors.mergeMaximumAngleDegrees;
+                vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
+                const auto anchorsStart = std::chrono::steady_clock::now();
+                std::cerr << "fiber_replay_stage stage=anchors status=started"
+                          << " cells=" << tube.cellsZYX.size() << '\n';
+                bundle.anchors = vc::fiber_tracer::extractFiberAnchorsForCells(
+                    grid,
+                    options.anchors,
+                    [&](const auto& indices, int threads, auto& samples) {
+                        field.sampleStoredGridBatch(indices, threads, samples);
+                    },
+                    tube.cellsZYX,
+                    [&](const vc::fiber_tracer::FiberAnchor& anchor) {
+                        return tube.containsPredictionPoint(
+                            anchor.positionPredictionXYZ,
+                            grid.predictionToBaseScale);
+                    },
+                    printAnchorProgress);
+                const auto anchorCount =
+                    bundle.anchors->diagnostics.oneAnchorCells +
+                    2 * bundle.anchors->diagnostics.twoAnchorCells;
+                std::cerr << "fiber_replay_stage stage=anchors status=completed"
+                          << " elapsed_seconds="
+                          << std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - anchorsStart)
+                                 .count()
+                          << " anchors=" << anchorCount << '\n';
+                vc::fiber_tracer::FiberAnchorArtifactInfo anchorArtifact;
+                anchorArtifact.sourceLocator = datasetLocator(dataset);
+                anchorArtifact.manifestContentHash =
+                    fileHash(dataset.manifest().manifestPath);
+                anchorArtifact.glyphLengthBaseVoxels =
+                    options.glyphLengthBaseVoxels;
+                anchorArtifact.baseVoxelSizeUm = options.baseVoxelSizeUm;
+                bundle.anchorArtifact = anchorArtifact;
+
+                vc::lasagna::LasagnaDatasetOpenOptions canonicalNormalOptions;
+                canonicalNormalOptions.workingToBaseScale =
+                    grid.predictionToBaseScale;
+                canonicalNormalOptions.remoteCacheRoot =
+                    options.remoteCacheDirectory;
+                const auto canonicalNormalDataset =
+                    vc::lasagna::LasagnaDataset::openLocation(
+                        options.normalManifestLocation, canonicalNormalOptions);
+                const vc::lasagna::LasagnaNormalSampler canonicalNormalSampler(
+                    canonicalNormalDataset,
+                    vc::lasagna::LasagnaNormalSamplerOptions{
+                        options.decodedCacheBytes});
+                vc::fiber_tracer::LoadedFiberAnchorArtifact loadedAnchors{
+                    *bundle.anchors, anchorArtifact};
+                const auto fiberletsStart = std::chrono::steady_clock::now();
+                std::cerr << "fiber_replay_stage stage=fiberlets status=started"
+                          << " anchors=" << anchorCount << '\n';
+                bundle.paths = vc::fiber_tracer::traceFiberletPaths(
+                    loadedAnchors,
+                    grid,
+                    options.paths,
+                    [&](const auto& indices, int threads, auto& samples) {
+                        field.sampleStoredGridBatch(indices, threads, samples);
+                    },
+                    canonicalNormalSampler,
+                    printFiberletProgress,
+                    [&](const cv::Vec3d& pointPrediction) {
+                        return tube.containsPredictionPoint(
+                            pointPrediction, grid.predictionToBaseScale);
+                    });
+                std::cerr << "fiber_replay_stage stage=fiberlets status=completed"
+                          << " elapsed_seconds="
+                          << std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - fiberletsStart)
+                                 .count()
+                          << " searched="
+                          << bundle.paths->diagnostics.searchedPairs
+                          << " accepted="
+                          << bundle.paths->diagnostics.successfulPaths
+                          << " preloaded_voxels=" << bundle.paths->preloadedVoxels
+                          << '\n';
+                vc::fiber_tracer::FiberletArtifactInfo pathArtifact;
+                pathArtifact.fiberManifestLocator = datasetLocator(dataset);
+                pathArtifact.fiberManifestContentHash =
+                    anchorArtifact.manifestContentHash;
+                pathArtifact.normalManifestLocator =
+                    datasetLocator(canonicalNormalDataset);
+                pathArtifact.normalManifestContentHash =
+                    fileHash(canonicalNormalDataset.manifest().manifestPath);
+                pathArtifact.anchorArtifactLocator = "anchors/anchors.json";
+                pathArtifact.anchorArtifactContentHash = stringHash(
+                    vc::fiber_tracer::fiberAnchorReportJson(
+                        *bundle.anchors, anchorArtifact).dump(2) + "\n");
+                pathArtifact.baseVoxelSizeUm = options.baseVoxelSizeUm;
+                bundle.pathArtifact = pathArtifact;
+            }
+
+            const auto publishStart = std::chrono::steady_clock::now();
+            std::cerr << "fiber_replay_stage stage=publish status=started\n";
+            const auto resultBundle = vc::fiber_tracer::writeFiberReplayBundle(
+                options.outputDirectory, bundle);
+            std::cerr << "fiber_replay_stage stage=publish status=completed"
+                      << " elapsed_seconds="
+                      << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - publishStart)
+                             .count()
+                      << '\n';
+            std::cout << "fiber_replay status="
+                      << resultBundle.at("status").get<std::string>()
+                      << " trace_points=" << replay.tracePointsBase.size()
+                      << " matches=" << replay.matches.size()
+                      << " postroll=" << replay.completedPostrollSteps;
+            if (bundle.tube.has_value()) {
+                const auto anchorCount = bundle.anchors->diagnostics.oneAnchorCells +
+                    2 * bundle.anchors->diagnostics.twoAnchorCells;
+                std::cout << " cells=" << bundle.tube->cellsZYX.size()
+                          << " anchors=" << anchorCount
+                          << " fiberlets=" << bundle.paths->diagnostics.successfulPaths
+                          << " preloaded_voxels=" << bundle.paths->preloadedVoxels;
+            }
+            std::cout << '\n';
+            return 0;
+        }
 
         if (options.command == Command::Anchors) {
             const double cellSideBase =
@@ -361,7 +751,8 @@ int main(int argc, char** argv)
                 grid,
                 options.anchors,
                 [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
-                crop);
+                crop,
+                printAnchorProgress);
             vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
             artifact.sourceLocator = datasetLocator(dataset);
             artifact.manifestContentHash = fileHash(dataset.manifest().manifestPath);
@@ -404,29 +795,13 @@ int main(int argc, char** argv)
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
         const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
-        const auto printProgress = [](const vc::fiber_tracer::FiberletPathProgress& progress) {
-            const double percent =
-                progress.total == 0 ? 100.0 : 100.0 * static_cast<double>(progress.completed) / static_cast<double>(progress.total);
-            const double rate = progress.elapsedSeconds > 0.0 ? static_cast<double>(progress.completed) / progress.elapsedSeconds : 0.0;
-            const double eta = progress.completed >= progress.total ? 0.0
-                               : rate > 0.0                         ? static_cast<double>(progress.total - progress.completed) / rate
-                                                                    : std::numeric_limits<double>::infinity();
-            std::ostringstream line;
-            line << std::fixed << std::setprecision(1) << "fiberlet_progress completed=" << progress.completed << " total=" << progress.total
-                 << " percent=" << percent << " elapsed_seconds=" << progress.elapsedSeconds << " candidates_per_second=" << rate << " eta_seconds=";
-            if (std::isfinite(eta))
-                line << eta;
-            else
-                line << "n/a";
-            std::cerr << line.str() << '\n';
-        };
         const auto report = vc::fiber_tracer::traceFiberletPaths(
             anchors,
             grid,
             options.paths,
             [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
             normalSampler,
-            printProgress);
+            printFiberletProgress);
         std::optional<vc::fiber_tracer::FiberPresenceSliceReport> presenceSlices;
         if (options.writePresenceSlices) {
             const auto sliceCrop = vc::fiber_tracer::fiberAnchorCellCoverageCrop(anchors);

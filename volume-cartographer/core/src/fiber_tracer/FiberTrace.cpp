@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 
@@ -2165,7 +2166,9 @@ template <typename LossAt>
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
     std::string phase,
-    std::optional<double> traceLengthLimitVoxels = std::nullopt)
+    std::optional<double> traceLengthLimitVoxels = std::nullopt,
+    std::optional<int> maximumStepsOverride = std::nullopt,
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {})
 {
     const TraceVec start = toTraceVec(request.startPoint);
     const TraceVec target = toTraceVec(request.targetPoint);
@@ -2222,9 +2225,11 @@ template <typename LossAt>
         ? *traceLengthLimitVoxels / static_cast<double>(step)
         : static_cast<double>(distance) * request.config.maxStepFactor /
             static_cast<double>(step);
-    const int maxSteps = std::max(
+    const int maxSteps = maximumStepsOverride.value_or(std::max(
         1,
-        static_cast<int>(std::ceil(stepBudget)));
+        static_cast<int>(std::ceil(stepBudget))));
+    if (maxSteps < 1)
+        throw std::invalid_argument("fiber trace maximum step override must be positive");
 
     BeamState initial;
     initial.path = appendBeamPathPoint(nullptr, start);
@@ -2524,6 +2529,24 @@ template <typename LossAt>
                 profile->pruneSeconds += elapsedSeconds(pruneStart);
         }
         stepIndex += std::max(1, advanced);
+
+        if (committedStep) {
+            const auto best = std::min_element(
+                beams.begin(), beams.end(), beamSearchLess);
+            if (!committedStep(
+                    toVec3d(beamEndpoint(*best)),
+                    static_cast<double>(best->loss),
+                    stepIndex)) {
+                return oneWayResultFromState(
+                    *best,
+                    targetPlanes,
+                    false,
+                    "observer_stop",
+                    acceptThresholdVoxels,
+                    request.snapTraceToSelectedCrossing,
+                    traceLengthLimitVoxels);
+            }
+        }
 
         if (progress) {
             FiberTraceProgress event;
@@ -5242,6 +5265,189 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
     }
     updateMetricFields();
     emitProgress(result.segmentCount, result.segmentCount, "done");
+    return result;
+}
+
+const char* fiberReplayStatusName(FiberReplayStatus status) noexcept
+{
+    switch (status) {
+    case FiberReplayStatus::FailureWithPostroll:
+        return "failure_with_postroll";
+    case FiberReplayStatus::FailureTruncated:
+        return "failure_truncated";
+    case FiberReplayStatus::NoFailure:
+        return "no_failure";
+    case FiberReplayStatus::TraceTerminatedBeforeFailure:
+        return "trace_terminated_before_failure";
+    }
+    return "unknown";
+}
+
+FiberReplayTraceResult traceFiberReplay(
+    const FiberPredictionSource& predictions,
+    const FiberReplayTraceRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const FiberTraceProgressCallback& progress)
+{
+    if (!(request.traceToBaseScale > 0.0) ||
+        !std::isfinite(request.traceToBaseScale)) {
+        throw std::invalid_argument("fiber replay trace-to-base scale must be finite and positive");
+    }
+    if (!(request.errorThresholdBaseVoxels >= 0.0) ||
+        !std::isfinite(request.errorThresholdBaseVoxels)) {
+        throw std::invalid_argument("fiber replay failure threshold must be finite and non-negative");
+    }
+    if (!(request.matchRefineSteps >= 0.0) ||
+        !std::isfinite(request.matchRefineSteps)) {
+        throw std::invalid_argument("fiber replay match refinement must be finite and non-negative");
+    }
+    if (request.postrollSteps < 0)
+        throw std::invalid_argument("fiber replay postroll step count must be non-negative");
+    if (request.config.beamWidth != 1 || request.config.beamLookaheadSteps != 1) {
+        throw std::invalid_argument(
+            "fiber replay requires greedy tracing with beam width and lookahead equal to one");
+    }
+    validateTraceConfig(request.config);
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
+    if (request.startControlPointIndex >= request.fiber.controlPointsXyzBase.size() ||
+        request.startControlPointIndex >= request.fiber.controlPointLineIndices.size()) {
+        throw std::invalid_argument("fiber replay start control point is out of range");
+    }
+    if (request.startControlPointIndex + 1 >= request.fiber.controlPointsXyzBase.size())
+        throw std::invalid_argument("fiber replay start control point has no following control point");
+    const size_t startLineIndex =
+        request.fiber.controlPointLineIndices[request.startControlPointIndex];
+    const size_t nextLineIndex =
+        request.fiber.controlPointLineIndices[request.startControlPointIndex + 1];
+    if (startLineIndex >= request.fiber.linePointsXyzBase.size() ||
+        nextLineIndex >= request.fiber.linePointsXyzBase.size() ||
+        nextLineIndex <= startLineIndex) {
+        throw std::invalid_argument(
+            "fiber replay requires strictly forward control-point line indices");
+    }
+
+    const auto reference = makePolylineArcGeometry(request.fiber.linePointsXyzBase);
+    const double startArcBase = reference.vertexArcs[startLineIndex];
+    const double remainingArcBase = reference.length() - startArcBase;
+    if (!(remainingArcBase > kEpsilon))
+        throw std::invalid_argument("fiber replay reference has no usable forward extent");
+    const cv::Vec3d initialDirectionBase = referenceTangentToward(
+        request.fiber.linePointsXyzBase, startLineIndex, nextLineIndex);
+    const FiberTraceCoordinateAdapter coordinates(request.traceToBaseScale);
+    const double nominalStepBase =
+        coordinates.traceDistanceToBase(request.config.stepVoxels);
+    const int referenceBudget = static_cast<int>(std::ceil(
+        request.config.maxStepFactor * remainingArcBase / nominalStepBase));
+
+    FiberReplayTraceResult result;
+    result.requestedPostrollSteps = request.postrollSteps;
+    result.maximumTraceSteps = std::max(
+        1, referenceBudget + request.postrollSteps + 1);
+    result.tracePointsBase.push_back(
+        request.fiber.linePointsXyzBase[startLineIndex]);
+    result.cumulativeLosses.push_back(0.0);
+
+    double previousArcBase = startArcBase;
+    bool referenceExhausted = false;
+    const auto observe = [&](const cv::Vec3d& pointTrace,
+                             double cumulativeLoss,
+                             int /*step*/) {
+        const cv::Vec3d pointBase = coordinates.traceToBase(pointTrace);
+        if (result.failureTracePointIndex.has_value()) {
+            result.tracePointsBase.push_back(pointBase);
+            result.cumulativeLosses.push_back(cumulativeLoss);
+            ++result.completedPostrollSteps;
+            return result.completedPostrollSteps < request.postrollSteps;
+        }
+
+        if (previousArcBase >= reference.length() - kEpsilon) {
+            referenceExhausted = true;
+            return false;
+        }
+        const double predictedArc = std::min(
+            reference.length(), previousArcBase + nominalStepBase);
+        const double windowEnd = std::min(
+            reference.length(),
+            predictedArc + request.matchRefineSteps * nominalStepBase);
+        if (!(windowEnd > previousArcBase + kEpsilon)) {
+            referenceExhausted = true;
+            return false;
+        }
+        const auto match = projectPointToPolylineArc(
+            reference, pointBase, previousArcBase, windowEnd);
+        result.tracePointsBase.push_back(pointBase);
+        result.cumulativeLosses.push_back(cumulativeLoss);
+        result.matches.push_back({
+            result.tracePointsBase.size() - 1,
+            predictedArc,
+            match.arc,
+            match.point,
+            previousArcBase,
+            windowEnd,
+            match.distance,
+                request.errorThresholdBaseVoxels > 0.0
+                ? match.distance / request.errorThresholdBaseVoxels
+                : (match.distance == 0.0
+                    ? 0.0
+                    : std::numeric_limits<double>::max()),
+        });
+        previousArcBase = match.arc;
+        if (match.distance > request.errorThresholdBaseVoxels) {
+            result.failureTracePointIndex = result.tracePointsBase.size() - 1;
+            result.failureReferenceArcBase = match.arc;
+            return request.postrollSteps > 0;
+        }
+        return true;
+    };
+
+    FiberTraceOneWayRequest oneWay;
+    oneWay.startPoint = coordinates.baseToTrace(
+        request.fiber.linePointsXyzBase[startLineIndex]);
+    oneWay.initialDirection = initialDirectionBase;
+    oneWay.targetPoint = oneWay.startPoint +
+        initialDirectionBase * (remainingArcBase / request.traceToBaseScale);
+    oneWay.budgetSpanVoxels = remainingArcBase / request.traceToBaseScale;
+    oneWay.config = request.config;
+
+    FiberTraceOneWayResult native;
+    try {
+        native = traceOneWayCore(
+            predictions,
+            oneWay,
+            normalSampler,
+            progress,
+            "replay",
+            static_cast<double>(result.maximumTraceSteps) *
+                request.config.stepVoxels,
+            result.maximumTraceSteps,
+            observe);
+    } catch (const std::invalid_argument& error) {
+        if (std::string_view(error.what()) !=
+            "fiber trace start point has no valid prediction direction") {
+            throw;
+        }
+        result.status = FiberReplayStatus::TraceTerminatedBeforeFailure;
+        result.terminationReason = "invalid_initial_prediction";
+        return result;
+    }
+
+    if (result.failureTracePointIndex.has_value()) {
+        if (result.completedPostrollSteps >= request.postrollSteps) {
+            result.status = FiberReplayStatus::FailureWithPostroll;
+            result.terminationReason = "postroll_complete";
+        } else {
+            result.status = FiberReplayStatus::FailureTruncated;
+            result.terminationReason = native.reason == "observer_stop"
+                ? "postroll_complete"
+                : native.reason;
+        }
+    } else if (referenceExhausted) {
+        result.status = FiberReplayStatus::NoFailure;
+        result.terminationReason = "reference_end";
+    } else {
+        result.status = FiberReplayStatus::TraceTerminatedBeforeFailure;
+        result.terminationReason = native.reason;
+    }
     return result;
 }
 

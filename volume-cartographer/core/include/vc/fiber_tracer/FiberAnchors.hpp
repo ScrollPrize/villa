@@ -94,6 +94,7 @@ struct FiberAnchorExtractionDiagnostics {
     size_t belowSupportComponents = 0;
     size_t mergedComponentPairs = 0;
     size_t nmsSuppressedComponents = 0;
+    size_t outsideSelectionComponents = 0;
 };
 
 struct FiberAnchorExtractionReport {
@@ -102,6 +103,7 @@ struct FiberAnchorExtractionReport {
     FiberAnchorCrop selectedCrop;
     std::array<size_t, 3> selectedCellBeginZYX{0, 0, 0};
     std::array<size_t, 3> selectedCellEndZYX{0, 0, 0};
+    std::vector<std::array<size_t, 3>> selectedCellsZYX;
     FiberAnchorExtractionDiagnostics diagnostics;
     std::vector<FiberCellAnchorResult> nonEmptyCells;
     double elapsedSeconds = 0.0;
@@ -114,8 +116,19 @@ struct FiberAnchorArtifactInfo {
     std::optional<double> baseVoxelSizeUm;
 };
 
+struct FiberAnchorProgress {
+    std::string phase;
+    size_t completed = 0;
+    size_t total = 0;
+    double elapsedSeconds = 0.0;
+};
+
 using FiberStoredPredictionBatchSampler =
     std::function<void(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPredictionSample>& samples)>;
+
+using FiberAnchorRetainPredicate = std::function<bool(const FiberAnchor& anchor)>;
+using FiberAnchorProgressCallback =
+    std::function<void(const FiberAnchorProgress& progress)>;
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config);
 
@@ -132,7 +145,16 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const FiberPredictionGridInfo& grid,
     const FiberAnchorConfig& config,
     const FiberStoredPredictionBatchSampler& sampler,
-    std::optional<FiberAnchorCrop> crop = std::nullopt);
+    std::optional<FiberAnchorCrop> crop = std::nullopt,
+    const FiberAnchorProgressCallback& progressCallback = {});
+
+[[nodiscard]] FiberAnchorExtractionReport extractFiberAnchorsForCells(
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& config,
+    const FiberStoredPredictionBatchSampler& sampler,
+    std::vector<std::array<size_t, 3>> cellsZYX,
+    const FiberAnchorRetainPredicate& retainPredicate = {},
+    const FiberAnchorProgressCallback& progressCallback = {});
 
 void suppressFiberAnchorDuplicates(
     std::vector<FiberCellAnchorResult>& cells,
@@ -141,6 +163,9 @@ void suppressFiberAnchorDuplicates(
 [[nodiscard]] nlohmann::json fiberAnchorReportJson(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 
 [[nodiscard]] std::string fiberAnchorReportObj(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
+
+[[nodiscard]] std::string fiberAnchorCellReportObj(
+    const FiberAnchorExtractionReport& report);
 
 void writeFiberAnchorArtifacts(const std::filesystem::path& outputDirectory, const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 

@@ -195,6 +195,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberAnchors.cpp
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
+    src/fiber_tracer/FiberReplay.cpp
+    src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberTrace.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)

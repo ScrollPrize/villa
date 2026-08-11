@@ -1,3 +1,23 @@
+# 2026-08-11: dense-fiber failure replay
+
+- Added C++ greedy native replay against dense VC3D fiber geometry with bounded
+  monotone matching, typed failure statuses, and exact postroll handling.
+- Added exact tube-selected anchors, tube-constrained integer fiberlets, sparse
+  replay scoring preload, and content-addressed atomic diagnostic bundles.
+- Added strict napari replay loading with external-Zarr validation and separate
+  reference, trace, failure, anchor, and quality-colored fiberlet layers.
+- Kept replay failure-marker styling compatible across napari Points API
+  versions by avoiding the renamed outline-color keyword.
+- Added a replay presence-tube mask using a one-time reference rasterization and
+  base-voxel distance transform, with a runtime radius slider defaulted from the
+  anchor/fiberlet extraction tube.
+- Added replay stage timing plus per-second anchor and fiberlet progress/ETA;
+  anchor progress distinguishes selected-cell fitting from NMS context.
+- Expanded the replay presence mask to the union of the reference fiber and the
+  complete failed greedy trace, including postroll, for direct comparison.
+- Added `anchor_cells.obj` with every selected cell center and retained-anchor
+  displacement lines, exposed as separate clipped napari diagnostic layers.
+
 # 2026-08-11: fiber-centered anchor refinement
 
 - Replaced fixed cell-centroid anchor positions with bounded halo-backed joint

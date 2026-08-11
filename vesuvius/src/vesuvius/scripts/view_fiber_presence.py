@@ -6,8 +6,9 @@ import argparse
 import json
 import math
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,28 @@ class LineObjGeometry:
     relative_quality: list[float]
 
 
+@dataclass(frozen=True)
+class AnchorCellGeometry:
+    centers_zyx: np.ndarray
+    displacements_zyx: list[np.ndarray]
+
+
+@dataclass(frozen=True)
+class FiberReplayBundle:
+    path: Path
+    status: str
+    crop_xyzwhd: tuple[int, int, int, int, int, int]
+    prediction_shape_zyx: tuple[int, int, int]
+    prediction_to_base_scale: float
+    reference_zyx: np.ndarray
+    trace_zyx: np.ndarray
+    failure_zyx: np.ndarray | None
+    tube_radius_base_voxels: float | None
+    anchors_obj: Path | None
+    anchor_cells_obj: Path | None
+    paths_obj: Path | None
+
+
 _LINE_OBJ_HEADERS = {
     "anchors": "# vc_fiberlet_anchors version 1",
     "paths": "# vc_fiberlets version 1",
@@ -49,6 +72,437 @@ _LINE_OBJ_HEADERS = {
 
 
 _FIBERLET_QUALITY_COLORMAP = "red-yellow-green"
+
+
+def _fnv1a64(data: bytes) -> str:
+    value = 14695981039346656037
+    for byte in data:
+        value ^= byte
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"fnv1a64:{value:016x}"
+
+
+def _strict_xyz_points(value, name: str, minimum: int) -> np.ndarray:
+    points = np.asarray(value, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1:] != (3,) or points.shape[0] < minimum:
+        raise ValueError(f"{name} must contain at least {minimum} XYZ points")
+    if not np.isfinite(points).all():
+        raise ValueError(f"{name} contains non-finite coordinates")
+    return points
+
+
+def _read_replay_obj(path: Path, header: str, point_record: bool) -> np.ndarray:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read replay OBJ {path}: {exc}") from exc
+    if not lines or lines[0].strip() != header:
+        raise ValueError(f"{path}: unsupported replay OBJ header")
+    vertices: list[list[float]] = []
+    records: list[list[int]] = []
+    record_name = "p" if point_record else "l"
+    for line_number, raw in enumerate(lines[1:], start=2):
+        fields = raw.strip().split()
+        if not fields:
+            continue
+        if fields[0] == "v" and len(fields) == 4:
+            try:
+                vertices.append([float(item) for item in fields[1:]])
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid vertex") from exc
+        elif fields[0] == record_name:
+            try:
+                records.append([int(item) for item in fields[1:]])
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid index") from exc
+        else:
+            raise ValueError(f"{path}:{line_number}: unsupported OBJ record")
+    expected = [1] if point_record else (
+        [1, 1] if len(vertices) == 1 else list(range(1, len(vertices) + 1))
+    )
+    if len(records) != 1 or records[0] != expected:
+        raise ValueError(f"{path}: replay OBJ topology does not match its vertices")
+    return _strict_xyz_points(vertices, str(path), 1)
+
+
+def read_anchor_cell_obj(path: str | Path) -> AnchorCellGeometry:
+    """Read cell-center points and center-to-anchor displacement lines."""
+    obj_path = Path(path)
+    try:
+        lines = obj_path.read_text().splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read anchor-cell OBJ {obj_path}: {exc}") from exc
+    if not lines or lines[0].strip() != "# vc_fiberlet_anchor_cells version 1":
+        raise ValueError(f"{obj_path}: unsupported anchor-cell OBJ header")
+    vertices: list[list[float]] = []
+    points: list[int] = []
+    connectors: list[tuple[int, int]] = []
+    has_group = False
+    for line_number, raw in enumerate(lines[1:], start=2):
+        fields = raw.strip().split()
+        if not fields:
+            continue
+        if fields[0] == "g" and len(fields) == 2:
+            has_group = True
+        elif fields[0] == "v" and len(fields) == 4 and has_group:
+            try:
+                vertex = [float(value) for value in fields[1:]]
+            except ValueError as exc:
+                raise ValueError(
+                    f"{obj_path}:{line_number}: invalid vertex"
+                ) from exc
+            if not np.isfinite(vertex).all():
+                raise ValueError(f"{obj_path}:{line_number}: non-finite vertex")
+            vertices.append(vertex)
+        elif fields[0] == "p" and len(fields) == 2 and has_group:
+            try:
+                points.append(int(fields[1]))
+            except ValueError as exc:
+                raise ValueError(
+                    f"{obj_path}:{line_number}: invalid point index"
+                ) from exc
+        elif fields[0] == "l" and len(fields) == 3 and has_group:
+            try:
+                connectors.append((int(fields[1]), int(fields[2])))
+            except ValueError as exc:
+                raise ValueError(
+                    f"{obj_path}:{line_number}: invalid line index"
+                ) from exc
+        else:
+            raise ValueError(
+                f"{obj_path}:{line_number}: unsupported anchor-cell OBJ record"
+            )
+    if not points or len(set(points)) != len(points):
+        raise ValueError(f"{obj_path}: anchor-cell points are empty or duplicated")
+    if any(index < 1 or index > len(vertices) for index in points):
+        raise ValueError(f"{obj_path}: anchor-cell point index is out of range")
+    point_set = set(points)
+    if any(
+        start not in point_set
+        or target < 1
+        or target > len(vertices)
+        or target in point_set
+        for start, target in connectors
+    ):
+        raise ValueError(f"{obj_path}: anchor-cell connector topology is invalid")
+    xyz = np.asarray(vertices, dtype=np.float64)
+    centers = xyz[np.asarray(points, dtype=np.int64) - 1, ::-1].copy()
+    displacements = [
+        xyz[np.asarray((start, target), dtype=np.int64) - 1, ::-1].copy()
+        for start, target in connectors
+    ]
+    return AnchorCellGeometry(centers, displacements)
+
+
+def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
+    bundle_path = Path(path).expanduser().resolve()
+    try:
+        root = json.loads(bundle_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read replay bundle {bundle_path}: {exc}") from exc
+    if not isinstance(root, dict) or root.get("format") != "vc_fiber_replay" or root.get("version") != 1:
+        raise ValueError("replay bundle must be vc_fiber_replay version 1")
+    required_root = {
+        "format",
+        "version",
+        "coordinates",
+        "sources",
+        "bindings",
+        "trace_config",
+        "status",
+        "termination_reason",
+        "reference_points_base_xyz",
+        "trace_points_base_xyz",
+        "trace_cumulative_losses",
+        "matching",
+        "postroll",
+        "failure_trace_point_index",
+        "failure_reference_arc_base",
+        "tube",
+        "volume_crop_base_xyzwhd",
+        "artifacts",
+    }
+    if set(root) != required_root:
+        raise ValueError("replay bundle fields do not match version 1")
+    coordinates = root.get("coordinates")
+    if coordinates != {
+        "position_order": "XYZ",
+        "position_space": "base_volume",
+        "distance_unit": "base_voxels",
+    }:
+        raise ValueError("replay bundle coordinate contract is unsupported")
+    valid_statuses = {
+        "failure_with_postroll",
+        "failure_truncated",
+        "no_failure",
+        "trace_terminated_before_failure",
+    }
+    status = root.get("status")
+    if status not in valid_statuses:
+        raise ValueError("replay bundle status is invalid")
+    failed = status in {"failure_with_postroll", "failure_truncated"}
+    if not isinstance(root.get("termination_reason"), str) or not root["termination_reason"]:
+        raise ValueError("replay bundle termination reason is invalid")
+    expected_source_keys = {
+        "fiber_manifest",
+        "fiber_manifest_content_hash",
+        "normal_manifest",
+        "normal_manifest_content_hash",
+        "fiber_json",
+        "fiber_json_content_hash",
+    }
+    sources = root.get("sources")
+    if (
+        not isinstance(sources, dict)
+        or set(sources) != expected_source_keys
+        or any(not isinstance(value, str) or not value for value in sources.values())
+    ):
+        raise ValueError("replay bundle sources are invalid")
+    crop_value = root.get("volume_crop_base_xyzwhd")
+    if failed:
+        if not isinstance(crop_value, list) or len(crop_value) != 6 or any(
+            not isinstance(item, int) for item in crop_value
+        ):
+            raise ValueError("failure replay bundle has an invalid crop")
+        try:
+            crop = parse_crop(",".join(str(item) for item in crop_value))
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError("failure replay bundle has an invalid crop") from exc
+    else:
+        if crop_value is not None:
+            raise ValueError("nonfailure replay bundle must not contain a crop")
+        reference_xyz = _strict_xyz_points(
+            root.get("reference_points_base_xyz"), "reference_points_base_xyz", 1
+        )
+        low = np.floor(reference_xyz.min(axis=0)).astype(int)
+        high = np.ceil(reference_xyz.max(axis=0)).astype(int) + 1
+        crop = (*low.tolist(), *(high - low).tolist())
+    binding = root.get("bindings", {}).get("prediction")
+    if not isinstance(binding, dict) or binding.get("mode") != "canonical_stored_grid":
+        raise ValueError("replay bundle prediction binding is invalid")
+    shape = binding.get("prediction_shape_zyx")
+    scale = binding.get("prediction_to_base_scale")
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 3
+        or any(not isinstance(item, int) or item <= 0 for item in shape)
+        or not isinstance(scale, (int, float))
+        or not math.isfinite(scale)
+        or scale <= 0
+    ):
+        raise ValueError("replay bundle prediction grid metadata is invalid")
+    trace_binding = root.get("bindings", {}).get("trace")
+    if (
+        not isinstance(trace_binding, dict)
+        or trace_binding.get("mode") != "trace_options"
+        or any(
+            not isinstance(trace_binding.get(key), (int, float))
+            or not math.isfinite(trace_binding[key])
+            or trace_binding[key] <= 0
+            for key in (
+                "trace_to_base_scale",
+                "prediction_to_base_scale",
+                "prediction_spacing_trace_voxels",
+            )
+        )
+    ):
+        raise ValueError("replay bundle trace binding is invalid")
+    trace_config = root.get("trace_config")
+    if (
+        not isinstance(trace_config, dict)
+        or set(trace_config) != {"requested", "effective"}
+        or not isinstance(trace_config["requested"], dict)
+        or not isinstance(trace_config["effective"], dict)
+        or trace_config["effective"].get("beam_width") != 1
+        or trace_config["effective"].get("beam_lookahead_steps") != 1
+    ):
+        raise ValueError("replay bundle trace configuration is invalid")
+    reference_xyz = _strict_xyz_points(
+        root.get("reference_points_base_xyz"), "reference_points_base_xyz", 1
+    )
+    trace_xyz = _strict_xyz_points(
+        root.get("trace_points_base_xyz"), "trace_points_base_xyz", 1
+    )
+    losses = np.asarray(root.get("trace_cumulative_losses"), dtype=np.float64)
+    if losses.shape != (len(trace_xyz),) or not np.isfinite(losses).all():
+        raise ValueError("replay cumulative losses do not match trace geometry")
+    matching = root.get("matching")
+    if (
+        not isinstance(matching, dict)
+        or set(matching) != {
+            "failure_threshold_base_voxels",
+            "refine_steps",
+            "records",
+        }
+        or not isinstance(matching["records"], list)
+        or not isinstance(matching["failure_threshold_base_voxels"], (int, float))
+        or matching["failure_threshold_base_voxels"] < 0
+        or not isinstance(matching["refine_steps"], (int, float))
+        or matching["refine_steps"] < 0
+    ):
+        raise ValueError("replay matching metadata is invalid")
+    previous_arc = -math.inf
+    for record in matching["records"]:
+        if not isinstance(record, dict) or set(record) != {
+            "trace_point_index",
+            "predicted_reference_arc_base",
+            "matched_reference_arc_base",
+            "matched_reference_point_base_xyz",
+            "search_begin_arc_base",
+            "search_end_arc_base",
+            "error_base_voxels",
+            "error_ratio",
+        }:
+            raise ValueError("replay match record is malformed")
+        trace_index = record["trace_point_index"]
+        numeric = [
+            record[key]
+            for key in (
+                "predicted_reference_arc_base",
+                "matched_reference_arc_base",
+                "search_begin_arc_base",
+                "search_end_arc_base",
+                "error_base_voxels",
+                "error_ratio",
+            )
+        ]
+        _strict_xyz_points(
+            [record["matched_reference_point_base_xyz"]],
+            "matched_reference_point_base_xyz",
+            1,
+        )
+        if (
+            not isinstance(trace_index, int)
+            or not 0 < trace_index < len(trace_xyz)
+            or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in numeric)
+            or record["matched_reference_arc_base"] < previous_arc
+            or not record["search_begin_arc_base"] <= record["matched_reference_arc_base"] <= record["search_end_arc_base"]
+            or record["error_base_voxels"] < 0
+            or record["error_ratio"] < 0
+        ):
+            raise ValueError("replay match record is inconsistent")
+        previous_arc = record["matched_reference_arc_base"]
+    postroll = root.get("postroll")
+    if (
+        not isinstance(postroll, dict)
+        or set(postroll) != {
+            "requested_steps",
+            "completed_steps",
+            "maximum_trace_steps",
+        }
+        or any(not isinstance(value, int) for value in postroll.values())
+        or postroll["requested_steps"] < 0
+        or not 0 <= postroll["completed_steps"] <= postroll["requested_steps"]
+        or postroll["maximum_trace_steps"] < 1
+    ):
+        raise ValueError("replay postroll metadata is invalid")
+    if status == "failure_with_postroll" and postroll["completed_steps"] != postroll["requested_steps"]:
+        raise ValueError("completed failure replay has incomplete postroll")
+    if status == "failure_truncated" and postroll["completed_steps"] >= postroll["requested_steps"]:
+        raise ValueError("truncated failure replay has complete postroll")
+    artifacts = root.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("replay bundle artifacts must be an object")  # noqa: TRY004
+    expected_keys = {"replay/reference.obj", "replay/trace.obj"}
+    if failed:
+        expected_keys |= {
+            "replay/failure.obj",
+            "anchors/anchors.json",
+            "anchors/anchors.obj",
+            "anchors/anchors_0.obj",
+            "anchors/anchors_1.obj",
+            "anchors/anchor_cells.obj",
+            "paths/fiberlets.json",
+            "paths/fiberlets.obj",
+        }
+    if set(artifacts) != expected_keys:
+        raise ValueError("replay bundle artifact set does not match its status")
+    base = bundle_path.parent.resolve()
+    resolved: dict[str, Path] = {}
+    for key, descriptor in artifacts.items():
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "content_hash"}:
+            raise ValueError(f"replay artifact descriptor {key!r} is invalid")
+        relative = Path(descriptor["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"replay artifact path {relative} escapes the bundle")
+        artifact = (base / relative).resolve(strict=True)
+        if not artifact.is_relative_to(base):
+            raise ValueError(f"replay artifact path {relative} escapes the bundle")
+        try:
+            content = artifact.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"cannot read replay artifact {artifact}: {exc}") from exc
+        if _fnv1a64(content) != descriptor["content_hash"]:
+            raise ValueError(f"replay artifact hash mismatch: {relative}")
+        resolved[key] = artifact
+    reference_obj = _read_replay_obj(
+        resolved["replay/reference.obj"],
+        "# vc_fiber_replay_reference version 1",
+        False,
+    )
+    trace_obj = _read_replay_obj(
+        resolved["replay/trace.obj"],
+        "# vc_fiber_replay_trace version 1",
+        False,
+    )
+    if not np.array_equal(reference_obj, reference_xyz) or not np.array_equal(trace_obj, trace_xyz):
+        raise ValueError("replay OBJ geometry differs from authoritative JSON")
+    failure_zyx = None
+    tube_radius_base_voxels = None
+    if failed:
+        failure_index = root.get("failure_trace_point_index")
+        if not isinstance(failure_index, int) or not 0 <= failure_index < len(trace_xyz):
+            raise ValueError("failure replay bundle has an invalid failure index")
+        failure_obj = _read_replay_obj(
+            resolved["replay/failure.obj"],
+            "# vc_fiber_replay_failure version 1",
+            True,
+        )
+        if not np.array_equal(failure_obj[0], trace_xyz[failure_index]):
+            raise ValueError("failure OBJ differs from authoritative JSON")
+        failure_zyx = failure_obj[:, ::-1].copy()
+        if not isinstance(root.get("failure_reference_arc_base"), (int, float)):
+            raise ValueError("failure replay bundle has no failure reference arclength")
+        tube = root.get("tube")
+        if not isinstance(tube, dict) or set(tube) != {
+            "begin_arc_base",
+            "end_arc_base",
+            "radius_base_voxels",
+            "reference_points_base_xyz",
+            "cells_zyx",
+        }:
+            raise ValueError("failure replay bundle tube is invalid")
+        tube_radius_base_voxels = tube["radius_base_voxels"]
+        if (
+            not isinstance(tube_radius_base_voxels, (int, float))
+            or not math.isfinite(tube_radius_base_voxels)
+            or tube_radius_base_voxels <= 0
+        ):
+            raise ValueError("failure replay bundle tube radius is invalid")
+    elif (
+        root.get("failure_trace_point_index") is not None
+        or root.get("failure_reference_arc_base") is not None
+        or root.get("tube") is not None
+    ):
+        raise ValueError("nonfailure replay bundle contains failure metadata")
+    return FiberReplayBundle(
+        path=bundle_path,
+        status=status,
+        crop_xyzwhd=crop,
+        prediction_shape_zyx=tuple(shape),
+        prediction_to_base_scale=float(scale),
+        reference_zyx=reference_xyz[:, ::-1].copy(),
+        trace_zyx=trace_xyz[:, ::-1].copy(),
+        failure_zyx=failure_zyx,
+        tube_radius_base_voxels=(
+            float(tube_radius_base_voxels)
+            if tube_radius_base_voxels is not None
+            else None
+        ),
+        anchors_obj=resolved.get("anchors/anchors.obj"),
+        anchor_cells_obj=resolved.get("anchors/anchor_cells.obj"),
+        paths_obj=resolved.get("paths/fiberlets.obj"),
+    )
 
 
 def fiberlet_quality_colormap_spec() -> tuple[str, np.ndarray, np.ndarray]:
@@ -484,6 +938,14 @@ def add_clipping_controls(
     paths_layer,
     crop_xyzwhd: tuple[int, int, int, int, int, int],
     path_quality_colormaps: dict[str, object] | None = None,
+    reference_layer=None,
+    trace_layer=None,
+    failure_layer=None,
+    anchor_cell_centers_layer=None,
+    anchor_displacements_layer=None,
+    presence_radius_base_voxels: float | None = None,
+    maximum_presence_radius_base_voxels: float | None = None,
+    set_presence_radius: Callable[[float], None] | None = None,
 ) -> None:
     from qtpy.QtCore import Qt
     from qtpy.QtWidgets import (
@@ -547,16 +1009,78 @@ def add_clipping_controls(
 
     anchors_width = add_width_control("Anchor width", anchors_layer)
     paths_width = add_width_control("Path width", paths_layer)
+    reference_width = add_width_control("Reference width", reference_layer)
+    trace_width = add_width_control("Trace width", trace_layer)
+    anchor_displacements_width = add_width_control(
+        "Anchor offset width", anchor_displacements_layer
+    )
+    failure_size = QDoubleSpinBox()
+    failure_size.setRange(0.1, 100.0)
+    failure_size.setValue(
+        float(np.asarray(failure_layer.size).reshape(-1)[0])
+        if failure_layer is not None
+        else 4.0
+    )
+    failure_size.setEnabled(failure_layer is not None)
+    form.addRow("Failure size", failure_size)
+    anchor_cell_size = QDoubleSpinBox()
+    anchor_cell_size.setRange(0.1, 100.0)
+    anchor_cell_size.setValue(
+        float(np.asarray(anchor_cell_centers_layer.size).reshape(-1)[0])
+        if anchor_cell_centers_layer is not None
+        else 2.0
+    )
+    anchor_cell_size.setEnabled(anchor_cell_centers_layer is not None)
+    form.addRow("Cell center size", anchor_cell_size)
     quality_colormap_combo: QComboBox | None = None
     if paths_layer is not None and path_quality_colormaps:
         quality_colormap_combo = QComboBox()
         quality_colormap_combo.addItems(path_quality_colormaps)
         form.addRow("Path colormap", quality_colormap_combo)
+    presence_radius_control: tuple[QSlider, QDoubleSpinBox] | None = None
+    if set_presence_radius is not None:
+        if (
+            presence_radius_base_voxels is None
+            or maximum_presence_radius_base_voxels is None
+        ):
+            raise ValueError("presence radius controls require initial and maximum values")
+        maximum_radius = max(
+            float(presence_radius_base_voxels),
+            float(maximum_presence_radius_base_voxels),
+        )
+        control = QWidget()
+        layout = QHBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        maximum_tenths = max(1, math.ceil(maximum_radius * 10.0))
+        displayed_maximum = maximum_tenths / 10.0
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, maximum_tenths)
+        slider.setTracking(False)
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, displayed_maximum)
+        spin.setDecimals(1)
+        spin.setSingleStep(1.0)
+        slider.setValue(round(presence_radius_base_voxels * 10.0))
+        spin.setValue(presence_radius_base_voxels)
+        layout.addWidget(slider, stretch=1)
+        layout.addWidget(spin)
+        form.addRow("Presence radius", control)
+        presence_radius_control = (slider, spin)
     reset_button = QPushButton("Reset")
     form.addRow(reset_button)
 
     shape_layers = tuple(
-        layer for layer in (anchors_layer, paths_layer) if layer is not None
+        layer
+        for layer in (
+            anchors_layer,
+            paths_layer,
+            reference_layer,
+            trace_layer,
+            failure_layer,
+            anchor_cell_centers_layer,
+            anchor_displacements_layer,
+        )
+        if layer is not None
     )
     updating_bounds = False
 
@@ -642,6 +1166,17 @@ def add_clipping_controls(
 
     connect_width_control(anchors_width, anchors_layer)
     connect_width_control(paths_width, paths_layer)
+    connect_width_control(reference_width, reference_layer)
+    connect_width_control(trace_width, trace_layer)
+    connect_width_control(anchor_displacements_width, anchor_displacements_layer)
+    if failure_layer is not None:
+        failure_size.valueChanged.connect(
+            lambda value: setattr(failure_layer, "size", float(value))
+        )
+    if anchor_cell_centers_layer is not None:
+        anchor_cell_size.valueChanged.connect(
+            lambda value: setattr(anchor_cell_centers_layer, "size", float(value))
+        )
 
     if quality_colormap_combo is not None and path_quality_colormaps is not None:
         def quality_colormap_changed(name: str) -> None:
@@ -649,6 +1184,32 @@ def add_clipping_controls(
             paths_layer.refresh_colors()
 
         quality_colormap_combo.currentTextChanged.connect(quality_colormap_changed)
+
+    if presence_radius_control is not None and set_presence_radius is not None:
+        presence_slider, presence_spin = presence_radius_control
+        updating_presence_radius = False
+
+        def presence_slider_changed(value: int) -> None:
+            nonlocal updating_presence_radius
+            if updating_presence_radius:
+                return
+            updating_presence_radius = True
+            radius = value / 10.0
+            presence_spin.setValue(radius)
+            updating_presence_radius = False
+            set_presence_radius(radius)
+
+        def presence_spin_changed(value: float) -> None:
+            nonlocal updating_presence_radius
+            if updating_presence_radius:
+                return
+            updating_presence_radius = True
+            presence_slider.setValue(round(value * 10.0))
+            updating_presence_radius = False
+            set_presence_radius(float(value))
+
+        presence_slider.valueChanged.connect(presence_slider_changed)
+        presence_spin.valueChanged.connect(presence_spin_changed)
 
     def reset_bounds(*_args) -> None:
         nonlocal updating_bounds
@@ -662,6 +1223,11 @@ def add_clipping_controls(
         update_clipping()
         if quality_colormap_combo is not None:
             quality_colormap_combo.setCurrentIndex(0)
+        if presence_radius_control is not None:
+            presence_slider, presence_spin = presence_radius_control
+            presence_slider.setValue(round(presence_radius_base_voxels * 10.0))
+            presence_spin.setValue(presence_radius_base_voxels)
+            set_presence_radius(presence_radius_base_voxels)
 
     reset_button.clicked.connect(reset_bounds)
     update_clipping()
@@ -849,11 +1415,78 @@ def open_lazy_crop(
     return lazy_array, selection
 
 
+def replay_distance_transform_base(
+    reference_base_zyx: np.ndarray,
+    trace_base_zyx: np.ndarray,
+    selection: CropSelection,
+    scale_zyx: Sequence[float],
+) -> np.ndarray:
+    """Return base-voxel distance to the reference-or-replay line union."""
+    from scipy.ndimage import distance_transform_edt
+
+    scale = np.asarray(scale_zyx, dtype=np.float64)
+    origin = np.asarray(selection.origin_base_zyx, dtype=np.float64)
+    shape = np.asarray(selection.shape_zyx, dtype=np.int64)
+    if scale.shape != (3,) or not np.isfinite(scale).all() or np.any(scale <= 0):
+        raise ValueError("replay distance-transform scale is invalid")
+    if np.any(shape <= 0):
+        raise ValueError("replay distance-transform crop is empty")
+
+    centerline = np.zeros(selection.shape_zyx, dtype=bool)
+    for name, polyline_value in (
+        ("reference", reference_base_zyx),
+        ("trace", trace_base_zyx),
+    ):
+        polyline = np.asarray(polyline_value, dtype=np.float64)
+        if polyline.ndim != 2 or polyline.shape[1:] != (3,) or len(polyline) < 1:
+            raise ValueError(f"{name} polyline must contain ZYX points")
+        if not np.isfinite(polyline).all():
+            raise ValueError(f"{name} polyline contains non-finite coordinates")
+        polyline_data = (polyline - origin) / scale
+        rasterized: list[np.ndarray] = []
+        if len(polyline_data) == 1:
+            rasterized.append(polyline_data)
+        else:
+            for start, end in pairwise(polyline_data):
+                steps = max(1, math.ceil(np.max(np.abs(end - start))))
+                fractions = np.linspace(0.0, 1.0, steps + 1)[:, np.newaxis]
+                rasterized.append(start + fractions * (end - start))
+        for samples in rasterized:
+            indices = np.rint(samples).astype(np.int64)
+            valid = np.all((indices >= 0) & (indices < shape), axis=1)
+            indices = indices[valid]
+            if len(indices):
+                centerline[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+    if not centerline.any():
+        raise ValueError("replay lines do not intersect the selected crop")
+    return distance_transform_edt(~centerline, sampling=scale).astype(
+        np.float32, copy=False
+    )
+
+
+def mask_presence_by_distance(data, distance_data, radius_base_voxels: float):
+    """Apply a hard base-distance tube mask without materializing presence."""
+    if not math.isfinite(radius_base_voxels) or radius_base_voxels < 0:
+        raise ValueError("presence radius must be finite and non-negative")
+    if data.shape != distance_data.shape:
+        raise ValueError("presence and reference-distance shapes differ")
+    return data.map_blocks(
+        lambda presence, distance: np.where(
+            distance <= radius_base_voxels,
+            presence,
+            np.zeros((), dtype=presence.dtype),
+        ),
+        distance_data,
+        dtype=data.dtype,
+    )
+
+
 def launch_viewer(
     level: OmeZarrLevel,
     crop_xyzwhd: tuple[int, int, int, int, int, int],
     anchors_obj: str | Path | None = None,
     paths_obj: str | Path | None = None,
+    replay: FiberReplayBundle | None = None,
 ) -> None:
     try:
         import napari
@@ -865,6 +1498,19 @@ def launch_viewer(
         ) from exc
 
     data, selection = open_lazy_crop(level, crop_xyzwhd)
+    if replay is not None:
+        import zarr
+
+        array = zarr.open_array(str(level.array_path), mode="r")
+        if tuple(array.shape) != replay.prediction_shape_zyx:
+            raise ValueError(
+                "external fiber-presence Zarr shape does not match replay metadata"
+            )
+        expected_scale = (replay.prediction_to_base_scale,) * 3
+        if not np.allclose(level.scale_zyx, expected_scale, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                "external fiber-presence Zarr scale does not match replay metadata"
+            )
     dense_gib = int(np.prod(selection.shape_zyx)) * data.dtype.itemsize / 1024**3
     stored_bounds = ",".join(
         f"{axis_slice.start}:{axis_slice.stop}" for axis_slice in selection.slices_zyx
@@ -874,9 +1520,39 @@ def launch_viewer(
     print(f"Stored crop ZYX: {stored_bounds} shape={selection.shape_zyx}")
     print(f"Dense crop size: {dense_gib:.3f} GiB")
 
+    presence_source_data = data
+    presence_distance_base = None
+    presence_distance_data = None
+    presence_radius_base_voxels = None
+    if replay is not None and replay.tube_radius_base_voxels is not None:
+        import dask.array as da
+
+        print("Rasterizing replay reference/trace and computing presence-tube EDT...")
+        presence_distance_base = replay_distance_transform_base(
+            replay.reference_zyx,
+            replay.trace_zyx,
+            selection,
+            level.scale_zyx,
+        )
+        presence_distance_data = da.from_array(
+            presence_distance_base,
+            chunks=data.chunks,
+        )
+        presence_radius_base_voxels = replay.tube_radius_base_voxels
+        data = mask_presence_by_distance(
+            presence_source_data,
+            presence_distance_data,
+            presence_radius_base_voxels,
+        )
+
     anchors = (
         read_line_obj(anchors_obj, "anchors", crop_xyzwhd)
         if anchors_obj is not None
+        else None
+    )
+    anchor_cells = (
+        read_anchor_cell_obj(replay.anchor_cells_obj)
+        if replay is not None and replay.anchor_cells_obj is not None
         else None
     )
     fiberlets = (
@@ -887,6 +1563,11 @@ def launch_viewer(
     if anchors is not None:
         print(
             f"Anchors: {len(anchors.paths_zyx)}/{anchors.total_groups} groups intersect crop"
+        )
+    if anchor_cells is not None:
+        print(
+            f"Anchor cells: {len(anchor_cells.centers_zyx)} centers, "
+            f"{len(anchor_cells.displacements_zyx)} accepted offsets"
         )
     if fiberlets is not None:
         print(
@@ -907,6 +1588,15 @@ def launch_viewer(
         contrast_limits=contrast_limits,
         rendering="attenuated_mip",
     )
+
+    def set_presence_radius(radius_base_voxels: float) -> None:
+        if presence_distance_data is None:
+            return
+        volume_layer.data = mask_presence_by_distance(
+            presence_source_data,
+            presence_distance_data,
+            radius_base_voxels,
+        )
     anchors_layer = None
     if anchors is not None and anchors.paths_zyx:
         anchors_layer = viewer.add_shapes(
@@ -917,6 +1607,24 @@ def launch_viewer(
             edge_width=2,
             face_color="transparent",
         )
+    anchor_cell_centers_layer = None
+    anchor_displacements_layer = None
+    if anchor_cells is not None:
+        anchor_cell_centers_layer = viewer.add_points(
+            anchor_cells.centers_zyx,
+            name="anchor cell centers",
+            face_color="yellow",
+            size=2,
+        )
+        if anchor_cells.displacements_zyx:
+            anchor_displacements_layer = viewer.add_shapes(
+                anchor_cells.displacements_zyx,
+                shape_type="line",
+                name="anchor refinement offsets",
+                edge_color="orange",
+                edge_width=1,
+                face_color="transparent",
+            )
     paths_layer = None
     path_quality_colormaps: dict[str, object] | None = None
     if fiberlets is not None and fiberlets.paths_zyx:
@@ -953,13 +1661,54 @@ def launch_viewer(
             edge_width=2,
             face_color="transparent",
         )
+    reference_layer = None
+    trace_layer = None
+    failure_layer = None
+    if replay is not None:
+        reference_layer = viewer.add_shapes(
+            [replay.reference_zyx],
+            shape_type="path",
+            name="reference fiber",
+            edge_color="white",
+            edge_width=2,
+            face_color="transparent",
+        )
+        trace_layer = viewer.add_shapes(
+            [replay.trace_zyx],
+            shape_type="path",
+            name="greedy replay",
+            edge_color="magenta",
+            edge_width=2,
+            face_color="transparent",
+        )
+        if replay.failure_zyx is not None:
+            failure_layer = viewer.add_points(
+                replay.failure_zyx,
+                name="replay failure",
+                face_color="red",
+                size=4,
+            )
     add_clipping_controls(
-        viewer,
-        volume_layer,
-        anchors_layer,
-        paths_layer,
-        crop_xyzwhd,
-        path_quality_colormaps,
+        viewer=viewer,
+        volume_layer=volume_layer,
+        anchors_layer=anchors_layer,
+        paths_layer=paths_layer,
+        crop_xyzwhd=crop_xyzwhd,
+        path_quality_colormaps=path_quality_colormaps,
+        reference_layer=reference_layer,
+        trace_layer=trace_layer,
+        failure_layer=failure_layer,
+        anchor_cell_centers_layer=anchor_cell_centers_layer,
+        anchor_displacements_layer=anchor_displacements_layer,
+        presence_radius_base_voxels=presence_radius_base_voxels,
+        maximum_presence_radius_base_voxels=(
+            float(np.max(presence_distance_base))
+            if presence_distance_base is not None
+            else None
+        ),
+        set_presence_radius=(
+            set_presence_radius if presence_distance_data is not None else None
+        ),
     )
     viewer.reset_view()
     napari.run()
@@ -973,7 +1722,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--crop",
-        required=True,
         type=parse_crop,
         metavar="X,Y,Z,W,H,D",
         help="Half-open crop in base voxels",
@@ -990,14 +1738,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--paths",
         help="Fiberlet paths OBJ to show as a separate path layer",
     )
+    parser.add_argument(
+        "--replay",
+        help="Strict vc_fiber_replay version-1 bundle",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.replay is not None and any(
+            value is not None for value in (args.crop, args.anchors, args.paths)
+        ):
+            raise ValueError("--replay cannot be combined with --crop, --anchors, or --paths")
+        if args.replay is None and args.crop is None:
+            raise ValueError("manual mode requires --crop")
+        replay = load_fiber_replay_bundle(args.replay) if args.replay else None
+        crop = replay.crop_xyzwhd if replay is not None else args.crop
+        anchors = replay.anchors_obj if replay is not None else args.anchors
+        paths = replay.paths_obj if replay is not None else args.paths
         resolved = resolve_ome_zarr_level(args.zarr, args.level)
-        launch_viewer(resolved, args.crop, args.anchors, args.paths)
+        launch_viewer(resolved, crop, anchors, paths, replay)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

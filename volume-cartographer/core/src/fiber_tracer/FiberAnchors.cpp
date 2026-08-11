@@ -1074,11 +1074,14 @@ FiberCellAnchorResult fitFiberCellAnchors(
     return result;
 }
 
-FiberAnchorExtractionReport extractFiberAnchors(
+static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     const FiberPredictionGridInfo& grid,
     const FiberAnchorConfig& config,
     const FiberStoredPredictionBatchSampler& sampler,
-    std::optional<FiberAnchorCrop> crop)
+    std::optional<FiberAnchorCrop> crop,
+    std::vector<std::array<size_t, 3>> explicitCells,
+    const FiberAnchorRetainPredicate& retainPredicate,
+    const FiberAnchorProgressCallback& progressCallback)
 {
     validateFiberAnchorConfig(config);
     if (!sampler)
@@ -1093,7 +1096,50 @@ FiberAnchorExtractionReport extractFiberAnchors(
     FiberAnchorExtractionReport report;
     report.grid = grid;
     report.config = config;
-    if (!crop.has_value()) {
+    const size_t cellSize = static_cast<size_t>(config.cellSizePredictionVoxels);
+    const std::array<size_t, 3> totalCellsZYX{
+        ceilDivide(grid.shapeZYX[0], cellSize),
+        ceilDivide(grid.shapeZYX[1], cellSize),
+        ceilDivide(grid.shapeZYX[2], cellSize),
+    };
+    const bool usesExplicitCells = !explicitCells.empty();
+    if (usesExplicitCells) {
+        std::sort(explicitCells.begin(), explicitCells.end());
+        if (std::adjacent_find(explicitCells.begin(), explicitCells.end()) !=
+            explicitCells.end()) {
+            throw std::invalid_argument("fiber anchor cells must be unique");
+        }
+        report.selectedCellsZYX = explicitCells;
+        report.selectedCellBeginZYX = explicitCells.front();
+        report.selectedCellEndZYX = explicitCells.front();
+        for (size_t axis = 0; axis < 3; ++axis)
+            ++report.selectedCellEndZYX[axis];
+        for (const auto& cell : explicitCells) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                if (cell[axis] >= totalCellsZYX[axis])
+                    throw std::invalid_argument("fiber anchor cell lies outside the prediction grid");
+                report.selectedCellBeginZYX[axis] =
+                    std::min(report.selectedCellBeginZYX[axis], cell[axis]);
+                report.selectedCellEndZYX[axis] =
+                    std::max(report.selectedCellEndZYX[axis], cell[axis] + 1);
+            }
+        }
+        const std::array<size_t, 3> beginZYX{
+            report.selectedCellBeginZYX[0] * cellSize,
+            report.selectedCellBeginZYX[1] * cellSize,
+            report.selectedCellBeginZYX[2] * cellSize,
+        };
+        const std::array<size_t, 3> endZYX{
+            std::min(grid.shapeZYX[0], report.selectedCellEndZYX[0] * cellSize),
+            std::min(grid.shapeZYX[1], report.selectedCellEndZYX[1] * cellSize),
+            std::min(grid.shapeZYX[2], report.selectedCellEndZYX[2] * cellSize),
+        };
+        report.selectedCrop = {
+            {beginZYX[2], beginZYX[1], beginZYX[0]},
+            {endZYX[2] - beginZYX[2], endZYX[1] - beginZYX[1],
+             endZYX[0] - beginZYX[0]},
+        };
+    } else if (!crop.has_value()) {
         report.selectedCrop.originXYZ = {0, 0, 0};
         report.selectedCrop.sizeXYZ = {
             grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
@@ -1110,7 +1156,6 @@ FiberAnchorExtractionReport extractFiberAnchors(
         }
     }
 
-    const size_t cellSize = static_cast<size_t>(config.cellSizePredictionVoxels);
     const std::array<size_t, 3> cropBeginZYX = {
         report.selectedCrop.originXYZ[2],
         report.selectedCrop.originXYZ[1],
@@ -1121,9 +1166,11 @@ FiberAnchorExtractionReport extractFiberAnchors(
         cropBeginZYX[1] + report.selectedCrop.sizeXYZ[1],
         cropBeginZYX[2] + report.selectedCrop.sizeXYZ[0],
     };
-    for (size_t axis = 0; axis < 3; ++axis) {
-        report.selectedCellBeginZYX[axis] = cropBeginZYX[axis] / cellSize;
-        report.selectedCellEndZYX[axis] = ceilDivide(cropEndZYX[axis], cellSize);
+    if (!usesExplicitCells) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+            report.selectedCellBeginZYX[axis] = cropBeginZYX[axis] / cellSize;
+            report.selectedCellEndZYX[axis] = ceilDivide(cropEndZYX[axis], cellSize);
+        }
     }
 
     const auto checkedProduct = [](const std::array<size_t, 3>& size,
@@ -1136,11 +1183,6 @@ FiberAnchorExtractionReport extractFiberAnchors(
         }
         return result;
     };
-    const std::array<size_t, 3> totalCellsZYX{
-        ceilDivide(grid.shapeZYX[0], cellSize),
-        ceilDivide(grid.shapeZYX[1], cellSize),
-        ceilDivide(grid.shapeZYX[2], cellSize),
-    };
     const double maximumTransverseSupport =
         config.localWindowRadiusPredictionVoxels +
         config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
@@ -1148,7 +1190,11 @@ FiberAnchorExtractionReport extractFiberAnchors(
         maximumTransverseSupport,
         config.axialSupportHalfWidthPredictionVoxels);
     const size_t sampleHalo = static_cast<size_t>(std::ceil(maximumSupportRadius));
-    const auto selectedCell = [&report](const std::array<size_t, 3>& cell) {
+    const std::set<std::array<size_t, 3>> explicitCellSet(
+        explicitCells.begin(), explicitCells.end());
+    const auto selectedCell = [&report, &explicitCellSet, usesExplicitCells](const std::array<size_t, 3>& cell) {
+        if (usesExplicitCells)
+            return explicitCellSet.contains(cell);
         for (size_t axis = 0; axis < 3; ++axis) {
             if (cell[axis] < report.selectedCellBeginZYX[axis] ||
                 cell[axis] >= report.selectedCellEndZYX[axis]) {
@@ -1160,7 +1206,9 @@ FiberAnchorExtractionReport extractFiberAnchors(
 
     const auto start = std::chrono::steady_clock::now();
     const size_t blockSide = config.processingBlockCellSide;
-    const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells, bool tallySelectedDiagnostics) {
+    const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells,
+                                  bool tallySelectedDiagnostics,
+                                  const char* phase) {
         using CellIndex = std::array<size_t, 3>;
         std::map<CellIndex, std::vector<CellIndex>> cellsByBlock;
         for (const auto& cell : requestedCells) {
@@ -1173,6 +1221,11 @@ FiberAnchorExtractionReport extractFiberAnchors(
         }
 
         std::vector<FiberCellAnchorResult> results;
+        const auto phaseStart = std::chrono::steady_clock::now();
+        auto lastProgressTime = phaseStart;
+        size_t completedCells = 0;
+        if (progressCallback)
+            progressCallback({phase, 0, requestedCells.size(), 0.0});
         for (const auto& [blockIndex, blockCells] : cellsByBlock) {
             const CellIndex blockCellBegin{
                 blockIndex[0] * blockSide,
@@ -1265,6 +1318,16 @@ FiberAnchorExtractionReport extractFiberAnchors(
                     }
                 }
                 FiberCellAnchorResult cell = fitFiberCellAnchors(cellZYX, begin, end, cellObservations, config);
+                if (tallySelectedDiagnostics && retainPredicate) {
+                    for (auto& component : cell.components) {
+                        if (component.retained && !retainPredicate(component.anchor)) {
+                            component.retained = false;
+                            component.rejectionReason = "outside_selection";
+                            --cell.retainedAnchorCount;
+                            ++report.diagnostics.outsideSelectionComponents;
+                        }
+                    }
+                }
                 if (tallySelectedDiagnostics) {
                     if (cell.mergeEvaluation.has_value() && cell.mergeEvaluation->merged) {
                         ++report.diagnostics.mergedComponentPairs;
@@ -1281,19 +1344,35 @@ FiberAnchorExtractionReport extractFiberAnchors(
                 if (cell.retainedAnchorCount > 0)
                     results.push_back(std::move(cell));
             }
+            completedCells += blockCells.size();
+            const auto now = std::chrono::steady_clock::now();
+            if (progressCallback &&
+                (completedCells == requestedCells.size() ||
+                 now - lastProgressTime >= std::chrono::seconds(1))) {
+                progressCallback({
+                    phase,
+                    completedCells,
+                    requestedCells.size(),
+                    std::chrono::duration<double>(now - phaseStart).count(),
+                });
+                lastProgressTime = now;
+            }
         }
         return results;
     };
 
-    std::vector<std::array<size_t, 3>> selectedCells;
-    for (size_t cz = report.selectedCellBeginZYX[0]; cz < report.selectedCellEndZYX[0]; ++cz) {
-        for (size_t cy = report.selectedCellBeginZYX[1]; cy < report.selectedCellEndZYX[1]; ++cy) {
-            for (size_t cx = report.selectedCellBeginZYX[2]; cx < report.selectedCellEndZYX[2]; ++cx) {
-                selectedCells.push_back({cz, cy, cx});
+    std::vector<std::array<size_t, 3>> selectedCells = explicitCells;
+    if (!usesExplicitCells) {
+        for (size_t cz = report.selectedCellBeginZYX[0]; cz < report.selectedCellEndZYX[0]; ++cz) {
+            for (size_t cy = report.selectedCellBeginZYX[1]; cy < report.selectedCellEndZYX[1]; ++cy) {
+                for (size_t cx = report.selectedCellBeginZYX[2]; cx < report.selectedCellEndZYX[2]; ++cx) {
+                    selectedCells.push_back({cz, cy, cx});
+                }
             }
         }
     }
-    std::vector<FiberCellAnchorResult> contextResults = processCells(selectedCells, true);
+    std::vector<FiberCellAnchorResult> contextResults = processCells(
+        selectedCells, true, "selected_cells");
 
     const double nmsDistance = std::hypot(config.localWindowRadiusPredictionVoxels, config.nmsLongitudinalRadiusPredictionVoxels);
     const double contextPivotDistance = config.localWindowRadiusPredictionVoxels + nmsDistance;
@@ -1342,7 +1421,7 @@ FiberAnchorExtractionReport extractFiberAnchors(
     }
     const std::vector<std::array<size_t, 3>> externalCells(
         externalContextCells.begin(), externalContextCells.end());
-    auto externalResults = processCells(externalCells, false);
+    auto externalResults = processCells(externalCells, false, "nms_context");
     contextResults.insert(
         contextResults.end(),
         std::make_move_iterator(externalResults.begin()),
@@ -1352,11 +1431,13 @@ FiberAnchorExtractionReport extractFiberAnchors(
             return left.cellZYX < right.cellZYX;
     });
     suppressFiberAnchorDuplicates(contextResults, config);
-    report.diagnostics.totalCells = checkedProduct({
-        report.selectedCellEndZYX[0] - report.selectedCellBeginZYX[0],
-        report.selectedCellEndZYX[1] - report.selectedCellBeginZYX[1],
-        report.selectedCellEndZYX[2] - report.selectedCellBeginZYX[2],
-    }, "selected fiber anchor cell");
+    report.diagnostics.totalCells = usesExplicitCells
+        ? explicitCells.size()
+        : checkedProduct({
+              report.selectedCellEndZYX[0] - report.selectedCellBeginZYX[0],
+              report.selectedCellEndZYX[1] - report.selectedCellBeginZYX[1],
+              report.selectedCellEndZYX[2] - report.selectedCellBeginZYX[2],
+          }, "selected fiber anchor cell");
     for (auto& cell : contextResults) {
         if (!selectedCell(cell.cellZYX))
             continue;
@@ -1381,6 +1462,38 @@ FiberAnchorExtractionReport extractFiberAnchors(
         std::chrono::steady_clock::now() - start).count();
     return report;
 }
+
+FiberAnchorExtractionReport extractFiberAnchors(
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& config,
+    const FiberStoredPredictionBatchSampler& sampler,
+    std::optional<FiberAnchorCrop> crop,
+    const FiberAnchorProgressCallback& progressCallback)
+{
+    return extractFiberAnchorsImpl(
+        grid, config, sampler, crop, {}, {}, progressCallback);
+}
+
+FiberAnchorExtractionReport extractFiberAnchorsForCells(
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& config,
+    const FiberStoredPredictionBatchSampler& sampler,
+    std::vector<std::array<size_t, 3>> cellsZYX,
+    const FiberAnchorRetainPredicate& retainPredicate,
+    const FiberAnchorProgressCallback& progressCallback)
+{
+    if (cellsZYX.empty())
+        throw std::invalid_argument("fiber anchor explicit cell selection must not be empty");
+    return extractFiberAnchorsImpl(
+        grid,
+        config,
+        sampler,
+        std::nullopt,
+        std::move(cellsZYX),
+        retainPredicate,
+        progressCallback);
+}
+
 
 nlohmann::json fiberAnchorReportJson(
     const FiberAnchorExtractionReport& report,
@@ -1444,9 +1557,13 @@ nlohmann::json fiberAnchorReportJson(
             {"below_support_components", report.diagnostics.belowSupportComponents},
             {"merged_component_pairs", report.diagnostics.mergedComponentPairs},
             {"nms_suppressed_components", report.diagnostics.nmsSuppressedComponents},
+            {"outside_selection_components", report.diagnostics.outsideSelectionComponents},
         }},
         {"cells", nlohmann::json::array()},
     };
+    if (!report.selectedCellsZYX.empty()) {
+        root["selection"]["cells_zyx"] = report.selectedCellsZYX;
+    }
     if (artifact.baseVoxelSizeUm.has_value()) {
         root["coordinates"]["base_voxel_size_um"] = *artifact.baseVoxelSizeUm;
     }
@@ -1549,6 +1666,76 @@ std::string fiberAnchorReportObj(
     return fiberAnchorReportObjForComponent(report, artifact, std::nullopt);
 }
 
+std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
+{
+    if (!(report.grid.predictionToBaseScale > 0.0) ||
+        !std::isfinite(report.grid.predictionToBaseScale) ||
+        report.config.cellSizePredictionVoxels < 1) {
+        throw std::invalid_argument("fiber anchor cell OBJ metadata is invalid");
+    }
+    std::vector<std::array<size_t, 3>> selectedCells = report.selectedCellsZYX;
+    if (selectedCells.empty()) {
+        for (size_t z = report.selectedCellBeginZYX[0];
+             z < report.selectedCellEndZYX[0]; ++z) {
+            for (size_t y = report.selectedCellBeginZYX[1];
+                 y < report.selectedCellEndZYX[1]; ++y) {
+                for (size_t x = report.selectedCellBeginZYX[2];
+                     x < report.selectedCellEndZYX[2]; ++x) {
+                    selectedCells.push_back({z, y, x});
+                }
+            }
+        }
+    }
+    std::map<std::array<size_t, 3>, const FiberCellAnchorResult*> retainedByCell;
+    for (const auto& cell : report.nonEmptyCells)
+        retainedByCell.emplace(cell.cellZYX, &cell);
+
+    const size_t cellSize = static_cast<size_t>(
+        report.config.cellSizePredictionVoxels);
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    output << "# vc_fiberlet_anchor_cells version 1\n";
+    size_t vertex = 1;
+    for (const auto& cellZYX : selectedCells) {
+        std::array<size_t, 3> begin{};
+        std::array<size_t, 3> end{};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            begin[axis] = cellZYX[axis] * cellSize;
+            end[axis] = std::min(
+                report.grid.shapeZYX[axis], begin[axis] + cellSize);
+            if (begin[axis] >= end[axis])
+                throw std::invalid_argument("fiber anchor cell lies outside its grid");
+        }
+        const cv::Vec3d centerPredictionXYZ{
+            0.5 * static_cast<double>(begin[2] + end[2] - 1),
+            0.5 * static_cast<double>(begin[1] + end[1] - 1),
+            0.5 * static_cast<double>(begin[0] + end[0] - 1),
+        };
+        const cv::Vec3d centerBase = centerPredictionXYZ *
+            report.grid.predictionToBaseScale;
+        const size_t centerVertex = vertex++;
+        output << "g cell_" << cellZYX[0] << '_' << cellZYX[1] << '_'
+               << cellZYX[2] << '\n';
+        output << "v " << centerBase[0] << ' ' << centerBase[1] << ' '
+               << centerBase[2] << '\n';
+        output << "p " << centerVertex << '\n';
+        const auto retained = retainedByCell.find(cellZYX);
+        if (retained == retainedByCell.end())
+            continue;
+        for (const auto& component : retained->second->components) {
+            if (!component.retained)
+                continue;
+            const cv::Vec3d anchorBase = component.anchor.positionPredictionXYZ *
+                report.grid.predictionToBaseScale;
+            const size_t anchorVertex = vertex++;
+            output << "v " << anchorBase[0] << ' ' << anchorBase[1] << ' '
+                   << anchorBase[2] << '\n';
+            output << "l " << centerVertex << ' ' << anchorVertex << '\n';
+        }
+    }
+    return output.str();
+}
+
 void writeFiberAnchorArtifacts(
     const std::filesystem::path& outputDirectory,
     const FiberAnchorExtractionReport& report,
@@ -1569,6 +1756,9 @@ void writeFiberAnchorArtifacts(
     vc::core::util::atomicWriteString(
         outputDirectory / "anchors_1.obj",
         fiberAnchorReportObjForComponent(report, artifact, 1));
+    vc::core::util::atomicWriteString(
+        outputDirectory / "anchor_cells.obj",
+        fiberAnchorCellReportObj(report));
 }
 
 } // namespace vc::fiber_tracer

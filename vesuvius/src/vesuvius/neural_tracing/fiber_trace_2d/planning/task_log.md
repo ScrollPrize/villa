@@ -1,77 +1,117 @@
-# Task log: regular-tracer fiberlet loss and napari colormap selector
+# Task log: dense-fiber failure replay
 
 ## Findings
 
-- The regular tracer's local data score multiplies presence by six positive-
-  clamped pairwise alignments among incoming step, outgoing step, current
-  prediction, and candidate prediction, then uses `1-score` as loss.
-- The fiberlet DP instead independently added `(1-presence)` and one squared
-  move/prediction angle. It therefore omitted prediction continuity and several
-  trajectory/prediction relationships required by the regular tracer.
-- Only direct normal-aware smoothness was shared. Fiberlets intentionally omit
-  cumulative-history smoothness and retain finite invalid-data bridging.
-- The requested visualization control was a colormap/ramp selector. The prior
-  green/red numeric endpoint interpretation was incorrect and will be removed.
-- Napari is now the only supported viewer for experimental fiberlet paths, so
-  material colors and the MTL sidecar are unnecessary duplicated display state
-  and will be removed without compatibility handling.
+- `loadFiberJson` already strictly loads VC3D line/control points and maps each
+  control point to an exact dense-line index. `referenceTangentToward` already
+  captures the desired first non-degenerate dense-edge direction.
+- `traceFiberExtrapolation` and `traceOneWayCore` provide the regular native
+  scoring and length-bounded tracing, but expose no data-dependent committed-
+  step stop condition. Replay should extend that core rather than reproduce it.
+- Beam width one is the existing explicit greedy mode in both native
+  implementations. It avoids an ambiguous failure point across live beams.
+- Existing whole-fiber metric checks only CP target-plane crossings against an
+  absolute default of 20 base voxels. It restarts at CPs and therefore is not
+  the requested dense continuous replay.
+- Python's legacy 2D `_score_trace2cp` normalizes target-column cross-track
+  error by the usable strip-edge distance and clamps it to `[0,1]`; it does not
+  define a compatible continuous 3D failure threshold. The 10-percent/10-voxel
+  rule is bidirectional meeting fusion, not reference replay.
+- Anchor extraction already block-samples bounded selected cells plus support
+  and NMS context, but its selection is currently only one rectangular cell
+  range and its strict artifact assumes that rectangle.
+- Fiberlet path preload currently materializes one dense rectangular bounding
+  box around all candidate corridors. That is unsuitable for a long curved
+  tube even if anchor extraction is sparse; replay needs a sparse union of
+  actual corridor nodes.
+- The napari viewer already accepts an external Zarr and separate anchor/path
+  OBJs. A replay bundle can add reference/trace/failure layers and supply the
+  crop without storing the Zarr location.
 
 ## Plan review
 
-- Independent review required making the removed alignment quantization floor
-  explicit; fully specifying source, ordinary, sink, zero-length, and invalid
-  transitions; deleting stale path MTL while retaining central-slice MTL;
-  removing every material/color schema field; preserving native float scoring
-  with caller-level regression tests; deterministic public napari colormap
-  selection; and strict rejection of obsolete OBJ material records. The plan
-  incorporates these requirements.
-
-## Implementation
-
-- Extracted the native six-factor presence/alignment product into
-  `fiberLocalAlignmentLoss` and made both native sample/corner scoring and the
-  fiberlet DP call it.
-- Replaced the DP's independent presence/direction terms and quantization-angle
-  floor with edge-length-weighted alignment loss. Fitted anchor axes provide
-  the source/target direction constraints; explicit invalid gap cost and direct
-  normal-aware smoothness remain separate.
-- Changed fiberlet JSON cost output to the single `alignment` component and
-  removed the obsolete CLI weights, path RGB/material metadata, OBJ material
-  records, and path MTL writer. Artifact replacement deletes a stale
-  `fiberlets.mtl`.
-- Kept scalar normalized path quality in the OBJ/JSON and mapped it through a
-  napari Shapes feature. Replaced the numeric color endpoints with a runtime
-  colormap selector whose default is red-yellow-green and whose other entries
-  come from napari's registered colormaps.
-- Kept the separately requested central presence-slice OBJ/MTL/PNG artifacts;
-  they are texture geometry rather than fiberlet path coloring.
-- Updated focused regression tests, the fiberlet documentation, specification,
-  and changelog.
+- Two independent reviews checked the task plan against the current task,
+  specification, code, and viewer behavior. The revised plan now:
+  - separates trace-scale and canonical prediction-scale fields and normals;
+  - uses a bounded, monotone, step-initialized dense-reference match instead of
+    equal-arclength or global-nearest matching;
+  - defines exact postroll, reference-end, invalid-start, and hard-budget rules;
+  - preserves repeated reference vertices and only skips consecutive zero edges;
+  - filters refined outside-tube anchors before NMS and clips replay DP nodes
+    and endpoints to the tube while preserving interpolation halo reads;
+  - includes complete sparse-preload dependencies and requires dense parity;
+  - uses immutable content-addressed generations plus an atomic root bundle;
+  - makes bundle JSON authoritative and validates derived OBJ geometry/hashes;
+  - makes replay/manual viewer modes, path containment, status layouts, and
+    external-Zarr metadata checks strict.
 
 ## Deviations and limitations
 
-- The fiberlet DP still intentionally omits the regular tracer's cumulative-
-  history smoothness term, as agreed before this task. It retains direct
-  normal-aware smoothness and finite invalid-prediction bridging.
-- Napari is not installed in the validation Python environment, so the live Qt
-  selector could not be launched here. Its deterministic colormap construction,
-  ordering, quality data, and strict OBJ input are covered by unit tests.
-- Validation used focused synthetic C++ and Python suites; no real prediction
-  crop was retraced and the complete monorepo test suite was not run.
+- The initial reference interval is 512 base voxels in each direction because
+  the user left `N` unspecified; it remains configurable through `--along`.
+- Initial failure threshold is 20 base voxels because there is no matching
+  Python continuous-3D default. The artifact also records normalized
+  `error/threshold` so this choice can be evaluated without ambiguity.
+- The bounded direct reference refinement defaults to one nominal trace step on
+  either side of the predicted next arclength. This is an explicit initial
+  experimental default exposed by `--match-refine`; it can be changed without
+  compatibility code because the workflow has not shipped.
+- Fiberlet DP scores integer stored-prediction voxels directly; it performs no
+  trilinear prediction or normal interpolation. The planned interpolation-halo
+  dependency expansion is therefore not applicable. Sparse preload includes
+  the canonical corridor nodes and every admissible virtual endpoint attachment.
+- The C++ side is the sole bundle writer. The only bundle reader is the napari
+  Python path, which performs strict schema, containment, hash, status, and OBJ
+  geometry validation. No unused duplicate C++ bundle reader was added.
+- The napari GUI itself was not launched during automated validation. Its
+  Qt-free bundle parsing, CLI conflict logic, geometry conversion, crop helpers,
+  and existing layer-control helpers are covered by Python tests; the real
+  bundle and external Zarr metadata were also checked without opening a window.
+
+## Implementation
+
+- Added shared dense-polyline geometry and a committed-step observer in the
+  existing native one-way trace core. Replay forces greedy settings and returns
+  typed statuses without changing ordinary tracer calls.
+- Added exact tube construction, explicit sparse anchor-cell selection,
+  pre-NMS refined-anchor filtering, tube-constrained DP endpoints/nodes, and a
+  sorted immutable sparse scoring preload. Standalone anchor/path behavior is
+  retained.
+- Added `vc_fiberlets fiber-replay`, shared native trace CLI parsing used by
+  both C++ tools, separate trace/canonical bindings, atomic content-addressed
+  run publication, and strict replay artifacts.
+- Added napari `--replay` mode with the external Zarr kept separate, strict
+  metadata/artifact validation, and independent reference, trace, failure,
+  anchor, and fiberlet layers.
+- Added a hard presence-tube mask from a one-time displayed-level reference EDT.
+  Its runtime slider only changes the lazy distance threshold and defaults to
+  the extraction radius shared by replay anchors and fiberlets.
+- Added explicit replay stage start/completion timing. Anchor extraction now
+  exposes library-level selected-cell and NMS-context progress, and replay wires
+  both that ETA stream and the existing fiberlet-search ETA stream to the CLI.
+- The napari presence EDT now rasterizes the union of reference and complete
+  greedy replay geometry so the same radius exposes predictions around both.
+- Anchor artifacts now include every selected cell center plus center-to-anchor
+  lines for retained results. Replay validates the artifact and shows point and
+  displacement geometry as separately toggleable napari layers.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build -j32 --target test_fiberlet_paths test_fiber_trace3d vc_fiberlets`
-  completed successfully.
-- `volume-cartographer/build/bin/test_fiberlet_paths`: 21 test cases passed.
-- `volume-cartographer/build/bin/test_fiber_trace3d`: 46 test cases passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=.:vesuvius/src python -m pytest -q vesuvius/tests/test_view_fiber_presence.py`:
-  23 tests passed.
-- `ruff check vesuvius/src/vesuvius/scripts/view_fiber_presence.py vesuvius/tests/test_view_fiber_presence.py`
-  passed.
-- `python -m py_compile vesuvius/src/vesuvius/scripts/view_fiber_presence.py vesuvius/tests/test_view_fiber_presence.py`
-  passed.
-- `git diff --check` passed.
-- A whole-file `clang-format --dry-run --Werror` was not usable as a focused
-  gate because the existing files do not conform to the installed profile; no
-  bulk formatting rewrite was made.
+- Built with 32 jobs:
+  `cmake --build build --target vc_fiberlets vc_fiber_trace_metric test_fiber_trace3d test_fiber_replay test_fiber_anchors test_fiberlet_paths -j32`.
+- C++ focused suites passed: `test_fiber_trace3d` 49 cases,
+  `test_fiber_replay` 2 cases, `test_fiber_anchors` 33 cases, and
+  `test_fiberlet_paths` 23 cases.
+- Python viewer suite passed 29 cases with
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=src python -m pytest -q tests/test_view_fiber_presence.py`.
+  Plugin autoload is disabled locally because the installed pytest Zarr plugin
+  imports the absent `zarr.testing`; this is an environment issue before test
+  collection, not a project test failure.
+- Ruff and Python compilation passed for the viewer and its tests.
+- Real-data smoke command used the Paris `fiber_s1_002` manifest, the
+  `kb_20260605T150824406_000001.json` reference, and `las_008` normals with
+  `--fail 0 --after 1 --along 16 --radius 16 --threads 32`. It reported
+  `failure_with_postroll`, 3 trace points, 1 match, 1 postroll step, 8 selected
+  cells, 1 anchor, and 0 fiberlets. The strict reader loaded the generated
+  bundle and the external presence level matched shape `(9473,4087,4087)` and
+  scale `(8,8,8)`.

@@ -2709,3 +2709,57 @@
 - Continuous/sub-voxel search, learned path-quality rejection, overlap
   deduplication, extension, global graph construction, H/V and winding labels,
   CUDA batching, and production radius selection remain out of scope.
+
+# C++ dense-fiber failure replay
+
+- `vc_fiberlets fiber-replay` consumes a fiber-prediction Lasagna manifest, a
+  strict VC3D fiber JSON, a required regular-normal Lasagna manifest, and an
+  output directory. Spatial arguments and artifacts use base-volume XYZ/base
+  voxels. Defaults are `--fail 20`, `--after 100`, `--along 512`,
+  `--radius 128`, and `--match-refine 1`.
+- Replay uses the regular native one-way candidate generation, prediction loss,
+  Lasagna-normal curvature, and validity rules. It forces beam width and
+  lookahead to one. The first control point and first subsequent nonzero dense
+  edge define the start. Existing tracer calls without the committed-step
+  observer remain unchanged.
+- Dense-reference matching is monotone and local. From the previous match it
+  predicts one nominal base-coordinate trace step and computes the exact
+  closest dense-polyline point through at most `match_refine` further nominal
+  steps. Consecutive zero edges contribute no arclength; nonconsecutive repeated
+  vertices are preserved. Deterministic ties select the lowest arclength and
+  then source segment. Failure is the first raw Euclidean distance strictly
+  above the base-voxel threshold.
+- The failing committed point is postroll step zero. Replay retains at most the
+  requested number of further fixed-length greedy steps and reports exactly one
+  of `failure_with_postroll`, `failure_truncated`, `no_failure`, or
+  `trace_terminated_before_failure`. Invalid prediction at the initial point is
+  a typed termination result. The hard step budget is the native maximum-step
+  factor applied to remaining reference arclength plus postroll and one
+  reference-end probe.
+- Trace sampling and canonical anchor/path extraction use separate Lasagna
+  dataset/normal bindings and independently recorded trace-to-base and
+  prediction-to-base scales. A failure selects exact reference arclength on
+  each side. Tube membership is Euclidean distance through the interpolated
+  reference interval including endpoint caps.
+- Anchor cells are a canonical sorted explicit set whose prediction-sample
+  footprint has exact distance at most the tube radius. Halo/context reads and
+  external NMS suppressors remain allowed, but refined selected anchors outside
+  the tube are rejected before NMS and cannot suppress in-tube anchors.
+- Replay fiberlet endpoints and integer DP nodes must be inside the tube. The
+  replay preload enumerates sorted unique admissible corridor voxels, samples
+  each once, and exposes a checked immutable sparse lookup. Standalone `paths`
+  retains the existing dense rectangular preload and the objective/path solver
+  is otherwise shared.
+- Bundle JSON is authoritative for reference, trace, and failure geometry.
+  Derived OBJ files and every extraction artifact have relative contained paths
+  and content hashes. A run is completed in a staging directory, renamed to an
+  immutable `runs/<content-hash>` generation, and only then referenced by an
+  atomically replaced root `fiber_replay.json`. Nonfailure statuses omit tube,
+  failure marker, anchors, and paths. The experimental version-1 format has no
+  repair or compatibility behavior.
+- The napari viewer accepts the presence OME-Zarr separately with `--replay`.
+  Replay mode rejects manual crop/anchor/path inputs, verifies external Zarr
+  shape/scale, path containment, hashes, status layout, and JSON/OBJ geometry,
+  and creates independent presence/reference/trace/failure/anchor/fiberlet
+  layers. Six crop controls clip all layers; line widths, failure size, and
+  fiberlet quality colormap remain runtime display controls.

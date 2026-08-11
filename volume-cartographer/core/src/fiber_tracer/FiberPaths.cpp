@@ -87,13 +87,25 @@ struct ScoringVoxel {
     bool normalValid = false;
 };
 
-struct DenseScoringVolume {
+struct ScoringVolume {
     Voxel begin{0, 0, 0};
     std::array<size_t, 3> sizeXYZ{0, 0, 0};
     std::vector<ScoringVoxel> voxels;
+    std::unordered_map<Voxel, ScoringVoxel, VoxelHash> sparseVoxels;
+
+    [[nodiscard]] size_t size() const noexcept
+    {
+        return voxels.empty() ? sparseVoxels.size() : voxels.size();
+    }
 
     [[nodiscard]] const ScoringVoxel& at(const Voxel& voxel) const
     {
+        if (voxels.empty()) {
+            const auto found = sparseVoxels.find(voxel);
+            if (found == sparseVoxels.end())
+                throw std::out_of_range("fiberlet scoring voxel is outside the sparse preload");
+            return found->second;
+        }
         std::array<size_t, 3> local{};
         for (size_t axis = 0; axis < 3; ++axis) {
             if (voxel[axis] < begin[axis])
@@ -329,6 +341,27 @@ std::vector<Attachment> endpointAttachments(
     return out;
 }
 
+std::set<Voxel> enumerateCorridorVoxels(
+    const SearchCorridor& corridor,
+    const FiberletPointPredicate& pointPredicate)
+{
+    std::set<Voxel> voxels;
+    for (int64_t z = corridor.begin[2]; z <= corridor.end[2]; ++z) {
+        for (int64_t y = corridor.begin[1]; y <= corridor.end[1]; ++y) {
+            for (int64_t x = corridor.begin[0]; x <= corridor.end[0]; ++x) {
+                const Voxel voxel{x, y, z};
+                const cv::Vec3d point = voxelPoint(voxel);
+                if (insideCorridor(
+                        point, corridor.reference, corridor.radiusSquared) &&
+                    (!pointPredicate || pointPredicate(point))) {
+                    voxels.insert(voxel);
+                }
+            }
+        }
+    }
+    return voxels;
+}
+
 size_t checkedProduct(size_t left, size_t right, const char* description)
 {
     if (right != 0 && left > std::numeric_limits<size_t>::max() / right)
@@ -343,7 +376,7 @@ size_t checkedSum(size_t left, size_t right, const char* description)
     return left + right;
 }
 
-DenseScoringVolume preloadScoringVolume(
+ScoringVolume preloadScoringVolume(
     const std::vector<FiberletCandidateResult>& candidates,
     const std::vector<size_t>& searchCandidateIndices,
     const FiberPredictionGridInfo& grid,
@@ -351,9 +384,10 @@ DenseScoringVolume preloadScoringVolume(
     const FiberletPathConfig& config,
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
-    size_t& estimatedPreloadBytes)
+    size_t& estimatedPreloadBytes,
+    const FiberletPointPredicate& pointPredicate)
 {
-    DenseScoringVolume volume;
+    ScoringVolume volume;
     estimatedPreloadBytes = 0;
     if (searchCandidateIndices.empty())
         return volume;
@@ -384,7 +418,44 @@ DenseScoringVolume preloadScoringVolume(
         volume.sizeXYZ[axis] = static_cast<size_t>(extent);
     }
     const size_t xy = checkedProduct(volume.sizeXYZ[0], volume.sizeXYZ[1], "fiberlet preload XY extent");
-    const size_t count = checkedProduct(xy, volume.sizeXYZ[2], "fiberlet preload voxel count");
+    const size_t denseCount = checkedProduct(xy, volume.sizeXYZ[2], "fiberlet preload voxel count");
+    std::set<Voxel> sparseKeys;
+    if (pointPredicate) {
+        for (const size_t candidateIndex : searchCandidateIndices) {
+            const auto& candidate = candidates.at(candidateIndex);
+            const SearchCorridor corridor = makeSearchCorridor(
+                candidate, grid, cellSize, config);
+            const auto corridorVoxels = enumerateCorridorVoxels(
+                corridor, pointPredicate);
+            sparseKeys.insert(corridorVoxels.begin(), corridorVoxels.end());
+            const cv::Vec3d chord = normalized(
+                candidate.targetPositionPredictionXYZ -
+                candidate.startPositionPredictionXYZ);
+            const double maximumAngle =
+                config.maximumEndpointAngleDegrees * kPi / 180.0;
+            for (const auto& attachment : endpointAttachments(
+                     candidate.startPositionPredictionXYZ,
+                     candidate.startAxisXYZ,
+                     chord,
+                     true,
+                     maximumAngle,
+                     grid)) {
+                if (pointPredicate(voxelPoint(attachment.voxel)))
+                    sparseKeys.insert(attachment.voxel);
+            }
+            for (const auto& attachment : endpointAttachments(
+                     candidate.targetPositionPredictionXYZ,
+                     candidate.targetAxisXYZ,
+                     chord,
+                     false,
+                     maximumAngle,
+                     grid)) {
+                if (pointPredicate(voxelPoint(attachment.voxel)))
+                    sparseKeys.insert(attachment.voxel);
+            }
+        }
+    }
+    const size_t count = pointPredicate ? sparseKeys.size() : denseCount;
     if (count > static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max()))
         throw std::length_error("fiberlet preload exceeds sampler index range");
 
@@ -407,12 +478,23 @@ DenseScoringVolume preloadScoringVolume(
 
     indices.reserve(count);
     normalPoints.reserve(count);
-    for (int64_t z = unionBegin[2]; z <= unionEnd[2]; ++z) {
-        for (int64_t y = unionBegin[1]; y <= unionEnd[1]; ++y) {
-            for (int64_t x = unionBegin[0]; x <= unionEnd[0]; ++x) {
-                const Voxel voxel{x, y, z};
-                indices.push_back(storedIndex(voxel));
-                normalPoints.push_back(voxelPoint(voxel));
+    std::vector<Voxel> orderedVoxels;
+    orderedVoxels.reserve(count);
+    if (pointPredicate) {
+        for (const auto& voxel : sparseKeys) {
+            orderedVoxels.push_back(voxel);
+            indices.push_back(storedIndex(voxel));
+            normalPoints.push_back(voxelPoint(voxel));
+        }
+    } else {
+        for (int64_t z = unionBegin[2]; z <= unionEnd[2]; ++z) {
+            for (int64_t y = unionBegin[1]; y <= unionEnd[1]; ++y) {
+                for (int64_t x = unionBegin[0]; x <= unionEnd[0]; ++x) {
+                    const Voxel voxel{x, y, z};
+                    orderedVoxels.push_back(voxel);
+                    indices.push_back(storedIndex(voxel));
+                    normalPoints.push_back(voxelPoint(voxel));
+                }
             }
         }
     }
@@ -425,11 +507,20 @@ DenseScoringVolume preloadScoringVolume(
     if (normals.size() != count)
         throw std::runtime_error("fiberlet normal sampler returned the wrong preload sample count");
 
-    volume.voxels.resize(count);
-    for (size_t index = 0; index < count; ++index) {
-        volume.voxels[index].prediction = predictions[index];
-        volume.voxels[index].normal = normals[index].sample.normal;
-        volume.voxels[index].normalValid = normals[index].sample.valid;
+    if (pointPredicate) {
+        volume.sparseVoxels.reserve(count * 2);
+        for (size_t index = 0; index < count; ++index) {
+            volume.sparseVoxels.emplace(orderedVoxels[index], ScoringVoxel{
+                predictions[index], normals[index].sample.normal,
+                normals[index].sample.valid});
+        }
+    } else {
+        volume.voxels.resize(count);
+        for (size_t index = 0; index < count; ++index) {
+            volume.voxels[index].prediction = predictions[index];
+            volume.voxels[index].normal = normals[index].sample.normal;
+            volume.voxels[index].normalValid = normals[index].sample.valid;
+        }
     }
     return volume;
 }
@@ -541,7 +632,8 @@ bool betterCost(double candidate, double current)
 }
 
 FiberletCandidateResult solveCandidate(
-    FiberletCandidateResult candidate, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config, const DenseScoringVolume& scoringVolume)
+    FiberletCandidateResult candidate, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config, const ScoringVolume& scoringVolume,
+    const FiberletPointPredicate& pointPredicate)
 {
     candidate.searched = true;
     const cv::Vec3d chordVector = candidate.targetPositionPredictionXYZ - candidate.startPositionPredictionXYZ;
@@ -569,21 +661,15 @@ FiberletCandidateResult solveCandidate(
     }
 
     const SearchCorridor corridor = makeSearchCorridor(candidate, grid, cellSize, config);
-    std::set<Voxel> voxelSet;
-    for (int64_t z = corridor.begin[2]; z <= corridor.end[2]; ++z) {
-        for (int64_t y = corridor.begin[1]; y <= corridor.end[1]; ++y) {
-            for (int64_t x = corridor.begin[0]; x <= corridor.end[0]; ++x) {
-                const Voxel voxel{x, y, z};
-                if (insideCorridor(voxelPoint(voxel), corridor.reference, corridor.radiusSquared)) {
-                    voxelSet.insert(voxel);
-                }
-            }
-        }
+    std::set<Voxel> voxelSet = enumerateCorridorVoxels(corridor, pointPredicate);
+    for (const auto& attachment : sources) {
+        if (!pointPredicate || pointPredicate(voxelPoint(attachment.voxel)))
+            voxelSet.insert(attachment.voxel);
     }
-    for (const auto& attachment : sources)
-        voxelSet.insert(attachment.voxel);
-    for (const auto& attachment : targets)
-        voxelSet.insert(attachment.voxel);
+    for (const auto& attachment : targets) {
+        if (!pointPredicate || pointPredicate(voxelPoint(attachment.voxel)))
+            voxelSet.insert(attachment.voxel);
+    }
     if (voxelSet.empty()) {
         candidate.reason = "empty_corridor";
         return candidate;
@@ -1171,6 +1257,22 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     }
     loaded.report.selectedCellBeginZYX = jsonSize3(selection.at("cell_begin_zyx"), "cell_begin_zyx");
     loaded.report.selectedCellEndZYX = jsonSize3(selection.at("cell_end_zyx"), "cell_end_zyx");
+    if (selection.contains("cells_zyx")) {
+        const auto& cells = selection.at("cells_zyx");
+        if (!cells.is_array() || cells.empty())
+            throw std::runtime_error("fiber anchor explicit cells must be a non-empty array");
+        for (const auto& cell : cells)
+            loaded.report.selectedCellsZYX.push_back(jsonSize3(cell, "cells_zyx"));
+        if (!std::is_sorted(
+                loaded.report.selectedCellsZYX.begin(),
+                loaded.report.selectedCellsZYX.end()) ||
+            std::adjacent_find(
+                loaded.report.selectedCellsZYX.begin(),
+                loaded.report.selectedCellsZYX.end()) !=
+                loaded.report.selectedCellsZYX.end()) {
+            throw std::runtime_error("fiber anchor explicit cells must be strictly ordered");
+        }
+    }
     const auto& parameters = root.at("parameters");
     auto& config = loaded.report.config;
     config.cellSizePredictionVoxels = parameters.at("cell_size_prediction_voxels").get<int>();
@@ -1200,7 +1302,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     config.convergenceTolerance = finiteNumber(parameters.at("convergence_tolerance"), "convergence_tolerance");
     config.parallelThreads = 1;
     validateFiberAnchorConfig(config);
-    size_t selectedCellCount = 1;
+    size_t selectedCellCount = loaded.report.selectedCellsZYX.empty() ? 1 :
+        loaded.report.selectedCellsZYX.size();
     for (size_t axis = 0; axis < 3; ++axis) {
         const size_t totalCells =
             (loaded.report.grid.shapeZYX[axis] +
@@ -1211,11 +1314,24 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
             loaded.report.selectedCellEndZYX[axis] > totalCells) {
             throw std::runtime_error("fiber anchor selected cell range is invalid");
         }
-        const size_t extent = loaded.report.selectedCellEndZYX[axis] -
-            loaded.report.selectedCellBeginZYX[axis];
-        if (selectedCellCount > std::numeric_limits<size_t>::max() / extent)
-            throw std::runtime_error("fiber anchor selected cell count overflows");
-        selectedCellCount *= extent;
+        if (loaded.report.selectedCellsZYX.empty()) {
+            const size_t extent = loaded.report.selectedCellEndZYX[axis] -
+                loaded.report.selectedCellBeginZYX[axis];
+            if (selectedCellCount > std::numeric_limits<size_t>::max() / extent)
+                throw std::runtime_error("fiber anchor selected cell count overflows");
+            selectedCellCount *= extent;
+        }
+    }
+    const std::set<std::array<size_t, 3>> explicitCells(
+        loaded.report.selectedCellsZYX.begin(),
+        loaded.report.selectedCellsZYX.end());
+    for (const auto& cell : loaded.report.selectedCellsZYX) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+            if (cell[axis] < loaded.report.selectedCellBeginZYX[axis] ||
+                cell[axis] >= loaded.report.selectedCellEndZYX[axis]) {
+                throw std::runtime_error("fiber anchor explicit cell lies outside its bounds");
+            }
+        }
     }
     const auto& diagnostics = root.at("diagnostics");
     loaded.report.diagnostics.totalCells = diagnostics.at("total_cells").get<size_t>();
@@ -1227,6 +1343,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     loaded.report.diagnostics.belowSupportComponents = diagnostics.at("below_support_components").get<size_t>();
     loaded.report.diagnostics.mergedComponentPairs = diagnostics.at("merged_component_pairs").get<size_t>();
     loaded.report.diagnostics.nmsSuppressedComponents = diagnostics.at("nms_suppressed_components").get<size_t>();
+    loaded.report.diagnostics.outsideSelectionComponents =
+        diagnostics.value("outside_selection_components", size_t{0});
 
     std::optional<std::array<size_t, 3>> previousCell;
     size_t storedMergedComponentPairs = 0;
@@ -1243,6 +1361,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
                 throw std::runtime_error("fiber anchor cell lies outside the selected cell range");
             }
         }
+        if (!explicitCells.empty() && !explicitCells.contains(cell.cellZYX))
+            throw std::runtime_error("fiber anchor cell is not in the explicit selection");
         if (previousCell.has_value() && !(previousCell.value() < cell.cellZYX))
             throw std::runtime_error("fiber anchor cells must be strictly ordered");
         previousCell = cell.cellZYX;
@@ -1282,7 +1402,7 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
             component.anchor.cellZYX = cell.cellZYX;
             if (!component.retained) {
                 component.rejectionReason = componentJson.at("reason").get<std::string>();
-                const std::set<std::string> validReasons{"empty", "degenerate", "below_support", "merged_same_direction", "nms_suppressed"};
+                const std::set<std::string> validReasons{"empty", "degenerate", "below_support", "merged_same_direction", "nms_suppressed", "outside_selection"};
                 if (!validReasons.contains(component.rejectionReason))
                     throw std::runtime_error("rejected fiber anchor component has an unsupported reason");
                 if (component.rejectionReason == "nms_suppressed")
@@ -1412,7 +1532,8 @@ FiberletPathReport traceFiberletPaths(
     const FiberletPathConfig& inputConfig,
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
-    const FiberletPathProgressCallback& progressCallback)
+    const FiberletPathProgressCallback& progressCallback,
+    const FiberletPointPredicate& pointPredicate)
 {
     validateFiberletPathConfig(inputConfig);
     if (!predictionSampler)
@@ -1479,6 +1600,13 @@ FiberletPathReport traceFiberletPaths(
                 const cv::Vec3d chord = chordVector / distance;
                 candidate.startAxisXYZ = normalized(source.anchor.axisXYZ);
                 candidate.targetAxisXYZ = normalized(target->anchor.axisXYZ);
+                if (pointPredicate &&
+                    (!pointPredicate(candidate.startPositionPredictionXYZ) ||
+                     !pointPredicate(candidate.targetPositionPredictionXYZ))) {
+                    candidate.reason = "outside_selection";
+                    report.candidates.push_back(std::move(candidate));
+                    continue;
+                }
                 if (candidate.startAxisXYZ.dot(chord) < 0.0)
                     candidate.startAxisXYZ *= -1.0;
                 if (candidate.targetAxisXYZ.dot(chord) < 0.0)
@@ -1497,7 +1625,7 @@ FiberletPathReport traceFiberletPaths(
     const auto candidateGenerationEnd = Clock::now();
     report.candidateGenerationSeconds = std::chrono::duration<double>(candidateGenerationEnd - startTime).count();
 
-    DenseScoringVolume scoringVolume;
+    ScoringVolume scoringVolume;
     if (!searchCandidateIndices.empty()) {
         scoringVolume = preloadScoringVolume(
             report.candidates,
@@ -1507,8 +1635,9 @@ FiberletPathReport traceFiberletPaths(
             report.config,
             predictionSampler,
             normalSampler,
-            report.estimatedPreloadBytes);
-        report.preloadedVoxels = scoringVolume.voxels.size();
+            report.estimatedPreloadBytes,
+            pointPredicate);
+        report.preloadedVoxels = scoringVolume.size();
     }
     const auto preloadEnd = Clock::now();
     report.preloadSeconds = std::chrono::duration<double>(preloadEnd - candidateGenerationEnd).count();
@@ -1558,7 +1687,7 @@ FiberletPathReport traceFiberletPaths(
             const size_t candidateIndex = searchCandidateIndices[searchIndex];
             try {
                 report.candidates[candidateIndex] =
-                    solveCandidate(report.candidates[candidateIndex], grid, report.anchorCellSizePredictionVoxels, report.config, scoringVolume);
+                    solveCandidate(report.candidates[candidateIndex], grid, report.anchorCellSizePredictionVoxels, report.config, scoringVolume, pointPredicate);
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }

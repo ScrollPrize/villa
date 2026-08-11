@@ -462,6 +462,47 @@ struct FiberTraceWholeFiberMetricRequest {
     FiberTraceConfig config;
 };
 
+enum class FiberReplayStatus {
+    FailureWithPostroll,
+    FailureTruncated,
+    NoFailure,
+    TraceTerminatedBeforeFailure,
+};
+
+struct FiberReplayMatch {
+    size_t tracePointIndex = 0;
+    double predictedReferenceArcBase = 0.0;
+    double matchedReferenceArcBase = 0.0;
+    cv::Vec3d matchedReferencePointBase{0.0, 0.0, 0.0};
+    double searchBeginArcBase = 0.0;
+    double searchEndArcBase = 0.0;
+    double errorBaseVoxels = 0.0;
+    double errorRatio = 0.0;
+};
+
+struct FiberReplayTraceRequest {
+    FiberInput fiber;
+    size_t startControlPointIndex = 0;
+    double traceToBaseScale = 1.0;
+    double errorThresholdBaseVoxels = 20.0;
+    double matchRefineSteps = 1.0;
+    int postrollSteps = 100;
+    FiberTraceConfig config;
+};
+
+struct FiberReplayTraceResult {
+    FiberReplayStatus status = FiberReplayStatus::TraceTerminatedBeforeFailure;
+    std::string terminationReason;
+    std::vector<cv::Vec3d> tracePointsBase;
+    std::vector<double> cumulativeLosses;
+    std::vector<FiberReplayMatch> matches;
+    std::optional<size_t> failureTracePointIndex;
+    std::optional<double> failureReferenceArcBase;
+    int requestedPostrollSteps = 0;
+    int completedPostrollSteps = 0;
+    int maximumTraceSteps = 0;
+};
+
 struct FiberTraceWholeFiberProgress {
     int completedSegments = 0;
     int segmentCount = 0;
@@ -589,6 +630,14 @@ struct CandidateScoreDebug {
     const FiberTraceWholeFiberMetricRequest& request,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceWholeFiberProgressCallback& progress = {});
+
+[[nodiscard]] FiberReplayTraceResult traceFiberReplay(
+    const FiberPredictionSource& predictions,
+    const FiberReplayTraceRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler = nullptr,
+    const FiberTraceProgressCallback& progress = {});
+
+[[nodiscard]] const char* fiberReplayStatusName(FiberReplayStatus status) noexcept;
 
 [[nodiscard]] cv::Vec3d referenceTangentToward(
     const std::vector<cv::Vec3d>& line,

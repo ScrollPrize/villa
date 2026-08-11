@@ -652,7 +652,13 @@ TEST_CASE("fiber anchor artifacts are deterministic across block and worker coun
         std::ifstream input(path);
         return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
-    for (const auto* name : {"anchors.json", "anchors.obj", "anchors_0.obj", "anchors_1.obj"})
+    for (const auto* name : {
+             "anchors.json",
+             "anchors.obj",
+             "anchors_0.obj",
+             "anchors_1.obj",
+             "anchor_cells.obj",
+         })
         CHECK(read(firstDirectory / name) == read(secondDirectory / name));
     std::filesystem::remove_all(firstDirectory);
     std::filesystem::remove_all(secondDirectory);
@@ -760,6 +766,11 @@ TEST_CASE("fiber anchor artifacts expose only base-volume positions")
     const std::string obj = vc::fiber_tracer::fiberAnchorReportObj(report, artifact);
     CHECK(obj.find("g cell_0_0_0_anchor_0") != std::string::npos);
     CHECK(obj.find("\nl 1 2\n") != std::string::npos);
+    const std::string cellObj =
+        vc::fiber_tracer::fiberAnchorCellReportObj(report);
+    CHECK(cellObj.starts_with("# vc_fiberlet_anchor_cells version 1\n"));
+    CHECK(occurrenceCount(cellObj, "\np ") == 1);
+    CHECK(occurrenceCount(cellObj, "\nl ") == 1);
 
     auto parallelConfig = config();
     parallelConfig.parallelThreads = 7;
@@ -913,4 +924,51 @@ TEST_CASE("fiber stored-grid metadata does not substitute a prefixed triplet")
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::FiberPredictionField(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid), doctest::Contains("canonical presence/nx/ny"), std::runtime_error);
     std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {8, 8, 8};
+    grid.predictionToBaseScale = 1.0;
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    std::vector<vc::fiber_tracer::FiberAnchorProgress> progress;
+    const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
+        grid,
+        value,
+        [](const auto& indices, int, auto& samples) {
+            samples.clear();
+            for (size_t index = 0; index < indices.size(); ++index) {
+                samples.push_back({{1.0, 0.0, 0.0}, 1.0, true});
+            }
+        },
+        {{0, 0, 0}, {1, 1, 1}},
+        [](const vc::fiber_tracer::FiberAnchor& anchor) {
+            return anchor.positionPredictionXYZ[0] < 4.0;
+        },
+        [&](const vc::fiber_tracer::FiberAnchorProgress& event) {
+            progress.push_back(event);
+        });
+
+    CHECK(report.selectedCellsZYX ==
+          std::vector<std::array<size_t, 3>>{{0, 0, 0}, {1, 1, 1}});
+    CHECK(report.diagnostics.totalCells == 2);
+    CHECK(report.diagnostics.outsideSelectionComponents >= 1);
+    for (const auto& cell : report.nonEmptyCells)
+        CHECK(cell.cellZYX == std::array<size_t, 3>{0, 0, 0});
+    REQUIRE(progress.size() >= 3);
+    CHECK(progress.front().phase == "selected_cells");
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.front().total == 2);
+    CHECK(std::any_of(progress.begin(), progress.end(), [](const auto& event) {
+        return event.phase == "selected_cells" && event.completed == 2 &&
+            event.total == 2;
+    }));
+    CHECK(progress.back().phase == "nms_context");
+    CHECK(progress.back().completed <= progress.back().total);
+    const std::string cellObj =
+        vc::fiber_tracer::fiberAnchorCellReportObj(report);
+    CHECK(occurrenceCount(cellObj, "\np ") == 2);
+    CHECK(occurrenceCount(cellObj, "\nl ") == 1);
 }

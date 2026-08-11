@@ -296,6 +296,55 @@ TEST_CASE("fiberlet DP preloads each scoring voxel once")
     }
 }
 
+TEST_CASE("fiberlet sparse replay preload preserves dense path bytes and costs")
+{
+    const auto anchors = twoAnchorArtifact();
+    const ConstantNormalSampler normals;
+    const auto dense = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, pathConfig(), constantPredictions(), normals);
+    std::vector<std::array<size_t, 3>> sampled;
+    const auto sparse = vc::fiber_tracer::traceFiberletPaths(
+        anchors,
+        anchors.report.grid,
+        pathConfig(),
+        [&](const auto& indices, int, auto& samples) {
+            sampled = indices;
+            samples.assign(indices.size(), {{1.0, 0.0, 0.0}, 1.0, true});
+        },
+        normals,
+        {},
+        [](const cv::Vec3d&) { return true; });
+
+    REQUIRE(dense.diagnostics.successfulPaths == 1);
+    REQUIRE(sparse.diagnostics.successfulPaths == 1);
+    CHECK(sparse.preloadedVoxels <= dense.preloadedVoxels);
+    CHECK(std::set<std::array<size_t, 3>>(sampled.begin(), sampled.end()).size() ==
+          sampled.size());
+    CHECK(sparse.candidates[0].pointsPredictionXYZ ==
+          dense.candidates[0].pointsPredictionXYZ);
+    CHECK(sparse.candidates[0].cost.total() == dense.candidates[0].cost.total());
+    CHECK(vc::fiber_tracer::fiberletPathReportObj(sparse) ==
+          vc::fiber_tracer::fiberletPathReportObj(dense));
+}
+
+TEST_CASE("fiberlet sparse replay domain rejects a disconnected corridor")
+{
+    const auto anchors = twoAnchorArtifact();
+    const ConstantNormalSampler normals;
+    const auto report = vc::fiber_tracer::traceFiberletPaths(
+        anchors,
+        anchors.report.grid,
+        pathConfig(),
+        constantPredictions(),
+        normals,
+        {},
+        [](const cv::Vec3d& point) { return point[0] < 6.0 || point[0] > 6.0; });
+
+    CHECK(report.diagnostics.successfulPaths == 0);
+    REQUIRE(report.candidates.size() == 1);
+    CHECK(report.candidates[0].reason == "no_path");
+}
+
 TEST_CASE("fiberlet candidate workers preserve deterministic results")
 {
     const auto anchors = twoPathArtifact();

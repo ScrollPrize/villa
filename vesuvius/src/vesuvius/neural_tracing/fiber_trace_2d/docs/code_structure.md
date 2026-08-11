@@ -2528,9 +2528,23 @@ emits the terminal update after joining workers and before rethrowing a task or
 callback exception. `vc_fiberlets` formats this callback on stderr with rate
 and ETA, while the core remains independent of console output.
 
-`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors` and `paths`.
+`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`, and
+`fiber-replay`.
 The latter requires the matching fiber manifest plus a separate regular
 Lasagna normal manifest and writes machine-readable `fiberlets.json` together
 with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ
 coordinates are base-volume coordinates; prediction coordinates are private to
 the anchor fit and DP implementations.
+
+`PolylineGeometry.cpp` owns dense-polyline arclength sampling, slicing, and
+bounded exact projection. `FiberTrace.cpp::traceFiberReplay` adds a committed-
+step stop observer to the existing one-way core; ordinary callers omit it and
+retain their prior behavior. `FiberReplay.cpp` constructs exact base-coordinate
+tubes and atomically publishes content-addressed replay generations.
+
+Replay opens separate prediction and normal bindings for native trace space and
+the canonical stored prediction grid. Explicit sparse anchor cells flow through
+the same block fit and NMS implementation as rectangular crops. `FiberPaths.cpp`
+uses its dense preload for standalone paths and a sorted sparse tube preload
+when a replay point predicate is present. The Python viewer keeps the presence
+Zarr external and strictly loads the replay bundle plus its relative artifacts.

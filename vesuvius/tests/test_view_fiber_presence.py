@@ -1,23 +1,216 @@
 import argparse
 import json
 
+import dask.array as da
 import numpy as np
 import pytest
 import zarr
+
 from vesuvius.scripts.view_fiber_presence import (
+    CropSelection,
     clipping_plane_in_layer_data,
     common_shape_edge_width,
     crop_clipping_planes_in_base,
     crop_clipping_planes_in_layer_data,
     fiberlet_colormap_names,
     fiberlet_quality_colormap_spec,
+    load_fiber_replay_bundle,
+    mask_presence_by_distance,
     open_lazy_crop,
     parse_crop,
+    read_anchor_cell_obj,
     read_line_obj,
+    replay_distance_transform_base,
     resolve_ome_zarr_level,
     select_base_crop,
     set_common_shape_edge_width,
 )
+
+
+def _fnv1a64(data: bytes) -> str:
+    value = 14695981039346656037
+    for byte in data:
+        value ^= byte
+        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"fnv1a64:{value:016x}"
+
+
+def _write_nonfailure_replay(tmp_path):
+    generation = tmp_path / "runs" / "abc" / "replay"
+    generation.mkdir(parents=True)
+    reference = (
+        b"# vc_fiber_replay_reference version 1\n"
+        b"v 0 0 0\nv 8 0 0\nl 1 2\n"
+    )
+    trace = (
+        b"# vc_fiber_replay_trace version 1\n"
+        b"v 0 0 0\nv 4 0 0\nl 1 2\n"
+    )
+    (generation / "reference.obj").write_bytes(reference)
+    (generation / "trace.obj").write_bytes(trace)
+    bundle = {
+        "format": "vc_fiber_replay",
+        "version": 1,
+        "coordinates": {
+            "position_order": "XYZ",
+            "position_space": "base_volume",
+            "distance_unit": "base_voxels",
+        },
+        "sources": {
+            "fiber_manifest": "/fiber.json",
+            "fiber_manifest_content_hash": "fnv1a64:1",
+            "normal_manifest": "/normal.json",
+            "normal_manifest_content_hash": "fnv1a64:2",
+            "fiber_json": "/reference.json",
+            "fiber_json_content_hash": "fnv1a64:3",
+        },
+        "bindings": {
+            "trace": {
+                "mode": "trace_options",
+                "trace_to_base_scale": 2.0,
+                "prediction_to_base_scale": 2.0,
+                "prediction_spacing_trace_voxels": 1.0,
+            },
+            "prediction": {
+                "mode": "canonical_stored_grid",
+                "prediction_to_base_scale": 2.0,
+                "prediction_shape_zyx": [4, 4, 4],
+            }
+        },
+        "trace_config": {
+            "requested": {"beam_width": 8, "beam_lookahead_steps": 2},
+            "effective": {"beam_width": 1, "beam_lookahead_steps": 1},
+        },
+        "status": "no_failure",
+        "termination_reason": "reference_end",
+        "reference_points_base_xyz": [[0, 0, 0], [8, 0, 0]],
+        "trace_points_base_xyz": [[0, 0, 0], [4, 0, 0]],
+        "trace_cumulative_losses": [0.0, 1.0],
+        "matching": {
+            "failure_threshold_base_voxels": 20.0,
+            "refine_steps": 1.0,
+            "records": [],
+        },
+        "postroll": {
+            "requested_steps": 100,
+            "completed_steps": 0,
+            "maximum_trace_steps": 10,
+        },
+        "failure_trace_point_index": None,
+        "failure_reference_arc_base": None,
+        "tube": None,
+        "volume_crop_base_xyzwhd": None,
+        "artifacts": {
+            "replay/reference.obj": {
+                "path": "runs/abc/replay/reference.obj",
+                "content_hash": _fnv1a64(reference),
+            },
+            "replay/trace.obj": {
+                "path": "runs/abc/replay/trace.obj",
+                "content_hash": _fnv1a64(trace),
+            },
+        },
+    }
+    path = tmp_path / "fiber_replay.json"
+    path.write_text(json.dumps(bundle))
+    return path
+
+
+def test_loads_strict_nonfailure_replay_bundle(tmp_path):
+    replay = load_fiber_replay_bundle(_write_nonfailure_replay(tmp_path))
+
+    assert replay.status == "no_failure"
+    assert replay.crop_xyzwhd == (0, 0, 0, 9, 1, 1)
+    assert replay.prediction_shape_zyx == (4, 4, 4)
+    np.testing.assert_array_equal(replay.reference_zyx, [[0, 0, 0], [0, 0, 8]])
+    assert replay.anchors_obj is None
+    assert replay.anchor_cells_obj is None
+    assert replay.failure_zyx is None
+    assert replay.tube_radius_base_voxels is None
+
+
+def test_reads_anchor_cell_centers_and_accepted_offsets(tmp_path):
+    path = tmp_path / "anchor_cells.obj"
+    path.write_text(
+        "# vc_fiberlet_anchor_cells version 1\n"
+        "g cell_0_0_0\n"
+        "v 1 2 3\n"
+        "p 1\n"
+        "v 4 5 6\n"
+        "l 1 2\n"
+        "g cell_0_0_1\n"
+        "v 7 8 9\n"
+        "p 3\n"
+    )
+
+    geometry = read_anchor_cell_obj(path)
+
+    np.testing.assert_array_equal(geometry.centers_zyx, [[3, 2, 1], [9, 8, 7]])
+    assert len(geometry.displacements_zyx) == 1
+    np.testing.assert_array_equal(
+        geometry.displacements_zyx[0], [[3, 2, 1], [6, 5, 4]]
+    )
+
+
+def test_replay_distance_mask_uses_reference_and_trace_in_base_voxels():
+    selection = CropSelection(
+        requested_base_xyzwhd=(0, 0, 0, 10, 10, 10),
+        slices_zyx=(slice(0, 5), slice(0, 5), slice(0, 5)),
+        origin_base_zyx=(0.0, 0.0, 0.0),
+        shape_zyx=(5, 5, 5),
+    )
+    distance = replay_distance_transform_base(
+        np.asarray([[0.0, 4.0, 0.0], [0.0, 4.0, 8.0]]),
+        np.asarray([[0.0, 8.0, 0.0], [0.0, 8.0, 8.0]]),
+        selection,
+        (2.0, 2.0, 2.0),
+    )
+
+    np.testing.assert_array_equal(distance[0, 2], np.zeros(5))
+    np.testing.assert_array_equal(distance[0, 4], np.zeros(5))
+    assert distance[0, 3, 2] == pytest.approx(2.0)
+    presence = da.from_array(np.ones((5, 5, 5), dtype=np.float32), chunks=(2, 2, 2))
+    distance_data = da.from_array(distance, chunks=presence.chunks)
+    masked = mask_presence_by_distance(presence, distance_data, 1.0).compute()
+    np.testing.assert_array_equal(masked[0, 2], np.ones(5))
+    np.testing.assert_array_equal(masked[0, 4], np.ones(5))
+    assert masked[0, 3, 2] == 0.0
+
+
+def test_replay_bundle_rejects_hash_mismatch(tmp_path):
+    path = _write_nonfailure_replay(tmp_path)
+    (tmp_path / "runs" / "abc" / "replay" / "trace.obj").write_text("changed")
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_fiber_replay_bundle(path)
+
+
+def test_replay_bundle_rejects_lexical_escape(tmp_path):
+    path = _write_nonfailure_replay(tmp_path)
+    bundle = json.loads(path.read_text())
+    bundle["artifacts"]["replay/trace.obj"]["path"] = "../trace.obj"
+    path.write_text(json.dumps(bundle))
+
+    with pytest.raises(ValueError, match="escapes"):
+        load_fiber_replay_bundle(path)
+
+
+def test_replay_bundle_rejects_symlink_escape(tmp_path):
+    path = _write_nonfailure_replay(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.obj"
+    outside.write_text("outside")
+    symlink = tmp_path / "runs" / "abc" / "replay" / "escape.obj"
+    symlink.symlink_to(outside)
+    bundle = json.loads(path.read_text())
+    bundle["artifacts"]["replay/trace.obj"] = {
+        "path": "runs/abc/replay/escape.obj",
+        "content_hash": _fnv1a64(b"outside"),
+    }
+    path.write_text(json.dumps(bundle))
+
+    with pytest.raises(ValueError, match="escapes"):
+        load_fiber_replay_bundle(path)
+    outside.unlink()
 
 
 def test_fiberlet_quality_colormap_spec_is_red_yellow_green():

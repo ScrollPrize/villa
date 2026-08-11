@@ -114,6 +114,8 @@ diagonal, retained/NMS counts, and elapsed time. It writes:
 - `anchors.obj`: all diagnostic base-coordinate line glyphs.
 - `anchors_0.obj`: only component slot zero from every non-empty cell.
 - `anchors_1.obj`: only component slot one from two-anchor cells.
+- `anchor_cells.obj`: one point for every selected cell center and a line from
+  that center to each anchor retained after fitting and NMS.
 
 The component slots are deterministic within each cell after support-based
 sorting. They are visualization layers, not global H/V or winding classes, and
@@ -176,6 +178,11 @@ Corridors may leave the selected anchor-cell box, so the preload box can extend
 beyond the original crop. This intentionally favors speed for the current
 small test crops and can consume substantial memory on large stored-prediction
 regions.
+
+Replay mode instead enumerates the union of admissible corridor bounding boxes,
+intersects every integer prediction voxel with the replay tube, sorts the voxel
+keys, and samples each key once into an immutable sparse lookup. The standalone
+`paths` command retains the dense rectangular preload described above.
 
 `--threads` controls both the one-time preload batch and the subsequent fixed
 candidate worker pool. Candidate results are written into their original
@@ -322,6 +329,70 @@ Fiberlet path visualization artifacts are experimental and parsed strictly by
 the napari viewer. Regenerate older `fiberlets.obj` output that lacks the
 quality report comments or per-group metrics; there is no repair or
 compatibility path. Obsolete `mtllib` or `usemtl` records are rejected.
+
+## Dense-fiber failure replay
+
+`fiber-replay` starts the regular native 3D tracer at the first control point
+of a strict VC3D fiber JSON. It forces the native tracer to greedy mode and
+compares every committed trace point with the dense stored fiber line:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets fiber-replay \
+  /path/to/fiber.lasagna.json \
+  /path/to/reference-fiber.json \
+  /tmp/fiber-replay \
+  --normal-manifest /path/to/lasagna.lasagna.json
+```
+
+The command reports start/completion and elapsed time for trace setup, tracing,
+tube selection, anchor extraction, fiberlet tracing, and publication. Anchor
+fitting reports selected-cell and NMS-context progress with ETA once per second;
+fiberlet DP reports candidate-search progress and ETA with the same cadence.
+
+All distances are base voxels. The correspondence cursor advances monotonically.
+Each step predicts one nominal trace step along the reference, then computes the
+exact closest point in the bounded forward interval. `--match-refine 1` permits
+zero through two nominal steps of forward reference advance. The first distance
+strictly above `--fail 20` is the failure point; `--after 100` retains that many
+additional native greedy steps. Exhaustive statuses distinguish a complete or
+truncated failure, reference completion without failure, and native termination
+before failure.
+
+For failures, `--along 512` selects that much dense-reference arclength on each
+side and `--radius 128` defines an exact Euclidean tube including endpoint caps.
+Anchor cells are selected when their prediction-sample footprint intersects the
+tube. Refined anchors are rejected outside the tube before NMS. Fiberlet virtual
+endpoints and integer DP nodes are also tube constrained, and their scoring data
+uses the sparse replay preload. No central textured slice OBJ is produced.
+
+Each run is published under `runs/<content-hash>/`; only after the complete
+generation exists is `fiber_replay.json` atomically replaced. The bundle stores
+the two independent trace/canonical scale bindings, requested and forced-effective
+trace configurations, matching diagnostics, reference/trace/failure geometry,
+tube cells, crop, relative artifact paths, and content hashes. It deliberately
+does not store the external presence-Zarr path.
+
+Load the bundle and the independently selected presence Zarr with:
+
+```bash
+python -m vesuvius.scripts.view_fiber_presence \
+  /path/to/fiber-presence.ome.zarr \
+  --replay /tmp/fiber-replay/fiber_replay.json
+```
+
+Replay mode rejects manual crop/anchor/path arguments and verifies the external
+Zarr shape and scale. It strictly validates bundle paths, containment, hashes,
+status-specific artifacts, and OBJ equality with authoritative JSON geometry.
+Reference, greedy trace, failure, anchors, fiberlets, and presence are separate
+toggleable layers. Cell centers and their retained-anchor displacement lines are
+also separate layers loaded from `anchor_cells.obj`, so zero-anchor cells remain
+visible. The six crop controls clip every layer and the dock provides width or
+size controls for the diagnostic geometry. For failure replay,
+the viewer rasterizes both the reference and complete greedy replay trace at the
+displayed Zarr level and computes one base-voxel distance transform to their
+union. The `Presence radius` slider applies a hard lazy mask to that distance
+field and defaults to the extraction-tube radius used for anchors and fiberlets.
+Changing the slider threshold does not recompute the EDT.
 
 This is an overcomplete diagnostic collection. There is no path-quality cutoff,
 degree selection, overlap deduplication, extension, H/V or winding assignment,

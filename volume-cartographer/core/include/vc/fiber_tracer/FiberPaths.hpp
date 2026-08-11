@@ -173,6 +173,7 @@ struct FiberletPathProgress {
 };
 
 using FiberletPathProgressCallback = std::function<void(const FiberletPathProgress& progress)>;
+using FiberletPointPredicate = std::function<bool(const cv::Vec3d& pointPredictionXYZ)>;
 
 void validateFiberletPathConfig(const FiberletPathConfig& config);
 
@@ -186,7 +187,8 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
     const FiberletPathConfig& config,
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
-    const FiberletPathProgressCallback& progressCallback = {});
+    const FiberletPathProgressCallback& progressCallback = {},
+    const FiberletPointPredicate& pointPredicate = {});
 
 [[nodiscard]] FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report);
 
