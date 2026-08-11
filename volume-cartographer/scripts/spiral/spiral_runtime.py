@@ -104,6 +104,13 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
+# How long one requested preview export may take. The window covers the whole
+# operation, not just the render: the host service Lasagna-flattens and hashes
+# the generation synchronously from the status callback, inside the session's
+# ExportingPreview window. Exceeding it reports a failure for an export that
+# usually goes on to publish anyway, so it is sized for the largest fits.
+PREVIEW_EXPORT_TIMEOUT_S = 1200.0
+
 
 # All-rank commands that only a rank with nothing outstanding may enter.
 _QUIESCENT_COMMANDS = frozenset({
@@ -1581,7 +1588,7 @@ class InteractiveFitSession:
                 session_generation=self.session_generation, epoch=epoch)
         return self._queue_command(command, timeout)
 
-    def export_preview(self, timeout=600.0):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
         """Export and publish one preview generation, on request.
 
         A coordinator sub-operation: only the publishing rank exports, so it
@@ -1684,7 +1691,7 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
                     result = session.export_preview(
-                        arguments.get("timeout", 600.0))
+                        arguments.get("timeout", PREVIEW_EXPORT_TIMEOUT_S))
                 elif name == "rebuild_model":
                     result = session.rebuild_model(
                         arguments["paths"], arguments["run"],
@@ -2145,7 +2152,7 @@ class DistributedInteractiveFitSession:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
 
-    def export_preview(self, timeout=600.0):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Preview export is not allowed in {state}")
