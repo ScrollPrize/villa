@@ -216,10 +216,18 @@ populate read-only from the service's advertised dataset resolution; run
 parameters (z range, iterations, advanced config) stay editable and persist
 per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
-filesystem is needed. Optional: set the profile's path map
-(service prefix → local prefix) if this machine mounts the same dataset, so
-input surface overlays (verified/unverified/shell) can be displayed locally;
-without a mapping those overlays are simply marked unavailable.
+filesystem is needed. Optional: set the profile's **Local dataset path** if
+this machine mounts the same dataset, so input surface overlays
+(verified/unverified/shell) can be displayed locally. It is assumed to
+correspond to the dataset root the service advertises, which is the prefix
+service paths are translated from; without it those overlays are simply marked
+unavailable.
+
+`spiral-scroll.json` in the dataset root is the only source of the scroll's
+name and voxel resolution and of the Lasagna store layout (zarr groups,
+coordinate scale). None of them are panel settings: the panel reports them
+read-only, and the service rejects a session request that carries
+`scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
 
 While a session is active you can right-click a patch in the Surface panel or
 a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs

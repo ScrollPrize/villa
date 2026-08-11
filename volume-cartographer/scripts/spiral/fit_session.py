@@ -80,7 +80,13 @@ from config import Config
 # Version 26 removes the stateful run-plan handshake. POST /session/run carries
 # the complete request and rejects configuration that requires a rebuild;
 # run-boundary configuration is applied directly.
-API_VERSION = 26
+# Version 27 makes spiral-scroll.json the only source of the facts it carries.
+# The run block no longer carries scroll_name, voxel_size_um, lasagna_group or
+# lasagna_scale, and a request that names any of them is rejected. Each
+# restated something the dataset root already specifies and silently won over
+# it, so a client could mislabel outputs, scale a fit against a resolution the
+# dataset contradicts, or read the Lasagna stores at the wrong zarr level.
+API_VERSION = 27
 
 
 class SessionState(str, Enum):
@@ -365,14 +371,29 @@ class SpiralInputPaths:
         return result
 
 
+# Run-block keys the scroll specification owns, mapped to the ScrollSpec field
+# each one used to shadow. A request that carries one is rejected rather than
+# ignored: silently dropping it would let a client believe it had renamed a
+# scroll, changed its resolution, or moved the Lasagna stores.
+SCROLL_SPEC_OWNED_RUN_KEYS = {
+    "scroll_name": "name",
+    "voxel_size_um": "voxel_size_um",
+    "lasagna_group": "normal_zarr_group",
+    "lasagna_scale": "lasagna_scale",
+}
+
+
 @dataclass(frozen=True)
 class SpiralRunConfig:
+    """Deployment and presentation settings of one fit run.
+
+    Nothing spiral-scroll.json specifies is here — not the scroll's physical
+    facts (name, voxel size, outward sense) and not the dataset's Lasagna store
+    layout. That file is the single source for all of it (see ``ScrollSpec``).
+    """
+
     z_begin: int
     z_end: int
-    scroll_name: str = "scroll"
-    voxel_size_um: float = 9.6
-    lasagna_group: str = "4"
-    lasagna_scale: int = 4
     storage_backend: str = "sparse_cuda"
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
@@ -384,10 +405,6 @@ class SpiralRunConfig:
         return cls(
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
-            scroll_name=str(value.get("scroll_name", "scroll")),
-            voxel_size_um=float(value.get("voxel_size_um", 9.6)),
-            lasagna_group=str(value.get("lasagna_group", "4")),
-            lasagna_scale=int(value.get("lasagna_scale", 4)),
             storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
@@ -1099,8 +1116,6 @@ def validate_session_request(
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
-    if run.lasagna_scale <= 0:
-        errors.append({"field": "lasagna_scale", "message": "Must be positive"})
     if run.storage_backend != "sparse_cuda":
         errors.append({
             "field": "storage_backend",

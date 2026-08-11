@@ -61,6 +61,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
+                         SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir,
                          load_scroll_spec,
@@ -689,6 +690,13 @@ class ServiceState:
         return {**self._base(), **self.dataset_resolution.to_dict(),
                 "session_checkpoints": self.session_checkpoints()}
 
+    @property
+    def scroll_spec(self):
+        """The parsed spiral-scroll.json manifest, or None if it is invalid."""
+        if self.dataset_resolution is None:
+            return None
+        return self.dataset_resolution.scroll_spec
+
     def session_checkpoints(self):
         """Checkpoints under the session output directory, newest first.
 
@@ -772,6 +780,20 @@ class ServiceState:
 
     def _prepare_session_request(self, request):
         """Validate one session request into the arguments a build needs."""
+        # The scroll specification in the dataset root owns these. A request
+        # that names one is refused rather than quietly overruled by the file.
+        scroll_owned = sorted(
+            key for key in SCROLL_SPEC_OWNED_RUN_KEYS
+            if key in (request.get("run") or {}))
+        if scroll_owned:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
+                "values; the request must not carry them",
+                [{"field": f"run.{key}",
+                  "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
+                              f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
+                 for key in scroll_owned])
         if self.dataset_resolution is not None:
             request = self._dataset_session_request(request)
         paths, run, preview = parse_session_request(request)
@@ -1447,9 +1469,9 @@ class ServiceState:
         """
         with self.lock:
             output_directory = self.session_paths.output_directory
-            voxel_size_um = (
-                (self.session_request or {}).get("run") or {}
-            ).get("voxel_size_um")
+        # The physical resolution of the preview is the scroll's own, read from
+        # the specification the dataset root carries.
+        voxel_size_um = (self.scroll_spec or {}).get("voxel_size_um")
 
         def attach_process(process):
             with self.lock:

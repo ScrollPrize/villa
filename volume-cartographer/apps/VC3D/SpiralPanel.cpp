@@ -54,6 +54,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* contents = new QWidget(scroll);
     auto* layout = new QVBoxLayout(contents);
 
+    // Session state, progress and diagnostics live outside the scroll area:
+    // they report on work in flight and must stay readable wherever the rest
+    // of the panel is scrolled to.
+    auto* statusDock = new QWidget(this);
+    auto* statusDockLayout = new QVBoxLayout(statusDock);
+    statusDockLayout->setContentsMargins(0, 0, 0, 0);
+
     auto makeSection = [this, contents, layout](const QString& title,
                                                 const QString& objectName,
                                                 const QString& settingsKey) {
@@ -127,7 +134,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     apiKeyLayout->setContentsMargins(0, 0, 0, 0);
     _apiKey = new QLineEdit(_apiKeyRow);
     _apiKey->setEchoMode(QLineEdit::Password);
-    _apiKey->setPlaceholderText(tr("Printed by the service at startup (or set SPIRAL_API_KEY)"));
     apiKeyLayout->addWidget(_apiKey);
     serviceForm->addRow(tr("API key"), _apiKeyRow);
 
@@ -172,20 +178,28 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                               "outside the dataset root. Empty uses the "
                               "documented user cache default."));
 
+    // One box, not a pair: the service advertises its own dataset root, so the
+    // only thing this viewer cannot know is where the same dataset is mounted
+    // here. Service paths are translated by swapping the advertised root for
+    // this local root.
     _mappingRow = new QWidget(serviceContents);
     auto* mappingLayout = new QHBoxLayout(_mappingRow);
     mappingLayout->setContentsMargins(0, 0, 0, 0);
-    _mapServiceRoot = new QLineEdit(_mappingRow);
-    _mapServiceRoot->setPlaceholderText(tr("service path prefix"));
     _mapLocalRoot = new QLineEdit(_mappingRow);
-    _mapLocalRoot->setPlaceholderText(tr("local path prefix"));
-    mappingLayout->addWidget(_mapServiceRoot, 1);
-    mappingLayout->addWidget(new QLabel(QStringLiteral("→"), _mappingRow));
+    _mapLocalRoot->setPlaceholderText(tr("local mount of the service's dataset root"));
+    auto* browseLocalRoot = new QToolButton(_mappingRow);
+    browseLocalRoot->setText(QStringLiteral("…"));
     mappingLayout->addWidget(_mapLocalRoot, 1);
-    _mappingRow->setToolTip(tr("Optional: when both machines mount the same dataset under "
-                               "different roots, map service paths to local paths so input "
-                               "overlays can be displayed."));
-    serviceForm->addRow(tr("Path map"), _mappingRow);
+    mappingLayout->addWidget(browseLocalRoot);
+    _mappingRow->setToolTip(tr("Optional: where this computer mounts the same dataset the "
+                               "service is bound to. Assumed to correspond to the service's "
+                               "advertised dataset root, so input overlays can be displayed."));
+    serviceForm->addRow(tr("Local dataset path"), _mappingRow);
+    connect(browseLocalRoot, &QToolButton::clicked, this, [this]() {
+        const QString chosen = QFileDialog::getExistingDirectory(
+            this, tr("Select the local dataset root"), _mapLocalRoot->text());
+        if (!chosen.isEmpty()) _mapLocalRoot->setText(chosen);
+    });
 
     auto* connectRow = new QWidget(serviceContents);
     auto* connectLayout = new QHBoxLayout(connectRow);
@@ -212,6 +226,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
     addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
+    // Read-only, because spiral-scroll.json in the dataset root is the only
+    // source of these: the service rejects a request that restates them. They
+    // are still shown, because a fit's meaning depends on them.
+    _scrollSummary = new QLabel(tr("No scroll specification loaded"), pathsContents);
+    _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
+    _scrollSummary->setWordWrap(true);
+    _scrollSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _scrollSummary->setToolTip(
+        tr("The scroll's physical facts, from spiral-scroll.json in the dataset root"));
+    pathsForm->addRow(tr("Scroll"), _scrollSummary);
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
 
     auto* pclContainer = new QWidget(pathsContents);
@@ -220,7 +244,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _pclList = new QListWidget(pclContainer);
     _pclList->setObjectName(QStringLiteral("spiralPclList"));
     _pclList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _pclList->setMinimumHeight(90);
+    _pclList->setMinimumHeight(60);
+    // Two thirds of the default scroll-area height: the list rarely holds more
+    // than a few roles, and the space is better spent on the rows below it.
+    _pclList->setMaximumHeight(_pclList->sizeHint().height() * 2 / 3);
     pclLayout->addWidget(_pclList);
     auto* pclInputRow = new QHBoxLayout;
     _pclRole = new QComboBox(pclContainer);
@@ -321,13 +348,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     addPathRow(lasagnaForm, "normal_y", tr("Normal Y"), true);
     addPathRow(lasagnaForm, "surf_sdt", tr("Surface SDT"), true);
     addPathRow(lasagnaForm, "gradient_magnitude", tr("Gradient magnitude"), true);
-    _lasagnaGroup = new QLineEdit(QStringLiteral("4"), lasagnaContents);
-    _lasagnaScale = new QSpinBox(lasagnaContents);
-    _lasagnaScale->setRange(1, 1024);
-    _lasagnaScale->setValue(4);
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
-    lasagnaForm->addRow(tr("Zarr group"), _lasagnaGroup);
-    lasagnaForm->addRow(tr("Coordinate scale"), _lasagnaScale);
+    // Also owned by spiral-scroll.json: the zarr level and coordinate scale
+    // describe how the dataset's Lasagna stores were written, so they are
+    // reported rather than chosen.
+    _lasagnaSummary = new QLabel(tr("No scroll specification loaded"), lasagnaContents);
+    _lasagnaSummary->setObjectName(QStringLiteral("spiralLasagnaSummary"));
+    _lasagnaSummary->setWordWrap(true);
+    _lasagnaSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _lasagnaSummary->setToolTip(
+        tr("The store layout, from spiral-scroll.json in the dataset root"));
+    lasagnaForm->addRow(tr("Store layout"), _lasagnaSummary);
 
     auto* outputGroup = makeSection(tr("Fit and output"),
                                     QStringLiteral("spiralFitOutputGroup"),
@@ -340,8 +371,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     addPathRow(outputForm, "scroll_zarr", tr("Scroll/render Zarr"), true);
     _zBegin = new QSpinBox(outputContents); _zBegin->setRange(0, 1000000); _zBegin->setValue(4000);
     _zEnd = new QSpinBox(outputContents); _zEnd->setRange(1, 1000000); _zEnd->setValue(17000);
-    _scrollName = new QLineEdit(QStringLiteral("s1"), outputContents);
-    _voxelSize = new QDoubleSpinBox(outputContents); _voxelSize->setRange(0.001, 10000); _voxelSize->setDecimals(4); _voxelSize->setValue(9.6);
+    // The scroll's name and voxel resolution are not here: spiral-scroll.json
+    // in the dataset root is their only source, and the service rejects a
+    // request that restates them.
     _legacyCheckpointStep = new QSpinBox(outputContents); _legacyCheckpointStep->setRange(0, 1000000000);
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
@@ -376,8 +408,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _advanced = _advancedProfiles->textEdit();
     outputForm->addRow(tr("z begin"), _zBegin);
     outputForm->addRow(tr("z end"), _zEnd);
-    outputForm->addRow(tr("Scroll name"), _scrollName);
-    outputForm->addRow(tr("Voxel size (µm)"), _voxelSize);
     outputForm->addRow(tr("Legacy checkpoint step"), _legacyCheckpointStep);
     outputForm->addRow(tr("Run tag"), _runTag);
     outputForm->addRow(tr("Render-volume scale"), _renderVolumeScale);
@@ -638,21 +668,32 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runLayout->addLayout(commitRow);
     runLayout->addWidget(_commitHint);
 
-    _state = new QLabel(tr("Service disconnected"), runContents);
-    _previewProgress = new QProgressBar(runContents);
+    _state = new QLabel(tr("Service disconnected"), statusDock);
+    _state->setWordWrap(true);
+    _previewProgress = new QProgressBar(statusDock);
     _previewProgress->setObjectName(QStringLiteral("spiralPreviewProgress"));
     _previewProgress->setTextVisible(true);
     _previewProgress->setVisible(false);
-    _metrics = new QLabel(runContents);
-    _warnings = new QLabel(runContents); _warnings->setWordWrap(true);
+    _metrics = new QLabel(statusDock);
+    // Diagnostics are unbounded (stacked warnings, tracebacks), so they scroll
+    // within a fixed slice of the dock instead of pushing the panel around.
+    auto* warningsScroll = new QScrollArea(statusDock);
+    warningsScroll->setWidgetResizable(true);
+    warningsScroll->setFrameShape(QFrame::NoFrame);
+    warningsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    warningsScroll->setMaximumHeight(4 * fontMetrics().lineSpacing() + 4);
+    _warnings = new QLabel(warningsScroll); _warnings->setWordWrap(true);
+    _warnings->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     _warnings->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    runLayout->addWidget(_state);
-    runLayout->addWidget(_previewProgress);
-    runLayout->addWidget(_metrics);
-    runLayout->addWidget(_warnings);
+    warningsScroll->setWidget(_warnings);
+    statusDockLayout->addWidget(_state);
+    statusDockLayout->addWidget(_previewProgress);
+    statusDockLayout->addWidget(_metrics);
+    statusDockLayout->addWidget(warningsScroll);
     layout->addStretch(1);
     scroll->setWidget(contents);
-    rootLayout->addWidget(scroll);
+    rootLayout->addWidget(scroll, 1);
+    rootLayout->addWidget(statusDock);
 
     // ------------------------------------------------------------------
     // Wiring
@@ -705,7 +746,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 case CS::Disconnected: text = tr("Disconnected"); break;
                 case CS::Starting: text = tr("Starting…"); break;
                 case CS::Connecting: text = tr("Connecting…"); break;
-                case CS::Ready: text = tr("Connected — API v10%1")
+                case CS::Ready: text = tr("Connected — API v%1%2")
+                        .arg(SpiralServiceManager::kApiVersion)
                         .arg(message.isEmpty() ? QString() : QStringLiteral(" — ") + message); break;
                 case CS::Reconnecting: text = tr("Reconnecting… %1").arg(message); break;
                 case CS::Failed: text = tr("Failed: %1").arg(message); break;
@@ -737,6 +779,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     }
                 }
                 if (state == CS::Starting || state == CS::Connecting) {
+                    // A new connection may be to another dataset entirely, so
+                    // the previous scroll specification stops being true here.
+                    applyScrollSpec({});
                     _hasSession = false;
                     _loadedSessionRequest = {};
                     _attachedAdvancedConfig = {};
@@ -747,6 +792,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _state->setText(tr("Service: %1").arg(text));
             });
     connect(_service, &SpiralServiceManager::datasetResolved, this, [this](const QJsonObject& value) {
+        // The scroll specification belongs to the dataset, not to a session, so
+        // it is reported whether or not one is attached.
+        applyScrollSpec(value.value(QStringLiteral("scroll_spec")).toObject());
         // A service-owned dataset advertisement describes what a future load
         // would use. Once attached, the resident session's canonical request
         // is authoritative and may intentionally differ.
@@ -1018,13 +1066,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     });
     connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
-    for (QSpinBox* spin : {_zBegin, _zEnd, _lasagnaScale, _legacyCheckpointStep,
+    for (QSpinBox* spin : {_zBegin, _zEnd, _legacyCheckpointStep,
                            _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
-    for (QDoubleSpinBox* spin : {_voxelSize})
-        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-                [this](double) { refreshReloadRequired(); });
-    for (QLineEdit* edit : {_lasagnaGroup, _scrollName, _runTag})
+    for (QLineEdit* edit : {_runTag})
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
@@ -1170,8 +1215,13 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
     const bool ssh = profile.transport == SpiralServiceProfile::Transport::SshTunnel;
     _endpointRow->setVisible(!localhost && !ssh);
     _sshRow->setVisible(ssh);
-    // An SSH profile's credential is read from the host over SSH.
-    _apiKeyRow->setVisible(!localhost && !ssh);
+    // An SSH profile reads its credential from the host over SSH; the field
+    // stays available so a key entered here overrides that read. The localhost
+    // service is handed a per-launch nonce instead, so it has nothing to enter.
+    _apiKeyRow->setVisible(!localhost);
+    _apiKey->setPlaceholderText(
+        ssh ? tr("Optional override — read from the host over SSH when empty")
+            : tr("Printed by the service at startup (or set SPIRAL_API_KEY)"));
     _mappingRow->setVisible(!localhost);
     // The launch binding only exists for the locally owned service; remote
     // profiles display the service's advertised paths instead.
@@ -1184,7 +1234,6 @@ void SpiralPanel::applyProfileFields(const SpiralServiceProfile& profile)
     _endpointUrl->setText(profile.baseUrl.toString());
     _sshDestination->setText(profile.sshDestination);
     if (profile.remoteServicePort > 0) _sshPort->setValue(profile.remoteServicePort);
-    _mapServiceRoot->setText(profile.serviceRootPrefix);
     _mapLocalRoot->setText(profile.localRootPrefix);
     _apiKey->clear();
 }
@@ -1203,7 +1252,6 @@ SpiralServiceProfile SpiralPanel::profileFromFields() const
     profile.baseUrl = QUrl(_endpointUrl->text().trimmed());
     profile.sshDestination = _sshDestination->text().trimmed();
     profile.remoteServicePort = _sshPort->value();
-    profile.serviceRootPrefix = _mapServiceRoot->text().trimmed();
     profile.localRootPrefix = _mapLocalRoot->text().trimmed();
     profile.apiKey = _apiKey->text();
     return profile;
@@ -1363,6 +1411,29 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     _warnings->setText(notes.join(QStringLiteral("\n")));
 }
 
+void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
+{
+    if (spec.isEmpty()) {
+        // A missing or invalid specification is a missing_required condition
+        // the service reports; the panel says so where the values would be.
+        const QString unavailable = tr("No valid spiral-scroll.json in the dataset root");
+        _scrollSummary->setText(unavailable);
+        _lasagnaSummary->setText(unavailable);
+        return;
+    }
+    const double voxelSize = spec.value(QStringLiteral("voxel_size_um")).toDouble();
+    _scrollSummary->setText(
+        tr("%1 — %2 µm/voxel, outward %3")
+            .arg(spec.value(QStringLiteral("name")).toString())
+            .arg(voxelSize, 0, 'g', 4)
+            .arg(spec.value(QStringLiteral("spiral_outward_sense")).toString()));
+    _lasagnaSummary->setText(
+        tr("normals in zarr group %1, SDT in %2, coordinate scale %3")
+            .arg(spec.value(QStringLiteral("normal_zarr_group")).toString())
+            .arg(spec.value(QStringLiteral("surf_sdt_zarr_group")).toString())
+            .arg(spec.value(QStringLiteral("lasagna_scale")).toInt()));
+}
+
 QJsonObject SpiralPanel::sessionRequest() const
 {
     QJsonObject paths;
@@ -1378,9 +1449,6 @@ QJsonObject SpiralPanel::sessionRequest() const
     paths["pcls"] = pcls;
     QJsonObject config = sessionAdvancedConfig();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
-                    {"scroll_name", _scrollName->text()},
-                    {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
-                    {"lasagna_scale", _lasagnaScale->value()},
                     {"storage_backend", QStringLiteral("sparse_cuda")},
                     {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
                     {"run_tag", _runTag->text()},
@@ -1598,14 +1666,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _zBegin->setValue(run.value(QStringLiteral("z_begin")).toInt(_zBegin->value()));
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
-    _scrollName->setText(
-        run.value(QStringLiteral("scroll_name")).toString(_scrollName->text()));
-    _voxelSize->setValue(
-        run.value(QStringLiteral("voxel_size_um")).toDouble(_voxelSize->value()));
-    _lasagnaGroup->setText(
-        run.value(QStringLiteral("lasagna_group")).toString(_lasagnaGroup->text()));
-    _lasagnaScale->setValue(
-        run.value(QStringLiteral("lasagna_scale")).toInt(_lasagnaScale->value()));
     _legacyCheckpointStep->setValue(
         run.value(QStringLiteral("legacy_checkpoint_step"))
             .toInt(_legacyCheckpointStep->value()));
@@ -1908,10 +1968,6 @@ void SpiralPanel::persist() const
                       QJsonDocument(pcls).toJson(QJsonDocument::Compact));
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
-    settings.setValue(prefix + "scroll_name", _scrollName->text());
-    settings.setValue(prefix + "voxel_size_um", _voxelSize->value());
-    settings.setValue(prefix + "lasagna_group", _lasagnaGroup->text());
-    settings.setValue(prefix + "lasagna_scale", _lasagnaScale->value());
     settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
     settings.setValue(prefix + "legacy_checkpoint_step", _legacyCheckpointStep->value());
     settings.setValue(prefix + "run_tag", _runTag->text());
@@ -1966,10 +2022,6 @@ void SpiralPanel::restore()
     }
     _zBegin->setValue(settings.value(valuePrefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(valuePrefix + "z_end", 17000).toInt());
-    _scrollName->setText(settings.value(valuePrefix + "scroll_name", "s1").toString());
-    _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
-    _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
-    _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());
     _legacyCheckpointStep->setValue(settings.value(valuePrefix + "legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
@@ -1985,6 +2037,9 @@ void SpiralPanel::restore()
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
     _advancedProfiles->clearSessionDefault();
+    // Restoring is a profile switch: the previous service's scroll is not this
+    // profile's, and nothing is known until the new connection advertises one.
+    applyScrollSpec({});
     _applyingResolution = false;
     _hasManualEdits = false;
     _hasSession = false;

@@ -67,6 +67,7 @@ private:
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
+    void applyScrollSpec(const QJsonObject& spec);
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
     void refreshReloadRequired();
@@ -99,12 +100,11 @@ private:
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
     QSpinBox* _iterations = nullptr;
-    QSpinBox* _lasagnaScale = nullptr;
     QSpinBox* _legacyCheckpointStep = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
-    QDoubleSpinBox* _voxelSize = nullptr;
-    QLineEdit* _lasagnaGroup = nullptr;
-    QLineEdit* _scrollName = nullptr;
+    // Read-only reports of what spiral-scroll.json specifies.
+    QLabel* _scrollSummary = nullptr;
+    QLabel* _lasagnaSummary = nullptr;
     QLineEdit* _runTag = nullptr;
     QLineEdit* _pclPath = nullptr;
     QListWidget* _pclList = nullptr;
@@ -157,7 +157,6 @@ private:
     QLineEdit* _sshDestination = nullptr;
     QSpinBox* _sshPort = nullptr;
     QLineEdit* _apiKey = nullptr;
-    QLineEdit* _mapServiceRoot = nullptr;
     QLineEdit* _mapLocalRoot = nullptr;
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;

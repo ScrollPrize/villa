@@ -40,7 +40,6 @@ constexpr int kPollReconnectMs = 5000;
 // short poll interval keeps the panel live without flooding it.
 constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 26;
 constexpr int kPreviewCacheKept = 3;
 
 // Deterministic per-dataset default output root, outside the dataset: the
@@ -431,10 +430,10 @@ void SpiralServiceManager::beginHandshake()
 void SpiralServiceManager::handleHealth(const QJsonObject& health)
 {
     const int apiVersion = health.value(QStringLiteral("api_version")).toInt(-1);
-    if (apiVersion != kSupportedApiVersion) {
+    if (apiVersion != SpiralServiceManager::kApiVersion) {
         const QString message = tr("Incompatible Spiral service: expected API version %1, received %2. "
                                    "Update the service and VC3D together.")
-                                    .arg(kSupportedApiVersion).arg(apiVersion);
+                                    .arg(SpiralServiceManager::kApiVersion).arg(apiVersion);
         setConnectionState(ConnectionState::Failed, message);
         emit errorOccurred(message);
         if (ownsProcess()) stopService();

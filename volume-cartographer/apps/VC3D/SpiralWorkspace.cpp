@@ -433,12 +433,17 @@ QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
 {
     const SpiralServiceProfile& profile = _service->profile();
     if (profile.isLocalhost()) return servicePath;
-    if (profile.serviceRootPrefix.isEmpty() || profile.localRootPrefix.isEmpty()
-        || !servicePath.startsWith(profile.serviceRootPrefix))
+    // The service side of the mapping is the dataset root the service
+    // advertises; the profile only names where this computer mounts it.
+    QString serviceRoot = _service->advertisedDataset()
+                              .value(QStringLiteral("root")).toString();
+    while (serviceRoot.endsWith(QLatin1Char('/'))) serviceRoot.chop(1);
+    if (serviceRoot.isEmpty() || profile.localRootPrefix.isEmpty()
+        || !servicePath.startsWith(serviceRoot))
         return {};
     // Translate separators as well as prefixes: a Windows viewer may map a
     // POSIX service root.
-    QString rest = servicePath.mid(profile.serviceRootPrefix.size());
+    QString rest = servicePath.mid(serviceRoot.size());
     rest.replace(QLatin1Char('\\'), QLatin1Char('/'));
     QString local = profile.localRootPrefix;
     while (local.endsWith(QLatin1Char('/')) || local.endsWith(QLatin1Char('\\'))) local.chop(1);

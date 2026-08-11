@@ -787,17 +787,11 @@ class InteractiveFitSession:
 
             self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._transition(SessionState.Loading, "Loading fit inputs and model")
-            # The scroll specification supplies the physical facts (including
-            # the outward sense, which is not part of the load request). The
-            # session request may still override the request-carried scroll
-            # values it historically owned.
-            scroll = dataclasses.replace(
-                self.scroll,
-                name=self.run_config.scroll_name,
-                voxel_size_um=self.run_config.voxel_size_um,
-                normal_zarr_group=self.run_config.lasagna_group,
-                lasagna_scale=self.run_config.lasagna_scale,
-            )
+            # The scroll specification is used exactly as the dataset root
+            # states it: its physical facts (name, resolution, outward sense)
+            # and its Lasagna store layout. A session request may not restate
+            # any of them, so there is nothing left here to override.
+            scroll = self.scroll
             # The runtime is the execution owner of the context: it constructs
             # it, drives every phase on this fitter thread, and closes it.
             # Configuration, the scroll facts, the resolved input paths, and

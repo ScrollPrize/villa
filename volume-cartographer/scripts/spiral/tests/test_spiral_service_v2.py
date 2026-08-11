@@ -45,6 +45,7 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             parse_session_name)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
+                         SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, SessionState, SpiralInputPaths,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
@@ -944,7 +945,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             "run": {
                 "z_begin": 100,
                 "z_end": 900,
-                "scroll_name": "attached-scroll",
                 "config": config,
             },
             "preview": {"first_winding": 12, "variant": "raw"},
@@ -968,10 +968,23 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["paths"]["fibers"], "")
         self.assertEqual(attached["run"]["z_begin"], 100)
         self.assertEqual(attached["run"]["z_end"], 900)
-        self.assertEqual(attached["run"]["scroll_name"], "attached-scroll")
+        for key in SCROLL_SPEC_OWNED_RUN_KEYS:
+            self.assertNotIn(key, attached["run"])
         self.assertEqual(attached["run"]["config"], config)
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
+
+    def test_a_rebuild_refuses_run_keys_the_scroll_spec_owns(self):
+        for key, value in (("scroll_name", "renamed"), ("voxel_size_um", 4.0),
+                           ("lasagna_group", "8"), ("lasagna_scale", 2)):
+            with self.subTest(key=key):
+                with self.assertRaises(ApiError) as caught:
+                    self.state.rebuild({"run": {"z_begin": 100, "z_end": 900,
+                                                key: value}})
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual([detail["field"] for detail
+                                  in caught.exception.details],
+                                 [f"run.{key}"])
 
     def test_a_failed_build_reports_error_and_a_rebuild_recovers(self):
         request = {
