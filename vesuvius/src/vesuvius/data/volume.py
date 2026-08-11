@@ -68,6 +68,128 @@ def list_files():
     return data
 
 
+# Depth of a segment entry in scrolls.yaml: scroll -> energy -> resolution ->
+# segments -> segment id, so the node holding 'segments' sits three keys deep.
+# get_url_from_yaml walks exactly that depth, so a match at any other depth could
+# not be turned into a URL. The layout is documented in install/configs/README.md.
+_SEGMENT_ENTRY_DEPTH = 3
+
+
+def _catalog_key_value(key: str) -> Any:
+    """Return the number a catalog key spells, otherwise the key itself.
+
+    scrolls.yaml keys are strings ('1', '54', '7.91') while the constructor takes
+    numbers. Only a conversion that renders back to the original key is used,
+    because get_url_from_yaml looks entries up by ``str()`` of these values, so a
+    key like '07' has to stay a string.
+    """
+    for cast in (int, float):
+        try:
+            value = cast(key)
+        except (TypeError, ValueError):
+            continue
+        if str(value) == key:
+            return value
+    return key
+
+
+def _find_segment_locations(
+        catalog: Dict[str, Any],
+        segment_id: Union[int, str],
+) -> List[Tuple[str, str, str, Any]]:
+    """Every place in ``catalog`` that lists ``segment_id``.
+
+    Returns one ``(scroll_key, energy_key, resolution_key, entry)`` tuple per
+    match, sorted, with the keys as the catalog spells them. All matches are
+    collected rather than the first one found, so a caller can tell a unique
+    answer from an ambiguous one instead of guessing. The sort keeps the result
+    independent of dict order.
+    """
+    wanted = str(segment_id)
+    found: List[Tuple[str, str, str, Any]] = []
+    stack: List[Tuple[Any, List[str]]] = [(catalog, [])]
+
+    while stack:
+        node, path = stack.pop()
+        if not isinstance(node, dict):
+            continue
+
+        segments = node.get('segments')
+        if (isinstance(segments, dict) and wanted in segments
+                and len(path) == _SEGMENT_ENTRY_DEPTH):
+            scroll_key, energy_key, resolution_key = path
+            found.append((scroll_key, energy_key, resolution_key,
+                          segments[wanted]))
+
+        if len(path) < _SEGMENT_ENTRY_DEPTH:
+            for key, value in node.items():
+                # Segment ids are keys of 'segments', not another nesting level.
+                if isinstance(value, dict) and key != 'segments':
+                    stack.append((value, path + [str(key)]))
+
+    return sorted(found, key=lambda match: match[:3])
+
+
+def _describe_segment_locations(matches: List[Tuple[str, str, str, Any]]) -> str:
+    """Render catalog locations for an error message."""
+    return ", ".join(
+        f"scroll {scroll} at energy {energy}, resolution {resolution}"
+        for scroll, energy, resolution, _ in matches)
+
+
+def _resolve_segment_location(
+        segment_id: Union[int, str],
+        scroll_id: Optional[Union[int, str]] = None,
+) -> Tuple[Any, Any, Any]:
+    """Resolve ``(scroll_id, energy, resolution)`` for a segment from the catalog.
+
+    The catalog records which scroll a segment belongs to, so a segment id is
+    enough to reach it. scrolls.yaml is read from disk, so no network access is
+    involved.
+
+    With no ``scroll_id``, the segment has to resolve to exactly one scroll, and
+    ValueError is raised otherwise rather than a scroll being guessed.
+
+    With a ``scroll_id``, that scroll is returned as passed and only energy and
+    resolution are looked up, from the entries under that scroll. Either comes
+    back as None when the catalog does not pin it to a single value, which leaves
+    it to the scroll's canonical default.
+    """
+    matches = _find_segment_locations(list_files(), segment_id)
+
+    if not matches:
+        # The data URL comes from the same catalog, so an unlisted segment cannot
+        # be opened whatever scroll is named. Say that rather than sending the
+        # caller into a second error.
+        raise ValueError(
+            f"Segment {segment_id} is not listed in the scroll catalog "
+            f"(vesuvius/install/configs/scrolls.yaml), so neither its scroll nor "
+            f"its data URL can be resolved. Check the segment id or add an entry "
+            f"for it to the catalog. scroll_id does not help here, the URL comes "
+            f"from the same file.")
+
+    if scroll_id is not None:
+        under_scroll = [match for match in matches if match[0] == str(scroll_id)]
+        if len(under_scroll) != 1:
+            return scroll_id, None, None
+        return (scroll_id, _catalog_key_value(under_scroll[0][1]),
+                _catalog_key_value(under_scroll[0][2]))
+
+    if len({scroll for scroll, _, _, _ in matches}) > 1:
+        raise ValueError(
+            f"Segment {segment_id} is listed under more than one scroll "
+            f"({_describe_segment_locations(matches)}), so its scroll cannot be "
+            f"determined. Pass scroll_id explicitly to say which one you mean.")
+
+    scroll_key, energy_key, resolution_key, _ = matches[0]
+    if len(matches) > 1:
+        # One scroll at several energies or resolutions. The scroll is settled,
+        # so leave the other two to the canonical defaults.
+        return _catalog_key_value(scroll_key), None, None
+    return (_catalog_key_value(scroll_key), _catalog_key_value(energy_key),
+            _catalog_key_value(resolution_key))
+
+
 def is_aws_ec2_instance():
     """Determine if the current system is an AWS EC2 instance."""
     try:
@@ -270,13 +392,10 @@ class Volume:
                     self.segment_id = None
                 elif type.isdigit():  # Assume it's a segment timestamp
                     segment_id_str = str(type)
-                    details = self.find_segment_details(segment_id_str)
-                    if details[0] is None:
-                        raise ValueError(f"Could not find details for segment ID: {segment_id_str}")
-                    s_id, e, res, _ = details
+                    s_id, e, res = _resolve_segment_location(segment_id_str, scroll_id)
                     self.type = "segment"
                     self.segment_id = int(segment_id_str)
-                    self.scroll_id = scroll_id if scroll_id is not None else s_id
+                    self.scroll_id = s_id
                     energy = energy if energy is not None else e
                     resolution = resolution if resolution is not None else res
                     if self.verbose:
@@ -287,7 +406,15 @@ class Volume:
                     if type == "segment":
                         assert isinstance(segment_id, int), "segment_id must be an int when type is 'segment'"
                         self.segment_id = segment_id
-                        self.scroll_id = scroll_id
+                        # A segment id alone is enough: the catalog records which
+                        # scroll it belongs to. Anything passed explicitly wins.
+                        s_id, e, res = _resolve_segment_location(segment_id, scroll_id)
+                        self.scroll_id = s_id
+                        energy = energy if energy is not None else e
+                        resolution = resolution if resolution is not None else res
+                        if self.verbose:
+                            print(
+                                f"Resolved segment {segment_id} to scroll {self.scroll_id}, E={energy}, Res={resolution}")
                     else:  # type == "scroll"
                         self.segment_id = None
                         self.scroll_id = scroll_id
@@ -515,31 +642,15 @@ class Volume:
         -------
         Tuple[Optional[int], Optional[int], Optional[float], Optional[Dict[str, Any]]]
             A tuple containing scroll_id, energy, resolution, and segment metadata.
-
-        Raises
-        ------
-        ValueError
-            If the segment details cannot be found.
+            Four Nones when the segment is not in the catalog. Keys come back as
+            the catalog spells them. Where a segment is listed in more than one
+            place, the first location in sorted order is reported;
+            ``_resolve_segment_location`` is the caller that refuses to choose.
         """
-
-        dictionary = list_files()
-        stack = [(list(dictionary.items()), [])]
-
-        while stack:
-            items, path = stack.pop()
-
-            for key, value in items:
-                if isinstance(value, dict):
-                    # Check if 'segments' key is present in the current level of the dictionary
-                    if 'segments' in value:
-                        # Check if the segment_id is in the segments dictionary
-                        if segment_id in value['segments']:
-                            scroll_id, energy, resolution = path[0], path[1], key
-                            return scroll_id, energy, resolution, value['segments'][segment_id]
-                    # Add nested dictionary to the stack for further traversal
-                    stack.append((list(value.items()), path + [key]))
-
-        return None, None, None, None
+        matches = _find_segment_locations(list_files(), segment_id)
+        if not matches:
+            return None, None, None, None
+        return matches[0]
 
     def get_url_from_yaml(self) -> str:
         """Retrieves the data URL/path from the YAML config file."""
