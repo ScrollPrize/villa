@@ -614,6 +614,14 @@ TEST_CASE("fiber anchor cropped NMS includes suppressors outside the selected ce
     CHECK(cropped.diagnostics.zeroAnchorCells == 1);
     CHECK(cropped.diagnostics.nmsSuppressedComponents == 1);
     CHECK(cropped.nonEmptyCells.empty());
+    const auto& selection = cropped.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Selection)];
+    REQUIRE(selection.size() == 1);
+    REQUIRE(selection[0].transition.suppressor.has_value());
+    CHECK(selection[0].transition.reason == "nms_suppressed");
+    CHECK(selection[0].transition.suppressor->externalContext);
+    CHECK(selection[0].transition.suppressor->cellZYX !=
+          selection[0].cellZYX);
 }
 
 TEST_CASE("fiber anchor artifacts are deterministic across block and worker counts")
@@ -658,6 +666,11 @@ TEST_CASE("fiber anchor artifacts are deterministic across block and worker coun
              "anchors_0.obj",
              "anchors_1.obj",
              "anchor_cells.obj",
+             "stages/initialized.json",
+             "stages/refined.json",
+             "stages/support.json",
+             "stages/selection.json",
+             "stages/nms.json",
          })
         CHECK(read(firstDirectory / name) == read(secondDirectory / name));
     std::filesystem::remove_all(firstDirectory);
@@ -779,6 +792,16 @@ TEST_CASE("fiber anchor artifacts expose only base-volume positions")
     });
     CHECK(vc::fiber_tracer::fiberAnchorReportJson(parallelReport, artifact).dump() == json.dump());
     CHECK(vc::fiber_tracer::fiberAnchorReportObj(parallelReport, artifact) == obj);
+    for (size_t index = 0;
+         index < vc::fiber_tracer::kFiberAnchorDiagnosticStageCount; ++index) {
+        const auto stage = static_cast<
+            vc::fiber_tracer::FiberAnchorDiagnosticStage>(index);
+        CHECK(
+            vc::fiber_tracer::fiberAnchorDiagnosticStageJson(
+                parallelReport, artifact, stage).dump() ==
+            vc::fiber_tracer::fiberAnchorDiagnosticStageJson(
+                report, artifact, stage).dump());
+    }
 
     auto layeredReport = report;
     auto secondCell = layeredReport.nonEmptyCells.front();
@@ -945,7 +968,11 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
         },
         {{0, 0, 0}, {1, 1, 1}},
         [](const vc::fiber_tracer::FiberAnchor& anchor) {
-            return anchor.positionPredictionXYZ[0] < 4.0;
+            return vc::fiber_tracer::FiberAnchorRetainEvaluation{
+                anchor.positionPredictionXYZ[0] < 4.0,
+                anchor.positionPredictionXYZ[0],
+                4.0,
+            };
         },
         [&](const vc::fiber_tracer::FiberAnchorProgress& event) {
             progress.push_back(event);
@@ -955,6 +982,27 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
           std::vector<std::array<size_t, 3>>{{0, 0, 0}, {1, 1, 1}});
     CHECK(report.diagnostics.totalCells == 2);
     CHECK(report.diagnostics.outsideSelectionComponents >= 1);
+    const auto& initialized = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Initialized)];
+    const auto& refined = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined)];
+    const auto& support = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Support)];
+    const auto& selection = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Selection)];
+    const auto& nms = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Nms)];
+    CHECK(initialized.size() == 4);
+    CHECK(refined.size() == 2);
+    CHECK(support.size() == 2);
+    CHECK(selection.size() == 1);
+    CHECK(nms.size() == 1);
+    const auto outside = std::find_if(support.begin(), support.end(), [](const auto& record) {
+        return record.transition.reason == "outside_selection";
+    });
+    REQUIRE(outside != support.end());
+    CHECK(outside->transition.testedValue.has_value());
+    CHECK(outside->transition.threshold == 4.0);
     for (const auto& cell : report.nonEmptyCells)
         CHECK(cell.cellZYX == std::array<size_t, 3>{0, 0, 0});
     REQUIRE(progress.size() >= 3);
@@ -971,4 +1019,28 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
         vc::fiber_tracer::fiberAnchorCellReportObj(report);
     CHECK(occurrenceCount(cellObj, "\np ") == 2);
     CHECK(occurrenceCount(cellObj, "\nl ") == 1);
+}
+
+TEST_CASE("anchor diagnostics retain unavailable attempts in zero-anchor cells")
+{
+    const auto report = vc::fiber_tracer::extractFiberAnchors(
+        {{4, 4, 4}, 2.0},
+        config(),
+        [](const auto& indices, int, auto& samples) {
+            samples.assign(indices.size(), {
+                cv::Vec3d{1.0, 0.0, 0.0}, 0.0, true});
+        });
+    const auto& initialized = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Initialized)];
+    REQUIRE(initialized.size() == 2);
+    for (size_t index = 0; index < initialized.size(); ++index) {
+        CHECK(initialized[index].candidateId == index);
+        CHECK_FALSE(initialized[index].anchor.has_value());
+        CHECK(initialized[index].transition.outcome == "rejected");
+        CHECK(initialized[index].transition.reason == "empty");
+    }
+    for (size_t stage = 1;
+         stage < vc::fiber_tracer::kFiberAnchorDiagnosticStageCount; ++stage) {
+        CHECK(report.diagnosticStages[stage].empty());
+    }
 }

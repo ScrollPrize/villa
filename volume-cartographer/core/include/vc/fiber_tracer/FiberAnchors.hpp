@@ -7,6 +7,7 @@
 #include <functional>
 #include <filesystem>
 #include <optional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -60,11 +61,68 @@ struct FiberAnchor {
     size_t refinementIterations = 0;
 };
 
+struct FiberAnchorDiagnosticMetrics {
+    std::optional<size_t> assignedObservationCount;
+    std::optional<double> objectiveContribution;
+    std::optional<double> alignedSupport;
+    std::optional<double> directionalCoherence;
+    std::optional<double> refinementScore;
+    std::optional<size_t> refinementIterations;
+};
+
+struct FiberAnchorDiagnosticSuppressor {
+    std::array<size_t, 3> cellZYX{0, 0, 0};
+    size_t candidateId = 0;
+    bool externalContext = false;
+    double alignedSupport = 0.0;
+    double directionalCoherence = 0.0;
+};
+
+struct FiberAnchorDiagnosticTransition {
+    std::string outcome;
+    std::optional<std::string> reason;
+    std::optional<size_t> successorId;
+    std::optional<double> testedValue;
+    std::optional<double> threshold;
+    std::optional<FiberAnchorDiagnosticSuppressor> suppressor;
+};
+
+struct FiberAnchorDiagnosticRecord {
+    std::array<size_t, 3> cellZYX{0, 0, 0};
+    size_t candidateId = 0;
+    std::vector<size_t> parentIds;
+    std::optional<FiberAnchor> anchor;
+    FiberAnchorDiagnosticMetrics metrics;
+    FiberAnchorDiagnosticTransition transition;
+};
+
+enum class FiberAnchorDiagnosticStage : size_t {
+    Initialized = 0,
+    Refined,
+    Support,
+    Selection,
+    Nms,
+    Count,
+};
+
+inline constexpr size_t kFiberAnchorDiagnosticStageCount =
+    static_cast<size_t>(FiberAnchorDiagnosticStage::Count);
+
+[[nodiscard]] const char* fiberAnchorDiagnosticStageName(
+    FiberAnchorDiagnosticStage stage);
+
 struct FiberAnchorComponent {
     FiberAnchor anchor;
     bool retained = false;
     std::string rejectionReason;
     size_t assignedObservationCount = 0;
+    size_t diagnosticId = std::numeric_limits<size_t>::max();
+    std::vector<size_t> diagnosticParentIds;
+    bool retainedAfterSupport = false;
+    bool retainedAfterSelection = false;
+    std::optional<double> selectionTestedValue;
+    std::optional<double> selectionThreshold;
+    std::optional<FiberAnchorDiagnosticSuppressor> nmsSuppressor;
 };
 
 struct FiberAnchorMergeEvaluation {
@@ -82,6 +140,7 @@ struct FiberCellAnchorResult {
     std::optional<FiberAnchorMergeEvaluation> mergeEvaluation;
     double objective = 0.0;
     size_t retainedAnchorCount = 0;
+    std::array<FiberAnchorDiagnosticRecord, 2> initializedDiagnostics;
 };
 
 struct FiberAnchorExtractionDiagnostics {
@@ -106,6 +165,8 @@ struct FiberAnchorExtractionReport {
     std::vector<std::array<size_t, 3>> selectedCellsZYX;
     FiberAnchorExtractionDiagnostics diagnostics;
     std::vector<FiberCellAnchorResult> nonEmptyCells;
+    std::array<std::vector<FiberAnchorDiagnosticRecord>,
+               kFiberAnchorDiagnosticStageCount> diagnosticStages;
     double elapsedSeconds = 0.0;
 };
 
@@ -126,7 +187,14 @@ struct FiberAnchorProgress {
 using FiberStoredPredictionBatchSampler =
     std::function<void(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPredictionSample>& samples)>;
 
-using FiberAnchorRetainPredicate = std::function<bool(const FiberAnchor& anchor)>;
+struct FiberAnchorRetainEvaluation {
+    bool retained = true;
+    std::optional<double> testedValue;
+    std::optional<double> threshold;
+};
+
+using FiberAnchorRetainPredicate =
+    std::function<FiberAnchorRetainEvaluation(const FiberAnchor& anchor)>;
 using FiberAnchorProgressCallback =
     std::function<void(const FiberAnchorProgress& progress)>;
 
@@ -161,6 +229,11 @@ void suppressFiberAnchorDuplicates(
     const FiberAnchorConfig& config);
 
 [[nodiscard]] nlohmann::json fiberAnchorReportJson(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
+
+[[nodiscard]] nlohmann::json fiberAnchorDiagnosticStageJson(
+    const FiberAnchorExtractionReport& report,
+    const FiberAnchorArtifactInfo& artifact,
+    FiberAnchorDiagnosticStage stage);
 
 [[nodiscard]] std::string fiberAnchorReportObj(const FiberAnchorExtractionReport& report, const FiberAnchorArtifactInfo& artifact);
 

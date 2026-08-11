@@ -1,29 +1,45 @@
 import argparse
 import json
+from dataclasses import replace
+from pathlib import Path
 
 import dask.array as da
 import numpy as np
 import pytest
 import zarr
-
 from vesuvius.scripts.view_fiber_presence import (
+    AnchorCellGeometry,
+    AnchorStageGeometry,
     CropSelection,
+    FiberReplayBundle,
+    LineObjGeometry,
+    ReplayVisualArtifacts,
+    anchor_path_representatives,
     clipping_plane_in_layer_data,
+    commit_with_rollback,
     common_shape_edge_width,
     crop_clipping_planes_in_base,
     crop_clipping_planes_in_layer_data,
+    distance_masked_colors,
+    distance_visibility_mask,
     fiberlet_colormap_names,
+    fiberlet_layer_features,
     fiberlet_quality_colormap_spec,
     load_fiber_replay_bundle,
     mask_presence_by_distance,
     open_lazy_crop,
     parse_crop,
+    polyline_union_distances_base,
     read_anchor_cell_obj,
+    read_anchor_stage_json,
     read_line_obj,
     replay_distance_transform_base,
+    replay_visual_topology,
     resolve_ome_zarr_level,
     select_base_crop,
     set_common_shape_edge_width,
+    validate_anchor_stage_chain,
+    validate_replay_reload_compatibility,
 )
 
 
@@ -38,14 +54,8 @@ def _fnv1a64(data: bytes) -> str:
 def _write_nonfailure_replay(tmp_path):
     generation = tmp_path / "runs" / "abc" / "replay"
     generation.mkdir(parents=True)
-    reference = (
-        b"# vc_fiber_replay_reference version 1\n"
-        b"v 0 0 0\nv 8 0 0\nl 1 2\n"
-    )
-    trace = (
-        b"# vc_fiber_replay_trace version 1\n"
-        b"v 0 0 0\nv 4 0 0\nl 1 2\n"
-    )
+    reference = b"# vc_fiber_replay_reference version 1\nv 0 0 0\nv 8 0 0\nl 1 2\n"
+    trace = b"# vc_fiber_replay_trace version 1\nv 0 0 0\nv 4 0 0\nl 1 2\n"
     (generation / "reference.obj").write_bytes(reference)
     (generation / "trace.obj").write_bytes(trace)
     bundle = {
@@ -75,7 +85,7 @@ def _write_nonfailure_replay(tmp_path):
                 "mode": "canonical_stored_grid",
                 "prediction_to_base_scale": 2.0,
                 "prediction_shape_zyx": [4, 4, 4],
-            }
+            },
         },
         "trace_config": {
             "requested": {"beam_width": 8, "beam_lookahead_steps": 2},
@@ -127,6 +137,147 @@ def test_loads_strict_nonfailure_replay_bundle(tmp_path):
     assert replay.anchor_cells_obj is None
     assert replay.failure_zyx is None
     assert replay.tube_radius_base_voxels is None
+    assert replay.fiber_manifest_content_hash == "fnv1a64:1"
+
+
+def _reload_fixture():
+    path = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
+    line = LineObjGeometry(
+        paths_zyx=[path],
+        total_groups=1,
+        trace_loss_total=[],
+        loss_per_prediction_voxel=[],
+        relative_quality=[],
+    )
+    fiberlets = LineObjGeometry(
+        paths_zyx=[path],
+        total_groups=1,
+        trace_loss_total=[2.0],
+        loss_per_prediction_voxel=[1.0],
+        relative_quality=[0.5],
+    )
+    stages = tuple(
+        AnchorStageGeometry(
+            stage=stage,
+            paths_zyx=[path],
+            features={"candidate_id": [0]},
+            record_count=1,
+            geometric_record_count=1,
+            reasons={},
+            binding={},
+            records=(),
+        )
+        for stage in ("initialized", "refined", "support", "selection", "nms")
+    )
+    replay = FiberReplayBundle(
+        path=Path("/tmp/fiber_replay.json"),
+        status="failure_with_postroll",
+        crop_xyzwhd=(0, 0, 0, 8, 8, 8),
+        prediction_shape_zyx=(4, 4, 4),
+        prediction_to_base_scale=2.0,
+        fiber_manifest_content_hash="fnv1a64:prediction",
+        reference_zyx=path,
+        trace_zyx=path,
+        failure_zyx=np.asarray([[0.0, 0.0, 2.0]]),
+        tube_radius_base_voxels=8.0,
+        anchors_obj=Path("anchors.obj"),
+        anchor_cells_obj=Path("anchor_cells.obj"),
+        anchor_stages=stages,
+        paths_obj=Path("fiberlets.obj"),
+    )
+    artifacts = ReplayVisualArtifacts(
+        anchors=line,
+        anchor_cells=AnchorCellGeometry(
+            centers_zyx=np.asarray([[0.0, 0.0, 1.0]]),
+            displacements_zyx=[path],
+        ),
+        anchor_stages=stages,
+        fiberlets=fiberlets,
+    )
+    return replay, artifacts
+
+
+def test_replay_reload_compatibility_allows_changed_positive_counts():
+    replay, artifacts = _reload_fixture()
+    extra_path = np.asarray([[0.0, 1.0, 0.0], [0.0, 1.0, 2.0]])
+    replacement_artifacts = replace(
+        artifacts,
+        anchors=replace(
+            artifacts.anchors,
+            paths_zyx=[*artifacts.anchors.paths_zyx, extra_path],
+            total_groups=2,
+        ),
+    )
+
+    validate_replay_reload_compatibility(
+        replay, artifacts, replay, replacement_artifacts
+    )
+
+    assert replay_visual_topology(replay, artifacts) == replay_visual_topology(
+        replay, replacement_artifacts
+    )
+
+
+def test_replay_reload_rejects_prediction_source_and_stage_topology_changes():
+    replay, artifacts = _reload_fixture()
+    with pytest.raises(ValueError, match="different fiber prediction source"):
+        validate_replay_reload_compatibility(
+            replay,
+            artifacts,
+            replace(replay, fiber_manifest_content_hash="fnv1a64:other"),
+            artifacts,
+        )
+    validate_replay_reload_compatibility(
+        replay,
+        artifacts,
+        replay,
+        replace(
+            artifacts,
+            fiberlets=replace(artifacts.fiberlets, paths_zyx=[]),
+        ),
+    )
+    with pytest.raises(ValueError, match="topology"):
+        validate_replay_reload_compatibility(
+            replay,
+            artifacts,
+            replay,
+            replace(
+                artifacts,
+                anchor_stages=artifacts.anchor_stages[:-1],
+            ),
+        )
+
+
+def test_fiberlet_reload_features_follow_changed_path_count():
+    _, artifacts = _reload_fixture()
+    repeated = replace(
+        artifacts.fiberlets,
+        paths_zyx=artifacts.fiberlets.paths_zyx * 2,
+        trace_loss_total=[2.0, 3.0],
+        loss_per_prediction_voxel=[1.0, 1.5],
+        relative_quality=[0.5, 0.25],
+    )
+
+    features = fiberlet_layer_features(repeated)
+
+    np.testing.assert_array_equal(features["trace_loss_total"], [2.0, 3.0])
+    np.testing.assert_array_equal(features["relative_quality"], [0.5, 0.25])
+
+
+def test_reload_commit_failure_rolls_state_back():
+    state = ["old"]
+
+    def commit():
+        state[:] = ["partial"]
+        raise ValueError("injected setter failure")
+
+    def rollback():
+        state[:] = ["old"]
+
+    with pytest.raises(RuntimeError, match="was rolled back"):
+        commit_with_rollback(commit, rollback)
+
+    assert state == ["old"]
 
 
 def test_reads_anchor_cell_centers_and_accepted_offsets(tmp_path):
@@ -147,9 +298,154 @@ def test_reads_anchor_cell_centers_and_accepted_offsets(tmp_path):
 
     np.testing.assert_array_equal(geometry.centers_zyx, [[3, 2, 1], [9, 8, 7]])
     assert len(geometry.displacements_zyx) == 1
-    np.testing.assert_array_equal(
-        geometry.displacements_zyx[0], [[3, 2, 1], [6, 5, 4]]
+    np.testing.assert_array_equal(geometry.displacements_zyx[0], [[3, 2, 1], [6, 5, 4]])
+
+
+def _anchor_stage_root(stage, records):
+    outcomes = {}
+    reasons = {}
+    for record in records:
+        transition = record["transition"]
+        outcomes[transition["outcome"]] = outcomes.get(transition["outcome"], 0) + 1
+        if transition["reason"] is not None:
+            reasons[transition["reason"]] = reasons.get(transition["reason"], 0) + 1
+    return {
+        "format": "vc_fiberlet_anchor_stage",
+        "version": 1,
+        "stage": stage,
+        "source": {"manifest": "/fiber.json", "manifest_content_hash": "fnv1a64:1"},
+        "coordinates": {
+            "position_order": "XYZ",
+            "cell_index_order": "ZYX",
+            "position_space": "base_volume",
+            "prediction_to_base_scale": 2.0,
+            "prediction_shape_zyx": [4, 4, 4],
+        },
+        "selection": {"cells_zyx": [[0, 0, 0]]},
+        "parameters": {
+            "cell_size_prediction_voxels": 4,
+            "gaussian_sigma_prediction_voxels": 2.0,
+            "gaussian_cutoff_sigmas": 3.0,
+            "local_window_radius_prediction_voxels": 4.0,
+            "axial_support_half_width_prediction_voxels": 6.0,
+            "position_convergence_tolerance_prediction_voxels": 0.0001,
+            "nms_maximum_angle_degrees": 10.0,
+            "nms_longitudinal_radius_prediction_voxels": 2.0,
+            "observation_presence_floor": 0.05,
+            "minimum_aligned_support": 0.05,
+            "merge_maximum_angle_degrees": 10.0,
+            "merge_maximum_absolute_objective_loss": 0.01,
+            "merge_maximum_relative_objective_loss": 0.05,
+            "maximum_seed_count": 8,
+            "maximum_iterations": 64,
+            "convergence_tolerance": 1e-12,
+        },
+        "glyph_length_base_voxels": 8.0,
+        "summary": {
+            "record_count": len(records),
+            "geometric_record_count": sum(
+                record["geometry"] is not None for record in records
+            ),
+            "outcomes": outcomes,
+            "reasons": reasons,
+        },
+        "records": records,
+    }
+
+
+def _anchor_record(candidate, outcome, reason=None, geometry=True, parents=None):
+    return {
+        "cell_zyx": [0, 0, 0],
+        "candidate_id": candidate,
+        "parent_ids": [] if parents is None else parents,
+        "geometry": (
+            {"position_base_xyz": [2.0, 4.0, 6.0], "axis_xyz": [1.0, 0.0, 0.0]}
+            if geometry
+            else None
+        ),
+        "metrics": {
+            "assigned_observations": 4 if geometry else None,
+            "objective_contribution": None,
+            "aligned_support": 0.8 if geometry else None,
+            "directional_coherence": 0.9 if geometry else None,
+            "refinement_score": 0.8 if geometry else None,
+            "refinement_iterations": 2 if geometry else None,
+        },
+        "transition": {
+            "outcome": outcome,
+            "reason": reason,
+            "successor_id": None,
+            "tested_value": None,
+            "threshold": None,
+            "suppressor": None,
+        },
+    }
+
+
+def test_reads_and_validates_anchor_stage_chain(tmp_path):
+    records = {
+        "initialized": [
+            _anchor_record(0, "continue", parents=[]),
+            _anchor_record(1, "rejected", "empty", geometry=False, parents=[]),
+        ],
+        "refined": [_anchor_record(0, "continue", parents=[0])],
+        "support": [_anchor_record(0, "continue", parents=[0])],
+        "selection": [_anchor_record(0, "continue", parents=[0])],
+        "nms": [_anchor_record(0, "final", parents=[0])],
+    }
+    stages = []
+    for stage, stage_records in records.items():
+        path = tmp_path / f"{stage}.json"
+        path.write_text(json.dumps(_anchor_stage_root(stage, stage_records)))
+        stages.append(read_anchor_stage_json(path, stage))
+    final = LineObjGeometry(
+        paths_zyx=[stages[-1].paths_zyx[0]],
+        total_groups=1,
+        trace_loss_total=[],
+        loss_per_prediction_voxel=[],
+        relative_quality=[],
     )
+
+    validate_anchor_stage_chain(stages, final)
+
+    assert stages[0].record_count == 2
+    assert stages[0].geometric_record_count == 1
+    assert stages[0].reasons == {"empty": 1}
+    assert stages[-1].features["candidate_id"] == [0]
+    np.testing.assert_array_equal(
+        stages[-1].paths_zyx[0], [[6.0, 4.0, -2.0], [6.0, 4.0, 6.0]]
+    )
+
+
+def test_anchor_stage_chain_rejects_mixed_bindings(tmp_path):
+    stages = []
+    for index, stage in enumerate(
+        ("initialized", "refined", "support", "selection", "nms")
+    ):
+        if stage == "initialized":
+            stage_records = [
+                _anchor_record(0, "continue", parents=[]),
+                _anchor_record(1, "rejected", "empty", geometry=False, parents=[]),
+            ]
+        else:
+            outcome = "final" if stage == "nms" else "continue"
+            stage_records = [_anchor_record(0, outcome, parents=[0])]
+        root = _anchor_stage_root(stage, stage_records)
+        if index == 2:
+            root["source"]["manifest_content_hash"] = "fnv1a64:mixed"
+        path = tmp_path / f"{stage}.json"
+        path.write_text(json.dumps(root))
+        stages.append(read_anchor_stage_json(path, stage))
+    final = LineObjGeometry(
+        paths_zyx=[stages[-1].paths_zyx[0]],
+        total_groups=1,
+        trace_loss_total=[],
+        loss_per_prediction_voxel=[],
+        relative_quality=[],
+    )
+
+    with pytest.raises(ValueError, match="mixed bindings"):
+        validate_anchor_stage_chain(stages, final)
 
 
 def test_replay_distance_mask_uses_reference_and_trace_in_base_voxels():
@@ -175,6 +471,83 @@ def test_replay_distance_mask_uses_reference_and_trace_in_base_voxels():
     np.testing.assert_array_equal(masked[0, 2], np.ones(5))
     np.testing.assert_array_equal(masked[0, 4], np.ones(5))
     assert masked[0, 3, 2] == 0.0
+
+
+def test_exact_anchor_distance_uses_polyline_interiors_and_union():
+    reference = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+    trace = np.asarray([[0.0, 4.0, 0.0], [0.0, 4.0, 10.0]])
+    points = np.asarray(
+        [
+            [0.0, 1.0, 5.0],
+            [0.0, 3.0, 5.0],
+            [0.0, 0.0, -2.0],
+            [3.0, 0.0, 10.0],
+        ]
+    )
+
+    distances = polyline_union_distances_base(points, (reference, trace))
+
+    np.testing.assert_allclose(distances, [1.0, 1.0, 2.0, 3.0])
+
+
+def test_exact_anchor_distance_rejects_missing_or_nonfinite_geometry():
+    with pytest.raises(ValueError, match="at least one polyline"):
+        polyline_union_distances_base(np.zeros((1, 3)), ())
+    with pytest.raises(ValueError, match="non-finite"):
+        polyline_union_distances_base(
+            np.asarray([[0.0, np.nan, 0.0]]),
+            (np.zeros((1, 3)),),
+        )
+
+
+def test_anchor_representatives_use_glyph_midpoint_and_offset_target():
+    paths = [
+        np.asarray([[2.0, 4.0, 6.0], [6.0, 8.0, 10.0]]),
+        np.asarray([[1.0, 2.0, 3.0], [9.0, 10.0, 11.0]]),
+    ]
+
+    np.testing.assert_array_equal(
+        anchor_path_representatives(paths),
+        [[4.0, 6.0, 8.0], [5.0, 6.0, 7.0]],
+    )
+    np.testing.assert_array_equal(
+        anchor_path_representatives(paths, target_endpoint=True),
+        [[6.0, 8.0, 10.0], [9.0, 10.0, 11.0]],
+    )
+
+
+def test_anchor_distance_colors_are_inclusive_reversible_and_nonmutating():
+    colors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.5],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.75],
+        ]
+    )
+    original = colors.copy()
+    distances = np.asarray([0.0, 1.0, 2.0])
+
+    zero = distance_masked_colors(colors, distances, 0.0)
+    threshold = distance_masked_colors(colors, distances, 1.0)
+    restored = distance_masked_colors(colors, distances, 100.0)
+
+    np.testing.assert_array_equal(zero[:, 3], [0.5, 0.0, 0.0])
+    np.testing.assert_array_equal(threshold[:, 3], [0.5, 1.0, 0.0])
+    np.testing.assert_array_equal(restored[:, 3], [0.5, 1.0, 0.75])
+    np.testing.assert_array_equal(colors, original)
+
+
+def test_anchor_distance_visibility_mask_is_inclusive_and_supports_infinity():
+    np.testing.assert_array_equal(
+        distance_visibility_mask(np.asarray([0.0, 1.0, 2.0, np.inf]), 1.0),
+        [True, True, False, False],
+    )
+
+
+@pytest.mark.parametrize("radius", [-1.0, np.inf, np.nan])
+def test_anchor_distance_colors_reject_invalid_radius(radius):
+    with pytest.raises(ValueError, match="anchor radius"):
+        distance_masked_colors(np.ones((1, 4)), np.zeros(1), radius)
 
 
 def test_replay_bundle_rejects_hash_mismatch(tmp_path):
@@ -435,9 +808,7 @@ def test_fiberlet_crop_keeps_geometry_and_metrics_aligned(tmp_path):
         vertex += 2
     (tmp_path / "fiberlets.obj").write_text("\n".join(obj_lines) + "\n")
 
-    geometry = read_line_obj(
-        tmp_path / "fiberlets.obj", "paths", (0, 0, 0, 50, 50, 50)
-    )
+    geometry = read_line_obj(tmp_path / "fiberlets.obj", "paths", (0, 0, 0, 50, 50, 50))
 
     assert geometry.total_groups == 4
     assert len(geometry.paths_zyx) == 2

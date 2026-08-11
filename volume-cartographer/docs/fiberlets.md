@@ -116,6 +116,25 @@ diagonal, retained/NMS counts, and elapsed time. It writes:
 - `anchors_1.obj`: only component slot one from two-anchor cells.
 - `anchor_cells.obj`: one point for every selected cell center and a line from
   that center to each anchor retained after fitting and NMS.
+- `stages/initialized.json`, `stages/refined.json`, `stages/support.json`,
+  `stages/selection.json`, and `stages/nms.json`: strict diagnostic snapshots of
+  candidate initialization, local refinement, support filtering, optional
+  selection filtering, and duplicate suppression. These are diagnostics only;
+  `anchors.json` remains the sole path-stage input.
+
+Each selected cell has two initialized attempt records, including explicit null
+geometry for empty or degenerate attempts. Stable per-cell candidate IDs survive
+component compaction and sorting. A same-direction merge creates candidate ID 2
+with both attempted IDs as parents. Later records retain the fitted base-XYZ
+geometry and stage-appropriate metrics. Transitions record the exact rejection
+reason, support or selection threshold/value where applicable, and the actual
+NMS suppressor (including whether it came from external crop context). Thus a
+missing final anchor can be located without inferring history from component
+array slots.
+
+Manual napari mode automatically loads and cross-validates the complete sibling
+`stages/` directory when `--anchors` points to its `anchors.obj`. Replay mode
+obtains the same stage files from its hashed artifact table.
 
 The component slots are deterministic within each cell after support-based
 sorting. They are visualization layers, not global H/V or winding classes, and
@@ -386,13 +405,44 @@ status-specific artifacts, and OBJ equality with authoritative JSON geometry.
 Reference, greedy trace, failure, anchors, fiberlets, and presence are separate
 toggleable layers. Cell centers and their retained-anchor displacement lines are
 also separate layers loaded from `anchor_cells.obj`, so zero-anchor cells remain
-visible. The six crop controls clip every layer and the dock provides width or
+visible. The five anchor-stage JSON files are validated as one lineage chain and
+shown as distinct colored line layers. The NMS layer is visible initially;
+earlier stages and the duplicate final-anchor OBJ layer start hidden. Layer
+names show candidate/rejection counts, and per-shape features expose lineage,
+support/coherence, transition reason, tested threshold, and NMS suppressor.
+The six crop controls clip every layer and the dock provides width or
 size controls for the diagnostic geometry. For failure replay,
 the viewer rasterizes both the reference and complete greedy replay trace at the
 displayed Zarr level and computes one base-voxel distance transform to their
 union. The `Presence radius` slider applies a hard lazy mask to that distance
 field and defaults to the extraction-tube radius used for anchors and fiberlets.
 Changing the slider threshold does not recompute the EDT.
+
+The independent `Anchor radius` slider filters the final anchors, all five
+anchor-stage layers, cell centers, and center-to-anchor refinement offsets. It
+uses exact base-voxel distance to the reference/greedy-trace union and also
+defaults to the extraction-tube radius. Anchor glyphs use their center, while a
+refinement offset uses its anchor endpoint. Items at exactly the selected radius
+remain visible. The filter changes only line alpha or point visibility, so
+layer geometry, stage features, ordering, clipping, widths/sizes, layer
+visibility toggles, and the full counts in layer names remain unchanged.
+Fiberlet paths and the presence mask are independent of this control.
+
+Use `Reload artifacts` after regenerating the replay output. The viewer rereads
+the original root `fiber_replay.json`, so atomic publication automatically
+selects the newest hashed generation. It updates reference, greedy trace,
+failure marker, final anchors, every anchor stage, cell centers, refinement
+offsets, and fiberlets in their existing layers. Empty layers are retained and
+can become populated, or vice versa, during reload.
+
+Reload does not reopen or reload the presence Zarr. It retains the exact lazy
+source crop and recomputes only the reference-dependent EDT, lazy presence mask,
+and anchor distances. Current radii, clipping, visibility, widths/sizes, path
+colormap, layer order, and volume rendering remain unchanged. The replacement
+must retain the fiber-prediction manifest hash, prediction shape/scale, crop,
+extraction radius, and five-stage contract. A mismatch or malformed/hash-racing
+publication is reported without replacing the current display; change the Zarr
+or crop by restarting the viewer.
 
 This is an overcomplete diagnostic collection. There is no path-quality cutoff,
 degree selection, overlap deduplication, extension, H/V or winding assignment,

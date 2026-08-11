@@ -7,6 +7,7 @@ import json
 import math
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -50,19 +51,41 @@ class AnchorCellGeometry:
 
 
 @dataclass(frozen=True)
+class AnchorStageGeometry:
+    stage: str
+    paths_zyx: list[np.ndarray]
+    features: dict[str, list]
+    record_count: int
+    geometric_record_count: int
+    reasons: dict[str, int]
+    binding: dict
+    records: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
 class FiberReplayBundle:
     path: Path
     status: str
     crop_xyzwhd: tuple[int, int, int, int, int, int]
     prediction_shape_zyx: tuple[int, int, int]
     prediction_to_base_scale: float
+    fiber_manifest_content_hash: str
     reference_zyx: np.ndarray
     trace_zyx: np.ndarray
     failure_zyx: np.ndarray | None
     tube_radius_base_voxels: float | None
     anchors_obj: Path | None
     anchor_cells_obj: Path | None
+    anchor_stages: tuple[AnchorStageGeometry, ...]
     paths_obj: Path | None
+
+
+@dataclass(frozen=True)
+class ReplayVisualArtifacts:
+    anchors: LineObjGeometry
+    anchor_cells: AnchorCellGeometry
+    anchor_stages: tuple[AnchorStageGeometry, ...]
+    fiberlets: LineObjGeometry
 
 
 _LINE_OBJ_HEADERS = {
@@ -72,6 +95,23 @@ _LINE_OBJ_HEADERS = {
 
 
 _FIBERLET_QUALITY_COLORMAP = "red-yellow-green"
+_ANCHOR_STAGE_NAMES = ("initialized", "refined", "support", "selection", "nms")
+_ANCHOR_STAGE_COLORS = {
+    "initialized": "blue",
+    "refined": "magenta",
+    "support": "orange",
+    "selection": "white",
+    "nms": "lime",
+}
+_ANCHOR_FILTER_RGBA = {
+    "anchors": np.asarray([0.0, 1.0, 1.0, 1.0]),
+    "stage:initialized": np.asarray([0.0, 0.0, 1.0, 1.0]),
+    "stage:refined": np.asarray([1.0, 0.0, 1.0, 1.0]),
+    "stage:support": np.asarray([1.0, 0.6470588235294118, 0.0, 1.0]),
+    "stage:selection": np.asarray([1.0, 1.0, 1.0, 1.0]),
+    "stage:nms": np.asarray([0.0, 1.0, 0.0, 1.0]),
+    "displacements": np.asarray([1.0, 0.6470588235294118, 0.0, 1.0]),
+}
 
 
 def _fnv1a64(data: bytes) -> str:
@@ -117,8 +157,10 @@ def _read_replay_obj(path: Path, header: str, point_record: bool) -> np.ndarray:
                 raise ValueError(f"{path}:{line_number}: invalid index") from exc
         else:
             raise ValueError(f"{path}:{line_number}: unsupported OBJ record")
-    expected = [1] if point_record else (
-        [1, 1] if len(vertices) == 1 else list(range(1, len(vertices) + 1))
+    expected = (
+        [1]
+        if point_record
+        else ([1, 1] if len(vertices) == 1 else list(range(1, len(vertices) + 1)))
     )
     if len(records) != 1 or records[0] != expected:
         raise ValueError(f"{path}: replay OBJ topology does not match its vertices")
@@ -148,9 +190,7 @@ def read_anchor_cell_obj(path: str | Path) -> AnchorCellGeometry:
             try:
                 vertex = [float(value) for value in fields[1:]]
             except ValueError as exc:
-                raise ValueError(
-                    f"{obj_path}:{line_number}: invalid vertex"
-                ) from exc
+                raise ValueError(f"{obj_path}:{line_number}: invalid vertex") from exc
             if not np.isfinite(vertex).all():
                 raise ValueError(f"{obj_path}:{line_number}: non-finite vertex")
             vertices.append(vertex)
@@ -194,13 +234,505 @@ def read_anchor_cell_obj(path: str | Path) -> AnchorCellGeometry:
     return AnchorCellGeometry(centers, displacements)
 
 
+def _finite_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def read_anchor_stage_json(
+    path: str | Path, expected_stage: str
+) -> AnchorStageGeometry:
+    """Read one strict anchor-pipeline diagnostic stage."""
+    stage_path = Path(path)
+    try:
+        root = json.loads(stage_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read anchor stage {stage_path}: {exc}") from exc
+    expected_root = {
+        "format",
+        "version",
+        "stage",
+        "source",
+        "coordinates",
+        "selection",
+        "parameters",
+        "glyph_length_base_voxels",
+        "summary",
+        "records",
+    }
+    if (
+        not isinstance(root, dict)
+        or set(root) != expected_root
+        or root.get("format") != "vc_fiberlet_anchor_stage"
+        or root.get("version") != 1
+        or root.get("stage") != expected_stage
+        or expected_stage not in _ANCHOR_STAGE_NAMES
+    ):
+        raise ValueError(f"{stage_path}: unsupported anchor-stage schema")
+    source = root["source"]
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"manifest", "manifest_content_hash"}
+        or not all(isinstance(value, str) and value for value in source.values())
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage source")
+    coordinates = root["coordinates"]
+    coordinate_keys = {
+        "position_order",
+        "cell_index_order",
+        "position_space",
+        "prediction_to_base_scale",
+        "prediction_shape_zyx",
+    }
+    if not isinstance(coordinates, dict) or set(coordinates) not in (
+        coordinate_keys,
+        coordinate_keys | {"base_voxel_size_um"},
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage coordinates")
+    scale = coordinates.get("prediction_to_base_scale")
+    shape = coordinates.get("prediction_shape_zyx")
+    if (
+        coordinates.get("position_order") != "XYZ"
+        or coordinates.get("cell_index_order") != "ZYX"
+        or coordinates.get("position_space") != "base_volume"
+        or not _finite_number(scale)
+        or scale <= 0
+        or not isinstance(shape, list)
+        or len(shape) != 3
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in shape
+        )
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage grid")
+    if "base_voxel_size_um" in coordinates and (
+        not _finite_number(coordinates["base_voxel_size_um"])
+        or coordinates["base_voxel_size_um"] <= 0
+    ):
+        raise ValueError(f"{stage_path}: invalid base voxel size")
+    parameter_keys = {
+        "cell_size_prediction_voxels",
+        "gaussian_sigma_prediction_voxels",
+        "gaussian_cutoff_sigmas",
+        "local_window_radius_prediction_voxels",
+        "axial_support_half_width_prediction_voxels",
+        "position_convergence_tolerance_prediction_voxels",
+        "nms_maximum_angle_degrees",
+        "nms_longitudinal_radius_prediction_voxels",
+        "observation_presence_floor",
+        "minimum_aligned_support",
+        "merge_maximum_angle_degrees",
+        "merge_maximum_absolute_objective_loss",
+        "merge_maximum_relative_objective_loss",
+        "maximum_seed_count",
+        "maximum_iterations",
+        "convergence_tolerance",
+    }
+    parameters = root["parameters"]
+    if (
+        not isinstance(parameters, dict)
+        or set(parameters) != parameter_keys
+        or any(not _finite_number(value) for value in parameters.values())
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage parameters")
+    cell_size = parameters["cell_size_prediction_voxels"]
+    glyph = root["glyph_length_base_voxels"]
+    if (
+        not isinstance(cell_size, int)
+        or isinstance(cell_size, bool)
+        or cell_size < 1
+        or not _finite_number(glyph)
+        or glyph <= 0
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage dimensions")
+    selection = root["selection"]
+    cells = selection.get("cells_zyx") if isinstance(selection, dict) else None
+    if (
+        not isinstance(selection, dict)
+        or set(selection) != {"cells_zyx"}
+        or not isinstance(cells, list)
+        or not cells
+    ):
+        raise ValueError(f"{stage_path}: invalid anchor-stage selection")
+    cell_limits = [math.ceil(value / cell_size) for value in shape]
+    cell_keys = []
+    for cell in cells:
+        if (
+            not isinstance(cell, list)
+            or len(cell) != 3
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) for value in cell
+            )
+            or any(
+                value < 0 or value >= cell_limits[axis]
+                for axis, value in enumerate(cell)
+            )
+        ):
+            raise ValueError(f"{stage_path}: invalid selected anchor cell")
+        cell_keys.append(tuple(cell))
+    if cell_keys != sorted(set(cell_keys)):
+        raise ValueError(f"{stage_path}: anchor-stage cells are not canonical")
+
+    record_keys = {
+        "cell_zyx",
+        "candidate_id",
+        "parent_ids",
+        "geometry",
+        "metrics",
+        "transition",
+    }
+    metric_keys = {
+        "assigned_observations",
+        "objective_contribution",
+        "aligned_support",
+        "directional_coherence",
+        "refinement_score",
+        "refinement_iterations",
+    }
+    transition_keys = {
+        "outcome",
+        "reason",
+        "successor_id",
+        "tested_value",
+        "threshold",
+        "suppressor",
+    }
+    records = root["records"]
+    if not isinstance(records, list):
+        raise ValueError(f"{stage_path}: records must be a list")  # noqa: TRY004
+    normalized = []
+    paths = []
+    features = {
+        name: []
+        for name in (
+            "cell_zyx",
+            "candidate_id",
+            "parent_ids",
+            "assigned_observations",
+            "aligned_support",
+            "directional_coherence",
+            "refinement_score",
+            "refinement_iterations",
+            "transition",
+            "reason",
+            "tested_value",
+            "threshold",
+            "suppressor",
+        )
+    }
+    selected_set = set(cell_keys)
+    previous_key = None
+    outcome_counts = {}
+    reason_counts = {}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != record_keys:
+            raise ValueError(f"{stage_path}: malformed anchor-stage record")
+        cell = record["cell_zyx"]
+        candidate_id = record["candidate_id"]
+        parents = record["parent_ids"]
+        if (
+            not isinstance(cell, list)
+            or tuple(cell) not in selected_set
+            or not isinstance(candidate_id, int)
+            or isinstance(candidate_id, bool)
+            or candidate_id < 0
+            or not isinstance(parents, list)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in parents
+            )
+            or len(parents) != len(set(parents))
+        ):
+            raise ValueError(f"{stage_path}: invalid anchor-stage identity")
+        key = (tuple(cell), candidate_id)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError(f"{stage_path}: records are not canonical")
+        previous_key = key
+        geometry = record["geometry"]
+        path_zyx = None
+        if geometry is not None:
+            if not isinstance(geometry, dict) or set(geometry) != {
+                "position_base_xyz",
+                "axis_xyz",
+            }:
+                raise ValueError(f"{stage_path}: malformed anchor geometry")
+            position = _strict_xyz_points(
+                [geometry["position_base_xyz"]], "position_base_xyz", 1
+            )[0]
+            axis = _strict_xyz_points([geometry["axis_xyz"]], "axis_xyz", 1)[0]
+            if not math.isclose(
+                float(np.linalg.norm(axis)), 1.0, rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(f"{stage_path}: anchor axis is not unit length")
+            if axis[int(np.argmax(np.abs(axis)))] < 0:
+                raise ValueError(f"{stage_path}: anchor axis is not canonical")
+            half = axis * (float(glyph) * 0.5)
+            path_zyx = np.asarray([position - half, position + half])[:, ::-1]
+        metrics = record["metrics"]
+        if not isinstance(metrics, dict) or set(metrics) != metric_keys:
+            raise ValueError(f"{stage_path}: malformed anchor metrics")
+        for name, value in metrics.items():
+            if value is None:
+                continue
+            if name in {"assigned_observations", "refinement_iterations"}:
+                valid = (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+            else:
+                valid = _finite_number(value)
+            if not valid:
+                raise ValueError(f"{stage_path}: invalid metric {name}")
+        transition = record["transition"]
+        if not isinstance(transition, dict) or set(transition) != transition_keys:
+            raise ValueError(f"{stage_path}: malformed anchor transition")
+        outcome = transition["outcome"]
+        reason = transition["reason"]
+        if outcome not in {"continue", "rejected", "merged", "final"}:
+            raise ValueError(f"{stage_path}: invalid transition outcome")
+        if reason is not None and (not isinstance(reason, str) or not reason):
+            raise ValueError(f"{stage_path}: invalid transition reason")
+        successor = transition["successor_id"]
+        if successor is not None and (
+            not isinstance(successor, int)
+            or isinstance(successor, bool)
+            or successor < 0
+        ):
+            raise ValueError(f"{stage_path}: invalid transition successor")
+        for name in ("tested_value", "threshold"):
+            if transition[name] is not None and not _finite_number(transition[name]):
+                raise ValueError(f"{stage_path}: invalid transition {name}")
+        suppressor = transition["suppressor"]
+        if suppressor is not None:
+            suppressor_keys = {
+                "cell_zyx",
+                "candidate_id",
+                "external_context",
+                "aligned_support",
+                "directional_coherence",
+            }
+            if (
+                not isinstance(suppressor, dict)
+                or set(suppressor) != suppressor_keys
+                or not isinstance(suppressor["cell_zyx"], list)
+                or len(suppressor["cell_zyx"]) != 3
+                or not isinstance(suppressor["candidate_id"], int)
+                or suppressor["candidate_id"] < 0
+                or not isinstance(suppressor["external_context"], bool)
+                or not _finite_number(suppressor["aligned_support"])
+                or not _finite_number(suppressor["directional_coherence"])
+            ):
+                raise ValueError(f"{stage_path}: invalid NMS suppressor")
+        if outcome == "merged":
+            if reason != "merged_same_direction" or successor is None:
+                raise ValueError(f"{stage_path}: invalid merge transition")
+        elif successor is not None:
+            raise ValueError(f"{stage_path}: unexpected merge successor")
+        if outcome in {"continue", "final"} and reason is not None:
+            raise ValueError(f"{stage_path}: surviving transition has a reason")
+        if (reason == "nms_suppressed") != (suppressor is not None):
+            raise ValueError(f"{stage_path}: inconsistent NMS suppressor")
+        if reason in {"below_support", "outside_selection"} and (
+            transition["tested_value"] is None or transition["threshold"] is None
+        ):
+            raise ValueError(f"{stage_path}: threshold rejection lacks values")
+        allowed_outcomes = {
+            "initialized": {"continue", "rejected", "merged"},
+            "refined": {"continue", "rejected"},
+            "support": {"continue", "rejected"},
+            "selection": {"continue", "rejected"},
+            "nms": {"final"},
+        }
+        allowed_reasons = {
+            "initialized": {None, "empty", "degenerate", "merged_same_direction"},
+            "refined": {None, "empty", "below_support"},
+            "support": {None, "outside_selection"},
+            "selection": {None, "nms_suppressed"},
+            "nms": {None},
+        }
+        if (
+            outcome not in allowed_outcomes[expected_stage]
+            or reason not in allowed_reasons[expected_stage]
+        ):
+            raise ValueError(f"{stage_path}: transition does not belong to its stage")
+        if expected_stage != "initialized" and geometry is None:
+            raise ValueError(
+                f"{stage_path}: post-initialization record has no geometry"
+            )
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        if reason is not None:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        normalized.append(record)
+        if path_zyx is not None:
+            paths.append(path_zyx)
+            features["cell_zyx"].append("_".join(str(value) for value in cell))
+            features["candidate_id"].append(candidate_id)
+            features["parent_ids"].append(",".join(str(value) for value in parents))
+            for name in (
+                "assigned_observations",
+                "aligned_support",
+                "directional_coherence",
+                "refinement_score",
+                "refinement_iterations",
+            ):
+                features[name].append(metrics[name])
+            features["transition"].append(outcome)
+            features["reason"].append(reason or "")
+            features["tested_value"].append(transition["tested_value"])
+            features["threshold"].append(transition["threshold"])
+            features["suppressor"].append(
+                ""
+                if suppressor is None
+                else (
+                    f"{suppressor['cell_zyx']}:{suppressor['candidate_id']}"
+                    f" external={suppressor['external_context']}"
+                )
+            )
+    if expected_stage == "initialized":
+        expected = [(cell, candidate) for cell in cell_keys for candidate in (0, 1)]
+        actual = [
+            (tuple(record["cell_zyx"]), record["candidate_id"]) for record in normalized
+        ]
+        if actual != expected:
+            raise ValueError(f"{stage_path}: initialized attempts are incomplete")
+    expected_summary = {
+        "record_count": len(normalized),
+        "geometric_record_count": len(paths),
+        "outcomes": outcome_counts,
+        "reasons": reason_counts,
+    }
+    if root["summary"] != expected_summary:
+        raise ValueError(f"{stage_path}: summary is inconsistent")
+    return AnchorStageGeometry(
+        stage=expected_stage,
+        paths_zyx=paths,
+        features=features,
+        record_count=len(normalized),
+        geometric_record_count=len(paths),
+        reasons=reason_counts,
+        binding={
+            "source": source,
+            "coordinates": coordinates,
+            "selection": selection,
+            "parameters": parameters,
+            "glyph_length_base_voxels": glyph,
+        },
+        records=tuple(normalized),
+    )
+
+
+def validate_anchor_stage_chain(
+    stages: Sequence[AnchorStageGeometry], final_anchors: LineObjGeometry
+) -> None:
+    """Validate lineage and unchanged geometry through all anchor stages."""
+    if tuple(stage.stage for stage in stages) != _ANCHOR_STAGE_NAMES:
+        raise ValueError("anchor-stage chain is incomplete or out of order")
+    if any(stage.binding != stages[0].binding for stage in stages[1:]):
+        raise ValueError("anchor-stage files have mixed bindings")
+    indexed = [
+        {
+            (tuple(record["cell_zyx"]), record["candidate_id"]): record
+            for record in stage.records
+        }
+        for stage in stages
+    ]
+    expected_refined = {}
+    for key, record in indexed[0].items():
+        transition = record["transition"]
+        if transition["outcome"] == "continue":
+            expected_refined[key] = (record["candidate_id"],)
+        elif transition["outcome"] == "merged":
+            successor = (key[0], transition["successor_id"])
+            expected_refined[successor] = tuple(
+                sorted((*expected_refined.get(successor, ()), record["candidate_id"]))
+            )
+    if set(indexed[1]) != set(expected_refined):
+        raise ValueError("initialized-to-refined anchor lineage is inconsistent")
+    for key, parents in expected_refined.items():
+        if tuple(indexed[1][key]["parent_ids"]) != parents:
+            raise ValueError("refined anchor parent lineage is inconsistent")
+    for stage_index in range(1, 4):
+        expected_keys = {
+            key
+            for key, record in indexed[stage_index].items()
+            if record["transition"]["outcome"] == "continue"
+        }
+        if set(indexed[stage_index + 1]) != expected_keys:
+            raise ValueError("anchor-stage survivor set is inconsistent")
+        for key in expected_keys:
+            before = indexed[stage_index][key]
+            after = indexed[stage_index + 1][key]
+            if (
+                before["geometry"] != after["geometry"]
+                or before["metrics"] != after["metrics"]
+            ):
+                raise ValueError(
+                    "anchor geometry or metrics changed between filter stages"
+                )
+    for record in stages[3].records:
+        suppressor = record["transition"]["suppressor"]
+        if suppressor is None or suppressor["external_context"]:
+            continue
+        suppressor_key = (tuple(suppressor["cell_zyx"]), suppressor["candidate_id"])
+        if suppressor_key not in indexed[3]:
+            raise ValueError("internal NMS suppressor is absent from selection")
+        metrics = indexed[3][suppressor_key]["metrics"]
+        if (
+            metrics["aligned_support"] != suppressor["aligned_support"]
+            or metrics["directional_coherence"] != suppressor["directional_coherence"]
+        ):
+            raise ValueError("internal NMS suppressor metrics are inconsistent")
+    if any(record["transition"]["outcome"] != "final" for record in stages[-1].records):
+        raise ValueError("NMS stage contains non-final records")
+    unmatched = list(final_anchors.paths_zyx)
+    if len(unmatched) != len(stages[-1].paths_zyx):
+        raise ValueError("NMS stage differs from authoritative final anchors")
+    for diagnostic in stages[-1].paths_zyx:
+        match = next(
+            (
+                index
+                for index, final in enumerate(unmatched)
+                if np.allclose(diagnostic, final, rtol=0.0, atol=1e-5)
+            ),
+            None,
+        )
+        if match is None:
+            raise ValueError("NMS stage differs from authoritative final anchors")
+        unmatched.pop(match)
+
+
+def load_anchor_stage_directory(
+    directory: str | Path,
+    final_anchor_obj: str | Path,
+    crop_xyzwhd: tuple[int, int, int, int, int, int],
+) -> tuple[AnchorStageGeometry, ...]:
+    """Load and cross-check the complete stage set from an anchor output."""
+    stage_directory = Path(directory)
+    stages = tuple(
+        read_anchor_stage_json(stage_directory / f"{stage}.json", stage)
+        for stage in _ANCHOR_STAGE_NAMES
+    )
+    validate_anchor_stage_chain(
+        stages, read_line_obj(final_anchor_obj, "anchors", crop_xyzwhd)
+    )
+    return stages
+
+
 def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     bundle_path = Path(path).expanduser().resolve()
     try:
         root = json.loads(bundle_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read replay bundle {bundle_path}: {exc}") from exc
-    if not isinstance(root, dict) or root.get("format") != "vc_fiber_replay" or root.get("version") != 1:
+    if (
+        not isinstance(root, dict)
+        or root.get("format") != "vc_fiber_replay"
+        or root.get("version") != 1
+    ):
         raise ValueError("replay bundle must be vc_fiber_replay version 1")
     required_root = {
         "format",
@@ -241,7 +773,10 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     if status not in valid_statuses:
         raise ValueError("replay bundle status is invalid")
     failed = status in {"failure_with_postroll", "failure_truncated"}
-    if not isinstance(root.get("termination_reason"), str) or not root["termination_reason"]:
+    if (
+        not isinstance(root.get("termination_reason"), str)
+        or not root["termination_reason"]
+    ):
         raise ValueError("replay bundle termination reason is invalid")
     expected_source_keys = {
         "fiber_manifest",
@@ -260,8 +795,10 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         raise ValueError("replay bundle sources are invalid")
     crop_value = root.get("volume_crop_base_xyzwhd")
     if failed:
-        if not isinstance(crop_value, list) or len(crop_value) != 6 or any(
-            not isinstance(item, int) for item in crop_value
+        if (
+            not isinstance(crop_value, list)
+            or len(crop_value) != 6
+            or any(not isinstance(item, int) for item in crop_value)
         ):
             raise ValueError("failure replay bundle has an invalid crop")
         try:
@@ -329,7 +866,8 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     matching = root.get("matching")
     if (
         not isinstance(matching, dict)
-        or set(matching) != {
+        or set(matching)
+        != {
             "failure_threshold_base_voxels",
             "refine_steps",
             "records",
@@ -374,9 +912,14 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         if (
             not isinstance(trace_index, int)
             or not 0 < trace_index < len(trace_xyz)
-            or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in numeric)
+            or any(
+                not isinstance(value, (int, float)) or not math.isfinite(value)
+                for value in numeric
+            )
             or record["matched_reference_arc_base"] < previous_arc
-            or not record["search_begin_arc_base"] <= record["matched_reference_arc_base"] <= record["search_end_arc_base"]
+            or not record["search_begin_arc_base"]
+            <= record["matched_reference_arc_base"]
+            <= record["search_end_arc_base"]
             or record["error_base_voxels"] < 0
             or record["error_ratio"] < 0
         ):
@@ -385,7 +928,8 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     postroll = root.get("postroll")
     if (
         not isinstance(postroll, dict)
-        or set(postroll) != {
+        or set(postroll)
+        != {
             "requested_steps",
             "completed_steps",
             "maximum_trace_steps",
@@ -396,9 +940,15 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         or postroll["maximum_trace_steps"] < 1
     ):
         raise ValueError("replay postroll metadata is invalid")
-    if status == "failure_with_postroll" and postroll["completed_steps"] != postroll["requested_steps"]:
+    if (
+        status == "failure_with_postroll"
+        and postroll["completed_steps"] != postroll["requested_steps"]
+    ):
         raise ValueError("completed failure replay has incomplete postroll")
-    if status == "failure_truncated" and postroll["completed_steps"] >= postroll["requested_steps"]:
+    if (
+        status == "failure_truncated"
+        and postroll["completed_steps"] >= postroll["requested_steps"]
+    ):
         raise ValueError("truncated failure replay has complete postroll")
     artifacts = root.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -412,6 +962,11 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
             "anchors/anchors_0.obj",
             "anchors/anchors_1.obj",
             "anchors/anchor_cells.obj",
+            "anchors/stages/initialized.json",
+            "anchors/stages/refined.json",
+            "anchors/stages/support.json",
+            "anchors/stages/selection.json",
+            "anchors/stages/nms.json",
             "paths/fiberlets.json",
             "paths/fiberlets.obj",
         }
@@ -420,7 +975,10 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     base = bundle_path.parent.resolve()
     resolved: dict[str, Path] = {}
     for key, descriptor in artifacts.items():
-        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "content_hash"}:
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "path",
+            "content_hash",
+        }:
             raise ValueError(f"replay artifact descriptor {key!r} is invalid")
         relative = Path(descriptor["path"])
         if relative.is_absolute() or ".." in relative.parts:
@@ -445,13 +1003,17 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         "# vc_fiber_replay_trace version 1",
         False,
     )
-    if not np.array_equal(reference_obj, reference_xyz) or not np.array_equal(trace_obj, trace_xyz):
+    if not np.array_equal(reference_obj, reference_xyz) or not np.array_equal(
+        trace_obj, trace_xyz
+    ):
         raise ValueError("replay OBJ geometry differs from authoritative JSON")
     failure_zyx = None
     tube_radius_base_voxels = None
     if failed:
         failure_index = root.get("failure_trace_point_index")
-        if not isinstance(failure_index, int) or not 0 <= failure_index < len(trace_xyz):
+        if not isinstance(failure_index, int) or not 0 <= failure_index < len(
+            trace_xyz
+        ):
             raise ValueError("failure replay bundle has an invalid failure index")
         failure_obj = _read_replay_obj(
             resolved["replay/failure.obj"],
@@ -485,12 +1047,20 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         or root.get("tube") is not None
     ):
         raise ValueError("nonfailure replay bundle contains failure metadata")
+    anchor_stages: tuple[AnchorStageGeometry, ...] = ()
+    if failed:
+        anchor_stages = load_anchor_stage_directory(
+            resolved["anchors/stages/initialized.json"].parent,
+            resolved["anchors/anchors.obj"],
+            crop,
+        )
     return FiberReplayBundle(
         path=bundle_path,
         status=status,
         crop_xyzwhd=crop,
         prediction_shape_zyx=tuple(shape),
         prediction_to_base_scale=float(scale),
+        fiber_manifest_content_hash=sources["fiber_manifest_content_hash"],
         reference_zyx=reference_xyz[:, ::-1].copy(),
         trace_zyx=trace_xyz[:, ::-1].copy(),
         failure_zyx=failure_zyx,
@@ -501,7 +1071,110 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         ),
         anchors_obj=resolved.get("anchors/anchors.obj"),
         anchor_cells_obj=resolved.get("anchors/anchor_cells.obj"),
+        anchor_stages=anchor_stages,
         paths_obj=resolved.get("paths/fiberlets.obj"),
+    )
+
+
+def load_replay_visual_artifacts(replay: FiberReplayBundle) -> ReplayVisualArtifacts:
+    """Load every failed-replay visualization artifact through strict readers."""
+    if (
+        replay.failure_zyx is None
+        or replay.tube_radius_base_voxels is None
+        or replay.anchors_obj is None
+        or replay.anchor_cells_obj is None
+        or replay.paths_obj is None
+        or len(replay.anchor_stages) != len(_ANCHOR_STAGE_NAMES)
+    ):
+        raise ValueError("artifact reload requires a failed replay bundle")
+    return ReplayVisualArtifacts(
+        anchors=read_line_obj(replay.anchors_obj, "anchors", replay.crop_xyzwhd),
+        anchor_cells=read_anchor_cell_obj(replay.anchor_cells_obj),
+        anchor_stages=replay.anchor_stages,
+        fiberlets=read_line_obj(replay.paths_obj, "paths", replay.crop_xyzwhd),
+    )
+
+
+def replay_visual_topology(
+    replay: FiberReplayBundle,
+    artifacts: ReplayVisualArtifacts,
+) -> tuple:
+    """Describe the layer-presence topology that an in-place reload must retain."""
+    return (
+        replay.failure_zyx is not None,
+        tuple(stage.stage for stage in artifacts.anchor_stages),
+    )
+
+
+def validate_replay_reload_compatibility(
+    current_replay: FiberReplayBundle,
+    current_artifacts: ReplayVisualArtifacts,
+    replacement_replay: FiberReplayBundle,
+    replacement_artifacts: ReplayVisualArtifacts,
+) -> None:
+    """Reject a replay replacement that cannot reuse the current viewer/Zarr."""
+    if current_replay.fiber_manifest_content_hash != (
+        replacement_replay.fiber_manifest_content_hash
+    ):
+        raise ValueError("reloaded replay uses a different fiber prediction source")
+    if current_replay.prediction_shape_zyx != replacement_replay.prediction_shape_zyx:
+        raise ValueError("reloaded replay prediction shape differs")
+    if current_replay.prediction_to_base_scale != (
+        replacement_replay.prediction_to_base_scale
+    ):
+        raise ValueError("reloaded replay prediction scale differs")
+    if current_replay.crop_xyzwhd != replacement_replay.crop_xyzwhd:
+        raise ValueError("reloaded replay crop differs")
+    if current_replay.tube_radius_base_voxels != (
+        replacement_replay.tube_radius_base_voxels
+    ):
+        raise ValueError("reloaded replay extraction radius differs")
+    if replay_visual_topology(current_replay, current_artifacts) != (
+        replay_visual_topology(replacement_replay, replacement_artifacts)
+    ):
+        raise ValueError("reloaded replay visual layer topology differs")
+
+
+def commit_with_rollback(
+    commit: Callable[[], None],
+    rollback: Callable[[], None],
+) -> None:
+    """Run one reload commit and guarantee an attempted rollback on failure."""
+    try:
+        commit()
+    except Exception as update_error:
+        try:
+            rollback()
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "artifact reload failed and rollback also failed: "
+                f"reload={update_error}; rollback={rollback_error}"
+            ) from rollback_error
+        raise RuntimeError(
+            f"artifact reload commit failed and was rolled back: {update_error}"
+        ) from update_error
+
+
+def fiberlet_layer_features(fiberlets: LineObjGeometry) -> dict[str, np.ndarray]:
+    """Return the aligned napari feature columns for fiberlet paths."""
+    features = {
+        "trace_loss_total": np.asarray(fiberlets.trace_loss_total, dtype=np.float64),
+        "loss_per_prediction_voxel": np.asarray(
+            fiberlets.loss_per_prediction_voxel, dtype=np.float64
+        ),
+        "relative_quality": np.asarray(fiberlets.relative_quality, dtype=np.float64),
+    }
+    if any(len(values) != len(fiberlets.paths_zyx) for values in features.values()):
+        raise ValueError("fiberlet feature rows do not match path geometry")
+    return features
+
+
+def anchor_stage_layer_name(stage: AnchorStageGeometry) -> str:
+    """Return a full-population diagnostic name independent of display filters."""
+    rejected = sum(stage.reasons.values())
+    return (
+        f"anchor {stage.stage} "
+        f"[{stage.geometric_record_count}/{stage.record_count}; rejected={rejected}]"
     )
 
 
@@ -608,7 +1281,7 @@ def read_line_obj(
         try:
             xyz = np.asarray(
                 [group_vertices[index] for index in ordered_indices],
-                dtype=np.float32,
+                dtype=np.float64,
             )
         except KeyError as exc:
             raise fail(
@@ -693,7 +1366,9 @@ def read_line_obj(
                         if group_name is not None or len(fields) != 2:
                             raise fail(line_number, f"invalid report metadata {key!r}")
                         if key in report_metadata:
-                            raise fail(line_number, f"duplicate report metadata {key!r}")
+                            raise fail(
+                                line_number, f"duplicate report metadata {key!r}"
+                            )
                         report_metadata[key] = fields[1]
                     elif key in metric_keys:
                         if group_name is None or len(fields) != 2:
@@ -703,7 +1378,9 @@ def read_line_obj(
                         try:
                             group_metrics[key] = float(fields[1])
                         except ValueError as exc:
-                            raise fail(line_number, f"group metadata {key!r} must be numeric") from exc
+                            raise fail(
+                                line_number, f"group metadata {key!r} must be numeric"
+                            ) from exc
                     else:
                         raise fail(line_number, f"unsupported path OBJ comment {key!r}")
                     continue
@@ -743,7 +1420,8 @@ def read_line_obj(
                         raise fail(line_number, "line appears before the first group")
                     if len(fields) < 3 or (paths_have_quality and len(fields) != 3):
                         raise fail(
-                            line_number, "path line record must reference exactly two vertices"
+                            line_number,
+                            "path line record must reference exactly two vertices"
                             if paths_have_quality
                             else "line record must reference at least two vertices",
                         )
@@ -786,7 +1464,9 @@ def read_line_obj(
         try:
             expected_count = int(report_metadata["trace_quality_count"])
         except ValueError as exc:
-            raise ValueError(f"{obj_path}: trace_quality_count must be an integer") from exc
+            raise ValueError(
+                f"{obj_path}: trace_quality_count must be an integer"
+            ) from exc
         if expected_count < 0 or expected_count != total_groups:
             raise ValueError(f"{obj_path}: trace-quality count does not match groups")
         densities = [record[4] for record in group_records]
@@ -801,7 +1481,9 @@ def read_line_obj(
                 minimum = float(minimum_text)
                 maximum = float(maximum_text)
             except ValueError as exc:
-                raise ValueError(f"{obj_path}: trace-quality bounds must be numeric") from exc
+                raise ValueError(
+                    f"{obj_path}: trace-quality bounds must be numeric"
+                ) from exc
             if (
                 not math.isfinite(minimum)
                 or not math.isfinite(maximum)
@@ -810,14 +1492,16 @@ def read_line_obj(
                 or min(densities) != minimum
                 or max(densities) != maximum
             ):
-                raise ValueError(f"{obj_path}: trace-quality bounds do not match groups")
+                raise ValueError(
+                    f"{obj_path}: trace-quality bounds do not match groups"
+                )
         for path_zyx, intersects, name, total, density, quality in group_records:
             expected_quality = (
-                1.0
-                if minimum == maximum
-                else (maximum - density) / (maximum - minimum)
+                1.0 if minimum == maximum else (maximum - density) / (maximum - minimum)
             )
-            if not math.isclose(quality, expected_quality, rel_tol=1e-12, abs_tol=1e-12):
+            if not math.isclose(
+                quality, expected_quality, rel_tol=1e-12, abs_tol=1e-12
+            ):
                 raise ValueError(f"{obj_path}: group {name!r} quality is inconsistent")
             if intersects:
                 paths_zyx.append(path_zyx)
@@ -831,7 +1515,9 @@ def read_line_obj(
         len(relative_quality) if paths_have_quality else len(paths_zyx),
     }
     if len(lengths) != 1:
-        raise ValueError(f"{obj_path}: cropped fiberlet geometry and metrics are misaligned")
+        raise ValueError(
+            f"{obj_path}: cropped fiberlet geometry and metrics are misaligned"
+        )
     return LineObjGeometry(
         paths_zyx=paths_zyx,
         total_groups=total_groups,
@@ -943,9 +1629,14 @@ def add_clipping_controls(
     failure_layer=None,
     anchor_cell_centers_layer=None,
     anchor_displacements_layer=None,
+    anchor_stage_layers: Sequence | None = None,
     presence_radius_base_voxels: float | None = None,
     maximum_presence_radius_base_voxels: float | None = None,
     set_presence_radius: Callable[[float], None] | None = None,
+    anchor_radius_base_voxels: float | None = None,
+    maximum_anchor_radius_base_voxels: float | None = None,
+    set_anchor_radius: Callable[[float], None] | None = None,
+    reload_artifacts: Callable[[], str] | None = None,
 ) -> None:
     from qtpy.QtCore import Qt
     from qtpy.QtWidgets import (
@@ -1007,7 +1698,13 @@ def add_clipping_controls(
         form.addRow(label, control)
         return slider, spin
 
-    anchors_width = add_width_control("Anchor width", anchors_layer)
+    anchor_stage_layers = tuple(anchor_stage_layers or ())
+    anchor_width_source = (
+        anchors_layer
+        if anchors_layer is not None
+        else (anchor_stage_layers[0] if anchor_stage_layers else None)
+    )
+    anchors_width = add_width_control("Anchor width", anchor_width_source)
     paths_width = add_width_control("Path width", paths_layer)
     reference_width = add_width_control("Reference width", reference_layer)
     trace_width = add_width_control("Trace width", trace_layer)
@@ -1037,16 +1734,22 @@ def add_clipping_controls(
         quality_colormap_combo = QComboBox()
         quality_colormap_combo.addItems(path_quality_colormaps)
         form.addRow("Path colormap", quality_colormap_combo)
-    presence_radius_control: tuple[QSlider, QDoubleSpinBox] | None = None
-    if set_presence_radius is not None:
+
+    def add_radius_control(
+        label: str,
+        initial_radius: float,
+        maximum_radius: float,
+    ) -> tuple[QSlider, QDoubleSpinBox]:
         if (
-            presence_radius_base_voxels is None
-            or maximum_presence_radius_base_voxels is None
+            not math.isfinite(initial_radius)
+            or initial_radius < 0
+            or not math.isfinite(maximum_radius)
+            or maximum_radius < 0
         ):
-            raise ValueError("presence radius controls require initial and maximum values")
+            raise ValueError(f"{label.lower()} values must be finite and non-negative")
         maximum_radius = max(
-            float(presence_radius_base_voxels),
-            float(maximum_presence_radius_base_voxels),
+            float(initial_radius),
+            float(maximum_radius),
         )
         control = QWidget()
         layout = QHBoxLayout(control)
@@ -1060,12 +1763,62 @@ def add_clipping_controls(
         spin.setRange(0.0, displayed_maximum)
         spin.setDecimals(1)
         spin.setSingleStep(1.0)
-        slider.setValue(round(presence_radius_base_voxels * 10.0))
-        spin.setValue(presence_radius_base_voxels)
+        slider.setValue(round(initial_radius * 10.0))
+        spin.setValue(initial_radius)
         layout.addWidget(slider, stretch=1)
         layout.addWidget(spin)
-        form.addRow("Presence radius", control)
-        presence_radius_control = (slider, spin)
+        form.addRow(label, control)
+        return slider, spin
+
+    radius_controls: list[
+        tuple[
+            tuple[QSlider, QDoubleSpinBox],
+            float,
+            Callable[[float], None],
+        ]
+    ] = []
+    if set_presence_radius is not None:
+        if (
+            presence_radius_base_voxels is None
+            or maximum_presence_radius_base_voxels is None
+        ):
+            raise ValueError(
+                "presence radius controls require initial and maximum values"
+            )
+        radius_controls.append(
+            (
+                add_radius_control(
+                    "Presence radius",
+                    presence_radius_base_voxels,
+                    maximum_presence_radius_base_voxels,
+                ),
+                presence_radius_base_voxels,
+                set_presence_radius,
+            )
+        )
+    if set_anchor_radius is not None:
+        if (
+            anchor_radius_base_voxels is None
+            or maximum_anchor_radius_base_voxels is None
+        ):
+            raise ValueError(
+                "anchor radius controls require initial and maximum values"
+            )
+        radius_controls.append(
+            (
+                add_radius_control(
+                    "Anchor radius",
+                    anchor_radius_base_voxels,
+                    maximum_anchor_radius_base_voxels,
+                ),
+                anchor_radius_base_voxels,
+                set_anchor_radius,
+            )
+        )
+    reload_button = None
+    if reload_artifacts is not None:
+        reload_button = QPushButton("Reload artifacts")
+        form.addRow(reload_button)
     reset_button = QPushButton("Reset")
     form.addRow(reset_button)
 
@@ -1079,6 +1832,7 @@ def add_clipping_controls(
             failure_layer,
             anchor_cell_centers_layer,
             anchor_displacements_layer,
+            *anchor_stage_layers,
         )
         if layer is not None
     )
@@ -1165,6 +1919,8 @@ def add_clipping_controls(
         spin.valueChanged.connect(spin_changed)
 
     connect_width_control(anchors_width, anchors_layer)
+    for anchor_stage_layer in anchor_stage_layers:
+        connect_width_control(anchors_width, anchor_stage_layer)
     connect_width_control(paths_width, paths_layer)
     connect_width_control(reference_width, reference_layer)
     connect_width_control(trace_width, trace_layer)
@@ -1179,37 +1935,56 @@ def add_clipping_controls(
         )
 
     if quality_colormap_combo is not None and path_quality_colormaps is not None:
+
         def quality_colormap_changed(name: str) -> None:
             paths_layer.edge_colormap = path_quality_colormaps[name]
             paths_layer.refresh_colors()
 
         quality_colormap_combo.currentTextChanged.connect(quality_colormap_changed)
 
-    if presence_radius_control is not None and set_presence_radius is not None:
-        presence_slider, presence_spin = presence_radius_control
-        updating_presence_radius = False
+    radius_resets: list[Callable[[], None]] = []
 
-        def presence_slider_changed(value: int) -> None:
-            nonlocal updating_presence_radius
-            if updating_presence_radius:
+    def connect_radius_control(
+        control: tuple[QSlider, QDoubleSpinBox],
+        initial_radius: float,
+        setter: Callable[[float], None],
+    ) -> None:
+        radius_slider, radius_spin = control
+        updating_radius = False
+
+        def set_control_radius(radius: float) -> None:
+            nonlocal updating_radius
+            updating_radius = True
+            radius_slider.setValue(round(radius * 10.0))
+            radius_spin.setValue(radius)
+            updating_radius = False
+            setter(radius)
+
+        def radius_slider_changed(value: int) -> None:
+            nonlocal updating_radius
+            if updating_radius:
                 return
-            updating_presence_radius = True
+            updating_radius = True
             radius = value / 10.0
-            presence_spin.setValue(radius)
-            updating_presence_radius = False
-            set_presence_radius(radius)
+            radius_spin.setValue(radius)
+            updating_radius = False
+            setter(radius)
 
-        def presence_spin_changed(value: float) -> None:
-            nonlocal updating_presence_radius
-            if updating_presence_radius:
+        def radius_spin_changed(value: float) -> None:
+            nonlocal updating_radius
+            if updating_radius:
                 return
-            updating_presence_radius = True
-            presence_slider.setValue(round(value * 10.0))
-            updating_presence_radius = False
-            set_presence_radius(float(value))
+            updating_radius = True
+            radius_slider.setValue(round(value * 10.0))
+            updating_radius = False
+            setter(float(value))
 
-        presence_slider.valueChanged.connect(presence_slider_changed)
-        presence_spin.valueChanged.connect(presence_spin_changed)
+        radius_slider.valueChanged.connect(radius_slider_changed)
+        radius_spin.valueChanged.connect(radius_spin_changed)
+        radius_resets.append(lambda: set_control_radius(initial_radius))
+
+    for radius_control, initial_radius, setter in radius_controls:
+        connect_radius_control(radius_control, initial_radius, setter)
 
     def reset_bounds(*_args) -> None:
         nonlocal updating_bounds
@@ -1223,13 +1998,26 @@ def add_clipping_controls(
         update_clipping()
         if quality_colormap_combo is not None:
             quality_colormap_combo.setCurrentIndex(0)
-        if presence_radius_control is not None:
-            presence_slider, presence_spin = presence_radius_control
-            presence_slider.setValue(round(presence_radius_base_voxels * 10.0))
-            presence_spin.setValue(presence_radius_base_voxels)
-            set_presence_radius(presence_radius_base_voxels)
+        for reset_radius in radius_resets:
+            reset_radius()
 
     reset_button.clicked.connect(reset_bounds)
+    if reload_button is not None and reload_artifacts is not None:
+
+        def reload_clicked(*_args) -> None:
+            reload_button.setEnabled(False)
+            try:
+                message = reload_artifacts()
+                viewer.status = message
+                print(message)
+            except Exception as exc:  # noqa: BLE001 - Qt callback must stay alive
+                message = f"Replay artifact reload failed: {exc}"
+                viewer.status = message
+                print(message, file=sys.stderr)
+            finally:
+                reload_button.setEnabled(True)
+
+        reload_button.clicked.connect(reload_clicked)
     update_clipping()
 
     viewer.window.add_dock_widget(widget, area="right", name="Clip")
@@ -1481,12 +2269,189 @@ def mask_presence_by_distance(data, distance_data, radius_base_voxels: float):
     )
 
 
+def polyline_union_distances_base(
+    points_base_zyx: np.ndarray,
+    polylines_base_zyx: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Return exact point-to-polyline-union distances in base voxels."""
+    points = np.asarray(points_base_zyx, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1:] != (3,):
+        raise ValueError("anchor representatives must be an Nx3 ZYX array")
+    if not np.isfinite(points).all():
+        raise ValueError("anchor representatives contain non-finite coordinates")
+    if not polylines_base_zyx:
+        raise ValueError("anchor distance requires at least one polyline")
+
+    segment_starts = []
+    segment_ends = []
+    for index, polyline_value in enumerate(polylines_base_zyx):
+        polyline = np.asarray(polyline_value, dtype=np.float64)
+        if polyline.ndim != 2 or polyline.shape[1:] != (3,) or len(polyline) < 1:
+            raise ValueError(f"polyline {index} must contain ZYX points")
+        if not np.isfinite(polyline).all():
+            raise ValueError(f"polyline {index} contains non-finite coordinates")
+        if len(polyline) == 1:
+            segment_starts.append(polyline)
+            segment_ends.append(polyline)
+        else:
+            segment_starts.append(polyline[:-1])
+            segment_ends.append(polyline[1:])
+
+    if len(points) == 0:
+        return np.empty(0, dtype=np.float64)
+    starts = np.concatenate(segment_starts, axis=0)
+    ends = np.concatenate(segment_ends, axis=0)
+    directions = ends - starts
+    squared_lengths = np.einsum("ij,ij->i", directions, directions)
+    distances_squared = np.full(len(points), np.inf, dtype=np.float64)
+
+    # Bound pairwise scratch while retaining vectorized point-to-segment math.
+    point_batch = 512
+    segment_batch = 512
+    for point_start in range(0, len(points), point_batch):
+        point_stop = min(len(points), point_start + point_batch)
+        point_block = points[point_start:point_stop]
+        block_minimum = np.full(len(point_block), np.inf, dtype=np.float64)
+        for segment_start in range(0, len(starts), segment_batch):
+            segment_stop = min(len(starts), segment_start + segment_batch)
+            starts_block = starts[segment_start:segment_stop]
+            directions_block = directions[segment_start:segment_stop]
+            lengths_block = squared_lengths[segment_start:segment_stop]
+            relative = point_block[:, np.newaxis, :] - starts_block[np.newaxis, :, :]
+            numerators = np.einsum("ijk,jk->ij", relative, directions_block)
+            fractions = np.divide(
+                numerators,
+                lengths_block,
+                out=np.zeros_like(numerators),
+                where=lengths_block > 0,
+            )
+            np.clip(fractions, 0.0, 1.0, out=fractions)
+            offsets = relative - fractions[:, :, np.newaxis] * directions_block
+            candidate_squared = np.einsum("ijk,ijk->ij", offsets, offsets)
+            block_minimum = np.minimum(
+                block_minimum,
+                np.min(candidate_squared, axis=1),
+            )
+        distances_squared[point_start:point_stop] = block_minimum
+    return np.sqrt(distances_squared)
+
+
+def anchor_path_representatives(
+    paths_zyx: Sequence[np.ndarray], *, target_endpoint: bool = False
+) -> np.ndarray:
+    """Return the semantic base-coordinate representative of each anchor glyph."""
+    representatives = []
+    for index, path_value in enumerate(paths_zyx):
+        path = np.asarray(path_value, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1:] != (3,) or len(path) < 1:
+            raise ValueError(f"anchor geometry {index} must contain ZYX points")
+        if not np.isfinite(path).all():
+            raise ValueError(f"anchor geometry {index} contains non-finite coordinates")
+        representatives.append(
+            path[-1] if target_endpoint else (path[0] + path[-1]) * 0.5
+        )
+    if not representatives:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.asarray(representatives, dtype=np.float64)
+
+
+def replay_anchor_representatives(
+    artifacts: ReplayVisualArtifacts,
+) -> dict[str, np.ndarray]:
+    """Return stable layer-keyed anchor representatives for replay filtering."""
+    representatives = {}
+    if artifacts.anchors.paths_zyx:
+        representatives["anchors"] = anchor_path_representatives(
+            artifacts.anchors.paths_zyx
+        )
+    for stage in artifacts.anchor_stages:
+        if stage.paths_zyx:
+            representatives[f"stage:{stage.stage}"] = anchor_path_representatives(
+                stage.paths_zyx
+            )
+    if len(artifacts.anchor_cells.centers_zyx):
+        representatives["cell_centers"] = np.asarray(
+            artifacts.anchor_cells.centers_zyx, dtype=np.float64
+        )
+    if artifacts.anchor_cells.displacements_zyx:
+        representatives["displacements"] = anchor_path_representatives(
+            artifacts.anchor_cells.displacements_zyx,
+            target_endpoint=True,
+        )
+    return representatives
+
+
+def replay_anchor_distances_base(
+    replay: FiberReplayBundle,
+    artifacts: ReplayVisualArtifacts,
+) -> dict[str, np.ndarray]:
+    """Compute exact union distances while deduplicating shared representatives."""
+    representatives = replay_anchor_representatives(artifacts)
+    if not representatives:
+        return {}
+    keys = tuple(representatives)
+    counts = [len(representatives[key]) for key in keys]
+    all_representatives = np.concatenate([representatives[key] for key in keys], axis=0)
+    unique_representatives, inverse = np.unique(
+        all_representatives,
+        axis=0,
+        return_inverse=True,
+    )
+    unique_distances = polyline_union_distances_base(
+        unique_representatives,
+        (replay.reference_zyx, replay.trace_zyx),
+    )
+    all_distances = unique_distances[inverse]
+    result = {}
+    offset = 0
+    for key, count in zip(keys, counts, strict=True):
+        result[key] = all_distances[offset : offset + count]
+        offset += count
+    return result
+
+
+def distance_masked_colors(
+    colors: np.ndarray,
+    distances_base_voxels: np.ndarray,
+    radius_base_voxels: float,
+) -> np.ndarray:
+    """Hide items beyond an inclusive radius without mutating source colors."""
+    rgba = np.asarray(colors, dtype=np.float64)
+    distances = np.asarray(distances_base_voxels, dtype=np.float64)
+    if rgba.ndim != 2 or rgba.shape[1:] != (4,):
+        raise ValueError("anchor colors must be an Nx4 RGBA array")
+    if distances.shape != (len(rgba),):
+        raise ValueError("anchor colors and distances differ in length")
+    if not np.isfinite(rgba).all():
+        raise ValueError("anchor colors contain non-finite values")
+    visible = distance_visibility_mask(distances, radius_base_voxels)
+    masked = rgba.copy()
+    masked[~visible, 3] = 0.0
+    return masked
+
+
+def distance_visibility_mask(
+    distances_base_voxels: np.ndarray,
+    radius_base_voxels: float,
+) -> np.ndarray:
+    """Return the inclusive visibility mask for a base-voxel radius."""
+    distances = np.asarray(distances_base_voxels, dtype=np.float64)
+    if distances.ndim != 1:
+        raise ValueError("anchor distances must be one-dimensional")
+    if np.isnan(distances).any() or np.any(distances < 0):
+        raise ValueError("anchor distances must be non-negative and not NaN")
+    if not math.isfinite(radius_base_voxels) or radius_base_voxels < 0:
+        raise ValueError("anchor radius must be finite and non-negative")
+    return distances <= radius_base_voxels
+
+
 def launch_viewer(
     level: OmeZarrLevel,
     crop_xyzwhd: tuple[int, int, int, int, int, int],
     anchors_obj: str | Path | None = None,
     paths_obj: str | Path | None = None,
     replay: FiberReplayBundle | None = None,
+    anchor_stages: Sequence[AnchorStageGeometry] = (),
 ) -> None:
     try:
         import napari
@@ -1545,20 +2510,31 @@ def launch_viewer(
             presence_radius_base_voxels,
         )
 
-    anchors = (
-        read_line_obj(anchors_obj, "anchors", crop_xyzwhd)
-        if anchors_obj is not None
+    replay_artifacts = (
+        load_replay_visual_artifacts(replay)
+        if replay is not None and replay.failure_zyx is not None
         else None
+    )
+    anchors = (
+        replay_artifacts.anchors
+        if replay_artifacts is not None
+        else (
+            read_line_obj(anchors_obj, "anchors", crop_xyzwhd)
+            if anchors_obj is not None
+            else None
+        )
     )
     anchor_cells = (
-        read_anchor_cell_obj(replay.anchor_cells_obj)
-        if replay is not None and replay.anchor_cells_obj is not None
-        else None
+        replay_artifacts.anchor_cells if replay_artifacts is not None else None
     )
     fiberlets = (
-        read_line_obj(paths_obj, "paths", crop_xyzwhd)
-        if paths_obj is not None
-        else None
+        replay_artifacts.fiberlets
+        if replay_artifacts is not None
+        else (
+            read_line_obj(paths_obj, "paths", crop_xyzwhd)
+            if paths_obj is not None
+            else None
+        )
     )
     if anchors is not None:
         print(
@@ -1568,6 +2544,20 @@ def launch_viewer(
         print(
             f"Anchor cells: {len(anchor_cells.centers_zyx)} centers, "
             f"{len(anchor_cells.displacements_zyx)} accepted offsets"
+        )
+    anchor_stage_geometry = (
+        replay_artifacts.anchor_stages
+        if replay_artifacts is not None
+        else tuple(anchor_stages)
+    )
+    for stage in anchor_stage_geometry:
+        reasons = (
+            ",".join(f"{name}={count}" for name, count in sorted(stage.reasons.items()))
+            or "none"
+        )
+        print(
+            f"Anchor stage {stage.stage}: records={stage.record_count} "
+            f"geometry={stage.geometric_record_count} reasons={reasons}"
         )
     if fiberlets is not None:
         print(
@@ -1588,24 +2578,95 @@ def launch_viewer(
         contrast_limits=contrast_limits,
         rendering="attenuated_mip",
     )
+    derived_state = {
+        "presence_distance_base": presence_distance_base,
+        "presence_distance_data": presence_distance_data,
+        "presence_radius": presence_radius_base_voxels,
+        "anchor_visual_filters": [],
+        "anchor_radius": (
+            replay.tube_radius_base_voxels
+            if replay is not None and replay.tube_radius_base_voxels is not None
+            else None
+        ),
+    }
 
     def set_presence_radius(radius_base_voxels: float) -> None:
-        if presence_distance_data is None:
+        distance_data = derived_state["presence_distance_data"]
+        if distance_data is None:
             return
+        derived_state["presence_radius"] = radius_base_voxels
         volume_layer.data = mask_presence_by_distance(
             presence_source_data,
-            presence_distance_data,
+            distance_data,
             radius_base_voxels,
         )
+
+    def set_anchor_radius(radius_base_voxels: float) -> None:
+        derived_state["anchor_radius"] = radius_base_voxels
+        for _, layer, attribute, source_values, distances in derived_state[
+            "anchor_visual_filters"
+        ]:
+            if attribute == "shown":
+                layer.shown = source_values & distance_visibility_mask(
+                    distances, radius_base_voxels
+                )
+            else:
+                setattr(
+                    layer,
+                    attribute,
+                    distance_masked_colors(
+                        source_values,
+                        distances,
+                        radius_base_voxels,
+                    ),
+                )
+
+    anchor_filter_specs: list[tuple[str, object, str, np.ndarray]] = []
     anchors_layer = None
-    if anchors is not None and anchors.paths_zyx:
+    if anchors is not None and (anchors.paths_zyx or replay_artifacts is not None):
         anchors_layer = viewer.add_shapes(
-            anchors.paths_zyx,
+            anchors.paths_zyx or None,
+            ndim=3,
             shape_type="line",
             name="fiber anchors",
             edge_color="cyan",
             edge_width=2,
             face_color="transparent",
+            visible=not anchor_stage_geometry,
+        )
+        anchor_filter_specs.append(
+            (
+                "anchors",
+                anchors_layer,
+                "edge_color",
+                anchor_path_representatives(anchors.paths_zyx),
+            )
+        )
+    anchor_stage_layers = []
+    anchor_stage_layers_by_name = {}
+    for stage in anchor_stage_geometry:
+        if not stage.paths_zyx and replay_artifacts is None:
+            continue
+        layer = viewer.add_shapes(
+            stage.paths_zyx or None,
+            ndim=3,
+            shape_type="line",
+            name=anchor_stage_layer_name(stage),
+            features=stage.features,
+            edge_color=_ANCHOR_STAGE_COLORS[stage.stage],
+            edge_width=2,
+            face_color="transparent",
+            visible=stage.stage == "nms",
+        )
+        anchor_stage_layers.append(layer)
+        anchor_stage_layers_by_name[stage.stage] = layer
+        anchor_filter_specs.append(
+            (
+                f"stage:{stage.stage}",
+                layer,
+                "edge_color",
+                anchor_path_representatives(stage.paths_zyx),
+            )
         )
     anchor_cell_centers_layer = None
     anchor_displacements_layer = None
@@ -1616,21 +2677,39 @@ def launch_viewer(
             face_color="yellow",
             size=2,
         )
-        if anchor_cells.displacements_zyx:
+        anchor_filter_specs.append(
+            (
+                "cell_centers",
+                anchor_cell_centers_layer,
+                "shown",
+                np.asarray(anchor_cells.centers_zyx, dtype=np.float64),
+            )
+        )
+        if anchor_cells.displacements_zyx or replay_artifacts is not None:
             anchor_displacements_layer = viewer.add_shapes(
-                anchor_cells.displacements_zyx,
+                anchor_cells.displacements_zyx or None,
+                ndim=3,
                 shape_type="line",
                 name="anchor refinement offsets",
                 edge_color="orange",
                 edge_width=1,
                 face_color="transparent",
             )
+            anchor_filter_specs.append(
+                (
+                    "displacements",
+                    anchor_displacements_layer,
+                    "edge_color",
+                    anchor_path_representatives(
+                        anchor_cells.displacements_zyx,
+                        target_endpoint=True,
+                    ),
+                )
+            )
     paths_layer = None
     path_quality_colormaps: dict[str, object] | None = None
-    if fiberlets is not None and fiberlets.paths_zyx:
-        custom_name, custom_colors, custom_controls = (
-            fiberlet_quality_colormap_spec()
-        )
+    if fiberlets is not None and (fiberlets.paths_zyx or replay_artifacts is not None):
+        custom_name, custom_colors, custom_controls = fiberlet_quality_colormap_spec()
         custom_colormap = Colormap(
             custom_colors,
             controls=custom_controls,
@@ -1641,21 +2720,12 @@ def launch_viewer(
             for name in fiberlet_colormap_names(tuple(AVAILABLE_COLORMAPS))
         }
         paths_layer = viewer.add_shapes(
-            fiberlets.paths_zyx,
+            fiberlets.paths_zyx or None,
+            ndim=3,
             shape_type="path",
             name="fiberlet paths",
-            features={
-                "trace_loss_total": np.asarray(
-                    fiberlets.trace_loss_total, dtype=np.float64
-                ),
-                "loss_per_prediction_voxel": np.asarray(
-                    fiberlets.loss_per_prediction_voxel, dtype=np.float64
-                ),
-                "relative_quality": np.asarray(
-                    fiberlets.relative_quality, dtype=np.float64
-                ),
-            },
-            edge_color="relative_quality",
+            features=fiberlet_layer_features(fiberlets),
+            edge_color=("relative_quality" if fiberlets.paths_zyx else "gray"),
             edge_colormap=custom_colormap,
             edge_contrast_limits=(0.0, 1.0),
             edge_width=2,
@@ -1688,6 +2758,289 @@ def launch_viewer(
                 face_color="red",
                 size=4,
             )
+
+    anchor_radius_base_voxels = None
+    maximum_anchor_radius_base_voxels = None
+    set_anchor_radius_callback = None
+    if (
+        replay is not None
+        and replay_artifacts is not None
+        and replay.tube_radius_base_voxels is not None
+        and anchor_filter_specs
+    ):
+        print("Computing exact replay distance for anchor diagnostics...")
+        anchor_distances = replay_anchor_distances_base(replay, replay_artifacts)
+        anchor_visual_filters = []
+        for key, layer, color_attribute, representatives in anchor_filter_specs:
+            distances = anchor_distances.get(key, np.empty(0, dtype=np.float64))
+            count = len(representatives)
+            if len(distances) != count:
+                raise ValueError("anchor diagnostic distances do not match geometry")
+            if color_attribute == "shown":
+                source_values = np.ones(count, dtype=bool)
+            else:
+                source_values = np.repeat(
+                    _ANCHOR_FILTER_RGBA[key][np.newaxis, :], count, axis=0
+                )
+            anchor_visual_filters.append(
+                (key, layer, color_attribute, source_values.copy(), distances)
+            )
+
+        anchor_radius_base_voxels = replay.tube_radius_base_voxels
+        maximum_anchor_radius_base_voxels = max(
+            anchor_radius_base_voxels,
+            max(float(np.max(values)) for values in anchor_distances.values()),
+        )
+        derived_state["anchor_visual_filters"] = anchor_visual_filters
+        set_anchor_radius(anchor_radius_base_voxels)
+        set_anchor_radius_callback = set_anchor_radius
+
+    reload_artifacts_callback = None
+    if replay is not None and replay_artifacts is not None:
+        import dask.array as da
+
+        replay_root_path = replay.path
+        replay_state = {"replay": replay, "artifacts": replay_artifacts}
+
+        def build_reloaded_anchor_filters(
+            distances_by_key: dict[str, np.ndarray],
+        ) -> list[tuple]:
+            templates = {
+                key: (layer, attribute)
+                for key, layer, attribute, _, _ in derived_state[
+                    "anchor_visual_filters"
+                ]
+            }
+            filters = []
+            for key, (layer, attribute) in templates.items():
+                distances = distances_by_key.get(key, np.empty(0, dtype=np.float64))
+                count = len(distances)
+                if attribute == "shown":
+                    replacement_values = np.ones(count, dtype=bool)
+                else:
+                    replacement_values = np.repeat(
+                        _ANCHOR_FILTER_RGBA[key][np.newaxis, :], count, axis=0
+                    )
+                filters.append((key, layer, attribute, replacement_values, distances))
+            return filters
+
+        def mutable_replay_layers() -> tuple:
+            return tuple(
+                layer
+                for layer in (
+                    anchors_layer,
+                    *anchor_stage_layers,
+                    anchor_cell_centers_layer,
+                    anchor_displacements_layer,
+                    paths_layer,
+                    reference_layer,
+                    trace_layer,
+                    failure_layer,
+                    volume_layer,
+                )
+                if layer is not None
+            )
+
+        def apply_replay_artifacts(
+            candidate_replay: FiberReplayBundle,
+            candidate_artifacts: ReplayVisualArtifacts,
+            candidate_presence_data,
+            candidate_presence_distance_base: np.ndarray,
+            candidate_presence_distance_data,
+            candidate_anchor_filters: list[tuple],
+            selected_data: dict[int, set] | None = None,
+        ) -> None:
+            layers = mutable_replay_layers()
+            widths = {
+                id(layer): common_shape_edge_width(layer)
+                for layer in layers
+                if hasattr(layer, "edge_width")
+            }
+            sizes = {
+                id(layer): float(np.asarray(layer.size).reshape(-1)[0])
+                for layer in layers
+                if hasattr(layer, "size") and np.asarray(layer.size).size
+            }
+            with ExitStack() as stack:
+                for layer in layers:
+                    blocker = getattr(layer.events, "blocker_all", None)
+                    if blocker is not None:
+                        stack.enter_context(blocker())
+                    if hasattr(layer, "selected_data"):
+                        layer.selected_data = set()
+
+                for layer in layers:
+                    if id(layer) in widths:
+                        layer.edge_width = widths[id(layer)]
+                    if id(layer) in sizes:
+                        layer.size = sizes[id(layer)]
+                if anchors_layer is not None:
+                    anchors_layer.edge_color = "cyan"
+                for stage_name, layer in anchor_stage_layers_by_name.items():
+                    layer.edge_color = _ANCHOR_STAGE_COLORS[stage_name]
+                if anchor_displacements_layer is not None:
+                    anchor_displacements_layer.edge_color = "orange"
+                if anchor_cell_centers_layer is not None:
+                    anchor_cell_centers_layer.shown = np.ones(
+                        len(anchor_cell_centers_layer.data), dtype=bool
+                    )
+
+                reference_layer.data = [candidate_replay.reference_zyx]
+                trace_layer.data = [candidate_replay.trace_zyx]
+                failure_layer.data = candidate_replay.failure_zyx
+                if anchors_layer is not None:
+                    anchors_layer.data = candidate_artifacts.anchors.paths_zyx
+                for stage in candidate_artifacts.anchor_stages:
+                    layer = anchor_stage_layers_by_name.get(stage.stage)
+                    if layer is None:
+                        continue
+                    layer.data = stage.paths_zyx
+                    layer.features = stage.features
+                    layer.name = anchor_stage_layer_name(stage)
+                if anchor_cell_centers_layer is not None:
+                    anchor_cell_centers_layer.data = (
+                        candidate_artifacts.anchor_cells.centers_zyx
+                    )
+                if anchor_displacements_layer is not None:
+                    anchor_displacements_layer.data = (
+                        candidate_artifacts.anchor_cells.displacements_zyx
+                    )
+                if paths_layer is not None:
+                    paths_layer.data = candidate_artifacts.fiberlets.paths_zyx
+                    paths_layer.features = fiberlet_layer_features(
+                        candidate_artifacts.fiberlets
+                    )
+                    paths_layer.edge_color = (
+                        "relative_quality"
+                        if candidate_artifacts.fiberlets.paths_zyx
+                        else "gray"
+                    )
+
+                derived_state["presence_distance_base"] = (
+                    candidate_presence_distance_base
+                )
+                derived_state["presence_distance_data"] = (
+                    candidate_presence_distance_data
+                )
+                derived_state["anchor_visual_filters"] = candidate_anchor_filters
+                volume_layer.data = candidate_presence_data
+                for (
+                    _,
+                    layer,
+                    attribute,
+                    source_values,
+                    distances,
+                ) in candidate_anchor_filters:
+                    if attribute == "shown":
+                        layer.shown = source_values & distance_visibility_mask(
+                            distances, derived_state["anchor_radius"]
+                        )
+                    else:
+                        setattr(
+                            layer,
+                            attribute,
+                            distance_masked_colors(
+                                source_values,
+                                distances,
+                                derived_state["anchor_radius"],
+                            ),
+                        )
+
+                for layer in layers:
+                    if id(layer) in widths:
+                        layer.edge_width = widths[id(layer)]
+                    if id(layer) in sizes:
+                        layer.size = sizes[id(layer)]
+                    if selected_data is not None and id(layer) in selected_data:
+                        layer.selected_data = selected_data[id(layer)]
+
+            if paths_layer is not None:
+                paths_layer.refresh_colors()
+            for layer in layers:
+                layer.refresh()
+
+        def reload_artifacts() -> str:
+            current_replay = replay_state["replay"]
+            current_artifacts = replay_state["artifacts"]
+            replacement_replay = load_fiber_replay_bundle(replay_root_path)
+            replacement_artifacts = load_replay_visual_artifacts(replacement_replay)
+            validate_replay_reload_compatibility(
+                current_replay,
+                current_artifacts,
+                replacement_replay,
+                replacement_artifacts,
+            )
+            replacement_presence_distance_base = replay_distance_transform_base(
+                replacement_replay.reference_zyx,
+                replacement_replay.trace_zyx,
+                selection,
+                level.scale_zyx,
+            )
+            replacement_presence_distance_data = da.from_array(
+                replacement_presence_distance_base,
+                chunks=presence_source_data.chunks,
+            )
+            replacement_presence_data = mask_presence_by_distance(
+                presence_source_data,
+                replacement_presence_distance_data,
+                derived_state["presence_radius"],
+            )
+            replacement_anchor_filters = build_reloaded_anchor_filters(
+                replay_anchor_distances_base(
+                    replacement_replay,
+                    replacement_artifacts,
+                )
+            )
+
+            old_presence_data = volume_layer.data
+            old_presence_distance_base = derived_state["presence_distance_base"]
+            old_presence_distance_data = derived_state["presence_distance_data"]
+            old_anchor_filters = derived_state["anchor_visual_filters"]
+            old_selected_data = {
+                id(layer): set(layer.selected_data)
+                for layer in mutable_replay_layers()
+                if hasattr(layer, "selected_data")
+            }
+
+            def commit() -> None:
+                apply_replay_artifacts(
+                    replacement_replay,
+                    replacement_artifacts,
+                    replacement_presence_data,
+                    replacement_presence_distance_base,
+                    replacement_presence_distance_data,
+                    replacement_anchor_filters,
+                )
+
+            def rollback() -> None:
+                derived_state["presence_distance_base"] = old_presence_distance_base
+                derived_state["presence_distance_data"] = old_presence_distance_data
+                derived_state["anchor_visual_filters"] = old_anchor_filters
+                apply_replay_artifacts(
+                    current_replay,
+                    current_artifacts,
+                    old_presence_data,
+                    old_presence_distance_base,
+                    old_presence_distance_data,
+                    old_anchor_filters,
+                    old_selected_data,
+                )
+
+            commit_with_rollback(commit, rollback)
+
+            replay_state["replay"] = replacement_replay
+            replay_state["artifacts"] = replacement_artifacts
+            return (
+                "Reloaded replay artifacts: "
+                f"anchors={len(replacement_artifacts.anchors.paths_zyx)} "
+                f"fiberlets={len(replacement_artifacts.fiberlets.paths_zyx)}"
+            )
+
+        reload_artifacts_callback = reload_artifacts
+
+    maximum_display_radius = math.sqrt(
+        crop_xyzwhd[3] ** 2 + crop_xyzwhd[4] ** 2 + crop_xyzwhd[5] ** 2
+    )
     add_clipping_controls(
         viewer=viewer,
         volume_layer=volume_layer,
@@ -1700,15 +3053,22 @@ def launch_viewer(
         failure_layer=failure_layer,
         anchor_cell_centers_layer=anchor_cell_centers_layer,
         anchor_displacements_layer=anchor_displacements_layer,
+        anchor_stage_layers=anchor_stage_layers,
         presence_radius_base_voxels=presence_radius_base_voxels,
         maximum_presence_radius_base_voxels=(
-            float(np.max(presence_distance_base))
-            if presence_distance_base is not None
-            else None
+            maximum_display_radius if presence_distance_base is not None else None
         ),
         set_presence_radius=(
             set_presence_radius if presence_distance_data is not None else None
         ),
+        anchor_radius_base_voxels=anchor_radius_base_voxels,
+        maximum_anchor_radius_base_voxels=(
+            maximum_display_radius
+            if maximum_anchor_radius_base_voxels is not None
+            else None
+        ),
+        set_anchor_radius=set_anchor_radius_callback,
+        reload_artifacts=reload_artifacts_callback,
     )
     viewer.reset_view()
     napari.run()
@@ -1751,15 +3111,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.replay is not None and any(
             value is not None for value in (args.crop, args.anchors, args.paths)
         ):
-            raise ValueError("--replay cannot be combined with --crop, --anchors, or --paths")
+            raise ValueError(
+                "--replay cannot be combined with --crop, --anchors, or --paths"
+            )
         if args.replay is None and args.crop is None:
             raise ValueError("manual mode requires --crop")
         replay = load_fiber_replay_bundle(args.replay) if args.replay else None
         crop = replay.crop_xyzwhd if replay is not None else args.crop
         anchors = replay.anchors_obj if replay is not None else args.anchors
         paths = replay.paths_obj if replay is not None else args.paths
+        anchor_stages = ()
+        if replay is None and anchors is not None:
+            stage_directory = Path(anchors).expanduser().resolve().parent / "stages"
+            if stage_directory.exists():
+                anchor_stages = load_anchor_stage_directory(
+                    stage_directory, anchors, crop
+                )
         resolved = resolve_ome_zarr_level(args.zarr, args.level)
-        launch_viewer(resolved, crop, anchors, paths, replay)
+        launch_viewer(resolved, crop, anchors, paths, replay, anchor_stages)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

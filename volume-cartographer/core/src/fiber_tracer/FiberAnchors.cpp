@@ -80,6 +80,8 @@ struct RefinedFitState {
     size_t acceptedIterations = 0;
 };
 
+constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
+
 [[nodiscard]] bool finiteVector(const cv::Vec3d& value)
 {
     return std::isfinite(value[0]) && std::isfinite(value[1]) &&
@@ -680,15 +682,15 @@ void applyLocalMaximumNms(
             candidates[index].componentIndex].anchor;
         bins[binFor(anchor.positionPredictionXYZ)].push_back(index);
     }
-    std::vector<bool> suppressed(candidates.size(), false);
+    std::vector<std::optional<size_t>> suppressors(candidates.size());
     for (size_t index = 0; index < candidates.size(); ++index) {
         const auto& candidate = candidates[index];
         const auto& anchor = candidate.cell->components[
             candidate.componentIndex].anchor;
         const Bin ownBin = binFor(anchor.positionPredictionXYZ);
-        for (int dz = -1; dz <= 1 && !suppressed[index]; ++dz) {
-            for (int dy = -1; dy <= 1 && !suppressed[index]; ++dy) {
-                for (int dx = -1; dx <= 1 && !suppressed[index]; ++dx) {
+        for (int dz = -1; dz <= 1 && !suppressors[index].has_value(); ++dz) {
+            for (int dy = -1; dy <= 1 && !suppressors[index].has_value(); ++dy) {
+                for (int dx = -1; dx <= 1 && !suppressors[index].has_value(); ++dx) {
                     const auto found = bins.find(Bin{
                         ownBin[0] + dx, ownBin[1] + dy, ownBin[2] + dz});
                     if (found == bins.end())
@@ -701,7 +703,7 @@ void applyLocalMaximumNms(
                             other.componentIndex].anchor;
                         if (nmsRankedBefore(other, candidate) &&
                             nmsNeighbors(anchor, otherAnchor, config)) {
-                            suppressed[index] = true;
+                            suppressors[index] = otherIndex;
                             break;
                         }
                     }
@@ -710,10 +712,20 @@ void applyLocalMaximumNms(
         }
     }
     for (size_t index = 0; index < candidates.size(); ++index) {
-        if (!suppressed[index])
+        if (!suppressors[index].has_value())
             continue;
         auto& component = candidates[index].cell->components[
             candidates[index].componentIndex];
+        const auto& suppressor = candidates[*suppressors[index]];
+        const auto& suppressorComponent = suppressor.cell->components[
+            suppressor.componentIndex];
+        component.nmsSuppressor = FiberAnchorDiagnosticSuppressor{
+            suppressor.cell->cellZYX,
+            suppressorComponent.diagnosticId,
+            false,
+            suppressorComponent.anchor.alignedSupport,
+            suppressorComponent.anchor.directionalCoherence,
+        };
         component.retained = false;
         component.rejectionReason = "nms_suppressed";
         --candidates[index].cell->retainedAnchorCount;
@@ -721,6 +733,25 @@ void applyLocalMaximumNms(
 }
 
 } // namespace
+
+const char* fiberAnchorDiagnosticStageName(FiberAnchorDiagnosticStage stage)
+{
+    switch (stage) {
+    case FiberAnchorDiagnosticStage::Initialized:
+        return "initialized";
+    case FiberAnchorDiagnosticStage::Refined:
+        return "refined";
+    case FiberAnchorDiagnosticStage::Support:
+        return "support";
+    case FiberAnchorDiagnosticStage::Selection:
+        return "selection";
+    case FiberAnchorDiagnosticStage::Nms:
+        return "nms";
+    case FiberAnchorDiagnosticStage::Count:
+        break;
+    }
+    throw std::invalid_argument("invalid fiber anchor diagnostic stage");
+}
 
 void validateFiberAnchorConfig(const FiberAnchorConfig& config)
 {
@@ -869,8 +900,16 @@ FiberCellAnchorResult fitFiberCellAnchors(
 
     FiberCellAnchorResult result;
     result.cellZYX = cellZYX;
-    for (auto& component : result.components)
+    for (size_t componentIndex = 0;
+         componentIndex < result.components.size(); ++componentIndex) {
+        auto& component = result.components[componentIndex];
         component.anchor.cellZYX = cellZYX;
+        auto& diagnostic = result.initializedDiagnostics[componentIndex];
+        diagnostic.cellZYX = cellZYX;
+        diagnostic.candidateId = componentIndex;
+        diagnostic.transition.outcome = "rejected";
+        diagnostic.transition.reason = "empty";
+    }
     const cv::Vec3d center{
         (static_cast<double>(cellBeginZYX[2]) +
             static_cast<double>(cellEndZYX[2]) - 1.0) * 0.5,
@@ -977,6 +1016,36 @@ FiberCellAnchorResult fitFiberCellAnchors(
         principalAxis(weightedTensor(observations, &bestFit.assignments, 0)),
         principalAxis(weightedTensor(observations, &bestFit.assignments, 1)),
     };
+    std::array<size_t, 2> fittedAssignedCounts{0, 0};
+    for (const uint8_t assignment : bestFit.assignments) {
+        if (assignment < fittedAssignedCounts.size())
+            ++fittedAssignedCounts[assignment];
+    }
+    for (size_t componentIndex = 0;
+         componentIndex < fittedComponents.size(); ++componentIndex) {
+        auto& diagnostic = result.initializedDiagnostics[componentIndex];
+        const auto& fitted = fittedComponents[componentIndex];
+        diagnostic.metrics.assignedObservationCount =
+            fittedAssignedCounts[componentIndex];
+        if (fitted.unique) {
+            FiberAnchor anchor;
+            anchor.cellZYX = cellZYX;
+            anchor.positionPredictionXYZ = center;
+            anchor.axisXYZ = fitted.axis;
+            diagnostic.anchor = anchor;
+            diagnostic.metrics.objectiveContribution = denominator.sum > 0.0
+                ? fitted.largestEigenvalue / denominator.sum
+                : 0.0;
+            diagnostic.transition.outcome = "continue";
+            diagnostic.transition.reason.reset();
+        } else {
+            diagnostic.transition.reason = std::any_of(
+                bestFit.assignments.begin(), bestFit.assignments.end(),
+                [componentIndex](uint8_t assigned) {
+                    return assigned == componentIndex;
+                }) ? "degenerate" : "empty";
+        }
+    }
     bool mergeComponents = false;
     if (denominator.sum > 0.0 && global.unique &&
         fittedComponents[0].unique && fittedComponents[1].unique) {
@@ -1014,14 +1083,24 @@ FiberCellAnchorResult fitFiberCellAnchors(
     }
 
     std::array<cv::Vec3d, 2> seedAxes{};
+    std::array<size_t, 2> diagnosticIds{kNoDiagnosticId, kNoDiagnosticId};
     size_t activeComponents = 0;
     if (mergeComponents) {
-        seedAxes[activeComponents++] = global.axis;
+        seedAxes[activeComponents] = global.axis;
+        diagnosticIds[activeComponents++] = 2;
+        for (auto& diagnostic : result.initializedDiagnostics) {
+            if (!diagnostic.anchor.has_value())
+                continue;
+            diagnostic.transition.outcome = "merged";
+            diagnostic.transition.reason = "merged_same_direction";
+            diagnostic.transition.successorId = 2;
+        }
     } else {
         for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
             const auto& fitted = fittedComponents[componentIndex];
             if (fitted.unique) {
-                seedAxes[activeComponents++] = fitted.axis;
+                seedAxes[activeComponents] = fitted.axis;
+                diagnosticIds[activeComponents++] = componentIndex;
             } else {
                 result.components[componentIndex].rejectionReason = std::any_of(
                     bestFit.assignments.begin(), bestFit.assignments.end(),
@@ -1039,6 +1118,10 @@ FiberCellAnchorResult fitFiberCellAnchors(
     result.objective = refined.evaluation.objective;
     for (size_t componentIndex = 0; componentIndex < activeComponents; ++componentIndex) {
         auto& component = result.components[componentIndex];
+        component.diagnosticId = diagnosticIds[componentIndex];
+        component.diagnosticParentIds = mergeComponents
+            ? std::vector<size_t>{0, 1}
+            : std::vector<size_t>{diagnosticIds[componentIndex]};
         const double denominatorValue = refined.evaluation.denominators[componentIndex];
         const double numeratorValue = refined.evaluation.numerators[componentIndex];
         const double presenceMass = refined.evaluation.presenceMasses[componentIndex];
@@ -1064,6 +1147,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
             component.retained = true;
             ++result.retainedAnchorCount;
         }
+        component.retainedAfterSupport = component.retained;
     }
     if (mergeComponents)
         result.components[1].rejectionReason = "merged_same_direction";
@@ -1320,13 +1404,29 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 FiberCellAnchorResult cell = fitFiberCellAnchors(cellZYX, begin, end, cellObservations, config);
                 if (tallySelectedDiagnostics && retainPredicate) {
                     for (auto& component : cell.components) {
-                        if (component.retained && !retainPredicate(component.anchor)) {
+                        if (!component.retained)
+                            continue;
+                        const FiberAnchorRetainEvaluation evaluation =
+                            retainPredicate(component.anchor);
+                        if (!evaluation.retained &&
+                            (!evaluation.testedValue.has_value() ||
+                             !evaluation.threshold.has_value())) {
+                            throw std::invalid_argument(
+                                "fiber anchor selection rejection requires tested value and threshold");
+                        }
+                        component.selectionTestedValue = evaluation.testedValue;
+                        component.selectionThreshold = evaluation.threshold;
+                        if (!evaluation.retained) {
                             component.retained = false;
                             component.rejectionReason = "outside_selection";
                             --cell.retainedAnchorCount;
                             ++report.diagnostics.outsideSelectionComponents;
                         }
                     }
+                }
+                if (tallySelectedDiagnostics) {
+                    for (auto& component : cell.components)
+                        component.retainedAfterSelection = component.retained;
                 }
                 if (tallySelectedDiagnostics) {
                     if (cell.mergeEvaluation.has_value() && cell.mergeEvaluation->merged) {
@@ -1341,7 +1441,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             ++report.diagnostics.belowSupportComponents;
                     }
                 }
-                if (cell.retainedAnchorCount > 0)
+                if (cell.retainedAnchorCount > 0 || tallySelectedDiagnostics)
                     results.push_back(std::move(cell));
             }
             completedCells += blockCells.size();
@@ -1441,9 +1541,89 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     for (auto& cell : contextResults) {
         if (!selectedCell(cell.cellZYX))
             continue;
+        for (auto& component : cell.components) {
+            if (component.nmsSuppressor.has_value()) {
+                component.nmsSuppressor->externalContext =
+                    !selectedCell(component.nmsSuppressor->cellZYX);
+            }
+        }
         for (const auto& component : cell.components) {
             if (component.rejectionReason == "nms_suppressed")
                 ++report.diagnostics.nmsSuppressedComponents;
+        }
+        for (const auto& initialized : cell.initializedDiagnostics) {
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
+        }
+        const auto makeComponentRecord = [&](const FiberAnchorComponent& component) {
+            FiberAnchorDiagnosticRecord record;
+            record.cellZYX = cell.cellZYX;
+            record.candidateId = component.diagnosticId;
+            record.parentIds = component.diagnosticParentIds;
+            record.anchor = component.anchor;
+            record.metrics.assignedObservationCount =
+                component.assignedObservationCount;
+            record.metrics.alignedSupport = component.anchor.alignedSupport;
+            record.metrics.directionalCoherence =
+                component.anchor.directionalCoherence;
+            record.metrics.refinementScore = component.anchor.refinementScore;
+            record.metrics.refinementIterations =
+                component.anchor.refinementIterations;
+            return record;
+        };
+        for (const auto& component : cell.components) {
+            if (component.diagnosticId == kNoDiagnosticId)
+                continue;
+            FiberAnchorDiagnosticRecord refined = makeComponentRecord(component);
+            if (component.retainedAfterSupport) {
+                refined.transition.outcome = "continue";
+            } else {
+                refined.transition.outcome = "rejected";
+                refined.transition.reason = component.rejectionReason;
+                if (component.rejectionReason == "below_support") {
+                    refined.transition.testedValue = component.anchor.alignedSupport;
+                    refined.transition.threshold = config.minimumAlignedSupport;
+                }
+            }
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Refined)].push_back(
+                    std::move(refined));
+
+            if (!component.retainedAfterSupport)
+                continue;
+            FiberAnchorDiagnosticRecord support = makeComponentRecord(component);
+            if (component.retainedAfterSelection) {
+                support.transition.outcome = "continue";
+            } else {
+                support.transition.outcome = "rejected";
+                support.transition.reason = "outside_selection";
+                support.transition.testedValue = component.selectionTestedValue;
+                support.transition.threshold = component.selectionThreshold;
+            }
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Support)].push_back(
+                    std::move(support));
+
+            if (!component.retainedAfterSelection)
+                continue;
+            FiberAnchorDiagnosticRecord selection = makeComponentRecord(component);
+            if (component.retained) {
+                selection.transition.outcome = "continue";
+            } else {
+                selection.transition.outcome = "rejected";
+                selection.transition.reason = "nms_suppressed";
+                selection.transition.suppressor = component.nmsSuppressor;
+            }
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Selection)].push_back(
+                    std::move(selection));
+
+            if (!component.retained)
+                continue;
+            FiberAnchorDiagnosticRecord nms = makeComponentRecord(component);
+            nms.transition.outcome = "final";
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Nms)].push_back(std::move(nms));
         }
         if (componentLess(cell.components[1], cell.components[0]))
             std::swap(cell.components[0], cell.components[1]);
@@ -1458,6 +1638,12 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     report.diagnostics.zeroAnchorCells =
         report.diagnostics.totalCells - report.diagnostics.oneAnchorCells -
         report.diagnostics.twoAnchorCells;
+    for (auto& stage : report.diagnosticStages) {
+        std::sort(stage.begin(), stage.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.cellZYX, left.candidateId) <
+                std::tie(right.cellZYX, right.candidateId);
+        });
+    }
     report.elapsedSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     return report;
@@ -1616,6 +1802,57 @@ nlohmann::json fiberAnchorReportJson(
 namespace
 {
 
+std::vector<std::array<size_t, 3>> selectedAnchorCells(
+    const FiberAnchorExtractionReport& report)
+{
+    std::vector<std::array<size_t, 3>> selected = report.selectedCellsZYX;
+    if (!selected.empty())
+        return selected;
+    for (size_t z = report.selectedCellBeginZYX[0];
+         z < report.selectedCellEndZYX[0]; ++z) {
+        for (size_t y = report.selectedCellBeginZYX[1];
+             y < report.selectedCellEndZYX[1]; ++y) {
+            for (size_t x = report.selectedCellBeginZYX[2];
+                 x < report.selectedCellEndZYX[2]; ++x) {
+                selected.push_back({z, y, x});
+            }
+        }
+    }
+    return selected;
+}
+
+nlohmann::json nullableSize(const std::optional<size_t>& value)
+{
+    return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
+}
+
+nlohmann::json nullableDouble(const std::optional<double>& value)
+{
+    return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
+}
+
+nlohmann::json anchorDiagnosticParameters(const FiberAnchorConfig& config)
+{
+    return {
+        {"cell_size_prediction_voxels", config.cellSizePredictionVoxels},
+        {"gaussian_sigma_prediction_voxels", config.gaussianSigmaPredictionVoxels},
+        {"gaussian_cutoff_sigmas", config.gaussianCutoffSigmas},
+        {"local_window_radius_prediction_voxels", config.localWindowRadiusPredictionVoxels},
+        {"axial_support_half_width_prediction_voxels", config.axialSupportHalfWidthPredictionVoxels},
+        {"position_convergence_tolerance_prediction_voxels", config.positionConvergenceTolerancePredictionVoxels},
+        {"nms_maximum_angle_degrees", config.nmsMaximumAngleDegrees},
+        {"nms_longitudinal_radius_prediction_voxels", config.nmsLongitudinalRadiusPredictionVoxels},
+        {"observation_presence_floor", config.observationPresenceFloor},
+        {"minimum_aligned_support", config.minimumAlignedSupport},
+        {"merge_maximum_angle_degrees", config.mergeMaximumAngleDegrees},
+        {"merge_maximum_absolute_objective_loss", config.mergeMaximumAbsoluteObjectiveLoss},
+        {"merge_maximum_relative_objective_loss", config.mergeMaximumRelativeObjectiveLoss},
+        {"maximum_seed_count", config.maximumSeedCount},
+        {"maximum_iterations", config.maximumIterations},
+        {"convergence_tolerance", config.convergenceTolerance},
+    };
+}
+
 std::string fiberAnchorReportObjForComponent(
     const FiberAnchorExtractionReport& report,
     const FiberAnchorArtifactInfo& artifact,
@@ -1659,6 +1896,114 @@ std::string fiberAnchorReportObjForComponent(
 
 }  // namespace
 
+nlohmann::json fiberAnchorDiagnosticStageJson(
+    const FiberAnchorExtractionReport& report,
+    const FiberAnchorArtifactInfo& artifact,
+    FiberAnchorDiagnosticStage stage)
+{
+    if (artifact.sourceLocator.empty() || artifact.manifestContentHash.empty())
+        throw std::invalid_argument("fiber anchor diagnostics require source identity and manifest hash");
+    if (!(artifact.glyphLengthBaseVoxels > 0.0) ||
+        !std::isfinite(artifact.glyphLengthBaseVoxels)) {
+        throw std::invalid_argument("fiber anchor diagnostic glyph length must be positive and finite");
+    }
+    const size_t stageIndex = static_cast<size_t>(stage);
+    if (stageIndex >= kFiberAnchorDiagnosticStageCount)
+        throw std::invalid_argument("invalid fiber anchor diagnostic stage");
+
+    nlohmann::json root = {
+        {"format", "vc_fiberlet_anchor_stage"},
+        {"version", 1},
+        {"stage", fiberAnchorDiagnosticStageName(stage)},
+        {"source", {
+            {"manifest", artifact.sourceLocator},
+            {"manifest_content_hash", artifact.manifestContentHash},
+        }},
+        {"coordinates", {
+            {"position_order", "XYZ"},
+            {"cell_index_order", "ZYX"},
+            {"position_space", "base_volume"},
+            {"prediction_to_base_scale", report.grid.predictionToBaseScale},
+            {"prediction_shape_zyx", report.grid.shapeZYX},
+        }},
+        {"selection", {{"cells_zyx", selectedAnchorCells(report)}}},
+        {"parameters", anchorDiagnosticParameters(report.config)},
+        {"glyph_length_base_voxels", artifact.glyphLengthBaseVoxels},
+        {"summary", {
+            {"record_count", 0},
+            {"geometric_record_count", 0},
+            {"outcomes", nlohmann::json::object()},
+            {"reasons", nlohmann::json::object()},
+        }},
+        {"records", nlohmann::json::array()},
+    };
+    if (artifact.baseVoxelSizeUm.has_value())
+        root["coordinates"]["base_voxel_size_um"] = *artifact.baseVoxelSizeUm;
+
+    const auto& records = report.diagnosticStages[stageIndex];
+    for (const auto& record : records) {
+        nlohmann::json geometry = nullptr;
+        if (record.anchor.has_value()) {
+            const FiberAnchor& anchor = *record.anchor;
+            const cv::Vec3d positionBase =
+                anchor.positionPredictionXYZ * report.grid.predictionToBaseScale;
+            geometry = {
+                {"position_base_xyz", {positionBase[0], positionBase[1], positionBase[2]}},
+                {"axis_xyz", {anchor.axisXYZ[0], anchor.axisXYZ[1], anchor.axisXYZ[2]}},
+            };
+        }
+        nlohmann::json suppressor = nullptr;
+        if (record.transition.suppressor.has_value()) {
+            const auto& value = *record.transition.suppressor;
+            suppressor = {
+                {"cell_zyx", value.cellZYX},
+                {"candidate_id", value.candidateId},
+                {"external_context", value.externalContext},
+                {"aligned_support", value.alignedSupport},
+                {"directional_coherence", value.directionalCoherence},
+            };
+        }
+        root["records"].push_back({
+            {"cell_zyx", record.cellZYX},
+            {"candidate_id", record.candidateId},
+            {"parent_ids", record.parentIds},
+            {"geometry", std::move(geometry)},
+            {"metrics", {
+                {"assigned_observations", nullableSize(record.metrics.assignedObservationCount)},
+                {"objective_contribution", nullableDouble(record.metrics.objectiveContribution)},
+                {"aligned_support", nullableDouble(record.metrics.alignedSupport)},
+                {"directional_coherence", nullableDouble(record.metrics.directionalCoherence)},
+                {"refinement_score", nullableDouble(record.metrics.refinementScore)},
+                {"refinement_iterations", nullableSize(record.metrics.refinementIterations)},
+            }},
+            {"transition", {
+                {"outcome", record.transition.outcome},
+                {"reason", record.transition.reason.has_value()
+                    ? nlohmann::json(*record.transition.reason) : nlohmann::json(nullptr)},
+                {"successor_id", nullableSize(record.transition.successorId)},
+                {"tested_value", nullableDouble(record.transition.testedValue)},
+                {"threshold", nullableDouble(record.transition.threshold)},
+                {"suppressor", std::move(suppressor)},
+            }},
+        });
+        root["summary"]["record_count"] =
+            root["summary"]["record_count"].get<size_t>() + 1;
+        if (record.anchor.has_value()) {
+            root["summary"]["geometric_record_count"] =
+                root["summary"]["geometric_record_count"].get<size_t>() + 1;
+        }
+        auto& outcomes = root["summary"]["outcomes"];
+        outcomes[record.transition.outcome] =
+            outcomes.value(record.transition.outcome, size_t{0}) + 1;
+        if (record.transition.reason.has_value()) {
+            auto& reasons = root["summary"]["reasons"];
+            reasons[*record.transition.reason] =
+                reasons.value(*record.transition.reason, size_t{0}) + 1;
+        }
+    }
+    return root;
+}
+
 std::string fiberAnchorReportObj(
     const FiberAnchorExtractionReport& report,
     const FiberAnchorArtifactInfo& artifact)
@@ -1673,19 +2018,8 @@ std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
         report.config.cellSizePredictionVoxels < 1) {
         throw std::invalid_argument("fiber anchor cell OBJ metadata is invalid");
     }
-    std::vector<std::array<size_t, 3>> selectedCells = report.selectedCellsZYX;
-    if (selectedCells.empty()) {
-        for (size_t z = report.selectedCellBeginZYX[0];
-             z < report.selectedCellEndZYX[0]; ++z) {
-            for (size_t y = report.selectedCellBeginZYX[1];
-                 y < report.selectedCellEndZYX[1]; ++y) {
-                for (size_t x = report.selectedCellBeginZYX[2];
-                     x < report.selectedCellEndZYX[2]; ++x) {
-                    selectedCells.push_back({z, y, x});
-                }
-            }
-        }
-    }
+    const std::vector<std::array<size_t, 3>> selectedCells =
+        selectedAnchorCells(report);
     std::map<std::array<size_t, 3>, const FiberCellAnchorResult*> retainedByCell;
     for (const auto& cell : report.nonEmptyCells)
         retainedByCell.emplace(cell.cellZYX, &cell);
@@ -1759,6 +2093,14 @@ void writeFiberAnchorArtifacts(
     vc::core::util::atomicWriteString(
         outputDirectory / "anchor_cells.obj",
         fiberAnchorCellReportObj(report));
+    std::filesystem::create_directories(outputDirectory / "stages");
+    for (size_t index = 0; index < kFiberAnchorDiagnosticStageCount; ++index) {
+        const auto stage = static_cast<FiberAnchorDiagnosticStage>(index);
+        vc::core::util::atomicWriteString(
+            outputDirectory / "stages" /
+                (std::string(fiberAnchorDiagnosticStageName(stage)) + ".json"),
+            fiberAnchorDiagnosticStageJson(report, artifact, stage).dump(2) + "\n");
+    }
 }
 
 } // namespace vc::fiber_tracer

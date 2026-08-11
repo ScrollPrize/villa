@@ -620,9 +620,14 @@ int main(int argc, char** argv)
                     },
                     tube.cellsZYX,
                     [&](const vc::fiber_tracer::FiberAnchor& anchor) {
-                        return tube.containsPredictionPoint(
-                            anchor.positionPredictionXYZ,
+                        const double distance = tube.distanceToBasePoint(
+                            anchor.positionPredictionXYZ *
                             grid.predictionToBaseScale);
+                        return vc::fiber_tracer::FiberAnchorRetainEvaluation{
+                            distance <= tube.radiusBaseVoxels + 1.0e-12,
+                            distance,
+                            tube.radiusBaseVoxels,
+                        };
                     },
                     printAnchorProgress);
                 const auto anchorCount =

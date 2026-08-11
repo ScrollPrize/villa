@@ -26,6 +26,7 @@ struct FiberReplayTube {
     std::array<size_t, 6> volumeCropBaseXYZWHD{0, 0, 0, 0, 0, 0};
 
     [[nodiscard]] bool containsBasePoint(const cv::Vec3d& point) const;
+    [[nodiscard]] double distanceToBasePoint(const cv::Vec3d& point) const;
     [[nodiscard]] bool containsPredictionPoint(
         const cv::Vec3d& pointPredictionXYZ,
         double predictionToBaseScale) const;

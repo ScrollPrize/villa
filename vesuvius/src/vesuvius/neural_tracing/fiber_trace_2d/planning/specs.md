@@ -2763,3 +2763,61 @@
   and creates independent presence/reference/trace/failure/anchor/fiberlet
   layers. Six crop controls clip all layers; line widths, failure size, and
   fiberlet quality colormap remain runtime display controls.
+
+# Anchor pipeline stage diagnostics
+
+- Anchor extraction assigns stable per-cell diagnostic IDs to the two fitted
+  attempts before merge, compaction, or component sorting. Both attempts are
+  emitted for every selected cell; unavailable directions use null geometry.
+  A same-direction merge creates candidate ID 2 with parent IDs 0 and 1.
+- Five strict `vc_fiberlet_anchor_stage` version-1 JSON files capture the real
+  boundaries `initialized`, `refined`, `support`, `selection`, and `nms`.
+  External NMS-context cells may be referenced as suppressors but never enter
+  the selected stage populations.
+- Per-record transitions distinguish empty/degenerate initialization, merge,
+  refined empty or below-support rejection, outside-selection rejection, and
+  NMS suppression. Threshold decisions store their tested value and threshold;
+  NMS rejection stores the actual higher-ranked suppressor used by the existing
+  pass, its ranking fields, and whether it is external context.
+- All stage files bind the same source hash, grid/scale, complete selected-cell
+  set, extraction parameters, and glyph length. Strict replay loading validates
+  canonical identities/order, merge lineage, survivor subsets, unchanged
+  geometry/metrics across filter-only stages, and equality between final NMS
+  geometry and `anchors.obj`. No repair or compatibility behavior exists.
+- Stage capture copies existing computations and must not change fitting,
+  filtering, NMS ranking, final `anchors.json`/OBJ bytes, or fiberlet paths.
+  `anchors.json` remains the only authoritative path-stage input.
+- Napari exposes one Shapes layer per nonempty stage with stable colors,
+  transition/metric features, common clipping and width controls. Only NMS is
+  initially visible; the duplicate final-anchor OBJ layer starts hidden.
+- Failed-replay viewing provides an independent `Anchor radius` in base voxels.
+  Each final/stage glyph uses its symmetric center, each cell-center point uses
+  itself, and each refinement offset uses its anchor target. Exact Euclidean
+  point-to-segment distance is measured against the union of the reference
+  fiber and complete failed trace; a glyph remains rendered when its distance
+  is at most the radius. The default is the extraction-tube radius.
+- Anchor distance filtering changes only per-item line alpha or point visibility. It preserves
+  complete geometry, stage features, item order, selections, widths/sizes,
+  clipping, layer visibility, and full artifact counts in layer names. It does
+  not affect fiberlet paths or the independently controlled presence EDT mask.
+- Failed-replay mode creates stable typed layers for final anchors, all five
+  anchor stages, cell centers, refinement offsets, and fiberlets even when an
+  artifact population is empty. The `Reload artifacts` command always rereads
+  the original root `fiber_replay.json`, follows its newly published immutable
+  hashed generation, and passes it through the startup strict loaders.
+- In-process artifact reload requires the same failed-replay artifact contract,
+  fiber-prediction manifest content hash, prediction shape/scale, displayed
+  Zarr level transform, base crop, extraction-tube radius, and five stage names.
+  Counts may cross zero; geometry, metrics, reference/trace/failure data, and
+  generation paths may change. An incompatible replacement leaves the current
+  display unchanged and reports that restart is required.
+- Reload never resolves or opens the presence Zarr and retains the exact lazy
+  source crop object. It recomputes only derived reference/trace EDT and exact
+  anchor distances, creates a new lazy mask graph over that same source, and
+  reapplies the current independent radius values.
+- Reload preparation completes strict parsing, compatibility, features, names,
+  and distance calculations before layer mutation. Commit updates existing
+  layers under blocked events, clears stale item selections, and preserves
+  layer identity/order, visibility, clipping, widths/sizes, path colormap,
+  volume rendering, crop controls, and radius controls. A commit error rolls all
+  artifact layers and derived controller state back before it is reported.

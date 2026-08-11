@@ -162,8 +162,12 @@ std::string artifactHash(const std::filesystem::path& path)
 
 bool FiberReplayTube::containsBasePoint(const cv::Vec3d& point) const
 {
-    return distanceToPolylineArc(reference, point, beginArcBase, endArcBase) <=
-        radiusBaseVoxels + kEpsilon;
+    return distanceToBasePoint(point) <= radiusBaseVoxels + kEpsilon;
+}
+
+double FiberReplayTube::distanceToBasePoint(const cv::Vec3d& point) const
+{
+    return distanceToPolylineArc(reference, point, beginArcBase, endArcBase);
 }
 
 bool FiberReplayTube::containsPredictionPoint(
@@ -339,6 +343,11 @@ nlohmann::json writeFiberReplayBundle(
             "anchors/anchors_0.obj",
             "anchors/anchors_1.obj",
             "anchors/anchor_cells.obj",
+            "anchors/stages/initialized.json",
+            "anchors/stages/refined.json",
+            "anchors/stages/support.json",
+            "anchors/stages/selection.json",
+            "anchors/stages/nms.json",
             "paths/fiberlets.json",
             "paths/fiberlets.obj",
         });

@@ -17,6 +17,14 @@
   complete failed greedy trace, including postroll, for direct comparison.
 - Added `anchor_cells.obj` with every selected cell center and retained-anchor
   displacement lines, exposed as separate clipped napari diagnostic layers.
+- Added strict initialized/refined/support/selection/NMS anchor-stage JSON
+  diagnostics with stable merge lineage, exact filter causes, and actual NMS
+  suppressors, plus independently toggleable napari comparison layers.
+- Added an independent base-voxel anchor-radius slider that filters every replay
+  anchor diagnostic against the exact reference/failed-trace union distance.
+- Added transactional in-process replay-artifact reload with stable empty
+  layers, strict prediction/crop compatibility, derived-distance refresh, and
+  no presence-Zarr reopening.
 
 # 2026-08-11: fiber-centered anchor refinement
 
