@@ -932,11 +932,17 @@ class FitContext:
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
-        builds the sampling caches, the host-resident patch atlases, and
-        the trusted-geometry index. Requires no device state: the patch
-        atlases are host-resident (their `device` only selects where each
-        lookup's interpolated points are delivered), and the CUDA stores,
-        model, and optimiser are built later by build_device_state().
+        builds the sampling caches, the host-resident patch atlases, the
+        trusted-geometry index, the interactive influence anchor stash and
+        the whole-object DT target samples. Requires no device state: the
+        patch atlases are host-resident (their `device` only selects where
+        each lookup's interpolated points are delivered), and the CUDA
+        stores, model, and optimiser are built later by
+        build_device_state().
+
+        Everything the device stages read from here they only read: nothing
+        below the cut consumes or releases a host structure, so the model
+        stage can be re-run against inputs this method loaded once.
 
         The loaded inputs stay readable as attributes afterwards, so
         analysis tools can construct a context, call this, and read:
@@ -949,8 +955,8 @@ class FitContext:
           link_distance_tolerance
         - sampling: patch_sampling_probabilities, patch_atlas,
           unverified_patch_sampling_probabilities, unverified_patch_atlas
-        - trusted geometry: verified_patches_and_pcls_cpu / _np,
-          trusted_geometry_tree
+        - trusted geometry: trusted_geometry_tree,
+          influence_anchor_geometry
         - tracks: tracks, track_families, track_source_ids,
           track_crossing_cache, track_graph, track_reload_source /
           _families / _source_ids, track_sampling_config, using_tracks,
@@ -1499,12 +1505,54 @@ class FitContext:
         self.num_verified_patches = num_verified_patches
         self.patch_atlas = patch_atlas
         self.using_tracks = using_tracks
-        self.verified_patches_and_pcls_cpu = verified_patches_and_pcls_cpu
-        self.verified_patches_and_pcls_np = verified_patches_and_pcls_np
         self.trusted_geometry_tree = trusted_geometry_tree
         self.unverified_patches_list = unverified_patches_list
         self.unverified_patch_sampling_probabilities = unverified_patch_sampling_probabilities
         self.unverified_patch_atlas = unverified_patch_atlas
+
+        # A compact subsample of the trusted cloud seeds a future Run's
+        # influence anchor bank. Keep it for every interactive session because
+        # influence can be enabled or disabled independently on each Run
+        # request. The generator is seeded explicitly, so the stash is
+        # deterministic without perturbing the training RNG streams.
+        self.influence_anchor_geometry = None
+        if self.interactive_driver is not None:
+            stash_generator = torch.Generator()
+            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
+            self.influence_anchor_geometry = subsample_rows(
+                verified_patches_and_pcls_cpu,
+                int(self.config['sample_count_influence_anchor_geometry_points']),
+                stash_generator,
+            ).clone()
+        # The trusted cloud itself stays local: the cKDTree above and that
+        # stash are all anything downstream reads it for, and consuming it
+        # here rather than in build_device_state() is what leaves the device
+        # stages with nothing of the host's to release.
+        del verified_patches_and_pcls_cpu, verified_patches_and_pcls_np
+
+        # ==========================================================================
+        # Whole-object DT target caches (see dt_targets.py)
+        # ==========================================================================
+
+        # Deterministic sparse samples over each patch's own grid: host work on
+        # host inputs, so it belongs here rather than beside the model that
+        # eventually reads the caches these seed.
+        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
+            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
+        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
+        if self.dt_target_whole_object:
+            progress.begin(
+                'loading', 'Preparing distance-target samples',
+                detail=(
+                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
+                    'patches'))
+            prepare_patch_dt_target_samples(
+                self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
+            )
+            if self.unverified_patches_list:
+                prepare_patch_dt_target_samples(
+                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
+                )
 
     def _phase_mode_active(self):
         return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
@@ -1601,6 +1649,20 @@ class FitContext:
         resume-checkpoint restore and the distributed reseed consume and
         overwrite the host RNG streams, so relative order is load-bearing.
         Requires load_host_inputs() to have run and self.out_path to be set.
+
+        The two stages below are one ordinal, not a graph: everything the
+        model stage needs from the store stage the store stage has already
+        built, so a rebuild that only changes the model re-runs the second
+        alone (see rebuild_model_state()).
+        """
+        self._build_store_state()
+        self._build_model_state()
+
+    def _build_store_state(self):
+        """Materialise the Lasagna and surf-SDT brick pools.
+
+        The expensive half of the device build, and the half nothing but the
+        z window, the store paths and the dense-loss mode can invalidate.
         """
         interactive_driver = self.interactive_driver
         progress = progress_or_null(self.progress)
@@ -1654,6 +1716,19 @@ class FitContext:
                 self._scalar_stores.append(self.sdt_volume['store'])
 
         self._sdt_inactive_warned = set()
+
+    def _build_model_state(self):
+        """Construct the model, the optimiser, and everything after them.
+
+        Reads the host inputs and the stores; owns the umbilicus device
+        tensors, the flow-field corners, the model and its resume, the shell
+        loss structures, the optimiser and LR scheduler, the prepared device
+        track tables, and the distributed bookkeeping. Nothing here consumes
+        or releases a host structure, which is what lets rebuild_model_state()
+        run it a second time.
+        """
+        interactive_driver = self.interactive_driver
+        progress = progress_or_null(self.progress)
 
         self.num_slices_for_visualisation = self.config.get('output_num_slices_for_visualization', 20)
         self.device = torch.device('cuda')
@@ -1893,49 +1968,15 @@ class FitContext:
                 if self.prepared_main_tracks['flat_zyx_cpu'].shape[0] == input_track_points:
                     self.preview_extent_tracks = (self.prepared_main_tracks['flat_zyx_cpu'],)
 
-        # A compact subsample of the trusted cloud seeds a future Run's influence
-        # anchor bank. Keep it for every interactive session because influence can
-        # be enabled or disabled independently on each Run request.
-        self.influence_anchor_geometry = None
-        if interactive_driver is not None:
-            stash_generator = torch.Generator()
-            stash_generator.manual_seed(int(self.config['optimizer_random_seed']))
-            self.influence_anchor_geometry = subsample_rows(
-                self.verified_patches_and_pcls_cpu,
-                int(self.config['sample_count_influence_anchor_geometry_points']),
-                stash_generator,
-            ).clone()
-
-        # The trusted cloud and its double-precision cKDTree are setup-only data.
+        # The trusted cloud's double-precision cKDTree is setup-only data on a
+        # one-shot fit; prepare_main_phase_tracks above is its last reader.
         # Track sampling retains its own compact offsets and coordinates.
         if interactive_driver is None:
             self.trusted_geometry_tree = None
-        self.verified_patches_and_pcls_cpu = None
-        self.verified_patches_and_pcls_np = None
 
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
 
-        # ==========================================================================
-        # Whole-object DT target caches (see dt_targets.py)
-        # ==========================================================================
-
-        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
-            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
-        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
-        if self.dt_target_whole_object:
-            progress.begin(
-                'loading', 'Preparing distance-target samples',
-                detail=(
-                    f'{len(self.verified_patches_list) + len(self.unverified_patches_list):,} '
-                    'patches'))
-            prepare_patch_dt_target_samples(
-                self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-            )
-            if self.unverified_patches_list:
-                prepare_patch_dt_target_samples(
-                    self.unverified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-                )
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
         def report_first_dt_target_cache(kind, cache):
