@@ -114,7 +114,7 @@ rclone copy :http: ./spiral_datasets/phercparis4 \
     --transfers 32 -P
 ```
 
-`hf buckets sync` works like `rsync`: re-running it resumes interrupted downloads. The dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
+re-running rclone resumes interrupted downloads. The dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
 
 #### Configure
 
