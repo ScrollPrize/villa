@@ -178,9 +178,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);
+        // The dialog stays where the user left it; the status bar carries the
+        // error and the panel's "Logs" button opens the detail on demand.
         _pythonOutput->appendOutput(tr("Error: %1").arg(error));
-        _pythonOutputDialog->show();
-        _pythonOutputDialog->raise();
     });
     connect(_service, &SpiralServiceManager::inputUploadFinished, this,
             [this](const QString& inputId, const QString& error) {

@@ -738,6 +738,21 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _previewProgress->setTextVisible(true);
     _previewProgress->setVisible(false);
     _metrics = new QLabel(statusDock);
+    // The log window never opens on its own, so the dock carries the only way
+    // in.  It shares the metrics line rather than claiming a row of its own.
+    auto* showLogs = new QToolButton(statusDock);
+    showLogs->setObjectName(QStringLiteral("spiralShowLogs"));
+    showLogs->setText(tr("Logs"));
+    showLogs->setToolTip(tr("Show the spiral service's Python stdout / stderr"));
+    showLogs->setAutoRaise(true);
+    showLogs->setMaximumHeight(fontMetrics().height() + 4);
+    connect(showLogs, &QToolButton::clicked, this,
+            [this]() { emit pythonOutputRequested(); });
+    auto* metricsRow = new QHBoxLayout;
+    metricsRow->setContentsMargins(0, 0, 0, 0);
+    metricsRow->addWidget(_metrics);
+    metricsRow->addStretch(1);
+    metricsRow->addWidget(showLogs);
     // Diagnostics are unbounded (stacked warnings, tracebacks), so they scroll
     // within a fixed slice of the dock instead of pushing the panel around.
     auto* warningsScroll = new QScrollArea(statusDock);
@@ -751,7 +766,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     warningsScroll->setWidget(_warnings);
     statusDockLayout->addWidget(_state);
     statusDockLayout->addWidget(_previewProgress);
-    statusDockLayout->addWidget(_metrics);
+    statusDockLayout->addLayout(metricsRow);
     statusDockLayout->addWidget(warningsScroll);
     layout->addStretch(1);
     scroll->setWidget(contents);
@@ -1039,7 +1054,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 else if (box.clickedButton() != panelInputs) return;
             }
             persist();
-            emit pythonOutputRequested();
             if (useDefaults)
                 _service->rebuildWithDefaults();
             else
@@ -1057,7 +1071,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         persist();
-        emit pythonOutputRequested();
         _service->runIterations(_iterations->value(), influenceConfig(),
                                 runAdvancedConfig(),
                                 sessionRequest().value(QStringLiteral("paths")).toObject());
