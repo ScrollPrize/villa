@@ -144,16 +144,11 @@ class PclRole(str, Enum):
 #
 # One description of every fit input, consumed by request validation
 # (validate_session_request), dataset resolution (resolve_dataset_root /
-# conventional_input_paths), run admission (spiral_service.ServiceState.run), and the
-# resident fitter's impact analysis (FitContext.apply_config). Each entry
-# records the input's path kind, its enabling/required predicates over the
-# run configuration, what must be rebuilt when the path changes, and whether
-# a change breaks checkpoint compatibility.
-
-# A path change whose input has no specific rebuild scope invalidates every
-# prepared-input family: the session must be reloaded with fresh host inputs.
-FULL_REBUILD_DEPENDENCIES = (
-    "dense_stores", "patch_pcl", "tracks", "shell", "preview_output")
+# conventional_input_paths) and run admission
+# (spiral_service.ServiceState.run). Each entry records the input's path kind
+# and its enabling/required predicates over the run configuration. Fit-input
+# paths are static for the lifetime of a resident session, so an entry says
+# nothing about rebuild scope: changing any of them rebuilds the session.
 
 
 def _always(config: Mapping[str, Any]) -> bool:
@@ -220,12 +215,6 @@ class FitInputSpec:
     enabled: Callable[[Mapping[str, Any]], bool] = _always
     # required(config): the input must exist for this configuration.
     required: Callable[[Mapping[str, Any]], bool] = _never
-    # What a path change invalidates on a resident session. Fit-input paths
-    # are static for the lifetime of a resident session, so the default is a
-    # host-input/session rebuild. More granular impacts remain representable
-    # for a future input type whose identity is explicitly session-mutable.
-    runtime_impact: str = "new_fit"
-    dependencies: tuple[str, ...] = FULL_REBUILD_DEPENDENCIES
     # Whether changing the input breaks checkpoint compatibility. No fit
     # input does today: the checkpoint domain is set by "new_fit" config
     # keys (z-range, model shape, optimizer seed), never by an input path.
@@ -268,33 +257,6 @@ _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
 
 def fit_input(key: str) -> FitInputSpec | None:
     return _FIT_INPUTS_BY_KEY.get(key)
-
-
-def input_change_impact(key: str) -> tuple[str, list[str]]:
-    """Rebuild scope of changing one input path on a resident session.
-
-    Unknown keys get the conservative full-rebuild scope, exactly as run
-    planning has always treated paths it had no specific knowledge of.
-    """
-    spec = _FIT_INPUTS_BY_KEY.get(key)
-    if spec is None:
-        return "new_fit", list(FULL_REBUILD_DEPENDENCIES)
-    return spec.runtime_impact, list(spec.dependencies)
-
-
-def input_path_schema() -> dict[str, dict[str, Any]]:
-    """Path entries advertised in the configuration catalog schema.
-
-    Only inputs a resident session can take live (without a session reload)
-    are advertised; everything else uses the implicit
-    new-fit default.
-    """
-    return {
-        spec.key: {"runtime_impact": spec.runtime_impact,
-                   "dependencies": list(spec.dependencies)}
-        for spec in FIT_INPUT_CATALOG
-        if spec.runtime_impact != "new_fit"
-    }
 
 
 # PCL point-collection inputs: (role, conventional filename, discovered).

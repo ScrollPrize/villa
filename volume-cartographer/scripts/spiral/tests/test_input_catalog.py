@@ -1,10 +1,9 @@
 """The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
-from fit_session import (FIT_INPUT_CATALOG, FULL_REBUILD_DEPENDENCIES,
-                         PCL_ROLE_CONVENTIONS, SCROLL_SPEC_PATH_OVERRIDE_KEYS,
-                         SpiralInputPaths, fit_input, input_change_impact,
-                         input_path_schema)
+from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS,
+                         SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
+                         fit_input)
 
 
 def test_catalog_covers_every_fit_input_path_field():
@@ -21,8 +20,6 @@ def test_catalog_covers_every_fit_input_path_field():
 def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
     spec = fit_input("outer_shell")
     assert spec.kind == "directory"
-    assert spec.runtime_impact == "new_fit"
-    assert spec.dependencies == FULL_REBUILD_DEPENDENCIES
     # Enabled by either shell loss weight; the outer weight defaults on.
     assert spec.required({}) is True
     assert spec.required({"loss_weight_shell_outer": 0.0,
@@ -31,24 +28,12 @@ def test_outer_shell_is_an_ordinary_entry_with_the_shell_weight_predicate():
                           "loss_weight_shell_patch_radius": 2.0}) is True
 
 
-def test_every_input_path_change_requires_a_full_host_rebuild():
-    assert input_change_impact("outer_shell") == (
-        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
-    assert input_change_impact("verified_patches") == (
-        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
-    assert input_change_impact("checkpoint") == (
-        "new_fit", list(FULL_REBUILD_DEPENDENCIES))
+def test_no_input_path_is_advertised_as_takeable_by_a_resident_session():
+    assert Config.catalog()["schema"]["paths"] == {}
 
 
-def test_config_catalog_paths_derive_from_the_input_catalog():
-    assert input_path_schema() == {}
-    assert Config.catalog()["schema"]["paths"] == input_path_schema()
-
-
-def test_input_paths_and_model_configuration_are_new_fit_changes():
+def test_model_configuration_is_a_new_fit_change():
     assert not any(spec.checkpoint_domain for spec in FIT_INPUT_CATALOG)
-    assert all(input_change_impact(spec.key)[0] == "new_fit"
-               for spec in FIT_INPUT_CATALOG)
     fields = Config.catalog()["schema"]["fields"]
     assert fields["z_begin"]["runtime_impact"] == "new_fit"
     assert fields["model_num_flow_stages"]["runtime_impact"] == "new_fit"

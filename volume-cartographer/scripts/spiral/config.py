@@ -46,11 +46,6 @@ _PREPARED_INPUT_FIELDS = {
     "shell_min_confidence",
 }
 
-_DENSE_LOSS_ONLY_FIELDS = {
-    "dense_spacing_density_lambda",
-    "dense_spacing_density_soft_mass_min_gap_wv",
-}
-
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
@@ -92,12 +87,6 @@ _Z_RANGE_DESCRIPTIONS = {
              "rendering, and model/checkpoint z-domain compatibility.",
 }
 
-_Z_RANGE_DEPENDENCIES = [
-    "patch_pcl", "trusted_geometry", "tracks",
-    "dense_stores", "dense_losses", "shell", "preview_output",
-]
-
-
 def _runtime_impact(key):
     if key in _Z_RANGE_DESCRIPTIONS:
         # Changing the z-range invalidates host inputs, dense stores, and the
@@ -108,25 +97,6 @@ def _runtime_impact(key):
     if key.startswith(("input_", "pcl_")) or key in _PREPARED_INPUT_FIELDS:
         return "new_fit"
     return "run_boundary"
-
-
-def _dependencies(key):
-    if key in _Z_RANGE_DESCRIPTIONS:
-        return list(_Z_RANGE_DEPENDENCIES)
-    if key.startswith(("patch_", "pcl_")):
-        return ["patch_pcl", "trusted_geometry", "tracks"]
-    if key.startswith("track_"):
-        return ["tracks"]
-    if key.startswith("dense_"):
-        return (["dense_losses"] if key in _DENSE_LOSS_ONLY_FIELDS
-                else ["dense_stores", "dense_losses"])
-    if key.startswith("dt_"):
-        return ["patch_pcl", "tracks", "dense_losses"]
-    if key.startswith("shell_"):
-        return ["shell"]
-    if key.startswith("output_") and key != "output_save_png_visualizations":
-        return ["preview_output"]
-    return []
 
 
 def _field_spec(key, default):
@@ -153,7 +123,6 @@ def _field_spec(key, default):
         "nullable": nullable,
         "label": key.split("_", 1)[-1].replace("_", " ").title(),
         "runtime_impact": _runtime_impact(key),
-        "dependencies": _dependencies(key),
     }
     if kind in ("integer", "number"):
         spec.update(
@@ -434,16 +403,13 @@ class Config:
             path.stem: cls(path).as_dict()
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
-        # The advertised path entries derive from the declarative fit-input
-        # catalog (imported lazily: fit_session imports Config). Only inputs
-        # a resident session can take live appear; every other path change
-        # implies the new-fit default.
-        from fit_session import input_path_schema
-
         return {
             "defaults": defaults,
             "schema": {
-                "paths": input_path_schema(),
+                # No input path can be taken by a resident session: every path
+                # change implies a rebuild, which is the client's default for
+                # a path it finds no entry for.
+                "paths": {},
                 "fields": fields,
             },
             "presets": presets,

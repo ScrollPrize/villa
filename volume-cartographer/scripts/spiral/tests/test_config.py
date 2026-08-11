@@ -28,8 +28,7 @@ def test_catalog_is_complete_and_presets_are_resolved():
 
 def test_every_key_has_generated_metadata():
     catalog = Config.catalog()
-    required = {
-        "type", "nullable", "label", "runtime_impact", "dependencies"}
+    required = {"type", "nullable", "label", "runtime_impact"}
     for key, field in catalog["schema"]["fields"].items():
         assert required <= set(field)
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
