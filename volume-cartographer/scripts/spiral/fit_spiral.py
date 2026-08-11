@@ -487,6 +487,41 @@ def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
     return int(start_iteration) + int(run_iterations * fraction)
 
 
+def unresolved_fiber_link_warning(new_fibers, *, use_links, use_pending_links,
+                                  max_named=6):
+    """Warn that uploaded fibers' cross-fiber links are inert this session.
+
+    Cross-fiber links are resolved once, over the resident inputs
+    (load_host_inputs): an uploaded fiber joins the pool as its own singleton
+    component, so any branch the user drew on it does nothing until the input
+    is committed and the fit rebuilt. Rather than let that pass silently, count
+    the links that *would* be used after a rebuild -- so nothing is reported
+    when links are configured off, and pending links only count when they are
+    configured in -- and describe them.
+
+    new_fibers is an iterable of (input_id, pcl). Returns the warning text, or
+    None when there is nothing to warn about.
+    """
+    if not use_links:
+        return None
+    counted = []
+    for input_id, pcl in new_fibers:
+        num_links = sum(1 for branch in pcl.get('branches', ())
+                        if use_pending_links or not branch['pending'])
+        if num_links:
+            counted.append((input_id, num_links))
+    if not counted:
+        return None
+    named = ', '.join(f'{input_id} ({count})' for input_id, count in counted[:max_named])
+    if len(counted) > max_named:
+        named += f', and {len(counted) - max_named} more'
+    return (
+        f'{sum(count for _, count in counted)} cross-fiber link(s) on '
+        f'{len(counted)} added fiber(s) are not used by this session: links are '
+        f'resolved when the fit is built. Commit the inputs and rebuild the fit '
+        f'to apply them. Fibers: {named}')
+
+
 def get_dense_attachment_ramp(cfg, iteration):
     """Warm-up/ramp factor for the attachment weight, measured against the
     durable completed-iteration count so a resumed run continues the schedule
@@ -2769,6 +2804,10 @@ class FitContext:
         and prepared samplers are reused untouched. The record order is the
         service's deterministic order, so a multi-rank session would append the
         same items in the same order on every rank.
+
+        Returns the warnings this incorporation raised, for the runtime to
+        publish on the session status (nothing here is fatal enough to refuse
+        the inputs).
         """
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
@@ -2784,6 +2823,9 @@ class FitContext:
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            # (input_id, pcl) per uploaded fiber, for the unresolved-link
+            # warning below.
+            new_fibers = []
             for record in records:
                 kind = record.get('kind')
                 path = record.get('path')
@@ -2812,6 +2854,7 @@ class FitContext:
                     pcl.setdefault('metadata', {})['winding_is_absolute'] = False
                     pcl['metadata']['input_role'] = 'fiber'
                     pcl['sampling_group'] = 'fibers'
+                    new_fibers.append((input_id, pcl))
                     new_collections[self.next_id] = pcl
                     self.next_id += 1
                 elif kind == 'pcl':
@@ -2953,10 +2996,10 @@ class FitContext:
                         'windings': windings,
                     })
                     self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
-                # Cross-fiber links are resolved once, over the resident inputs
-                # (load_host_inputs); an uploaded fiber's branches are not
-                # resolved, so its strip joins the pool as its own singleton
-                # component (no 'link_points', no junctions to walk).
+                # No 'link_points' on these strips: an uploaded fiber's
+                # branches are not resolved (see unresolved_links above), so
+                # each new strip is its own singleton component with no
+                # junctions to walk.
                 # The flat GPU bundle is derived from the strip list; drop it so
                 # the next consumer rebuilds it including the appended strips.
                 self.unattached_pcl_strips.flat = None
@@ -2998,6 +3041,16 @@ class FitContext:
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session; '
                   f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
+
+            warnings = []
+            link_warning = unresolved_fiber_link_warning(
+                new_fibers,
+                use_links=self.config['pcl_use_fiber_links'],
+                use_pending_links=self.config['pcl_use_pending_fiber_links'])
+            if link_warning is not None:
+                print(f'WARNING: {link_warning}')
+                warnings.append(link_warning)
+            return warnings
         finally:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)

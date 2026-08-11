@@ -1176,7 +1176,7 @@ class InteractiveFitSession:
                 "incorporating_inputs", "Incorporating new session inputs",
                 step=0, total_steps=len(records), unit="inputs")
             self._publish_status()
-            self._context.incorporate_interactive_inputs(
+            incorporation_warnings = self._context.incorporate_interactive_inputs(
                 records, influence_config,
                 current_iteration=current_iteration,
                 target_iteration=target_iteration)
@@ -1198,6 +1198,9 @@ class InteractiveFitSession:
             if mark_incorporated is not None:
                 mark_incorporated(records)
             with self._condition:
+                # Incorporation warnings are advisory (the inputs were taken):
+                # they ride the status warnings the panel already displays.
+                self._warnings.extend(incorporation_warnings or ())
                 if self._state is SessionState.Running:
                     self._phase = "Optimizing"
             command.complete(incorporated=len(records))

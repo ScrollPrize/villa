@@ -909,6 +909,43 @@ class ProtocolTests(unittest.TestCase):
                          ["configure", "incorporate"])
         self.assertEqual(session._run_config["loss_weight_patch_radius"], 4.0)
 
+    def test_incorporation_warnings_reach_the_session_status(self):
+        # The context takes the inputs but reports what it could not honour;
+        # those warnings ride the status the panel already displays.
+        session = self._idle_session(completed=10)
+        session._warnings = []
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        session._context = SimpleNamespace(
+            incorporate_interactive_inputs=lambda *args, **kwargs: [
+                "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
+        command = IncorporateCommand(
+            records=[{"id": "fiber-a", "kind": "fiber"}],
+            influence_config=None,
+            mark_incorporated=None)
+
+        session._run_incorporation(command)
+
+        self.assertEqual(session._warnings, [
+            "2 cross-fiber link(s) on 1 added fiber(s) are not used by this session"])
+
+    def test_incorporation_without_warnings_leaves_the_status_clean(self):
+        session = self._idle_session(completed=10)
+        session._warnings = []
+        session._progress_reporter = lambda: NullProgressReporter()
+        session._publish_status = lambda: None
+        # A context predating the warning return value must not break the path.
+        session._context = SimpleNamespace(
+            incorporate_interactive_inputs=lambda *args, **kwargs: None)
+        command = IncorporateCommand(
+            records=[{"id": "patch-a", "kind": "patch"}],
+            influence_config=None,
+            mark_incorporated=None)
+
+        session._run_incorporation(command)
+
+        self.assertEqual(session._warnings, [])
+
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
