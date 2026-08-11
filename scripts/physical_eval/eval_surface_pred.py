@@ -83,6 +83,21 @@ SIDE_STEP = 2.0        # sampling offset along the sheet normal, voxels
 SIDE_COH_MIN = 0.3     # structure-tensor coherence floor
 
 
+def _dist(band):
+    """Distance to the nearest set voxel, infinite if the band is empty.
+
+    A slice is scored on its truth alone, so a prediction that is empty or
+    nearly so has to stay in its own denominator and score zero rather than
+    drop the slice. scipy's transform does not give that for free: with no
+    set voxel it treats outside-the-array as background and returns 1.0 at
+    the border, which would read as a hit. Raised by TAUIL-Abd-Elilah on
+    the villa PR.
+    """
+    if not band.any():
+        return np.full(band.shape, np.inf)
+    return ndi.distance_transform_edt(~band)
+
+
 def normal_field(g):
     """Per-pixel sheet normal from the 2D structure tensor."""
     gy, gx = ndi.sobel(g, 0), ndi.sobel(g, 1)
@@ -163,14 +178,14 @@ def side_stats(acc, tb, pb, pbs, recto_k, ys, xs, cd):
     inner = near[coh]                         # real-near subset of it
     yn, xn = ya[inner], xa[inner]
     nyn, nxn = ny[inner], nx[inner]
-    dpred = ndi.distance_transform_edt(~pb)
+    dpred = _dist(pb)
     i, o = _inward_counts(dpred, yn, xn, nyn, nxn)
     acc["side_in"] += i
     acc["side_out"] += o
     for band, key in ((pbs, "null"), (recto_k, "ideal")):
         if not band.any():
             continue
-        d = ndi.distance_transform_edt(~band)
+        d = _dist(band)
         sel = d[yn, xn] <= 3                  # conditioned, as the report
         if sel.sum() > 100:
             i, o = _inward_counts(d, yn[sel], xn[sel], nyn[sel], nxn[sel])
@@ -215,9 +230,9 @@ def main(labels_path, pred_path, pred_level):
             tb = material[k]
             pb = pred[k] & valid[k]
             ctr = (lab[k] & 4) > 0
-            if ctr.sum() < 500 or pb.sum() < 100:
+            if ctr.sum() < 500:
                 continue
-            dpred = ndi.distance_transform_edt(~pb)
+            dpred = _dist(pb)
             ys, xs = np.nonzero(ctr)
             cd = dpred[ys, xs]
             acc["n_ctr"] += len(ys)
@@ -225,7 +240,7 @@ def main(labels_path, pred_path, pred_level):
                 acc["hits"][r] += int((cd <= r).sum())
             pbs = np.zeros_like(pb)
             pbs[NULL_SHIFT:] = pb[:-NULL_SHIFT]
-            dnull = ndi.distance_transform_edt(~pbs)
+            dnull = _dist(pbs)
             nd = dnull[ys, xs]
             acc["null2"] += int((nd <= 2).sum())
             lab2, _ = ndi.label(ctr, structure=np.ones((3, 3), int))
