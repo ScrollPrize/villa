@@ -70,6 +70,7 @@ private:
     void applyScrollSpec(const QJsonObject& spec);
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
+    QString pendingRebuildStage() const;
     void refreshReloadRequired();
     void persist() const;
     void restore();
@@ -177,6 +178,9 @@ private:
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
     QSet<QString> _runMutablePaths;
+    // schema.model_stage_keys: the settings a rebuild can apply without
+    // reloading the session's inputs.
+    QSet<QString> _modelStageKeys;
     qint64 _advancedSessionGeneration = -1;
 
     QString _currentProfileId;

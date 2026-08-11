@@ -459,6 +459,11 @@ class Config:
                 # change implies a rebuild, which is the client's default for
                 # a path it finds no entry for.
                 "paths": {},
+                # The keys a rebuild can apply without reloading the session's
+                # inputs, advertised so a client can say in advance which kind
+                # of rebuild its pending changes would cause. Authoritative
+                # answers still come from the service (see rebuild_stage).
+                "model_stage_keys": sorted(MODEL_STAGE_KEYS),
                 "fields": fields,
             },
             "presets": presets,

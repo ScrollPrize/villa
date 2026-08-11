@@ -9,6 +9,7 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
+import gc
 import json
 import glob
 from collections.abc import Mapping
@@ -1934,9 +1935,17 @@ class FitContext:
         # Track training inputs
         # ==========================================================================
 
-        self.prepared_main_tracks = None
-        self.preview_extent_tracks = self.tracks
-        if self.using_tracks:
+        # A resident session drops the per-track input arrays once the tables
+        # exist (release_setup_only_tracks), so on a model-stage rebuild there
+        # is nothing left to prepare them from. Nothing is lost: the tables are
+        # a function of the host tracks and of track_* settings, and no track
+        # setting is on MODEL_STAGE_KEYS, so the tables already in hand are
+        # exactly what preparing them again would produce.
+        retained_tracks = self.using_tracks and self.tracks is None
+        if not retained_tracks:
+            self.prepared_main_tracks = None
+            self.preview_extent_tracks = self.tracks
+        if self.using_tracks and not retained_tracks:
             progress.begin(
                 'loading', 'Preparing tracks for optimization',
                 detail=f'{len(self.tracks):,} tracks')
@@ -2012,6 +2021,54 @@ class FitContext:
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
         self.interactive_dt_resume_iteration = None
+
+    # What _build_model_state() constructs, and therefore what
+    # rebuild_model_state() releases before running it again. Written out
+    # rather than derived, so device state added to the model stage without a
+    # decision about its release is a visible omission instead of a leak.
+    # prepared_main_tracks/preview_extent_tracks are deliberately absent: see
+    # the retained_tracks note in _build_model_state.
+    _MODEL_STAGE_ATTRIBUTES = (
+        'num_slices_for_visualisation', 'device', 'umbilicus_zyx',
+        'start_iteration', 'model_z_begin', 'model_z_end',
+        'flow_field_radius', 'flow_min_corner_spiral_zyx',
+        'flow_max_corner_spiral_zyx', 'num_training_steps',
+        '_initial_num_training_steps', 'spiral_and_transform', 'shell_map',
+        'shell_valid_zyxs_gpu', 'shell_outer_winding_idx',
+        '_dense_inactive_warned', 'low_res_flow_params',
+        'high_res_flow_params', 'gap_expander_params', 'optimiser',
+        'influence_state', 'interactive_influence_loss_weight',
+        'interactive_influence_anchor_samples', 'lr_scheduler', 'profiler',
+        'slice_to_spiral_transform', 'dr_per_winding',
+        'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
+        'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
+        'interactive_dt_resume_iteration',
+    )
+
+    def rebuild_model_state(self):
+        """Replace the model stage, keeping the host inputs and the stores.
+
+        The cheap rebuild: a configuration change confined to
+        config.MODEL_STAGE_KEYS reaches nothing load_host_inputs() or
+        _build_store_state() produced, so this releases exactly what
+        _build_model_state() owns and runs it again, against a model built
+        from the current configuration and resumed from the current
+        resume_path — the same session a full rebuild would have produced,
+        without re-reading the dataset or re-materialising the brick pools.
+
+        Fitter-thread only: the CUDA tensors released here are freed by the
+        thread that owns them, as every other release in this class is.
+        """
+        if getattr(self, 'profiler', None) is not None:
+            self.profiler.stop()
+        for name in self._MODEL_STAGE_ATTRIBUTES:
+            setattr(self, name, None)
+        # The optimiser state and the flow-field lattices are the session's
+        # largest allocations; hand the arena back before asking for their
+        # replacements rather than peaking at twice the model.
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._build_model_state()
 
     # ==========================================================================
     # Checkpoint save/load

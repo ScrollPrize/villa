@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+import copy
 import dataclasses
 import errno
 import json
@@ -68,7 +69,7 @@ from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          parse_session_request, resolve_dataset_root,
                          select_startup_autosave, validate_autosave,
                          validate_session_request)
-from config import Config
+from config import Config, rebuild_stage
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from service_artifacts import ArtifactRegistry
@@ -855,13 +856,18 @@ class ServiceState:
                          daemon=True).start()
 
     def rebuild(self, request):
-        """Tear the resident session down and build a fresh one.
+        """Rebuild the resident session, from the model stage or from nothing.
 
         This is the only verb that may replace the model domain or the
         structural configuration: teardown is visible as ``Loading`` instead
         of hidden inside a load. ``{"defaults": true}`` rebuilds from the
         launch defaults and ignores every autosave, which is how a service
         stuck in ``Error`` recovers.
+
+        A request that changes nothing but model configuration keeps the
+        loaded host inputs and the brick pools and replaces the model stage
+        alone (see ``_rebuild_stage_locked``); everything else is the full
+        teardown and reconstruction it has always been.
         """
         request = dict(request or {})
         request.pop("command_id", None)
@@ -889,8 +895,89 @@ class ServiceState:
                     HTTPStatus.CONFLICT,
                     f"A rebuild requires an idle or failed session (state is "
                     f"{SessionState(state).name})")
-        self._begin_build(paths, run, preview, scroll)
-        return {**self.status(), "accepted": True, "rebuilding": True}
+            stage = ("all" if defaults
+                     else self._rebuild_stage_locked(paths, run, preview, state))
+        if stage == "model":
+            self._begin_model_rebuild(paths, run, preview)
+        else:
+            self._begin_build(paths, run, preview, scroll)
+        return {**self.status(), "accepted": True, "rebuilding": True,
+                "stage": stage}
+
+    def _rebuild_stage_locked(self, paths, run, preview, state):
+        """How much of the resident session this request has to replace.
+
+        Everything outside ``run.config`` is ``all``. Paths name host inputs
+        whose contents another process may have changed, so retaining a stage
+        across one would need a content fingerprint nothing computes; the
+        preview block, the run tag, the z window and the storage backend are
+        read before or outside the model. Within ``run.config`` the answer is
+        ``config.rebuild_stage`` over the keys whose requested value differs
+        from the live session's, which is "model" only for the audited
+        allowlist and "all" for everything else.
+
+        Call with the lock held.
+        """
+        current = self.session_request
+        if (self.session is None or current is None
+                or state != SessionState.Idle):
+            # Nothing to keep: there is no resident session, or it has no
+            # model to rebuild around (Error), or it is not quiescent.
+            return "all"
+        if (paths.manifest() != current.get("paths")
+                or preview.manifest() != current.get("preview")):
+            return "all"
+        live_run = dict(current.get("run") or {})
+        new_run = run.manifest()
+        live_config = dict(live_run.pop("config", None) or {})
+        new_config = dict(new_run.pop("config", None) or {})
+        if live_run != new_run:
+            return "all"
+        changed = {
+            key for key in set(live_config) | set(new_config)
+            if live_config.get(key) != new_config.get(key)
+        }
+        return rebuild_stage(changed)
+
+    def _begin_model_rebuild(self, paths, run, preview):
+        """Publish the new request and rebuild the model off the HTTP thread.
+
+        The session object, its generation and its whole session scope
+        survive: the host inputs the ephemeral uploads were incorporated into
+        are retained, so neither the ephemeral ledger nor the uploaded files
+        behind it are reset here, and the session reports its own ``Loading``
+        while the fitter thread works.
+        """
+        with self.lock:
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
+            self._building = True
+            self.session_paths = paths
+            self.session_request = {
+                "paths": paths.manifest(),
+                "run": run.manifest(),
+                "preview": preview.manifest(),
+            }
+            self.session_revision += 1
+            self.status_generation += 1
+            session_id = self.session_id
+            session = self.session
+        threading.Thread(
+            target=self._rebuild_model,
+            args=(session_id, session, paths, run),
+            name="spiral-model-rebuild", daemon=True).start()
+
+    def _rebuild_model(self, session_id, session, paths, run):
+        """Ask the resident session to replace its model stage."""
+        try:
+            session.rebuild_model(paths, run)
+        except BaseException as exc:
+            self._fail_session(session_id, _cause(exc))
+            return
+        with self.lock:
+            self._building = False
+            self.status_generation += 1
 
     def _begin_build(self, paths, run, preview, scroll):
         """Publish ``Loading`` and construct the runtime off the HTTP thread."""

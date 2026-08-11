@@ -806,9 +806,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::configurationCatalogChanged,
             this, [this](const QJsonObject& catalog) {
                 _runMutablePaths.clear();
+                const QJsonObject schema =
+                    catalog.value(QStringLiteral("schema")).toObject();
+                _modelStageKeys.clear();
+                for (const QJsonValue& key :
+                         schema.value(QStringLiteral("model_stage_keys")).toArray())
+                    _modelStageKeys.insert(key.toString());
                 const QJsonObject paths =
-                    catalog.value(QStringLiteral("schema")).toObject()
-                        .value(QStringLiteral("paths")).toObject();
+                    schema.value(QStringLiteral("paths")).toObject();
                 for (auto it = paths.begin(); it != paths.end(); ++it) {
                     const QString impact =
                         it.value().toObject()
@@ -925,7 +930,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         guardSessionExit([this]() {
-            if (_uncommittedCount > 0
+            // A model-stage rebuild keeps the loaded host inputs, and with
+            // them everything already incorporated into the fit, so there is
+            // nothing to warn about; only a full rebuild discards them.
+            if (_uncommittedCount > 0 && pendingRebuildStage() != QStringLiteral("model")
                 && QMessageBox::question(
                        this, tr("Uncommitted inputs"),
                        tr("The current session has %1 added input(s) that were not committed "
@@ -1920,6 +1928,17 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             : tr("Pending inputs join the fit on the next run"));
     else
         _commitHint->clear();
+}
+
+QString SpiralPanel::pendingRebuildStage() const
+{
+    // Advisory only: the service derives the stage itself from the request it
+    // receives. Without a loaded session to compare against there is nothing
+    // to keep, so the answer is the whole build.
+    if (!_hasSession || _loadedSessionRequest.isEmpty())
+        return QStringLiteral("all");
+    return vc3d::spiralRebuildStage(sessionRequest(), _loadedSessionRequest,
+                                    _modelStageKeys);
 }
 
 QJsonObject SpiralPanel::normalizedReloadRequest(QJsonObject request) const

@@ -89,6 +89,7 @@ class FakeSession:
         self.load_refusal = None
         self.closed = False
         self.path_change_calls = []
+        self.model_rebuilds = []
         self.progress = None
 
     def status(self):
@@ -137,6 +138,10 @@ class FakeSession:
         self.previews += 1
         return {"preview_generation": self.previews,
                 "preview_manifest_path": f"/preview/{self.previews}"}
+
+    def rebuild_model(self, paths, run, timeout=1800.0):
+        self.model_rebuilds.append((paths, run))
+        return {"config_revision": 1, "current_iteration": 0}
 
     def close(self):
         self.closed = True
@@ -922,6 +927,87 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.rebuild({"paths": {"checkpoint": "/attacker/model.ckpt"},
                                 "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
+
+    def _attach_session_for_request(self, config=None):
+        """Attach a fake session whose canonical request the service produced."""
+        session = _attach_fake_session(self.state, self.output, self.root)
+        request = {"run": {"z_begin": 0, "z_end": 10,
+                           "config": {**_NO_DENSE_LOSSES, **(config or {})}}}
+        paths, run, preview, _ = self.state._prepare_session_request(request)
+        self.state.session_paths = paths
+        self.state.session_request = {
+            "paths": paths.manifest(), "run": run.manifest(),
+            "preview": preview.manifest()}
+        return session
+
+    def _stage_for(self, request):
+        paths, run, preview, _ = self.state._prepare_session_request(request)
+        with self.state.lock:
+            return self.state._rebuild_stage_locked(
+                paths, run, preview, SessionState.Idle)
+
+    def _base_request(self, config=None, **run):
+        return {"run": {"z_begin": 0, "z_end": 10,
+                        "config": {**_NO_DENSE_LOSSES, **(config or {})},
+                        **run}}
+
+    def test_only_allowlisted_configuration_keeps_the_loaded_inputs(self):
+        self._attach_session_for_request()
+        self.assertEqual(self._stage_for(self._base_request()), "model")
+        self.assertEqual(
+            self._stage_for(self._base_request(
+                {"model_num_flow_integration_steps": 5})),
+            "model")
+        # An unaudited key alongside an allowlisted one is still the whole
+        # build, and so is anything outside run.config.
+        self.assertEqual(
+            self._stage_for(self._base_request({
+                "model_num_flow_integration_steps": 5,
+                "optimizer_random_seed": 7})),
+            "all")
+        self.assertEqual(
+            self._stage_for(self._base_request({"loss_weight_patch_radius": 1.0})),
+            "all")
+        self.assertEqual(
+            self._stage_for(self._base_request(run_tag="second")), "all")
+        self.assertEqual(
+            self._stage_for({"run": {"z_begin": 0, "z_end": 20,
+                                     "config": dict(_NO_DENSE_LOSSES)}}),
+            "all")
+
+    def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
+        self._attach_session_for_request()
+        paths, run, preview, _ = self.state._prepare_session_request(
+            self._base_request({"model_num_flow_integration_steps": 5}))
+        with self.state.lock:
+            self.assertEqual(
+                self.state._rebuild_stage_locked(
+                    paths, run, preview, SessionState.Error),
+                "all")
+
+    def test_a_model_stage_rebuild_keeps_the_session_and_its_inputs(self):
+        session = self._attach_session_for_request()
+        generation = self.state.session_generation
+        response = self.state.rebuild(
+            self._base_request({"model_num_flow_integration_steps": 5}))
+        self.assertEqual(response["stage"], "model")
+        deadline = time.monotonic() + 5.0
+        while self.state._building and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.state._building)
+        # The same session object, not a replacement: its host inputs, and
+        # everything incorporated into them, are still resident.
+        self.assertIs(self.state.session, session)
+        self.assertFalse(session.closed)
+        self.assertEqual(self.state.session_generation, generation)
+        self.assertEqual(len(session.model_rebuilds), 1)
+        rebuilt_paths, rebuilt_run = session.model_rebuilds[0]
+        self.assertEqual(rebuilt_run.config["model_num_flow_integration_steps"], 5)
+        self.assertEqual(rebuilt_paths.manifest(),
+                         self.state.session_request["paths"])
+        self.assertEqual(
+            self.state.session_request["run"]["config"]
+            ["model_num_flow_integration_steps"], 5)
 
     def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
         request = self.state._dataset_session_request({
