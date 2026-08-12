@@ -842,7 +842,7 @@
              <number>512</number>
             </property>
             <property name="value">
-             <number>0</number>
+             <number>2</number>
             </property>
             <property name="suffix">
              <string> GB</string>

@@ -289,7 +289,7 @@ namespace viewer_cache {
     // Per-workspace budget for the overlay volume's surface-space cache. 0
     // leaves the overlay channel on its legacy resident-only sampling path.
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
-    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
     // LRU cap for the private decoded-chunk pool behind a workspace's plane panes.
     // A floor rather than a ceiling: it is raised automatically when it cannot

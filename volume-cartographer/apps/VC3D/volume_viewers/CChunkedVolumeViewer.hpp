@@ -517,9 +517,6 @@ private:
     std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
-    // Tile fills finish in bursts. Only one UI callback/render needs to
-    // represent all tiles that became resident during a short debounce window.
-    std::atomic_bool _surfaceTileRenderQueued{false};
     // Last frame fell outside the stored band and used the legacy path, so the
     // status bar can make that performance cliff legible.
     bool _surfaceCacheOutOfBand = false;

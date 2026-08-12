@@ -1096,7 +1096,6 @@ void CChunkedVolumeViewer::dropOverlaySurfaceCache()
     _overlaySurfaceCache->shutdown();
     _overlaySurfaceCache.reset();
     _overlaySurfaceCacheVolume = nullptr;
-    _surfaceTileRenderQueued.store(false, std::memory_order_release);
     ++_surfaceCacheEpoch;
 }
 
@@ -1116,7 +1115,6 @@ void CChunkedVolumeViewer::dropSurfaceCaches()
     _surfaceCacheSurface = nullptr;
     _surfaceCacheGeometryEpoch = 0;
     _surfaceCacheOutOfBand = false;
-    _surfaceTileRenderQueued.store(false, std::memory_order_release);
     ++_surfaceCacheEpoch;
 }
 
@@ -1178,30 +1176,34 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         ++_surfaceCacheEpoch;
         QPointer<CChunkedVolumeViewer> guard(this);
         std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _surfaceCache;
-        _surfaceTileCbId = _surfaceCache->addTileReadyListener([guard, cacheWeak]() {
-            QMetaObject::invokeMethod(qApp, [guard, cacheWeak]() {
-                const auto source = cacheWeak.lock();
-                if (!guard || !source || guard->_surfaceCache != source ||
-                    guard->_surfaceTileRenderQueued.exchange(
-                        true, std::memory_order_acq_rel)) {
+        auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+        _surfaceTileCbId = _surfaceCache->addTileReadyListener(
+            [guard, cacheWeak, notificationQueued]() {
+                // notifyTileReady() runs on fill workers. Gate here so a large tile
+                // publish burst posts only one event to Qt's UI queue.
+                if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                     return;
-                }
-                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
-                                   [guard, cacheWeak]() {
+                QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
                     const auto source = cacheWeak.lock();
-                    if (!guard || !source || guard->_surfaceCache != source)
+                    if (!guard || !source || guard->_surfaceCache != source) {
+                        notificationQueued->store(false, std::memory_order_release);
                         return;
-                    guard->_surfaceTileRenderQueued.store(false,
-                                                          std::memory_order_release);
-                    if (guard->_closing)
-                        return;
-                    // One epoch represents the whole burst. The render reads
-                    // every tile resident at the time it starts.
-                    ++guard->_chunkContentEpoch;
-                    guard->submitRender("surface tile batch ready");
-                });
-            }, Qt::QueuedConnection);
-        });
+                    }
+                    QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                       [guard, cacheWeak, notificationQueued]() {
+                        notificationQueued->store(false, std::memory_order_release);
+                        const auto source = cacheWeak.lock();
+                        if (!guard || !source || guard->_surfaceCache != source)
+                            return;
+                        if (guard->_closing)
+                            return;
+                        // One epoch represents the whole burst. The render reads
+                        // every tile resident at the time it starts.
+                        ++guard->_chunkContentEpoch;
+                        guard->submitRender("surface tile batch ready");
+                    });
+                }, Qt::QueuedConnection);
+            });
     }
 
     // Overlay channel: its own instance with its own budget over the overlay
@@ -1246,28 +1248,31 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
 
     QPointer<CChunkedVolumeViewer> guard(this);
     std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _overlaySurfaceCache;
-    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener([guard, cacheWeak]() {
-        QMetaObject::invokeMethod(qApp, [guard, cacheWeak]() {
-            const auto source = cacheWeak.lock();
-            if (!guard || !source || guard->_overlaySurfaceCache != source ||
-                guard->_surfaceTileRenderQueued.exchange(
-                    true, std::memory_order_acq_rel)) {
+    auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener(
+        [guard, cacheWeak, notificationQueued]() {
+            // Keep overlay tile bursts bounded to one queued UI notification too.
+            if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                 return;
-            }
-            QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
-                               [guard, cacheWeak]() {
+            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
                 const auto source = cacheWeak.lock();
-                if (!guard || !source || guard->_overlaySurfaceCache != source)
+                if (!guard || !source || guard->_overlaySurfaceCache != source) {
+                    notificationQueued->store(false, std::memory_order_release);
                     return;
-                guard->_surfaceTileRenderQueued.store(false,
-                                                      std::memory_order_release);
-                if (guard->_closing)
-                    return;
-                ++guard->_chunkContentEpoch;
-                guard->submitRender("surface tile batch ready");
-            });
-        }, Qt::QueuedConnection);
-    });
+                }
+                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                   [guard, cacheWeak, notificationQueued]() {
+                    notificationQueued->store(false, std::memory_order_release);
+                    const auto source = cacheWeak.lock();
+                    if (!guard || !source || guard->_overlaySurfaceCache != source)
+                        return;
+                    if (guard->_closing)
+                        return;
+                    ++guard->_chunkContentEpoch;
+                    guard->submitRender("surface tile batch ready");
+                });
+            }, Qt::QueuedConnection);
+        });
 }
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
