@@ -56,7 +56,7 @@ def flat_z_window_bbox(
     do_augmentations: bool,
     is_validation: bool,
 ) -> tuple[tuple[int, int, int, int, int, int], int]:
-    """Select the canonical or randomly shifted real-layer flat Z window."""
+    """Select the centered or randomly shifted real-layer flat Z window."""
     z0, y0, x0, z1, y1, x1 = bbox_zyx
     jitter = config.jitter
     base_depth = z1 - z0

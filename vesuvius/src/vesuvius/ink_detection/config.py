@@ -1275,7 +1275,7 @@ def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Frozen local training views derived from one canonical InkConfig."""
+    """Frozen local training views derived from one resolved InkConfig."""
 
     ink: InkConfig
     num_iterations: int
@@ -1417,6 +1417,6 @@ class TrainingConfig:
         return self.ink.data.mode == "full_3d_single_wrap"
 
     def to_mapping(self) -> dict[str, Any]:
-        """Return the canonical mapping persisted in training checkpoints."""
+        """Return the resolved training mapping persisted in checkpoints."""
 
         return self.ink.to_mapping()

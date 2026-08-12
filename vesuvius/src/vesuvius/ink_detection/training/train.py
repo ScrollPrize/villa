@@ -48,7 +48,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 @dataclass(frozen=True)
 class TrainingRequest:
-    """Resolved command inputs after checkpoint selection and canonicalization."""
+    """Command inputs after checkpoint selection and config resolution."""
 
     config: TrainingConfig
     checkpoint_path: Path | None

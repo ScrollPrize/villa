@@ -1,1 +1,1 @@
-"""Standalone ink-detection pipeline."""
+"""Ink-model training, flat and native inference, and label preparation."""

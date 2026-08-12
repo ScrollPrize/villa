@@ -1,6 +1,6 @@
 # Ink Detection
 
-This standalone package provides ink-model training, flat surface-volume
+This package provides ink-model training, flat surface-volume
 inference, native tifxyz-guided 3D inference, label conversion, and aligned
 21-slice input preparation.
 
