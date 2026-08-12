@@ -21,6 +21,8 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+
+#include <atomic>
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
@@ -96,14 +98,30 @@ std::optional<uint32_t> environment_seed()
     return cached;
 }
 
+} // anonymous namespace
+
+// Base seed for every RNG in this translation unit: the VC_GROWPATCH_RNG_SEED
+// environment value when set, otherwise drawn once per process so a trace can
+// record the seed that produced it (issue #1317). Thread RNGs derive from it
+// by thread ordinal, so with a single thread the stream is fully determined by
+// this value.
+uint32_t growpatch_rng_base_seed()
+{
+    static const uint32_t seed = [] {
+        if (const auto env = environment_seed()) {
+            return *env;
+        }
+        return static_cast<uint32_t>(std::random_device{}());
+    }();
+    return seed;
+}
+
+namespace {
+
 std::mt19937& thread_rng()
 {
-    static thread_local std::mt19937 rng = [] {
-        if (const auto seed = environment_seed()) {
-            return std::mt19937(*seed);
-        }
-        return std::mt19937(std::random_device{}());
-    }();
+    static std::atomic<uint32_t> thread_ordinal{0};
+    static thread_local std::mt19937 rng(growpatch_rng_base_seed() + thread_ordinal.fetch_add(1));
     return rng;
 }
 
