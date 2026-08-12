@@ -55,6 +55,60 @@ private slots:
             vc3d::normalizedSpiralReloadRequest(current, defaults, {})
             != vc3d::normalizedSpiralReloadRequest(loaded, defaults, {}));
     }
+
+    void OnlyAllowlistedConfigurationIsAModelStageRebuild()
+    {
+        const QSet<QString> modelStageKeys{"model_num_flow_stages"};
+        const QJsonObject loaded{
+            {"paths", QJsonObject{{"verified_patches", "/patches"}}},
+            {"run", QJsonObject{{"z_end", 900}, {"config", QJsonObject{
+                {"model_num_flow_stages", 1},
+                {"loss_weight_patch_radius", 8.0},
+            }}}},
+        };
+        // Identical requests, and requests differing only in an allowlisted
+        // key, keep the loaded inputs.
+        QCOMPARE(vc3d::spiralRebuildStage(loaded, loaded, modelStageKeys),
+                 QStringLiteral("model"));
+        auto withConfig = [&](const QString& key, const QJsonValue& value) {
+            QJsonObject request = loaded;
+            QJsonObject run = request["run"].toObject();
+            QJsonObject config = run["config"].toObject();
+            config[key] = value;
+            run["config"] = config;
+            request["run"] = run;
+            return request;
+        };
+        QCOMPARE(vc3d::spiralRebuildStage(
+                     withConfig("model_num_flow_stages", 3), loaded,
+                     modelStageKeys),
+                 QStringLiteral("model"));
+        // An unaudited key, a path, or anything else in the run block is the
+        // whole build.
+        QCOMPARE(vc3d::spiralRebuildStage(
+                     withConfig("loss_weight_patch_radius", 1.0), loaded,
+                     modelStageKeys),
+                 QStringLiteral("all"));
+        QJsonObject otherRun = loaded;
+        otherRun["run"] = QJsonObject{
+            {"z_end", 1800}, {"config", loaded["run"].toObject()["config"]}};
+        QCOMPARE(vc3d::spiralRebuildStage(otherRun, loaded, modelStageKeys),
+                 QStringLiteral("all"));
+        QJsonObject otherPaths = loaded;
+        otherPaths["paths"] = QJsonObject{{"verified_patches", "/elsewhere"}};
+        QCOMPARE(vc3d::spiralRebuildStage(otherPaths, loaded, modelStageKeys),
+                 QStringLiteral("all"));
+        // A key present on one side only counts as changed, exactly as the
+        // service's own diff over the requests counts it.
+        QJsonObject dropped = loaded;
+        QJsonObject droppedRun = dropped["run"].toObject();
+        QJsonObject droppedConfig = droppedRun["config"].toObject();
+        droppedConfig.remove("loss_weight_patch_radius");
+        droppedRun["config"] = droppedConfig;
+        dropped["run"] = droppedRun;
+        QCOMPARE(vc3d::spiralRebuildStage(dropped, loaded, modelStageKeys),
+                 QStringLiteral("all"));
+    }
 };
 
 QTEST_APPLESS_MAIN(SpiralReloadComparisonTest)

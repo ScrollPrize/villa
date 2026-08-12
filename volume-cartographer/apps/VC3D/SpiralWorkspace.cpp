@@ -170,24 +170,17 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // available alongside the live fit-stage bar.
     _pythonOutput->setMaximumBlockCount(100000);
     pythonOutputLayout->addWidget(_pythonOutput);
+    // The service suppresses successful polling access lines at the source
+    // (SpiralHandler.log_request), so every relayed message is worth showing.
     connect(_service, &SpiralServiceManager::logMessage, _pythonOutput,
             [this](const QString& message) {
-                const QString line = message.trimmed();
-                const bool routineStatusPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /session/status HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                const bool routineLogPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /logs?after="))
-                    && line.contains(QStringLiteral(" HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                if (!routineStatusPoll && !routineLogPoll)
-                    _pythonOutput->appendOutput(message);
+                _pythonOutput->appendOutput(message);
             });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);
+        // The dialog stays where the user left it; the status bar carries the
+        // error and the panel's "Logs" button opens the detail on demand.
         _pythonOutput->appendOutput(tr("Error: %1").arg(error));
-        _pythonOutputDialog->show();
-        _pythonOutputDialog->raise();
     });
     connect(_service, &SpiralServiceManager::inputUploadFinished, this,
             [this](const QString& inputId, const QString& error) {
@@ -440,12 +433,17 @@ QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
 {
     const SpiralServiceProfile& profile = _service->profile();
     if (profile.isLocalhost()) return servicePath;
-    if (profile.serviceRootPrefix.isEmpty() || profile.localRootPrefix.isEmpty()
-        || !servicePath.startsWith(profile.serviceRootPrefix))
+    // The service side of the mapping is the dataset root the service
+    // advertises; the profile only names where this computer mounts it.
+    QString serviceRoot = _service->advertisedDataset()
+                              .value(QStringLiteral("root")).toString();
+    while (serviceRoot.endsWith(QLatin1Char('/'))) serviceRoot.chop(1);
+    if (serviceRoot.isEmpty() || profile.localRootPrefix.isEmpty()
+        || !servicePath.startsWith(serviceRoot))
         return {};
     // Translate separators as well as prefixes: a Windows viewer may map a
     // POSIX service root.
-    QString rest = servicePath.mid(profile.serviceRootPrefix.size());
+    QString rest = servicePath.mid(serviceRoot.size());
     rest.replace(QLatin1Char('\\'), QLatin1Char('/'));
     QString local = profile.localRootPrefix;
     while (local.endsWith(QLatin1Char('/')) || local.endsWith(QLatin1Char('\\'))) local.chop(1);
