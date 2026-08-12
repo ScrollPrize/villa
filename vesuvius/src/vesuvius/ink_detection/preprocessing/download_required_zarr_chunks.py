@@ -16,6 +16,10 @@ import vesuvius.tifxyz as tifxyz
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import compute_native_crop_bbox
+from vesuvius.ink_detection.data.patch_finding_default import (
+    labeled_patch_coverage,
+    surface_patch_bbox,
+)
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
@@ -613,35 +617,6 @@ def copy_chunks_to_output(
     }
 
 
-def _surface_patch_bbox(surface: int, y0: int, x0: int, patch_size) -> tuple[int, int, int, int, int, int]:
-    depth, height, width = (int(v) for v in patch_size)
-    z0 = int(surface - depth // 2)
-    return (
-        z0,
-        int(y0),
-        int(x0),
-        z0 + depth,
-        int(y0) + height,
-        int(x0) + width,
-    )
-
-
-def _labeled_patch_coverage(label_patch) -> float:
-    patch = np.asarray(label_patch)
-    if patch.size == 0:
-        return 0.0
-
-    labeled_ys, labeled_xs = np.nonzero(patch)
-    if labeled_ys.size == 0:
-        return 0.0
-
-    labeled_area = (
-        (int(labeled_ys.max()) - int(labeled_ys.min()) + 1)
-        * (int(labeled_xs.max()) - int(labeled_xs.min()) + 1)
-    )
-    return float(labeled_area) / float(patch.size)
-
-
 def _iter_segment_dirs(dataset_dir: Path) -> Iterable[Path]:
     for segment_dir in sorted(dataset_dir.iterdir()):
         if not segment_dir.is_dir() or segment_dir.name == "unused":
@@ -746,7 +721,7 @@ def _build_segment_download_patches(
 
     kept_patches: list[dict] = []
     for y0, x0 in candidates:
-        patch_bbox_zyx = _surface_patch_bbox(surface, y0, x0, patch_size)
+        patch_bbox_zyx = surface_patch_bbox(surface, y0, x0, patch_size)
         flat_x, flat_y, flat_z, flat_valid = patch_tifxyz[
             int(y0):int(y0) + patch_size[1],
             int(x0):int(x0) + patch_size[2],
@@ -797,7 +772,7 @@ def _build_segment_download_patches(
             int(y0):int(y0) + patch_size[1],
             int(x0):int(x0) + patch_size[2],
         ]
-        if _labeled_patch_coverage(label_patch) >= min_labeled_coverage:
+        if labeled_patch_coverage(label_patch) >= min_labeled_coverage:
             kept_patches.append(
                 {
                     "segment_relpath": str(segment.segment_relpath),
