@@ -19,6 +19,7 @@ every script or line of code ever commited. We are only interested in supporting
 - Any bugfix PR must be accompanied by a screenshot of the error (either terminal or within the tool), and the script/tool running without error afterward
 - Bugfixes or improvements must be run on real scroll data. Synthetic or toy examples are not accepted
 - PRs must contain a motivation section, detailing what it is you were attempting to do when this issue arose (ex: "i was attempting to use `vc_grow_seg_from_seed` in this volume to do some ink exploration when this error popped up")
+- Where applicable, images or videos must be provided comparing results against current methods (ie. ink detection, segmentation, etc)
 
 ## AI Guidelines
 We support the use of LLMs as coding assistants, and we make broad use of them ourselves. However, because reviewing PRs takes a significant amount of time away from the goal of unrolling the scrolls, we have a few rules regarding llm assisted PRs:
