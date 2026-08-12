@@ -1274,10 +1274,44 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         }
     }
     const auto& parameters = root.at("parameters");
+    const std::set<std::string> parameterKeys{
+        "cell_size_prediction_voxels",
+        "gaussian_sigma_prediction_voxels",
+        "peak_sigma_prediction_voxels",
+        "peak_axial_sigma_prediction_voxels",
+        "peak_grid_step_prediction_voxels",
+        "gaussian_cutoff_sigmas",
+        "local_window_radius_prediction_voxels",
+        "axial_support_half_width_prediction_voxels",
+        "position_convergence_tolerance_prediction_voxels",
+        "nms_maximum_angle_degrees",
+        "nms_longitudinal_radius_prediction_voxels",
+        "observation_presence_floor",
+        "minimum_aligned_support",
+        "merge_maximum_angle_degrees",
+        "merge_maximum_absolute_objective_loss",
+        "merge_maximum_relative_objective_loss",
+        "maximum_seed_count",
+        "maximum_iterations",
+        "convergence_tolerance",
+    };
+    if (!parameters.is_object())
+        throw std::runtime_error("fiber anchor parameters must be an object");
+    std::set<std::string> storedParameterKeys;
+    for (const auto& item : parameters.items())
+        storedParameterKeys.insert(item.key());
+    if (storedParameterKeys != parameterKeys)
+        throw std::runtime_error("fiber anchor parameters do not match the version-1 schema");
     auto& config = loaded.report.config;
     config.cellSizePredictionVoxels = parameters.at("cell_size_prediction_voxels").get<int>();
     config.gaussianSigmaPredictionVoxels =
         finiteNumber(parameters.at("gaussian_sigma_prediction_voxels"), "gaussian_sigma_prediction_voxels");
+    config.peakSigmaPredictionVoxels =
+        finiteNumber(parameters.at("peak_sigma_prediction_voxels"), "peak_sigma_prediction_voxels");
+    config.peakAxialSigmaPredictionVoxels =
+        finiteNumber(parameters.at("peak_axial_sigma_prediction_voxels"), "peak_axial_sigma_prediction_voxels");
+    config.peakGridStepPredictionVoxels =
+        finiteNumber(parameters.at("peak_grid_step_prediction_voxels"), "peak_grid_step_prediction_voxels");
     config.gaussianCutoffSigmas =
         finiteNumber(parameters.at("gaussian_cutoff_sigmas"), "gaussian_cutoff_sigmas");
     config.localWindowRadiusPredictionVoxels =
@@ -1458,6 +1492,27 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
                 if (position < -kEpsilon ||
                     position > static_cast<double>(loaded.report.grid.shapeZYX[gridAxis] - 1) + kEpsilon) {
                     throw std::runtime_error("fiber anchor position is outside the prediction grid");
+                }
+                const double cellBegin = static_cast<double>(
+                    cell.cellZYX[gridAxis] *
+                    static_cast<size_t>(config.cellSizePredictionVoxels));
+                const double cellEnd = static_cast<double>(std::min(
+                    (cell.cellZYX[gridAxis] + 1) *
+                        static_cast<size_t>(config.cellSizePredictionVoxels),
+                    loaded.report.grid.shapeZYX[gridAxis]));
+                const double ownerLower = cellBegin == 0.0
+                    ? 0.0
+                    : cellBegin - 0.5;
+                const double ownerUpper =
+                    cellEnd == static_cast<double>(loaded.report.grid.shapeZYX[gridAxis])
+                    ? cellEnd - 1.0
+                    : std::nextafter(
+                        cellEnd - 0.5,
+                        -std::numeric_limits<double>::infinity());
+                if (position < ownerLower - kEpsilon ||
+                    position > ownerUpper + kEpsilon) {
+                    throw std::runtime_error(
+                        "fiber anchor position is outside its owning cell");
                 }
             }
             if (planeResidual > 1.0e-6 ||

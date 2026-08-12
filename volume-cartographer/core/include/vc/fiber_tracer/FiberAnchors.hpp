@@ -27,6 +27,9 @@ struct FiberAnchorObservation {
 struct FiberAnchorConfig {
     int cellSizePredictionVoxels = 4;
     double gaussianSigmaPredictionVoxels = 2.0;
+    double peakSigmaPredictionVoxels = 1.5;
+    double peakAxialSigmaPredictionVoxels = 6.0;
+    double peakGridStepPredictionVoxels = 0.5;
     double gaussianCutoffSigmas = 3.0;
     double localWindowRadiusPredictionVoxels = 4.0;
     double axialSupportHalfWidthPredictionVoxels = 6.0;

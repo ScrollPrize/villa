@@ -80,6 +80,11 @@ struct RefinedFitState {
     size_t acceptedIterations = 0;
 };
 
+struct PeakOwnerBounds {
+    cv::Vec3d lower{0.0, 0.0, 0.0};
+    cv::Vec3d upper{0.0, 0.0, 0.0};
+};
+
 constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
 
 [[nodiscard]] bool finiteVector(const cv::Vec3d& value)
@@ -111,6 +116,41 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     if (axis[static_cast<int>(signAxis)] < 0.0)
         axis *= -1.0;
     return axis;
+}
+
+[[nodiscard]] std::array<cv::Vec3d, 2> transverseBasis(
+    const cv::Vec3d& axis)
+{
+    size_t referenceIndex = 0;
+    for (size_t index = 1; index < 3; ++index) {
+        if (std::abs(axis[static_cast<int>(index)]) <
+            std::abs(axis[static_cast<int>(referenceIndex)])) {
+            referenceIndex = index;
+        }
+    }
+    cv::Vec3d reference{0.0, 0.0, 0.0};
+    reference[static_cast<int>(referenceIndex)] = 1.0;
+    const cv::Vec3d first = normalized(
+        reference - axis * reference.dot(axis));
+    return {first, normalized(axis.cross(first))};
+}
+
+[[nodiscard]] bool insidePeakDomain(
+    const cv::Vec3d& point,
+    const cv::Vec3d& pivot,
+    const PeakOwnerBounds& owner,
+    double radius)
+{
+    const cv::Vec3d offset = point - pivot;
+    if (offset.dot(offset) > radius * radius + 1.0e-12)
+        return false;
+    for (int coordinate = 0; coordinate < 3; ++coordinate) {
+        if (point[coordinate] < owner.lower[coordinate] ||
+            point[coordinate] > owner.upper[coordinate]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 [[nodiscard]] cv::Matx33d weightedTensor(
@@ -525,6 +565,251 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     return state;
 }
 
+[[nodiscard]] PeakOwnerBounds peakOwnerBounds(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<size_t, 3>& cellBeginZYX,
+    const std::array<size_t, 3>& cellEndZYX)
+{
+    cv::Vec3d observedLower{
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::infinity(),
+    };
+    cv::Vec3d observedUpper{
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+    };
+    for (const auto& observation : observations) {
+        if (!finiteVector(observation.positionPredictionXYZ))
+            continue;
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            observedLower[coordinate] = std::min(
+                observedLower[coordinate],
+                observation.positionPredictionXYZ[coordinate]);
+            observedUpper[coordinate] = std::max(
+                observedUpper[coordinate],
+                observation.positionPredictionXYZ[coordinate]);
+        }
+    }
+
+    PeakOwnerBounds owner;
+    for (int coordinate = 0; coordinate < 3; ++coordinate) {
+        const size_t zyx = static_cast<size_t>(2 - coordinate);
+        const double begin = static_cast<double>(cellBeginZYX[zyx]);
+        const double end = static_cast<double>(cellEndZYX[zyx]);
+        owner.lower[coordinate] = std::max(observedLower[coordinate], begin - 0.5);
+        const double voronoiUpper = end - 0.5;
+        if (observedUpper[coordinate] <= end - 1.0) {
+            owner.upper[coordinate] = observedUpper[coordinate];
+        } else {
+            owner.upper[coordinate] = std::nextafter(
+                std::min(observedUpper[coordinate], voronoiUpper),
+                -std::numeric_limits<double>::infinity());
+        }
+    }
+    return owner;
+}
+
+[[nodiscard]] cv::Vec3d findDirectionConditionedLocalPeak(
+    const std::vector<FiberAnchorObservation>& observations,
+    const cv::Vec3d& pivot,
+    const PeakOwnerBounds& owner,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    size_t selectedComponent,
+    const FiberAnchorConfig& config)
+{
+    const cv::Vec3d axis = components[selectedComponent].axis;
+    const auto basis = transverseBasis(axis);
+    const double cutoff =
+        config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels;
+    const double axialCutoff =
+        config.gaussianCutoffSigmas *
+        config.peakAxialSigmaPredictionVoxels;
+    const double unionRadius = config.localWindowRadiusPredictionVoxels + cutoff;
+    const double invTwoTransverseSigma2 = 1.0 /
+        (2.0 * config.peakSigmaPredictionVoxels *
+         config.peakSigmaPredictionVoxels);
+    const double invTwoAxialSigma2 = 1.0 /
+        (2.0 * config.peakAxialSigmaPredictionVoxels *
+         config.peakAxialSigmaPredictionVoxels);
+
+    struct PeakObservation {
+        cv::Vec3d position{0.0, 0.0, 0.0};
+        double signal = 0.0;
+    };
+    std::vector<PeakObservation> peakObservations;
+    peakObservations.reserve(observations.size());
+    for (const auto& observation : observations) {
+        if (!finiteVector(observation.positionPredictionXYZ))
+            continue;
+        const cv::Vec3d pivotOffset =
+            observation.positionPredictionXYZ - pivot;
+        const double axial = pivotOffset.dot(axis);
+        if (std::abs(axial) > axialCutoff)
+            continue;
+        const cv::Vec3d transverse = pivotOffset - axis * axial;
+        if (transverse.dot(transverse) > unionRadius * unionRadius)
+            continue;
+
+        double signal = 0.0;
+        if (observation.valid && finiteVector(observation.direction) &&
+            std::isfinite(observation.presence) &&
+            observation.presence >= config.observationPresenceFloor &&
+            observation.presence >= 0.0 && observation.presence <= 1.0) {
+            const cv::Vec3d direction = normalized(observation.direction);
+            if (direction.dot(direction) > kMatrixEpsilon) {
+                size_t assignment = 0;
+                double bestAlignment = -1.0;
+                for (size_t component = 0; component < activeComponents;
+                     ++component) {
+                    const double dot = direction.dot(components[component].axis);
+                    const double alignment = dot * dot;
+                    if (alignment > bestAlignment) {
+                        bestAlignment = alignment;
+                        assignment = component;
+                    }
+                }
+                if (assignment == selectedComponent)
+                    signal = observation.presence * bestAlignment;
+            }
+        }
+        peakObservations.push_back({observation.positionPredictionXYZ, signal});
+    }
+
+    const auto responseAt = [&](const cv::Vec3d& candidate) {
+        CompensatedSum numerator;
+        CompensatedSum denominator;
+        for (const auto& observation : peakObservations) {
+            const cv::Vec3d offset = observation.position - candidate;
+            const double axial = offset.dot(axis);
+            if (std::abs(axial) > axialCutoff)
+                continue;
+            const cv::Vec3d transverse = offset - axis * axial;
+            const double distanceSquared = transverse.dot(transverse);
+            if (distanceSquared > cutoff * cutoff)
+                continue;
+            const double gaussian = std::exp(
+                -distanceSquared * invTwoTransverseSigma2 -
+                axial * axial * invTwoAxialSigma2);
+            denominator.add(gaussian);
+            numerator.add(gaussian * observation.signal);
+        }
+        return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+    };
+
+    using GridIndex = std::pair<int, int>;
+    const int extent = static_cast<int>(std::floor(
+        config.localWindowRadiusPredictionVoxels /
+        config.peakGridStepPredictionVoxels));
+    const auto pointAt = [&](const GridIndex& index) {
+        return pivot + basis[0] *
+                (static_cast<double>(index.first) *
+                 config.peakGridStepPredictionVoxels) +
+            basis[1] *
+                (static_cast<double>(index.second) *
+                 config.peakGridStepPredictionVoxels);
+    };
+    const auto feasible = [&](const GridIndex& index) {
+        return std::abs(index.first) <= extent &&
+            std::abs(index.second) <= extent &&
+            insidePeakDomain(
+                pointAt(index), pivot, owner,
+                config.localWindowRadiusPredictionVoxels);
+    };
+
+    std::map<GridIndex, double> responseCache;
+    const auto response = [&](const GridIndex& index) {
+        const auto found = responseCache.find(index);
+        if (found != responseCache.end())
+            return found->second;
+        return responseCache.emplace(index, responseAt(pointAt(index)))
+            .first->second;
+    };
+
+    GridIndex current{0, 0};
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    for (int first = -extent; first <= extent; ++first) {
+        for (int second = -extent; second <= extent; ++second) {
+            const GridIndex candidate{first, second};
+            if (!feasible(candidate))
+                continue;
+            const cv::Vec3d delta =
+                pointAt(candidate) - components[selectedComponent].position;
+            const double distance = delta.dot(delta);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                current = candidate;
+            }
+        }
+    }
+
+    constexpr std::array<GridIndex, 8> neighbors{{
+        {-1, -1}, {-1, 0}, {-1, 1}, {0, -1},
+        {0, 1}, {1, -1}, {1, 0}, {1, 1},
+    }};
+    while (true) {
+        GridIndex best = current;
+        double bestResponse = response(current);
+        for (const auto& offset : neighbors) {
+            const GridIndex candidate{
+                current.first + offset.first,
+                current.second + offset.second,
+            };
+            if (!feasible(candidate))
+                continue;
+            const double candidateResponse = response(candidate);
+            if (candidateResponse > bestResponse ||
+                (candidateResponse == bestResponse && candidate < best)) {
+                best = candidate;
+                bestResponse = candidateResponse;
+            }
+        }
+        const double tolerance = 1.0e-12 *
+            std::max(1.0, std::abs(response(current)));
+        if (bestResponse <= response(current) + tolerance)
+            break;
+        current = best;
+    }
+
+    const double centerResponse = response(current);
+    std::array<double, 2> offset{0.0, 0.0};
+    for (int dimension = 0; dimension < 2; ++dimension) {
+        GridIndex lower = current;
+        GridIndex upper = current;
+        (dimension == 0 ? lower.first : lower.second) -= 1;
+        (dimension == 0 ? upper.first : upper.second) += 1;
+        if (!feasible(lower) || !feasible(upper))
+            continue;
+        const double lowerResponse = response(lower);
+        const double upperResponse = response(upper);
+        const double curvature =
+            lowerResponse - 2.0 * centerResponse + upperResponse;
+        if (!(curvature < 0.0) || !std::isfinite(curvature))
+            continue;
+        const double gridOffset =
+            0.5 * (lowerResponse - upperResponse) / curvature;
+        if (std::isfinite(gridOffset)) {
+            offset[static_cast<size_t>(dimension)] = std::clamp(
+                gridOffset, -0.5, 0.5) *
+                config.peakGridStepPredictionVoxels;
+        }
+    }
+    const cv::Vec3d discrete = pointAt(current);
+    const cv::Vec3d fitted =
+        discrete + basis[0] * offset[0] + basis[1] * offset[1];
+    const double tolerance =
+        1.0e-12 * std::max(1.0, std::abs(centerResponse));
+    if (insidePeakDomain(
+            fitted, pivot, owner,
+            config.localWindowRadiusPredictionVoxels) &&
+        responseAt(fitted) + tolerance >= centerResponse) {
+        return fitted;
+    }
+    return discrete;
+}
+
 [[nodiscard]] bool betterState(const FitState& candidate, const FitState& current)
 {
     return candidate.objectiveNumerator > current.objectiveNumerator;
@@ -761,6 +1046,19 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !std::isfinite(config.gaussianSigmaPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor Gaussian sigma must be positive and finite");
     }
+    if (!(config.peakSigmaPredictionVoxels > 0.0) ||
+        !std::isfinite(config.peakSigmaPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor peak sigma must be positive and finite");
+    }
+    if (!(config.peakAxialSigmaPredictionVoxels > 0.0) ||
+        !std::isfinite(config.peakAxialSigmaPredictionVoxels)) {
+        throw std::invalid_argument(
+            "fiber anchor peak axial sigma must be positive and finite");
+    }
+    if (!(config.peakGridStepPredictionVoxels > 0.0) ||
+        !std::isfinite(config.peakGridStepPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor peak grid step must be positive and finite");
+    }
     if (!(config.gaussianCutoffSigmas > 0.0) ||
         !std::isfinite(config.gaussianCutoffSigmas)) {
         throw std::invalid_argument("fiber anchor Gaussian cutoff must be positive and finite");
@@ -768,6 +1066,12 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
     if (!(config.localWindowRadiusPredictionVoxels > 0.0) ||
         !std::isfinite(config.localWindowRadiusPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor local window must be positive and finite");
+    }
+    if (config.localWindowRadiusPredictionVoxels /
+            config.peakGridStepPredictionVoxels >
+        128.0) {
+        throw std::invalid_argument(
+            "fiber anchor peak grid radius must not exceed 128 steps");
     }
     if (!(config.axialSupportHalfWidthPredictionVoxels > 0.0) ||
         !std::isfinite(config.axialSupportHalfWidthPredictionVoxels)) {
@@ -1113,8 +1417,20 @@ FiberCellAnchorResult fitFiberCellAnchors(
     if (activeComponents == 0)
         return result;
 
-    const RefinedFitState refined = refineLocalComponents(
+    RefinedFitState refined = refineLocalComponents(
         input, center, seedAxes, activeComponents, config);
+    const PeakOwnerBounds owner = peakOwnerBounds(
+        input, cellBeginZYX, cellEndZYX);
+    const auto broadRefinedComponents = refined.components;
+    for (size_t componentIndex = 0; componentIndex < activeComponents;
+         ++componentIndex) {
+        refined.components[componentIndex].position =
+            findDirectionConditionedLocalPeak(
+                input, center, owner, broadRefinedComponents,
+                activeComponents, componentIndex, config);
+    }
+    refined.evaluation = evaluateRefinedState(
+        input, refined.components, activeComponents, center, config);
     result.objective = refined.evaluation.objective;
     for (size_t componentIndex = 0; componentIndex < activeComponents; ++componentIndex) {
         auto& component = result.components[componentIndex];
@@ -1267,12 +1583,21 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         }
         return result;
     };
-    const double maximumTransverseSupport =
+    const double broadTransverseSupport =
         config.localWindowRadiusPredictionVoxels +
         config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
-    const double maximumSupportRadius = std::hypot(
-        maximumTransverseSupport,
+    const double broadSupportRadius = std::hypot(
+        broadTransverseSupport,
         config.axialSupportHalfWidthPredictionVoxels);
+    const double peakTransverseSupport =
+        config.localWindowRadiusPredictionVoxels +
+        config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels;
+    const double peakSupportRadius = std::hypot(
+        peakTransverseSupport,
+        config.gaussianCutoffSigmas *
+            config.peakAxialSigmaPredictionVoxels);
+    const double maximumSupportRadius =
+        std::max(broadSupportRadius, peakSupportRadius);
     const size_t sampleHalo = static_cast<size_t>(std::ceil(maximumSupportRadius));
     const std::set<std::array<size_t, 3>> explicitCellSet(
         explicitCells.begin(), explicitCells.end());
@@ -1718,6 +2043,9 @@ nlohmann::json fiberAnchorReportJson(
         {"parameters", {
             {"cell_size_prediction_voxels", report.config.cellSizePredictionVoxels},
             {"gaussian_sigma_prediction_voxels", report.config.gaussianSigmaPredictionVoxels},
+            {"peak_sigma_prediction_voxels", report.config.peakSigmaPredictionVoxels},
+            {"peak_axial_sigma_prediction_voxels", report.config.peakAxialSigmaPredictionVoxels},
+            {"peak_grid_step_prediction_voxels", report.config.peakGridStepPredictionVoxels},
             {"gaussian_cutoff_sigmas", report.config.gaussianCutoffSigmas},
             {"local_window_radius_prediction_voxels", report.config.localWindowRadiusPredictionVoxels},
             {"axial_support_half_width_prediction_voxels", report.config.axialSupportHalfWidthPredictionVoxels},
@@ -1836,6 +2164,9 @@ nlohmann::json anchorDiagnosticParameters(const FiberAnchorConfig& config)
     return {
         {"cell_size_prediction_voxels", config.cellSizePredictionVoxels},
         {"gaussian_sigma_prediction_voxels", config.gaussianSigmaPredictionVoxels},
+        {"peak_sigma_prediction_voxels", config.peakSigmaPredictionVoxels},
+        {"peak_axial_sigma_prediction_voxels", config.peakAxialSigmaPredictionVoxels},
+        {"peak_grid_step_prediction_voxels", config.peakGridStepPredictionVoxels},
         {"gaussian_cutoff_sigmas", config.gaussianCutoffSigmas},
         {"local_window_radius_prediction_voxels", config.localWindowRadiusPredictionVoxels},
         {"axial_support_half_width_prediction_voxels", config.axialSupportHalfWidthPredictionVoxels},

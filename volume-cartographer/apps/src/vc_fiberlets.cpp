@@ -44,6 +44,9 @@ struct CliOptions {
     std::optional<vc::fiber_tracer::FiberAnchorCrop> baseCrop;
     std::optional<double> corridorRadiusBaseVoxels;
     std::optional<double> falloffSigmaBaseVoxels;
+    std::optional<double> peakSigmaBaseVoxels;
+    std::optional<double> peakAxialSigmaBaseVoxels;
+    std::optional<double> peakStepBaseVoxels;
     std::optional<double> localWindowBaseVoxels;
     std::optional<double> baseVoxelSizeUm;
     double glyphLengthBaseVoxels = 16.0;
@@ -83,6 +86,9 @@ void usage(const char* executable)
               << "Anchor options:\n"
               << "  --cell-size N                 prediction-grid cell side, 2..8 [4]\n"
               << "  --falloff N                   normal-plane sigma in base voxels [cell-side/2]\n"
+              << "  --peak-sigma N                transverse peak sigma in base voxels [1.5 prediction voxels]\n"
+              << "  --axial-sigma N               along-fiber peak sigma in base voxels [1.5 cell-sides]\n"
+              << "  --peak-step N                 local-peak grid step in base voxels [0.5 prediction voxels]\n"
               << "  --window N                    refinement/NMS radius in base voxels [cell-side]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
@@ -246,6 +252,15 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--falloff" && options.command != Command::Paths) {
             options.falloffSigmaBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "falloff"), "falloff");
+        } else if (argument == "--peak-sigma" && options.command != Command::Paths) {
+            options.peakSigmaBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "peak-sigma"), "peak-sigma");
+        } else if (argument == "--axial-sigma" && options.command != Command::Paths) {
+            options.peakAxialSigmaBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "axial-sigma"), "axial-sigma");
+        } else if (argument == "--peak-step" && options.command != Command::Paths) {
+            options.peakStepBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "peak-step"), "peak-step");
         } else if (argument == "--window" && options.command != Command::Paths) {
             options.localWindowBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "window"), "window");
@@ -317,6 +332,15 @@ CliOptions parseArgs(int argc, char** argv)
         if (options.falloffSigmaBaseVoxels.has_value() &&
             !(*options.falloffSigmaBaseVoxels > 0.0))
             fail("--falloff must be positive");
+        if (options.peakSigmaBaseVoxels.has_value() &&
+            !(*options.peakSigmaBaseVoxels > 0.0))
+            fail("--peak-sigma must be positive");
+        if (options.peakAxialSigmaBaseVoxels.has_value() &&
+            !(*options.peakAxialSigmaBaseVoxels > 0.0))
+            fail("--axial-sigma must be positive");
+        if (options.peakStepBaseVoxels.has_value() &&
+            !(*options.peakStepBaseVoxels > 0.0))
+            fail("--peak-step must be positive");
         if (options.localWindowBaseVoxels.has_value() &&
             !(*options.localWindowBaseVoxels > 0.0))
             fail("--window must be positive");
@@ -599,6 +623,18 @@ int main(int argc, char** argv)
                 options.anchors.gaussianSigmaPredictionVoxels =
                     options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
                     grid.predictionToBaseScale;
+                options.anchors.peakSigmaPredictionVoxels =
+                    options.peakSigmaBaseVoxels.value_or(
+                        1.5 * grid.predictionToBaseScale) /
+                    grid.predictionToBaseScale;
+                options.anchors.peakAxialSigmaPredictionVoxels =
+                    options.peakAxialSigmaBaseVoxels.value_or(
+                        1.5 * cellSideBase) /
+                    grid.predictionToBaseScale;
+                options.anchors.peakGridStepPredictionVoxels =
+                    options.peakStepBaseVoxels.value_or(
+                        0.5 * grid.predictionToBaseScale) /
+                    grid.predictionToBaseScale;
                 options.anchors.localWindowRadiusPredictionVoxels =
                     options.localWindowBaseVoxels.value_or(cellSideBase) /
                     grid.predictionToBaseScale;
@@ -739,6 +775,18 @@ int main(int argc, char** argv)
             options.anchors.gaussianSigmaPredictionVoxels =
                 options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
                 grid.predictionToBaseScale;
+            options.anchors.peakSigmaPredictionVoxels =
+                options.peakSigmaBaseVoxels.value_or(
+                    1.5 * grid.predictionToBaseScale) /
+                grid.predictionToBaseScale;
+            options.anchors.peakAxialSigmaPredictionVoxels =
+                options.peakAxialSigmaBaseVoxels.value_or(
+                    1.5 * cellSideBase) /
+                grid.predictionToBaseScale;
+            options.anchors.peakGridStepPredictionVoxels =
+                options.peakStepBaseVoxels.value_or(
+                    0.5 * grid.predictionToBaseScale) /
+                grid.predictionToBaseScale;
             options.anchors.localWindowRadiusPredictionVoxels =
                 options.localWindowBaseVoxels.value_or(cellSideBase) /
                 grid.predictionToBaseScale;
@@ -768,6 +816,9 @@ int main(int argc, char** argv)
             std::cout << "prediction_shape_zyx=" << grid.shapeZYX[0] << ',' << grid.shapeZYX[1] << ',' << grid.shapeZYX[2]
                       << " prediction_to_base=" << grid.predictionToBaseScale << " cell_side_base_voxels=" << cellSideBase
                       << " falloff_sigma_base_voxels=" << options.anchors.gaussianSigmaPredictionVoxels * grid.predictionToBaseScale
+                      << " peak_sigma_base_voxels=" << options.anchors.peakSigmaPredictionVoxels * grid.predictionToBaseScale
+                      << " axial_sigma_base_voxels=" << options.anchors.peakAxialSigmaPredictionVoxels * grid.predictionToBaseScale
+                      << " peak_step_base_voxels=" << options.anchors.peakGridStepPredictionVoxels * grid.predictionToBaseScale
                       << " local_window_base_voxels=" << options.anchors.localWindowRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells

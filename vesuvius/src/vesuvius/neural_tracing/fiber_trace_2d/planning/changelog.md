@@ -1,3 +1,22 @@
+# 2026-08-12: local-maximum fiberlet anchors
+
+- Added deterministic direction-conditioned normal-plane peak search after the
+  existing non-orthogonal anchor direction fit.
+- Integrated the peak response with a `1.5`-voxel transverse Gaussian and a
+  longer `1.5`-cell-side along-direction Gaussian, with complete rotated-kernel
+  halo sizing.
+- Added bounded non-decreasing subvoxel peak fitting, continuous owner-cell
+  constraints, normalized edge response, strict transverse/axial peak fields,
+  and base-voxel CLI controls.
+
+# 2026-08-12: faster replay viewer startup
+
+- Kept detailed anchor-stage layers enabled by default so replay diagnostics are
+  immediately available; `--no-anchor-stages` provides an explicit fast-start
+  opt-out and avoids hashing unused stage artifacts.
+- Preserved strict stage schemas and selected-stage topology across artifact
+  reloads.
+
 # 2026-08-11: dense-fiber failure replay
 
 - Added C++ greedy native replay against dense VC3D fiber geometry with bounded

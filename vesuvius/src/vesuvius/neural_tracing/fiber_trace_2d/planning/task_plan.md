@@ -1,67 +1,68 @@
-# Plan: reload replay artifacts in napari
+# Plan: integrate broader peak evidence for fiber anchors
 
-## Reload contract
+## Kernel and sampling
 
-1. Add a replay-only `Reload artifacts` command to the existing dock. It rereads
-   the original root `fiber_replay.json`, following its newly published
-   content-addressed generation, and runs the same strict bundle/artifact
-   loaders used at startup.
-2. Require unchanged failed-status class, prediction manifest content hash,
-   prediction shape/scale, selected Zarr level transform, base crop,
-   extraction-tube radius, failed artifact-kind set, and five-stage identity.
-   Permit changed counts including empty/nonempty transitions, geometry,
-   metrics, reference/trace/failure data, and generation paths.
-3. Keep the exact existing lazy Zarr source object, crop, image layer, selected
-   level, scale, and translation. Do not call the Zarr opener, crop loader, or
-   resolver during reload. Replacing the image layer's derived mask graph is
-   allowed only when it is built from that identical source object.
+1. Keep broad Gaussian direction/position refinement unchanged. Change only the
+   subsequent direction-conditioned peak response.
+2. Raise the transverse peak sigma default to `1.5` prediction voxels.
+3. Add `peakAxialSigmaPredictionVoxels`, defaulting to `1.5 * cell-size` in the
+   CLI (`6` prediction voxels for the default four-voxel cells). A straight
+   fiber one cell from the pivot then has Gaussian weight about `0.80`, and the
+   ends of the centered three-cell span have weight about `0.61`.
+4. Score each candidate with the normalized anisotropic Gaussian
+   `exp(-0.5*(r_transverse/sigma_transverse)^2
+        -0.5*(r_axial/sigma_axial)^2)` multiplied by the existing
+   `presence * abs(prediction_direction dot component_axis)^2` signal. Apply
+   the existing cutoff independently in normalized transverse and axial
+   distance, where transverse distance is distance to the candidate line and
+   axial distance is measured from the candidate in its fixed pivot-normal
+   plane. The support is the intersection of those two cutoff bounds. The
+   denominator sums the anisotropic Gaussian for every sampled in-volume site
+   inside both bounds, including invalid, below-floor, zero-presence, and
+   unassigned sites. Replace the peak stage's old fixed axial half-width with
+   `gaussianCutoffSigmas * peakAxialSigmaPredictionVoxels`; retain the fixed
+   axial half-width only for the preceding broad direction fit.
+5. Expand the extraction sampling halo to the outward-rounded maximum of the
+   broad bound and the orientation-independent peak bound
+   `hypot(localWindow + cutoff*peakTransverseSigma,
+          cutoff*peakAxialSigma)`.
+   Keep invalid/zero samples in the response denominator as before.
 
-## Layer updates
+## CLI and strict artifacts
 
-4. Extract shared artifact loading, topology, compatibility, and feature helpers
-   so startup and reload cannot diverge. In replay mode, create stable typed
-   layers for every artifact kind even when its initial population is empty.
-   Update the existing reference, trace, failure,
-   final-anchor, five stage, cell-center, refinement-offset, and fiberlet layers
-   in place. Update stage names/counts and feature tables and fiberlet features;
-   clear stale item selection before row-count changes.
-5. Preserve layer identity, order, visibility, clipping, widths/sizes, path
-   colormap, and current radius values. Restore the fixed diagnostic colors
-   after data replacement so per-item arrays match the new counts.
-6. Recompute the presence distance transform and exact anchor representative
-   distances from the reloaded reference/trace artifacts. Reapply the current
-   independent presence and anchor radii. This is derived display state, not a
-   Zarr reload.
-7. Split reload into prepare and commit. Preparation strictly loads and
-   validates every file and computes EDT, exact anchor distances, features,
-   colors/visibility, and names before touching Napari. Commit snapshots all
-   affected layer/controller fields, clears item selections, applies under
-   blocked events, and refreshes once. Any setter failure restores every layer
-   and derived controller field before reporting a terminal/viewer error.
+6. Add `--axial-sigma` in base voxels to `anchors` and `fiber-replay`, print its
+   effective base-voxel value, and store
+   `peak_axial_sigma_prediction_voxels` in the anchor and diagnostic artifacts.
+7. Require the new field in strict C++ and Python readers. Do not accept or
+   repair old experimental artifacts.
 
-## Tests and validation
+## Tests and measurements
 
-8. Add focused tests for prediction-fingerprint and topology compatibility,
-   changed-count layer replacement, feature alignment, selection clearing,
-   style preservation, incompatible reload rejection, and unchanged lazy Zarr
-   source identity/no-opener behavior. Test derived-mask/distance recomputation,
-   current-radius reuse, repeated reload, zero/nonzero transitions, and injected
-   commit failure rollback.
-9. Run focused viewer pytest, Ruff, Python compilation, diff hygiene, and a
-   strict reload of two local replay generations when fixtures permit. A live
-   napari smoke remains conditional on the installed GUI environment.
+8. Add focused tests for the core defaults (`1.5` transverse and `6` axial for
+   four-voxel cells), CLI axial-default recomputation for non-default cell
+   sizes and prediction-to-base scales, config validation, exact anisotropic
+   weighting, evidence beyond the old axial slab affecting peak selection,
+   complete oblique/block-boundary halo sampling, strict missing/exact artifact
+   fields across C++ and Python readers, and unchanged deterministic output
+   across blocks/threads. Retain explicit owner-cell/pivot-plane and broad
+   support/NMS preservation coverage.
+9. Build the anchor/path/replay targets with `-j32`; run focused C++ and Python
+   viewer tests, Ruff, Python compilation, and diff hygiene.
+10. Run the existing small real replay before and after the change and report
+    anchor-stage timing and output counts. This is a signal-quality experiment;
+    final scientific quality still requires visual inspection on the user's
+    representative replay.
 
 ## Spec update
 
-- Define the replay-only reload command, strict same-Zarr/same-layout contract,
-  in-place layer/state preservation, derived-distance recomputation, and
-  failure behavior.
+- Document the anisotropic peak kernel, default transverse/axial sigmas,
+  normalized cutoff, expanded halo, and strict axial-sigma artifact field.
 
 ## Docs updates
 
-- Document how `Reload artifacts` follows the root bundle, what it refreshes,
-  what display state it preserves, and which incompatibilities require restart.
+- Document the peak-kernel controls, units, and intended multi-cell axial
+  integration.
 
 ## Changelog update
 
-- Record in-process replay-artifact reload without Zarr reopening.
+- Record broader anisotropic peak evidence for anchor placement.

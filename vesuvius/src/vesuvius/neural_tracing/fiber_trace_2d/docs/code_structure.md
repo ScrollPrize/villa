@@ -2513,6 +2513,27 @@ enumerates fixed-radius cell-shell pairs, and solves integer prediction-voxel
 paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
 smoothness equations shared by the native greedy tracer and fiberlet DP.
 
+Anchor direction fitting retains the broader cell/halo Gaussian and the
+existing deterministic non-orthogonal two-mode PCA updates. Final spatial
+placement is a separate cached hill climb on an anisotropically integrated
+`presence * abs(direction dot axis)^2` response sampled in the final rotating
+normal plane. The transverse peak sigma defaults to `1.5` prediction voxels;
+the along-direction sigma defaults to `1.5` cell sides so straight-fiber
+evidence remains substantial across several cells. The climb starts near the
+provisional broad-fit position, stops at the first discrete local maximum,
+applies only a non-decreasing bounded parabolic subvoxel fit, and keeps the
+result within the cell's continuous voxel-Voronoi ownership box.
+`vc_fiberlets anchors` and `fiber-replay` expose base-voxel controls as
+`--peak-sigma`, `--axial-sigma`, and `--peak-step`; strict artifacts store the
+transverse and axial sigmas in prediction-grid units. The extraction halo
+conservatively encloses both the broad direction-fit kernel and every rotated
+peak kernel.
+
+The napari replay viewer loads the final anchor centre/direction glyphs and all
+five anchor diagnostic Shapes layers by default. `--no-anchor-stages` is an
+explicit fast-start opt-out that skips parsing and hashing the stage artifacts;
+replay reload preserves the selected stage-layer topology.
+
 `FiberPaths.cpp` first generates all candidates in canonical order. It unions
 their clipped Hermite-corridor and virtual-attachment bounds into one enclosing
 ZYX box, then batch-loads an immutable dense scoring volume containing exact

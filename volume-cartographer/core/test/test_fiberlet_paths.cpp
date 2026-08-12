@@ -865,12 +865,30 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
     auto missingRefinementParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
-    missingRefinementParameter["parameters"].erase("gaussian_cutoff_sigmas");
+    missingRefinementParameter["parameters"].erase("peak_sigma_prediction_voxels");
     {
         std::ofstream output(path);
         output << missingRefinementParameter.dump(2);
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto missingAxialPeakParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingAxialPeakParameter["parameters"].erase("peak_axial_sigma_prediction_voxels");
+    {
+        std::ofstream output(path);
+        output << missingAxialPeakParameter.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto extraParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    extraParameter["parameters"]["unknown"] = 1.0;
+    {
+        std::ofstream output(path);
+        output << extraParameter.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version-1 schema"), std::runtime_error);
 
     auto missingRefinementValue = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementValue["cells"][0]["components"][0].erase("refinement_score");
@@ -887,6 +905,16 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
         output << offPlane.dump(2);
     }
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("rotating-plane window"), std::runtime_error);
+
+    auto outsideOwner = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    outsideOwner["cells"][0]["components"][0]["position_base_xyz"][1] = 12.0;
+    {
+        std::ofstream output(path);
+        output << outsideOwner.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("owning cell"), std::runtime_error);
 
     auto missingNmsDiagnostic = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingNmsDiagnostic["diagnostics"].erase("nms_suppressed_components");

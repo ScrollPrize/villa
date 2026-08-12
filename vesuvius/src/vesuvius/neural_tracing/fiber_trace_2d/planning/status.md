@@ -1,11 +1,12 @@
-# Status: reload replay artifacts in napari
+# Status: integrate broader peak evidence for fiber anchors
 
-- [x] Capture the user requirements in `task.md`.
-- [x] Inspect replay loading, layer construction, controls, and distance state.
-- [x] Draft implementation, documentation, and validation plan.
-- [x] Complete independent plan review against task/spec/plan.
-- [x] Incorporate review findings.
-- [x] Extract shared artifact loading and compatibility validation.
-- [x] Implement in-place reload and derived-distance refresh.
-- [x] Add tests and documentation.
-- [x] Run focused validation and record results.
+- [x] Record the current task.
+- [x] Write the detailed implementation and validation plan.
+- [x] Independently review the plan against task/spec/overarching plan.
+- [x] Record a current real-replay timing baseline.
+- [x] Implement the anisotropic peak response and complete sampling halo.
+- [x] Add CLI and strict artifact plumbing.
+- [x] Add focused regression tests.
+- [x] Build and run focused validation.
+- [x] Measure the updated real replay.
+- [x] Complete specs, docs, task log, changelog, and status.

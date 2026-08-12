@@ -15,6 +15,7 @@ from vesuvius.scripts.view_fiber_presence import (
     LineObjGeometry,
     ReplayVisualArtifacts,
     anchor_path_representatives,
+    build_parser,
     clipping_plane_in_layer_data,
     commit_with_rollback,
     common_shape_edge_width,
@@ -41,6 +42,23 @@ from vesuvius.scripts.view_fiber_presence import (
     validate_anchor_stage_chain,
     validate_replay_reload_compatibility,
 )
+
+
+def test_anchor_stage_layers_are_enabled_by_default_with_explicit_opt_out():
+    parser = build_parser()
+    assert parser.parse_args(
+        ["presence.zarr", "--crop", "0,0,0,1,1,1"]
+    ).anchor_stages
+    assert parser.parse_args(
+        ["presence.zarr", "--crop", "0,0,0,1,1,1", "--anchor-stages"]
+    ).anchor_stages
+    assert not parser.parse_args(
+        ["presence.zarr", "--crop", "0,0,0,1,1,1", "--no-anchor-stages"]
+    ).anchor_stages
+
+
+def test_replay_loader_enables_anchor_stages_by_default():
+    assert load_fiber_replay_bundle.__kwdefaults__ == {"include_anchor_stages": True}
 
 
 def _fnv1a64(data: bytes) -> str:
@@ -325,6 +343,9 @@ def _anchor_stage_root(stage, records):
         "parameters": {
             "cell_size_prediction_voxels": 4,
             "gaussian_sigma_prediction_voxels": 2.0,
+            "peak_sigma_prediction_voxels": 1.5,
+            "peak_axial_sigma_prediction_voxels": 6.0,
+            "peak_grid_step_prediction_voxels": 0.5,
             "gaussian_cutoff_sigmas": 3.0,
             "local_window_radius_prediction_voxels": 4.0,
             "axial_support_half_width_prediction_voxels": 6.0,
@@ -415,6 +436,36 @@ def test_reads_and_validates_anchor_stage_chain(tmp_path):
     np.testing.assert_array_equal(
         stages[-1].paths_zyx[0], [[6.0, 4.0, -2.0], [6.0, 4.0, 6.0]]
     )
+
+
+def test_anchor_stage_rejects_extra_geometry(tmp_path):
+    record = _anchor_record(0, "final", parents=[0])
+    record["geometry"]["unknown"] = 1
+    path = tmp_path / "nms.json"
+    path.write_text(json.dumps(_anchor_stage_root("nms", [record])))
+
+    with pytest.raises(ValueError, match="malformed anchor geometry"):
+        read_anchor_stage_json(path, "nms")
+
+
+def test_anchor_stage_rejects_extra_parameter(tmp_path):
+    root = _anchor_stage_root("nms", [_anchor_record(0, "final", parents=[0])])
+    root["parameters"]["unknown"] = 1.0
+    path = tmp_path / "nms.json"
+    path.write_text(json.dumps(root))
+
+    with pytest.raises(ValueError, match="invalid anchor-stage parameters"):
+        read_anchor_stage_json(path, "nms")
+
+
+def test_anchor_stage_rejects_missing_axial_peak_parameter(tmp_path):
+    root = _anchor_stage_root("nms", [_anchor_record(0, "final", parents=[0])])
+    del root["parameters"]["peak_axial_sigma_prediction_voxels"]
+    path = tmp_path / "nms.json"
+    path.write_text(json.dumps(root))
+
+    with pytest.raises(ValueError, match="invalid anchor-stage parameters"):
+        read_anchor_stage_json(path, "nms")
 
 
 def test_anchor_stage_chain_rejects_mixed_bindings(tmp_path):

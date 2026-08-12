@@ -316,6 +316,9 @@ def read_anchor_stage_json(
     parameter_keys = {
         "cell_size_prediction_voxels",
         "gaussian_sigma_prediction_voxels",
+        "peak_sigma_prediction_voxels",
+        "peak_axial_sigma_prediction_voxels",
+        "peak_grid_step_prediction_voxels",
         "gaussian_cutoff_sigmas",
         "local_window_radius_prediction_voxels",
         "axial_support_half_width_prediction_voxels",
@@ -722,7 +725,9 @@ def load_anchor_stage_directory(
     return stages
 
 
-def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
+def load_fiber_replay_bundle(
+    path: str | Path, *, include_anchor_stages: bool = True
+) -> FiberReplayBundle:
     bundle_path = Path(path).expanduser().resolve()
     try:
         root = json.loads(bundle_path.read_text())
@@ -974,6 +979,18 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         raise ValueError("replay bundle artifact set does not match its status")
     base = bundle_path.parent.resolve()
     resolved: dict[str, Path] = {}
+    verified_artifacts = {"replay/reference.obj", "replay/trace.obj"}
+    if failed:
+        verified_artifacts |= {
+            "replay/failure.obj",
+            "anchors/anchors.obj",
+            "anchors/anchor_cells.obj",
+            "paths/fiberlets.obj",
+        }
+        if include_anchor_stages:
+            verified_artifacts |= {
+                f"anchors/stages/{stage}.json" for stage in _ANCHOR_STAGE_NAMES
+            }
     for key, descriptor in artifacts.items():
         if not isinstance(descriptor, dict) or set(descriptor) != {
             "path",
@@ -986,12 +1003,13 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
         artifact = (base / relative).resolve(strict=True)
         if not artifact.is_relative_to(base):
             raise ValueError(f"replay artifact path {relative} escapes the bundle")
-        try:
-            content = artifact.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"cannot read replay artifact {artifact}: {exc}") from exc
-        if _fnv1a64(content) != descriptor["content_hash"]:
-            raise ValueError(f"replay artifact hash mismatch: {relative}")
+        if key in verified_artifacts:
+            try:
+                content = artifact.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"cannot read replay artifact {artifact}: {exc}") from exc
+            if _fnv1a64(content) != descriptor["content_hash"]:
+                raise ValueError(f"replay artifact hash mismatch: {relative}")
         resolved[key] = artifact
     reference_obj = _read_replay_obj(
         resolved["replay/reference.obj"],
@@ -1048,7 +1066,7 @@ def load_fiber_replay_bundle(path: str | Path) -> FiberReplayBundle:
     ):
         raise ValueError("nonfailure replay bundle contains failure metadata")
     anchor_stages: tuple[AnchorStageGeometry, ...] = ()
-    if failed:
+    if failed and include_anchor_stages:
         anchor_stages = load_anchor_stage_directory(
             resolved["anchors/stages/initialized.json"].parent,
             resolved["anchors/anchors.obj"],
@@ -1084,7 +1102,7 @@ def load_replay_visual_artifacts(replay: FiberReplayBundle) -> ReplayVisualArtif
         or replay.anchors_obj is None
         or replay.anchor_cells_obj is None
         or replay.paths_obj is None
-        or len(replay.anchor_stages) != len(_ANCHOR_STAGE_NAMES)
+        or len(replay.anchor_stages) not in {0, len(_ANCHOR_STAGE_NAMES)}
     ):
         raise ValueError("artifact reload requires a failed replay bundle")
     return ReplayVisualArtifacts(
@@ -2962,7 +2980,10 @@ def launch_viewer(
         def reload_artifacts() -> str:
             current_replay = replay_state["replay"]
             current_artifacts = replay_state["artifacts"]
-            replacement_replay = load_fiber_replay_bundle(replay_root_path)
+            replacement_replay = load_fiber_replay_bundle(
+                replay_root_path,
+                include_anchor_stages=bool(current_replay.anchor_stages),
+            )
             replacement_artifacts = load_replay_visual_artifacts(replacement_replay)
             validate_replay_reload_compatibility(
                 current_replay,
@@ -3102,6 +3123,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--replay",
         help="Strict vc_fiber_replay version-1 bundle",
     )
+    parser.add_argument(
+        "--anchor-stages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load the five detailed anchor diagnostic layers (default: enabled)",
+    )
     return parser
 
 
@@ -3116,12 +3143,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.replay is None and args.crop is None:
             raise ValueError("manual mode requires --crop")
-        replay = load_fiber_replay_bundle(args.replay) if args.replay else None
+        replay = (
+            load_fiber_replay_bundle(
+                args.replay, include_anchor_stages=args.anchor_stages
+            )
+            if args.replay
+            else None
+        )
         crop = replay.crop_xyzwhd if replay is not None else args.crop
         anchors = replay.anchors_obj if replay is not None else args.anchors
         paths = replay.paths_obj if replay is not None else args.paths
         anchor_stages = ()
-        if replay is None and anchors is not None:
+        if replay is None and anchors is not None and args.anchor_stages:
             stage_directory = Path(anchors).expanduser().resolve().parent / "stages"
             if stage_directory.exists():
                 anchor_stages = load_anchor_stage_directory(

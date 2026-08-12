@@ -2511,7 +2511,8 @@
   assignment/PCA supplies only initial directions. A single covariance's first
   two orthogonal eigenvectors are not a valid replacement. Initial component
   positions are the centre of the clipped owned-cell voxel range.
-- Direction and position are then refined jointly from a bounded halo. For
+- Direction and a provisional position are then refined jointly from a bounded
+  halo. For
   anchor `(p_k,u_k)`, the transverse Gaussian is recentered at `p_k`, uses the
   distance to the line through `p_k` along `u_k`, and is truncated at three
   sigma. Evidence is also restricted to a symmetric axial slab about the plane
@@ -2525,16 +2526,47 @@
   pivot normal to the updated direction. The plane therefore rotates with the
   direction, but the anchor never advances along the fiber through the cell.
   Transverse displacement is clamped to the local window and the prediction
-  grid. The next iteration recomputes falloff about the new position.
+  grid. The next iteration recomputes falloff about the new provisional
+  position.
 - Proposed joint updates use deterministic backtracking and are accepted only
   when the normalized joint objective strictly improves. This bounded monotonic
-  mode search stops at a local maximum and cannot cross a lower-response valley
-  merely to reach a stronger neighboring fiber. A component's denominator is
+  direction-refinement phase is retained unchanged. A component's denominator is
   `sum g_ik` over every lattice site in its finite kernel, including invalid,
   below-floor, zero-presence, and unassigned sites. Aligned support is assigned
   aligned evidence divided by that denominator; coherence divides by assigned
   `sum g_ik p_i`. Empty, degenerate, and below-threshold components are
-  discarded independently. A cell emits zero, one, or two anchors.
+  discarded independently.
+- After direction refinement, final position is selected independently for each
+  surviving direction by deterministic steepest ascent on a narrower
+  direction-conditioned response in the final normal plane. The response is
+  `sum(G_peak p_i abs(d_i dot u_k)^2) / sum(G_peak)`, where `G_peak` is an
+  anisotropic Gaussian about the candidate line. Its default transverse sigma
+  is `1.5` prediction voxels and its default along-direction sigma is
+  `1.5 * cell_size` (`6` prediction voxels for default cells). Consequently a
+  straight fiber one cell from the pivot retains about `0.80` axial weight and
+  the ends of a centered three-cell span retain about `0.61`.
+- Peak support is the intersection of independent three-sigma transverse and
+  axial bounds. Direction assignment uses all valid above-floor observations
+  in that support and is independent of the provisional center. The denominator
+  includes every sampled in-volume site inside both bounds, including invalid,
+  below-floor, zero-presence, and unassigned sites, so global-edge truncation is
+  normalized. The broad direction fit continues to use its separate fixed
+  axial half-width.
+- The peak grid is anchored at the fixed cell pivot and uses canonical
+  transverse basis construction, configured prediction-voxel step, a circular
+  local window, and continuous voxel-Voronoi ownership
+  `[cell_begin-0.5,cell_end-0.5)` clipped to `[0,shape-1]` at global edges.
+  Search starts at the grid node nearest the provisional position and repeatedly
+  chooses the highest strictly improving 8-neighbor, with canonical integer-grid
+  tie breaking. It stops on a plateau and cannot cross a response valley to a
+  stronger distant fiber. The grid radius is limited to 128 steps so malformed
+  parameters cannot create unbounded enumeration.
+- Two three-sample parabolic fits may move the discrete maximum by at most half
+  a grid step in each plane coordinate. Their combined point is retained only
+  when it remains in the owner/window domain and does not reduce the normalized
+  peak response; otherwise the discrete maximum is final. Broad-kernel support
+  and coherence are then reevaluated at the peak for ordinary filtering and
+  NMS ranking. A cell emits zero, one, or two anchors.
 - When both fitted components and their joint PCA are unique, near-duplicate
   components are evaluated before support rejection. Let `O2` be the sum of
   the two fixed-assignment principal eigenvalues divided by `sum_cell g_i` and
@@ -2560,17 +2592,22 @@
   within-cell reduction. Extraction uses bounded deterministic cell blocks and
   one halo sample per block; block size and worker count are operational only.
   Machine output and OBJ store spatial positions only in base-volume XYZ
-  coordinates. Prediction shape/scale, cell indices, cell size, falloff,
-  cutoff, local window, axial slab, convergence, and NMS limits remain explicit
-  lattice metadata and parameters. Runtime timing and worker count are not
+  coordinates. Prediction shape/scale, cell indices, cell size, direction
+  falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
+  broad axial slab, convergence, and NMS limits remain explicit lattice
+  metadata and parameters. The orientation-independent sampling halo covers the
+  larger of the broad direction kernel and anisotropic peak kernel, including
+  the local-window displacement. Runtime timing and
+  worker count are not
   scientific output, so artifacts remain byte-identical across worker counts
   and block sizes.
 - The anchor command itself does not connect anchors. Its strict version-1
   JSON is the authoritative input to the separate integer-DP path stage. It
   requires the refinement/NMS and merge parameters, aggregate diagnostics,
   per-anchor refinement fields, and auditable per-cell merge evaluations where
-  applicable. Positions are validated against the prediction grid, rotating
-  pivot plane, and local window. Older experimental artifacts must be
+  applicable. Positions are validated against the prediction grid, continuous
+  owner cell, rotating pivot plane, and local window. Older experimental
+  artifacts must be
   regenerated. `anchors.obj` contains all retained anchors, while
   `anchors_0.obj` and `anchors_1.obj` contain deterministic post-sort
   per-cell component slots. These slots are not global H/V classes.
@@ -2759,10 +2796,13 @@
   repair or compatibility behavior.
 - The napari viewer accepts the presence OME-Zarr separately with `--replay`.
   Replay mode rejects manual crop/anchor/path inputs, verifies external Zarr
-  shape/scale, path containment, hashes, status layout, and JSON/OBJ geometry,
-  and creates independent presence/reference/trace/failure/anchor/fiberlet
-  layers. Six crop controls clip all layers; line widths, failure size, and
-  fiberlet quality colormap remain runtime display controls.
+  shape/scale, path containment, hashes for every artifact it consumes, status
+  layout, and JSON/OBJ geometry, and creates independent
+  presence/reference/trace/failure/anchor/fiberlet layers. Declared but unused
+  JSON and alternate OBJ artifacts are containment/existence checked without
+  paying the pure-Python FNV cost. Six crop controls clip all layers; line
+  widths, failure size, and fiberlet quality colormap remain runtime display
+  controls.
 
 # Anchor pipeline stage diagnostics
 
@@ -2787,9 +2827,11 @@
 - Stage capture copies existing computations and must not change fitting,
   filtering, NMS ranking, final `anchors.json`/OBJ bytes, or fiberlet paths.
   `anchors.json` remains the only authoritative path-stage input.
-- Napari exposes one Shapes layer per nonempty stage with stable colors,
-  transition/metric features, common clipping and width controls. Only NMS is
-  initially visible; the duplicate final-anchor OBJ layer starts hidden.
+- Napari displays all five anchor diagnostic stages by default, with one Shapes
+  layer per nonempty stage using stable colors, transition/metric features,
+  common clipping, and width controls. Only NMS is initially visible while the
+  duplicate final-anchor OBJ layer starts hidden. `--no-anchor-stages` is the
+  explicit fast-start opt-out and displays only final centre/direction glyphs.
 - Failed-replay viewing provides an independent `Anchor radius` in base voxels.
   Each final/stage glyph uses its symmetric center, each cell-center point uses
   itself, and each refinement offset uses its anchor target. Exact Euclidean
@@ -2800,14 +2842,17 @@
   complete geometry, stage features, item order, selections, widths/sizes,
   clipping, layer visibility, and full artifact counts in layer names. It does
   not affect fiberlet paths or the independently controlled presence EDT mask.
-- Failed-replay mode creates stable typed layers for final anchors, all five
-  anchor stages, cell centers, refinement offsets, and fiberlets even when an
-  artifact population is empty. The `Reload artifacts` command always rereads
+- Failed-replay mode creates stable typed layers for final anchors, cell
+  centers, refinement offsets, and fiberlets even when an artifact population
+  is empty, plus all five anchor stages unless diagnostic loading was explicitly
+  disabled. The
+  `Reload artifacts` command always rereads
   the original root `fiber_replay.json`, follows its newly published immutable
   hashed generation, and passes it through the startup strict loaders.
 - In-process artifact reload requires the same failed-replay artifact contract,
   fiber-prediction manifest content hash, prediction shape/scale, displayed
-  Zarr level transform, base crop, extraction-tube radius, and five stage names.
+  Zarr level transform, base crop, extraction-tube radius, and the same optional
+  stage-layer topology.
   Counts may cross zero; geometry, metrics, reference/trace/failure data, and
   generation paths may change. An incompatible replacement leaves the current
   display unchanged and reports that restart is required.
