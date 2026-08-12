@@ -30,3 +30,22 @@ def test_explicit_weights_require_every_group():
     cfg = _cfg(weights={'a': 1})
     with pytest.raises(KeyError, match='sampling group.*b'):
         losses.build_pcl_sampling_strata(['a', 'b'], cfg)
+
+
+def test_component_member_count_allows_repeated_draws():
+    cfg = _cfg(stratified=False)
+    strata = losses.build_pcl_sampling_strata(
+        ['fibers'], cfg, member_weights=[4])
+
+    assert strata['effective_size'] == 4
+    chosen = losses._choose_pcl_indices(strata, 4, cfg)
+    assert np.array_equal(chosen, np.zeros(4, dtype=np.int64))
+
+
+def test_singleton_members_keep_no_replacement_sampling():
+    cfg = _cfg(stratified=False)
+    strata = losses.build_pcl_sampling_strata(
+        ['fibers', 'fibers', 'fibers'], cfg, member_weights=[1, 1, 1])
+
+    chosen = losses._choose_pcl_indices(strata, 3, cfg)
+    assert sorted(chosen) == [0, 1, 2]

@@ -55,7 +55,8 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
     # per stratum], 'weights': float weight per stratum, 'member_probs': [per-stratum
     # draw probabilities or None], 'all': all eligible indices, 'all_probs': draw
-    # probabilities over 'all' or None}.
+    # probabilities over 'all' or None, 'effective_size': eligible member count
+    # after expanding component multiplicities}.
     sampling_groups = list(sampling_groups)
     if member_weights is not None:
         member_weights = np.asarray(list(member_weights), dtype=np.float64)
@@ -85,6 +86,9 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     if member_weights is not None and len(all_indices):
         w = member_weights[all_indices]
         all_probs = w / w.sum()
+        effective_size = int(round(w.sum()))
+    else:
+        effective_size = len(all_indices)
     return {
         'strata': strata,
         'groups': groups,
@@ -92,6 +96,7 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
         'member_probs': member_probs,
         'all': all_indices,
         'all_probs': all_probs,
+        'effective_size': effective_size,
     }
 
 
@@ -103,7 +108,8 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
     # the bundle carries them, skew the within-pool draws.
     weighted = cfg['pcl_sampling_weights'] is not None
     if not weighted and not cfg['pcl_stratified_pcl_sampling']:
-        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False,
+        return np.random.choice(sampling_strata['all'], num_to_sample,
+                                replace=num_to_sample > len(sampling_strata['all']),
                                 p=sampling_strata['all_probs'])
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
@@ -886,7 +892,10 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # sampling_strata indexes into point_collections and already excludes single-point
     # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
     # pair; see the build_pcl_sampling_strata call in fit_spiral.main.
-    num_pcls_per_step = min(cfg['sample_count_relative_winding_pcls'], len(sampling_strata['all']))
+    num_pcls_per_step = min(
+        cfg['sample_count_relative_winding_pcls'],
+        sampling_strata['effective_size'],
+    )
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
     selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step, cfg)
@@ -1455,7 +1464,7 @@ def get_unattached_pcl_strip_losses(
     if not pcl_strips:
         return zero, zero
 
-    num_to_sample = min(num_pcls_per_step, len(sampling_strata['all']))
+    num_to_sample = min(num_pcls_per_step, sampling_strata['effective_size'])
     if num_to_sample <= 0:
         return zero, zero
     chosen_comps = _choose_pcl_indices(sampling_strata, num_to_sample, cfg)
