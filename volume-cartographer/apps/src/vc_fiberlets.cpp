@@ -27,6 +27,7 @@ namespace
 
 enum class Command {
     Anchors,
+    AnchorBenchmark,
     Paths,
     FiberReplay,
 };
@@ -73,6 +74,8 @@ void usage(const char* executable)
     std::cerr << "Usage:\n"
               << "  " << executable << " anchors <fiber.lasagna.json-or-url> <output-dir> [options]\n"
               << "  " << executable
+              << " anchor-benchmark <fiber.lasagna.json-or-url> <fiber.json> [options]\n"
+              << "  " << executable
               << " paths <fiber.lasagna.json-or-url> <anchors.json> <output-dir>"
                  " --normal-manifest <lasagna.json-or-url> [options]\n\n"
               << "  " << executable
@@ -89,7 +92,8 @@ void usage(const char* executable)
               << "  --peak-sigma N                transverse peak sigma in base voxels [1.5 prediction voxels]\n"
               << "  --axial-sigma N               along-fiber peak sigma in base voxels [1.5 cell-sides]\n"
               << "  --peak-step N                 local-peak grid step in base voxels [0.5 prediction voxels]\n"
-              << "  --window N                    refinement/NMS radius in base voxels [cell-side]\n"
+              << "  --gradient-weight N           signed presence-gradient centering weight [1.0]\n"
+              << "  --window N                    refinement radius in base voxels [cell-side]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
               << "  --merge-angle-deg N           maximum duplicate-axis angle [10]\n"
@@ -196,6 +200,11 @@ CliOptions parseArgs(int argc, char** argv)
         options.anchorArtifact = argv[3];
         options.outputDirectory = argv[4];
         firstOption = 5;
+    } else if (command == "anchor-benchmark") {
+        options.command = Command::AnchorBenchmark;
+        options.manifestLocation = argv[2];
+        options.fiberJson = argv[3];
+        firstOption = 4;
     } else if (command == "fiber-replay") {
         if (argc < 5) {
             usage(argv[0]);
@@ -233,7 +242,9 @@ CliOptions parseArgs(int argc, char** argv)
             options.remoteCacheDirectory = valueAfter(index, argc, argv, "remote-cache-dir");
         } else if (argument == "--base-voxel-size-um") {
             options.baseVoxelSizeUm = parseDouble(valueAfter(index, argc, argv, "base-voxel-size-um"), "base-voxel-size-um");
-        } else if (argument == "--normal-manifest" && options.command != Command::Anchors) {
+        } else if (argument == "--normal-manifest" &&
+                   (options.command == Command::Paths ||
+                    options.command == Command::FiberReplay)) {
             options.normalManifestLocation = valueAfter(index, argc, argv, "normal-manifest");
         } else if (argument == "--fail" && options.command == Command::FiberReplay) {
             options.failureThresholdBaseVoxels = parseDouble(valueAfter(index, argc, argv, "fail"), "fail");
@@ -261,6 +272,11 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--peak-step" && options.command != Command::Paths) {
             options.peakStepBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "peak-step"), "peak-step");
+        } else if (argument == "--gradient-weight" &&
+                   options.command != Command::Paths) {
+            options.anchors.peakGradientWeight = parseDouble(
+                valueAfter(index, argc, argv, "gradient-weight"),
+                "gradient-weight");
         } else if (argument == "--window" && options.command != Command::Paths) {
             options.localWindowBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "window"), "window");
@@ -345,7 +361,8 @@ CliOptions parseArgs(int argc, char** argv)
             !(*options.localWindowBaseVoxels > 0.0))
             fail("--window must be positive");
     }
-    if (options.command != Command::Anchors) {
+    if (options.command == Command::Paths ||
+        options.command == Command::FiberReplay) {
         if (options.normalManifestLocation.empty())
             fail("paths and fiber-replay require --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
@@ -363,8 +380,10 @@ CliOptions parseArgs(int argc, char** argv)
             fail("fiber-replay only supports --beam-width 1 and --beam-lookahead-steps 1");
         }
     }
+    const bool needsNormals = options.command == Command::Paths ||
+        options.command == Command::FiberReplay;
     const bool remote = vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
-                        (options.command != Command::Anchors && vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation));
+                        (needsNormals && vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation));
     if (remote && options.remoteCacheDirectory.empty())
         fail("direct remote manifests require --remote-cache-dir");
     return options;
@@ -425,6 +444,35 @@ std::string datasetLocator(const vc::lasagna::LasagnaDataset& dataset)
     const auto& manifest = dataset.manifest();
     return manifest.manifestIsRemote ? credentialFreeLocator(manifest.manifestLocation)
                                      : std::filesystem::absolute(manifest.manifestPath).lexically_normal().string();
+}
+
+double resolveAnchorConfig(
+    CliOptions& options,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid)
+{
+    const double cellSideBase = options.anchors.cellSizePredictionVoxels *
+        grid.predictionToBaseScale;
+    options.anchors.gaussianSigmaPredictionVoxels =
+        options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
+        grid.predictionToBaseScale;
+    options.anchors.peakSigmaPredictionVoxels =
+        options.peakSigmaBaseVoxels.value_or(1.5 * grid.predictionToBaseScale) /
+        grid.predictionToBaseScale;
+    options.anchors.peakAxialSigmaPredictionVoxels =
+        options.peakAxialSigmaBaseVoxels.value_or(1.5 * cellSideBase) /
+        grid.predictionToBaseScale;
+    options.anchors.peakGridStepPredictionVoxels =
+        options.peakStepBaseVoxels.value_or(0.5 * grid.predictionToBaseScale) /
+        grid.predictionToBaseScale;
+    options.anchors.localWindowRadiusPredictionVoxels =
+        options.localWindowBaseVoxels.value_or(cellSideBase) /
+        grid.predictionToBaseScale;
+    options.anchors.axialSupportHalfWidthPredictionVoxels =
+        1.5 * options.anchors.cellSizePredictionVoxels;
+    options.anchors.nmsMaximumAngleDegrees =
+        options.anchors.mergeMaximumAngleDegrees;
+    vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
+    return cellSideBase;
 }
 
 void printRateProgress(
@@ -496,6 +544,84 @@ int main(int argc, char** argv)
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
         const vc::fiber_tracer::FiberPredictionField field(dataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
         const auto grid = field.storedGridInfo();
+
+        if (options.command == Command::AnchorBenchmark) {
+            const double cellSideBase = resolveAnchorConfig(options, grid);
+            const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
+            const auto cells = vc::fiber_tracer::fiberAnchorCellsNearPolyline(
+                fiber.linePointsXyzBase,
+                0.0,
+                grid,
+                options.anchors.cellSizePredictionVoxels);
+            std::cerr << "anchor_benchmark_stage stage=anchors status=started"
+                      << " cells=" << cells.size() << '\n';
+            const auto anchors =
+                vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+                grid,
+                options.anchors,
+                [&](const auto& indices, int threads, auto& samples) {
+                    field.sampleStoredGridBatch(indices, threads, samples);
+                },
+                cells,
+                printAnchorProgress);
+            std::cerr << "anchor_benchmark_stage stage=anchors status=completed"
+                      << " elapsed_seconds=" << anchors.elapsedSeconds << '\n';
+            const auto benchmark = vc::fiber_tracer::benchmarkRefinedFiberAnchors(
+                anchors,
+                fiber.linePointsXyzBase,
+                {4.0, 8.0});
+            std::cout << std::setprecision(17)
+                      << "anchor_benchmark_extraction"
+                      << " prediction_to_base=" << grid.predictionToBaseScale
+                      << " cell_side_base_voxels=" << cellSideBase
+                      << " extraction_seconds=" << anchors.elapsedSeconds << '\n';
+            const auto printOptional = [](const std::optional<double>& value) {
+                if (value.has_value())
+                    std::cout << *value;
+                else
+                    std::cout << "n/a";
+            };
+            const auto printStage = [&](const char* name, const auto& stage) {
+                std::cout << "anchor_benchmark_population"
+                          << " stage=" << name
+                          << " reference_cells=" << stage.referenceCells
+                          << " cells_with_refined_anchors="
+                          << stage.cellsWithRefinedAnchors
+                          << " refined_anchors=" << stage.refinedAnchors << '\n';
+                const auto& distances = stage.anchorDistancesBaseVoxels;
+                std::cout << "anchor_benchmark_distance_base_voxels"
+                          << " stage=" << name
+                          << " count=" << distances.count << " min=";
+                printOptional(distances.minimum);
+                std::cout << " mean=";
+                printOptional(distances.mean);
+                std::cout << " median=";
+                printOptional(distances.median);
+                std::cout << " p95=";
+                printOptional(distances.percentile95);
+                std::cout << " max=";
+                printOptional(distances.maximum);
+                std::cout << '\n';
+                for (const auto& threshold : stage.thresholds) {
+                    std::cout << "anchor_benchmark_threshold"
+                              << " stage=" << name
+                              << " threshold_base_voxels="
+                              << threshold.thresholdBaseVoxels
+                              << " anchor_hits=" << threshold.anchorHits
+                              << " anchor_total=" << stage.refinedAnchors
+                              << " anchor_hit_rate=";
+                    printOptional(threshold.anchorHitRate);
+                    std::cout << " cell_hits=" << threshold.cellHits
+                              << " cell_total=" << stage.referenceCells
+                              << " cell_hit_rate=" << threshold.cellHitRate
+                              << '\n';
+                }
+            };
+            printStage("discrete", benchmark.discrete);
+            printStage("separable_1d", benchmark.separable1d);
+            printStage("joint_2d", benchmark.joint2d);
+            return 0;
+        }
 
         if (options.command == Command::FiberReplay) {
             const auto traceSetupStart = std::chrono::steady_clock::now();
@@ -617,34 +743,7 @@ int main(int argc, char** argv)
                                  .count()
                           << " cells=" << tube.cellsZYX.size() << '\n';
 
-                const double cellSideBase =
-                    options.anchors.cellSizePredictionVoxels *
-                    grid.predictionToBaseScale;
-                options.anchors.gaussianSigmaPredictionVoxels =
-                    options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
-                    grid.predictionToBaseScale;
-                options.anchors.peakSigmaPredictionVoxels =
-                    options.peakSigmaBaseVoxels.value_or(
-                        1.5 * grid.predictionToBaseScale) /
-                    grid.predictionToBaseScale;
-                options.anchors.peakAxialSigmaPredictionVoxels =
-                    options.peakAxialSigmaBaseVoxels.value_or(
-                        1.5 * cellSideBase) /
-                    grid.predictionToBaseScale;
-                options.anchors.peakGridStepPredictionVoxels =
-                    options.peakStepBaseVoxels.value_or(
-                        0.5 * grid.predictionToBaseScale) /
-                    grid.predictionToBaseScale;
-                options.anchors.localWindowRadiusPredictionVoxels =
-                    options.localWindowBaseVoxels.value_or(cellSideBase) /
-                    grid.predictionToBaseScale;
-                options.anchors.axialSupportHalfWidthPredictionVoxels =
-                    1.5 * options.anchors.cellSizePredictionVoxels;
-                options.anchors.nmsLongitudinalRadiusPredictionVoxels =
-                    0.5 * options.anchors.cellSizePredictionVoxels;
-                options.anchors.nmsMaximumAngleDegrees =
-                    options.anchors.mergeMaximumAngleDegrees;
-                vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
+                resolveAnchorConfig(options, grid);
                 const auto anchorsStart = std::chrono::steady_clock::now();
                 std::cerr << "fiber_replay_stage stage=anchors status=started"
                           << " cells=" << tube.cellsZYX.size() << '\n';
@@ -769,34 +868,7 @@ int main(int argc, char** argv)
         }
 
         if (options.command == Command::Anchors) {
-            const double cellSideBase =
-                options.anchors.cellSizePredictionVoxels *
-                grid.predictionToBaseScale;
-            options.anchors.gaussianSigmaPredictionVoxels =
-                options.falloffSigmaBaseVoxels.value_or(cellSideBase * 0.5) /
-                grid.predictionToBaseScale;
-            options.anchors.peakSigmaPredictionVoxels =
-                options.peakSigmaBaseVoxels.value_or(
-                    1.5 * grid.predictionToBaseScale) /
-                grid.predictionToBaseScale;
-            options.anchors.peakAxialSigmaPredictionVoxels =
-                options.peakAxialSigmaBaseVoxels.value_or(
-                    1.5 * cellSideBase) /
-                grid.predictionToBaseScale;
-            options.anchors.peakGridStepPredictionVoxels =
-                options.peakStepBaseVoxels.value_or(
-                    0.5 * grid.predictionToBaseScale) /
-                grid.predictionToBaseScale;
-            options.anchors.localWindowRadiusPredictionVoxels =
-                options.localWindowBaseVoxels.value_or(cellSideBase) /
-                grid.predictionToBaseScale;
-            options.anchors.axialSupportHalfWidthPredictionVoxels =
-                1.5 * options.anchors.cellSizePredictionVoxels;
-            options.anchors.nmsLongitudinalRadiusPredictionVoxels =
-                0.5 * options.anchors.cellSizePredictionVoxels;
-            options.anchors.nmsMaximumAngleDegrees =
-                options.anchors.mergeMaximumAngleDegrees;
-            vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
+            const double cellSideBase = resolveAnchorConfig(options, grid);
             const auto crop = options.baseCrop.has_value()
                                   ? std::make_optional(vc::fiber_tracer::fiberAnchorCropFromBaseVoxels(*options.baseCrop, grid.predictionToBaseScale))
                                   : std::nullopt;
@@ -820,6 +892,8 @@ int main(int argc, char** argv)
                       << " axial_sigma_base_voxels=" << options.anchors.peakAxialSigmaPredictionVoxels * grid.predictionToBaseScale
                       << " peak_step_base_voxels=" << options.anchors.peakGridStepPredictionVoxels * grid.predictionToBaseScale
                       << " local_window_base_voxels=" << options.anchors.localWindowRadiusPredictionVoxels * grid.predictionToBaseScale
+                      << " nms_transverse_radius_base_voxels=" << options.anchors.nmsTransverseRadiusPredictionVoxels * grid.predictionToBaseScale
+                      << " nms_longitudinal_radius_base_voxels=" << options.anchors.nmsLongitudinalRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells
                       << " zero=" << report.diagnostics.zeroAnchorCells << " one=" << report.diagnostics.oneAnchorCells

@@ -20,80 +20,6 @@ namespace
 
 constexpr double kEpsilon = 1.0e-12;
 
-double segmentAabbDistanceSquared(
-    const cv::Vec3d& start,
-    const cv::Vec3d& end,
-    const cv::Vec3d& low,
-    const cv::Vec3d& high)
-{
-    const cv::Vec3d delta = end - start;
-    std::vector<double> breaks{0.0, 1.0};
-    for (int axis = 0; axis < 3; ++axis) {
-        if (std::abs(delta[axis]) <= kEpsilon)
-            continue;
-        for (const double bound : {low[axis], high[axis]}) {
-            const double t = (bound - start[axis]) / delta[axis];
-            if (t > 0.0 && t < 1.0)
-                breaks.push_back(t);
-        }
-    }
-    std::sort(breaks.begin(), breaks.end());
-    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
-    double best = std::numeric_limits<double>::infinity();
-    const auto evaluate = [&](double t) {
-        const cv::Vec3d point = start + delta * t;
-        double squared = 0.0;
-        for (int axis = 0; axis < 3; ++axis) {
-            const double outside = point[axis] < low[axis]
-                ? low[axis] - point[axis]
-                : point[axis] > high[axis]
-                    ? point[axis] - high[axis]
-                    : 0.0;
-            squared += outside * outside;
-        }
-        best = std::min(best, squared);
-    };
-    for (size_t interval = 0; interval + 1 < breaks.size(); ++interval) {
-        const double begin = breaks[interval];
-        const double finish = breaks[interval + 1];
-        evaluate(begin);
-        evaluate(finish);
-        const double middle = 0.5 * (begin + finish);
-        double quadratic = 0.0;
-        double linear = 0.0;
-        for (int axis = 0; axis < 3; ++axis) {
-            const double point = start[axis] + delta[axis] * middle;
-            double offset = 0.0;
-            if (point < low[axis])
-                offset = start[axis] - low[axis];
-            else if (point > high[axis])
-                offset = start[axis] - high[axis];
-            else
-                continue;
-            quadratic += delta[axis] * delta[axis];
-            linear += delta[axis] * offset;
-        }
-        if (quadratic > kEpsilon)
-            evaluate(std::clamp(-linear / quadratic, begin, finish));
-    }
-    return best;
-}
-
-double polylineAabbDistanceSquared(
-    const std::vector<cv::Vec3d>& points,
-    const cv::Vec3d& low,
-    const cv::Vec3d& high)
-{
-    double best = std::numeric_limits<double>::infinity();
-    if (points.size() == 1)
-        return segmentAabbDistanceSquared(points.front(), points.front(), low, high);
-    for (size_t index = 1; index < points.size(); ++index) {
-        best = std::min(best, segmentAabbDistanceSquared(
-            points[index - 1], points[index], low, high));
-    }
-    return best;
-}
-
 nlohmann::json pointJson(const cv::Vec3d& point)
 {
     return nlohmann::json::array({point[0], point[1], point[2]});
@@ -221,62 +147,11 @@ FiberReplayTube makeFiberReplayTube(
         tube.volumeCropBaseXYZWHD[axis + 3] = static_cast<size_t>(cropHigh - cropLow);
     }
 
-    const size_t cellSize = static_cast<size_t>(anchorCellSizePredictionVoxels);
-    const std::array<size_t, 3> cellShape{
-        (grid.shapeZYX[0] + cellSize - 1) / cellSize,
-        (grid.shapeZYX[1] + cellSize - 1) / cellSize,
-        (grid.shapeZYX[2] + cellSize - 1) / cellSize,
-    };
-    const double scale = grid.predictionToBaseScale;
-    const double radiusSquared = radiusBaseVoxels * radiusBaseVoxels;
-    std::array<size_t, 3> cellBeginZYX{};
-    std::array<size_t, 3> cellEndZYX{};
-    for (size_t axis = 0; axis < 3; ++axis) {
-        const size_t xyz = 2 - axis;
-        const double cropBeginPrediction =
-            static_cast<double>(tube.volumeCropBaseXYZWHD[xyz]) / scale;
-        const double cropEndPrediction =
-            static_cast<double>(tube.volumeCropBaseXYZWHD[xyz] +
-                                tube.volumeCropBaseXYZWHD[xyz + 3]) /
-            scale;
-        cellBeginZYX[axis] = std::min(
-            cellShape[axis],
-            static_cast<size_t>(std::max(0.0, std::floor(cropBeginPrediction /
-                static_cast<double>(cellSize)))));
-        cellEndZYX[axis] = std::min(
-            cellShape[axis],
-            static_cast<size_t>(std::max(0.0, std::ceil(cropEndPrediction /
-                static_cast<double>(cellSize)))));
-    }
-    for (size_t cz = cellBeginZYX[0]; cz < cellEndZYX[0]; ++cz) {
-        for (size_t cy = cellBeginZYX[1]; cy < cellEndZYX[1]; ++cy) {
-            for (size_t cx = cellBeginZYX[2]; cx < cellEndZYX[2]; ++cx) {
-                const std::array<size_t, 3> begin{cz * cellSize, cy * cellSize, cx * cellSize};
-                const std::array<size_t, 3> end{
-                    std::min(grid.shapeZYX[0], begin[0] + cellSize),
-                    std::min(grid.shapeZYX[1], begin[1] + cellSize),
-                    std::min(grid.shapeZYX[2], begin[2] + cellSize),
-                };
-                const cv::Vec3d cellLow{
-                    (static_cast<double>(begin[2]) - 0.5) * scale,
-                    (static_cast<double>(begin[1]) - 0.5) * scale,
-                    (static_cast<double>(begin[0]) - 0.5) * scale,
-                };
-                const cv::Vec3d cellHigh{
-                    (static_cast<double>(end[2]) - 0.5) * scale,
-                    (static_cast<double>(end[1]) - 0.5) * scale,
-                    (static_cast<double>(end[0]) - 0.5) * scale,
-                };
-                if (polylineAabbDistanceSquared(
-                        tube.referenceIntervalBase, cellLow, cellHigh) <=
-                    radiusSquared + kEpsilon) {
-                    tube.cellsZYX.push_back({cz, cy, cx});
-                }
-            }
-        }
-    }
-    if (tube.cellsZYX.empty())
-        throw std::runtime_error("fiber replay tube selects no prediction cells");
+    tube.cellsZYX = fiberAnchorCellsNearPolyline(
+        tube.referenceIntervalBase,
+        radiusBaseVoxels,
+        grid,
+        anchorCellSizePredictionVoxels);
     return tube;
 }
 

@@ -4594,16 +4594,17 @@ public:
             resolvers[2].resolve(nyRequest);
             const auto rawPresence = vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
             const auto direction = vc::lasagna::sampleLasagnaCompactAxisTensor(option.nx, option.ny, nxRequest, nyRequest);
-            if (!rawPresence.has_value() || !direction.has_value())
+            if (!rawPresence.has_value())
+                return;
+            samples[index].presence = clamp01(*rawPresence / 255.0);
+            samples[index].presenceValid = true;
+            if (!direction.has_value())
                 return;
             const double norm2 = direction->dot(*direction);
             if (!(norm2 > kEpsilon * kEpsilon) || !std::isfinite(norm2))
                 return;
-            samples[index] = {
-                *direction / std::sqrt(norm2),
-                clamp01(*rawPresence / 255.0),
-                true,
-            };
+            samples[index].direction = *direction / std::sqrt(norm2);
+            samples[index].valid = true;
         };
         const auto makeResolvers = [&]() {
             return std::array{

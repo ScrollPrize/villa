@@ -22,6 +22,8 @@ struct FiberAnchorObservation {
     cv::Vec3d direction{0.0, 0.0, 0.0};
     double presence = 0.0;
     bool valid = false;
+    cv::Vec3d presenceGradientPredictionXYZ{0.0, 0.0, 0.0};
+    bool presenceGradientValid = false;
 };
 
 struct FiberAnchorConfig {
@@ -30,12 +32,15 @@ struct FiberAnchorConfig {
     double peakSigmaPredictionVoxels = 1.5;
     double peakAxialSigmaPredictionVoxels = 6.0;
     double peakGridStepPredictionVoxels = 0.5;
+    double peakGradientWeight = 1.0;
+    double peakGradientReliabilityScale = 0.05;
     double gaussianCutoffSigmas = 3.0;
     double localWindowRadiusPredictionVoxels = 4.0;
     double axialSupportHalfWidthPredictionVoxels = 6.0;
     double positionConvergenceTolerancePredictionVoxels = 1.0e-4;
     double nmsMaximumAngleDegrees = 10.0;
-    double nmsLongitudinalRadiusPredictionVoxels = 2.0;
+    double nmsTransverseRadiusPredictionVoxels = 2.0;
+    double nmsLongitudinalRadiusPredictionVoxels = 1.0;
     double observationPresenceFloor = 0.05;
     double minimumAlignedSupport = 0.05;
     double mergeMaximumAngleDegrees = 10.0;
@@ -44,10 +49,20 @@ struct FiberAnchorConfig {
     size_t maximumSeedCount = 8;
     int maximumIterations = 64;
     double convergenceTolerance = 1.0e-12;
-    size_t processingBlockCellSide = 4;
-    size_t maximumSampleBlockBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    size_t maximumConcurrentSampleBytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
     int parallelThreads = 1;
 };
+
+struct FiberAnchorQuadraticPeakOffset {
+    double firstGridSteps = 0.0;
+    double secondGridSteps = 0.0;
+};
+
+// Samples are indexed [first + 1][second + 1] for offsets in {-1, 0, 1}.
+[[nodiscard]] std::optional<FiberAnchorQuadraticPeakOffset>
+fitFiberAnchorQuadraticPeak(
+    const std::array<std::array<double, 3>, 3>& response);
 
 struct FiberAnchorCrop {
     std::array<size_t, 3> originXYZ{0, 0, 0};
@@ -95,6 +110,10 @@ struct FiberAnchorDiagnosticRecord {
     size_t candidateId = 0;
     std::vector<size_t> parentIds;
     std::optional<FiberAnchor> anchor;
+    // Transient benchmark provenance. Deliberately omitted from artifacts.
+    std::optional<cv::Vec3d> discretePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3d> separablePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3d> jointPeakPositionPredictionXYZ;
     FiberAnchorDiagnosticMetrics metrics;
     FiberAnchorDiagnosticTransition transition;
 };
@@ -116,6 +135,9 @@ inline constexpr size_t kFiberAnchorDiagnosticStageCount =
 
 struct FiberAnchorComponent {
     FiberAnchor anchor;
+    std::optional<cv::Vec3d> discretePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3d> separablePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3d> jointPeakPositionPredictionXYZ;
     bool retained = false;
     std::string rejectionReason;
     size_t assignedObservationCount = 0;
@@ -173,6 +195,37 @@ struct FiberAnchorExtractionReport {
     double elapsedSeconds = 0.0;
 };
 
+struct FiberAnchorDistanceStatistics {
+    size_t count = 0;
+    std::optional<double> minimum;
+    std::optional<double> mean;
+    std::optional<double> median;
+    std::optional<double> percentile95;
+    std::optional<double> maximum;
+};
+
+struct FiberAnchorBenchmarkThreshold {
+    double thresholdBaseVoxels = 0.0;
+    size_t anchorHits = 0;
+    std::optional<double> anchorHitRate;
+    size_t cellHits = 0;
+    double cellHitRate = 0.0;
+};
+
+struct FiberAnchorBenchmarkStageReport {
+    size_t referenceCells = 0;
+    size_t cellsWithRefinedAnchors = 0;
+    size_t refinedAnchors = 0;
+    FiberAnchorDistanceStatistics anchorDistancesBaseVoxels;
+    std::vector<FiberAnchorBenchmarkThreshold> thresholds;
+};
+
+struct FiberAnchorBenchmarkReport {
+    FiberAnchorBenchmarkStageReport discrete;
+    FiberAnchorBenchmarkStageReport separable1d;
+    FiberAnchorBenchmarkStageReport joint2d;
+};
+
 struct FiberAnchorArtifactInfo {
     std::string sourceLocator;
     std::string manifestContentHash;
@@ -226,6 +279,25 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     std::vector<std::array<size_t, 3>> cellsZYX,
     const FiberAnchorRetainPredicate& retainPredicate = {},
     const FiberAnchorProgressCallback& progressCallback = {});
+
+[[nodiscard]] FiberAnchorExtractionReport extractRefinedFiberAnchorsForCells(
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& config,
+    const FiberStoredPredictionBatchSampler& sampler,
+    std::vector<std::array<size_t, 3>> cellsZYX,
+    const FiberAnchorProgressCallback& progressCallback = {});
+
+[[nodiscard]] std::vector<std::array<size_t, 3>>
+fiberAnchorCellsNearPolyline(
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    double radiusBaseVoxels,
+    const FiberPredictionGridInfo& grid,
+    int anchorCellSizePredictionVoxels);
+
+[[nodiscard]] FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
+    const FiberAnchorExtractionReport& anchors,
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    const std::vector<double>& thresholdsBaseVoxels);
 
 void suppressFiberAnchorDuplicates(
     std::vector<FiberCellAnchorResult>& cells,

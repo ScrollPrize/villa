@@ -1280,11 +1280,14 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         "peak_sigma_prediction_voxels",
         "peak_axial_sigma_prediction_voxels",
         "peak_grid_step_prediction_voxels",
+        "peak_gradient_weight",
+        "peak_gradient_reliability_scale",
         "gaussian_cutoff_sigmas",
         "local_window_radius_prediction_voxels",
         "axial_support_half_width_prediction_voxels",
         "position_convergence_tolerance_prediction_voxels",
         "nms_maximum_angle_degrees",
+        "nms_transverse_radius_prediction_voxels",
         "nms_longitudinal_radius_prediction_voxels",
         "observation_presence_floor",
         "minimum_aligned_support",
@@ -1312,6 +1315,11 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         finiteNumber(parameters.at("peak_axial_sigma_prediction_voxels"), "peak_axial_sigma_prediction_voxels");
     config.peakGridStepPredictionVoxels =
         finiteNumber(parameters.at("peak_grid_step_prediction_voxels"), "peak_grid_step_prediction_voxels");
+    config.peakGradientWeight =
+        finiteNumber(parameters.at("peak_gradient_weight"), "peak_gradient_weight");
+    config.peakGradientReliabilityScale = finiteNumber(
+        parameters.at("peak_gradient_reliability_scale"),
+        "peak_gradient_reliability_scale");
     config.gaussianCutoffSigmas =
         finiteNumber(parameters.at("gaussian_cutoff_sigmas"), "gaussian_cutoff_sigmas");
     config.localWindowRadiusPredictionVoxels =
@@ -1322,6 +1330,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         finiteNumber(parameters.at("position_convergence_tolerance_prediction_voxels"), "position_convergence_tolerance_prediction_voxels");
     config.nmsMaximumAngleDegrees =
         finiteNumber(parameters.at("nms_maximum_angle_degrees"), "nms_maximum_angle_degrees");
+    config.nmsTransverseRadiusPredictionVoxels =
+        finiteNumber(parameters.at("nms_transverse_radius_prediction_voxels"), "nms_transverse_radius_prediction_voxels");
     config.nmsLongitudinalRadiusPredictionVoxels =
         finiteNumber(parameters.at("nms_longitudinal_radius_prediction_voxels"), "nms_longitudinal_radius_prediction_voxels");
     config.observationPresenceFloor = finiteNumber(parameters.at("observation_presence_floor"), "observation_presence_floor");

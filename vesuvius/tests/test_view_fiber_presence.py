@@ -15,18 +15,20 @@ from vesuvius.scripts.view_fiber_presence import (
     LineObjGeometry,
     ReplayVisualArtifacts,
     anchor_path_representatives,
+    apply_replay_geometry_filter,
     build_parser,
     clipping_plane_in_layer_data,
     commit_with_rollback,
     common_shape_edge_width,
     crop_clipping_planes_in_base,
     crop_clipping_planes_in_layer_data,
-    distance_masked_colors,
     distance_visibility_mask,
     fiberlet_colormap_names,
     fiberlet_layer_features,
     fiberlet_quality_colormap_spec,
+    filtered_replay_geometry_data,
     load_fiber_replay_bundle,
+    make_replay_geometry_filter,
     mask_presence_by_distance,
     open_lazy_crop,
     parse_crop,
@@ -34,7 +36,10 @@ from vesuvius.scripts.view_fiber_presence import (
     read_anchor_cell_obj,
     read_anchor_stage_json,
     read_line_obj,
+    replace_replay_geometry_filter_sources,
+    replay_display_radius_defaults_base,
     replay_distance_transform_base,
+    replay_fiberlet_distances_base,
     replay_visual_topology,
     resolve_ome_zarr_level,
     select_base_crop,
@@ -46,9 +51,7 @@ from vesuvius.scripts.view_fiber_presence import (
 
 def test_anchor_stage_layers_are_enabled_by_default_with_explicit_opt_out():
     parser = build_parser()
-    assert parser.parse_args(
-        ["presence.zarr", "--crop", "0,0,0,1,1,1"]
-    ).anchor_stages
+    assert parser.parse_args(["presence.zarr", "--crop", "0,0,0,1,1,1"]).anchor_stages
     assert parser.parse_args(
         ["presence.zarr", "--crop", "0,0,0,1,1,1", "--anchor-stages"]
     ).anchor_stages
@@ -346,12 +349,15 @@ def _anchor_stage_root(stage, records):
             "peak_sigma_prediction_voxels": 1.5,
             "peak_axial_sigma_prediction_voxels": 6.0,
             "peak_grid_step_prediction_voxels": 0.5,
+            "peak_gradient_weight": 1.0,
+            "peak_gradient_reliability_scale": 0.05,
             "gaussian_cutoff_sigmas": 3.0,
             "local_window_radius_prediction_voxels": 4.0,
             "axial_support_half_width_prediction_voxels": 6.0,
             "position_convergence_tolerance_prediction_voxels": 0.0001,
             "nms_maximum_angle_degrees": 10.0,
-            "nms_longitudinal_radius_prediction_voxels": 2.0,
+            "nms_transverse_radius_prediction_voxels": 2.0,
+            "nms_longitudinal_radius_prediction_voxels": 1.0,
             "observation_presence_floor": 0.05,
             "minimum_aligned_support": 0.05,
             "merge_maximum_angle_degrees": 10.0,
@@ -415,9 +421,21 @@ def test_reads_and_validates_anchor_stage_chain(tmp_path):
         "nms": [_anchor_record(0, "final", parents=[0])],
     }
     stages = []
-    for stage, stage_records in records.items():
+    for index, (stage, stage_records) in enumerate(records.items()):
         path = tmp_path / f"{stage}.json"
-        path.write_text(json.dumps(_anchor_stage_root(stage, stage_records)))
+        root = _anchor_stage_root(stage, stage_records)
+        if index == 0:
+            del root["parameters"]
+        elif index == 1:
+            del root["parameters"]["peak_gradient_weight"]
+            del root["parameters"]["peak_gradient_reliability_scale"]
+        elif index == 2:
+            root["parameters"]["future_parameter"] = {"opaque": True}
+        elif index == 3:
+            root["parameters"] = ["opaque", "producer", "metadata"]
+        else:
+            root["future_metadata"] = {"ignored": True}
+        path.write_text(json.dumps(root))
         stages.append(read_anchor_stage_json(path, stage))
     final = LineObjGeometry(
         paths_zyx=[stages[-1].paths_zyx[0]],
@@ -448,24 +466,19 @@ def test_anchor_stage_rejects_extra_geometry(tmp_path):
         read_anchor_stage_json(path, "nms")
 
 
-def test_anchor_stage_rejects_extra_parameter(tmp_path):
-    root = _anchor_stage_root("nms", [_anchor_record(0, "final", parents=[0])])
-    root["parameters"]["unknown"] = 1.0
+def test_anchor_stage_cell_identity_is_not_bounded_by_extractor_parameters(tmp_path):
+    record = _anchor_record(0, "final", parents=[0])
+    record["cell_zyx"] = [100, 50, 25]
+    root = _anchor_stage_root("nms", [record])
+    root["selection"]["cells_zyx"] = [[100, 50, 25]]
+    root["parameters"]["cell_size_prediction_voxels"] = 1_000_000
     path = tmp_path / "nms.json"
     path.write_text(json.dumps(root))
 
-    with pytest.raises(ValueError, match="invalid anchor-stage parameters"):
-        read_anchor_stage_json(path, "nms")
+    stage = read_anchor_stage_json(path, "nms")
 
-
-def test_anchor_stage_rejects_missing_axial_peak_parameter(tmp_path):
-    root = _anchor_stage_root("nms", [_anchor_record(0, "final", parents=[0])])
-    del root["parameters"]["peak_axial_sigma_prediction_voxels"]
-    path = tmp_path / "nms.json"
-    path.write_text(json.dumps(root))
-
-    with pytest.raises(ValueError, match="invalid anchor-stage parameters"):
-        read_anchor_stage_json(path, "nms")
+    assert stage.record_count == 1
+    assert stage.features["cell_zyx"] == ["100_50_25"]
 
 
 def test_anchor_stage_chain_rejects_mixed_bindings(tmp_path):
@@ -551,6 +564,38 @@ def test_exact_anchor_distance_rejects_missing_or_nonfinite_geometry():
         )
 
 
+def test_exact_fiberlet_distance_uses_segment_interiors_and_degenerate_paths():
+    replay, artifacts = _reload_fixture()
+    fiberlets = replace(
+        artifacts.fiberlets,
+        paths_zyx=[
+            np.asarray([[0.0, -2.0, 1.0], [0.0, 2.0, 1.0]]),
+            np.asarray([[0.0, 3.0, 0.0], [0.0, 3.0, 2.0]]),
+            np.asarray([[0.0, 1.0, 1.0]]),
+        ],
+        trace_loss_total=[1.0, 2.0, 3.0],
+        loss_per_prediction_voxel=[0.1, 0.2, 0.3],
+        relative_quality=[0.9, 0.8, 0.7],
+    )
+
+    distances = replay_fiberlet_distances_base(replay, fiberlets)
+
+    np.testing.assert_allclose(distances, [0.0, 3.0, 1.0])
+    np.testing.assert_array_equal(
+        distance_visibility_mask(distances, 1.0), [True, False, True]
+    )
+    assert replay_fiberlet_distances_base(
+        replay, replace(fiberlets, paths_zyx=[])
+    ).shape == (0,)
+
+
+def test_replay_display_radius_defaults_are_independent_base_voxel_values():
+    defaults = replay_display_radius_defaults_base()
+    assert defaults == {"presence": 32.0, "anchors": 32.0, "fiberlets": 16.0}
+    defaults["fiberlets"] = 99.0
+    assert replay_display_radius_defaults_base()["fiberlets"] == 16.0
+
+
 def test_anchor_representatives_use_glyph_midpoint_and_offset_target():
     paths = [
         np.asarray([[2.0, 4.0, 6.0], [6.0, 8.0, 10.0]]),
@@ -567,27 +612,6 @@ def test_anchor_representatives_use_glyph_midpoint_and_offset_target():
     )
 
 
-def test_anchor_distance_colors_are_inclusive_reversible_and_nonmutating():
-    colors = np.asarray(
-        [
-            [1.0, 0.0, 0.0, 0.5],
-            [0.0, 1.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 0.75],
-        ]
-    )
-    original = colors.copy()
-    distances = np.asarray([0.0, 1.0, 2.0])
-
-    zero = distance_masked_colors(colors, distances, 0.0)
-    threshold = distance_masked_colors(colors, distances, 1.0)
-    restored = distance_masked_colors(colors, distances, 100.0)
-
-    np.testing.assert_array_equal(zero[:, 3], [0.5, 0.0, 0.0])
-    np.testing.assert_array_equal(threshold[:, 3], [0.5, 1.0, 0.0])
-    np.testing.assert_array_equal(restored[:, 3], [0.5, 1.0, 0.75])
-    np.testing.assert_array_equal(colors, original)
-
-
 def test_anchor_distance_visibility_mask_is_inclusive_and_supports_infinity():
     np.testing.assert_array_equal(
         distance_visibility_mask(np.asarray([0.0, 1.0, 2.0, np.inf]), 1.0),
@@ -596,9 +620,210 @@ def test_anchor_distance_visibility_mask_is_inclusive_and_supports_infinity():
 
 
 @pytest.mark.parametrize("radius", [-1.0, np.inf, np.nan])
-def test_anchor_distance_colors_reject_invalid_radius(radius):
-    with pytest.raises(ValueError, match="anchor radius"):
-        distance_masked_colors(np.ones((1, 4)), np.zeros(1), radius)
+def test_anchor_distance_filter_rejects_invalid_radius(radius):
+    with pytest.raises(ValueError, match="replay geometry radius"):
+        distance_visibility_mask(np.zeros(1), radius)
+
+
+class _FakeAnchorLayer:
+    def __init__(self, *, points=False):
+        self.data = np.empty((0, 3)) if points else []
+        self.features = {}
+        self.selected_data = {1}
+        if points:
+            self.size = np.asarray([3.5])
+            self.face_color = "old"
+        else:
+            self.edge_width = np.asarray([2.5])
+            self.edge_color = "old"
+
+
+def test_anchor_visual_filter_physically_subsets_shapes_and_features():
+    paths = [
+        np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        np.asarray([[1.0, 0.0, 0.0], [1.0, 0.0, 1.0]]),
+        np.asarray([[2.0, 0.0, 0.0], [2.0, 0.0, 1.0]]),
+    ]
+    features = {
+        "candidate": [10, 11, 12],
+        "detail": [{"value": 1}, {"value": 2}, {"value": 3}],
+    }
+    layer = _FakeAnchorLayer()
+    visual_filter = make_replay_geometry_filter(
+        key="stage:refined",
+        layer=layer,
+        source_data=paths,
+        source_features=features,
+        distances_base_voxels=np.asarray([0.0, 1.0, 2.0]),
+        color_attribute="edge_color",
+        color_value="magenta",
+    )
+    paths[0][0, 0] = 99.0
+    features["detail"][0]["value"] = 99
+
+    data, selected_features = filtered_replay_geometry_data(visual_filter, 1.0)
+    assert len(data) == 2
+    assert selected_features == {
+        "candidate": [10, 11],
+        "detail": [{"value": 1}, {"value": 2}],
+    }
+    assert data[0][0, 0] == 0.0
+
+    apply_replay_geometry_filter(visual_filter, 1.0)
+    assert len(layer.data) == 2
+    assert layer.features == selected_features
+    assert layer.edge_color == "magenta"
+    np.testing.assert_array_equal(layer.edge_width, 2.5)
+    assert layer.selected_data == set()
+
+    layer.data[0][0, 0] = 88.0
+    layer.edge_width = []
+    apply_replay_geometry_filter(visual_filter, 100.0)
+    assert len(layer.data) == 3
+    assert layer.data[0][0, 0] == 0.0
+    assert layer.features["candidate"] == [10, 11, 12]
+    assert layer.edge_width == 2.5
+
+
+def test_anchor_visual_filter_physically_removes_all_point_geometry():
+    layer = _FakeAnchorLayer(points=True)
+    visual_filter = make_replay_geometry_filter(
+        key="cell_centers",
+        layer=layer,
+        source_data=np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        distances_base_voxels=np.asarray([1.0, 2.0]),
+        color_attribute="face_color",
+        color_value="yellow",
+    )
+
+    apply_replay_geometry_filter(visual_filter, 0.0)
+    assert layer.data.shape == (0, 3)
+    assert layer.face_color == "yellow"
+    np.testing.assert_array_equal(layer.size, 3.5)
+
+    layer.size = []
+    apply_replay_geometry_filter(visual_filter, 1.0)
+    np.testing.assert_array_equal(layer.data, [[1.0, 2.0, 3.0]])
+    assert layer.size == 3.5
+
+
+def test_anchor_visual_filter_rejects_misaligned_distances_and_features():
+    layer = _FakeAnchorLayer()
+    paths = [np.zeros((2, 3)), np.ones((2, 3))]
+    with pytest.raises(ValueError, match="distances do not match"):
+        make_replay_geometry_filter(
+            key="anchors",
+            layer=layer,
+            source_data=paths,
+            distances_base_voxels=np.zeros(1),
+            color_attribute="edge_color",
+            color_value="cyan",
+        )
+    with pytest.raises(ValueError, match="feature 'candidate'"):
+        make_replay_geometry_filter(
+            key="anchors",
+            layer=layer,
+            source_data=paths,
+            source_features={"candidate": [1]},
+            distances_base_voxels=np.zeros(2),
+            color_attribute="edge_color",
+            color_value="cyan",
+        )
+
+
+def test_anchor_visual_filter_reload_handles_zero_counts_and_rollback():
+    layer = _FakeAnchorLayer()
+    original = make_replay_geometry_filter(
+        key="anchors",
+        layer=layer,
+        source_data=[np.zeros((2, 3)), np.ones((2, 3))],
+        distances_base_voxels=np.asarray([0.0, 2.0]),
+        color_attribute="edge_color",
+        color_value="cyan",
+    )
+    apply_replay_geometry_filter(original, 0.0)
+    assert len(layer.data) == 1
+
+    empty = replace_replay_geometry_filter_sources(
+        [original], {"anchors": ([], None)}, {}
+    )[0]
+    apply_replay_geometry_filter(empty, 100.0)
+    assert layer.data == []
+
+    replacement = replace_replay_geometry_filter_sources(
+        [original],
+        {"anchors": ([np.full((2, 3), 4.0)], None)},
+        {"anchors": np.asarray([0.0])},
+    )[0]
+
+    def commit():
+        apply_replay_geometry_filter(replacement, 0.0)
+        raise RuntimeError("injected")
+
+    def rollback():
+        apply_replay_geometry_filter(original, 0.0)
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        commit_with_rollback(commit, rollback)
+    assert len(layer.data) == 1
+    np.testing.assert_array_equal(layer.data[0], np.zeros((2, 3)))
+
+    apply_replay_geometry_filter(replacement, 100.0)
+    assert len(layer.data) == 1
+    np.testing.assert_array_equal(layer.data[0], np.full((2, 3), 4.0))
+
+
+def test_fiberlet_filter_keeps_features_and_width_across_empty_replacement():
+    layer = _FakeAnchorLayer()
+    paths = [np.zeros((2, 3)), np.ones((2, 3))]
+    visual_filter = make_replay_geometry_filter(
+        key="fiberlets",
+        layer=layer,
+        source_data=paths,
+        source_features={"relative_quality": [0.25, 0.75]},
+        distances_base_voxels=np.asarray([1.0, 2.0]),
+        color_attribute="edge_color",
+        color_value="relative_quality",
+        empty_color_value="gray",
+    )
+    layer._vc_display_edge_width = 4.25
+    layer.edge_width = []
+
+    apply_replay_geometry_filter(visual_filter, 1.0)
+    assert len(layer.data) == 1
+    assert layer.features == {"relative_quality": [0.25]}
+    assert layer.edge_color == "relative_quality"
+    assert layer.edge_width == 4.25
+
+    apply_replay_geometry_filter(visual_filter, 0.0)
+    assert layer.data == []
+    assert visual_filter.display_width == 4.25
+
+    empty = replace_replay_geometry_filter_sources(
+        [visual_filter],
+        {"fiberlets": ([], {"relative_quality": []})},
+        {},
+    )[0]
+    apply_replay_geometry_filter(empty, 16.0)
+    assert layer.data == []
+    assert layer.edge_color == "gray"
+    assert layer.edge_width == 4.25
+
+    restored = replace_replay_geometry_filter_sources(
+        [empty],
+        {
+            "fiberlets": (
+                [np.full((2, 3), 3.0)],
+                {"relative_quality": [0.9]},
+            )
+        },
+        {"fiberlets": np.asarray([15.0])},
+    )[0]
+    apply_replay_geometry_filter(restored, 16.0)
+    assert len(layer.data) == 1
+    assert layer.features == {"relative_quality": [0.9]}
+    assert layer.edge_color == "relative_quality"
+    assert layer.edge_width == 4.25
 
 
 def test_replay_bundle_rejects_hash_mismatch(tmp_path):

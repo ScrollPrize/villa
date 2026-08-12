@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -88,6 +89,20 @@ class ReplayVisualArtifacts:
     fiberlets: LineObjGeometry
 
 
+@dataclass
+class ReplayGeometryFilter:
+    key: str
+    layer: object
+    source_data: np.ndarray | tuple[np.ndarray, ...]
+    source_features: dict[str, tuple] | None
+    distances_base_voxels: np.ndarray
+    color_attribute: str
+    color_value: str
+    empty_color_value: str | None
+    display_width: float | None
+    display_size: float | None
+
+
 _LINE_OBJ_HEADERS = {
     "anchors": "# vc_fiberlet_anchors version 1",
     "paths": "# vc_fiberlets version 1",
@@ -95,6 +110,9 @@ _LINE_OBJ_HEADERS = {
 
 
 _FIBERLET_QUALITY_COLORMAP = "red-yellow-green"
+_DEFAULT_PRESENCE_RADIUS_BASE_VOXELS = 32.0
+_DEFAULT_ANCHOR_RADIUS_BASE_VOXELS = 32.0
+_DEFAULT_FIBERLET_RADIUS_BASE_VOXELS = 16.0
 _ANCHOR_STAGE_NAMES = ("initialized", "refined", "support", "selection", "nms")
 _ANCHOR_STAGE_COLORS = {
     "initialized": "blue",
@@ -103,15 +121,15 @@ _ANCHOR_STAGE_COLORS = {
     "selection": "white",
     "nms": "lime",
 }
-_ANCHOR_FILTER_RGBA = {
-    "anchors": np.asarray([0.0, 1.0, 1.0, 1.0]),
-    "stage:initialized": np.asarray([0.0, 0.0, 1.0, 1.0]),
-    "stage:refined": np.asarray([1.0, 0.0, 1.0, 1.0]),
-    "stage:support": np.asarray([1.0, 0.6470588235294118, 0.0, 1.0]),
-    "stage:selection": np.asarray([1.0, 1.0, 1.0, 1.0]),
-    "stage:nms": np.asarray([0.0, 1.0, 0.0, 1.0]),
-    "displacements": np.asarray([1.0, 0.6470588235294118, 0.0, 1.0]),
-}
+
+
+def replay_display_radius_defaults_base() -> dict[str, float]:
+    """Return independent replay display radii in base voxels."""
+    return {
+        "presence": _DEFAULT_PRESENCE_RADIUS_BASE_VOXELS,
+        "anchors": _DEFAULT_ANCHOR_RADIUS_BASE_VOXELS,
+        "fiberlets": _DEFAULT_FIBERLET_RADIUS_BASE_VOXELS,
+    }
 
 
 def _fnv1a64(data: bytes) -> str:
@@ -245,27 +263,26 @@ def _finite_number(value) -> bool:
 def read_anchor_stage_json(
     path: str | Path, expected_stage: str
 ) -> AnchorStageGeometry:
-    """Read one strict anchor-pipeline diagnostic stage."""
+    """Read one compatible anchor-pipeline diagnostic stage."""
     stage_path = Path(path)
     try:
         root = json.loads(stage_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read anchor stage {stage_path}: {exc}") from exc
-    expected_root = {
+    required_root = {
         "format",
         "version",
         "stage",
         "source",
         "coordinates",
         "selection",
-        "parameters",
         "glyph_length_base_voxels",
         "summary",
         "records",
     }
     if (
         not isinstance(root, dict)
-        or set(root) != expected_root
+        or not required_root.issubset(root)
         or root.get("format") != "vc_fiberlet_anchor_stage"
         or root.get("version") != 1
         or root.get("stage") != expected_stage
@@ -313,43 +330,8 @@ def read_anchor_stage_json(
         or coordinates["base_voxel_size_um"] <= 0
     ):
         raise ValueError(f"{stage_path}: invalid base voxel size")
-    parameter_keys = {
-        "cell_size_prediction_voxels",
-        "gaussian_sigma_prediction_voxels",
-        "peak_sigma_prediction_voxels",
-        "peak_axial_sigma_prediction_voxels",
-        "peak_grid_step_prediction_voxels",
-        "gaussian_cutoff_sigmas",
-        "local_window_radius_prediction_voxels",
-        "axial_support_half_width_prediction_voxels",
-        "position_convergence_tolerance_prediction_voxels",
-        "nms_maximum_angle_degrees",
-        "nms_longitudinal_radius_prediction_voxels",
-        "observation_presence_floor",
-        "minimum_aligned_support",
-        "merge_maximum_angle_degrees",
-        "merge_maximum_absolute_objective_loss",
-        "merge_maximum_relative_objective_loss",
-        "maximum_seed_count",
-        "maximum_iterations",
-        "convergence_tolerance",
-    }
-    parameters = root["parameters"]
-    if (
-        not isinstance(parameters, dict)
-        or set(parameters) != parameter_keys
-        or any(not _finite_number(value) for value in parameters.values())
-    ):
-        raise ValueError(f"{stage_path}: invalid anchor-stage parameters")
-    cell_size = parameters["cell_size_prediction_voxels"]
     glyph = root["glyph_length_base_voxels"]
-    if (
-        not isinstance(cell_size, int)
-        or isinstance(cell_size, bool)
-        or cell_size < 1
-        or not _finite_number(glyph)
-        or glyph <= 0
-    ):
+    if not _finite_number(glyph) or glyph <= 0:
         raise ValueError(f"{stage_path}: invalid anchor-stage dimensions")
     selection = root["selection"]
     cells = selection.get("cells_zyx") if isinstance(selection, dict) else None
@@ -360,7 +342,6 @@ def read_anchor_stage_json(
         or not cells
     ):
         raise ValueError(f"{stage_path}: invalid anchor-stage selection")
-    cell_limits = [math.ceil(value / cell_size) for value in shape]
     cell_keys = []
     for cell in cells:
         if (
@@ -369,10 +350,7 @@ def read_anchor_stage_json(
             or any(
                 not isinstance(value, int) or isinstance(value, bool) for value in cell
             )
-            or any(
-                value < 0 or value >= cell_limits[axis]
-                for axis, value in enumerate(cell)
-            )
+            or any(value < 0 for value in cell)
         ):
             raise ValueError(f"{stage_path}: invalid selected anchor cell")
         cell_keys.append(tuple(cell))
@@ -621,7 +599,6 @@ def read_anchor_stage_json(
             "source": source,
             "coordinates": coordinates,
             "selection": selection,
-            "parameters": parameters,
             "glyph_length_base_voxels": glyph,
         },
         records=tuple(normalized),
@@ -1007,7 +984,9 @@ def load_fiber_replay_bundle(
             try:
                 content = artifact.read_bytes()
             except OSError as exc:
-                raise ValueError(f"cannot read replay artifact {artifact}: {exc}") from exc
+                raise ValueError(
+                    f"cannot read replay artifact {artifact}: {exc}"
+                ) from exc
             if _fnv1a64(content) != descriptor["content_hash"]:
                 raise ValueError(f"replay artifact hash mismatch: {relative}")
         resolved[key] = artifact
@@ -1617,6 +1596,12 @@ def common_shape_edge_width(layer, default: float = 2.0) -> float:
     """Read the common width from napari's per-shape edge-width collection."""
     if layer is None:
         return default
+    stored_width = getattr(layer, "_vc_display_edge_width", None)
+    if stored_width is not None:
+        width = float(stored_width)
+        if not math.isfinite(width) or width <= 0:
+            raise ValueError("shape edge width must be positive and finite")
+        return width
     widths = np.asarray(layer.edge_width, dtype=np.float64).reshape(-1)
     if widths.size == 0:
         return default
@@ -1631,6 +1616,7 @@ def set_common_shape_edge_width(layer, width: float) -> None:
     width = float(width)
     if not math.isfinite(width) or width <= 0:
         raise ValueError("shape edge width must be positive and finite")
+    layer._vc_display_edge_width = width
     layer.edge_width = width
     layer.events.edge_width()
 
@@ -1654,6 +1640,9 @@ def add_clipping_controls(
     anchor_radius_base_voxels: float | None = None,
     maximum_anchor_radius_base_voxels: float | None = None,
     set_anchor_radius: Callable[[float], None] | None = None,
+    fiberlet_radius_base_voxels: float | None = None,
+    maximum_fiberlet_radius_base_voxels: float | None = None,
+    set_fiberlet_radius: Callable[[float], None] | None = None,
     reload_artifacts: Callable[[], str] | None = None,
 ) -> None:
     from qtpy.QtCore import Qt
@@ -1743,6 +1732,7 @@ def add_clipping_controls(
     anchor_cell_size.setValue(
         float(np.asarray(anchor_cell_centers_layer.size).reshape(-1)[0])
         if anchor_cell_centers_layer is not None
+        and np.asarray(anchor_cell_centers_layer.size).size
         else 2.0
     )
     anchor_cell_size.setEnabled(anchor_cell_centers_layer is not None)
@@ -1831,6 +1821,25 @@ def add_clipping_controls(
                 ),
                 anchor_radius_base_voxels,
                 set_anchor_radius,
+            )
+        )
+    if set_fiberlet_radius is not None:
+        if (
+            fiberlet_radius_base_voxels is None
+            or maximum_fiberlet_radius_base_voxels is None
+        ):
+            raise ValueError(
+                "fiberlet radius controls require initial and maximum values"
+            )
+        radius_controls.append(
+            (
+                add_radius_control(
+                    "Fiberlet radius",
+                    fiberlet_radius_base_voxels,
+                    maximum_fiberlet_radius_base_voxels,
+                ),
+                fiberlet_radius_base_voxels,
+                set_fiberlet_radius,
             )
         )
     reload_button = None
@@ -2428,24 +2437,158 @@ def replay_anchor_distances_base(
     return result
 
 
-def distance_masked_colors(
-    colors: np.ndarray,
-    distances_base_voxels: np.ndarray,
-    radius_base_voxels: float,
+def replay_fiberlet_distances_base(
+    replay: FiberReplayBundle,
+    fiberlets: LineObjGeometry,
 ) -> np.ndarray:
-    """Hide items beyond an inclusive radius without mutating source colors."""
-    rgba = np.asarray(colors, dtype=np.float64)
-    distances = np.asarray(distances_base_voxels, dtype=np.float64)
-    if rgba.ndim != 2 or rgba.shape[1:] != (4,):
-        raise ValueError("anchor colors must be an Nx4 RGBA array")
-    if distances.shape != (len(rgba),):
-        raise ValueError("anchor colors and distances differ in length")
-    if not np.isfinite(rgba).all():
-        raise ValueError("anchor colors contain non-finite values")
-    visible = distance_visibility_mask(distances, radius_base_voxels)
-    masked = rgba.copy()
-    masked[~visible, 3] = 0.0
-    return masked
+    """Return each rendered fiberlet polyline's exact replay-line distance."""
+    if not fiberlets.paths_zyx:
+        return np.empty(0, dtype=np.float64)
+    target_starts = []
+    target_ends = []
+    for index, value in enumerate((replay.reference_zyx, replay.trace_zyx)):
+        starts, ends = _polyline_segments_base(value, f"replay polyline {index}")
+        target_starts.append(starts)
+        target_ends.append(ends)
+    targets_start = np.concatenate(target_starts, axis=0)
+    targets_end = np.concatenate(target_ends, axis=0)
+
+    result = np.full(len(fiberlets.paths_zyx), np.inf, dtype=np.float64)
+    segment_batch = 256
+    for path_index, path in enumerate(fiberlets.paths_zyx):
+        starts, ends = _polyline_segments_base(path, f"fiberlet geometry {path_index}")
+        minimum_squared = np.inf
+        for source_offset in range(0, len(starts), segment_batch):
+            source_slice = slice(source_offset, source_offset + segment_batch)
+            for target_offset in range(0, len(targets_start), segment_batch):
+                target_slice = slice(target_offset, target_offset + segment_batch)
+                pairwise = _segment_pair_distances_squared(
+                    starts[source_slice],
+                    ends[source_slice],
+                    targets_start[target_slice],
+                    targets_end[target_slice],
+                )
+                minimum_squared = min(minimum_squared, float(np.min(pairwise)))
+        result[path_index] = math.sqrt(max(0.0, minimum_squared))
+    return result
+
+
+def _polyline_segments_base(
+    value: np.ndarray,
+    name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    polyline = np.asarray(value, dtype=np.float64)
+    if polyline.ndim != 2 or polyline.shape[1:] != (3,) or len(polyline) < 1:
+        raise ValueError(f"{name} must contain ZYX points")
+    if not np.isfinite(polyline).all():
+        raise ValueError(f"{name} contains non-finite coordinates")
+    if len(polyline) == 1:
+        return polyline, polyline
+    return polyline[:-1], polyline[1:]
+
+
+def _segment_pair_distances_squared(
+    first_starts: np.ndarray,
+    first_ends: np.ndarray,
+    second_starts: np.ndarray,
+    second_ends: np.ndarray,
+) -> np.ndarray:
+    """Return exact pairwise 3D segment distances with bounded caller batches."""
+    first_directions = first_ends - first_starts
+    second_directions = second_ends - second_starts
+    relative = first_starts[:, np.newaxis, :] - second_starts[np.newaxis, :, :]
+    first_length = np.einsum("ij,ij->i", first_directions, first_directions)[
+        :, np.newaxis
+    ]
+    second_length = np.einsum("ij,ij->i", second_directions, second_directions)[
+        np.newaxis, :
+    ]
+    cross = first_directions @ second_directions.T
+    first_relative = np.einsum("ijk,ik->ij", relative, first_directions)
+    second_relative = np.einsum("ijk,jk->ij", relative, second_directions)
+    epsilon = np.finfo(np.float64).eps
+
+    def squared_at(first_fraction, second_fraction):
+        offset = (
+            relative
+            + first_fraction[:, :, np.newaxis] * first_directions[:, np.newaxis, :]
+            - second_fraction[:, :, np.newaxis] * second_directions[np.newaxis, :, :]
+        )
+        return np.einsum("ijk,ijk->ij", offset, offset)
+
+    zeros = np.zeros_like(cross)
+    minimum = np.full_like(cross, np.inf)
+
+    denominator = first_length * second_length - cross * cross
+    nonparallel = denominator > epsilon * first_length * second_length
+    first_fraction = np.divide(
+        cross * second_relative - second_length * first_relative,
+        denominator,
+        out=zeros.copy(),
+        where=nonparallel,
+    )
+    second_fraction = np.divide(
+        first_length * second_relative - cross * first_relative,
+        denominator,
+        out=zeros.copy(),
+        where=nonparallel,
+    )
+    interior = (
+        nonparallel
+        & (first_fraction >= 0.0)
+        & (first_fraction <= 1.0)
+        & (second_fraction >= 0.0)
+        & (second_fraction <= 1.0)
+    )
+    minimum = np.minimum(
+        minimum,
+        np.where(interior, squared_at(first_fraction, second_fraction), np.inf),
+    )
+
+    second_on_first_start = np.clip(
+        np.divide(
+            second_relative,
+            second_length,
+            out=zeros.copy(),
+            where=second_length > 0.0,
+        ),
+        0.0,
+        1.0,
+    )
+    minimum = np.minimum(minimum, squared_at(zeros, second_on_first_start))
+    second_on_first_end = np.clip(
+        np.divide(
+            second_relative + cross,
+            second_length,
+            out=zeros.copy(),
+            where=second_length > 0.0,
+        ),
+        0.0,
+        1.0,
+    )
+    minimum = np.minimum(minimum, squared_at(np.ones_like(cross), second_on_first_end))
+    first_on_second_start = np.clip(
+        np.divide(
+            -first_relative,
+            first_length,
+            out=zeros.copy(),
+            where=first_length > 0.0,
+        ),
+        0.0,
+        1.0,
+    )
+    minimum = np.minimum(minimum, squared_at(first_on_second_start, zeros))
+    first_on_second_end = np.clip(
+        np.divide(
+            cross - first_relative,
+            first_length,
+            out=zeros.copy(),
+            where=first_length > 0.0,
+        ),
+        0.0,
+        1.0,
+    )
+    return np.minimum(minimum, squared_at(first_on_second_end, np.ones_like(cross)))
 
 
 def distance_visibility_mask(
@@ -2455,12 +2598,163 @@ def distance_visibility_mask(
     """Return the inclusive visibility mask for a base-voxel radius."""
     distances = np.asarray(distances_base_voxels, dtype=np.float64)
     if distances.ndim != 1:
-        raise ValueError("anchor distances must be one-dimensional")
+        raise ValueError("replay geometry distances must be one-dimensional")
     if np.isnan(distances).any() or np.any(distances < 0):
-        raise ValueError("anchor distances must be non-negative and not NaN")
+        raise ValueError("replay geometry distances must be non-negative and not NaN")
     if not math.isfinite(radius_base_voxels) or radius_base_voxels < 0:
-        raise ValueError("anchor radius must be finite and non-negative")
+        raise ValueError("replay geometry radius must be finite and non-negative")
     return distances <= radius_base_voxels
+
+
+def make_replay_geometry_filter(
+    *,
+    key: str,
+    layer,
+    source_data: np.ndarray | Sequence[np.ndarray],
+    distances_base_voxels: np.ndarray,
+    color_attribute: str,
+    color_value: str,
+    empty_color_value: str | None = None,
+    source_features: dict[str, Sequence] | None = None,
+) -> ReplayGeometryFilter:
+    """Retain a defensive full-population copy for reversible layer filtering."""
+    if isinstance(source_data, np.ndarray):
+        copied_data: np.ndarray | tuple[np.ndarray, ...] = np.array(
+            source_data, copy=True
+        )
+    else:
+        copied_data = tuple(np.array(value, copy=True) for value in source_data)
+    count = len(copied_data)
+    distances = np.array(distances_base_voxels, dtype=np.float64, copy=True)
+    if distances.shape != (count,):
+        raise ValueError("replay geometry distances do not match geometry")
+    distance_visibility_mask(distances, 0.0)
+
+    copied_features = None
+    if source_features is not None:
+        copied_features = {}
+        for name, values in source_features.items():
+            if len(values) != count:
+                raise ValueError(
+                    f"replay geometry feature {name!r} does not match geometry"
+                )
+            copied_features[name] = tuple(copy.deepcopy(value) for value in values)
+    return ReplayGeometryFilter(
+        key=key,
+        layer=layer,
+        source_data=copied_data,
+        source_features=copied_features,
+        distances_base_voxels=distances,
+        color_attribute=color_attribute,
+        color_value=color_value,
+        empty_color_value=empty_color_value,
+        display_width=(
+            common_shape_edge_width(layer) if hasattr(layer, "edge_width") else None
+        ),
+        display_size=(
+            float(np.asarray(layer.size).reshape(-1)[0])
+            if hasattr(layer, "size") and np.asarray(layer.size).size
+            else None
+        ),
+    )
+
+
+def filtered_replay_geometry_data(
+    visual_filter: ReplayGeometryFilter,
+    radius_base_voxels: float,
+) -> tuple[np.ndarray | list[np.ndarray], dict[str, list] | None]:
+    """Return the source-ordered geometry and features inside a replay radius."""
+    visible = distance_visibility_mask(
+        visual_filter.distances_base_voxels, radius_base_voxels
+    )
+    indices = np.flatnonzero(visible)
+    if isinstance(visual_filter.source_data, np.ndarray):
+        data: np.ndarray | list[np.ndarray] = np.array(
+            visual_filter.source_data[indices], copy=True
+        )
+    else:
+        data = [
+            np.array(visual_filter.source_data[index], copy=True) for index in indices
+        ]
+    features = None
+    if visual_filter.source_features is not None:
+        features = {
+            name: [copy.deepcopy(values[index]) for index in indices]
+            for name, values in visual_filter.source_features.items()
+        }
+    return data, features
+
+
+def apply_replay_geometry_filter(
+    visual_filter: ReplayGeometryFilter,
+    radius_base_voxels: float,
+) -> None:
+    """Physically remove out-of-radius geometry from one Napari layer."""
+    layer = visual_filter.layer
+    data, features = filtered_replay_geometry_data(visual_filter, radius_base_voxels)
+    if hasattr(layer, "edge_width") and (
+        getattr(layer, "_vc_display_edge_width", None) is not None
+        or np.asarray(layer.edge_width).size
+    ):
+        visual_filter.display_width = common_shape_edge_width(layer)
+    if hasattr(layer, "size") and np.asarray(layer.size).size:
+        visual_filter.display_size = float(np.asarray(layer.size).reshape(-1)[0])
+    if hasattr(layer, "selected_data"):
+        layer.selected_data = set()
+    layer.data = data
+    if features is not None:
+        layer.features = features
+    color_value = (
+        visual_filter.empty_color_value
+        if not len(visual_filter.source_data)
+        and visual_filter.empty_color_value is not None
+        else visual_filter.color_value
+    )
+    setattr(layer, visual_filter.color_attribute, color_value)
+    if visual_filter.display_width is not None:
+        layer.edge_width = visual_filter.display_width
+    if visual_filter.display_size is not None:
+        layer.size = visual_filter.display_size
+
+
+def replace_replay_geometry_filter_sources(
+    templates: Sequence[ReplayGeometryFilter],
+    sources: dict[
+        str,
+        tuple[np.ndarray | Sequence[np.ndarray], dict[str, Sequence] | None],
+    ],
+    distances_by_key: dict[str, np.ndarray],
+) -> list[ReplayGeometryFilter]:
+    """Prepare reload filter state without mutating any displayed layer."""
+    template_by_key = {value.key: value for value in templates}
+    if len(template_by_key) != len(templates):
+        raise ValueError("replay geometry filter keys are duplicated")
+    if set(sources) != set(template_by_key) or not set(distances_by_key).issubset(
+        template_by_key
+    ):
+        raise ValueError("reloaded replay geometry layer topology differs")
+    replacements = []
+    for key, template in template_by_key.items():
+        source_data, source_features = sources[key]
+        distances = distances_by_key.get(key)
+        if distances is None:
+            if len(source_data):
+                raise ValueError("reloaded replay geometry distances are missing")
+            distances = np.empty(0, dtype=np.float64)
+        replacement = make_replay_geometry_filter(
+            key=key,
+            layer=template.layer,
+            source_data=source_data,
+            source_features=source_features,
+            distances_base_voxels=distances,
+            color_attribute=template.color_attribute,
+            color_value=template.color_value,
+            empty_color_value=template.empty_color_value,
+        )
+        replacement.display_width = template.display_width
+        replacement.display_size = template.display_size
+        replacements.append(replacement)
+    return replacements
 
 
 def launch_viewer(
@@ -2480,6 +2774,7 @@ def launch_viewer(
             "napari is not installed; install the vesuvius GUI extra"
         ) from exc
 
+    display_radius_defaults = replay_display_radius_defaults_base()
     data, selection = open_lazy_crop(level, crop_xyzwhd)
     if replay is not None:
         import zarr
@@ -2521,7 +2816,7 @@ def launch_viewer(
             presence_distance_base,
             chunks=data.chunks,
         )
-        presence_radius_base_voxels = replay.tube_radius_base_voxels
+        presence_radius_base_voxels = display_radius_defaults["presence"]
         data = mask_presence_by_distance(
             presence_source_data,
             presence_distance_data,
@@ -2602,7 +2897,13 @@ def launch_viewer(
         "presence_radius": presence_radius_base_voxels,
         "anchor_visual_filters": [],
         "anchor_radius": (
-            replay.tube_radius_base_voxels
+            display_radius_defaults["anchors"]
+            if replay is not None and replay.tube_radius_base_voxels is not None
+            else None
+        ),
+        "fiberlet_visual_filter": None,
+        "fiberlet_radius": (
+            display_radius_defaults["fiberlets"]
             if replay is not None and replay.tube_radius_base_voxels is not None
             else None
         ),
@@ -2620,26 +2921,19 @@ def launch_viewer(
         )
 
     def set_anchor_radius(radius_base_voxels: float) -> None:
+        distance_visibility_mask(np.empty(0, dtype=np.float64), radius_base_voxels)
         derived_state["anchor_radius"] = radius_base_voxels
-        for _, layer, attribute, source_values, distances in derived_state[
-            "anchor_visual_filters"
-        ]:
-            if attribute == "shown":
-                layer.shown = source_values & distance_visibility_mask(
-                    distances, radius_base_voxels
-                )
-            else:
-                setattr(
-                    layer,
-                    attribute,
-                    distance_masked_colors(
-                        source_values,
-                        distances,
-                        radius_base_voxels,
-                    ),
-                )
+        for visual_filter in derived_state["anchor_visual_filters"]:
+            apply_replay_geometry_filter(visual_filter, radius_base_voxels)
 
-    anchor_filter_specs: list[tuple[str, object, str, np.ndarray]] = []
+    def set_fiberlet_radius(radius_base_voxels: float) -> None:
+        distance_visibility_mask(np.empty(0, dtype=np.float64), radius_base_voxels)
+        derived_state["fiberlet_radius"] = radius_base_voxels
+        visual_filter = derived_state["fiberlet_visual_filter"]
+        if visual_filter is not None:
+            apply_replay_geometry_filter(visual_filter, radius_base_voxels)
+
+    anchor_filter_specs: list[tuple] = []
     anchors_layer = None
     if anchors is not None and (anchors.paths_zyx or replay_artifacts is not None):
         anchors_layer = viewer.add_shapes(
@@ -2657,6 +2951,9 @@ def launch_viewer(
                 "anchors",
                 anchors_layer,
                 "edge_color",
+                "cyan",
+                anchors.paths_zyx,
+                None,
                 anchor_path_representatives(anchors.paths_zyx),
             )
         )
@@ -2683,6 +2980,9 @@ def launch_viewer(
                 f"stage:{stage.stage}",
                 layer,
                 "edge_color",
+                _ANCHOR_STAGE_COLORS[stage.stage],
+                stage.paths_zyx,
+                stage.features,
                 anchor_path_representatives(stage.paths_zyx),
             )
         )
@@ -2699,7 +2999,10 @@ def launch_viewer(
             (
                 "cell_centers",
                 anchor_cell_centers_layer,
-                "shown",
+                "face_color",
+                "yellow",
+                anchor_cells.centers_zyx,
+                None,
                 np.asarray(anchor_cells.centers_zyx, dtype=np.float64),
             )
         )
@@ -2718,6 +3021,9 @@ def launch_viewer(
                     "displacements",
                     anchor_displacements_layer,
                     "edge_color",
+                    "orange",
+                    anchor_cells.displacements_zyx,
+                    None,
                     anchor_path_representatives(
                         anchor_cells.displacements_zyx,
                         target_endpoint=True,
@@ -2789,29 +3095,78 @@ def launch_viewer(
         print("Computing exact replay distance for anchor diagnostics...")
         anchor_distances = replay_anchor_distances_base(replay, replay_artifacts)
         anchor_visual_filters = []
-        for key, layer, color_attribute, representatives in anchor_filter_specs:
+        for (
+            key,
+            layer,
+            color_attribute,
+            color_value,
+            source_data,
+            source_features,
+            representatives,
+        ) in anchor_filter_specs:
             distances = anchor_distances.get(key, np.empty(0, dtype=np.float64))
             count = len(representatives)
             if len(distances) != count:
                 raise ValueError("anchor diagnostic distances do not match geometry")
-            if color_attribute == "shown":
-                source_values = np.ones(count, dtype=bool)
-            else:
-                source_values = np.repeat(
-                    _ANCHOR_FILTER_RGBA[key][np.newaxis, :], count, axis=0
-                )
             anchor_visual_filters.append(
-                (key, layer, color_attribute, source_values.copy(), distances)
+                make_replay_geometry_filter(
+                    key=key,
+                    layer=layer,
+                    source_data=source_data,
+                    source_features=source_features,
+                    distances_base_voxels=distances,
+                    color_attribute=color_attribute,
+                    color_value=color_value,
+                )
             )
 
-        anchor_radius_base_voxels = replay.tube_radius_base_voxels
+        anchor_radius_base_voxels = display_radius_defaults["anchors"]
         maximum_anchor_radius_base_voxels = max(
             anchor_radius_base_voxels,
-            max(float(np.max(values)) for values in anchor_distances.values()),
+            max(
+                (
+                    float(np.max(values))
+                    for values in anchor_distances.values()
+                    if len(values)
+                ),
+                default=anchor_radius_base_voxels,
+            ),
         )
         derived_state["anchor_visual_filters"] = anchor_visual_filters
         set_anchor_radius(anchor_radius_base_voxels)
         set_anchor_radius_callback = set_anchor_radius
+
+    fiberlet_radius_base_voxels = None
+    maximum_fiberlet_radius_base_voxels = None
+    set_fiberlet_radius_callback = None
+    if (
+        replay is not None
+        and replay_artifacts is not None
+        and replay.tube_radius_base_voxels is not None
+        and paths_layer is not None
+    ):
+        print("Computing exact replay distance for fiberlet paths...")
+        fiberlet_distances = replay_fiberlet_distances_base(replay, fiberlets)
+        fiberlet_visual_filter = make_replay_geometry_filter(
+            key="fiberlets",
+            layer=paths_layer,
+            source_data=fiberlets.paths_zyx,
+            source_features=fiberlet_layer_features(fiberlets),
+            distances_base_voxels=fiberlet_distances,
+            color_attribute="edge_color",
+            color_value="relative_quality",
+            empty_color_value="gray",
+        )
+        fiberlet_radius_base_voxels = display_radius_defaults["fiberlets"]
+        maximum_fiberlet_radius_base_voxels = max(
+            fiberlet_radius_base_voxels,
+            float(np.max(fiberlet_distances))
+            if len(fiberlet_distances)
+            else fiberlet_radius_base_voxels,
+        )
+        derived_state["fiberlet_visual_filter"] = fiberlet_visual_filter
+        set_fiberlet_radius(fiberlet_radius_base_voxels)
+        set_fiberlet_radius_callback = set_fiberlet_radius
 
     reload_artifacts_callback = None
     if replay is not None and replay_artifacts is not None:
@@ -2821,26 +3176,46 @@ def launch_viewer(
         replay_state = {"replay": replay, "artifacts": replay_artifacts}
 
         def build_reloaded_anchor_filters(
+            artifacts: ReplayVisualArtifacts,
             distances_by_key: dict[str, np.ndarray],
-        ) -> list[tuple]:
-            templates = {
-                key: (layer, attribute)
-                for key, layer, attribute, _, _ in derived_state[
-                    "anchor_visual_filters"
-                ]
+        ) -> list[ReplayGeometryFilter]:
+            sources: dict[str, tuple[object, dict[str, Sequence] | None]] = {
+                "anchors": (artifacts.anchors.paths_zyx, None),
+                "cell_centers": (artifacts.anchor_cells.centers_zyx, None),
+                "displacements": (
+                    artifacts.anchor_cells.displacements_zyx,
+                    None,
+                ),
             }
-            filters = []
-            for key, (layer, attribute) in templates.items():
-                distances = distances_by_key.get(key, np.empty(0, dtype=np.float64))
-                count = len(distances)
-                if attribute == "shown":
-                    replacement_values = np.ones(count, dtype=bool)
-                else:
-                    replacement_values = np.repeat(
-                        _ANCHOR_FILTER_RGBA[key][np.newaxis, :], count, axis=0
+            sources.update(
+                {
+                    f"stage:{stage.stage}": (stage.paths_zyx, stage.features)
+                    for stage in artifacts.anchor_stages
+                }
+            )
+            return replace_replay_geometry_filter_sources(
+                derived_state["anchor_visual_filters"],
+                sources,
+                distances_by_key,
+            )
+
+        def build_reloaded_fiberlet_filter(
+            artifacts: ReplayVisualArtifacts,
+            distances: np.ndarray,
+        ) -> ReplayGeometryFilter:
+            template = derived_state["fiberlet_visual_filter"]
+            if template is None:
+                raise ValueError("fiberlet replay filter is unavailable")
+            return replace_replay_geometry_filter_sources(
+                [template],
+                {
+                    "fiberlets": (
+                        artifacts.fiberlets.paths_zyx,
+                        fiberlet_layer_features(artifacts.fiberlets),
                     )
-                filters.append((key, layer, attribute, replacement_values, distances))
-            return filters
+                },
+                {"fiberlets": distances},
+            )[0]
 
         def mutable_replay_layers() -> tuple:
             return tuple(
@@ -2865,7 +3240,8 @@ def launch_viewer(
             candidate_presence_data,
             candidate_presence_distance_base: np.ndarray,
             candidate_presence_distance_data,
-            candidate_anchor_filters: list[tuple],
+            candidate_anchor_filters: list[ReplayGeometryFilter],
+            candidate_fiberlet_filter: ReplayGeometryFilter,
             selected_data: dict[int, set] | None = None,
         ) -> None:
             layers = mutable_replay_layers()
@@ -2892,48 +3268,14 @@ def launch_viewer(
                         layer.edge_width = widths[id(layer)]
                     if id(layer) in sizes:
                         layer.size = sizes[id(layer)]
-                if anchors_layer is not None:
-                    anchors_layer.edge_color = "cyan"
-                for stage_name, layer in anchor_stage_layers_by_name.items():
-                    layer.edge_color = _ANCHOR_STAGE_COLORS[stage_name]
-                if anchor_displacements_layer is not None:
-                    anchor_displacements_layer.edge_color = "orange"
-                if anchor_cell_centers_layer is not None:
-                    anchor_cell_centers_layer.shown = np.ones(
-                        len(anchor_cell_centers_layer.data), dtype=bool
-                    )
-
                 reference_layer.data = [candidate_replay.reference_zyx]
                 trace_layer.data = [candidate_replay.trace_zyx]
                 failure_layer.data = candidate_replay.failure_zyx
-                if anchors_layer is not None:
-                    anchors_layer.data = candidate_artifacts.anchors.paths_zyx
                 for stage in candidate_artifacts.anchor_stages:
                     layer = anchor_stage_layers_by_name.get(stage.stage)
                     if layer is None:
                         continue
-                    layer.data = stage.paths_zyx
-                    layer.features = stage.features
                     layer.name = anchor_stage_layer_name(stage)
-                if anchor_cell_centers_layer is not None:
-                    anchor_cell_centers_layer.data = (
-                        candidate_artifacts.anchor_cells.centers_zyx
-                    )
-                if anchor_displacements_layer is not None:
-                    anchor_displacements_layer.data = (
-                        candidate_artifacts.anchor_cells.displacements_zyx
-                    )
-                if paths_layer is not None:
-                    paths_layer.data = candidate_artifacts.fiberlets.paths_zyx
-                    paths_layer.features = fiberlet_layer_features(
-                        candidate_artifacts.fiberlets
-                    )
-                    paths_layer.edge_color = (
-                        "relative_quality"
-                        if candidate_artifacts.fiberlets.paths_zyx
-                        else "gray"
-                    )
-
                 derived_state["presence_distance_base"] = (
                     candidate_presence_distance_base
                 )
@@ -2941,28 +3283,16 @@ def launch_viewer(
                     candidate_presence_distance_data
                 )
                 derived_state["anchor_visual_filters"] = candidate_anchor_filters
+                derived_state["fiberlet_visual_filter"] = candidate_fiberlet_filter
                 volume_layer.data = candidate_presence_data
-                for (
-                    _,
-                    layer,
-                    attribute,
-                    source_values,
-                    distances,
-                ) in candidate_anchor_filters:
-                    if attribute == "shown":
-                        layer.shown = source_values & distance_visibility_mask(
-                            distances, derived_state["anchor_radius"]
-                        )
-                    else:
-                        setattr(
-                            layer,
-                            attribute,
-                            distance_masked_colors(
-                                source_values,
-                                distances,
-                                derived_state["anchor_radius"],
-                            ),
-                        )
+                for visual_filter in candidate_anchor_filters:
+                    apply_replay_geometry_filter(
+                        visual_filter, derived_state["anchor_radius"]
+                    )
+                apply_replay_geometry_filter(
+                    candidate_fiberlet_filter,
+                    derived_state["fiberlet_radius"],
+                )
 
                 for layer in layers:
                     if id(layer) in widths:
@@ -3007,16 +3337,25 @@ def launch_viewer(
                 derived_state["presence_radius"],
             )
             replacement_anchor_filters = build_reloaded_anchor_filters(
+                replacement_artifacts,
                 replay_anchor_distances_base(
                     replacement_replay,
                     replacement_artifacts,
-                )
+                ),
+            )
+            replacement_fiberlet_filter = build_reloaded_fiberlet_filter(
+                replacement_artifacts,
+                replay_fiberlet_distances_base(
+                    replacement_replay,
+                    replacement_artifacts.fiberlets,
+                ),
             )
 
             old_presence_data = volume_layer.data
             old_presence_distance_base = derived_state["presence_distance_base"]
             old_presence_distance_data = derived_state["presence_distance_data"]
             old_anchor_filters = derived_state["anchor_visual_filters"]
+            old_fiberlet_filter = derived_state["fiberlet_visual_filter"]
             old_selected_data = {
                 id(layer): set(layer.selected_data)
                 for layer in mutable_replay_layers()
@@ -3031,12 +3370,14 @@ def launch_viewer(
                     replacement_presence_distance_base,
                     replacement_presence_distance_data,
                     replacement_anchor_filters,
+                    replacement_fiberlet_filter,
                 )
 
             def rollback() -> None:
                 derived_state["presence_distance_base"] = old_presence_distance_base
                 derived_state["presence_distance_data"] = old_presence_distance_data
                 derived_state["anchor_visual_filters"] = old_anchor_filters
+                derived_state["fiberlet_visual_filter"] = old_fiberlet_filter
                 apply_replay_artifacts(
                     current_replay,
                     current_artifacts,
@@ -3044,6 +3385,7 @@ def launch_viewer(
                     old_presence_distance_base,
                     old_presence_distance_data,
                     old_anchor_filters,
+                    old_fiberlet_filter,
                     old_selected_data,
                 )
 
@@ -3089,6 +3431,13 @@ def launch_viewer(
             else None
         ),
         set_anchor_radius=set_anchor_radius_callback,
+        fiberlet_radius_base_voxels=fiberlet_radius_base_voxels,
+        maximum_fiberlet_radius_base_voxels=(
+            maximum_display_radius
+            if maximum_fiberlet_radius_base_voxels is not None
+            else None
+        ),
+        set_fiberlet_radius=set_fiberlet_radius_callback,
         reload_artifacts=reload_artifacts_callback,
     )
     viewer.reset_view()

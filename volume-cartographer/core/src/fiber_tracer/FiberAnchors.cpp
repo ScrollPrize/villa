@@ -1,18 +1,23 @@
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <iomanip>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -20,6 +25,77 @@ namespace vc::fiber_tracer {
 namespace {
 
 constexpr double kMatrixEpsilon = 1.0e-15;
+constexpr double kGeometryEpsilon = 1.0e-12;
+
+double segmentAabbDistanceSquared(
+    const cv::Vec3d& start,
+    const cv::Vec3d& end,
+    const cv::Vec3d& low,
+    const cv::Vec3d& high)
+{
+    const cv::Vec3d delta = end - start;
+    std::vector<double> breaks{0.0, 1.0};
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(delta[axis]) <= kGeometryEpsilon)
+            continue;
+        for (const double bound : {low[axis], high[axis]}) {
+            const double t = (bound - start[axis]) / delta[axis];
+            if (t > 0.0 && t < 1.0)
+                breaks.push_back(t);
+        }
+    }
+    std::sort(breaks.begin(), breaks.end());
+    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+    double best = std::numeric_limits<double>::infinity();
+    const auto evaluate = [&](double t) {
+        const cv::Vec3d point = start + delta * t;
+        double squared = 0.0;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double outside = point[axis] < low[axis]
+                ? low[axis] - point[axis]
+                : point[axis] > high[axis]
+                    ? point[axis] - high[axis]
+                    : 0.0;
+            squared += outside * outside;
+        }
+        best = std::min(best, squared);
+    };
+    for (size_t interval = 0; interval + 1 < breaks.size(); ++interval) {
+        const double begin = breaks[interval];
+        const double finish = breaks[interval + 1];
+        evaluate(begin);
+        evaluate(finish);
+        const double middle = 0.5 * (begin + finish);
+        double quadratic = 0.0;
+        double linear = 0.0;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double point = start[axis] + delta[axis] * middle;
+            double offset = 0.0;
+            if (point < low[axis])
+                offset = start[axis] - low[axis];
+            else if (point > high[axis])
+                offset = start[axis] - high[axis];
+            else
+                continue;
+            quadratic += delta[axis] * delta[axis];
+            linear += delta[axis] * offset;
+        }
+        if (quadratic > kGeometryEpsilon)
+            evaluate(std::clamp(-linear / quadratic, begin, finish));
+    }
+    return best;
+}
+
+double interpolatedQuantile(const std::vector<double>& sorted, double quantile)
+{
+    if (sorted.empty())
+        throw std::invalid_argument("anchor benchmark quantile population is empty");
+    const double rank = quantile * static_cast<double>(sorted.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(rank));
+    const size_t upper = static_cast<size_t>(std::ceil(rank));
+    const double fraction = rank - static_cast<double>(lower);
+    return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
+}
 
 struct CompensatedSum {
     void add(double value)
@@ -611,7 +687,13 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     return owner;
 }
 
-[[nodiscard]] cv::Vec3d findDirectionConditionedLocalPeak(
+struct DirectionConditionedPeak {
+    cv::Vec3d discrete{0.0, 0.0, 0.0};
+    cv::Vec3d separable1d{0.0, 0.0, 0.0};
+    cv::Vec3d joint2d{0.0, 0.0, 0.0};
+};
+
+[[nodiscard]] DirectionConditionedPeak findDirectionConditionedLocalPeak(
     const std::vector<FiberAnchorObservation>& observations,
     const cv::Vec3d& pivot,
     const PeakOwnerBounds& owner,
@@ -638,6 +720,9 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     struct PeakObservation {
         cv::Vec3d position{0.0, 0.0, 0.0};
         double signal = 0.0;
+        double directionAlignmentSquared = 0.0;
+        cv::Vec3d presenceGradient{0.0, 0.0, 0.0};
+        bool presenceGradientValid = false;
     };
     std::vector<PeakObservation> peakObservations;
     peakObservations.reserve(observations.size());
@@ -654,6 +739,7 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
             continue;
 
         double signal = 0.0;
+        double selectedAlignment = 0.0;
         if (observation.valid && finiteVector(observation.direction) &&
             std::isfinite(observation.presence) &&
             observation.presence >= config.observationPresenceFloor &&
@@ -671,16 +757,28 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                         assignment = component;
                     }
                 }
-                if (assignment == selectedComponent)
+                if (assignment == selectedComponent) {
                     signal = observation.presence * bestAlignment;
+                    selectedAlignment = bestAlignment;
+                }
             }
         }
-        peakObservations.push_back({observation.positionPredictionXYZ, signal});
+        peakObservations.push_back({
+            observation.positionPredictionXYZ,
+            signal,
+            selectedAlignment,
+            observation.presenceGradientPredictionXYZ,
+            observation.presenceGradientValid,
+        });
     }
 
     const auto responseAt = [&](const cv::Vec3d& candidate) {
         CompensatedSum numerator;
         CompensatedSum denominator;
+        CompensatedSum eligibleGradientWeight;
+        CompensatedSum validGradientWeight;
+        CompensatedSum inward;
+        CompensatedSum outward;
         for (const auto& observation : peakObservations) {
             const cv::Vec3d offset = observation.position - candidate;
             const double axial = offset.dot(axis);
@@ -695,8 +793,61 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 axial * axial * invTwoAxialSigma2);
             denominator.add(gaussian);
             numerator.add(gaussian * observation.signal);
+            if (!(observation.directionAlignmentSquared > 0.0))
+                continue;
+            const double eligibleWeight =
+                gaussian * observation.directionAlignmentSquared;
+            eligibleGradientWeight.add(eligibleWeight);
+            if (!observation.presenceGradientValid ||
+                !finiteVector(observation.presenceGradient)) {
+                continue;
+            }
+            const cv::Vec3d radial =
+                (candidate - observation.position) -
+                axis * (candidate - observation.position).dot(axis);
+            const cv::Vec3d gradient = observation.presenceGradient -
+                axis * observation.presenceGradient.dot(axis);
+            const double radialNorm2 = radial.dot(radial);
+            const double gradientNorm2 = gradient.dot(gradient);
+            if (!(radialNorm2 > kMatrixEpsilon) ||
+                !(gradientNorm2 > kMatrixEpsilon)) {
+                continue;
+            }
+            validGradientWeight.add(eligibleWeight);
+            const double cosine = std::clamp(
+                gradient.dot(radial) /
+                    std::sqrt(gradientNorm2 * radialNorm2),
+                -1.0,
+                1.0);
+            const double vote = eligibleWeight *
+                std::sqrt(gradientNorm2) *
+                config.peakSigmaPredictionVoxels * cosine * cosine;
+            if (cosine > 0.0)
+                inward.add(vote);
+            else if (cosine < 0.0)
+                outward.add(vote);
         }
-        return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+        const double presenceResponse = denominator.sum > 0.0
+            ? numerator.sum / denominator.sum
+            : 0.0;
+        if (!(config.peakGradientWeight > 0.0) ||
+            !(eligibleGradientWeight.sum > 0.0) ||
+            !(validGradientWeight.sum > 0.0)) {
+            return presenceResponse;
+        }
+        const double voteMass = inward.sum + outward.sum;
+        if (!(voteMass > 0.0))
+            return presenceResponse;
+        const double coverage = std::clamp(
+            validGradientWeight.sum / eligibleGradientWeight.sum, 0.0, 1.0);
+        const double radialGradient =
+            voteMass / validGradientWeight.sum;
+        const double reliability = coverage * radialGradient /
+            (radialGradient + config.peakGradientReliabilityScale);
+        const double signedVote =
+            (inward.sum - outward.sum) / voteMass;
+        return presenceResponse +
+            config.peakGradientWeight * reliability * signedVote;
     };
 
     using GridIndex = std::pair<int, int>;
@@ -773,8 +924,18 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
         current = best;
     }
 
+    const cv::Vec3d discrete = pointAt(current);
     const double centerResponse = response(current);
-    std::array<double, 2> offset{0.0, 0.0};
+    const double tolerance =
+        1.0e-12 * std::max(1.0, std::abs(centerResponse));
+    const auto acceptedPosition = [&](const cv::Vec3d& candidate) {
+        return insidePeakDomain(
+                   candidate, pivot, owner,
+                   config.localWindowRadiusPredictionVoxels) &&
+            responseAt(candidate) + tolerance >= centerResponse;
+    };
+
+    std::array<double, 2> separableOffsetGridSteps{0.0, 0.0};
     for (int dimension = 0; dimension < 2; ++dimension) {
         GridIndex lower = current;
         GridIndex upper = current;
@@ -788,26 +949,61 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
             lowerResponse - 2.0 * centerResponse + upperResponse;
         if (!(curvature < 0.0) || !std::isfinite(curvature))
             continue;
-        const double gridOffset =
+        const double offset =
             0.5 * (lowerResponse - upperResponse) / curvature;
-        if (std::isfinite(gridOffset)) {
-            offset[static_cast<size_t>(dimension)] = std::clamp(
-                gridOffset, -0.5, 0.5) *
-                config.peakGridStepPredictionVoxels;
+        if (std::isfinite(offset)) {
+            separableOffsetGridSteps[static_cast<size_t>(dimension)] =
+                std::clamp(offset, -0.5, 0.5);
         }
     }
-    const cv::Vec3d discrete = pointAt(current);
-    const cv::Vec3d fitted =
-        discrete + basis[0] * offset[0] + basis[1] * offset[1];
-    const double tolerance =
-        1.0e-12 * std::max(1.0, std::abs(centerResponse));
-    if (insidePeakDomain(
-            fitted, pivot, owner,
-            config.localWindowRadiusPredictionVoxels) &&
-        responseAt(fitted) + tolerance >= centerResponse) {
-        return fitted;
+    const cv::Vec3d separableCandidate =
+        discrete + basis[0] *
+                (separableOffsetGridSteps[0] *
+                 config.peakGridStepPredictionVoxels) +
+        basis[1] *
+                (separableOffsetGridSteps[1] *
+                 config.peakGridStepPredictionVoxels);
+    const cv::Vec3d separable = acceptedPosition(separableCandidate)
+        ? separableCandidate
+        : discrete;
+
+    std::array<std::array<double, 3>, 3> neighborhood{};
+    bool completeNeighborhood = true;
+    for (int first = -1; first <= 1; ++first) {
+        for (int second = -1; second <= 1; ++second) {
+            const GridIndex sample{
+                current.first + first,
+                current.second + second,
+            };
+            if (!feasible(sample)) {
+                completeNeighborhood = false;
+                continue;
+            }
+            const double value = response(sample);
+            if (!std::isfinite(value)) {
+                completeNeighborhood = false;
+                continue;
+            }
+            neighborhood[static_cast<size_t>(first + 1)]
+                        [static_cast<size_t>(second + 1)] = value;
+        }
     }
-    return discrete;
+    cv::Vec3d joint = discrete;
+    if (completeNeighborhood) {
+        const auto offset = fitFiberAnchorQuadraticPeak(neighborhood);
+        if (offset.has_value()) {
+            const cv::Vec3d candidate =
+                discrete + basis[0] *
+                        (offset->firstGridSteps *
+                         config.peakGridStepPredictionVoxels) +
+                basis[1] *
+                        (offset->secondGridSteps *
+                         config.peakGridStepPredictionVoxels);
+            if (acceptedPosition(candidate))
+                joint = candidate;
+        }
+    }
+    return {discrete, separable, joint};
 }
 
 [[nodiscard]] bool betterState(const FitState& candidate, const FitState& current)
@@ -932,7 +1128,7 @@ struct NmsCandidate {
     const double transverse = std::sqrt(std::max(
         0.0, transverseVector.dot(transverseVector)));
     return longitudinal <= config.nmsLongitudinalRadiusPredictionVoxels &&
-        transverse <= config.localWindowRadiusPredictionVoxels;
+        transverse <= config.nmsTransverseRadiusPredictionVoxels;
 }
 
 void applyLocalMaximumNms(
@@ -951,7 +1147,7 @@ void applyLocalMaximumNms(
     const double binSize = std::max(
         1.0e-12,
         std::hypot(
-            config.localWindowRadiusPredictionVoxels,
+            config.nmsTransverseRadiusPredictionVoxels,
             config.nmsLongitudinalRadiusPredictionVoxels));
     using Bin = std::array<int64_t, 3>;
     std::map<Bin, std::vector<size_t>> bins;
@@ -1019,6 +1215,84 @@ void applyLocalMaximumNms(
 
 } // namespace
 
+std::optional<FiberAnchorQuadraticPeakOffset> fitFiberAnchorQuadraticPeak(
+    const std::array<std::array<double, 3>, 3>& response)
+{
+    CompensatedSum sum;
+    CompensatedSum firstMoment;
+    CompensatedSum secondMoment;
+    CompensatedSum firstSquaredMoment;
+    CompensatedSum mixedMoment;
+    CompensatedSum secondSquaredMoment;
+    double responseScale = 1.0;
+    for (int first = -1; first <= 1; ++first) {
+        for (int second = -1; second <= 1; ++second) {
+            const double value = response[static_cast<size_t>(first + 1)]
+                                         [static_cast<size_t>(second + 1)];
+            if (!std::isfinite(value))
+                return std::nullopt;
+            responseScale = std::max(responseScale, std::abs(value));
+            sum.add(value);
+            firstMoment.add(static_cast<double>(first) * value);
+            secondMoment.add(static_cast<double>(second) * value);
+            firstSquaredMoment.add(
+                static_cast<double>(first * first) * value);
+            mixedMoment.add(static_cast<double>(first * second) * value);
+            secondSquaredMoment.add(
+                static_cast<double>(second * second) * value);
+        }
+    }
+
+    // Least-squares model a + bx + cy + dx^2 + exy + fy^2 on {-1,0,1}^2.
+    const double gradientFirst = firstMoment.sum / 6.0;
+    const double gradientSecond = secondMoment.sum / 6.0;
+    const double hessianFirstFirst =
+        firstSquaredMoment.sum - 2.0 * sum.sum / 3.0;
+    const double hessianFirstSecond = mixedMoment.sum / 4.0;
+    const double hessianSecondSecond =
+        secondSquaredMoment.sum - 2.0 * sum.sum / 3.0;
+    const std::array<double, 5> coefficients{
+        gradientFirst,
+        gradientSecond,
+        hessianFirstFirst,
+        hessianFirstSecond,
+        hessianSecondSecond,
+    };
+    if (std::any_of(coefficients.begin(), coefficients.end(),
+                    [](double value) { return !std::isfinite(value); })) {
+        return std::nullopt;
+    }
+
+    constexpr double kRelativeCurvatureTolerance = 1.0e-12;
+    const double curvatureTolerance =
+        kRelativeCurvatureTolerance * responseScale;
+    const double trace = hessianFirstFirst + hessianSecondSecond;
+    const double discriminant = std::hypot(
+        hessianFirstFirst - hessianSecondSecond,
+        2.0 * hessianFirstSecond);
+    const double largestEigenvalue = 0.5 * (trace + discriminant);
+    const double determinant =
+        hessianFirstFirst * hessianSecondSecond -
+        hessianFirstSecond * hessianFirstSecond;
+    if (!(largestEigenvalue < -curvatureTolerance) ||
+        !(determinant > curvatureTolerance * curvatureTolerance) ||
+        !std::isfinite(determinant)) {
+        return std::nullopt;
+    }
+
+    const double first =
+        (hessianFirstSecond * gradientSecond -
+         hessianSecondSecond * gradientFirst) / determinant;
+    const double second =
+        (hessianFirstSecond * gradientFirst -
+         hessianFirstFirst * gradientSecond) / determinant;
+    if (!std::isfinite(first) || !std::isfinite(second) ||
+        std::abs(first) > 0.5 || std::abs(second) > 0.5) {
+        return std::nullopt;
+    }
+    return FiberAnchorQuadraticPeakOffset{first, second};
+}
+
 const char* fiberAnchorDiagnosticStageName(FiberAnchorDiagnosticStage stage)
 {
     switch (stage) {
@@ -1049,6 +1323,16 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
     if (!(config.peakSigmaPredictionVoxels > 0.0) ||
         !std::isfinite(config.peakSigmaPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor peak sigma must be positive and finite");
+    }
+    if (!(config.peakGradientWeight >= 0.0) ||
+        !std::isfinite(config.peakGradientWeight)) {
+        throw std::invalid_argument(
+            "fiber anchor peak gradient weight must be nonnegative and finite");
+    }
+    if (!(config.peakGradientReliabilityScale > 0.0) ||
+        !std::isfinite(config.peakGradientReliabilityScale)) {
+        throw std::invalid_argument(
+            "fiber anchor peak gradient reliability scale must be positive and finite");
     }
     if (!(config.peakAxialSigmaPredictionVoxels > 0.0) ||
         !std::isfinite(config.peakAxialSigmaPredictionVoxels)) {
@@ -1086,6 +1370,10 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !std::isfinite(config.nmsMaximumAngleDegrees)) {
         throw std::invalid_argument("fiber anchor NMS angle must be in [0, 90]");
     }
+    if (!(config.nmsTransverseRadiusPredictionVoxels >= 0.0) ||
+        !std::isfinite(config.nmsTransverseRadiusPredictionVoxels)) {
+        throw std::invalid_argument("fiber anchor NMS transverse radius must be finite and non-negative");
+    }
     if (!(config.nmsLongitudinalRadiusPredictionVoxels >= 0.0) ||
         !std::isfinite(config.nmsLongitudinalRadiusPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor NMS longitudinal radius must be finite and non-negative");
@@ -1121,12 +1409,10 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !std::isfinite(config.convergenceTolerance)) {
         throw std::invalid_argument("fiber anchor convergence tolerance must be finite and non-negative");
     }
-    if (config.processingBlockCellSide < 1 ||
-        config.processingBlockCellSide > 64) {
-        throw std::invalid_argument("fiber anchor processing block side must be in [1, 64]");
+    if (config.maximumConcurrentSampleBytes == 0) {
+        throw std::invalid_argument(
+            "fiber anchor concurrent sample byte limit must be positive");
     }
-    if (config.maximumSampleBlockBytes == 0)
-        throw std::invalid_argument("fiber anchor sample block byte limit must be positive");
     if (config.parallelThreads < 1)
         throw std::invalid_argument("fiber anchor thread count must be positive");
 }
@@ -1424,10 +1710,16 @@ FiberCellAnchorResult fitFiberCellAnchors(
     const auto broadRefinedComponents = refined.components;
     for (size_t componentIndex = 0; componentIndex < activeComponents;
          ++componentIndex) {
-        refined.components[componentIndex].position =
-            findDirectionConditionedLocalPeak(
-                input, center, owner, broadRefinedComponents,
-                activeComponents, componentIndex, config);
+        const auto peak = findDirectionConditionedLocalPeak(
+            input, center, owner, broadRefinedComponents,
+            activeComponents, componentIndex, config);
+        result.components[componentIndex]
+            .discretePeakPositionPredictionXYZ = peak.discrete;
+        result.components[componentIndex]
+            .separablePeakPositionPredictionXYZ = peak.separable1d;
+        result.components[componentIndex]
+            .jointPeakPositionPredictionXYZ = peak.joint2d;
+        refined.components[componentIndex].position = peak.separable1d;
     }
     refined.evaluation = evaluateRefinedState(
         input, refined.components, activeComponents, center, config);
@@ -1481,7 +1773,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     std::optional<FiberAnchorCrop> crop,
     std::vector<std::array<size_t, 3>> explicitCells,
     const FiberAnchorRetainPredicate& retainPredicate,
-    const FiberAnchorProgressCallback& progressCallback)
+    const FiberAnchorProgressCallback& progressCallback,
+    bool refinedOnly = false)
 {
     validateFiberAnchorConfig(config);
     if (!sampler)
@@ -1598,7 +1891,9 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             config.peakAxialSigmaPredictionVoxels);
     const double maximumSupportRadius =
         std::max(broadSupportRadius, peakSupportRadius);
-    const size_t sampleHalo = static_cast<size_t>(std::ceil(maximumSupportRadius));
+    const size_t sampleHalo =
+        static_cast<size_t>(std::ceil(maximumSupportRadius)) +
+        (config.peakGradientWeight > 0.0 ? 1 : 0);
     const std::set<std::array<size_t, 3>> explicitCellSet(
         explicitCells.begin(), explicitCells.end());
     const auto selectedCell = [&report, &explicitCellSet, usesExplicitCells](const std::array<size_t, 3>& cell) {
@@ -1614,65 +1909,80 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     };
 
     const auto start = std::chrono::steady_clock::now();
-    const size_t blockSide = config.processingBlockCellSide;
     const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells,
                                   bool tallySelectedDiagnostics,
                                   const char* phase) {
         using CellIndex = std::array<size_t, 3>;
-        std::map<CellIndex, std::vector<CellIndex>> cellsByBlock;
-        for (const auto& cell : requestedCells) {
-            cellsByBlock[CellIndex{
-                             cell[0] / blockSide,
-                             cell[1] / blockSide,
-                             cell[2] / blockSide,
-                         }]
-                .push_back(cell);
-        }
-
-        std::vector<FiberCellAnchorResult> results;
         const auto phaseStart = std::chrono::steady_clock::now();
-        auto lastProgressTime = phaseStart;
-        size_t completedCells = 0;
         if (progressCallback)
             progressCallback({phase, 0, requestedCells.size(), 0.0});
-        for (const auto& [blockIndex, blockCells] : cellsByBlock) {
-            const CellIndex blockCellBegin{
-                blockIndex[0] * blockSide,
-                blockIndex[1] * blockSide,
-                blockIndex[2] * blockSide,
+        if (requestedCells.empty())
+            return std::vector<FiberCellAnchorResult>{};
+
+        const auto sampleBounds = [&](const CellIndex& cell) {
+            const CellIndex begin{
+                cell[0] * cellSize,
+                cell[1] * cellSize,
+                cell[2] * cellSize,
             };
-            const CellIndex blockCellEnd{
-                std::min(totalCellsZYX[0], blockCellBegin[0] + blockSide),
-                std::min(totalCellsZYX[1], blockCellBegin[1] + blockSide),
-                std::min(totalCellsZYX[2], blockCellBegin[2] + blockSide),
-            };
-            const CellIndex blockBegin{
-                blockCellBegin[0] * cellSize,
-                blockCellBegin[1] * cellSize,
-                blockCellBegin[2] * cellSize,
-            };
-            const std::array<size_t, 3> blockEnd{
-                std::min(blockCellEnd[0] * cellSize, grid.shapeZYX[0]),
-                std::min(blockCellEnd[1] * cellSize, grid.shapeZYX[1]),
-                std::min(blockCellEnd[2] * cellSize, grid.shapeZYX[2]),
+            const CellIndex end{
+                std::min(begin[0] + cellSize, grid.shapeZYX[0]),
+                std::min(begin[1] + cellSize, grid.shapeZYX[1]),
+                std::min(begin[2] + cellSize, grid.shapeZYX[2]),
             };
             std::array<size_t, 3> sampleBegin{};
             std::array<size_t, 3> sampleEnd{};
             for (size_t axis = 0; axis < 3; ++axis) {
-                sampleBegin[axis] = blockBegin[axis] > sampleHalo ? blockBegin[axis] - sampleHalo : 0;
-                sampleEnd[axis] = std::min(grid.shapeZYX[axis], blockEnd[axis] + std::min(sampleHalo, grid.shapeZYX[axis] - blockEnd[axis]));
+                sampleBegin[axis] =
+                    begin[axis] > sampleHalo ? begin[axis] - sampleHalo : 0;
+                sampleEnd[axis] = std::min(
+                    grid.shapeZYX[axis],
+                    end[axis] +
+                        std::min(sampleHalo, grid.shapeZYX[axis] - end[axis]));
             }
+            return std::pair{sampleBegin, sampleEnd};
+        };
+
+        constexpr size_t bytesPerSample =
+            sizeof(std::array<size_t, 3>) +
+            sizeof(FiberStoredPredictionSample) +
+            sizeof(FiberAnchorObservation);
+        size_t maximumJobBytes = 0;
+        for (const auto& cell : requestedCells) {
+            const auto [sampleBegin, sampleEnd] = sampleBounds(cell);
             const std::array<size_t, 3> sampleShape{
                 sampleEnd[0] - sampleBegin[0],
                 sampleEnd[1] - sampleBegin[1],
                 sampleEnd[2] - sampleBegin[2],
             };
-            std::vector<std::array<size_t, 3>> indices;
-            const size_t sampleCount = checkedProduct(sampleShape, "fiber anchor sample block");
-            constexpr size_t bytesPerSample = sizeof(std::array<size_t, 3>) + sizeof(FiberStoredPredictionSample) + sizeof(FiberAnchorObservation);
-            if (sampleCount > config.maximumSampleBlockBytes / bytesPerSample) {
-                throw std::runtime_error("fiber anchor sample block exceeds the configured byte limit");
+            const size_t sampleCount =
+                checkedProduct(sampleShape, "fiber anchor cell sample");
+            if (sampleCount >
+                config.maximumConcurrentSampleBytes / bytesPerSample) {
+                throw std::runtime_error(
+                    "fiber anchor cell sample exceeds the concurrent byte limit");
             }
+            maximumJobBytes = std::max(
+                maximumJobBytes, sampleCount * bytesPerSample);
+        }
+        const size_t memoryWorkers = std::max<size_t>(
+            1, config.maximumConcurrentSampleBytes / maximumJobBytes);
+        const size_t workerCount = std::min({
+            requestedCells.size(),
+            static_cast<size_t>(config.parallelThreads),
+            memoryWorkers,
+        });
+
+        const auto processCell = [&](const CellIndex& cellZYX) {
+            const auto [sampleBegin, sampleEnd] = sampleBounds(cellZYX);
+            const std::array<size_t, 3> sampleShape{
+                sampleEnd[0] - sampleBegin[0],
+                sampleEnd[1] - sampleBegin[1],
+                sampleEnd[2] - sampleBegin[2],
+            };
+            const size_t sampleCount =
+                checkedProduct(sampleShape, "fiber anchor cell sample");
+            std::vector<std::array<size_t, 3>> indices;
             indices.reserve(sampleCount);
             for (size_t z = sampleBegin[0]; z < sampleEnd[0]; ++z) {
                 for (size_t y = sampleBegin[1]; y < sampleEnd[1]; ++y) {
@@ -1681,14 +1991,76 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 }
             }
             std::vector<FiberStoredPredictionSample> samples;
-            sampler(indices, config.parallelThreads, samples);
+            sampler(indices, 1, samples);
             if (samples.size() != indices.size()) {
                 throw std::runtime_error("fiber stored prediction sampler returned the wrong sample count");
             }
-            std::vector<FiberAnchorObservation> observations;
-            observations.reserve(samples.size());
+            const std::array<size_t, 3> begin{
+                cellZYX[0] * cellSize,
+                cellZYX[1] * cellSize,
+                cellZYX[2] * cellSize,
+            };
+            const std::array<size_t, 3> end{
+                std::min(begin[0] + cellSize, grid.shapeZYX[0]),
+                std::min(begin[1] + cellSize, grid.shapeZYX[1]),
+                std::min(begin[2] + cellSize, grid.shapeZYX[2]),
+            };
+            const cv::Vec3d pivot{
+                (static_cast<double>(begin[2]) + static_cast<double>(end[2]) -
+                 1.0) *
+                    0.5,
+                (static_cast<double>(begin[1]) + static_cast<double>(end[1]) -
+                 1.0) *
+                    0.5,
+                (static_cast<double>(begin[0]) + static_cast<double>(end[0]) -
+                 1.0) *
+                    0.5,
+            };
+            const auto presenceGradient = [&](size_t index) {
+                const size_t plane = sampleShape[1] * sampleShape[2];
+                const size_t relativeZ = index / plane;
+                const size_t remainder = index % plane;
+                const size_t relativeY = remainder / sampleShape[2];
+                const size_t relativeX = remainder % sampleShape[2];
+                if (relativeZ == 0 || relativeZ + 1 >= sampleShape[0] ||
+                    relativeY == 0 || relativeY + 1 >= sampleShape[1] ||
+                    relativeX == 0 || relativeX + 1 >= sampleShape[2]) {
+                    return std::optional<cv::Vec3d>{};
+                }
+                constexpr std::array<double, 3> smooth{0.25, 0.5, 0.25};
+                constexpr std::array<double, 3> derivative{-0.5, 0.0, 0.5};
+                cv::Vec3d gradient{0.0, 0.0, 0.0};
+                for (int dz = -1; dz <= 1; ++dz) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const size_t neighbor = static_cast<size_t>(
+                                static_cast<std::ptrdiff_t>(index) +
+                                static_cast<std::ptrdiff_t>(dz) *
+                                    static_cast<std::ptrdiff_t>(plane) +
+                                static_cast<std::ptrdiff_t>(dy) *
+                                    static_cast<std::ptrdiff_t>(sampleShape[2]) +
+                                dx);
+                            const auto& sample = samples[neighbor];
+                            if (!(sample.presenceValid || sample.valid) ||
+                                !std::isfinite(sample.presence)) {
+                                return std::optional<cv::Vec3d>{};
+                            }
+                            const double presence = sample.presence;
+                            gradient[0] += presence * derivative[dx + 1] *
+                                smooth[dy + 1] * smooth[dz + 1];
+                            gradient[1] += presence * smooth[dx + 1] *
+                                derivative[dy + 1] * smooth[dz + 1];
+                            gradient[2] += presence * smooth[dx + 1] *
+                                smooth[dy + 1] * derivative[dz + 1];
+                        }
+                    }
+                }
+                return std::optional<cv::Vec3d>{gradient};
+            };
+            std::vector<FiberAnchorObservation> cellObservations;
+            cellObservations.reserve(samples.size());
             for (size_t index = 0; index < samples.size(); ++index) {
-                observations.push_back({
+                FiberAnchorObservation observation{
                     cv::Vec3d{
                         static_cast<double>(indices[index][2]),
                         static_cast<double>(indices[index][1]),
@@ -1697,91 +2069,144 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     samples[index].direction,
                     samples[index].presence,
                     samples[index].valid,
-                });
-            }
-            for (const auto& cellZYX : blockCells) {
-                const size_t cz = cellZYX[0];
-                const size_t cy = cellZYX[1];
-                const size_t cx = cellZYX[2];
-                const std::array<size_t, 3> begin{cz * cellSize, cy * cellSize, cx * cellSize};
-                const std::array<size_t, 3> end{
-                    std::min(begin[0] + cellSize, grid.shapeZYX[0]),
-                    std::min(begin[1] + cellSize, grid.shapeZYX[1]),
-                    std::min(begin[2] + cellSize, grid.shapeZYX[2]),
                 };
-                const cv::Vec3d pivot{
-                    (static_cast<double>(begin[2]) + static_cast<double>(end[2]) - 1.0) * 0.5,
-                    (static_cast<double>(begin[1]) + static_cast<double>(end[1]) - 1.0) * 0.5,
-                    (static_cast<double>(begin[0]) + static_cast<double>(end[0]) - 1.0) * 0.5,
-                };
-                std::vector<FiberAnchorObservation> cellObservations;
-                for (const auto& observation : observations) {
-                    const cv::Vec3d delta = observation.positionPredictionXYZ - pivot;
-                    const auto& position = observation.positionPredictionXYZ;
-                    const bool owned =
-                        position[0] >= static_cast<double>(begin[2]) && position[0] < static_cast<double>(end[2]) &&
-                        position[1] >= static_cast<double>(begin[1]) && position[1] < static_cast<double>(end[1]) &&
-                        position[2] >= static_cast<double>(begin[0]) && position[2] < static_cast<double>(end[0]);
-                    if (owned || delta.dot(delta) <= maximumSupportRadius * maximumSupportRadius + 1.0e-12) {
-                        cellObservations.push_back(observation);
-                    }
-                }
-                FiberCellAnchorResult cell = fitFiberCellAnchors(cellZYX, begin, end, cellObservations, config);
-                if (tallySelectedDiagnostics && retainPredicate) {
-                    for (auto& component : cell.components) {
-                        if (!component.retained)
-                            continue;
-                        const FiberAnchorRetainEvaluation evaluation =
-                            retainPredicate(component.anchor);
-                        if (!evaluation.retained &&
-                            (!evaluation.testedValue.has_value() ||
-                             !evaluation.threshold.has_value())) {
-                            throw std::invalid_argument(
-                                "fiber anchor selection rejection requires tested value and threshold");
-                        }
-                        component.selectionTestedValue = evaluation.testedValue;
-                        component.selectionThreshold = evaluation.threshold;
-                        if (!evaluation.retained) {
-                            component.retained = false;
-                            component.rejectionReason = "outside_selection";
-                            --cell.retainedAnchorCount;
-                            ++report.diagnostics.outsideSelectionComponents;
+                const cv::Vec3d delta =
+                    observation.positionPredictionXYZ - pivot;
+                const auto& position = observation.positionPredictionXYZ;
+                const bool owned =
+                    position[0] >= static_cast<double>(begin[2]) &&
+                    position[0] < static_cast<double>(end[2]) &&
+                    position[1] >= static_cast<double>(begin[1]) &&
+                    position[1] < static_cast<double>(end[1]) &&
+                    position[2] >= static_cast<double>(begin[0]) &&
+                    position[2] < static_cast<double>(end[0]);
+                if (owned ||
+                    delta.dot(delta) <=
+                        maximumSupportRadius * maximumSupportRadius +
+                            1.0e-12) {
+                    if (config.peakGradientWeight > 0.0) {
+                        const auto gradient = presenceGradient(index);
+                        if (gradient.has_value()) {
+                            observation.presenceGradientPredictionXYZ =
+                                *gradient;
+                            observation.presenceGradientValid = true;
                         }
                     }
+                    cellObservations.push_back(observation);
                 }
-                if (tallySelectedDiagnostics) {
-                    for (auto& component : cell.components)
-                        component.retainedAfterSelection = component.retained;
-                }
-                if (tallySelectedDiagnostics) {
-                    if (cell.mergeEvaluation.has_value() && cell.mergeEvaluation->merged) {
-                        ++report.diagnostics.mergedComponentPairs;
-                    }
-                    for (const auto& component : cell.components) {
-                        if (component.rejectionReason == "empty")
-                            ++report.diagnostics.emptyComponents;
-                        else if (component.rejectionReason == "degenerate")
-                            ++report.diagnostics.degenerateComponents;
-                        else if (component.rejectionReason == "below_support")
-                            ++report.diagnostics.belowSupportComponents;
-                    }
-                }
-                if (cell.retainedAnchorCount > 0 || tallySelectedDiagnostics)
-                    results.push_back(std::move(cell));
             }
-            completedCells += blockCells.size();
-            const auto now = std::chrono::steady_clock::now();
-            if (progressCallback &&
-                (completedCells == requestedCells.size() ||
-                 now - lastProgressTime >= std::chrono::seconds(1))) {
-                progressCallback({
-                    phase,
-                    completedCells,
-                    requestedCells.size(),
-                    std::chrono::duration<double>(now - phaseStart).count(),
-                });
-                lastProgressTime = now;
+            return fitFiberCellAnchors(
+                cellZYX, begin, end, cellObservations, config);
+        };
+
+        std::vector<std::optional<FiberCellAnchorResult>> jobResults(
+            requestedCells.size());
+        std::vector<std::exception_ptr> jobErrors(requestedCells.size());
+        std::atomic<size_t> nextJob{0};
+        std::atomic<size_t> completedJobs{0};
+        std::mutex progressMutex;
+        auto lastProgressTime = phaseStart;
+        std::exception_ptr progressError;
+        const auto worker = [&]() {
+            while (true) {
+                const size_t job = nextJob.fetch_add(1);
+                if (job >= requestedCells.size())
+                    break;
+                try {
+                    jobResults[job] = processCell(requestedCells[job]);
+                } catch (...) {
+                    jobErrors[job] = std::current_exception();
+                }
+                completedJobs.fetch_add(1);
+                if (progressCallback) {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard lock(progressMutex);
+                    if (!progressError &&
+                        now - lastProgressTime >= std::chrono::seconds(1) &&
+                        completedJobs.load() < requestedCells.size()) {
+                        try {
+                            progressCallback({
+                                phase,
+                                completedJobs.load(),
+                                requestedCells.size(),
+                                std::chrono::duration<double>(
+                                    now - phaseStart).count(),
+                            });
+                            lastProgressTime = now;
+                        } catch (...) {
+                            progressError = std::current_exception();
+                        }
+                    }
+                }
             }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
+            workers.emplace_back(worker);
+        for (auto& thread : workers)
+            thread.join();
+
+        for (const auto& error : jobErrors) {
+            if (error)
+                std::rethrow_exception(error);
+        }
+        if (progressError)
+            std::rethrow_exception(progressError);
+        if (progressCallback) {
+            progressCallback({
+                phase,
+                requestedCells.size(),
+                requestedCells.size(),
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - phaseStart).count(),
+            });
+        }
+
+        std::vector<FiberCellAnchorResult> results;
+        results.reserve(requestedCells.size());
+        for (auto& result : jobResults) {
+            FiberCellAnchorResult cell = std::move(*result);
+            if (tallySelectedDiagnostics && retainPredicate) {
+                for (auto& component : cell.components) {
+                    if (!component.retained)
+                        continue;
+                    const FiberAnchorRetainEvaluation evaluation =
+                        retainPredicate(component.anchor);
+                    if (!evaluation.retained &&
+                        (!evaluation.testedValue.has_value() ||
+                         !evaluation.threshold.has_value())) {
+                        throw std::invalid_argument(
+                            "fiber anchor selection rejection requires tested value and threshold");
+                    }
+                    component.selectionTestedValue = evaluation.testedValue;
+                    component.selectionThreshold = evaluation.threshold;
+                    if (!evaluation.retained) {
+                        component.retained = false;
+                        component.rejectionReason = "outside_selection";
+                        --cell.retainedAnchorCount;
+                        ++report.diagnostics.outsideSelectionComponents;
+                    }
+                }
+            }
+            if (tallySelectedDiagnostics) {
+                for (auto& component : cell.components)
+                    component.retainedAfterSelection = component.retained;
+                if (cell.mergeEvaluation.has_value() &&
+                    cell.mergeEvaluation->merged) {
+                    ++report.diagnostics.mergedComponentPairs;
+                }
+                for (const auto& component : cell.components) {
+                    if (component.rejectionReason == "empty")
+                        ++report.diagnostics.emptyComponents;
+                    else if (component.rejectionReason == "degenerate")
+                        ++report.diagnostics.degenerateComponents;
+                    else if (component.rejectionReason == "below_support")
+                        ++report.diagnostics.belowSupportComponents;
+                }
+            }
+            if (cell.retainedAnchorCount > 0 || tallySelectedDiagnostics)
+                results.push_back(std::move(cell));
         }
         return results;
     };
@@ -1799,7 +2224,75 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     std::vector<FiberCellAnchorResult> contextResults = processCells(
         selectedCells, true, "selected_cells");
 
-    const double nmsDistance = std::hypot(config.localWindowRadiusPredictionVoxels, config.nmsLongitudinalRadiusPredictionVoxels);
+    report.diagnostics.totalCells = usesExplicitCells
+        ? explicitCells.size()
+        : checkedProduct({
+              report.selectedCellEndZYX[0] - report.selectedCellBeginZYX[0],
+              report.selectedCellEndZYX[1] - report.selectedCellBeginZYX[1],
+              report.selectedCellEndZYX[2] - report.selectedCellBeginZYX[2],
+          }, "selected fiber anchor cell");
+    const auto makeComponentRecord = [](const FiberCellAnchorResult& cell,
+                                        const FiberAnchorComponent& component) {
+        FiberAnchorDiagnosticRecord record;
+        record.cellZYX = cell.cellZYX;
+        record.candidateId = component.diagnosticId;
+        record.parentIds = component.diagnosticParentIds;
+        record.anchor = component.anchor;
+        record.discretePeakPositionPredictionXYZ =
+            component.discretePeakPositionPredictionXYZ;
+        record.separablePeakPositionPredictionXYZ =
+            component.separablePeakPositionPredictionXYZ;
+        record.jointPeakPositionPredictionXYZ =
+            component.jointPeakPositionPredictionXYZ;
+        record.metrics.assignedObservationCount =
+            component.assignedObservationCount;
+        record.metrics.alignedSupport = component.anchor.alignedSupport;
+        record.metrics.directionalCoherence =
+            component.anchor.directionalCoherence;
+        record.metrics.refinementScore = component.anchor.refinementScore;
+        record.metrics.refinementIterations =
+            component.anchor.refinementIterations;
+        return record;
+    };
+    for (const auto& cell : contextResults) {
+        for (const auto& initialized : cell.initializedDiagnostics) {
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
+        }
+        for (const auto& component : cell.components) {
+            if (component.diagnosticId == kNoDiagnosticId)
+                continue;
+            FiberAnchorDiagnosticRecord refined =
+                makeComponentRecord(cell, component);
+            if (component.retainedAfterSupport) {
+                refined.transition.outcome = "continue";
+            } else {
+                refined.transition.outcome = "rejected";
+                refined.transition.reason = component.rejectionReason;
+                if (component.rejectionReason == "below_support") {
+                    refined.transition.testedValue =
+                        component.anchor.alignedSupport;
+                    refined.transition.threshold = config.minimumAlignedSupport;
+                }
+            }
+            report.diagnosticStages[static_cast<size_t>(
+                FiberAnchorDiagnosticStage::Refined)].push_back(
+                    std::move(refined));
+        }
+    }
+    for (auto& stage : report.diagnosticStages) {
+        std::sort(stage.begin(), stage.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.cellZYX, left.candidateId) <
+                std::tie(right.cellZYX, right.candidateId);
+        });
+    }
+    if (refinedOnly) {
+        report.elapsedSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        return report;
+    }
+
+    const double nmsDistance = std::hypot(config.nmsTransverseRadiusPredictionVoxels, config.nmsLongitudinalRadiusPredictionVoxels);
     const double contextPivotDistance = config.localWindowRadiusPredictionVoxels + nmsDistance;
     const size_t contextCellRadius = static_cast<size_t>(std::ceil(contextPivotDistance / static_cast<double>(cellSize))) + 1;
     std::set<std::array<size_t, 3>> externalContextCells;
@@ -1856,13 +2349,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             return left.cellZYX < right.cellZYX;
     });
     suppressFiberAnchorDuplicates(contextResults, config);
-    report.diagnostics.totalCells = usesExplicitCells
-        ? explicitCells.size()
-        : checkedProduct({
-              report.selectedCellEndZYX[0] - report.selectedCellBeginZYX[0],
-              report.selectedCellEndZYX[1] - report.selectedCellBeginZYX[1],
-              report.selectedCellEndZYX[2] - report.selectedCellBeginZYX[2],
-          }, "selected fiber anchor cell");
     for (auto& cell : contextResults) {
         if (!selectedCell(cell.cellZYX))
             continue;
@@ -1876,47 +2362,13 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             if (component.rejectionReason == "nms_suppressed")
                 ++report.diagnostics.nmsSuppressedComponents;
         }
-        for (const auto& initialized : cell.initializedDiagnostics) {
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
-        }
-        const auto makeComponentRecord = [&](const FiberAnchorComponent& component) {
-            FiberAnchorDiagnosticRecord record;
-            record.cellZYX = cell.cellZYX;
-            record.candidateId = component.diagnosticId;
-            record.parentIds = component.diagnosticParentIds;
-            record.anchor = component.anchor;
-            record.metrics.assignedObservationCount =
-                component.assignedObservationCount;
-            record.metrics.alignedSupport = component.anchor.alignedSupport;
-            record.metrics.directionalCoherence =
-                component.anchor.directionalCoherence;
-            record.metrics.refinementScore = component.anchor.refinementScore;
-            record.metrics.refinementIterations =
-                component.anchor.refinementIterations;
-            return record;
-        };
         for (const auto& component : cell.components) {
             if (component.diagnosticId == kNoDiagnosticId)
                 continue;
-            FiberAnchorDiagnosticRecord refined = makeComponentRecord(component);
-            if (component.retainedAfterSupport) {
-                refined.transition.outcome = "continue";
-            } else {
-                refined.transition.outcome = "rejected";
-                refined.transition.reason = component.rejectionReason;
-                if (component.rejectionReason == "below_support") {
-                    refined.transition.testedValue = component.anchor.alignedSupport;
-                    refined.transition.threshold = config.minimumAlignedSupport;
-                }
-            }
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Refined)].push_back(
-                    std::move(refined));
-
             if (!component.retainedAfterSupport)
                 continue;
-            FiberAnchorDiagnosticRecord support = makeComponentRecord(component);
+            FiberAnchorDiagnosticRecord support =
+                makeComponentRecord(cell, component);
             if (component.retainedAfterSelection) {
                 support.transition.outcome = "continue";
             } else {
@@ -1931,7 +2383,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
 
             if (!component.retainedAfterSelection)
                 continue;
-            FiberAnchorDiagnosticRecord selection = makeComponentRecord(component);
+            FiberAnchorDiagnosticRecord selection =
+                makeComponentRecord(cell, component);
             if (component.retained) {
                 selection.transition.outcome = "continue";
             } else {
@@ -1945,7 +2398,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
 
             if (!component.retained)
                 continue;
-            FiberAnchorDiagnosticRecord nms = makeComponentRecord(component);
+            FiberAnchorDiagnosticRecord nms =
+                makeComponentRecord(cell, component);
             nms.transition.outcome = "final";
             report.diagnosticStages[static_cast<size_t>(
                 FiberAnchorDiagnosticStage::Nms)].push_back(std::move(nms));
@@ -1982,7 +2436,7 @@ FiberAnchorExtractionReport extractFiberAnchors(
     const FiberAnchorProgressCallback& progressCallback)
 {
     return extractFiberAnchorsImpl(
-        grid, config, sampler, crop, {}, {}, progressCallback);
+        grid, config, sampler, crop, {}, {}, progressCallback, false);
 }
 
 FiberAnchorExtractionReport extractFiberAnchorsForCells(
@@ -2002,7 +2456,232 @@ FiberAnchorExtractionReport extractFiberAnchorsForCells(
         std::nullopt,
         std::move(cellsZYX),
         retainPredicate,
-        progressCallback);
+        progressCallback,
+        false);
+}
+
+FiberAnchorExtractionReport extractRefinedFiberAnchorsForCells(
+    const FiberPredictionGridInfo& grid,
+    const FiberAnchorConfig& config,
+    const FiberStoredPredictionBatchSampler& sampler,
+    std::vector<std::array<size_t, 3>> cellsZYX,
+    const FiberAnchorProgressCallback& progressCallback)
+{
+    if (cellsZYX.empty()) {
+        throw std::invalid_argument(
+            "fiber anchor explicit cell selection must not be empty");
+    }
+    return extractFiberAnchorsImpl(
+        grid,
+        config,
+        sampler,
+        std::nullopt,
+        std::move(cellsZYX),
+        {},
+        progressCallback,
+        true);
+}
+
+std::vector<std::array<size_t, 3>> fiberAnchorCellsNearPolyline(
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    double radiusBaseVoxels,
+    const FiberPredictionGridInfo& grid,
+    int anchorCellSizePredictionVoxels)
+{
+    if (!(radiusBaseVoxels >= 0.0) || !std::isfinite(radiusBaseVoxels) ||
+        !(grid.predictionToBaseScale > 0.0) ||
+        !std::isfinite(grid.predictionToBaseScale) ||
+        anchorCellSizePredictionVoxels < 1) {
+        throw std::invalid_argument("fiber anchor polyline cell selection is invalid");
+    }
+    const auto reference = makePolylineArcGeometry(referenceLineBase);
+    const size_t cellSize = static_cast<size_t>(anchorCellSizePredictionVoxels);
+    const std::array<size_t, 3> cellShape{
+        (grid.shapeZYX[0] + cellSize - 1) / cellSize,
+        (grid.shapeZYX[1] + cellSize - 1) / cellSize,
+        (grid.shapeZYX[2] + cellSize - 1) / cellSize,
+    };
+    const double scale = grid.predictionToBaseScale;
+    const double radiusSquared = radiusBaseVoxels * radiusBaseVoxels;
+    std::set<std::array<size_t, 3>> cells;
+    for (size_t segment = 0; segment + 1 < reference.points.size(); ++segment) {
+        const cv::Vec3d& start = reference.points[segment];
+        const cv::Vec3d& endPoint = reference.points[segment + 1];
+        std::array<size_t, 3> cellBeginZYX{};
+        std::array<size_t, 3> cellEndZYX{};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const size_t xyz = 2 - axis;
+            const double gridSize = static_cast<double>(grid.shapeZYX[axis]);
+            const double lowerPrediction = std::clamp(
+                (std::min(start[xyz], endPoint[xyz]) - radiusBaseVoxels) /
+                    scale,
+                0.0,
+                gridSize);
+            const double upperPrediction = std::clamp(
+                (std::max(start[xyz], endPoint[xyz]) + radiusBaseVoxels) /
+                    scale,
+                0.0,
+                gridSize);
+            const size_t coarseBegin = static_cast<size_t>(std::floor(
+                lowerPrediction / static_cast<double>(cellSize)));
+            const size_t coarseEnd = static_cast<size_t>(std::ceil(
+                upperPrediction / static_cast<double>(cellSize)));
+            cellBeginZYX[axis] = coarseBegin > 0 ? coarseBegin - 1 : 0;
+            cellEndZYX[axis] = std::min(cellShape[axis], coarseEnd + 1);
+        }
+        for (size_t cz = cellBeginZYX[0]; cz < cellEndZYX[0]; ++cz) {
+            for (size_t cy = cellBeginZYX[1]; cy < cellEndZYX[1]; ++cy) {
+                for (size_t cx = cellBeginZYX[2]; cx < cellEndZYX[2]; ++cx) {
+                    const std::array<size_t, 3> begin{
+                        cz * cellSize, cy * cellSize, cx * cellSize};
+                    const std::array<size_t, 3> end{
+                        std::min(grid.shapeZYX[0], begin[0] + cellSize),
+                        std::min(grid.shapeZYX[1], begin[1] + cellSize),
+                        std::min(grid.shapeZYX[2], begin[2] + cellSize),
+                    };
+                    const cv::Vec3d cellLow{
+                        (static_cast<double>(begin[2]) - 0.5) * scale,
+                        (static_cast<double>(begin[1]) - 0.5) * scale,
+                        (static_cast<double>(begin[0]) - 0.5) * scale,
+                    };
+                    const cv::Vec3d cellHigh{
+                        (static_cast<double>(end[2]) - 0.5) * scale,
+                        (static_cast<double>(end[1]) - 0.5) * scale,
+                        (static_cast<double>(end[0]) - 0.5) * scale,
+                    };
+                    if (segmentAabbDistanceSquared(
+                            start, endPoint, cellLow, cellHigh) <=
+                        radiusSquared + kGeometryEpsilon) {
+                        cells.insert({cz, cy, cx});
+                    }
+                }
+            }
+        }
+    }
+    if (cells.empty())
+        throw std::runtime_error("reference fiber selects no prediction cells");
+    return {cells.begin(), cells.end()};
+}
+
+FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
+    const FiberAnchorExtractionReport& anchors,
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    const std::vector<double>& thresholdsBaseVoxels)
+{
+    if (!(anchors.grid.predictionToBaseScale > 0.0) ||
+        !std::isfinite(anchors.grid.predictionToBaseScale) ||
+        anchors.selectedCellsZYX.empty()) {
+        throw std::invalid_argument("anchor benchmark extraction report is invalid");
+    }
+    if (thresholdsBaseVoxels.empty() ||
+        std::any_of(
+            thresholdsBaseVoxels.begin(), thresholdsBaseVoxels.end(),
+            [](double value) { return !(value >= 0.0) || !std::isfinite(value); })) {
+        throw std::invalid_argument("anchor benchmark thresholds are invalid");
+    }
+    if (!std::is_sorted(
+            anchors.selectedCellsZYX.begin(), anchors.selectedCellsZYX.end()) ||
+        std::adjacent_find(
+            anchors.selectedCellsZYX.begin(), anchors.selectedCellsZYX.end()) !=
+            anchors.selectedCellsZYX.end()) {
+        throw std::invalid_argument("anchor benchmark cells are not canonical");
+    }
+    const auto reference = makePolylineArcGeometry(referenceLineBase);
+    const auto& refined = anchors.diagnosticStages[static_cast<size_t>(
+        FiberAnchorDiagnosticStage::Refined)];
+    enum class BenchmarkPeakStage { Discrete, Separable1d, Joint2d };
+    const auto measureStage = [&](BenchmarkPeakStage stage) {
+        std::map<std::array<size_t, 3>, std::vector<double>> distancesByCell;
+        for (const auto& cell : anchors.selectedCellsZYX)
+            distancesByCell.emplace(cell, std::vector<double>{});
+
+        std::vector<double> distances;
+        for (const auto& record : refined) {
+            if (!record.anchor.has_value())
+                continue;
+            const auto cell = distancesByCell.find(record.cellZYX);
+            if (cell == distancesByCell.end()) {
+                throw std::invalid_argument(
+                    "refined anchor belongs to an unselected benchmark cell");
+            }
+            if (!record.discretePeakPositionPredictionXYZ.has_value() ||
+                !record.separablePeakPositionPredictionXYZ.has_value() ||
+                !record.jointPeakPositionPredictionXYZ.has_value()) {
+                throw std::invalid_argument(
+                    "refined anchor lacks matched peak benchmark provenance");
+            }
+            cv::Vec3d pointPrediction;
+            switch (stage) {
+            case BenchmarkPeakStage::Discrete:
+                pointPrediction = *record.discretePeakPositionPredictionXYZ;
+                break;
+            case BenchmarkPeakStage::Separable1d:
+                pointPrediction = *record.separablePeakPositionPredictionXYZ;
+                break;
+            case BenchmarkPeakStage::Joint2d:
+                pointPrediction = *record.jointPeakPositionPredictionXYZ;
+                break;
+            }
+            const double distance = distanceToPolylineArc(
+                reference,
+                pointPrediction * anchors.grid.predictionToBaseScale,
+                0.0,
+                reference.length());
+            cell->second.push_back(distance);
+            distances.push_back(distance);
+        }
+
+        FiberAnchorBenchmarkStageReport result;
+        result.referenceCells = anchors.selectedCellsZYX.size();
+        result.cellsWithRefinedAnchors = static_cast<size_t>(std::count_if(
+            distancesByCell.begin(), distancesByCell.end(),
+            [](const auto& value) { return !value.second.empty(); }));
+        result.refinedAnchors = distances.size();
+        std::sort(distances.begin(), distances.end());
+        result.anchorDistancesBaseVoxels.count = distances.size();
+        if (!distances.empty()) {
+            result.anchorDistancesBaseVoxels.minimum = distances.front();
+            result.anchorDistancesBaseVoxels.maximum = distances.back();
+            result.anchorDistancesBaseVoxels.mean =
+                std::accumulate(distances.begin(), distances.end(), 0.0) /
+                static_cast<double>(distances.size());
+            result.anchorDistancesBaseVoxels.median =
+                interpolatedQuantile(distances, 0.5);
+            result.anchorDistancesBaseVoxels.percentile95 =
+                interpolatedQuantile(distances, 0.95);
+        }
+        for (const double threshold : thresholdsBaseVoxels) {
+            FiberAnchorBenchmarkThreshold measured;
+            measured.thresholdBaseVoxels = threshold;
+            measured.anchorHits = static_cast<size_t>(std::upper_bound(
+                distances.begin(), distances.end(),
+                threshold + kGeometryEpsilon) - distances.begin());
+            if (!distances.empty()) {
+                measured.anchorHitRate =
+                    static_cast<double>(measured.anchorHits) /
+                    static_cast<double>(distances.size());
+            }
+            for (const auto& [cell, cellDistances] : distancesByCell) {
+                (void)cell;
+                if (!cellDistances.empty() &&
+                    *std::min_element(
+                        cellDistances.begin(), cellDistances.end()) <=
+                        threshold + kGeometryEpsilon) {
+                    ++measured.cellHits;
+                }
+            }
+            measured.cellHitRate = static_cast<double>(measured.cellHits) /
+                static_cast<double>(result.referenceCells);
+            result.thresholds.push_back(measured);
+        }
+        return result;
+    };
+
+    return {
+        measureStage(BenchmarkPeakStage::Discrete),
+        measureStage(BenchmarkPeakStage::Separable1d),
+        measureStage(BenchmarkPeakStage::Joint2d),
+    };
 }
 
 
@@ -2046,11 +2725,14 @@ nlohmann::json fiberAnchorReportJson(
             {"peak_sigma_prediction_voxels", report.config.peakSigmaPredictionVoxels},
             {"peak_axial_sigma_prediction_voxels", report.config.peakAxialSigmaPredictionVoxels},
             {"peak_grid_step_prediction_voxels", report.config.peakGridStepPredictionVoxels},
+            {"peak_gradient_weight", report.config.peakGradientWeight},
+            {"peak_gradient_reliability_scale", report.config.peakGradientReliabilityScale},
             {"gaussian_cutoff_sigmas", report.config.gaussianCutoffSigmas},
             {"local_window_radius_prediction_voxels", report.config.localWindowRadiusPredictionVoxels},
             {"axial_support_half_width_prediction_voxels", report.config.axialSupportHalfWidthPredictionVoxels},
             {"position_convergence_tolerance_prediction_voxels", report.config.positionConvergenceTolerancePredictionVoxels},
             {"nms_maximum_angle_degrees", report.config.nmsMaximumAngleDegrees},
+            {"nms_transverse_radius_prediction_voxels", report.config.nmsTransverseRadiusPredictionVoxels},
             {"nms_longitudinal_radius_prediction_voxels", report.config.nmsLongitudinalRadiusPredictionVoxels},
             {"observation_presence_floor", report.config.observationPresenceFloor},
             {"minimum_aligned_support", report.config.minimumAlignedSupport},
@@ -2167,11 +2849,14 @@ nlohmann::json anchorDiagnosticParameters(const FiberAnchorConfig& config)
         {"peak_sigma_prediction_voxels", config.peakSigmaPredictionVoxels},
         {"peak_axial_sigma_prediction_voxels", config.peakAxialSigmaPredictionVoxels},
         {"peak_grid_step_prediction_voxels", config.peakGridStepPredictionVoxels},
+        {"peak_gradient_weight", config.peakGradientWeight},
+        {"peak_gradient_reliability_scale", config.peakGradientReliabilityScale},
         {"gaussian_cutoff_sigmas", config.gaussianCutoffSigmas},
         {"local_window_radius_prediction_voxels", config.localWindowRadiusPredictionVoxels},
         {"axial_support_half_width_prediction_voxels", config.axialSupportHalfWidthPredictionVoxels},
         {"position_convergence_tolerance_prediction_voxels", config.positionConvergenceTolerancePredictionVoxels},
         {"nms_maximum_angle_degrees", config.nmsMaximumAngleDegrees},
+        {"nms_transverse_radius_prediction_voxels", config.nmsTransverseRadiusPredictionVoxels},
         {"nms_longitudinal_radius_prediction_voxels", config.nmsLongitudinalRadiusPredictionVoxels},
         {"observation_presence_floor", config.observationPresenceFloor},
         {"minimum_aligned_support", config.minimumAlignedSupport},

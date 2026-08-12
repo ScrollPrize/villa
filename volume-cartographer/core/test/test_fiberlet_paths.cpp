@@ -77,6 +77,7 @@ vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
     artifact.report.config.gaussianSigmaPredictionVoxels = 1.0;
     artifact.report.config.localWindowRadiusPredictionVoxels = 2.0;
     artifact.report.config.axialSupportHalfWidthPredictionVoxels = 3.0;
+    artifact.report.config.nmsTransverseRadiusPredictionVoxels = 2.0;
     artifact.report.config.nmsLongitudinalRadiusPredictionVoxels = 1.0;
     artifact.report.config.observationPresenceFloor = 0.05;
     artifact.report.config.minimumAlignedSupport = 0.05;
@@ -847,6 +848,8 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK(loaded.report.nonEmptyCells[0].cellZYX == std::array<size_t, 3>{2, 2, 1});
     CHECK(loaded.report.nonEmptyCells[0].components[0].retained);
     CHECK_FALSE(loaded.report.nonEmptyCells[0].components[1].retained);
+    CHECK(loaded.report.config.nmsTransverseRadiusPredictionVoxels == 2.0);
+    CHECK(loaded.report.config.nmsLongitudinalRadiusPredictionVoxels == 1.0);
 
     auto oldCoordinates = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     oldCoordinates["coordinates"]["position_space"] = "stored_prediction_grid";
@@ -864,11 +867,32 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
+    auto missingTransverseNmsParameter =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingTransverseNmsParameter["parameters"].erase(
+        "nms_transverse_radius_prediction_voxels");
+    {
+        std::ofstream output(path);
+        output << missingTransverseNmsParameter.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version-1 schema"), std::runtime_error);
+
     auto missingRefinementParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementParameter["parameters"].erase("peak_sigma_prediction_voxels");
     {
         std::ofstream output(path);
         output << missingRefinementParameter.dump(2);
+    }
+    CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
+
+    auto missingGradientParameter =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingGradientParameter["parameters"].erase("peak_gradient_weight");
+    {
+        std::ofstream output(path);
+        output << missingGradientParameter.dump(2);
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 

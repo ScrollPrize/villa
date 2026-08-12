@@ -2520,19 +2520,85 @@ placement is a separate cached hill climb on an anisotropically integrated
 normal plane. The transverse peak sigma defaults to `1.5` prediction voxels;
 the along-direction sigma defaults to `1.5` cell sides so straight-fiber
 evidence remains substantial across several cells. The climb starts near the
-provisional broad-fit position, stops at the first discrete local maximum,
-applies only a non-decreasing bounded parabolic subvoxel fit, and keeps the
-result within the cell's continuous voxel-Voronoi ownership box.
+provisional broad-fit position and stops at the first discrete local maximum.
+Production placement then applies independent three-sample parabolic fits in
+the two normal-plane coordinates. Each finite offset is clamped to half a grid
+step; the combined point must remain in the cell's continuous voxel-Voronoi
+ownership box without decreasing the directly evaluated response. Every failed
+combined guard keeps the discrete peak. A full 3x3 joint quadratic is retained
+only as transient benchmark provenance.
 `vc_fiberlets anchors` and `fiber-replay` expose base-voxel controls as
 `--peak-sigma`, `--axial-sigma`, and `--peak-step`; strict artifacts store the
 transverse and axial sigmas in prediction-grid units. The extraction halo
 conservatively encloses both the broad direction-fit kernel and every rotated
 peak kernel.
 
+The peak objective also uses signed local presence-gradient evidence. Each cell
+job computes deterministic separable 3D Sobel gradients from presence-only
+stencils before discarding its dense halo. Normal-plane gradients pointing from
+a sample toward the candidate vote inward; the reverse sign votes outward.
+Votes retain direction-alignment and anisotropic Gaussian weighting and are
+reliability-gated by valid stencil coverage and radial gradient magnitude, so
+flat or incomplete neighborhoods preserve the presence-only result.
+`--gradient-weight` controls the dimensionless contribution, defaults to
+`1.0`, and `0` exactly disables gradient construction and its extra halo.
+Both weight and reliability scale are strict scientific artifact parameters.
+
+`FiberAnchors.cpp::fiberAnchorCellsNearPolyline` provides exact, canonical
+dense-polyline-to-cell selection for replay tubes and localization benchmarks.
+`benchmarkRefinedFiberAnchors` consumes only geometric records from the
+`Refined` diagnostic stage and evaluates exact base-coordinate distances to the
+stored dense fiber line. `vc_fiberlets anchor-benchmark` uses a refined-only
+extraction path that deliberately stops before support filtering and NMS. The
+production anchor uses `separable_1d`; `joint_2d` remains a matched comparison.
+The benchmark labels its three equal-population stages
+`discrete`, `separable_1d`, and `joint_2d`; none of the comparison coordinates
+are serialized. It prints distance statistics plus inclusive 4- and
+8-base-voxel anchor and cell hit rates and does not require a normal manifest or
+write artifacts. Both subpixel variants move only in the fitted anchor's normal
+plane. Their response already integrates an anisotropic 3D support volume, so
+calling the distinction 2D versus 3D would be incorrect; a true 3D positional
+fit would introduce forbidden forward/backward motion along the fiber.
+
+Anchor extraction performs reference/crop cell selection serially, then runs a
+bounded outer worker pool with one canonical job per cell. A job samples only
+its cell's required halo and always calls the prediction sampler with one inner
+thread, preventing nested chunk-read parallelism. Concurrent jobs share the
+decoded prediction cache, while an aggregate byte budget caps simultaneous
+halo buffers. Indexed result slots, followed by serial retain-predicate and
+diagnostic handling, keep artifacts deterministic across worker counts.
+
+Anchor duplicate suppression uses radii independent of peak refinement:
+2 stored prediction voxels transverse to the sign-aligned average anchor axis
+and 1 prediction voxel longitudinally. `FiberAnchorConfig` stores both fields,
+both strict anchor JSON writers serialize them, and `FiberPaths.cpp` requires
+them when loading anchors. Crop context preserves the full refinement-window
+displacement before adding this narrower NMS reach.
+
 The napari replay viewer loads the final anchor centre/direction glyphs and all
 five anchor diagnostic Shapes layers by default. `--no-anchor-stages` is an
 explicit fast-start opt-out that skips parsing and hashing the stage artifacts;
 replay reload preserves the selected stage-layer topology.
+The viewer interprets the versioned base-coordinate geometry, not the anchor
+extractor configuration. Its stage reader therefore ignores optional
+`parameters` metadata and future top-level metadata, and parameter differences
+do not enter cross-stage binding checks. Coordinate conventions, finite unit
+axes, identities, lineage, and final geometry consistency remain validated
+because those affect interpretation of the displayed diagnostic stages.
+Its independent anchor-radius control retains defensive full-population
+geometry/features in controller state but assigns only in-radius final anchors,
+stage anchors, cell centers, and refinement offsets to their Napari layers.
+This physical subsetting prevents cutoff-hidden geometry from writing depth and
+causing black occlusion artifacts. Slider widening and artifact rollback rebuild
+the displayed layers from the retained full source in original order.
+Presence and anchor display radii both initialize to 32 base voxels. A separate
+fiberlet-radius control initializes to 16 base voxels and retains a fiberlet if
+its rendered polyline has any point within that exact segment-to-segment
+distance of either the reference or failed trace. The generalized replay
+geometry filter keeps full path geometry, aligned quality features, colormap
+property, and explicit display width while physically removing complete
+out-of-radius paths. Reload recomputes distances and reapplies all three current
+radii without using the extraction-tube radius as a display default.
 
 `FiberPaths.cpp` first generates all candidates in canonical order. It unions
 their clipped Hermite-corridor and virtual-attachment bounds into one enclosing
@@ -2549,8 +2615,8 @@ emits the terminal update after joining workers and before rethrowing a task or
 callback exception. `vc_fiberlets` formats this callback on stderr with rate
 and ETA, while the core remains independent of console output.
 
-`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`, and
-`fiber-replay`.
+`volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`,
+`anchor-benchmark`, and `fiber-replay`.
 The latter requires the matching fiber manifest plus a separate regular
 Lasagna normal manifest and writes machine-readable `fiberlets.json` together
 with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ

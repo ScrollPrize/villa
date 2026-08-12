@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -439,7 +440,8 @@ TEST_CASE("fiber anchor peak search leaves a symmetric parallel-ridge midpoint")
     const auto result = vc::fiber_tracer::fitFiberCellAnchors(
         {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
     REQUIRE(result.retainedAnchorCount == 1);
-    const auto& position = result.components[0].anchor.positionPredictionXYZ;
+    const auto& component = result.components[0];
+    const auto& position = component.anchor.positionPredictionXYZ;
     CHECK(std::abs(position[1] - 5.5) > 1.0);
     CHECK((position[1] == doctest::Approx(4.0).epsilon(0.1) ||
            position[1] == doctest::Approx(7.0).epsilon(0.1)));
@@ -461,10 +463,20 @@ TEST_CASE("fiber anchor peak search applies a bounded subvoxel fit")
     const auto result = vc::fiber_tracer::fitFiberCellAnchors(
         {1, 1, 1}, {4, 4, 4}, {8, 8, 8}, observations, options);
     REQUIRE(result.retainedAnchorCount == 1);
-    const auto& position = result.components[0].anchor.positionPredictionXYZ;
+    const auto& component = result.components[0];
+    const auto& position = component.anchor.positionPredictionXYZ;
     CHECK(position[1] > 5.0);
     CHECK(position[1] < 5.5);
     CHECK(position[2] == doctest::Approx(6.0).epsilon(1.0e-8));
+    REQUIRE(component.discretePeakPositionPredictionXYZ.has_value());
+    REQUIRE(component.separablePeakPositionPredictionXYZ.has_value());
+    const auto& separable = *component.separablePeakPositionPredictionXYZ;
+    CHECK(separable[1] > 5.0);
+    CHECK(separable[1] < 5.5);
+    CHECK(separable[2] == doctest::Approx(6.0).epsilon(1.0e-8));
+    const cv::Vec3d pivot{5.5, 5.5, 5.5};
+    CHECK(std::abs((separable - pivot).dot(component.anchor.axisXYZ)) < 1.0e-10);
+    CHECK(std::abs((position - pivot).dot(component.anchor.axisXYZ)) < 1.0e-10);
     const auto response = [&](const cv::Vec3d& candidate) {
         double numerator = 0.0;
         double denominator = 0.0;
@@ -495,6 +507,108 @@ TEST_CASE("fiber anchor peak search applies a bounded subvoxel fit")
         return numerator / denominator;
     };
     CHECK(response(position) >= response({5.5, 5.0, 6.0}) - 1.0e-12);
+}
+
+TEST_CASE("fiber anchor quadratic peak recovers a cross-coupled maximum")
+{
+    constexpr double expectedFirst = 0.25;
+    constexpr double expectedSecond = -0.2;
+    std::array<std::array<double, 3>, 3> response{};
+    for (int first = -1; first <= 1; ++first) {
+        for (int second = -1; second <= 1; ++second) {
+            const double x = static_cast<double>(first) - expectedFirst;
+            const double y = static_cast<double>(second) - expectedSecond;
+            response[static_cast<size_t>(first + 1)]
+                    [static_cast<size_t>(second + 1)] =
+                10.0 - 2.0 * x * x - 0.75 * x * y - 3.0 * y * y;
+        }
+    }
+
+    const auto fitted = vc::fiber_tracer::fitFiberAnchorQuadraticPeak(response);
+    REQUIRE(fitted.has_value());
+    CHECK(fitted->firstGridSteps == doctest::Approx(expectedFirst).epsilon(1.0e-12));
+    CHECK(fitted->secondGridSteps == doctest::Approx(expectedSecond).epsilon(1.0e-12));
+
+    std::array<std::array<double, 3>, 3> transposed{};
+    for (size_t first = 0; first < 3; ++first) {
+        for (size_t second = 0; second < 3; ++second)
+            transposed[first][second] = response[second][first];
+    }
+    const auto swapped = vc::fiber_tracer::fitFiberAnchorQuadraticPeak(transposed);
+    REQUIRE(swapped.has_value());
+    CHECK(swapped->firstGridSteps == doctest::Approx(expectedSecond).epsilon(1.0e-12));
+    CHECK(swapped->secondGridSteps == doctest::Approx(expectedFirst).epsilon(1.0e-12));
+}
+
+TEST_CASE("fiber anchor quadratic peak least squares uses corner evidence")
+{
+    std::array<std::array<double, 3>, 3> response{};
+    for (int first = -1; first <= 1; ++first) {
+        for (int second = -1; second <= 1; ++second) {
+            response[static_cast<size_t>(first + 1)]
+                    [static_cast<size_t>(second + 1)] =
+                5.0 - first * first - second * second;
+        }
+    }
+    response[2][0] += 0.3;
+    response[2][2] += 0.3;
+
+    const auto fitted = vc::fiber_tracer::fitFiberAnchorQuadraticPeak(response);
+    REQUIRE(fitted.has_value());
+    CHECK(fitted->firstGridSteps > 0.04);
+    CHECK(std::abs(fitted->secondGridSteps) < 1.0e-12);
+}
+
+TEST_CASE("fiber anchor quadratic peak rejects ill-defined curvature")
+{
+    const auto samples = [](const auto& function) {
+        std::array<std::array<double, 3>, 3> response{};
+        for (int first = -1; first <= 1; ++first) {
+            for (int second = -1; second <= 1; ++second) {
+                response[static_cast<size_t>(first + 1)]
+                        [static_cast<size_t>(second + 1)] =
+                    function(static_cast<double>(first),
+                             static_cast<double>(second));
+            }
+        }
+        return response;
+    };
+
+    CHECK_FALSE(vc::fiber_tracer::fitFiberAnchorQuadraticPeak(
+        samples([](double, double) { return 1.0; })).has_value());
+    CHECK_FALSE(vc::fiber_tracer::fitFiberAnchorQuadraticPeak(
+        samples([](double x, double) { return 2.0 - x * x; })).has_value());
+    CHECK_FALSE(vc::fiber_tracer::fitFiberAnchorQuadraticPeak(
+        samples([](double x, double y) {
+            return 2.0 - x * x - 1.0e-13 * y * y;
+        })).has_value());
+
+    auto nonFinite = samples([](double x, double y) {
+        return 2.0 - x * x - y * y;
+    });
+    nonFinite[0][2] = std::numeric_limits<double>::quiet_NaN();
+    CHECK_FALSE(vc::fiber_tracer::fitFiberAnchorQuadraticPeak(nonFinite).has_value());
+}
+
+TEST_CASE("fiber anchor quadratic peak uses a closed half-step acceptance box")
+{
+    const auto peakAt = [](double expectedFirst) {
+        std::array<std::array<double, 3>, 3> response{};
+        for (int first = -1; first <= 1; ++first) {
+            for (int second = -1; second <= 1; ++second) {
+                const double x = static_cast<double>(first) - expectedFirst;
+                response[static_cast<size_t>(first + 1)]
+                        [static_cast<size_t>(second + 1)] =
+                    4.0 - x * x - second * second;
+            }
+        }
+        return vc::fiber_tracer::fitFiberAnchorQuadraticPeak(response);
+    };
+
+    const auto boundary = peakAt(0.5);
+    REQUIRE(boundary.has_value());
+    CHECK(boundary->firstGridSteps == doctest::Approx(0.5).epsilon(1.0e-12));
+    CHECK_FALSE(peakAt(0.500001).has_value());
 }
 
 TEST_CASE("fiber anchor refinement rotates its cell-center plane with direction")
@@ -638,8 +752,67 @@ TEST_CASE("fiber anchor extraction halo encloses every oblique peak kernel")
             options.peakAxialSigmaPredictionVoxels);
     const size_t expectedHalo = static_cast<size_t>(std::ceil(peakRadius));
     REQUIRE(expectedHalo == 20);
+    CHECK(selectedMinimum == std::array<size_t, 3>{11, 11, 11});
+    CHECK(selectedMaximum == std::array<size_t, 3>{56, 56, 56});
+
+    options.peakGradientWeight = 0.0;
+    calls = 0;
+    const auto noGradientReport = vc::fiber_tracer::extractFiberAnchorsForCells(
+        {{80, 80, 80}, 1.0}, options,
+        [&](const auto& indices, int, auto& samples) {
+            if (calls++ == 0) {
+                selectedMinimum = indices.front();
+                selectedMaximum = indices.back();
+            }
+            samples.assign(indices.size(), {
+                cv::Vec3d{1.0, 0.0, 0.0}, 0.0, true});
+        },
+        {{8, 8, 8}});
+    CHECK(noGradientReport.diagnostics.totalCells == 1);
     CHECK(selectedMinimum == std::array<size_t, 3>{12, 12, 12});
-    CHECK(selectedMaximum == std::array<size_t, 3>{67, 67, 67});
+    CHECK(selectedMaximum == std::array<size_t, 3>{55, 55, 55});
+}
+
+TEST_CASE("signed gradient evidence rejects a stationary midpoint between parallel ridges")
+{
+    const auto sampler = [](const auto& indices, int threads, auto& samples) {
+        if (threads != 1)
+            throw std::runtime_error("nested sampler threads used");
+        samples.clear();
+        for (const auto& index : indices) {
+            const size_t y = index[1];
+            const double presence = y == 2 || y == 5 ? 1.0 :
+                (y == 3 || y == 4 ? 0.4 : 0.0);
+            samples.push_back({
+                cv::Vec3d{1.0, 0.0, 0.0}, presence, true, true});
+        }
+    };
+    auto presenceOnly = config();
+    presenceOnly.cellSizePredictionVoxels = 8;
+    presenceOnly.minimumAlignedSupport = 0.001;
+    presenceOnly.peakGradientWeight = 0.0;
+    auto signedGradient = presenceOnly;
+    signedGradient.peakGradientWeight = 1.0;
+    signedGradient.peakGradientReliabilityScale = 0.01;
+
+    const auto baseline = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        {{16, 16, 16}, 1.0}, presenceOnly, sampler, {{0, 0, 0}});
+    const auto centered = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        {{16, 16, 16}, 1.0}, signedGradient, sampler, {{0, 0, 0}});
+    const auto& baselineRefined = baseline.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined)];
+    const auto& centeredRefined = centered.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined)];
+    REQUIRE(baselineRefined.size() == 1);
+    REQUIRE(centeredRefined.size() == 1);
+    REQUIRE(baselineRefined[0].anchor.has_value());
+    REQUIRE(centeredRefined[0].anchor.has_value());
+    const double baselineOffset = std::abs(
+        baselineRefined[0].anchor->positionPredictionXYZ[1] - 3.5);
+    const double gradientOffset = std::abs(
+        centeredRefined[0].anchor->positionPredictionXYZ[1] - 3.5);
+    CHECK(baselineOffset < 0.1);
+    CHECK(gradientOffset > 0.5);
 }
 
 TEST_CASE("fiber anchor truncated edge pivot remains feasible for an oblique direction")
@@ -658,7 +831,11 @@ TEST_CASE("fiber anchor truncated edge pivot remains feasible for an oblique dir
     const auto result = vc::fiber_tracer::fitFiberCellAnchors(
         {1, 1, 1}, {4, 4, 4}, {5, 5, 5}, observations, options);
     REQUIRE(result.retainedAnchorCount == 1);
-    CHECK(result.components[0].anchor.positionPredictionXYZ == cv::Vec3d{4.0, 4.0, 4.0});
+    const auto& component = result.components[0];
+    CHECK(component.anchor.positionPredictionXYZ == cv::Vec3d{4.0, 4.0, 4.0});
+    REQUIRE(component.discretePeakPositionPredictionXYZ.has_value());
+    CHECK(*component.discretePeakPositionPredictionXYZ ==
+        component.anchor.positionPredictionXYZ);
 }
 
 TEST_CASE("fiber anchor NMS suppresses transverse duplicates but keeps longitudinal anchors")
@@ -705,7 +882,8 @@ TEST_CASE("fiber anchor NMS preserves crossing directions")
 TEST_CASE("fiber anchor local-max NMS uses inclusive geometry and original candidates")
 {
     auto options = config();
-    options.localWindowRadiusPredictionVoxels = 2.0;
+    options.localWindowRadiusPredictionVoxels = 4.0;
+    options.nmsTransverseRadiusPredictionVoxels = 2.0;
     options.nmsLongitudinalRadiusPredictionVoxels = 1.0;
     const auto candidate = [](size_t cellX, cv::Vec3d position, cv::Vec3d axis, double support) {
         vc::fiber_tracer::FiberCellAnchorResult cell;
@@ -745,6 +923,40 @@ TEST_CASE("fiber anchor local-max NMS uses inclusive geometry and original candi
     CHECK(thresholds[1].retainedAnchorCount == 0);
     CHECK(thresholds[2].retainedAnchorCount == 1);
     CHECK(thresholds[3].retainedAnchorCount == 1);
+
+    std::vector<vc::fiber_tracer::FiberCellAnchorResult> transverseOutside{
+        candidate(0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.9),
+        candidate(1, {0.0, 2.1, 0.0}, {1.0, 0.0, 0.0}, 0.8),
+    };
+    vc::fiber_tracer::suppressFiberAnchorDuplicates(transverseOutside, options);
+    CHECK(transverseOutside[0].retainedAnchorCount == 1);
+    CHECK(transverseOutside[1].retainedAnchorCount == 1);
+
+    std::vector<vc::fiber_tracer::FiberCellAnchorResult> longitudinalOutside{
+        candidate(0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.9),
+        candidate(1, {1.1, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.8),
+    };
+    vc::fiber_tracer::suppressFiberAnchorDuplicates(longitudinalOutside, options);
+    CHECK(longitudinalOutside[0].retainedAnchorCount == 1);
+    CHECK(longitudinalOutside[1].retainedAnchorCount == 1);
+}
+
+TEST_CASE("fiber anchor NMS defaults are independent of refinement and cell size")
+{
+    for (const int cellSize : {2, 4, 8}) {
+        FiberAnchorConfig options;
+        options.cellSizePredictionVoxels = cellSize;
+        options.localWindowRadiusPredictionVoxels =
+            static_cast<double>(cellSize);
+        CHECK(options.nmsTransverseRadiusPredictionVoxels == 2.0);
+        CHECK(options.nmsLongitudinalRadiusPredictionVoxels == 1.0);
+    }
+    FiberAnchorConfig invalid;
+    invalid.nmsTransverseRadiusPredictionVoxels = -1.0;
+    std::vector<vc::fiber_tracer::FiberCellAnchorResult> cells;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::suppressFiberAnchorDuplicates(cells, invalid),
+        doctest::Contains("NMS transverse radius"), std::invalid_argument);
 }
 
 TEST_CASE("fiber anchor default falloff gives approximately uniform interior lattice coverage")
@@ -827,10 +1039,15 @@ TEST_CASE("fiber anchor cropped NMS includes suppressors outside the selected ce
           selection[0].cellZYX);
 }
 
-TEST_CASE("fiber anchor artifacts are deterministic across block and worker counts")
+TEST_CASE("fiber anchor artifacts are deterministic across outer worker counts")
 {
     const vc::fiber_tracer::FiberPredictionGridInfo grid{{8, 8, 8}, 2.0};
-    const auto sampler = [](const auto& indices, int, auto& samples) {
+    std::atomic<bool> allSamplerCallsSingleThreaded{true};
+    std::atomic<size_t> samplerCalls{0};
+    const auto sampler = [&](const auto& indices, int threads, auto& samples) {
+        if (threads != 1)
+            allSamplerCallsSingleThreaded.store(false);
+        samplerCalls.fetch_add(1);
         samples.clear();
         for (const auto& index : indices) {
             const bool fiber = index[1] == 3 || index[1] == 4;
@@ -841,13 +1058,13 @@ TEST_CASE("fiber anchor artifacts are deterministic across block and worker coun
     one.minimumAlignedSupport = 0.001;
     one.gaussianSigmaPredictionVoxels = 0.5;
     one.peakSigmaPredictionVoxels = 3.0;
-    one.processingBlockCellSide = 1;
     one.parallelThreads = 1;
     auto two = one;
-    two.processingBlockCellSide = 2;
     two.parallelThreads = 7;
     const auto first = vc::fiber_tracer::extractFiberAnchors(grid, one, sampler);
     const auto second = vc::fiber_tracer::extractFiberAnchors(grid, two, sampler);
+    CHECK(allSamplerCallsSingleThreaded.load());
+    CHECK(samplerCalls.load() >= 16);
     vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
     artifact.sourceLocator = "/tmp/fiber.lasagna.json";
     artifact.manifestContentHash = "fnv1a64:0123456789abcdef";
@@ -882,10 +1099,10 @@ TEST_CASE("fiber anchor artifacts are deterministic across block and worker coun
     std::filesystem::remove_all(secondDirectory);
 }
 
-TEST_CASE("fiber anchor extraction enforces its bounded sample block budget")
+TEST_CASE("fiber anchor extraction enforces its concurrent sample budget")
 {
     auto options = config();
-    options.maximumSampleBlockBytes = 1;
+    options.maximumConcurrentSampleBytes = 1;
     bool sampled = false;
     CHECK_THROWS_WITH_AS(
         vc::fiber_tracer::extractFiberAnchors(
@@ -894,6 +1111,26 @@ TEST_CASE("fiber anchor extraction enforces its bounded sample block budget")
         doctest::Contains("byte limit"),
         std::runtime_error);
     CHECK_FALSE(sampled);
+}
+
+TEST_CASE("parallel anchor extraction reports the lowest canonical cell failure")
+{
+    auto options = config();
+    options.parallelThreads = 8;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            {{64, 64, 64}, 1.0},
+            options,
+            [](const auto& indices, int threads, auto&) {
+                if (threads != 1)
+                    throw std::runtime_error("nested sampler threads used");
+                if (indices.front()[2] == 0)
+                    throw std::runtime_error("canonical cell zero failed");
+                throw std::runtime_error("later cell failed");
+            },
+            {{0, 0, 10}, {0, 0, 0}}),
+        doctest::Contains("canonical cell zero failed"),
+        std::runtime_error);
 }
 
 TEST_CASE("fiber anchor extraction keeps owned voxels with a narrower custom support kernel")
@@ -977,6 +1214,10 @@ TEST_CASE("fiber anchor artifacts expose only base-volume positions")
     CHECK(json.at("parameters").at("peak_sigma_prediction_voxels") == 1.5);
     CHECK(json.at("parameters").at("peak_axial_sigma_prediction_voxels") == 6.0);
     CHECK(json.at("parameters").at("peak_grid_step_prediction_voxels") == 0.5);
+    CHECK(json.at("parameters").at("peak_gradient_weight") == 1.0);
+    CHECK(json.at("parameters").at("peak_gradient_reliability_scale") == 0.05);
+    CHECK(json.at("parameters").at("nms_transverse_radius_prediction_voxels") == 2.0);
+    CHECK(json.at("parameters").at("nms_longitudinal_radius_prediction_voxels") == 1.0);
     CHECK(json.at("selection").contains("prediction_interval_origin_base_xyz"));
     CHECK(json.at("selection").contains("prediction_interval_size_base_xyz"));
     CHECK_FALSE(json.at("selection").contains("crop_origin_xyz"));
@@ -984,6 +1225,9 @@ TEST_CASE("fiber anchor artifacts expose only base-volume positions")
     const auto& anchor = json.at("cells").at(0).at("components").at(0);
     CHECK(anchor.contains("position_base_xyz"));
     CHECK_FALSE(anchor.contains("position_prediction_xyz"));
+    CHECK_FALSE(anchor.contains("discrete_peak_position_prediction_xyz"));
+    CHECK_FALSE(anchor.contains("separable_peak_position_prediction_xyz"));
+    CHECK_FALSE(anchor.contains("joint_peak_position_prediction_xyz"));
     const std::string obj = vc::fiber_tracer::fiberAnchorReportObj(report, artifact);
     CHECK(obj.find("g cell_0_0_0_anchor_0") != std::string::npos);
     CHECK(obj.find("\nl 1 2\n") != std::string::npos);
@@ -1008,6 +1252,34 @@ TEST_CASE("fiber anchor artifacts expose only base-volume positions")
                   report, artifact, stage)
                   .at("parameters")
                   .at("peak_axial_sigma_prediction_voxels") == 6.0);
+        CHECK(vc::fiber_tracer::fiberAnchorDiagnosticStageJson(
+                  report, artifact, stage)
+                  .at("parameters")
+                  .at("nms_transverse_radius_prediction_voxels") == 2.0);
+        const auto stageJson = vc::fiber_tracer::fiberAnchorDiagnosticStageJson(
+            report, artifact, stage);
+        if (stage == vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined) {
+            for (const auto& record : report.diagnosticStages[index]) {
+                if (record.anchor.has_value()) {
+                    CHECK(record.discretePeakPositionPredictionXYZ.has_value());
+                    CHECK(record.separablePeakPositionPredictionXYZ.has_value());
+                    CHECK(record.jointPeakPositionPredictionXYZ.has_value());
+                }
+            }
+        }
+        for (const auto& record : stageJson.at("records")) {
+            CHECK_FALSE(record.contains("discrete_peak_position_prediction_xyz"));
+            CHECK_FALSE(record.contains("separable_peak_position_prediction_xyz"));
+            CHECK_FALSE(record.contains("joint_peak_position_prediction_xyz"));
+            if (!record.at("geometry").is_null()) {
+                CHECK_FALSE(record.at("geometry").contains(
+                    "discrete_peak_position_prediction_xyz"));
+                CHECK_FALSE(record.at("geometry").contains(
+                    "separable_peak_position_prediction_xyz"));
+                CHECK_FALSE(record.at("geometry").contains(
+                    "joint_peak_position_prediction_xyz"));
+            }
+        }
         CHECK(
             vc::fiber_tracer::fiberAnchorDiagnosticStageJson(
                 parallelReport, artifact, stage).dump() ==
@@ -1085,6 +1357,7 @@ TEST_CASE("fiber stored-grid sampling binds only canonical prediction channels")
     REQUIRE(samples.size() == 2);
     for (const auto& sample : samples) {
         REQUIRE(sample.valid);
+        REQUIRE(sample.presenceValid);
         CHECK(sample.presence == doctest::Approx(1.0));
         CHECK(std::abs(sample.direction[0]) > 0.99);
     }
@@ -1168,11 +1441,15 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     grid.predictionToBaseScale = 1.0;
     auto value = config();
     value.localWindowRadiusPredictionVoxels = 2.0;
+    value.parallelThreads = 7;
+    std::atomic<bool> allSamplerCallsSingleThreaded{true};
     std::vector<vc::fiber_tracer::FiberAnchorProgress> progress;
     const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
         grid,
         value,
-        [](const auto& indices, int, auto& samples) {
+        [&](const auto& indices, int threads, auto& samples) {
+            if (threads != 1)
+                allSamplerCallsSingleThreaded.store(false);
             samples.clear();
             for (size_t index = 0; index < indices.size(); ++index) {
                 samples.push_back({{1.0, 0.0, 0.0}, 1.0, true});
@@ -1192,6 +1469,7 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
 
     CHECK(report.selectedCellsZYX ==
           std::vector<std::array<size_t, 3>>{{0, 0, 0}, {1, 1, 1}});
+    CHECK(allSamplerCallsSingleThreaded.load());
     CHECK(report.diagnostics.totalCells == 2);
     CHECK(report.diagnostics.outsideSelectionComponents >= 1);
     const auto& initialized = report.diagnosticStages[static_cast<size_t>(
@@ -1255,4 +1533,164 @@ TEST_CASE("anchor diagnostics retain unavailable attempts in zero-anchor cells")
          stage < vc::fiber_tracer::kFiberAnchorDiagnosticStageCount; ++stage) {
         CHECK(report.diagnosticStages[stage].empty());
     }
+}
+
+TEST_CASE("reference fiber cell selection uses exact closed ownership boxes")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid{{8, 8, 8}, 2.0};
+    const auto cells = vc::fiber_tracer::fiberAnchorCellsNearPolyline(
+        {{7.0, 0.0, 2.0}, {7.0, 2.0, 2.0}}, 0.0, grid, 2);
+
+    REQUIRE(cells.size() == 2);
+    CHECK(cells[0] == std::array<size_t, 3>{0, 0, 1});
+    CHECK(cells[1] == std::array<size_t, 3>{0, 0, 2});
+}
+
+TEST_CASE("refined anchor benchmark ignores all later filtering state")
+{
+    vc::fiber_tracer::FiberAnchorExtractionReport report;
+    report.grid = {{8, 8, 8}, 2.0};
+    report.selectedCellsZYX = {{0, 0, 0}, {0, 0, 1}, {0, 0, 2}};
+    const auto record = [](std::array<size_t, 3> cell,
+                           cv::Vec3d discrete,
+                           cv::Vec3d separable,
+                           cv::Vec3d joint) {
+        vc::fiber_tracer::FiberAnchorDiagnosticRecord result;
+        result.cellZYX = cell;
+        result.anchor = vc::fiber_tracer::FiberAnchor{};
+        result.anchor->cellZYX = cell;
+        result.anchor->positionPredictionXYZ = separable;
+        result.discretePeakPositionPredictionXYZ = discrete;
+        result.separablePeakPositionPredictionXYZ = separable;
+        result.jointPeakPositionPredictionXYZ = joint;
+        result.transition.outcome = "rejected";
+        result.transition.reason = "below_support";
+        return result;
+    };
+    report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined)] = {
+        record({0, 0, 0}, {2.5, 2.5, 0.0}, {2.5, 1.5, 0.0}, {2.5, 2.0, 0.0}),
+        record({0, 0, 0}, {2.5, 4.5, 0.0}, {2.5, 3.5, 0.0}, {2.5, 5.0, 0.0}),
+        record({0, 0, 1}, {2.5, 4.5, 0.0}, {2.5, 5.0, 0.0}, {2.5, 4.0, 0.0}),
+    };
+    report.nonEmptyCells.clear();
+    report.diagnostics.zeroAnchorCells = 3;
+
+    const auto measured = vc::fiber_tracer::benchmarkRefinedFiberAnchors(
+        report, {{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}}, {4.0, 8.0});
+
+    const auto checkPopulation = [](const auto& stage) {
+        CHECK(stage.referenceCells == 3);
+        CHECK(stage.cellsWithRefinedAnchors == 2);
+        CHECK(stage.refinedAnchors == 3);
+    };
+    checkPopulation(measured.discrete);
+    checkPopulation(measured.separable1d);
+    checkPopulation(measured.joint2d);
+
+    CHECK(measured.discrete.anchorDistancesBaseVoxels.minimum == 5.0);
+    CHECK(measured.discrete.anchorDistancesBaseVoxels.mean == doctest::Approx(23.0 / 3.0));
+    CHECK(measured.discrete.anchorDistancesBaseVoxels.median == 9.0);
+    CHECK(measured.discrete.anchorDistancesBaseVoxels.percentile95 == 9.0);
+    CHECK(measured.discrete.anchorDistancesBaseVoxels.maximum == 9.0);
+    REQUIRE(measured.discrete.thresholds.size() == 2);
+    CHECK(measured.discrete.thresholds[0].anchorHits == 0);
+    CHECK(measured.discrete.thresholds[0].anchorHitRate == 0.0);
+    CHECK(measured.discrete.thresholds[0].cellHits == 0);
+    CHECK(measured.discrete.thresholds[0].cellHitRate == 0.0);
+    CHECK(measured.discrete.thresholds[1].anchorHits == 1);
+    CHECK(measured.discrete.thresholds[1].anchorHitRate == doctest::Approx(1.0 / 3.0));
+    CHECK(measured.discrete.thresholds[1].cellHits == 1);
+    CHECK(measured.discrete.thresholds[1].cellHitRate == doctest::Approx(1.0 / 3.0));
+
+    CHECK(measured.separable1d.anchorDistancesBaseVoxels.minimum == 3.0);
+    CHECK(measured.separable1d.anchorDistancesBaseVoxels.mean == doctest::Approx(20.0 / 3.0));
+    CHECK(measured.separable1d.anchorDistancesBaseVoxels.median == 7.0);
+    CHECK(measured.separable1d.anchorDistancesBaseVoxels.percentile95 == doctest::Approx(9.7));
+    CHECK(measured.separable1d.anchorDistancesBaseVoxels.maximum == 10.0);
+    REQUIRE(measured.separable1d.thresholds.size() == 2);
+    CHECK(measured.separable1d.thresholds[0].anchorHits == 1);
+    CHECK(measured.separable1d.thresholds[0].cellHits == 1);
+    CHECK(measured.separable1d.thresholds[1].anchorHits == 2);
+    CHECK(measured.separable1d.thresholds[1].cellHits == 1);
+
+    CHECK(measured.joint2d.anchorDistancesBaseVoxels.minimum == 4.0);
+    CHECK(measured.joint2d.anchorDistancesBaseVoxels.mean == doctest::Approx(22.0 / 3.0));
+    CHECK(measured.joint2d.anchorDistancesBaseVoxels.median == 8.0);
+    CHECK(measured.joint2d.anchorDistancesBaseVoxels.percentile95 == doctest::Approx(9.8));
+    CHECK(measured.joint2d.anchorDistancesBaseVoxels.maximum == 10.0);
+    REQUIRE(measured.joint2d.thresholds.size() == 2);
+    CHECK(measured.joint2d.thresholds[0].anchorHits == 1);
+    CHECK(measured.joint2d.thresholds[0].anchorHitRate == doctest::Approx(1.0 / 3.0));
+    CHECK(measured.joint2d.thresholds[0].cellHits == 1);
+    CHECK(measured.joint2d.thresholds[0].cellHitRate == doctest::Approx(1.0 / 3.0));
+    CHECK(measured.joint2d.thresholds[1].anchorHits == 2);
+    CHECK(measured.joint2d.thresholds[1].anchorHitRate == doctest::Approx(2.0 / 3.0));
+    CHECK(measured.joint2d.thresholds[1].cellHits == 2);
+    CHECK(measured.joint2d.thresholds[1].cellHitRate == doctest::Approx(2.0 / 3.0));
+}
+
+TEST_CASE("refined anchor benchmark reports empty anchor population explicitly")
+{
+    vc::fiber_tracer::FiberAnchorExtractionReport report;
+    report.grid = {{4, 4, 4}, 1.0};
+    report.selectedCellsZYX = {{0, 0, 0}};
+
+    const auto measured = vc::fiber_tracer::benchmarkRefinedFiberAnchors(
+        report, {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}}, {4.0, 8.0});
+
+    for (const auto* stage : {
+             &measured.discrete, &measured.separable1d, &measured.joint2d}) {
+        CHECK(stage->refinedAnchors == 0);
+        CHECK_FALSE(stage->anchorDistancesBaseVoxels.mean.has_value());
+        REQUIRE(stage->thresholds.size() == 2);
+        for (const auto& threshold : stage->thresholds) {
+            CHECK(threshold.anchorHits == 0);
+            CHECK_FALSE(threshold.anchorHitRate.has_value());
+            CHECK(threshold.cellHits == 0);
+            CHECK(threshold.cellHitRate == 0.0);
+        }
+    }
+}
+
+TEST_CASE("refined-only extraction skips selection and NMS context")
+{
+    auto options = config();
+    options.parallelThreads = 7;
+    std::atomic<bool> allSamplerCallsSingleThreaded{true};
+    std::vector<vc::fiber_tracer::FiberAnchorProgress> progress;
+    const auto report = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        {{8, 8, 8}, 1.0},
+        options,
+        [&](const auto& indices, int threads, auto& samples) {
+            if (threads != 1)
+                allSamplerCallsSingleThreaded.store(false);
+            samples.assign(indices.size(), {
+                cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+        },
+        {{0, 0, 0}, {0, 0, 1}, {0, 1, 0}, {1, 0, 0}},
+        [&](const auto& event) { progress.push_back(event); });
+
+    CHECK(report.diagnostics.totalCells == 4);
+    CHECK(allSamplerCallsSingleThreaded.load());
+    CHECK_FALSE(report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Refined)].empty());
+    CHECK(report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Support)].empty());
+    CHECK(report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Selection)].empty());
+    CHECK(report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Nms)].empty());
+    REQUIRE_FALSE(progress.empty());
+    CHECK(std::all_of(progress.begin(), progress.end(), [](const auto& event) {
+        return event.phase == "selected_cells";
+    }));
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.back().completed == 4);
+    CHECK(progress.back().total == 4);
+    CHECK(std::is_sorted(
+        progress.begin(), progress.end(),
+        [](const auto& left, const auto& right) {
+            return left.completed < right.completed;
+        }));
 }

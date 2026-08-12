@@ -41,6 +41,14 @@ TEST_CASE("fiber replay tube uses exact endpoint caps and sorted explicit cells"
     CHECK_FALSE(tube.containsBasePoint({1.9, 6.1, 4.0}));
     CHECK(std::is_sorted(tube.cellsZYX.begin(), tube.cellsZYX.end()));
     REQUIRE_FALSE(tube.cellsZYX.empty());
+    CHECK(tube.cellsZYX == vc::fiber_tracer::fiberAnchorCellsNearPolyline(
+        tube.referenceIntervalBase, tube.radiusBaseVoxels, grid, 2));
+    CHECK(tube.cellsZYX == std::vector<std::array<size_t, 3>>{
+        {0, 0, 0}, {0, 0, 1}, {0, 0, 2},
+        {0, 1, 0}, {0, 1, 1}, {0, 1, 2},
+        {1, 0, 0}, {1, 0, 1}, {1, 0, 2},
+        {1, 1, 0}, {1, 1, 1}, {1, 1, 2},
+    });
     CHECK(tube.volumeCropBaseXYZWHD ==
           std::array<size_t, 6>{2, 2, 2, 8, 4, 4});
 }

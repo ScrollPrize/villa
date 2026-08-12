@@ -75,7 +75,8 @@ merges.
 
 Finally, local-maximum NMS suppresses cross-cell copies of the same anchor.
 Candidates must agree in unoriented direction and be within both the transverse
-window and half-cell longitudinal limit around their sign-aligned average axis.
+radius of 2 prediction voxels and longitudinal radius of 1 prediction voxel
+around their sign-aligned average axis.
 They are ranked by support, coherence, then stable cell/component identity.
 NMS compares every candidate with the original candidate set, preserving
 crossings and longitudinally separated anchors. Crops evaluate only the exact
@@ -92,9 +93,11 @@ volume-cartographer/build/bin/vc_fiberlets anchors \
 
 Cell size is restricted to 2 through 8 stored prediction voxels. `--falloff`
 sets the transverse Gaussian sigma in base voxels and defaults to half the cell
-side. `--window` sets the transverse refinement/NMS radius in base voxels and
-defaults to one cell side. The axial slab defaults to 1.5 cell sides, the NMS
-longitudinal limit to half a cell side, and the NMS angle to the merge angle.
+side. `--window` sets only the transverse refinement radius in base voxels and
+defaults to one cell side. The axial slab defaults to 1.5 cell sides. NMS uses
+independent fixed defaults of 2 prediction voxels transversely and 1 prediction
+voxel longitudinally; CLI reporting converts both to base voxels. The NMS angle
+defaults to the merge angle.
 The presence floor and aligned support threshold are inclusive.
 `--base-voxel-size-um` adds optional physical reporting metadata but never
 changes the solve.

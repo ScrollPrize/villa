@@ -1,17 +1,9 @@
-# Task: integrate broader peak evidence for fiber anchors
+# Task: reduce fiber-anchor NMS radii
 
-Improve the direction-conditioned local-maximum signal used to place cell
-anchors:
+Reduce duplicate suppression to a transverse radius of 2 and a longitudinal
+radius of 1 stored fiber-prediction voxels.
 
-- Increase the default transverse peak sigma from `0.75` to `1.5` prediction
-  voxels.
-- Integrate evidence along the fitted fiber direction with a substantially
-  larger Gaussian sigma. Choose it so a straight fiber contributes with roughly
-  comparable weight while passing through multiple neighboring cells.
-
-Keep candidate positions constrained to the rotating normal plane and owning
-cell. Preserve the existing broad direction fit, deterministic local ascent,
-subvoxel fit, support filtering, and NMS behavior.
-
-The fiberlet artifacts remain experimental and unshipped. Update their strict
-schema directly without compatibility or repair behavior.
+The transverse NMS radius must no longer reuse the refinement local-window
+radius. Refinement retains its current default one-cell-side window; only NMS
+becomes narrower. The fiberlet format remains experimental, so update its
+strict schema directly without compatibility or repair behavior.

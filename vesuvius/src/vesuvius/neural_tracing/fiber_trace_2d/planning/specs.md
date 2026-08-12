@@ -2545,6 +2545,28 @@
   `1.5 * cell_size` (`6` prediction voxels for default cells). Consequently a
   straight fiber one cell from the pivot retains about `0.80` axial weight and
   the ends of a centered three-cell span retain about `0.61`.
+- When `peak_gradient_weight > 0`, every outer cell job samples one additional
+  lattice voxel around that peak support and computes presence-only gradients
+  with separable 3D Sobel correlation. For example,
+  `grad_x=(P[x+1]-P[x-1])/2` after unit-sum `[1,2,1]/4` smoothing on Y and Z.
+  All 27 stencil presences must be finite and decoded; compact-direction
+  validity and the presence floor do not affect gradient validity. Global-edge
+  or otherwise incomplete stencils provide no gradient vote. Weight zero skips
+  both gradient construction and the extra halo exactly.
+- For candidate `a` and observation `x`, the presence gradient and `a-x` are
+  projected into the fitted anchor's normal plane. Zero projected vectors are
+  skipped. Their cosine is positive for an inward-pointing gradient and
+  negative for outward. Inward/outward vote mass is the anisotropic Gaussian
+  times squared fiber-direction alignment, transverse gradient magnitude,
+  `peak_sigma`, and squared radial cosine. Thus it is dimensionless in
+  prediction-grid units and weakly radial gradients contribute less.
+- The signed term is `(inward-outward)/(inward+outward+epsilon)`. It is gated by
+  valid-gradient Gaussian/alignment coverage and by
+  `R/(R+peak_gradient_reliability_scale)`, where `R` is normalized radial vote
+  magnitude. The default reliability scale is `0.05`; flat, tangential,
+  incomplete, or otherwise unsupported gradient neighborhoods fall back to the
+  presence response. The gated signed value is added with default weight
+  `1.0`. `--gradient-weight` changes or disables it.
 - Peak support is the intersection of independent three-sigma transverse and
   axial bounds. Direction assignment uses all valid above-floor observations
   in that support and is independent of the provisional center. The denominator
@@ -2561,12 +2583,42 @@
   tie breaking. It stops on a plateau and cannot cross a response valley to a
   stronger distant fiber. The grid radius is limited to 128 steps so malformed
   parameters cannot create unbounded enumeration.
-- Two three-sample parabolic fits may move the discrete maximum by at most half
-  a grid step in each plane coordinate. Their combined point is retained only
-  when it remains in the owner/window domain and does not reduce the normalized
-  peak response; otherwise the discrete maximum is final. Broad-kernel support
-  and coherence are then reevaluated at the peak for ordinary filtering and
-  NMS ranking. A cell emits zero, one, or two anchors.
+- Production subpixel placement uses `separable_1d`: each normal-plane
+  coordinate independently fits the center and its two axial neighbors.
+  Missing neighbors, non-finite curvature, or non-negative curvature leave only
+  that coordinate at zero. Each finite stationary offset is clamped to
+  `[-0.5,0.5]`; the combined point passes one owner/window and directly
+  evaluated non-decreasing-response guard or falls back wholly to discrete.
+  Broad-kernel support and coherence are reevaluated at this production point
+  for ordinary filtering and NMS ranking. A cell emits zero, one, or two
+  anchors.
+- For matched benchmarking, when the complete feasible 3x3 neighborhood exists,
+  all nine response samples
+  are fit by deterministic least squares to
+  `a + bx + cy + dx^2 + exy + fy^2` in grid-step coordinates. The stationary
+  point is usable only when all samples and coefficients are finite, the
+  symmetric Hessian's largest eigenvalue is strictly below
+  `-1e-12 * max(1,max(abs(samples)))`, its determinant exceeds the square of
+  that tolerance, and both offsets lie in the closed interval `[-0.5,0.5]`.
+  An exterior point is rejected rather than clamped. The fitted 3D point is
+  retained only when it remains in the owner/window domain and its directly
+  evaluated normalized response does not decrease within the existing
+  scale-aware response tolerance. Missing neighbors, unsuitable curvature, or
+  either final guard leave the joint comparison equal to the discrete maximum.
+- Refined-only benchmark extraction retains the converged grid maximum as
+  transient diagnostic provenance paired with two independently accepted
+  normal-plane candidates. `separable_1d` reproduces the previous estimator:
+  each coordinate uses its center and two axial neighbors; missing neighbors,
+  non-finite curvature, or non-negative curvature leave that coordinate at
+  zero; finite stationary offsets are clamped independently to `[-0.5,0.5]`;
+  the combined point passes one owner/window and real-response guard or falls
+  back wholly to discrete. `joint_2d` uses the complete quadratic rule above
+  and is benchmark-only.
+  All three stored transient positions are final estimator outputs, so a
+  rejected estimator equals the discrete point exactly. These values are not
+  serialized in either final or any diagnostic-stage version-1 anchor artifact.
+  Both estimators optimize two normal-plane coordinates from a response that
+  integrates 3D volumetric evidence; neither permits axial motion.
 - When both fitted components and their joint PCA are unique, near-duplicate
   components are evaluated before support rejection. Let `O2` be the sum of
   the two fixed-assignment principal eigenvalues divided by `sum_cell g_i` and
@@ -2581,26 +2633,34 @@
 - After all local fits, deterministic local-maximum NMS removes cross-cell
   duplicates with compatible unoriented directions. Two anchors interact only
   within the configured angular, transverse, and longitudinal limits measured
-  around their sign-aligned average axis. Ranking is aligned support, coherence,
-  then cell/component identity. Every decision compares against the original
+  around their sign-aligned average axis. Transverse and longitudinal defaults
+  are independent of the refinement window and cell size: 2 and 1 stored
+  prediction voxels respectively. Ranking is aligned support, coherence, then
+  cell/component identity. Every decision compares against the original
   candidate set, not only surviving candidates. Crossing directions and
   sequential anchors along a fiber therefore remain distinct. Cropped runs fit
   the exact external pivot cells that can directly compete with a selected
-  anchor, but serialize and count only selected cells.
+  anchor, conservatively including the full refinement displacement before the
+  NMS reach, but serialize and count only selected cells.
 - Reductions, seeds, assignment ties, convergence, component ordering, and
   serialization sign are deterministic. Parallel work cannot change a
-  within-cell reduction. Extraction uses bounded deterministic cell blocks and
-  one halo sample per block; block size and worker count are operational only.
+  within-cell reduction. After serial cell selection, extraction schedules one
+  canonical outer job per cell. Each job samples exactly that cell's bounded
+  halo and performs all lower-level sampling/chunk reads with one thread; jobs
+  may run concurrently up to the configured worker count and aggregate sample
+  memory budget. The decoded chunk cache deduplicates overlapping chunk loads.
+  Results and worker failures are stored by canonical cell index, retain
+  predicates and diagnostic aggregation run serially, and progress callbacks
+  are serialized. The lowest-index cell failure is reported after all workers
+  join.
   Machine output and OBJ store spatial positions only in base-volume XYZ
   coordinates. Prediction shape/scale, cell indices, cell size, direction
   falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
-  broad axial slab, convergence, and NMS limits remain explicit lattice
+  broad axial slab, convergence, and independent NMS limits remain explicit lattice
   metadata and parameters. The orientation-independent sampling halo covers the
   larger of the broad direction kernel and anisotropic peak kernel, including
-  the local-window displacement. Runtime timing and
-  worker count are not
-  scientific output, so artifacts remain byte-identical across worker counts
-  and block sizes.
+  the local-window displacement. Runtime timing and worker count are not
+  scientific output, so artifacts remain byte-identical across worker counts.
 - The anchor command itself does not connect anchors. Its strict version-1
   JSON is the authoritative input to the separate integer-DP path stage. It
   requires the refinement/NMS and merge parameters, aggregate diagnostics,
@@ -2611,6 +2671,41 @@
   regenerated. `anchors.obj` contains all retained anchors, while
   `anchors_0.obj` and `anchors_1.obj` contain deterministic post-sort
   per-cell component slots. These slots are not global H/V classes.
+  Strict final and diagnostic-stage parameters include
+  `peak_gradient_weight`, `peak_gradient_reliability_scale`, and
+  `nms_transverse_radius_prediction_voxels`; missing fields are rejected
+  without repair.
+
+# Refined-anchor localization benchmark
+
+- `vc_fiberlets anchor-benchmark <fiber-manifest> <fiber.json>` measures the
+  geometric anchor positions immediately after direction/position refinement.
+  It reads the strict fiber's dense `line_points` in base-volume XYZ
+  coordinates and never substitutes control points or later retained anchors.
+- Benchmark cells are the canonical prediction-grid anchor cells whose closed
+  continuous ownership boxes intersect an exact reference-polyline segment.
+  A segment on a shared cell face therefore selects both cells. Selection is
+  unique, sorted, grid-clipped, and uses radius zero; no sampled-vertex
+  approximation is permitted.
+- Extraction stops after the `refined` diagnostic stage. Support rejection,
+  retain predicates, external NMS context, NMS ranking, and final artifact
+  population cannot affect the benchmark. Refined prediction-coordinate
+  positions are converted to base coordinates before exact point-to-polyline-
+  segment distances are computed. The command reports `discrete`,
+  `separable_1d`, and `joint_2d` from the stored matched positions. All three
+  reports use the exact same geometric refined records and therefore have equal
+  populations.
+- The fixed inclusive thresholds are 4 and 8 base voxels. For each threshold,
+  the command reports anchor hits over all geometric refined anchors and cell
+  hits over all reference cells. A cell hits when at least one of its refined
+  anchors is within threshold; a cell with no refined anchor is a miss.
+- Distance output contains count, minimum, mean, median, p95, and maximum in
+  base voxels. Quantiles use linear interpolation at zero-based rank
+  `q*(n-1)`. Empty anchor populations report `n/a` rates/statistics rather than
+  changing denominators, and an empty reference-cell selection is an error.
+  Population, distance, and threshold output records carry
+  `stage=discrete|separable_1d|joint_2d`; extraction timing is shared. No
+  artifacts are written.
 
 # Integer-DP fiberlet paths
 
@@ -2819,11 +2914,15 @@
   NMS suppression. Threshold decisions store their tested value and threshold;
   NMS rejection stores the actual higher-ranked suppressor used by the existing
   pass, its ranking fields, and whether it is external context.
-- All stage files bind the same source hash, grid/scale, complete selected-cell
-  set, extraction parameters, and glyph length. Strict replay loading validates
-  canonical identities/order, merge lineage, survivor subsets, unchanged
-  geometry/metrics across filter-only stages, and equality between final NMS
-  geometry and `anchors.obj`. No repair or compatibility behavior exists.
+- Stage files emitted by one extraction bind the same source hash, grid/scale,
+  complete selected-cell set, extraction parameters, and glyph length. The
+  napari visualization reader treats extraction parameters as opaque optional
+  producer metadata: parameter additions, removals, value changes, or absence
+  cannot reject otherwise compatible geometry. Cross-stage visualization
+  checks bind only the source, coordinates, selection, and glyph length. They
+  still validate canonical identities/order, merge lineage, survivor subsets,
+  unchanged geometry/metrics across filter-only stages, and equality between
+  final NMS geometry and `anchors.obj`.
 - Stage capture copies existing computations and must not change fitting,
   filtering, NMS ranking, final `anchors.json`/OBJ bytes, or fiberlet paths.
   `anchors.json` remains the only authoritative path-stage input.
@@ -2837,11 +2936,28 @@
   itself, and each refinement offset uses its anchor target. Exact Euclidean
   point-to-segment distance is measured against the union of the reference
   fiber and complete failed trace; a glyph remains rendered when its distance
-  is at most the radius. The default is the extraction-tube radius.
-- Anchor distance filtering changes only per-item line alpha or point visibility. It preserves
-  complete geometry, stage features, item order, selections, widths/sizes,
-  clipping, layer visibility, and full artifact counts in layer names. It does
-  not affect fiberlet paths or the independently controlled presence EDT mask.
+  is at most the radius. Anchor radius defaults to 32 base voxels independently
+  of the extraction-tube radius. The presence EDT display mask is independently
+  controlled and also defaults to 32 base voxels.
+- Anchor distance filtering physically subsets each final/stage glyph Shapes
+  layer, the cell-center Points layer, and the refinement-offset Shapes layer.
+  Out-of-radius geometry must be absent from the displayed layer rather than
+  transparent or merely recolored, because hidden geometry must not participate
+  in depth rendering. The controller retains defensive full-population copies
+  of geometry, every aligned stage-feature column, exact distances, and source
+  order, then reconstructs the visible subset on each radius change. Filtering
+  preserves layer identity/order, widths/sizes, colors, clipping, layer
+  visibility, and full artifact counts in layer names; item selections are
+  cleared when displayed indices change. It does not affect the independently
+  controlled fiberlet-path or presence-EDT filters.
+- Failed-replay viewing provides an independent `Fiberlet radius`, defaulting
+  to 16 base voxels. Each fiberlet's distance is the exact minimum 3D
+  segment-to-segment distance between its complete rendered polyline and the
+  union of the reference fiber and failed trace. Degenerate segments are valid.
+  A path is retained inclusively when that distance is at most the radius, so
+  only fiberlets completely outside the threshold are physically absent from
+  the Shapes layer. The controller retains full geometry and aligned quality
+  features so widening restores source order, coloring, and widths.
 - Failed-replay mode creates stable typed layers for final anchors, cell
   centers, refinement offsets, and fiberlets even when an artifact population
   is empty, plus all five anchor stages unless diagnostic loading was explicitly
@@ -2857,12 +2973,17 @@
   generation paths may change. An incompatible replacement leaves the current
   display unchanged and reports that restart is required.
 - Reload never resolves or opens the presence Zarr and retains the exact lazy
-  source crop object. It recomputes only derived reference/trace EDT and exact
-  anchor distances, creates a new lazy mask graph over that same source, and
-  reapplies the current independent radius values.
+  source crop object. It recomputes only the derived reference/trace EDT, exact
+  anchor distances, and exact fiberlet-polyline distances; creates a new lazy
+  mask graph over that same source; and reapplies the current independent
+  presence, anchor, and fiberlet radius values.
 - Reload preparation completes strict parsing, compatibility, features, names,
   and distance calculations before layer mutation. Commit updates existing
   layers under blocked events, clears stale item selections, and preserves
   layer identity/order, visibility, clipping, widths/sizes, path colormap,
   volume rendering, crop controls, and radius controls. A commit error rolls all
-  artifact layers and derived controller state back before it is reported.
+  artifact layers, full-population filter sources, and derived controller state
+  back before it is reported. Reload reapplies the current anchor and fiberlet
+  radii to their replacement full sources, including transitions between empty
+  and nonempty displayed populations; later widening uses replacement full
+  sources rather than subsets visible during reload.

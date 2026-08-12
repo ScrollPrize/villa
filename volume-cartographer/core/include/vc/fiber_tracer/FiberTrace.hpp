@@ -228,6 +228,7 @@ struct FiberStoredPredictionSample {
     cv::Vec3d direction{0.0, 0.0, 0.0};
     double presence = 0.0;
     bool valid = false;
+    bool presenceValid = false;
 };
 
 struct FiberStoredPresenceSample {

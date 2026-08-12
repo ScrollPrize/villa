@@ -1,3 +1,89 @@
+# 2026-08-12: narrower independent anchor NMS
+
+- Decoupled transverse anchor NMS from the peak-refinement window and reduced
+  defaults to 2 transverse and 1 longitudinal prediction voxels.
+- Added the transverse radius to strict experimental anchor artifacts and path
+  loading while retaining conservative external crop context.
+
+# 2026-08-12: fiberlet replay distance filtering
+
+- Added an independent napari fiberlet-radius control that physically removes
+  paths wholly outside the exact reference/failed-trace polyline distance.
+- Set display defaults to 32 base voxels for presence and anchors and 16 for
+  fiberlets, with all three values preserved across artifact reload.
+
+# 2026-08-12: parameter-independent anchor visualization
+
+- Decoupled napari anchor-stage visualization compatibility from extractor
+  parameters. Old, absent, or extended parameter metadata now renders without
+  affecting coordinate, geometry, lineage, or final-output consistency checks.
+
+# 2026-08-12: full 2D anchor subpixel experiment
+
+- Replaced independent 1D peak parabolas with a complete 3x3 least-squares 2D
+  quadratic including cross-coupled curvature and conservative Hessian,
+  half-step, owner-domain, and real-response guards.
+- On the fixed David Paris4 benchmark, the 2D fit reproduced the discrete
+  population exactly but scored below the 1D baseline: 29.07%/43.90% versus
+  29.78%/44.88% anchor/cell hits at 4 vx, and 54.09%/80.42% versus
+  54.59%/81.06% at 8 vx.
+- Extending the signed-gradient sweep above its former maximum found a
+  4-voxel optimum near weight `1.0` and an 8-voxel optimum near `1.3-1.5`;
+  weight `1.2` gave the best equal-weight aggregate for joint-2D.
+- Added matched `discrete`, `separable_1d`, and `joint_2d` benchmark positions
+  from one extraction. The old `0.2` 1D result reproduced exactly. Across the
+  complete `0.0-2.0` sweep, separable-1D beat joint-2D on every 4/8 anchor/cell
+  hit rate; separable weight `1.1` scored 31.14%/46.89% at 4 vx and
+  55.97%/82.64% at 8 vx.
+- Selected separable-1D for production anchor placement and gradient weight
+  `1.0` as the default. Joint-2D remains transient benchmark provenance only.
+
+# 2026-08-12: discrete-versus-subpixel anchor benchmark
+
+- Split refined-anchor localization output into equal-population `discrete`
+  and `subpixel` reports while keeping discrete provenance transient and strict
+  version-1 artifacts unchanged.
+- Selected `0.2` as the default signed gradient weight from the fixed David
+  Paris4 sweep. Explicit CLI and artifact values remain authoritative.
+- At `0.2`, subpixel fitting improved 4-base-voxel anchor/cell hit rates from
+  27.79%/41.94% to 29.78%/44.88% and 8-base-voxel rates from 53.76%/79.86% to
+  54.59%/81.06% relative to the discrete peaks.
+
+# 2026-08-12: signed presence-gradient anchor centering
+
+- Added deterministic presence-only 3D Sobel gradients and reliability-gated
+  inward/outward normal-plane voting to the refined-anchor peak objective.
+- Added strict gradient weight/reliability artifact parameters and
+  `--gradient-weight`, with exact weight-zero fallback.
+- On the supplied David Paris4 reference, the default raised 4-base-voxel
+  anchor/cell hits from 1,002/982 to 1,021/1,000 and 8-base-voxel hits from
+  1,884/1,823 to 1,896/1,832 while reducing mean, median, and p95 distance.
+
+# 2026-08-12: outer-parallel anchor extraction
+
+- Parallelized anchor sampling and fitting over canonical cell jobs while
+  forcing every job's lower-level prediction sampler to one thread.
+- Added aggregate concurrent-halo memory bounding, deterministic indexed result
+  and error assembly, and serialized progress/retain handling.
+
+# 2026-08-12: refined-anchor localization benchmark
+
+- Added `vc_fiberlets anchor-benchmark` to extract only geometric refined
+  anchors in exact reference-intersecting cells and measure their exact
+  base-coordinate distance to a strict fiber's dense line.
+- Added stable distribution output and inclusive 4/8-base-voxel anchor and
+  reference-cell hit rates, with empty refined populations kept explicit.
+- Shared exact polyline-to-cell selection with failed-trace replay while
+  preserving replay's positive-radius tube behavior.
+
+# 2026-08-12: physical replay anchor filtering
+
+- Changed the Napari replay anchor-radius cutoff to physically subset final and
+  staged anchors, cell centers, and refinement offsets instead of leaving
+  transparent depth-occluding geometry in the rendered layers.
+- Retained defensive full geometry/features for reversible slider updates and
+  transactional artifact reload/rollback.
+
 # 2026-08-12: local-maximum fiberlet anchors
 
 - Added deterministic direction-conditioned normal-plane peak search after the
