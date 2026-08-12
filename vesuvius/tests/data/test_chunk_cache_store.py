@@ -413,6 +413,29 @@ def test_unbounded_by_default(tmp_path):
         assert _cached_path(store, key).exists()
 
 
+@pytest.mark.parametrize("bad", [0, -1, -2**30])
+def test_rejects_non_positive_max_bytes(tmp_path, bad):
+    # Every size check in the stores is `if self._max_bytes`, so a 0 cap would
+    # be indistinguishable from None and silently give an unbounded cache.
+    # Asserted on both classes, as with the other dual-class tests here.
+    with pytest.raises(ValueError, match="positive byte count"):
+        DiskCacheStore(
+            _remote_with({}), str(tmp_path), url="memory://dataset", max_bytes=bad
+        )
+    with pytest.raises(ValueError, match="positive byte count"):
+        DiskCacheStoreV2({}, str(tmp_path), url="memory://dataset", max_bytes=bad)
+
+
+def test_with_read_only_preserves_max_bytes(tmp_path):
+    # The cap is forwarded to the copy, and forwarding an already-validated
+    # value must not trip the new check.
+    for store in (
+        DiskCacheStore(_remote_with({}), str(tmp_path), url="memory://dataset", max_bytes=250),
+        DiskCacheStoreV2({}, str(tmp_path), url="memory://dataset", max_bytes=250),
+    ):
+        assert store.with_read_only(True)._max_bytes == 250
+
+
 def test_default_chunk_cache_dir_env(tmp_path, monkeypatch):
     monkeypatch.setenv("VESUVIUS_CACHE_DIR", str(tmp_path))
     assert default_chunk_cache_dir() == tmp_path / "chunks"
