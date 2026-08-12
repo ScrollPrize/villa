@@ -218,10 +218,14 @@ class Volume:
         cache_dir : Optional[Union[str, os.PathLike]], default = None
             If set, cache fetched chunks on disk under this directory instead of
             in memory, so a second run (or another process) reads them locally
-            rather than re-fetching. Remote stores opened read-only only.
+            rather than re-fetching. This is the chunk cache for the zarr store,
+            unrelated to ``Cube.cache_dir``. Applies only to remote stores opened
+            in read mode.
         cache_max_gb : Optional[float], default = None
             Size cap in GiB for the disk cache, evicting least-recently-used
             chunks. Unbounded if omitted; ignored unless ``cache_dir`` is set.
+            Eviction treats ``cache_dir`` as cache-owned and may delete any file
+            under it, so point it at a dedicated directory.
         read_retries : int, default = 4
             Attempts per read in __getitem__. Transient remote failures — dropped
             connections, truncated payloads, 429/5xx — are retried with exponential

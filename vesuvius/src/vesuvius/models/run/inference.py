@@ -1211,10 +1211,13 @@ def build_parser():
                            'with exponential backoff so one hiccup does not abort a long '
                            'streaming run. Set to 1 to disable.')
     parser.add_argument('--cache_dir', type=str, default=None,
-                      help='Directory for a persistent chunk cache for remote volumes. '
+                      help='Directory for a persistent chunk cache for remote volumes, '
+                           'for example ~/.cache/vesuvius/chunks. '
                            'Reused across runs; safe with multiple workers.')
     parser.add_argument('--cache_max_gb', type=float, default=None,
-                      help='Size cap in GiB for the chunk cache. Unbounded if omitted.')
+                      help='Size cap in GiB for the chunk cache. Unbounded if omitted. '
+                           'Eviction treats --cache_dir as cache-owned and may delete any '
+                           'file under it, so point it at a dedicated directory.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')

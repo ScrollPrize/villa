@@ -112,6 +112,10 @@ tensor_volume = Volume(
 - `return_as_type`: numpy dtype string such as `'np.uint16'` or `'np.float32'`.
 - `return_as_tensor`: return PyTorch tensors instead of NumPy arrays.
 - `download_only`: download metadata (and ink labels for segments) without opening the full volume.
+- `cache`: keep an in-memory LRU cache of fetched chunks, so repeated reads of the same region are served locally instead of re-fetched. Lasts for the life of the process.
+- `cache_size_mb`: maximum size of the in-memory cache in megabytes (default `256`). Ignored unless `cache=True`.
+- `cache_dir`: directory for a persistent on-disk chunk cache (e.g. `~/.cache/vesuvius/chunks`), reused by later runs and by other processes. Remote volumes opened in read mode only.
+- `cache_max_gb`: size cap in GiB for `cache_dir`, enforced by least-recently-used eviction (unbounded if omitted). Eviction treats the directory as cache-owned and may delete any file under it, so point it at a dedicated directory.
 - `verbose`: print detailed diagnostics during initialization and reads.
 
 ### Inspecting Metadata and Data

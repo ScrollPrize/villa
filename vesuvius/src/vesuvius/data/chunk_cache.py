@@ -16,7 +16,6 @@ import threading
 import time
 from collections.abc import MutableMapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import zarr
@@ -256,7 +255,6 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         # store's URL-namespaced subdirectory.
         self._cache_root = cache_dir
         self._max_bytes = max_bytes
-        self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
         self._url = str(url)
@@ -283,7 +281,7 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
 
     def with_read_only(self, read_only: bool = False):
         if not read_only:
-            raise NotImplementedError("_DiskCacheStore is always read-only")
+            raise NotImplementedError("DiskCacheStore is always read-only")
         return type(self)(
             self._remote.with_read_only(True),
             self._cache_root,
@@ -311,7 +309,7 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     print(
-                        f"[_DiskCacheStore] giving up on {key!r} after "
+                        f"[DiskCacheStore] giving up on {key!r} after "
                         f"{attempt} attempts, "
                         f"{self._retry_budget_seconds:.0f}s budget exhausted: "
                         f"{type(exc).__name__}: {exc}",
@@ -320,7 +318,7 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
                     raise
                 wait = min(delay, remaining, 60.0)
                 print(
-                    f"[_DiskCacheStore] transient error fetching {key!r} "
+                    f"[DiskCacheStore] transient error fetching {key!r} "
                     f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
                     f"retrying in {wait:.1f}s "
                     f"(remaining budget {remaining:.0f}s)",
@@ -468,9 +466,9 @@ class DiskCacheStoreV2(MutableMapping):
         # store's URL-namespaced subdirectory.
         self._cache_root = cache_dir
         self._max_bytes = max_bytes
-        self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
+        self._url = str(url)
         normalized = url.rstrip('/')
         scheme, sep, rest = normalized.partition('://')
         subdir = os.path.join(scheme, rest) if sep else normalized
@@ -478,7 +476,7 @@ class DiskCacheStoreV2(MutableMapping):
 
     def with_read_only(self, read_only: bool = False):
         if not read_only:
-            raise NotImplementedError("_DiskCacheStore is always read-only")
+            raise NotImplementedError("DiskCacheStore is always read-only")
         return type(self)(
             self._remote,
             self._cache_root,
@@ -505,7 +503,7 @@ class DiskCacheStoreV2(MutableMapping):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     print(
-                        f"[_DiskCacheStore] giving up on {key!r} after "
+                        f"[DiskCacheStore] giving up on {key!r} after "
                         f"{attempt} attempts, "
                         f"{self._retry_budget_seconds:.0f}s budget exhausted: "
                         f"{type(exc).__name__}: {exc}",
@@ -514,7 +512,7 @@ class DiskCacheStoreV2(MutableMapping):
                     raise
                 wait = min(delay, remaining, 60.0)
                 print(
-                    f"[_DiskCacheStore] transient error fetching {key!r} "
+                    f"[DiskCacheStore] transient error fetching {key!r} "
                     f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
                     f"retrying in {wait:.1f}s "
                     f"(remaining budget {remaining:.0f}s)",
@@ -630,10 +628,3 @@ class DiskCacheStoreV2(MutableMapping):
 
 
 DiskCacheStore = DiskCacheStoreV3 if _ZARR_V3 else DiskCacheStoreV2
-
-
-def default_chunk_cache_dir() -> Path:
-    """Default on-disk chunk cache root, following the existing
-    VESUVIUS_CACHE_DIR convention (see data/zarr_chunk_index.py)."""
-    root = Path(os.environ.get("VESUVIUS_CACHE_DIR", Path.home() / ".cache" / "vesuvius"))
-    return root / "chunks"

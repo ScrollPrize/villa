@@ -11,7 +11,6 @@ from vesuvius.data.chunk_cache import (
     _NEGATIVE_MARKER_SUFFIX,
     DiskCacheStore,
     DiskCacheStoreV2,
-    default_chunk_cache_dir,
 )
 
 
@@ -434,11 +433,3 @@ def test_with_read_only_preserves_max_bytes(tmp_path):
         DiskCacheStoreV2({}, str(tmp_path), url="memory://dataset", max_bytes=250),
     ):
         assert store.with_read_only(True)._max_bytes == 250
-
-
-def test_default_chunk_cache_dir_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("VESUVIUS_CACHE_DIR", str(tmp_path))
-    assert default_chunk_cache_dir() == tmp_path / "chunks"
-
-    monkeypatch.delenv("VESUVIUS_CACHE_DIR", raising=False)
-    assert default_chunk_cache_dir() == Path.home() / ".cache" / "vesuvius" / "chunks"
