@@ -85,11 +85,14 @@ def open_zarr(path: str, mode: str = 'r',
         back many volumes. The published scroll volumes are immutable, so
         cached entries are never revalidated against the remote; delete the
         directory to reset the cache. Ignored (falls through to the uncached
-        path) for local paths and for write modes. If both ``cache_dir`` and
-        ``cache=True`` are given, the disk cache wins.
+        path) for local paths, for write modes, and when ``cache_max_gb=0``.
+        If both ``cache_dir`` and ``cache=True`` are given, the disk cache wins.
     cache_max_gb : Optional[float], default None
         Size cap for the ``cache_dir`` tree, in gigabytes, enforced by
-        least-recently-used eviction. Default None means unbounded. Ignored
+        least-recently-used eviction. Default None means unbounded. 0 (or a
+        negative value) disables the disk cache entirely, so the call behaves
+        as if ``cache_dir`` had not been passed, mirroring how
+        ``cache_size_mb=0`` makes the in-memory cache retain nothing. Ignored
         unless ``cache_dir`` is set.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
@@ -198,13 +201,14 @@ def open_zarr(path: str, mode: str = 'r',
         return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
-        if cache_dir is not None and mode == 'r' and is_remote:
+        if (cache_dir is not None and mode == 'r' and is_remote
+                and (cache_max_gb is None or cache_max_gb > 0)):
             # Mirror fetched chunks into a local directory, keyed by the source
             # URL. Unlike the in-memory cache below this outlives the process,
             # so repeat epochs, DataLoader workers and separate runs all reuse
             # the same bytes, and it works on zarr 2 as well as zarr 3.
             from vesuvius.data.chunk_cache import DiskCacheStore
-            max_bytes = int(cache_max_gb * 2**30) if cache_max_gb else None
+            max_bytes = int(cache_max_gb * 2**30) if cache_max_gb is not None else None
             if _ZARR_V3:
                 from zarr.storage import FsspecStore
                 inner = FsspecStore.from_url(path, storage_options=storage_options, read_only=True)

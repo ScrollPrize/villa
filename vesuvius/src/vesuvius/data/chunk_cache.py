@@ -167,6 +167,18 @@ _EVICT_STATE: dict[str, int] = {}
 _EVICT_CHECK_EVERY = 64 * 2**20
 
 
+def _check_max_bytes(max_bytes: int | None) -> None:
+    """Reject a non-positive cap.
+
+    ``None`` means unbounded, so a 0 or negative cap would otherwise be
+    indistinguishable from it in every ``if self._max_bytes`` check below and
+    silently give the caller an unbounded cache. Callers that want no caching
+    should not build the store.
+    """
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive byte count or None")
+
+
 def _touch(path: str) -> None:
     """Record a cache hit as recent use, for eviction ordering.
 
@@ -238,6 +250,7 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         max_bytes: int | None = None,
     ) -> None:
         super().__init__(remote)
+        _check_max_bytes(max_bytes)
         self._remote = remote
         # The cap applies to the whole user-supplied cache root, not just this
         # store's URL-namespaced subdirectory.
@@ -449,6 +462,7 @@ class DiskCacheStoreV2(MutableMapping):
         retry_budget_seconds: float = 0.0,
         max_bytes: int | None = None,
     ) -> None:
+        _check_max_bytes(max_bytes)
         self._remote = remote
         # The cap applies to the whole user-supplied cache root, not just this
         # store's URL-namespaced subdirectory.

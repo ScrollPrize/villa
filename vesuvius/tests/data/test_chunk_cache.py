@@ -160,6 +160,26 @@ def test_cache_dir_max_gb_forwarded(monkeypatch, tmp_path, local_array):
     assert captured["max_bytes"] is None
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("cache_max_gb", [0, 0.0, -1.0])
+def test_cache_max_gb_zero_disables_disk_cache(monkeypatch, tmp_path, local_array, cache_max_gb):
+    # 0 means "no caching", not "unbounded": the disk branch is skipped
+    # entirely, mirroring cache_size_mb=0 retaining nothing.
+    from vesuvius.data import chunk_cache
+
+    def forbidden_store(*args, **kwargs):
+        raise AssertionError("disk cache store built despite cache_max_gb=0")
+
+    monkeypatch.setattr(chunk_cache, "DiskCacheStore", forbidden_store)
+    _patch_remote_store(monkeypatch, local_array)
+    cache_dir = tmp_path / "chunkcache"
+
+    arr = open_zarr(REMOTE_URL, mode="r", cache_dir=cache_dir, cache_max_gb=cache_max_gb)
+
+    assert np.array_equal(arr[:], zarr.open(local_array, mode="r")[:])
+    assert _cached_files(cache_dir) == []
+
+
 @requires_zarr_v3
 @pytest.mark.unit
 def test_cached_reads_are_byte_identical(local_array):
