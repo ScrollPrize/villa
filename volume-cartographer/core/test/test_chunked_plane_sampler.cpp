@@ -142,6 +142,44 @@ TEST_CASE("collectPlaneDependencies / collectCoordsDependencies enumerate keys")
     CHECK_FALSE(keysCoords.empty());
 }
 
+TEST_CASE("collectViewportDependencies is resident-only and keeps distant occurrences")
+{
+    class UnresolvedArray final : public UniformStatusArray {
+    public:
+        UnresolvedArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+
+        ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
+        {
+            ++queuedReads;
+            return UniformStatusArray::tryGetChunk(level, iz, iy, ix);
+        }
+
+        ChunkResult getChunkIfCached(int, int, int, int) override
+        {
+            ChunkResult result;
+            result.status = ChunkStatus::MissQueued;
+            result.dtype = vc::render::ChunkDtype::UInt8;
+            result.shape = shape(0);
+            return result;
+        }
+
+        int queuedReads = 0;
+    } array;
+
+    const std::vector<cv::Vec3f> coords{
+        {1.0f, 1.0f, 1.0f}, {1.1f, 1.0f, 1.0f}, {1.2f, 1.0f, 1.0f}};
+    const std::vector<std::array<float, 2>> viewport{
+        {4.0f, 4.0f}, {8.0f, 4.0f}, {40.0f, 4.0f}};
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 0;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, coords, viewport, options, 8.0f);
+
+    CHECK(array.queuedReads == 0);
+    REQUIRE(samples.size() == 2);
+    CHECK(samples[0].key == samples[1].key);
+}
+
 TEST_CASE("requestPlaneDependencies / requestCoordsDependencies run without crashing")
 {
     AllDataArray a;

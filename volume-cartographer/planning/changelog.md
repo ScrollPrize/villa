@@ -9,3 +9,8 @@
 - Unified VC3D regular decoded chunks behind one source-qualified application
   cache service, retaining warm data across volume switches and sharing base,
   overlay, Spiral, and surface-filler source reads.
+- Added a reduced-resolution viewport dependency pre-pass and focus-aware,
+  multi-view chunk scheduling. Pending GUI work is ordered by active view,
+  coarse level, and pointer distance while background requests receive bounded
+  fair service; direct and SurfaceCache rendering reuse their existing geometry
+  paths.

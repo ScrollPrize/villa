@@ -352,6 +352,9 @@ private:
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
+        vc::render::ChunkRequestContext chunkRequest;
+        std::array<float, 2> renderFocus{};
+        std::uint64_t surfaceViewGeneration = 0;
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -398,7 +401,6 @@ private:
         int fbW,
         int fbH,
         std::chrono::steady_clock::time_point submittedAt);
-    void requestSurfaceViewForJob(const PendingRenderJob& job);
     void startRenderJob(PendingRenderJob job);
     void submitPendingRenderJobIfNeeded();
     void updateDisplayedFramebufferMapping();
@@ -415,6 +417,7 @@ private:
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
+    void updateChunkRequestFocus(const QPointF& scenePos, bool makeActive);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -480,6 +483,8 @@ private:
     std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
+    std::uint64_t _chunkViewId = 0;
+    bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;

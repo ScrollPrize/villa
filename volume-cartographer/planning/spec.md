@@ -42,6 +42,42 @@
 - View epochs are allocated by the application cache service, not independently
   per source, so newly selected volume work outranks older queued source work.
 
+## Interactive chunk scheduling
+
+- Regular chunk work has separate interactive and background pending lanes.
+  Existing context-free `IChunkedArray` calls are background work. VC3D render
+  requests carry a stable numeric view ID and a monotonically increasing view
+  version through direct misses, prefetches, and asynchronous `SurfaceCache`
+  fills.
+- Before an accepted interactive render samples the volume, it probes the
+  viewport on a deterministic stratified 8-pixel grid. Each probe records the
+  2-D viewport occurrence of every required requested-level and permitted
+  fallback chunk. Nearby occurrences of the same chunk are deduplicated, but
+  distant occurrences on folded surfaces are retained.
+- A completed pre-pass atomically replaces that source's previous snapshot for
+  the view. Snapshot construction and surface-coordinate generation occur
+  without the chunk-cache state lock. Older view versions cannot replace a
+  newer snapshot.
+- Pending interactive work is ordered by active view, coarser pyramid level,
+  nearest retained occurrence to that view's focus, then FIFO. A GUI miss not
+  observed by the sparse pre-pass has no location and sorts after located work
+  at the same view and level.
+- Mouse interaction marks that view active and updates distances against its
+  retained point index. Before any pointer has been observed, viewport center
+  is the focus.
+- One unresolved source/chunk entry may contain demand from several views.
+  New snapshots promote already queued work in place instead of submitting a
+  duplicate task. Clearing a view removes only that view's demand.
+- Probe and fetch/decode queues use a work-conserving 7:1 interactive/background
+  admission policy, preventing background callers from starving. Priority is
+  recalculated when a persistent-cache miss enters fetch/decode work.
+- Running probe, download, decode, and render work is not cancelled. Updated
+  priorities affect pending work and stage handoffs only.
+- A direct surface render generates its full coordinate/normal matrices before
+  the pre-pass and reuses them for normal sampling. A fully SurfaceCache-backed
+  render probes the shared `SurfaceGeometryTileCache`; subsequent tile fills
+  reuse those geometry tiles and do not allocate a second full-frame matrix.
+
 ## Download label
 
 The main window uses one permanent status label for cache diagnostics and

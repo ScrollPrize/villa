@@ -8,6 +8,7 @@
 
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
+#include "vc/core/render/ChunkRequestScheduler.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -34,6 +36,8 @@ using vc::render::ChunkResult;
 using vc::render::ChunkStatus;
 using vc::render::ChunkCacheService;
 using vc::render::IChunkFetcher;
+using vc::render::ChunkRequestScheduler;
+using vc::render::ChunkWorkPriority;
 
 namespace {
 
@@ -1085,6 +1089,193 @@ TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetche
     REQUIRE(order.size() == 2);
     CHECK(order[0].ix == 0);
     CHECK(order[1].ix == 4);
+}
+
+TEST_CASE("ChunkRequestScheduler reprioritizes pending keyed work")
+{
+    ChunkRequestScheduler scheduler(1);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{1};
+    std::vector<int> order;
+    scheduler.submit(1, {}, 1, 0, [&] {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+        order.push_back(1);
+    });
+    started.wait();
+    scheduler.submit(2, {}, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(2);
+    });
+    ChunkWorkPriority interactive;
+    interactive.interactive = true;
+    interactive.activeView = true;
+    interactive.levelPriority = 0;
+    interactive.distanceSquared = 4.0f;
+    CHECK(scheduler.reprioritize(2, interactive));
+    scheduler.submit(3, {}, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(3);
+    });
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    CHECK(order == std::vector<int>{1, 2, 3});
+}
+
+TEST_CASE("ChunkRequestScheduler bounds interactive bursts")
+{
+    ChunkRequestScheduler scheduler(1, 3);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{1};
+    std::vector<int> order;
+    scheduler.submit(1, {}, 1, 0, [&] {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+        order.push_back(1);
+    });
+    started.wait();
+    ChunkWorkPriority gui;
+    gui.interactive = true;
+    gui.activeView = true;
+    for (int id = 2; id <= 6; ++id) {
+        scheduler.submit(std::uint64_t(id), gui, 1, 0, [&, id] {
+            std::lock_guard lock(mutex);
+            order.push_back(id);
+        });
+    }
+    scheduler.submit(7, {}, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(7);
+    });
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    REQUIRE(order.size() == 7);
+    CHECK(order[4] == 7); // blocker, three GUI tasks, then background
+}
+
+TEST_CASE("ChunkRequestScheduler orders active view then level then distance")
+{
+    ChunkRequestScheduler scheduler(1);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{1};
+    std::vector<int> order;
+    scheduler.submit(1, {}, 1, 0, [&] {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+        order.push_back(1);
+    });
+    started.wait();
+    auto submit = [&](int id, bool active, int level, float distance) {
+        ChunkWorkPriority priority;
+        priority.interactive = true;
+        priority.activeView = active;
+        priority.levelPriority = level;
+        priority.distanceSquared = distance;
+        scheduler.submit(std::uint64_t(id), priority, 1, 0, [&, id] {
+            std::lock_guard lock(mutex);
+            order.push_back(id);
+        });
+    };
+    submit(2, false, 0, 1.0f);   // inactive, coarse and near
+    submit(3, true, 1, 1.0f);    // active, finer
+    submit(4, true, 0, 100.0f);  // active, coarse and far
+    submit(5, true, 0, 4.0f);    // active, coarse and near
+    submit(6, true, 0, std::numeric_limits<float>::infinity());
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    CHECK(order == std::vector<int>{1, 5, 4, 6, 3, 2});
+}
+
+TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replacement")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 16}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+    (void)cache->tryGetChunk(0, 0, 0, 1); // initially background
+    (void)cache->tryGetChunk(0, 0, 0, 2); // remains background
+
+    vc::render::ChunkRequestContext current{41, 2};
+    cache->replaceViewDemand(current, {10.0f, 10.0f}, {
+        {{0, 0, 0, 1}, {10.0f, 10.0f}},
+    });
+    cache->updateViewFocus(41, {10.0f, 10.0f}, true);
+    cache->replaceViewDemand({41, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 3}, {0.0f, 0.0f}},
+    });
+
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+    const auto order = fetcher->order();
+    REQUIRE(order.size() == 3);
+    CHECK(order[0].ix == 0);
+    CHECK(order[1].ix == 1);
+    CHECK(order[2].ix == 2);
+    CHECK(cache->getChunkIfCached(0, 0, 0, 3).status == ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCache stale asynchronous GUI misses fall back to background priority")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 20}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+    (void)cache->tryGetChunk(0, 0, 0, 2); // background, queued first
+
+    cache->replaceViewDemand({51, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+    });
+    cache->updateViewFocus(51, {0.0f, 0.0f}, true);
+    (void)cache->tryGetChunk(0, 0, 0, 3, {51, 1}); // stale async fill
+
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 3).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 0, 3}});
 }
 
 TEST_CASE("ChunkCache: disk-cached chunks resolve without touching the fetcher pool")

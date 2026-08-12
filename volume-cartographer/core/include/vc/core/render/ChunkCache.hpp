@@ -20,10 +20,14 @@
 #include <unordered_set>
 #include <vector>
 
+class PointIndex;
+
 namespace vc::render {
 
 class PersistentZarrCacheBudget;
 class ChunkCache;
+class ChunkRequestScheduler;
+struct ChunkWorkPriority;
 
 // Application-owned decoded chunk-cache service. Source identity strings are
 // interned only when a facade is constructed; all hot lookups use the numeric
@@ -151,9 +155,22 @@ public:
     LevelTransform levelTransform(int level) const override;
 
     ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override;
+    ChunkResult tryGetChunk(int level, int iz, int iy, int ix,
+                            const ChunkRequestContext& request) override;
     ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
+    void prefetchChunks(const std::vector<ChunkKey>& keys,
+                        bool wait,
+                        int priorityOffset,
+                        const ChunkRequestContext& request) override;
+    void replaceViewDemand(const ChunkRequestContext& request,
+                           const std::array<float, 2>& focus,
+                           std::vector<ChunkViewportSample> samples) override;
+    void updateViewFocus(std::uint64_t viewId,
+                         const std::array<float, 2>& focus,
+                         bool makeActive) override;
+    void clearViewDemand(std::uint64_t viewId) override;
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
@@ -195,6 +212,11 @@ private:
         Error
     };
 
+    struct ViewDemandSlot {
+        std::uint64_t version = 0;
+        std::optional<float> distanceSquared;
+    };
+
     struct Entry {
         EntryStatus status = EntryStatus::InFlight;
         std::shared_ptr<const std::vector<std::byte>> bytes;
@@ -207,7 +229,10 @@ private:
         int basePriority = 0;
         std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
+        std::uint64_t probeTaskId = 0;
+        std::uint64_t fetchTaskId = 0;
         std::uint64_t budgetTouch = 0;
+        std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -254,6 +279,19 @@ private:
         const std::uint64_t schedulerGroup_;
         std::uint64_t schedulerEpoch_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
+        std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
+        std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
+        std::shared_ptr<std::atomic<std::uint64_t>> activeViewId_;
+        std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId_;
+        struct ViewSnapshot {
+            std::uint64_t version = 0;
+            std::array<float, 2> focus{};
+            std::vector<ChunkKey> collectionKeys;
+            std::shared_ptr<PointIndex> pointIndex;
+        };
+        std::unordered_map<std::uint64_t, ViewSnapshot> viewSnapshots_;
+        std::unordered_map<std::uint64_t,
+                           std::unordered_set<ChunkKey, ChunkKeyHash>> viewDemandKeys_;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
         std::size_t remoteFetchesInFlight_ = 0;
@@ -268,6 +306,16 @@ private:
     static ChunkResult resultFromEntryLocked(
         State& state, const ChunkKey& key, Entry& entry, bool promote = true);
     static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
+    static ChunkWorkPriority workPriorityLocked(const State& state,
+                                                const ChunkKey& key,
+                                                const Entry& entry);
+    static void reprioritizeEntryLocked(const State& state,
+                                        const ChunkKey& key,
+                                        Entry& entry);
+    static void addRequestDemandLocked(State& state,
+                                       const ChunkKey& key,
+                                       Entry& entry,
+                                       const ChunkRequestContext& request);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  std::uint64_t generation,
@@ -280,7 +328,6 @@ private:
                                         ChunkKey key,
                                         std::uint64_t generation,
                                         std::uint64_t fetchSerial,
-                                        std::int64_t priority,
                                         std::uint64_t schedulerEpoch);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,
@@ -337,6 +384,8 @@ private:
     std::shared_ptr<State> state_;
     mutable std::mutex facadeMutex_;
     std::unordered_set<ChunkReadyCallbackId> listenerIds_;
+    std::atomic<std::uint64_t> legacyViewId_{0};
+    std::atomic<std::uint64_t> legacyViewVersion_{0};
 };
 
 } // namespace vc::render

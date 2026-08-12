@@ -2,181 +2,135 @@
 
 ## Scope and invariants
 
-- Unify only regular decoded volume chunks. Keep `SurfaceCache`, surface image
-  tiles, surface geometry tiles, and unrelated application caches independent.
-- Preserve chunk bytes, interpolation, pyramid-level selection, fill handling,
-  persistent-cache paths/formats, and rendering output.
-- Retain decoded chunks across current-volume changes until the global LRU
-  evicts them or that specific source is explicitly invalidated.
-- Do not implement cancellation tokens or volume-switch cancellation. Already
-  queued/running work may drain and may populate the cache if still valid.
-- Keep standalone/core users of `ChunkCache` supported; the unified service is
-  injected by VC3D rather than imposed as process-global mutable state on every
-  command-line tool and test.
+- Change request ordering only. Preserve sampled values, level transforms,
+  interpolation, fill behavior, persistent-cache formats, and source identity.
+- Keep one deduplicated unresolved regular-chunk entry per source/key while
+  allowing that entry to carry demand from several viewers.
+- Use stable integer view IDs and viewport-space points; do not collapse a
+  folded surface's multiple chunk occurrences into one rectangle.
+- Treat "lower level" as lower spatial resolution/coarser pyramid data, matching
+  the current fallback-first behavior.
+- Never hold the shared scheduler/cache lock while generating surface geometry
+  or traversing viewport samples.
+- Running I/O/decode work is not cancelled. New scheduling applies at the next
+  admission decision and at persistent-probe to remote-fetch handoff.
 
-## Baseline and discovery
+## Core request context and scheduler
 
-1. Record the current build type, revision, host-load conditions, and repeated
-   `bench_chunked_plane_sampler` results before changing the cache hot path.
-   Because its current `DataChunkedArray` bypasses `ChunkCache`, first add a
-   behavior-neutral scenario backed by a warmed real `ChunkCache` and a
-   synthetic fetcher. Record that scenario on the old implementation before
-   introducing the shared backend so the changed key/map path is measured.
-2. Inventory every VC3D regular-cache construction/acquisition path:
-   `Volume::sharedChunkCache`, `Volume::createChunkCache`, main plane viewers,
-   overlay viewers, Spiral private plane pools, and the raw-volume inputs used
-   to fill surface tiles.
-3. Classify existing `ChunkCache::Options` as either service-wide (decoded RAM
-   capacity, worker concurrency), source-specific (levels, dtype, fill value,
-   fetchers, persistent directory, all-fill detection), or obsolete once
-   storage is unified. Fail loudly when two registrations of one source provide
-   incompatible source metadata instead of silently creating divergent views.
+1. Add explicit request metadata to `IChunkedArray`: background by default,
+   or GUI with stable view ID, view version and optional viewport location.
+   Preserve existing overloads for CLI/core callers as background requests.
+2. Add an application-cache-service scheduler with separate GUI and background
+   pending lanes. Admit work to the existing probe and fetch/decode pools only
+   when a worker slot is available, so the next item can be chosen from current
+   demand rather than being buried in an immutable executor heap.
+3. Track versioned per-view demand slots for each unresolved chunk. Select GUI
+   work by active view, coarse level, nearest occurrence, then FIFO. Interleave
+   background admissions with GUI admissions using a bounded weighted policy
+   while remaining work-conserving.
+4. Preserve request identity across stages. Re-evaluate priority when a disk
+   probe misses and the chunk enters the remote-fetch lane. Invalidation and
+   stale fetch serial checks must continue rejecting obsolete publications.
+5. Replacing a view snapshot removes that view's old slots, adds the new slots,
+   and queues/promotes all currently missing chunks atomically. Clearing or
+   destroying a viewer removes only that viewer's demand.
 
-## Core cache generalization
+## View pre-pass and point indexing
 
-1. Introduce a reusable shared regular-cache backend in `vc::render` and keep
-   `ChunkCache` as the source-bound `IChunkedArray` facade. Move the decoded
-   entry map, global LRU/accounting, metadata-entry bound, in-flight fetch
-   deduplication, and shared request scheduler behind that backend.
-2. Add a strongly typed `VolumeSourceId` backed by a fixed-width integer and an
-   internal source-qualified key containing only:
+1. Add reusable dependency-point collection helpers to
+   `ChunkedPlaneSampler`. A dependency point associates every nearest/trilinear
+   required chunk with the originating 2-D viewport sample without queueing or
+   touching cache LRU state.
+2. Sample the viewport on an 8-pixel stratified grid. Derive deterministic
+   jitter from view/render version and grid cell so successive renders cover
+   different positions while test runs remain reproducible.
+3. Deduplicate points per chunk in screen space with an 8-pixel radius/grid,
+   then bulk-build a 2-D `PointIndex` (`z=0`) whose collection IDs map to chunk
+   keys. Compute each chunk's nearest retained occurrence to the captured focus
+   point for scheduler ordering.
+4. Publish the locally completed snapshot immediately before normal rendering.
+   Actual sampler misses after publication use the same GUI context with no
+   position unless the caller has an exact viewport point.
 
-   ```text
-   VolumeSourceId + level + chunk_z + chunk_y + chunk_x
-   ```
+## Surface geometry reuse
 
-   The facade stores its numeric source ID, so `tryGetChunk`, cached/blocking
-   lookup, prefetch, LRU promotion, and ready-result publication add only an
-   integer copy/hash combine. Keep stable identity strings entirely out of
-   render-time keys, entry objects, and per-pixel/per-chunk path handling.
-3. Add a cold-path source registry that interns a canonical source identity to
-   one monotonic, non-reused numeric ID for the backend lifetime. Build the
-   canonical identity once from the actual data source:
-   - canonical local volume/group path plus selected base/group level;
-   - normalized remote volume/group URI plus selected base/group level;
-   - no UI volume ID, authentication secret, or cache-directory string.
-4. Extract source-identity normalization into a shared core helper and make
-   cache registration consume it; remove the obsolete VC3D-only overlay
-   identity implementation rather than duplicating it. Keep existing
-   persistent-cache directory selection and on-disk paths unchanged so this
-   in-memory generalization does not strand or rename disk-cache entries.
-5. Store levels, transforms, dtype, fill value, fetchers, persistent-cache
-   location, and source generation once per registered source. Re-registering
-   the same identity must reuse the ID and validate compatible metadata.
-6. Make explicit invalidation source-scoped: increment that source's generation
-   and remove only its entries. A completed stale-generation fetch must not
-   publish after invalidation, but this task does not interrupt the operation.
-7. Preserve source-specific listener delivery and diagnostics. Expose global
-   decoded RAM/capacity and persistent-budget totals while reporting in-flight
-   downloads, throughput, and unresolved levels for the facade's source, so an
-   old-volume download cannot corrupt the active volume's `qK` level display.
+1. Move direct-render coordinate generation ahead of the pre-pass whenever the
+   full render needs generated coordinates. Reuse the existing
+   `GeneratedSurfaceCache` result for both dependency collection and sampling.
+2. Add a sparse view-coordinate probe to `SurfaceGeometryTileCache`. It reads
+   or generates the same level geometry tiles used by SurfaceCache fills and
+   returns coordinates/normals only at requested viewport samples.
+3. When base and overlay rendering are fully SurfaceCache-backed, build the
+   pre-pass from this geometry-tile probe instead of allocating full-frame
+   coordinate mats. The following `requestView`/fill work reuses those tiles.
+4. Carry the originating GUI request context through `SurfaceCache::requestView`
+   into asynchronous fills and their blocking dependency prefetch calls.
 
-## VC3D ownership and lifecycle
+## VC3D integration
 
-1. Construct one regular-cache backend at VC3D application bootstrap and pass
-   that same instance explicitly through every `CWindow`/`CState` to volumes
-   and viewer cache acquisition. Avoid both one-service-per-window behavior and
-   a hidden global singleton.
-2. Change `Volume` cache acquisition to register its immutable source once and
-   return source-bound facades backed by that service. Preserve a private
-   backend fallback for volumes used outside VC3D.
-3. Stop treating `releaseCacheClient()` as cache invalidation. Releasing the
-   current view may release its facade/listeners, but the service retains source
-   metadata and decoded entries for its lifetime. Keep `Volume::invalidateCache`
-   as explicit source invalidation for writes or source changes.
-4. Remove the separate overlay regular-cache registry and lease. Base and
-   overlay access to the same source must resolve to the same numeric source ID,
-   entry, in-flight fetch, and decoded bytes.
-5. Replace VC3D's physically separate Spiral/private regular chunk pools with
-   facades over the unified backend. Keep `SurfaceCache` and geometry-cache
-   capacities separate; route their raw source-chunk reads through the unified
-   backend. Remove or migrate regular-cache settings that no longer represent a
-   real independent memory pool rather than leaving misleading controls.
-6. Preserve newest-view request priority across sources. In this task,
-   `beginViewRequest` may raise demand priority but volume switching must not
-   discard queued work. Any existing `discardPending` caller must be made
-   non-destructive when attached to the shared backend and documented as such;
-   cooperative cancellation/request withdrawal is deferred.
+1. Assign every `CChunkedVolumeViewer` a stable numeric view ID and track its
+   last valid viewport cursor/focus, falling back to viewport center.
+2. Mark a view active on mouse interaction and publish active-view state through
+   the shared cache service. Capture focus and demand version in accepted render
+   jobs; do not run a pre-pass for jobs merely stored in `_pendingRenderJob`.
+3. Run the pre-pass inside the accepted render worker before any normal chunk
+   miss can queue. Apply it independently to base and active overlay sources,
+   sharing one view ID/version.
+4. Move accepted `SurfaceCache::requestView()` admission from the UI-side
+   `startRenderJob()` setup to the render worker, immediately after snapshot
+   publication. This ensures its asynchronous fills inherit the completed GUI
+   demand instead of queueing unlocated dependencies ahead of the pre-pass.
+5. Clear view demand on volume/source replacement and viewer shutdown so stale
+   old-volume work becomes background rather than interactive priority work.
 
-## Testing
+## Testing and measurement
 
-- Extend focused core cache tests for:
-  - the same canonical source registered twice receiving the same numeric ID;
-  - different sources with identical chunk coordinates never colliding;
-  - two facades deduplicating one in-flight fetch and sharing the decoded result;
-  - numeric/trivially-copyable hot keys with no source string member;
-  - releasing all facades and reacquiring the source preserving resident data;
-  - switching A -> B -> A reusing A without another fetch while resident;
-  - source-scoped invalidation clearing A but not B and rejecting stale A
-    publication without cancelling its fetch;
-  - compatible local and remote persistent-cache reads/writes retaining their
-    current on-disk layout;
-  - global byte/LRU enforcement across sources;
-  - global storage stats combined with source-specific queue/network stats.
-- Add or extend VC3D-facing tests proving base/overlay reuse and that derived
-  SurfaceCache/geometry caches remain distinct while their source chunks use the
-  shared backend.
-- Build and run at minimum:
+- Add core scheduler/cache tests for:
+  - existing queued chunks adopting new GUI demand;
+  - active view before inactive view;
+  - coarse level before pointer distance;
+  - nearest of multiple viewport occurrences;
+  - no-location GUI ordering within a level;
+  - atomic snapshot replacement and stale-version rejection;
+  - weighted, work-conserving GUI/background fairness;
+  - priority re-evaluation between persistent probe and remote fetch;
+  - source/view isolation and cleanup.
+- Add sampler tests for deterministic jitter, dependency-point correctness,
+  per-chunk point deduplication, and nearest/trilinear corner coverage.
+- Add SurfaceGeometryTileCache tests proving sparse view probes reuse generated
+  tiles and match direct surface coordinates within the cache's sampling
+  convention.
+- Build and run:
 
   ```bash
-  cmake --build volume-cartographer/build --target test_chunk_cache test_chunk_cache_persist test_chunked_plane_sampler bench_chunked_plane_sampler VC3D -j4
+  cmake --build volume-cartographer/build --target test_chunk_cache test_chunk_cache_persist test_chunked_plane_sampler VC3D -j4
   ctest --test-dir volume-cartographer/build --output-on-failure -R '^(test_chunk_cache|test_chunk_cache_persist|test_chunked_plane_sampler)$'
   git diff --check
   ```
 
-- Run the deterministic Valgrind/Callgrind CI render gate before and after.
-  This is the required virtualized performance regression result and does not
-  depend on host load. Use the established `render_valgrind_ci` target and its
-  checked score/reference artifacts.
-
-- Also run the direct synthetic sampler benchmark before and after with the
-  same build and repetition count. This supplemental check includes the new
-  warmed-real-cache scenario that exercises the changed cache key/map path,
-  which the established CI fixture does not cover:
-
-  ```bash
-  volume-cartographer/build/bin/bench_chunked_plane_sampler
-  ```
-
-  Record every direct scenario's minimum and median/spread plus covered-pixel
-  count. Treat score-gate or output/coverage changes as correctness failures.
-  Investigate any repeatable direct-throughput regression outside run-to-run
-  noise; do not accept a meaningful regression merely because a loose floor
-  passes.
+- Run the synthetic Valgrind/Callgrind rendering gate after implementation and
+  compare with the accepted unified-cache result. Also report pre-pass cost and
+  point/chunk counts from a deterministic synthetic fixture. The gate is
+  virtualized and may run despite unrelated host load.
 
 ## Spec update
 
-- Add the process-wide VC3D regular-cache ownership invariant.
-- Specify canonical cold-path source interning and numeric-only hot keys.
-- Specify cross-volume retention, global LRU limits, source-scoped invalidation,
-  shared base/overlay entries, and source-specific queue diagnostics.
-- State that derived surface/geometry caches remain separate and that
-  switch-time cancellation is intentionally not part of this phase.
+- Replace scalar newest-render priority with versioned multi-view GUI demand.
+- Specify viewport occurrence points, pre-pass publication, active/level/distance
+  ordering, no-location semantics, and GUI/background fairness.
+- Specify that direct rendering and SurfaceCache-backed rendering reuse their
+  respective surface geometry paths for the pre-pass.
+- Specify explicit GUI request propagation through asynchronous SurfaceCache
+  fills and late render misses.
 
 ## Docs updates
 
-- Add a regular chunk-cache architecture section to
-  `docs/remote_file_cache.md` covering service/facade ownership, source IDs,
-  heap-backed decoded storage, persistent-disk separation, global eviction, and
-  volume-switch lifetime.
-- Update Spiral/cache setting documentation and UI text for any removed or
-  reinterpreted private regular-cache controls.
-- Document that cache retention is capacity-bound, not a guarantee that every
-  previously visited volume remains resident indefinitely.
+- Extend `docs/remote_file_cache.md` with request stages, GUI/background lanes,
+  view snapshots, focus ordering, and SurfaceCache geometry reuse.
+- Document that running work is not cancelled and that priority changes apply
+  to pending work and stage handoffs.
 
 ## Changelog update
 
-- Add one entry describing the unified source-qualified regular chunk cache,
-  warm volume switching, and base/overlay deduplication after implementation and
-  validation are complete.
-
-## Explicitly deferred
-
-- Cooperative cancellation of render, decode, persistent probes, local I/O, or
-  network transfers.
-- Withdrawing stale per-view demand or guaranteeing bounded switch latency while
-  all workers are occupied.
-- Combining SurfaceCache, surface geometry, or other derived caches with the
-  regular decoded chunk store.
-- Memory mapping decoded or persistent chunks; decoded data remains ordinary
-  heap-owned byte vectors in this task.
+- Add a dated entry for focus-aware multi-view chunk scheduling and the
+  reduced-resolution render pre-pass after implementation and validation.

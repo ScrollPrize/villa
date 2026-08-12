@@ -47,6 +47,7 @@ public:
         // -1 preserves the general-purpose "all levels" behavior, while 0
         // makes every fallback lookup resident-only.
         int queuedFallbackLevels;
+        ChunkRequestContext request;
     };
 
     struct Stats {
@@ -100,6 +101,19 @@ public:
                                                            const cv::Mat_<cv::Vec3f>& coords,
                                                            const cv::Mat_<uint8_t>& coverage,
                                                            const Options& options = Options());
+
+    // Collect candidate chunk occurrences for sparse logical-level-0 XYZ
+    // samples. `viewportPositions` uses framebuffer pixel coordinates and must
+    // match `coords`. No cache state is read or changed; the atomic demand
+    // publisher filters chunks that resolved while this local traversal ran.
+    // Nearby occurrences of one chunk are deduplicated in 2-D.
+    static std::vector<ChunkViewportSample> collectViewportDependencies(
+        IChunkedArray& array,
+        int startLevel,
+        const std::vector<cv::Vec3f>& coords,
+        const std::vector<std::array<float, 2>>& viewportPositions,
+        const Options& options = Options(),
+        float dedupRadiusPixels = 8.0f);
 
     // Samples one pyramid level into `out` for pixels not already marked in
     // `coverage`. Coordinates are logical level-0 XYZ voxel coordinates.

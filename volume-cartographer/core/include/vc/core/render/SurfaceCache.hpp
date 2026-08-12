@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <array>
+#include <vector>
 
 class QuadSurface;
 
@@ -166,7 +168,8 @@ public:
                      double scale,
                      int fbW,
                      int fbH,
-                     std::uint64_t viewGeneration);
+                     std::uint64_t viewGeneration,
+                     ChunkRequestContext request = {});
 
     TileReadyCallbackId addTileReadyListener(std::function<void()> callback);
     void removeTileReadyListener(TileReadyCallbackId id);
@@ -218,6 +221,17 @@ public:
     // Computes on miss. Concurrent callers for the same key wait for the
     // first one instead of duplicating the gen().
     std::shared_ptr<const Tile> get(int level, int tu, int tv);
+
+    // Resolve sparse framebuffer samples through the same geometry tiles used
+    // by SurfaceCache fills. This may generate missing geometry tiles, which
+    // makes the following fill reuse them rather than invoking gen() again.
+    void sampleView(int level,
+                    double uMin,
+                    double vMin,
+                    double scale,
+                    const std::vector<std::array<float, 2>>& viewportPositions,
+                    std::vector<cv::Vec3f>& coords,
+                    std::vector<cv::Vec3f>* normals = nullptr);
 
     void invalidateAll();
     void invalidateSurfaceRegion(const cv::Rect& gridCells);

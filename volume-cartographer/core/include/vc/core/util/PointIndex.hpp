@@ -55,6 +55,13 @@ public:
         size_t k,
         float maxDistance = std::numeric_limits<float>::max()) const;
 
+    // Return the nearest point for every collection, ordered by distance.
+    // This is useful when several spatial occurrences belong to one logical
+    // object and only that object's nearest occurrence affects priority.
+    std::vector<QueryResult> nearestPerCollection(
+        const cv::Vec3f& position,
+        float maxDistance = std::numeric_limits<float>::max()) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

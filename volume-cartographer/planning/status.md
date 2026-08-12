@@ -1,16 +1,15 @@
 # Status
 
 - [x] Read the task workflow and current render/fetch specification.
-- [x] Map current regular-cache ownership, volume-switch lifetime, source
-  identity, overlay cache, Spiral private pools, and synthetic benchmark.
+- [x] Inspect current cache epochs, immutable executor priorities, render job
+  admission, SurfaceCache fills, and shared surface geometry tiles.
 - [x] Create the detailed task plan.
 - [x] Independently review the task plan against `task.md`, `spec.md`, and
   `plan.md`; resolve findings.
-- [x] Record the pre-change synthetic renderer benchmark baseline.
-- [x] Introduce the numeric source ID and shared cache backend.
-- [x] Migrate VC3D base, overlay, and raw SurfaceCache input chunk access.
-- [x] Preserve source-scoped invalidation, diagnostics, and persistent-cache
-  compatibility.
+- [x] Add explicit request context and the fair multi-view scheduler.
+- [x] Add dependency-point collection and deterministic pre-pass sampling.
+- [x] Reuse full generated coordinates and SurfaceGeometryTileCache geometry.
+- [x] Integrate stable view IDs, focus state, snapshot publication, and cleanup.
 - [x] Add and run focused correctness tests.
-- [x] Run the Valgrind CI render gate and supplemental warmed-cache benchmark.
+- [ ] Run the synthetic render performance gate and record results.
 - [x] Update specification, documentation, changelog, and task log.

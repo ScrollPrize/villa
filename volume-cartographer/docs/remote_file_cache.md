@@ -129,6 +129,28 @@ No switch-time fetch/decode cancellation is implemented. The service allocates
 view epochs across all sources, so a newly selected volume gains priority while
 older work may drain.
 
+Interactive VC3D renders publish versioned per-view demand before normal
+sampling starts. A sparse, stratified viewport probe associates missing chunks
+with all of their retained screen-space occurrences. Pending GUI work is then
+ordered by active view, coarse pyramid level, and distance to that view's last
+pointer position (or viewport center before pointer activity). Chunks missed by
+the probe still enter the GUI lane, without a location, and sort last within
+their view and level.
+
+GUI and non-GUI callers use separate pending lanes. The shared probe and
+fetch/decode schedulers are work-conserving and admit one background item after
+at most seven consecutive GUI items while both lanes are nonempty. Existing
+queued chunks are reprioritized in place when a newer view snapshot references
+them. A persistent-cache miss has its current priority recalculated before it
+enters remote fetch/decode. Work already executing is allowed to finish.
+
+The viewport probe reuses the render's geometry path. Direct surface rendering
+generates the full coordinate/normal matrices once and uses them for both the
+probe and pixel sampling. Fully SurfaceCache-backed rendering probes the shared
+`SurfaceGeometryTileCache`; the following tile fills consume the same geometry
+tiles. This keeps the probe from introducing a competing surface-coordinate
+cache.
+
 Persistent Zarr cache directory selection and file naming are unchanged and
 remain separate from in-memory source identity. Surface image and geometry
 caches also remain separate derived caches, but their raw input chunks come

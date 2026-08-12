@@ -544,6 +544,51 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
     return tile;
 }
 
+void SurfaceGeometryTileCache::sampleView(
+    int level,
+    double uMin,
+    double vMin,
+    double scale,
+    const std::vector<std::array<float, 2>>& viewportPositions,
+    std::vector<cv::Vec3f>& coords,
+    std::vector<cv::Vec3f>* normals)
+{
+    coords.assign(viewportPositions.size(), cv::Vec3f(NAN, NAN, NAN));
+    if (normals)
+        normals->assign(viewportPositions.size(), cv::Vec3f(NAN, NAN, NAN));
+    if (!(scale > 0.0) || !std::isfinite(uMin) || !std::isfinite(vMin))
+        return;
+
+    const double step = std::ldexp(1.0, std::max(0, level));
+    int lastTu = std::numeric_limits<int>::min();
+    int lastTv = std::numeric_limits<int>::min();
+    std::shared_ptr<const Tile> tile;
+    for (std::size_t index = 0; index < viewportPositions.size(); ++index) {
+        const double u = uMin + double(viewportPositions[index][0]) / scale;
+        const double v = vMin + double(viewportPositions[index][1]) / scale;
+        const int sampleU = static_cast<int>(std::floor(u / step));
+        const int sampleV = static_cast<int>(std::floor(v / step));
+        const int tu = floorDiv(sampleU, kTileSize);
+        const int tv = floorDiv(sampleV, kTileSize);
+        if (tu != lastTu || tv != lastTv) {
+            tile = get(level, tu, tv);
+            lastTu = tu;
+            lastTv = tv;
+        }
+        if (!tile)
+            continue;
+        const int x = sampleU - tu * kTileSize;
+        const int y = sampleV - tv * kTileSize;
+        if (x < 0 || x >= kTileSize || y < 0 || y >= kTileSize ||
+            !tile->valid(y, x)) {
+            continue;
+        }
+        coords[index] = tile->coords(y, x);
+        if (normals && tile->validOffset(y, x))
+            (*normals)[index] = tile->normals(y, x);
+    }
+}
+
 void SurfaceGeometryTileCache::invalidateAll()
 {
     std::lock_guard lock(_state->mutex);
@@ -674,7 +719,10 @@ struct SurfaceCache::State {
             dropLocked(lru.back());
     }
 
-    static void runFill(const std::shared_ptr<State>& self, TileKey key, std::uint64_t epoch);
+    static void runFill(const std::shared_ptr<State>& self,
+                        TileKey key,
+                        std::uint64_t epoch,
+                        ChunkRequestContext request);
     static void notifyTileReady(const std::shared_ptr<State>& self);
     static SampleStats sampleReduced(const State& self,
                                      int startLevel,
@@ -910,7 +958,8 @@ void SurfaceCache::State::notifyTileReady(const std::shared_ptr<State>& self)
 
 void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                                   TileKey key,
-                                  std::uint64_t epoch)
+                                  std::uint64_t epoch,
+                                  ChunkRequestContext request)
 {
 #if defined(_OPENMP)
     // QuadSurface::gen() has OpenMP loops, but runFill is already parallel at
@@ -1016,7 +1065,8 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         }
 
         if (!dependencies.keys.empty()) {
-            self->volume->prefetchChunks(dependencies.keys, /*wait=*/true);
+            self->volume->prefetchChunks(
+                dependencies.keys, /*wait=*/true, /*priorityOffset=*/0, request);
         }
         if (!stillCurrent())
             return false;
@@ -1268,7 +1318,8 @@ void SurfaceCache::requestView(int startLevel,
                                double scale,
                                int fbW,
                                int fbH,
-                               std::uint64_t viewGeneration)
+                               std::uint64_t viewGeneration,
+                               ChunkRequestContext request)
 {
     if (!_state->volume || !_state->surface || fbW <= 0 || fbH <= 0 || !(scale > 0.0))
         return;
@@ -1365,7 +1416,9 @@ void SurfaceCache::requestView(int startLevel,
         auto state = _state;
         const TileKey key = candidate.key;
         surfaceFillPool().enqueue(
-            [state, key, epoch]() { State::runFill(state, key, epoch); });
+            [state, key, epoch, request]() {
+                State::runFill(state, key, epoch, request);
+            });
     }
 }
 

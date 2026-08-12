@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,18 @@ struct ChunkResult {
     std::string error;
 };
 
+struct ChunkRequestContext {
+    std::uint64_t viewId = 0;
+    std::uint64_t viewVersion = 0;
+
+    [[nodiscard]] bool interactive() const noexcept { return viewId != 0; }
+};
+
+struct ChunkViewportSample {
+    ChunkKey key;
+    std::array<float, 2> viewportPosition{};
+};
+
 class IChunkedArray {
 public:
     using ChunkReadyCallbackId = std::uint64_t;
@@ -56,6 +69,12 @@ public:
     // returns immediately; chunk-ready listeners are responsible for scheduling
     // a later repaint on the UI thread.
     virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix) = 0;
+    virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix,
+                                    const ChunkRequestContext& request)
+    {
+        (void)request;
+        return tryGetChunk(level, iz, iy, ix);
+    }
 
     // Return a resolved chunk only when it is already in memory. This must not
     // queue a miss or promote a resident entry in the decoded-cache eviction
@@ -77,6 +96,38 @@ public:
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
+    virtual void prefetchChunks(const std::vector<ChunkKey>& keys,
+                                bool wait,
+                                int priorityOffset,
+                                const ChunkRequestContext& request)
+    {
+        (void)request;
+        prefetchChunks(keys, wait, priorityOffset);
+    }
+
+    // Atomically replaces one view's located demand for this source. Building
+    // and deduplicating `samples` happens before implementations take their
+    // shared scheduler lock.
+    virtual void replaceViewDemand(const ChunkRequestContext& request,
+                                   const std::array<float, 2>& focus,
+                                   std::vector<ChunkViewportSample> samples)
+    {
+        (void)request;
+        (void)focus;
+        (void)samples;
+    }
+    virtual void updateViewFocus(std::uint64_t viewId,
+                                 const std::array<float, 2>& focus,
+                                 bool makeActive)
+    {
+        (void)viewId;
+        (void)focus;
+        (void)makeActive;
+    }
+    virtual void clearViewDemand(std::uint64_t viewId)
+    {
+        (void)viewId;
+    }
     // Starts a newer interactive request. An exclusively-owned backing array
     // may discard unresolved work from the superseded view; resident chunks
     // are preserved.
