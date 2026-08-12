@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import zarr
+import zarr.storage
 
 from vesuvius.data.utils import open_zarr
 
@@ -8,6 +9,16 @@ _ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
 requires_zarr_v3 = pytest.mark.skipif(
     not _ZARR_V3, reason="open_zarr(cache=True) requires zarr>=3 (zarr.experimental.cache_store.CacheStore)"
 )
+
+# Never resolves, so a test that reaches the network fails loudly instead of
+# quietly depending on it. The store factory is always patched to a local store.
+REMOTE_URL = "https://example.invalid/vol.zarr"
+
+_METADATA_NAMES = ("zarr.json", ".zarray", ".zgroup", ".zattrs", ".zmetadata")
+
+
+def _is_metadata(key):
+    return key.rsplit("/", 1)[-1] in _METADATA_NAMES
 
 
 @pytest.fixture
@@ -19,6 +30,134 @@ def local_array(tmp_path):
         a = zarr.open(path, mode="w", shape=(64, 64, 64), chunks=(16, 16, 16), dtype="uint8")
     a[:] = np.random.default_rng(0).integers(0, 255, (64, 64, 64), dtype="uint8")
     return path
+
+
+def _patch_remote_store(monkeypatch, source_path, chunks_forbidden=False):
+    """Make open_zarr's remote store factory hand back a local store.
+
+    Lets the disk-cache branch be exercised against REMOTE_URL without any
+    network access. With ``chunks_forbidden`` the stand-in serves store
+    metadata but raises on any chunk fetch, so a read that survives proves the
+    chunk came off the disk cache rather than the "remote".
+    """
+    if _ZARR_V3:
+        from zarr.storage import FsspecStore, LocalStore
+
+        class _NoChunkStore(LocalStore):
+            async def get(self, key, prototype, byte_range=None):
+                if chunks_forbidden and not _is_metadata(key):
+                    raise AssertionError(f"disk cache missed: refetched {key!r}")
+                return await super().get(key, prototype, byte_range)
+
+        def fake_from_url(url, storage_options=None, read_only=True):
+            return _NoChunkStore(source_path, read_only=read_only)
+
+        monkeypatch.setattr(FsspecStore, "from_url", staticmethod(fake_from_url))
+    else:
+        # Subclass rather than replace: zarr 2's normalize_store calls
+        # FSStore._fsspec_installed() on the module global, so a bare stub
+        # function breaks zarr.open before the cache is ever reached.
+        class _NoChunkStore(zarr.storage.FSStore):
+            def __init__(self, url, mode="r", **storage_options):
+                super().__init__(source_path, mode=mode, **storage_options)
+
+            def __getitem__(self, key):
+                if chunks_forbidden and not _is_metadata(key):
+                    raise AssertionError(f"disk cache missed: refetched {key!r}")
+                return super().__getitem__(key)
+
+        monkeypatch.setattr(zarr.storage, "FSStore", _NoChunkStore)
+
+
+def _cached_files(cache_dir):
+    return [p for p in cache_dir.rglob("*") if p.is_file()] if cache_dir.exists() else []
+
+
+@pytest.mark.unit
+def test_cache_dir_wraps_remote_reads(monkeypatch, tmp_path, local_array):
+    expected = zarr.open(local_array, mode="r")[:]
+    cache_dir = tmp_path / "chunkcache"
+
+    _patch_remote_store(monkeypatch, local_array)
+    arr = open_zarr(REMOTE_URL, mode="r", cache_dir=cache_dir)
+    assert np.array_equal(arr[:], expected)
+
+    # Chunks landed on disk, namespaced by the remote URL.
+    assert (cache_dir / "https" / "example.invalid" / "vol.zarr").is_dir()
+    assert _cached_files(cache_dir)
+
+    # Re-open against a store that refuses to serve chunks: the reads still
+    # succeed, so they came from the cache directory.
+    _patch_remote_store(monkeypatch, local_array, chunks_forbidden=True)
+    warm = open_zarr(REMOTE_URL, mode="r", cache_dir=cache_dir)
+    assert np.array_equal(warm[:], expected)
+
+
+@pytest.mark.unit
+def test_cache_dir_wins_over_memory_cache(monkeypatch, tmp_path, local_array):
+    # Documented precedence: cache_dir is checked first, so passing both does
+    # not fall through to the in-memory branch (which would raise on zarr 2).
+    cache_dir = tmp_path / "chunkcache"
+
+    _patch_remote_store(monkeypatch, local_array)
+    arr = open_zarr(REMOTE_URL, mode="r", cache_dir=cache_dir, cache=True)
+
+    assert _cached_files(cache_dir)
+    if _ZARR_V3:
+        from zarr.experimental.cache_store import CacheStore
+        assert not isinstance(arr.store, CacheStore)
+
+
+@pytest.mark.unit
+def test_cache_dir_ignored_for_local_paths(tmp_path, local_array):
+    expected = zarr.open(local_array, mode="r")[:]
+    cache_dir = tmp_path / "chunkcache"
+
+    arr = open_zarr(local_array, mode="r", cache_dir=cache_dir)
+
+    assert np.array_equal(arr[:], expected)
+    assert _cached_files(cache_dir) == []
+
+
+@pytest.mark.skipif(_ZARR_V3, reason="only exercises the zarr 2.x disk-cache leg")
+@pytest.mark.unit
+def test_cache_dir_works_under_zarr2(monkeypatch, tmp_path, local_array):
+    # Inverse of test_cache_true_raises_under_zarr2: the disk cache is not
+    # gated on zarr 3, so cache_dir must work here rather than raise.
+    expected = zarr.open(local_array, mode="r")[:]
+    cache_dir = tmp_path / "chunkcache"
+
+    _patch_remote_store(monkeypatch, local_array)
+    arr = open_zarr(REMOTE_URL, mode="r", cache_dir=cache_dir)
+
+    assert np.array_equal(arr[:], expected)
+    assert _cached_files(cache_dir)
+
+
+@pytest.mark.unit
+def test_cache_dir_max_gb_forwarded(monkeypatch, tmp_path, local_array):
+    from vesuvius.data import chunk_cache
+
+    captured = {}
+    real_store = chunk_cache.DiskCacheStore
+
+    def recording_store(remote, **kwargs):
+        captured.update(kwargs)
+        return real_store(remote, **kwargs)
+
+    monkeypatch.setattr(chunk_cache, "DiskCacheStore", recording_store)
+    _patch_remote_store(monkeypatch, local_array)
+
+    open_zarr(REMOTE_URL, mode="r", cache_dir=tmp_path / "chunkcache", cache_max_gb=0.5)
+
+    assert captured["max_bytes"] == int(0.5 * 2**30)
+    assert captured["cache_dir"] == str(tmp_path / "chunkcache")
+    assert captured["url"] == REMOTE_URL
+
+    # Unset means unbounded.
+    captured.clear()
+    open_zarr(REMOTE_URL, mode="r", cache_dir=tmp_path / "chunkcache")
+    assert captured["max_bytes"] is None
 
 
 @requires_zarr_v3
