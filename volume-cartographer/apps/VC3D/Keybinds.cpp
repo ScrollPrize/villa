@@ -571,6 +571,8 @@ QString buildKeybindsHelpText()
         { kSectionLineAnnotation, "Rotate the current cut about the vertical axis", HelpKeyType::Literal, nullptr, nullptr, "A / D" },
         { kSectionLineAnnotation, "Jump to the previous control point", HelpKeyType::Literal, nullptr, nullptr, "E" },
         { kSectionLineAnnotation, "Jump to the next control point", HelpKeyType::Literal, nullptr, nullptr, "T" },
+        { kSectionLineAnnotation, "Pan to the previous/next control point (hold to cruise through)", HelpKeyType::Literal, nullptr, nullptr, "Left / Right" },
+        { kSectionLineAnnotation, "Adjust the arrow-pan cruise speed", HelpKeyType::Literal, nullptr, nullptr, "Up / Down" },
         { kSectionLineAnnotation, "Snap the panes to the overview-bar cursor", HelpKeyType::Literal, nullptr, nullptr, "R" },
         { kSectionLineAnnotation, "Reset the side cut and strip normal offsets", HelpKeyType::Literal, nullptr, nullptr, "B" },
         { kSectionLineAnnotation, "Toggle the current cut following the strip mouse", HelpKeyType::Literal, nullptr, nullptr, "Space" },

@@ -66,6 +66,22 @@ control point), fading out over the outer quarter of that distance. Because the
 shift decays continuously to zero, the ghost converges on the solid marker as a
 landing ring instead of popping into place.
 
+The Left and Right arrow keys pan the current position between control points
+with a smooth velocity ramp. A tap accelerates, brakes, and lands exactly on
+the nearest control point in that direction; holding the key cruises straight
+through the intermediate points at a constant speed and, when it is released,
+decelerates onto the next control point ahead (never short of the one a tap
+would have reached). Beyond the outermost control point the pan continues one
+more hop, to the Max CP distance allowance or the end of the extrapolated
+line, whichever is shorter. Pressing the opposite arrow
+mid-pan decelerates through zero and reverses. Up and Down scale the cruising
+speed (default 12 line positions per second, roughly 360 voxels per second),
+which is shown in a transient badge and remembered between sessions. A Left or
+Right press pauses the mouse hover-follow exactly as the space bar does, so the
+❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow
+and cancels the pan. While the keyboard is panning, the strips stay centered
+on the current-position line and scroll underneath it.
+
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
 the initial centerline length and the base-voxel extrapolation distance, and

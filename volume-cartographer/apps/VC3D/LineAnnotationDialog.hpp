@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QElapsedTimer>
 #include <QList>
 #include <QMetaObject>
 #include <QPointer>
@@ -238,6 +239,9 @@ signals:
 protected:
     void closeEvent(QCloseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
+    void changeEvent(QEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -270,8 +274,38 @@ private:
     // per event. Discrete callers (keyboard jumps, clicks, scroll) keep calling
     // setCurrentLinePosition directly for immediate response.
     void requestCurrentLinePosition(double position);
-    void setCurrentLinePosition(double position, bool updateCurrentCutOverlay = true);
+    // forceApply bypasses the sub-1e-3 no-op shortcut so a keyboard-pan landing
+    // moves the cut planes onto the exact control-point position.
+    void setCurrentLinePosition(double position,
+                                bool updateCurrentCutOverlay = true,
+                                bool forceApply = false);
     void cancelControlPointPreviewAnimation();
+    // Left/Right arrow panning between control points. One velocity integrator
+    // (generatedArrowPanStep) drives it: a tap brakes into the first control
+    // point ahead, a hold cruises through the intermediate ones and lands on the
+    // next one after the key comes up, and the opposite arrow reverses mid-pan.
+    void startArrowPan(int direction);
+    // Control-point line positions plus (when there is room) one boundary
+    // target beyond each outer control point: Max CP distance or the
+    // extrapolated line end, whichever is shorter.
+    std::vector<double> arrowPanTargetPositions() const;
+    void releaseArrowPanKey(int direction);
+    void updateArrowPanStopTarget();
+    // Re-validates the pan against an edited control-point set: re-promises
+    // the minimum target if the edit removed it, then re-selects the stop
+    // target. Cancels when nothing remains in the travel direction.
+    void rebaseArrowPanTargets();
+    void tickArrowPan();
+    void finishArrowPan(double position);
+    void cancelArrowPan();
+    // Up/Down: scale the cruise speed (persisted) and flash the badge.
+    void adjustArrowPanCruiseSpeed(double factor);
+    void updateArrowPanSpeedIndicator();
+    // Keeps the current-position line centered in the strips while the keyboard
+    // pan scrolls them underneath it. Vertical only on the initial snap. Takes
+    // the position explicitly so each tick can move the camera BEFORE the
+    // overlay rebuild bakes it into the drawn line position.
+    void centerStripsOnLinePosition(double linePosition, bool includeVertical);
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
@@ -338,6 +372,7 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
+    bool handleKeyRelease(QKeyEvent* event);
     // Pushes line length, control dots, and the current-position marker to the
     // schematic overview bar.
     void updateOverviewBar();
@@ -467,6 +502,29 @@ private:
     QTimer* _linkedCursorMirrorTimer = nullptr;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    // Arrow-key pan integrator. _arrowPanDirection is the travel direction and
+    // stays set while a released tap coasts into its target; _arrowPanKeyHeld
+    // only tracks the key. _arrowPanMinimumTarget is the first control point the
+    // gesture promised at press time (NaN when idle), so a hold can never land
+    // short of what the same tap would have reached.
+    int _arrowPanDirection = 0;
+    bool _arrowPanKeyHeld = false;
+    // Physical key state of the two horizontal arrows, so releasing a reversal
+    // key can hand the pan back to the key that is still held down.
+    bool _arrowKeyLeftDown = false;
+    bool _arrowKeyRightDown = false;
+    // Distinguishes a pan that ended by landing from one that was cancelled
+    // (space, edits): only a landed pan may hand back to a still-held key.
+    bool _arrowPanEndedByLanding = false;
+    double _arrowPanVelocity = 0.0;
+    std::optional<double> _arrowPanStopTarget;
+    double _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    double _arrowPanCruiseSpeed =
+        vc3d::line_annotation::kGeneratedArrowPanDefaultSpeed;
+    QTimer* _arrowPanTimer = nullptr;
+    QElapsedTimer _arrowPanClock;
+    QPointer<QLabel> _arrowPanSpeedLabel;
+    QTimer* _arrowPanSpeedLabelTimer = nullptr;
     bool _restoredWindowGeometry = false;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;

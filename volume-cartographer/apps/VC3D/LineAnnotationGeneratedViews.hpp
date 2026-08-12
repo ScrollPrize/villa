@@ -789,6 +789,199 @@ inline std::optional<GeneratedParallaxGhost> generatedParallaxGhost(
     return ghost;
 }
 
+// ---------------------------------------------------------------------------
+// Arrow-key panning between control points.
+//
+// One signed-velocity integrator drives the whole gesture: a tap ramps up and
+// brakes into the first control point ahead, a hold cruises straight through
+// the intermediate ones, a live speed change simply moves the cruise target,
+// and pressing the opposite arrow decelerates through zero into the reverse
+// ramp. Everything below is pure arithmetic so it can be exercised without Qt.
+// ---------------------------------------------------------------------------
+
+// Seconds spent ramping from rest to the cruise speed (acceleration = cruise / this).
+inline constexpr double kGeneratedArrowPanRampSeconds = 0.25;
+// Cruise-speed bounds and default, in line positions per second (1 unit ~ 30 voxels).
+inline constexpr double kGeneratedArrowPanMinimumSpeed = 1.0;
+inline constexpr double kGeneratedArrowPanMaximumSpeed = 500.0;
+inline constexpr double kGeneratedArrowPanDefaultSpeed = 12.0;
+// Multiplicative step applied by the Up/Down arrows.
+inline constexpr double kGeneratedArrowPanSpeedStep = 1.25;
+// Distance below which a stop target counts as reached.
+inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-9;
+
+struct GeneratedArrowPanState {
+    double position = 0.0;
+    // Signed, in line positions per second.
+    double velocity = 0.0;
+    // True once the step consumed the stop target exactly.
+    bool landed = false;
+};
+
+// One integrator step. `direction` is the travel direction (not the key state):
+// it stays set while a released tap coasts into its target. `stopTarget`, when
+// present, is braked into using the v^2 / (2a) trigger and landed on exactly.
+inline GeneratedArrowPanState generatedArrowPanStep(double position,
+                                                    double velocity,
+                                                    int direction,
+                                                    double cruiseSpeed,
+                                                    double acceleration,
+                                                    double dtSeconds,
+                                                    const std::optional<double>& stopTarget)
+{
+    GeneratedArrowPanState next;
+    next.position = position;
+    next.velocity = std::isfinite(velocity) ? velocity : 0.0;
+    if (!std::isfinite(position)) {
+        next.velocity = 0.0;
+        return next;
+    }
+    if (!std::isfinite(dtSeconds) || dtSeconds <= 0.0) {
+        return next;
+    }
+    if (!std::isfinite(cruiseSpeed) || cruiseSpeed <= 0.0 ||
+        !std::isfinite(acceleration) || acceleration <= 0.0) {
+        next.velocity = 0.0;
+        return next;
+    }
+
+    const int travel = (direction > 0) ? 1 : ((direction < 0) ? -1 : 0);
+    const bool haveTarget = stopTarget.has_value() && std::isfinite(*stopTarget);
+    if (haveTarget && travel != 0) {
+        // Target already reached (or behind us): land instead of running off.
+        const double signedRemaining = (*stopTarget - position) * static_cast<double>(travel);
+        if (signedRemaining <= kGeneratedArrowPanLandingEpsilon) {
+            next.position = *stopTarget;
+            next.velocity = 0.0;
+            next.landed = true;
+            return next;
+        }
+    }
+
+    double desiredVelocity = static_cast<double>(travel) * cruiseSpeed;
+    double rate = acceleration;
+    bool braking = false;
+    if (haveTarget) {
+        const double remaining = *stopTarget - position;
+        // A reversal keeps the old velocity while the direction already points
+        // the other way; brake only when the target is ahead of the motion.
+        const double heading = (next.velocity != 0.0) ? next.velocity : desiredVelocity;
+        if (heading != 0.0 && remaining != 0.0 && ((remaining > 0.0) == (heading > 0.0))) {
+            const double brakingDistance =
+                (next.velocity * next.velocity) / (2.0 * acceleration);
+            if (std::abs(remaining) <= brakingDistance) {
+                desiredVelocity = 0.0;
+                braking = true;
+                // Never undershoot: brake at least as hard as the exact profile.
+                rate = std::max(acceleration,
+                                (next.velocity * next.velocity) / (2.0 * std::abs(remaining)));
+            }
+        }
+    }
+
+    const double maxDelta = rate * dtSeconds;
+    next.velocity += std::clamp(desiredVelocity - next.velocity, -maxDelta, maxDelta);
+    next.position = position + next.velocity * dtSeconds;
+
+    if (haveTarget) {
+        const double moved = next.position - position;
+        const double remaining = *stopTarget - position;
+        if (moved != 0.0 && ((remaining > 0.0) == (moved > 0.0)) &&
+            std::abs(moved) >= std::abs(remaining)) {
+            next.position = *stopTarget;
+            next.velocity = 0.0;
+            next.landed = true;
+        } else if (braking && next.velocity == 0.0) {
+            // Braking decayed to a standstill less than half a tick short of the
+            // target; snap so the gesture always terminates on the control point.
+            next.position = *stopTarget;
+            next.landed = true;
+        }
+    }
+    return next;
+}
+
+// Next control point strictly in `direction` from `currentPosition`, but never
+// short of `minimumTarget` (the first control point the gesture promised when
+// the key went down, or the far end while the key is still held). Falls back to
+// `minimumTarget` when nothing further exists; a non-finite `minimumTarget`
+// means "no floor and no fallback", which yields nullopt with no candidate.
+inline std::optional<double> generatedArrowPanStopTarget(
+    const std::vector<double>& sortedControlLinePositions,
+    double currentPosition,
+    int direction,
+    double minimumTarget)
+{
+    if (!std::isfinite(currentPosition) || direction == 0) {
+        return std::nullopt;
+    }
+    const bool haveMinimum = std::isfinite(minimumTarget);
+    std::optional<double> best;
+    for (const double position : sortedControlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (direction > 0) {
+            if (position <= currentPosition || (haveMinimum && position < minimumTarget)) {
+                continue;
+            }
+            if (!best || position < *best) {
+                best = position;
+            }
+        } else {
+            if (position >= currentPosition || (haveMinimum && position > minimumTarget)) {
+                continue;
+            }
+            if (!best || position > *best) {
+                best = position;
+            }
+        }
+    }
+    if (!best && haveMinimum) {
+        best = minimumTarget;
+    }
+    return best;
+}
+
+// One extra pan target beyond the outermost control point in `direction`: the
+// outer control point plus the max-control-point-distance allowance, clamped
+// to `lineEndPosition` (the end of the extrapolated line) - whichever is
+// shorter. `maxControlPointDistance` uses the same line-position
+// interpretation as the current-line marker state; a non-finite or <= 0 value
+// means unlimited (the line end alone bounds the hop). Returns nullopt when
+// there are no finite control positions or no room beyond the outer one.
+inline std::optional<double> generatedArrowPanBoundaryTarget(
+    const std::vector<double>& sortedControlLinePositions,
+    int direction,
+    double lineEndPosition,
+    double maxControlPointDistance)
+{
+    if (direction == 0 || !std::isfinite(lineEndPosition)) {
+        return std::nullopt;
+    }
+    std::optional<double> outer;
+    for (const double position : sortedControlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (!outer || (direction > 0 ? position > *outer : position < *outer)) {
+            outer = position;
+        }
+    }
+    if (!outer) {
+        return std::nullopt;
+    }
+    double limit = lineEndPosition;
+    if (std::isfinite(maxControlPointDistance) && maxControlPointDistance > 0.0) {
+        limit = (direction > 0) ? std::min(limit, *outer + maxControlPointDistance)
+                                : std::max(limit, *outer - maxControlPointDistance);
+    }
+    if (direction > 0 ? limit <= *outer : limit >= *outer) {
+        return std::nullopt;
+    }
+    return limit;
+}
+
 inline bool generatedControlPointPlacementWithinAnyDistance(
     double linePosition,
     const std::vector<double>& controlLinePositions,

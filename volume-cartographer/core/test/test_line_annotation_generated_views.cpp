@@ -402,6 +402,275 @@ TEST_CASE("line annotation control point navigation boundaries do not wrap")
         positions).has_value());
 }
 
+TEST_CASE("arrow pan integrator ramps up toward cruise without overshooting it")
+{
+    constexpr double kCruise = 12.0;
+    const double acceleration = kCruise / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
+    constexpr double kDt = 1.0 / 60.0;
+
+    auto state = vc3d::line_annotation::generatedArrowPanStep(
+        0.0, 0.0, 1, kCruise, acceleration, kDt, std::nullopt);
+    CHECK(state.velocity == doctest::Approx(acceleration * kDt));
+    CHECK(state.position == doctest::Approx(acceleration * kDt * kDt));
+    CHECK_FALSE(state.landed);
+
+    double previousVelocity = state.velocity;
+    for (int i = 0; i < 200; ++i) {
+        state = vc3d::line_annotation::generatedArrowPanStep(
+            state.position, state.velocity, 1, kCruise, acceleration, kDt, std::nullopt);
+        CHECK(state.velocity <= kCruise + 1.0e-12);
+        CHECK(state.velocity >= previousVelocity - 1.0e-12);
+        previousVelocity = state.velocity;
+    }
+    // The ramp is 0.25 s long, so it is long since saturated and stays there.
+    CHECK(state.velocity == doctest::Approx(kCruise));
+
+    const auto cruising = vc3d::line_annotation::generatedArrowPanStep(
+        state.position, kCruise, 1, kCruise, acceleration, kDt, std::nullopt);
+    CHECK(cruising.velocity == doctest::Approx(kCruise));
+    CHECK(cruising.position == doctest::Approx(state.position + kCruise * kDt));
+    CHECK_FALSE(cruising.landed);
+}
+
+TEST_CASE("arrow pan integrator brakes into its stop target and lands exactly")
+{
+    constexpr double kCruise = 12.0;
+    constexpr double kTarget = 10.0;
+    const double acceleration = kCruise / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
+    constexpr double kDt = 1.0 / 60.0;
+
+    vc3d::line_annotation::GeneratedArrowPanState state{0.0, 0.0, false};
+    bool sawDeceleration = false;
+    double peakVelocity = 0.0;
+    int ticks = 0;
+    while (!state.landed && ticks < 10000) {
+        const double before = state.velocity;
+        state = vc3d::line_annotation::generatedArrowPanStep(
+            state.position, state.velocity, 1, kCruise, acceleration, kDt, kTarget);
+        peakVelocity = std::max(peakVelocity, state.velocity);
+        if (state.velocity < before) {
+            sawDeceleration = true;
+        }
+        CHECK(state.position <= kTarget);
+        ++ticks;
+    }
+    REQUIRE(state.landed);
+    CHECK(state.position == kTarget);
+    CHECK(state.velocity == 0.0);
+    CHECK(sawDeceleration);
+    CHECK(peakVelocity <= kCruise + 1.0e-12);
+    // Roughly the ramp up, a short cruise and the ramp down: well under a minute.
+    CHECK(ticks < 300);
+
+    // Already sitting on the target: land immediately without moving.
+    const auto onTarget = vc3d::line_annotation::generatedArrowPanStep(
+        kTarget, 0.0, 1, kCruise, acceleration, kDt, kTarget);
+    CHECK(onTarget.landed);
+    CHECK(onTarget.position == kTarget);
+    CHECK(onTarget.velocity == 0.0);
+}
+
+TEST_CASE("arrow pan integrator decelerates through zero when the direction flips")
+{
+    constexpr double kCruise = 12.0;
+    const double acceleration = kCruise / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
+    constexpr double kDt = 1.0 / 60.0;
+
+    // Cruising right when the left arrow takes over: the target is behind, so
+    // the velocity must ramp down through zero rather than jump.
+    auto state = vc3d::line_annotation::generatedArrowPanStep(
+        50.0, kCruise, -1, kCruise, acceleration, kDt, std::optional<double>(40.0));
+    CHECK(state.velocity == doctest::Approx(kCruise - acceleration * kDt));
+    CHECK(state.velocity > 0.0);
+    CHECK(state.position > 50.0);
+    CHECK_FALSE(state.landed);
+
+    double furthest = state.position;
+    bool crossedZero = false;
+    for (int i = 0; i < 400 && !state.landed; ++i) {
+        state = vc3d::line_annotation::generatedArrowPanStep(
+            state.position, state.velocity, -1, kCruise, acceleration, kDt,
+            std::optional<double>(40.0));
+        if (state.velocity < 0.0) {
+            crossedZero = true;
+        }
+        if (!crossedZero) {
+            furthest = std::max(furthest, state.position);
+        }
+        CHECK(state.velocity >= -kCruise - 1.0e-12);
+    }
+    CHECK(crossedZero);
+    // Coasting to a stop from the cruise speed costs v^2 / (2a) = 1.5 positions.
+    CHECK(furthest > 51.0);
+    CHECK(furthest < 51.6);
+    REQUIRE(state.landed);
+    CHECK(state.position == 40.0);
+}
+
+TEST_CASE("arrow pan integrator handles zero steps and degenerate inputs")
+{
+    constexpr double kCruise = 12.0;
+    const double acceleration = kCruise / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    const auto noStep = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, 3.0, 1, kCruise, acceleration, 0.0, std::nullopt);
+    CHECK(noStep.position == 5.0);
+    CHECK(noStep.velocity == 3.0);
+    CHECK_FALSE(noStep.landed);
+
+    const auto negativeStep = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, 3.0, 1, kCruise, acceleration, -0.5, std::nullopt);
+    CHECK(negativeStep.position == 5.0);
+    CHECK(negativeStep.velocity == 3.0);
+
+    const auto nanDt = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, 3.0, 1, kCruise, acceleration, nan, std::nullopt);
+    CHECK(nanDt.position == 5.0);
+    CHECK(nanDt.velocity == 3.0);
+
+    const auto nanPosition = vc3d::line_annotation::generatedArrowPanStep(
+        nan, 3.0, 1, kCruise, acceleration, 0.016, std::nullopt);
+    CHECK_FALSE(std::isfinite(nanPosition.position));
+    CHECK(nanPosition.velocity == 0.0);
+    CHECK_FALSE(nanPosition.landed);
+
+    const auto nanVelocity = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, nan, 1, kCruise, acceleration, 0.016, std::nullopt);
+    CHECK(std::isfinite(nanVelocity.velocity));
+    CHECK(nanVelocity.velocity == doctest::Approx(acceleration * 0.016));
+
+    for (const double badCruise : {0.0, -3.0, nan}) {
+        const auto stalled = vc3d::line_annotation::generatedArrowPanStep(
+            5.0, 3.0, 1, badCruise, acceleration, 0.016, std::nullopt);
+        CHECK(stalled.position == 5.0);
+        CHECK(stalled.velocity == 0.0);
+        CHECK_FALSE(stalled.landed);
+    }
+    for (const double badAcceleration : {0.0, -3.0, nan}) {
+        const auto stalled = vc3d::line_annotation::generatedArrowPanStep(
+            5.0, 3.0, 1, kCruise, badAcceleration, 0.016, std::nullopt);
+        CHECK(stalled.position == 5.0);
+        CHECK(stalled.velocity == 0.0);
+    }
+
+    // A non-finite stop target is simply no target: free cruise, never landed.
+    const auto nanTarget = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, 3.0, 1, kCruise, acceleration, 0.016, std::optional<double>(nan));
+    CHECK(nanTarget.position > 5.0);
+    CHECK_FALSE(nanTarget.landed);
+
+    // Direction 0 coasts to a standstill instead of running away.
+    auto resting = vc3d::line_annotation::generatedArrowPanStep(
+        5.0, 3.0, 0, kCruise, acceleration, 0.016, std::nullopt);
+    CHECK(resting.velocity < 3.0);
+    for (int i = 0; i < 200; ++i) {
+        resting = vc3d::line_annotation::generatedArrowPanStep(
+            resting.position, resting.velocity, 0, kCruise, acceleration, 0.016, std::nullopt);
+    }
+    CHECK(resting.velocity == 0.0);
+}
+
+TEST_CASE("arrow pan boundary target extends one hop past the outer control point")
+{
+    using vc3d::line_annotation::generatedArrowPanBoundaryTarget;
+    const std::vector<double> positions{12.0, 20.0, 40.0};
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    // Bounded by the max-CP-distance allowance when it is shorter than the
+    // remaining line, by the line end (extrapolation limit) otherwise.
+    const auto right = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 30.0);
+    REQUIRE(right.has_value());
+    CHECK(*right == doctest::Approx(70.0));
+    const auto rightClamped = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 1000.0);
+    REQUIRE(rightClamped.has_value());
+    CHECK(*rightClamped == doctest::Approx(100.0));
+    const auto left = generatedArrowPanBoundaryTarget(positions, -1, 0.0, 5.0);
+    REQUIRE(left.has_value());
+    CHECK(*left == doctest::Approx(7.0));
+
+    // <= 0 or non-finite max distance means unlimited: the line end bounds it.
+    const auto unlimited = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 0.0);
+    REQUIRE(unlimited.has_value());
+    CHECK(*unlimited == doctest::Approx(100.0));
+    const auto nanMax = generatedArrowPanBoundaryTarget(positions, 1, 100.0, nan);
+    REQUIRE(nanMax.has_value());
+    CHECK(*nanMax == doctest::Approx(100.0));
+
+    // No room beyond the outer control point, no control points, or unusable
+    // inputs: no boundary hop.
+    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, 40.0, 30.0).has_value());
+    CHECK_FALSE(generatedArrowPanBoundaryTarget({0.0, 40.0}, -1, 0.0, 30.0).has_value());
+    CHECK_FALSE(generatedArrowPanBoundaryTarget({}, 1, 100.0, 30.0).has_value());
+    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 0, 100.0, 30.0).has_value());
+    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, nan, 30.0).has_value());
+
+    // Non-finite control positions are skipped when finding the outer one.
+    const auto skipped = generatedArrowPanBoundaryTarget({nan, 20.0}, 1, 100.0, 10.0);
+    REQUIRE(skipped.has_value());
+    CHECK(*skipped == doctest::Approx(30.0));
+}
+
+TEST_CASE("arrow pan stop target picks the next control point in the direction")
+{
+    const std::vector<double> positions{12.0, 20.0, 28.0, 40.0};
+    const double none = std::numeric_limits<double>::quiet_NaN();
+
+    // Plain next/previous when the floor is behind the travel.
+    const auto right = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 21.0, 1, 20.0);
+    REQUIRE(right.has_value());
+    CHECK(*right == doctest::Approx(28.0));
+    const auto left = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 27.0, -1, 28.0);
+    REQUIRE(left.has_value());
+    CHECK(*left == doctest::Approx(20.0));
+
+    // A control point strictly ahead but short of the floor is skipped: a hold
+    // released early still travels at least as far as the tap would have.
+    const auto floored = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 13.0, 1, 28.0);
+    REQUIRE(floored.has_value());
+    CHECK(*floored == doctest::Approx(28.0));
+    const auto flooredLeft = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 39.0, -1, 20.0);
+    REQUIRE(flooredLeft.has_value());
+    CHECK(*flooredLeft == doctest::Approx(20.0));
+
+    // Nothing further exists: fall back to the floor itself.
+    const auto beyondLast = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 41.0, 1, 40.0);
+    REQUIRE(beyondLast.has_value());
+    CHECK(*beyondLast == doctest::Approx(40.0));
+    const auto beyondFirst = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 5.0, -1, 12.0);
+    REQUIRE(beyondFirst.has_value());
+    CHECK(*beyondFirst == doctest::Approx(12.0));
+
+    // Aiming at the far end (the held case) skips every intermediate point.
+    const auto farEnd = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 13.0, 1, positions.back());
+    REQUIRE(farEnd.has_value());
+    CHECK(*farEnd == doctest::Approx(40.0));
+
+    // No floor and no candidate at all.
+    CHECK_FALSE(vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 41.0, 1, none).has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedArrowPanStopTarget(
+        {}, 20.0, 1, none).has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, 20.0, 0, 28.0).has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions, none, 1, 28.0).has_value());
+
+    // Non-finite control positions are ignored, not returned.
+    const std::vector<double> withNan{12.0, none, 28.0};
+    const auto skipped = vc3d::line_annotation::generatedArrowPanStopTarget(
+        withNan, 13.0, 1, none);
+    REQUIRE(skipped.has_value());
+    CHECK(*skipped == doctest::Approx(28.0));
+}
+
 TEST_CASE("line annotation closest control point chooses nearest valid position")
 {
     const std::vector<double> positions{12.0, 20.0, 40.0};
