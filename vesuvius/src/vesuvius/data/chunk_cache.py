@@ -159,6 +159,72 @@ def _atomic_write_bytes(target: str, data: bytes) -> None:
         raise
 
 
+# Bytes written per cache root since that root was last swept. Walking the
+# whole tree on every chunk write would cost more than the download it saves,
+# so a sweep only runs once the writes since the last one add up.
+_EVICT_STATE_LOCK = threading.Lock()
+_EVICT_STATE: dict[str, int] = {}
+_EVICT_CHECK_EVERY = 64 * 2**20
+
+
+def _touch(path: str) -> None:
+    """Record a cache hit as recent use, for eviction ordering.
+
+    Best effort: another process may have evicted the file between the read and
+    this call, which costs nothing but that entry's place in the order.
+    """
+    try:
+        os.utime(path)
+    except OSError:
+        pass
+
+
+def _maybe_evict(cache_root: str, max_bytes: int, written: int) -> None:
+    """Trim the cache tree below `max_bytes`, oldest mtime first.
+
+    Recency is the file mtime, refreshed on every cache hit, so this is an LRU.
+    The byte counter is per-process: with several processes sharing one cache
+    root each sweeps on its own writes, which keeps the cap approximate but
+    still bounded. Files another process removes or is midway through writing
+    are skipped rather than treated as errors.
+    """
+    with _EVICT_STATE_LOCK:
+        pending = _EVICT_STATE.get(cache_root, 0) + written
+        if pending < _EVICT_CHECK_EVERY and pending < max_bytes:
+            _EVICT_STATE[cache_root] = pending
+            return
+        _EVICT_STATE[cache_root] = 0
+
+    entries = []
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(cache_root):
+        for name in filenames:
+            # Partial writes belong to whoever is writing them; they become
+            # cache entries only once os.replace renames them.
+            if ".tmp." in name:
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                info = os.stat(path)
+            except OSError:
+                continue
+            entries.append((info.st_mtime, info.st_size, path))
+            total += info.st_size
+
+    if total <= max_bytes:
+        return
+
+    entries.sort()
+    for _mtime, size, path in entries:
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        total -= size
+        if total <= max_bytes:
+            break
+
+
 class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
     """Read-only Zarr v3 store wrapper that lazily caches remote bytes to disk."""
 
@@ -169,10 +235,14 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         url: str,
         offline: bool = False,
         retry_budget_seconds: float = 0.0,
+        max_bytes: int | None = None,
     ) -> None:
         super().__init__(remote)
         self._remote = remote
+        # The cap applies to the whole user-supplied cache root, not just this
+        # store's URL-namespaced subdirectory.
         self._cache_root = cache_dir
+        self._max_bytes = max_bytes
         self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
@@ -207,6 +277,7 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
             self._url,
             offline=self._offline,
             retry_budget_seconds=self._retry_budget_seconds,
+            max_bytes=self._max_bytes,
         )
 
     async def _remote_get_with_retry(self, key, prototype, byte_range=None):
@@ -267,6 +338,8 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
             try:
                 with open(cached, 'rb') as f:
                     data = f.read()
+                if self._max_bytes:
+                    _touch(cached)
                 _record_zarr_cache_event(
                     "cache_hit",
                     byte_count=len(data),
@@ -312,6 +385,8 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
             data = result.to_bytes()
             _atomic_write_bytes(cached, data)
             byte_count = len(data)
+            if self._max_bytes:
+                _maybe_evict(self._cache_root, self._max_bytes, byte_count)
         else:
             byte_count = len(result.to_bytes())
         _record_zarr_cache_event(
@@ -369,9 +444,13 @@ class DiskCacheStoreV2(MutableMapping):
         url: str,
         offline: bool = False,
         retry_budget_seconds: float = 0.0,
+        max_bytes: int | None = None,
     ) -> None:
         self._remote = remote
+        # The cap applies to the whole user-supplied cache root, not just this
+        # store's URL-namespaced subdirectory.
         self._cache_root = cache_dir
+        self._max_bytes = max_bytes
         self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
@@ -389,6 +468,7 @@ class DiskCacheStoreV2(MutableMapping):
             self._url,
             offline=self._offline,
             retry_budget_seconds=self._retry_budget_seconds,
+            max_bytes=self._max_bytes,
         )
 
     def _remote_get_with_retry(self, key):
@@ -436,6 +516,8 @@ class DiskCacheStoreV2(MutableMapping):
             try:
                 with open(cached, 'rb') as f:
                     data = f.read()
+                if self._max_bytes:
+                    _touch(cached)
                 _record_zarr_cache_event(
                     "cache_hit",
                     byte_count=len(data),
@@ -476,6 +558,8 @@ class DiskCacheStoreV2(MutableMapping):
 
         result = bytes(result)
         _atomic_write_bytes(cached, result)
+        if self._max_bytes:
+            _maybe_evict(self._cache_root, self._max_bytes, len(result))
         _record_zarr_cache_event(
             "download",
             byte_count=len(result),

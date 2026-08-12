@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 from collections.abc import MutableMapping
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import zarr
 from vesuvius.data.chunk_cache import (
     _NEGATIVE_MARKER_SUFFIX,
     DiskCacheStore,
+    DiskCacheStoreV2,
     default_chunk_cache_dir,
 )
 
@@ -54,6 +57,57 @@ class _CountingMapping(dict):
 
 def _marker_path(store, key: str) -> Path:
     return Path(store._cache_dir) / (key + _NEGATIVE_MARKER_SUFFIX)
+
+
+def _cached_path(store, key: str) -> Path:
+    return Path(store._cache_dir) / key
+
+
+def _chunk_key(index: int) -> str:
+    return f"c/0/0/{index}" if ZARR_V3 else f"0.0.{index}"
+
+
+def _remote_with(payloads: dict):
+    """In-memory remote holding `payloads`, for whichever zarr is installed."""
+    if not ZARR_V3:
+        return dict(payloads)
+
+    from zarr.core.buffer.core import default_buffer_prototype
+    from zarr.storage import MemoryStore
+
+    async def build():
+        prototype = default_buffer_prototype()
+        remote = MemoryStore()
+        for key, value in payloads.items():
+            await remote.set(key, prototype.buffer.from_bytes(value))
+        return remote.with_read_only(True)
+
+    return asyncio.run(build())
+
+
+def _read(store, key: str):
+    """Read one key through the store, returning its bytes or None."""
+    if not ZARR_V3:
+        return store[key]
+
+    from zarr.core.buffer.core import default_buffer_prototype
+
+    async def exercise():
+        result = await store.get(key, default_buffer_prototype())
+        return None if result is None else result.to_bytes()
+
+    return asyncio.run(exercise())
+
+
+def _cached_bytes(root) -> int:
+    """Total size of the non-temp files under a cache root."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if ".tmp." in name:
+                continue
+            total += os.stat(os.path.join(dirpath, name)).st_size
+    return total
 
 
 def test_persists_across_instances(tmp_path):
@@ -179,6 +233,122 @@ def test_stale_metadata_marker_is_ignored(tmp_path):
         assert await cache.exists(_METADATA_KEY)
 
     asyncio.run(exercise())
+
+
+def test_eviction_bounds_cache_size(tmp_path):
+    payload = b"x" * 100
+    keys = [_chunk_key(i) for i in range(6)]
+    store = DiskCacheStore(
+        _remote_with({key: payload for key in keys}),
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=300,
+    )
+
+    stamp = time.time() - 1000.0
+    for index, key in enumerate(keys):
+        assert _read(store, key) == payload
+        if index < len(keys) - 1:
+            # Pin the eviction order; the final write keeps its real (newest) mtime.
+            os.utime(_cached_path(store, key), (stamp + index, stamp + index))
+
+    assert _cached_bytes(tmp_path) <= 300
+    assert _cached_path(store, keys[-1]).exists()
+    assert not _cached_path(store, keys[0]).exists()
+
+
+def test_hit_refreshes_recency(tmp_path):
+    payload = b"y" * 100
+    keys = [_chunk_key(i) for i in range(3)]
+    store = DiskCacheStore(
+        _remote_with({key: payload for key in keys}),
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=250,
+    )
+
+    stamp = time.time() - 1000.0
+    assert _read(store, keys[0]) == payload
+    os.utime(_cached_path(store, keys[0]), (stamp, stamp))
+    assert _read(store, keys[1]) == payload
+    os.utime(_cached_path(store, keys[1]), (stamp + 1, stamp + 1))
+
+    # A disk hit on the older chunk makes it the most recently used one.
+    assert _read(store, keys[0]) == payload
+
+    # This write pushes the cache over the cap and evicts exactly one chunk.
+    assert _read(store, keys[2]) == payload
+
+    assert not _cached_path(store, keys[1]).exists()
+    assert _cached_path(store, keys[0]).exists()
+    assert _cached_path(store, keys[2]).exists()
+
+
+def test_eviction_skips_temp_files(tmp_path):
+    payload = b"w" * 100
+    keys = [_chunk_key(i) for i in range(3)]
+    store = DiskCacheStore(
+        _remote_with({key: payload for key in keys}),
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=300,
+    )
+
+    # A half-written file from another process must be neither counted nor removed.
+    partial = tmp_path / "chunk.tmp.999.1"
+    partial.write_bytes(b"p" * 1000)
+
+    for key in keys:
+        assert _read(store, key) == payload
+
+    assert partial.exists()
+    for key in keys:
+        assert _cached_path(store, key).exists()
+
+
+def test_v2_store_evicts_with_recency(tmp_path):
+    # The zarr 2 mapping is a plain MutableMapping over a dict remote, so its
+    # paths run under either zarr; assert them here rather than only on the
+    # zarr 2 CI leg.
+    payload = b"v" * 100
+    keys = [f"0.0.{i}" for i in range(3)]
+    store = DiskCacheStoreV2(
+        {key: payload for key in keys},
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=250,
+    )
+
+    stamp = time.time() - 1000.0
+    assert store[keys[0]] == payload
+    os.utime(_cached_path(store, keys[0]), (stamp, stamp))
+    assert store[keys[1]] == payload
+    os.utime(_cached_path(store, keys[1]), (stamp + 1, stamp + 1))
+
+    assert store[keys[0]] == payload  # hit, refreshing recency
+    assert store[keys[2]] == payload  # write, crossing the cap
+
+    assert _cached_bytes(tmp_path) <= 250
+    assert not _cached_path(store, keys[1]).exists()
+    assert _cached_path(store, keys[0]).exists()
+    assert _cached_path(store, keys[2]).exists()
+
+
+def test_unbounded_by_default(tmp_path):
+    payload = b"z" * 100
+    keys = [_chunk_key(i) for i in range(8)]
+    store = DiskCacheStore(
+        _remote_with({key: payload for key in keys}),
+        str(tmp_path),
+        url="memory://dataset",
+    )
+
+    for key in keys:
+        assert _read(store, key) == payload
+
+    assert _cached_bytes(tmp_path) == 800
+    for key in keys:
+        assert _cached_path(store, key).exists()
 
 
 def test_default_chunk_cache_dir_env(tmp_path, monkeypatch):
