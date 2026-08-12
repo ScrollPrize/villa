@@ -162,6 +162,8 @@ class Volume:
                  anon: bool = False,
                  cache: bool = False,
                  cache_size_mb: int = 256,
+                 cache_dir: Optional[Union[str, os.PathLike]] = None,
+                 cache_max_gb: Optional[float] = None,
                  read_retries: int = 4,
                  ):
 
@@ -211,8 +213,15 @@ class Volume:
             store. Byte-exact: the cache stores compressed chunks as-is, so
             values are identical with or without it.
         cache_size_mb : int, default = 256
-            Maximum size of the chunk cache in megabytes. Ignored unless
-            ``cache=True``.
+            Maximum size of the in-memory chunk cache in megabytes. Ignored
+            unless ``cache=True``.
+        cache_dir : Optional[Union[str, os.PathLike]], default = None
+            If set, cache fetched chunks on disk under this directory instead of
+            in memory, so a second run (or another process) reads them locally
+            rather than re-fetching. Remote stores opened read-only only.
+        cache_max_gb : Optional[float], default = None
+            Size cap in GiB for the disk cache, evicting least-recently-used
+            chunks. Unbounded if omitted; ignored unless ``cache_dir`` is set.
         read_retries : int, default = 4
             Attempts per read in __getitem__. Transient remote failures — dropped
             connections, truncated payloads, 429/5xx — are retried with exponential
@@ -232,6 +241,8 @@ class Volume:
         self.verbose = verbose
         self.cache = cache
         self.cache_size_mb = cache_size_mb
+        self.cache_dir = cache_dir
+        self.cache_max_gb = cache_max_gb
         self.anon = anon
         self.read_retries = max(1, int(read_retries))
         self.inklabel = None  # Initialize inklabel
@@ -405,7 +416,9 @@ class Volume:
                 storage_options=self._s3_storage_options(self.path),
                 verbose=self.verbose,
                 cache=self.cache,
-                cache_size_mb=self.cache_size_mb
+                cache_size_mb=self.cache_size_mb,
+                cache_dir=self.cache_dir,
+                cache_max_gb=self.cache_max_gb
             )
 
             # Get original dtype - handle both Array and Group cases
@@ -661,10 +674,14 @@ class Volume:
             try:
                 # Use our helper function to open the zarr store
                 zarr_store = open_zarr(
-                    path=zattrs_path, 
+                    path=zattrs_path,
                     mode='r',
                     storage_options=self._s3_storage_options(zattrs_path),
-                    verbose=self.verbose
+                    verbose=self.verbose,
+                    cache=self.cache,
+                    cache_size_mb=self.cache_size_mb,
+                    cache_dir=self.cache_dir,
+                    cache_max_gb=self.cache_max_gb
                 )
                 
                 # Get attributes from the store
@@ -730,7 +747,9 @@ class Volume:
                 storage_options=self._s3_storage_options(base_path),
                 verbose=self.verbose,
                 cache=self.cache,
-                cache_size_mb=self.cache_size_mb
+                cache_size_mb=self.cache_size_mb,
+                cache_dir=self.cache_dir,
+                cache_max_gb=self.cache_max_gb
             )
             
             if self.verbose:
