@@ -161,6 +161,9 @@ struct LineAnnotationController::LineAnnotationSession {
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationModeBeforeTask =
         vc3d::line_annotation::kDefaultNewFiberOptimizationMode;
     bool restoreFiberOptimizationModeOnFailure = false;
+    // Set when a toolbar interpolation-mode switch successfully re-optimized
+    // the whole line; the next saveSessionAsFiber drops the 'reviewed' tag.
+    bool stripReviewedTagOnSave = false;
     bool nativeSeedTracePending = false;
     std::optional<std::vector<vc3d::line_annotation::LineControlPoint>>
         controlPointsBeforeModeChange;
@@ -175,11 +178,6 @@ struct LineAnnotationController::LineAnnotationSession {
     // strip on save: a session whose line is still the loaded placeholder
     // must keep the tag.
     bool lineWasOptimized = false;
-    // True while an optimization result has not been saved yet; consumed
-    // by saveSessionAsFiber's trace-review tag transition. Unlike
-    // lineWasOptimized it resets on every save, so a verification granted
-    // between saves is not re-cleared by a later metadata-only save.
-    bool geometryChangedSinceReview = false;
     LineAnnotationController::SessionOptimizationState optimizationState =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     LineAnnotationController::SessionOptimizationState pendingOptimizationState =
@@ -1839,8 +1837,9 @@ bool LineAnnotationController::confirmFiberOptimizationModeChange(
         return _modeChangeConfirmation(requestedMode);
     }
     if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
-        // Agent-driven flows are deliberate scripted actions; the review
-        // tags still flag the result for inspection.
+        // Agent-driven flows are deliberate scripted actions; the 'reviewed'
+        // tag is still stripped on the save that follows, so the new
+        // geometry does not inherit the old human verdict.
         return true;
     }
     const bool toNative = requestedMode ==
@@ -1853,22 +1852,15 @@ bool LineAnnotationController::confirmFiberOptimizationModeChange(
             tr("Switching to the Fiber model re-traces every global-goal "
                "span with model predictions and overwrites the current "
                "line."));
-        prompt.setInformativeText(
-            tr("The fiber will be tagged '%1' until the whole line has "
-               "been reviewed and marked verified.")
-                .arg(QLatin1String(
-                    vc3d::line_annotation::kTraceNeedsReviewTag)));
     } else {
         prompt.setText(
             tr("Switching to Lasagna re-fits every global-goal span and "
                "overwrites the traced line."));
-        prompt.setInformativeText(
-            tr("Spans with an explicit trace goal keep their traced "
-               "geometry; the '%1' flag clears only if the resulting line "
-               "contains no traced spans.")
-                .arg(QLatin1String(
-                    vc3d::line_annotation::kTraceNeedsReviewTag)));
     }
+    prompt.setInformativeText(
+        tr("If the fiber is tagged 'reviewed', the tag is removed when the "
+           "re-optimized line is saved; re-tag it after inspecting the new "
+           "geometry."));
     auto* proceedButton =
         prompt.addButton(tr("Re-optimize"), QMessageBox::AcceptRole);
     prompt.addButton(QMessageBox::Cancel);
@@ -3158,18 +3150,6 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
         showError(validationError);
         return;
     }
-    if (*normalizedTag == vc3d::line_annotation::kTraceNeedsReviewTag) {
-        // Review state moves only through the dedicated review actions
-        // (setFiberTraceReviewed); the generic tag paths must not fabricate
-        // or clear it, since a traced fiber without the tag counts as
-        // reviewed.
-        showError(tr("'%1' is managed by the trace review workflow; use "
-                     "Mark trace verified / Mark as needs review instead.")
-                      .arg(QLatin1String(
-                          vc3d::line_annotation::kTraceNeedsReviewTag)));
-        return;
-    }
-
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
@@ -3213,81 +3193,6 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
             pane.session->fiberTags = it->tags;
             pushFiberUiState(pane);
         }
-    }
-    emitFiberSummaries();
-}
-
-bool LineAnnotationController::applyFiberTraceReview(uint64_t fiberId, bool verified)
-{
-    auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
-        return fiber.id == fiberId;
-    });
-    if (it == _fibers.end()) {
-        showError(tr("Fiber %1 is not loaded.").arg(fiberId));
-        return false;
-    }
-    if (!vc3d::line_annotation::hasAcceptedTraceSpan(it->controlPoints)) {
-        showError(tr("Fiber %1 has no prediction-traced spans to review.")
-                      .arg(fiberId));
-        return false;
-    }
-
-    // Single-tag review model: a traced fiber WITHOUT interp_unreviewed
-    // counts as reviewed, so verifying removes the tag and flagging for
-    // review re-adds it.
-    const std::vector<std::string> previousTags = it->tags;
-    const std::string reviewTag = vc3d::line_annotation::kTraceNeedsReviewTag;
-    if (verified) {
-        it->tags.erase(std::remove(it->tags.begin(), it->tags.end(), reviewTag),
-                       it->tags.end());
-    } else {
-        addUniqueSorted(it->tags, reviewTag);
-    }
-    if (it->tags == previousTags) {
-        return false;
-    }
-
-    it->needsSave = false;
-    try {
-        scheduleFiberSave(*it);
-    } catch (const std::exception& ex) {
-        it->tags = previousTags;
-        for (const auto& pane : _panes) {
-            if (pane.session && pane.session->fiberId == fiberId) {
-                pane.session->fiberTags = previousTags;
-                pushFiberUiState(pane);
-            }
-        }
-        showError(tr("Could not save fiber %1: %2")
-                      .arg(fiberId)
-                      .arg(QString::fromStdString(ex.what())));
-        return false;
-    }
-
-    for (const auto& pane : _panes) {
-        if (pane.session && pane.session->fiberId == fiberId) {
-            pane.session->fiberTags = it->tags;
-            pushFiberUiState(pane);
-        }
-    }
-    return true;
-}
-
-void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool verified)
-{
-    applyFiberTraceReview(fiberId, verified);
-    emitFiberSummaries();
-}
-
-void LineAnnotationController::setFibersTraceReviewed(
-    const std::vector<uint64_t>& fiberIds,
-    bool verified)
-{
-    // One summary emission for the whole batch: emitFiberSummaries
-    // rebuilds every fiber model and overlay chain, so per-fiber emission
-    // would make reviewing N fibers cost N full rebuilds.
-    for (const uint64_t fiberId : fiberIds) {
-        applyFiberTraceReview(fiberId, verified);
     }
     emitFiberSummaries();
 }
@@ -6033,10 +5938,6 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             std::count_if(fiber.branches.begin(),
                           fiber.branches.end(),
                           [](const FiberBranchRef& branch) { return branch.pending; }));
-        const auto hasTag = [&fiber](const char* tag) {
-            return std::find(fiber.tags.begin(), fiber.tags.end(), tag) !=
-                fiber.tags.end();
-        };
         summaries.push_back(FiberSummary{
             fiber.id,
             fiber.fileName,
@@ -6057,14 +5958,7 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             pendingLinkCount,
             vc3d::line_annotation::deriveTraceState(fiber.optimizationMode,
                                                     fiber.controlPoints),
-            hasTag(vc3d::line_annotation::kTraceNeedsReviewTag),
         });
-        // Single-tag review model: traced geometry without the review tag
-        // has been reviewed.
-        summaries.back().traceVerified =
-            summaries.back().traceState !=
-                vc3d::line_annotation::FiberTraceState::Legacy &&
-            !summaries.back().traceNeedsReview;
     }
     std::sort(summaries.begin(), summaries.end(), [](const FiberSummary& a, const FiberSummary& b) {
         return a.id < b.id;
@@ -6158,7 +6052,18 @@ QString LineAnnotationController::fiberDisplayName(uint64_t fiberId) const
 
 std::vector<std::string> LineAnnotationController::knownFiberTags() const
 {
-    return _knownFiberTags;
+    // 'reviewed' leads the list (dialog pills follow the given order); the
+    // rest keep the accumulated sorted order.
+    const std::string reviewedTag{vc3d::line_annotation::kReviewedTag};
+    std::vector<std::string> tags;
+    tags.reserve(_knownFiberTags.size() + 1);
+    tags.push_back(reviewedTag);
+    for (const auto& tag : _knownFiberTags) {
+        if (tag != reviewedTag) {
+            tags.push_back(tag);
+        }
+    }
+    return tags;
 }
 
 std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshots() const
@@ -8685,7 +8590,6 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     auto* pane = paneForSurface(session.surfaceName);
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
     session.lineWasOptimized = true;
-    session.geometryChangedSinceReview = true;
     session.seedPoint = task.seedPoint;
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
@@ -8742,6 +8646,15 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         }
     }
     refreshBranchLineViews(session.fiberId);
+
+    if (session.restoreFiberOptimizationModeOnFailure) {
+        // Only the toolbar interpolation-mode switch sets that flag, and it is
+        // still true while this (successful) result is applied: the whole line
+        // was re-optimized under the new mode, so the human 'reviewed' verdict
+        // no longer covers the geometry. Placed after the last failure exit so
+        // rollback paths never see the strip flag set.
+        session.stripReviewedTagOnSave = true;
+    }
 
     if (updateGeneratedViews && session.deferShowUntilGenerated && pane && pane->dialog &&
         !pane->dialog->isVisible()) {
@@ -10035,6 +9948,9 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     ++_fiberMetricsGeneration;
     _fiberMetricsPending = false;
     _knownFiberTags.clear();
+    // The review verdict tag must be offerable even in a package where no
+    // fiber carries it yet, so seed it instead of only discovering it.
+    addKnownFiberTags({std::string{vc3d::line_annotation::kReviewedTag}});
     if (!_state || !_state->vpkg()) {
         emitFiberSummaries();
         return;
@@ -12344,15 +12260,14 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                             std::string{kNeedsReoptimizationTag}),
                 session.fiberTags.end());
         }
-        if (session.geometryChangedSinceReview) {
-            // Freshly optimized geometry invalidates any prior human
-            // verification: traced spans re-enter review, a line re-fit
-            // without traces leaves the review workflow. Metadata-only
-            // saves (tags, links) skip this and keep the review state.
-            vc3d::line_annotation::applyTraceReviewTags(
-                session.fiberTags,
-                vc3d::line_annotation::hasAcceptedTraceSpan(session.controlPoints));
-            session.geometryChangedSinceReview = false;
+        if (session.stripReviewedTagOnSave) {
+            // An interpolation-mode switch overwrote the geometry; any prior
+            // human review verdict is stale. Ordinary edits/merges/splits keep it.
+            session.fiberTags.erase(
+                std::remove(session.fiberTags.begin(), session.fiberTags.end(),
+                            std::string{vc3d::line_annotation::kReviewedTag}),
+                session.fiberTags.end());
+            session.stripReviewedTagOnSave = false;
         }
         ensureSessionFiberIdentity(session);
         const BranchMetadataSyncResult branchSync =

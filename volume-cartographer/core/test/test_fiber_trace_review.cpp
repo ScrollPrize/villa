@@ -16,10 +16,8 @@ using vc3d::line_annotation::FiberTraceState;
 using vc3d::line_annotation::LineControlPoint;
 using vc3d::line_annotation::SegmentInterpolationMode;
 using vc3d::line_annotation::StoredControlPoint;
-using vc3d::line_annotation::applyTraceReviewTags;
 using vc3d::line_annotation::deriveTraceState;
 using vc3d::line_annotation::hasAcceptedTraceSpan;
-using vc3d::line_annotation::kTraceNeedsReviewTag;
 
 namespace {
 
@@ -78,38 +76,6 @@ TEST_CASE("deriveTraceState maps producer and mode to the panel state")
           FiberTraceState::Mixed);
     CHECK(deriveTraceState(FiberOptimizationMode::NativeFiberTrace3d, {}) ==
           FiberTraceState::Legacy);
-}
-
-TEST_CASE("applyTraceReviewTags transitions")
-{
-    SUBCASE("traced geometry demands review")
-    {
-        std::vector<std::string> tags{"approved"};
-        applyTraceReviewTags(tags, true);
-        CHECK(tags == std::vector<std::string>{"approved",
-                                               kTraceNeedsReviewTag});
-    }
-    SUBCASE("un-traced geometry leaves the workflow")
-    {
-        std::vector<std::string> tags{kTraceNeedsReviewTag, "zebra"};
-        applyTraceReviewTags(tags, false);
-        CHECK(tags == std::vector<std::string>{"zebra"});
-    }
-    SUBCASE("idempotent and keeps sorted order")
-    {
-        std::vector<std::string> tags{"alpha", "zebra"};
-        applyTraceReviewTags(tags, true);
-        applyTraceReviewTags(tags, true);
-        CHECK(tags == std::vector<std::string>{"alpha",
-                                               kTraceNeedsReviewTag,
-                                               "zebra"});
-    }
-    SUBCASE("no-op on untagged legacy fibers")
-    {
-        std::vector<std::string> tags{"alpha"};
-        applyTraceReviewTags(tags, false);
-        CHECK(tags == std::vector<std::string>{"alpha"});
-    }
 }
 
 // Golden fixture pinning the default lasagna segment descriptor — the

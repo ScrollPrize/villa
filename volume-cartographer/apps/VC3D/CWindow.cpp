@@ -7820,15 +7820,6 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberTag);
             connect(widget,
-                    &CFiberWidget::fiberTraceReviewChanged,
-                    _lineAnnotationController.get(),
-                    [this](const std::vector<uint64_t>& fiberIds, bool verified) {
-                        if (_lineAnnotationController) {
-                            _lineAnnotationController->setFibersTraceReviewed(
-                                fiberIds, verified);
-                        }
-                    });
-            connect(widget,
                     &CFiberWidget::hvScoreRecalculationRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::recalculateFiberHvClassification);

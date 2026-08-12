@@ -441,7 +441,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |
 | `vc3d_fiber_launch` | `fiber.launch` |
-| `vc3d_fiber_list` | `fiber.list` | Per fiber includes `traceState` (`legacy`/`predictions`/`mixed`), `traceNeedsReview` (the `interp_unreviewed` tag), `traceVerified` (derived: traced and unflagged), and per-span `interpMode` (`C`/`L`/`T`) plus `fiberManifest` (predictions provenance, trace spans only). |
+| `vc3d_fiber_list` | `fiber.list` | Per fiber includes `traceState` (`legacy`/`predictions`/`mixed`) and per-span `interpMode` (`C`/`L`/`T`) plus `fiberManifest` (predictions provenance, trace spans only). Human review state is just the ordinary `reviewed` tag in `tags`. |
 | `vc3d_fiber_open` | `fiber.open` |
 | `vc3d_fiber_save` | `fiber.save` |
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |
