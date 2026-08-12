@@ -220,4 +220,9 @@ def find_segment_unlabeled_patches(
                 is_unlabeled=True,
             )
         )
+    if not training:
+        print(
+            f"Warning: {segment.image_volume} produced no valid unlabeled "
+            "patches, skipping"
+        )
     return training, []
