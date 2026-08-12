@@ -96,9 +96,7 @@ public:
 
     // --- Chunk-source policy ---
     //
-    // Where a viewer of this manager samples from. The default returns the
-    // Volume's shared cache, which is what every viewer used before this
-    // existed, so the main workspace is unaffected. PrivateBounded gives this
+    // Where a viewer of this manager samples from. PrivateBounded gives this
     // manager its own hard-capped pools that are not joined to the
     // process-wide decoded-byte budget: they can neither evict the shared
     // working set nor be evicted by it, and they die with the workspace.
@@ -108,11 +106,9 @@ public:
     // base-tile, and overlay-tile requests can supersede independently.
     enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
 
-    // Opt this manager into the spiral cache policy and (re-)read all three
-    // spiral cache settings. Called once when the workspace is built and again
-    // whenever the settings dialog applies, so a budget change takes effect
-    // without reopening the workspace.
-    void applySpiralCacheSettings();
+    // Re-read all per-workspace viewer-cache settings. Called during manager
+    // construction and whenever the settings dialog applies.
+    void applyViewerCacheSettings();
     void setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes);
     ChunkCachePolicy chunkCachePolicy() const { return _chunkCachePolicy; }
     // The configured value is a *floor*: a setting that cannot hold one frame
@@ -136,12 +132,10 @@ public:
         const std::shared_ptr<Volume>& volume,
         ChunkCachePool pool = ChunkCachePool::PlaneViews);
 
-    // --- SurfaceCache budgets (spiral's flattened view) ---
+    // --- SurfaceCache budgets (flattened segmentation view) ---
     //
-    // Off unless a workspace opts in, so the main workspace never builds one.
     // Zero disables a channel and leaves it on the legacy render path.
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-    bool surfaceCacheEnabled() const { return _surfaceCacheEnabled; }
     std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
     std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
@@ -382,7 +376,6 @@ private:
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     ChunkCachePolicy _chunkCachePolicy{ChunkCachePolicy::SharedVolumeCache};
-    bool _surfaceCacheEnabled{false};
     std::size_t _surfaceCacheBudgetBytes{0};
     std::size_t _overlaySurfaceCacheBudgetBytes{0};
     struct PrivateChunkPool {

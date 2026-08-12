@@ -80,19 +80,13 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Share Main's process-wide decoded-chunk budget. Both workspaces use the
-    // single cache owned by their shared Volume.
+    // The state shares Main's process-wide default budget for non-viewer uses;
+    // ViewerManager gives this workspace independent bounded viewer caches.
     _state = new CState(
         _mainState ? _mainState->cacheSizeBytes() : 0,
         this,
         _mainState ? _mainState->decodedCacheBudget() : nullptr);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // Spiral's plane panes get their own hard-capped decoded-chunk pool instead
-    // of sharing the Volume's, so browsing slices here can never displace the
-    // main workspace's working set, and the flattened pane renders from tiles of
-    // resampled surface space. Applied before the viewers exist so they pick up
-    // the policy on construction.
-    _viewerManager->applySpiralCacheSettings();
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
     _viewerManager->setSurfacePatchSamplingStride(4, false);
