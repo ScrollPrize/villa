@@ -238,8 +238,9 @@ class SmearTransform(ImageOnlyTransform):
             raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
 
         local_smear_axis = self.smear_axis - 1
-        transformed = img.clone()
-        # Determine dims for moveaxis in torch
+        # In-place, like the module's other intensity/noise transforms:
+        # img[ch] and .permute() below are views, so the slice writes update
+        # img directly and img itself is returned.
         for ch in range(C):
             chan_img = img[ch]
             if chan_img.shape[local_smear_axis] <= self.num_prev_slices:
@@ -272,11 +273,4 @@ class SmearTransform(ImageOnlyTransform):
                 if count > 0:
                     aggregated = aggregated / float(count)
                 moved[i] = ((1 - self.alpha) * moved[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
-            # Restore original axis order
-            if local_smear_axis != 0:
-                inv_perm = list(range(1, moved.ndim))
-                inv_perm.insert(local_smear_axis, 0)
-                transformed[ch] = moved.permute(*inv_perm)
-            else:
-                transformed[ch] = moved
-        return transformed
+        return img
