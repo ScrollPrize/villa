@@ -191,6 +191,62 @@ jobs:
             --parallel 4 -L '^vc-specialized$'
           sccache --show-stats
 
+  render-benchmark:
+    name: Synthetic rendering regression (GCC Release / Valgrind replay)
+    needs: changes
+    if: needs.changes.outputs.test_core == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      # Keep this until the next published dependency image includes the
+      # valgrind entry in scripts/install_build_deps.sh.
+      - name: Install Valgrind profiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends valgrind
+          valgrind --version
+      - name: Configure Release benchmark graph
+        working-directory: volume-cartographer
+        run: |
+          cmake -S . -B build/ci-render-benchmark -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
+            -DVC_RUN_RENDER_BENCHMARKS=ON \
+            -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
+            -DVC_BUILD_FLATBOI=OFF
+      - name: Verify fixture and native parallel execution
+        working-directory: volume-cartographer
+        run: |
+          jobs=$(nproc)
+          echo "Using $jobs Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target bench_render_synthetic bench_thread_sync_replay \
+            --parallel "$jobs"
+          ctest --test-dir build/ci-render-benchmark --output-on-failure \
+            -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
+      - name: Run full fresh Valgrind matrix
+        working-directory: volume-cartographer
+        run: |
+          jobs=$(nproc)
+          echo "Using $jobs Valgrind/Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target render_valgrind_ci --parallel "$jobs"
+      - name: Upload rendering benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-rendering-valgrind
+          path: volume-cartographer/build/ci-render-benchmark/render-valgrind-ci/
+          if-no-files-found: warn
+
   vc3d-compile-smoke:
     name: Linux VC3D compile and smoke (Clang QuickBuild)
     needs: changes
@@ -378,7 +434,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
+    needs: [changes, skip, test-core, test-specialized, render-benchmark, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -389,6 +445,7 @@ jobs:
           R_SKIP: ${{ needs.skip.result }}
           R_TEST_CORE: ${{ needs.test-core.result }}
           R_TEST_SPECIALIZED: ${{ needs.test-specialized.result }}
+          R_RENDER_BENCHMARK: ${{ needs.render-benchmark.result }}
           R_VC3D: ${{ needs.vc3d-compile-smoke.result }}
           R_CLI: ${{ needs.cli-compile.result }}
           R_FLATBOI: ${{ needs.flatboi-compile.result }}
@@ -396,10 +453,10 @@ jobs:
           R_MACOS: ${{ needs.macos-build.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
+          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED render_benchmark=$R_RENDER_BENCHMARK vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
           # All non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_RENDER_BENCHMARK" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;

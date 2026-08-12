@@ -22,7 +22,31 @@ class FiberPointCollectionTests(unittest.TestCase):
         path.write_text(json.dumps(data))
         return path
 
-    def test_loads_control_points_instead_of_line_points(self):
+    def test_loads_line_points_trimmed_to_the_control_point_span(self):
+        # The tracer extends line_points past the first and last control point;
+        # those dangling ends must not become constraints.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "control_points": [[4, 8, 12], [20, 24, 28]],
+                "line_points": [
+                    [0, 0, 0],            # dangling start: dropped
+                    [4, 8, 12],           # first control point
+                    [12, 16, 20],         # dense in-between point: kept
+                    [20, 24, 28],         # last control point
+                    [100, 100, 100],      # dangling end: dropped
+                ],
+            })
+
+            collection = load_fiber_point_collection(
+                path, collection_id=7, min_point_spacing=0)
+
+            points = [point["p"] for point in collection["points"].values()]
+            np.testing.assert_array_equal(
+                points, [[1, 2, 3], [3, 4, 5], [5, 6, 7]])
+            np.testing.assert_array_equal(
+                collection["control_line_indices"], [0, 2])
+
+    def test_falls_back_to_control_points_without_a_dense_polyline(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self._write_fiber(temporary, {
                 "control_points": [[4, 8, 12], [20, 24, 28]],
@@ -35,7 +59,7 @@ class FiberPointCollectionTests(unittest.TestCase):
             points = [point["p"] for point in collection["points"].values()]
             np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
 
-    def test_does_not_fall_back_to_line_points(self):
+    def test_skips_fibers_without_control_points(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self._write_fiber(temporary, {
                 "line_points": [[4, 8, 12]],

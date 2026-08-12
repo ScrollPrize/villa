@@ -144,6 +144,23 @@ def resolve_umbilicus_path(patches_dir, explicit_path=None):
     )
 
 
+def resolve_fibers_path(patches_dir, fibers_flag):
+    """Resolve the fibers directory for --fibers.
+
+    --fibers may be given a path (used verbatim), or passed as a bare flag with no
+    value (sentinel ''), in which case we infer the dataset's `fibers/` dir next to
+    --patches-dir. Returns None when fibers are not requested."""
+    if fibers_flag is None:
+        return None
+    if fibers_flag:
+        path = os.path.abspath(os.path.expanduser(fibers_flag))
+    else:
+        path = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(patches_dir))), 'fibers')
+    if not os.path.isdir(path):
+        raise SystemExit(f'--fibers directory not found: {path}')
+    return path
+
+
 def _to_py(x):
     """Convert numpy / torch scalars+arrays to plain python for json."""
     if isinstance(x, torch.Tensor):
@@ -155,43 +172,64 @@ def _to_py(x):
     return x
 
 
-def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path):
-    """Point fit_spiral's module globals at the checkpoint's cfg and the
-    user-supplied patches/pcls/filter-z-range so its loaders behave identically.
-    Returns the checkpoint's model z-range, which shapes the transform's flow
-    field independently of the filtering z-range."""
+def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path,
+                     fibers_path=None):
+    """Build the explicit FitConfig / ScrollSpec / SpiralInputPaths pointing
+    fit_spiral's loaders at the user-supplied patches/pcls/filter-z-range so
+    they behave identically to a fit.
+    Returns (fit_config, scroll, paths, model_z_begin, model_z_end); the model
+    z-range shapes the transform's flow field independently of the filtering
+    z-range."""
+    from fit_session import PclInputSpec, ScrollSpec, SpiralInputPaths
+
     cfg = fs.Config().as_dict()
     cfg.update(checkpoint['cfg'])
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
-    fs.cfg = cfg
-    fs.verified_patches_path = patches_dir
-    # Attachment is over the verified patch set only, so skip the (slow, unrelated)
-    # unverified patches; they don't change the cross-patch / attached pcl set.
-    fs.unverified_patches_path = None
-    fs.fibers_path = None
-    fs.pcl_json_paths = list(pcl_paths)
-    fs.z_begin = filter_z_begin
-    fs.z_end = filter_z_end
-    fs.umbilicus_z_to_yx = (
-        lambda path=umbilicus_path: fs.json_umbilicus_z_to_yx(path, coordinate_scale=1.0)
+    # We compute no shell losses; zero their weights so the context's
+    # shell_losses_enabled() gate stops load_host_inputs() from loading the
+    # shell (replacing the old fs.shell_losses_enabled = lambda: False
+    # override). Nothing else in the host-loading path reads these weights.
+    cfg['loss_weight_shell_outer'] = 0.0
+    cfg['loss_weight_shell_patch_radius'] = 0.0
+    # The filtering z-range is the optimisation window this analysis uses.
+    cfg['z_begin'] = int(filter_z_begin)
+    cfg['z_end'] = int(filter_z_end)
+    fit_config = fs.FitConfig(cfg)
+    scroll = ScrollSpec(
+        name='analysis',
+        voxel_size_um=9.6,
+        spiral_outward_sense=checkpoint.get('spiral_outward_sense') or 'CW',
     )
-    # We don't compute shell losses; stop prepare_patches from loading the shell.
-    fs.shell_losses_enabled = lambda: False
-    return int(checkpoint['z_begin']), int(checkpoint['z_end'])
+    # This analysis needs no scroll volume, track store, or outer shell:
+    # leaving those paths empty keeps load_host_inputs() from touching the
+    # training-only inputs. Legacy role-less PCL specs (role=None) retain the
+    # historical abs_winding.json basename inference. Attachment is over the
+    # verified patch set only, so the (slow, unrelated) unverified patches
+    # are skipped; they don't change the cross-patch / attached pcl set.
+    # Fibers are same-winding annotations: when loaded they classify as 'neither'
+    # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
+    # unless a fibers dir is passed.
+    paths = SpiralInputPaths(
+        umbilicus=umbilicus_path,
+        pcls=tuple(PclInputSpec(path=str(path), role=None)
+                   for path in pcl_paths),
+        fibers=fibers_path or '',
+        verified_patches=patches_dir,
+    )
+    return fit_config, scroll, paths, int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
-def build_transform(checkpoint, model_z_begin, model_z_end):
+def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
     """Reconstruct the slice->spiral transform and dr_per_winding from the
     checkpoint, using fit_spiral's own model class. The flow field is shaped by
     the checkpoint's (model) z-range, not the filtering z-range."""
     device = torch.device('cuda')
-    cfg = fs.cfg
 
     all_zs = np.arange(model_z_begin, model_z_end)
-    umbilicus_fn = fs.umbilicus_z_to_yx()
+    umbilicus_fn = context.umbilicus_z_to_yx()
     umbilicus_zyx = torch.from_numpy(
         np.concatenate([all_zs[:, None], umbilicus_fn(all_zs)], axis=-1).astype(np.float32)
     ).to(device)
@@ -207,7 +245,7 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
         flow_min_corner_zyx=flow_min_corner,
         flow_max_corner_zyx=flow_max_corner,
         config=cfg,
-        spiral_outward_sense=fs.spiral_outward_sense,
+        spiral_outward_sense=context.spiral_outward_sense,
     )
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
@@ -402,50 +440,61 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
     return anchors
 
 
-def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
-    """Unwrap the adjacent PCL segment pa -> pb and return only its theta=0
-    cumulative branch-cut adjustment in winding units."""
-    device = dr.device
+def _tour_unwrap_adjustments(transform, dr, tour):
+    """Cumulative theta=0 branch adjustment (winding units) at each tour point."""
     zyx = torch.as_tensor(
-        np.stack([pa['zyx'], pb['zyx']], axis=0).astype(np.float32),
-        device=device,
+        np.stack([p['zyx'] for p in tour], axis=0).astype(np.float32),
+        device=dr.device,
     )
     with torch.no_grad():
         spiral = transform(zyx)
         theta, _, _ = get_theta_and_radii(spiral[..., 1:], dr)
         zero_shifted = torch.zeros_like(theta)
         _, adjustments = unwrap_shifted_radii(theta[None], zero_shifted[None], dr)
-        adjustments = adjustments[0]
-    return int(round(float((adjustments[-1] / dr).item())))
+        return np.round((adjustments[0] / dr).cpu().numpy()).astype(np.int64)
 
 
 def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of relative-winding edges leaving that patch.
 
-    For each relative-winding pcl we order its attached points by annotation
-    (int-json-key) order and connect each *consecutive* pair that lands on two
-    different (loaded) patches. Each such pair yields a pair of directed edges,
-    one per direction. An edge records the departure point (`from_ij`) on this
-    patch, the arrival point (`to_ij`) on the neighbour, and the edge's winding
-    delta = wind_a(arrival) - wind_a(departure), corrected for any theta=0 seam
-    crossing between the adjacent PCL points. Only consecutive pairs are used, so
-    the edge set stays a chain through the pcl's points; more distant patches are
-    reached transitively by BFS."""
+    For each relative-winding pcl we walk its chain-valid point sequence
+    (pcl['chain'].iter_chain(): id-sorted order for ordinary pcls, an Euler tour
+    of the member tree for merged fiber-link components -- whose id-sorted order is
+    not chain-valid across members -- crossing each loop-closing non-tree link
+    once too, so link cycles contribute their own patch edges and inconsistent
+    holonomy around them is detectable) and connect each *consecutive* pair of
+    attached points that lands on two different (loaded) patches. Each such pair
+    yields a pair of directed edges, one per direction. An edge records the
+    departure point (`from_ij`) on this patch, the arrival point (`to_ij`) on
+    the neighbour, and the edge's winding delta = wind_a(arrival) -
+    wind_a(departure), corrected for any theta=0 seam crossings accumulated
+    along the chain between the two points (through unattached points and, for
+    merged components, fiber-hopping junctions). Only consecutive pairs are
+    used, so the edge set stays a chain through the pcl's points; more distant
+    patches are reached transitively by BFS."""
     adjacency = {}
     for pid, pcl in cross_patch_pcls.items():
         kind = classify_pcl(pcl)
         if kind == 'absolute':
             continue
-        # Attached points (on a loaded patch, finite annotation) in annotation order.
-        seq = []
-        for _, p in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
+
+        def attached(p):
             on_patch = p.get('on_patch')
-            if on_patch is None or on_patch['id'] not in patches:
-                continue
-            if not np.isfinite(float(p['winding_annotation'])):
-                continue
-            seq.append(p)
-        for pa, pb in zip(seq, seq[1:]):
+            return (on_patch is not None and on_patch['id'] in patches
+                    and np.isfinite(float(p['winding_annotation'])))
+
+        tour = list(pcl['chain'].iter_chain())
+        tour_adjustments = _tour_unwrap_adjustments(transform, dr, tour)
+        attached_tour = [(k, p) for k, p in enumerate(tour) if attached(p)]
+        pairs = []
+        seen_pairs = set()
+        for (ka, pa), (kb, pb) in zip(attached_tour, attached_tour[1:]):
+            key = frozenset([id(pa), id(pb)])
+            if id(pa) == id(pb) or key in seen_pairs:
+                continue  # an Euler tour revisits points; keep each edge once
+            seen_pairs.add(key)
+            pairs.append((pa, pb, int(tour_adjustments[kb] - tour_adjustments[ka])))
+        for pa, pb, unwrap_adjustment in pairs:
             ida, idb = pa['on_patch']['id'], pb['on_patch']['id']
             if ida == idb:
                 continue
@@ -456,7 +505,6 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
             # shifted-radius adjustment; the diagnostic's integer branch transport
             # convention is -c (same sign as strip_winding_delta).
             raw_dwind = int(round(wb - wa))
-            unwrap_adjustment = pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb)
             branch_delta = -unwrap_adjustment
             dwind = raw_dwind + branch_delta
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
@@ -850,6 +898,11 @@ def parse_z_range(z_range):
               help='Directory of patch tifxyz folders (the full set, for attachment).')
 @click.option('--umbilicus', default=None, type=click.Path(exists=True, dir_okay=False),
               help='Path to umbilicus.json. Defaults to umbilicus.json next to --patches-dir.')
+@click.option('--fibers', 'fibers_flag', is_flag=False, flag_value='', default=None,
+              help='Include fibers as same-winding (delta-0) edges, like same_windings.json. '
+                   'Pass a directory, or use the bare flag to infer the dataset\'s fibers/ dir '
+                   'next to --patches-dir. Fibers add same-winding constraints (participating in '
+                   'loop/holonomy detection) but contribute no winding votes.')
 @click.option('--patch-id', required=True, help='Folder name (within --patches-dir) of the seed patch to debug.')
 @click.option('--pcl', 'pcl_paths', required=True, multiple=True, type=click.Path(exists=True, dir_okay=False),
               help='Point-collection json file(s). Repeat --pcl for several. Both absolute- and '
@@ -900,8 +953,8 @@ def parse_z_range(z_range):
 @click.option('--plot-output', default=None, type=click.Path(dir_okay=False),
               help='Output image path for --plot (default: winding_votes_<patch>_graph.png next to '
                    'the json). Ignored without --plot.')
-def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_size, medial_weight, max_hops,
-         detect_loops, min_fix, min_fix_time_limit, max_subgraphs, top_patches_per_subgraph, output,
+def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z_range, step_size, medial_weight,
+         max_hops, detect_loops, min_fix, min_fix_time_limit, max_subgraphs, top_patches_per_subgraph, output,
          plot, plot_output):
     torch.set_grad_enabled(False)
     device = torch.device('cuda')
@@ -919,11 +972,15 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     umbilicus_path = resolve_umbilicus_path(patches_dir, umbilicus)
     print(f'using umbilicus {umbilicus_path}')
 
+    fibers_path = resolve_fibers_path(patches_dir, fibers_flag)
+    if fibers_path:
+        print(f'including fibers from {fibers_path} (same-winding edges)')
+
     print(f'loading checkpoint {checkpoint}')
     from checkpoint_io import load_checkpoint_cpu
     ckpt = load_checkpoint_cpu(checkpoint)
-    model_z_begin, model_z_end = install_globals(
-        ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
+    fit_config, scroll, input_paths, model_z_begin, model_z_end = build_fit_inputs(
+        ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path, fibers_path
     )
     print(f'checkpoint (model) z-range: [{model_z_begin}, {model_z_end}); '
           f'filtering z-range: [{filter_z_begin}, {filter_z_end})')
@@ -934,14 +991,17 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         )
 
     print('loading + z-filtering patches and point-collections')
-    patches, _unverified, _shell, cross_patch_pcls, _unattached = fs.main(
-        load_only_patches_and_point_collections=True
-    )
-    if isinstance(cross_patch_pcls, list):
-        # fit_spiral now returns the cross-patch pcls as a list; this tool's
-        # vote/edge builders key their reports by pcl id. Per-file collection
-        # ids collide across json files, so key by list position instead.
-        cross_patch_pcls = dict(enumerate(cross_patch_pcls))
+    context = fs.FitContext(fit_config, scroll=scroll, paths=input_paths)
+    context.load_host_inputs()
+    patches = context.verified_patches
+    # fit_spiral holds the cross-patch pcls as a list; this tool's
+    # vote/edge builders key their reports by pcl id. Per-file collection
+    # ids collide across json files, so key by list position instead.
+    # Cross-fiber links arrive here as merged 'fibercomp:*' component pcls
+    # (load_host_inputs folds link-connected fibers together); build_rel_adjacency
+    # walks each component's fiber graph to emit delta-0 edges that hop fibers
+    # at the junctions -- same seam machinery as within-fiber / relative edges.
+    cross_patch_pcls = dict(enumerate(context.cross_patch_pcls))
     if patch_id not in patches:
         raise SystemExit(
             f'patch id {patch_id!r} not among {len(patches)} loaded patches (after z-filtering); '
@@ -950,7 +1010,7 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     patch = patches[patch_id]
 
     print('rebuilding spiral transform from checkpoint')
-    transform, dr = build_transform(ckpt, model_z_begin, model_z_end)
+    transform, dr = build_transform(ckpt, fit_config, context, model_z_begin, model_z_end)
     dr_value = float(dr.item())
     print(f'dr_per_winding = {dr_value:.4f}')
 
