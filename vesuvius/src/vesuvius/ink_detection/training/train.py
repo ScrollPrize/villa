@@ -580,7 +580,6 @@ def _run_training(request: TrainingRequest) -> int:
     latest_ema_val_loss = None
     best_checkpoint_value = None
     confusion_metric = Confusion()
-    balanced_accuracy_metric = BalancedAccuracy()
     progress = tqdm(
         range(start_step, config.num_iterations),
         total=config.num_iterations,
@@ -989,7 +988,7 @@ def _run_training(request: TrainingRequest) -> int:
                 latest_val_loss = mean_val_loss
                 latest_ema_val_loss = mean_ema_loss
                 balanced_accuracy = float(
-                    balanced_accuracy_metric._from_counts(counts).item()
+                    BalancedAccuracy.from_counts(counts).item()
                 )
                 log_values = build_validation_preview_log(
                     step=step,

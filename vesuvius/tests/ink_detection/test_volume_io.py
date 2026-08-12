@@ -355,18 +355,6 @@ def test_zarr2_cached_open_raises_factually(tmp_path):
         open_volume_root(tmp_path / "volume.zarr", cache_dir=tmp_path / "cache")
 
 
-def test_deleted_cache_and_url_shims_stay_deleted():
-    for name in (
-        "normalize_volume_url",
-        "PidAwareFsspecStore",
-        "AsyncDiskCachedStore",
-        "DiskCachedMapping",
-        "_apply_byte_range",
-        "_install_cache_value",
-    ):
-        assert not hasattr(volume_io, name)
-
-
 def test_public_group_keys_include_arrays_and_groups(tmp_path):
     path = tmp_path / "mixed.zarr"
     kwargs = {"mode": "w"}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import math
 import shutil
@@ -906,7 +907,7 @@ def load_flat_inference_state(
     return model.load_state_dict(state, strict=False)
 
 
-def configure_model(args: Any) -> ConfiguredModel:
+def configure_model(args: argparse.Namespace) -> ConfiguredModel:
     """Rebuild one strict flat model and preprocessing contract from checkpoint."""
 
     payload = load_checkpoint(args.checkpoint)
@@ -972,7 +973,7 @@ def _volume_axes(array: Any) -> tuple[bool, int, int, int, int, int]:
 
 def infer_single_zarr(
     *,
-    args: Any,
+    args: argparse.Namespace,
     input_zarr: str | Path,
     configured_model: ConfiguredModel,
     device: torch.device,
@@ -1208,7 +1209,7 @@ def resolve_segment_zarr_path(segment_dir: Path) -> Path:
 
 
 def infer_folder(
-    args: Any,
+    args: argparse.Namespace,
     configured_model: ConfiguredModel,
     *,
     device: torch.device,
@@ -1278,7 +1279,7 @@ def _is_url(path: str | Path) -> bool:
     return bool(parsed.scheme and parsed.netloc)
 
 
-def normalize_inference_paths(args: Any) -> Any:
+def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
     """Normalize the two accepted positional/folder command shapes."""
 
     if args.input_zarr is not None and not _is_url(args.input_zarr):

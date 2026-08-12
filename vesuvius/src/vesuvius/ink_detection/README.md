@@ -17,13 +17,8 @@ uv sync --extra models --extra tests
 
 ## Data
 
-Published `ink_9um` labels use a scroll-first directory:
-
-```text
-ink_9um/labels/<scroll>/<family>/<segment>/
-```
-
-For example:
+Each labeled segment is one directory holding its label zarrs beside its
+surface volume, for example:
 
 ```text
 /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/
@@ -133,7 +128,7 @@ counts without creating output.
 
 ## Checkpoints and metrics
 
-Training embeds the canonical JSON config in each checkpoint. Inference
+Training embeds the resolved JSON config in each checkpoint. Inference
 rebuilds the model, normalization, and input geometry from that embedded config
 and prefers EMA weights when present.
 

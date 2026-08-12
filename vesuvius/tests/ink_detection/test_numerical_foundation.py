@@ -297,7 +297,7 @@ def test_confusion_and_balanced_accuracy_match_binary_counts():
         value.item() for value in (counts.tp, counts.fp, counts.fn, counts.tn)
     )
     assert count_values == (1, 1, 1, 0)
-    assert BalancedAccuracy._from_counts(counts).item() == pytest.approx(0.25)
+    assert BalancedAccuracy.from_counts(counts).item() == pytest.approx(0.25)
 
 
 def _sampling_config(tmp_path: Path, strategy: str) -> InkDataConfig:

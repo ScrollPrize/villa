@@ -201,8 +201,9 @@ All long options accept hyphens and underscores interchangeably; help shows the
 reference spelling. The commands have these persistent-state guarantees:
 
 - `validate_segments` reports every readable label-content problem even when
-  another segment has missing or corrupt metadata. Pass the family directory
-  whose immediate children are segment directories as `ROOT`.
+  another segment has missing or corrupt metadata. `ROOT` is the grandparent
+  of the segment directories: every child of `ROOT` is a group whose
+  subdirectories are the segments.
 - `clean_labels` stages and validates the replacement before moving the source
   into the sibling `label_backup` tree. A failed write leaves the active input
   in place, and a completed rerun is reported as skipped unless `--overwrite`

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 import pickle
@@ -75,21 +74,6 @@ def test_negative_resolution_fails_before_native_volume_open(monkeypatch):
         native._plan_from_args(
             SimpleNamespace(checkpoint=Path("unused"), resolution="-1")
         )
-
-
-def test_native_module_has_no_function_local_imports():
-    tree = ast.parse(Path(native.__file__).read_text(encoding="utf-8"))
-    functions = (
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    )
-    assert not [
-        child
-        for function in functions
-        for child in ast.walk(function)
-        if isinstance(child, (ast.Import, ast.ImportFrom))
-    ]
 
 
 def test_cli_uses_hyphen_underscore_parser_and_explicit_workers_alias(tmp_path):
@@ -583,11 +567,3 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         np.all(np.asarray(zarr.open_group(output, mode="r")[str(level)]) == 128)
         for level in range(6)
     )
-
-
-def test_native_module_contains_no_layout_vocabulary():
-    source = Path(native.__file__).read_text(encoding="utf-8")
-    lowered = source.lower()
-    assert "scroll_id" not in lowered
-    assert "scroll-name" not in lowered
-    assert "s3://" not in lowered

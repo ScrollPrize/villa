@@ -68,7 +68,7 @@ class Confusion:
 
 class BalancedAccuracy:
     @staticmethod
-    def _from_counts(counts: ConfusionCounts) -> torch.Tensor:
+    def from_counts(counts: ConfusionCounts) -> torch.Tensor:
         positive_denominator = counts.tp + counts.fn
         negative_denominator = counts.tn + counts.fp
         positive_recall = torch.where(
