@@ -116,7 +116,7 @@ Common fields produced by tools:
 To stay compatible:
 
 - Preserve `scale` when copying/transforming surfaces.
-- If you resample the grid resolution, update `scale` consistently (halving the resolution along an axis halves `scale` on that axis).
+- If resampling doubles the grid-cell spacing along an axis, halve `scale` on that axis.
 
 ## 6. Writing rules (recommended)
 
@@ -145,4 +145,3 @@ A compatible reader should:
 
 - Writer populates `meta.json.format = "tifxyz"` & `meta.json.scale = [sx, sy]`: [`core/src/QuadSurface.cpp:729`](core/src/QuadSurface.cpp:729)
 - Reader loads `x/y/z.tif`, invalidates `Z <= 0`, then applies optional `mask.tif`: [`core/src/QuadSurface.cpp:848`](core/src/QuadSurface.cpp:848)
-
