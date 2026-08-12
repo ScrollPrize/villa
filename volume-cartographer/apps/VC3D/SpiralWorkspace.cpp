@@ -148,7 +148,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     auto* cacheStatsLabel = new QLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
-    cacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged, cacheStatsLabel,
             [cacheStatsLabel](const QStringList& items) {

@@ -490,6 +490,7 @@ ChunkCache::Stats ChunkCache::stats() const
         result.remoteDownloadBytesPerSecond =
             static_cast<double>(recentBytes) /
             std::chrono::duration<double>(kDownloadStatsWindow).count();
+        result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
     }
     if (state->persistentBudget_) {
@@ -527,6 +528,8 @@ void ChunkCache::invalidate()
         state->decodedBytes_ = 0;
         state->remoteFetchesInFlight_ = 0;
         state->remoteDownloadHistory_.clear();
+        std::fill(state->unresolvedFetchesByLevel_.begin(),
+                  state->unresolvedFetchesByLevel_.end(), 0);
     }
     chunkWorkerPool(state->options_.maxConcurrentReads)
         .cancel_group_before(state->schedulerGroup_, schedulerEpoch);
@@ -558,6 +561,8 @@ void ChunkCache::beginViewRequest(bool discardPending)
                     ++it;
                 }
             }
+            std::fill(state->unresolvedFetchesByLevel_.begin(),
+                      state->unresolvedFetchesByLevel_.end(), 0);
         }
     }
     if (discardPending) {
@@ -639,6 +644,12 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
     if (it == state->entries_.end())
         return;
     Entry& entry = it->second;
+    if (!entry.unresolvedCounted &&
+        key.level >= 0 &&
+        key.level < static_cast<int>(state->unresolvedFetchesByLevel_.size())) {
+        ++state->unresolvedFetchesByLevel_[static_cast<std::size_t>(key.level)];
+        entry.unresolvedCounted = true;
+    }
     entry.status = EntryStatus::InFlight;
     entry.basePriority = fetchBasePriority(*state, key, priorityOffset);
     const auto epochBias = state->viewEpoch_;
@@ -840,6 +851,15 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
         return;
 
     Entry& entry = it->second;
+    if (entry.unresolvedCounted &&
+        key.level >= 0 &&
+        key.level < static_cast<int>(state->unresolvedFetchesByLevel_.size())) {
+        auto& unresolved =
+            state->unresolvedFetchesByLevel_[static_cast<std::size_t>(key.level)];
+        if (unresolved > 0)
+            --unresolved;
+        entry.unresolvedCounted = false;
+    }
     if (entry.inLru) {
         state->lru_.erase(entry.lruIt);
         entry.inLru = false;

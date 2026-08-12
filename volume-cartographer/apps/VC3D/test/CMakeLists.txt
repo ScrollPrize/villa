@@ -50,6 +50,25 @@ add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
 vc_register_test_target(test_spiral_reload_comparison)
 vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
 
+add_executable(test_download_queue_stats
+    test_download_queue_stats.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueStats.cpp)
+
+set_target_properties(test_download_queue_stats PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_download_queue_stats PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_download_queue_stats PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME download_queue_stats COMMAND test_download_queue_stats)
+vc_register_test_target(test_download_queue_stats)
+vc_register_ctest(download_queue_stats test_download_queue_stats)
+
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)

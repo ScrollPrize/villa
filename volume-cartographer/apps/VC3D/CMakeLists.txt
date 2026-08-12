@@ -93,6 +93,8 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/DownloadQueueStats.cpp
+    elements/DownloadQueueStats.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp

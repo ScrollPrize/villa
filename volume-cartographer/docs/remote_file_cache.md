@@ -70,3 +70,27 @@ its `artifact_url` remains authoritative.
 There is no lookup or migration for the earlier development-only cache
 layout. Reopening a remote source populates the readable layout from a cold
 cache.
+
+## VC3D Download Diagnostics
+
+VC3D's existing application cache status bar reports fixed-GiB RAM and disk
+usage. An idle remote volume appears as:
+
+```text
+RAM 3.2/10.0 GiB  disk 82.4/500.0 GiB  net idle
+```
+
+During active remote downloads it includes in-flight count, recent throughput,
+and unresolved requests by pyramid level:
+
+```text
+RAM 3.2/10.0 GiB  disk 82.4/500.0 GiB  net 16@42.7MiB/s q1 8/0/3
+```
+
+`q1` means level 1 is the first pyramid level with queued or running chunk
+requests. Slash-separated values cover consecutive levels through the last
+nonzero level; interior zeros are retained. Queue information is omitted when
+no remote fetch is active, and local volumes omit the network field entirely.
+
+Counts come from `ChunkCache` state, so repeated requests for one unresolved
+chunk count once.

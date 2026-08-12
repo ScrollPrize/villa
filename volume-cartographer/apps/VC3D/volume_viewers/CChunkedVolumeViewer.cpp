@@ -1,6 +1,7 @@
 #include "CChunkedVolumeViewer.hpp"
 
 #include "CState.hpp"
+#include "elements/DownloadQueueStats.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "RemoteVolumeCachePaths.hpp"
 #include "VCSettings.hpp"
@@ -490,12 +491,6 @@ QString formatGigabytes(std::size_t bytes)
 {
     constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
     return QString("%1").arg(static_cast<double>(bytes) / kGiB, 0, 'f', 1);
-}
-
-QString formatMegabytesPerSecond(double bytesPerSecond)
-{
-    constexpr double kMiB = 1024.0 * 1024.0;
-    return QString("%1 MB/s").arg(std::max(0.0, bytesPerSecond) / kMiB, 0, 'f', 1);
 }
 
 constexpr std::size_t kOverlayDecodedCacheCapacity =
@@ -5943,16 +5938,17 @@ void CChunkedVolumeViewer::updateStatusLabel()
     if (showStats && !statsTopRight) {
         items << statsItems;
     }
-
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        sharedCacheItems << QString("RAM %1/%2 GB")
+        sharedCacheItems << QString("RAM %1/%2 GiB")
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
         if (stats.persistentCacheEnabled) {
-            QString disk = QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
-            if (stats.persistentCacheMaximumBytes)
-                disk += QString("/%1").arg(formatByteSize(*stats.persistentCacheMaximumBytes));
+            QString disk = QString("disk %1/").arg(formatGigabytes(stats.persistentCacheBytes));
+            disk += stats.persistentCacheMaximumBytes
+                ? formatGigabytes(*stats.persistentCacheMaximumBytes)
+                : QStringLiteral("unlimited");
+            disk += QStringLiteral(" GiB");
             if (stats.persistentCacheScanInFlight)
                 disk += QStringLiteral(" (scanning)");
             else if (stats.persistentCacheTrimInFlight)
@@ -5965,13 +5961,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
         } else {
             sharedCacheItems << QStringLiteral("disk off");
         }
-        if (stats.remoteFetchesInFlight > 0) {
-            sharedCacheItems << QString("network %1 @ %2")
-                .arg(stats.remoteFetchesInFlight)
-                .arg(formatMegabytesPerSecond(stats.remoteDownloadBytesPerSecond));
-        } else {
-            sharedCacheItems << QStringLiteral("network idle");
-        }
+        const QString network = vc3d::formatNetworkDownloadStats(
+            stats, _volume && _volume->isRemote());
+        if (!network.isEmpty())
+            sharedCacheItems << network;
     }
 
     // The RAM figure above already reports the *effective* chunk-cache

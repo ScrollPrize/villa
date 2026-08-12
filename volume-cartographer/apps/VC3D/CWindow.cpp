@@ -2637,7 +2637,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setMinimumWidth(320);
-    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
 
     _persistentCacheLowSpaceLabel = new QLabel(this);

@@ -76,6 +76,10 @@ public:
         std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
+        // Unresolved chunk requests (queued or executing), indexed by pyramid
+        // level. Persistent-cache probes count while the requested chunk is
+        // still unavailable to rendering.
+        std::vector<std::size_t> unresolvedFetchesByLevel;
 
     };
 
@@ -158,6 +162,7 @@ private:
         std::size_t decodedBytes = 0;
         bool persisted = false;
         bool persistentWriteQueued = false;
+        bool unresolvedCounted = false;
         bool inLru = false;
         int basePriority = 0;
         std::int64_t priority = 0;
@@ -178,7 +183,9 @@ private:
             , dtype_(dtype)
             , options_(std::move(options))
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
-        {}
+        {
+            unresolvedFetchesByLevel_.resize(levels_.size(), 0);
+        }
 
         std::vector<LevelInfo> levels_;
         std::vector<std::shared_ptr<IChunkFetcher>> fetchers_;
@@ -190,6 +197,7 @@ private:
         std::condition_variable cv_;
         std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
         std::list<ChunkKey> lru_;
+        std::vector<std::size_t> unresolvedFetchesByLevel_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t decodedBudgetRegistration_ = 0;
         std::uint64_t generation_ = 0;

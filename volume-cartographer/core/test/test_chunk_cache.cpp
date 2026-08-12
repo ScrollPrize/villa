@@ -654,8 +654,13 @@ TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
     // Occupy the single worker, then queue a fine and a coarse chunk.
     (void)c->tryGetChunk(0, 0, 0, 0);
     f->waitFirstStarted();
+    (void)c->tryGetChunk(0, 0, 0, 0); // duplicate demand counts once
     (void)c->tryGetChunk(0, 0, 0, 1); // fine (level 0)
     (void)c->tryGetChunk(1, 0, 0, 0); // coarse (level 1)
+    const auto queued = c->stats().unresolvedFetchesByLevel;
+    REQUIRE(queued.size() == 2);
+    CHECK(queued[0] == 2);
+    CHECK(queued[1] == 1);
     f->release();
 
     CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
@@ -665,6 +670,34 @@ TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
     REQUIRE(order.size() == 3);
     CHECK(order[1].level == 1); // coarse chunk jumped the fine one
     CHECK(order[2].level == 0);
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0, 0});
+}
+
+TEST_CASE("ChunkCache: invalidation clears unresolved fetch counts")
+{
+    auto f = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 8}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = false;
+    auto c = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    (void)c->tryGetChunk(0, 0, 0, 0);
+    f->waitFirstStarted();
+    (void)c->tryGetChunk(0, 0, 0, 1);
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{2});
+
+    c->invalidate();
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0});
+    f->release();
 }
 
 TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetches")
@@ -686,7 +719,11 @@ TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetche
     f->waitFirstStarted();
     for (int ix = 1; ix < 4; ++ix)
         (void)c->tryGetChunk(0, 0, 0, ix);
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{4});
     c->beginViewRequest(/*discardPending=*/true);
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0});
 
     // Repeated pans while the old fetch is still running must not accumulate
     // executor work outside the ChunkCache entry map.
@@ -696,6 +733,8 @@ TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetche
             (void)c->tryGetChunk(0, 0, 0, ix);
         c->beginViewRequest(/*discardPending=*/true);
     }
+    CHECK(c->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0});
 
     f->release();
     // The new view remains usable. Superseded queued jobs were removed before
