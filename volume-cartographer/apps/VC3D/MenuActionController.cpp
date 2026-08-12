@@ -1255,13 +1255,11 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // The spiral cache budgets live on the manager, not the window, and only the
-    // spiral workspace opts in -- so walk every live manager and let the ones
-    // that opted in re-read them. Byte capacities are adjustable in place, so
-    // this takes effect without reopening the workspace.
+    // Cache budgets are independent per workspace. Re-read them for every live
+    // manager so changes take effect without reopening either workspace.
     for (auto* manager : ViewerManager::allManagers()) {
-        if (manager && manager->surfaceCacheEnabled())
-            manager->applySpiralCacheSettings();
+        if (manager)
+            manager->applyViewerCacheSettings();
     }
 
     dialog->deleteLater();
