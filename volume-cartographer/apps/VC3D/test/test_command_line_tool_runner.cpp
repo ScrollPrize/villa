@@ -39,12 +39,15 @@ bool startHelper(CommandLineToolRunner& runner,
         helperProgram(), helperArguments(mode, outputPath), mode, options);
 }
 
-void expectSingleCompletion(QSignalSpy& finished)
-{
-    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 3000);
-    QTest::qWait(100);
-    QCOMPARE(finished.count(), 1);
-}
+// QTest check macros return from the enclosing function only; as a macro this
+// aborts the calling test slot on failure instead of letting it run on into
+// accessors that index an empty spy.
+#define EXPECT_SINGLE_COMPLETION(finished)                        \
+    do {                                                          \
+        QTRY_COMPARE_WITH_TIMEOUT((finished).count(), 1, 3000);   \
+        QTest::qWait(100);                                        \
+        QCOMPARE((finished).count(), 1);                          \
+    } while (false)
 
 bool completionSucceeded(const QSignalSpy& finished, int index = 0)
 {
@@ -109,7 +112,7 @@ private slots:
         QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
 
         QVERIFY(startHelper(runner, "success"));
-        expectSingleCompletion(finished);
+        EXPECT_SINGLE_COMPLETION(finished);
 
         QVERIFY(completionSucceeded(finished));
         QVERIFY(!runner.isRunning());
@@ -121,7 +124,7 @@ private slots:
         QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
 
         QVERIFY(startHelper(runner, "crash"));
-        expectSingleCompletion(finished);
+        EXPECT_SINGLE_COMPLETION(finished);
 
         QVERIFY(!completionSucceeded(finished));
         QVERIFY(completionMessage(finished).contains("crash", Qt::CaseInsensitive));
@@ -144,7 +147,7 @@ private slots:
         QVERIFY(runner.executeCustomCommand(
             invalidProgram.fileName(), {}, "failed start",
             CommandLineToolRunner::ExecutionOptions::silent()));
-        expectSingleCompletion(finished);
+        EXPECT_SINGLE_COMPLETION(finished);
 
         QVERIFY(!completionSucceeded(finished));
         QVERIFY(completionMessage(finished).contains(
@@ -160,7 +163,7 @@ private slots:
         QVERIFY(startHelper(runner, "wait"));
         QTRY_VERIFY_WITH_TIMEOUT(runner.isRunning(), 1000);
         runner.cancel();
-        expectSingleCompletion(finished);
+        EXPECT_SINGLE_COMPLETION(finished);
 
         QVERIFY(!completionSucceeded(finished));
         QVERIFY(!runner.isRunning());
@@ -182,7 +185,7 @@ private slots:
             "onProcessError",
             Qt::DirectConnection,
             Q_ARG(QProcess::ProcessError, QProcess::ReadError)));
-        expectSingleCompletion(finished);
+        EXPECT_SINGLE_COMPLETION(finished);
 
         QVERIFY(!completionSucceeded(finished));
         QVERIFY(completionMessage(finished).contains(
