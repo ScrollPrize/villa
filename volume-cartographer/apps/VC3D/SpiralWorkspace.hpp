@@ -23,6 +23,7 @@ class AxisAlignedSliceController;
 class CState;
 class ConsoleOutputWidget;
 class QDialog;
+class QComboBox;
 class QKeyEvent;
 class QuadSurface;
 class SpiralPanel;
@@ -30,6 +31,7 @@ class SpiralServiceManager;
 class ViewerManager;
 class ViewerSplitGrid;
 class VolumePkg;
+class Volume;
 class SpiralOverlayController;
 class SpiralBrushController;
 class SegmentationOverlayController;
@@ -43,6 +45,10 @@ public:
     ~SpiralWorkspace() override;
 
     ViewerManager* viewerManager() const { return _viewerManager.get(); }
+    ViewerSplitGrid* viewerGrid() const { return _grid; }
+    QComboBox* volumeSelectionControl() const;
+    void synchronizeVolume(const std::shared_ptr<Volume>& volume,
+                           const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;
@@ -108,8 +114,6 @@ private:
         QStringList warnings;
     };
 
-    void refreshVolumes();
-    void selectVolume(const QString& id);
     QString mapServicePath(const QString& servicePath) const;
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);

@@ -107,35 +107,60 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
     }
 
     setupControls();
-    setViewerManager(viewerManager);
+    setViewerManagers({viewerManager});
 }
 
-void ViewerCompositePanel::setViewerManager(ViewerManager* viewerManager)
+void ViewerCompositePanel::setViewerManagers(
+    const std::vector<ViewerManager*>& viewerManagers)
 {
-    if (_viewerManager == viewerManager) {
+    std::vector<ViewerManager*> unique;
+    for (auto* manager : viewerManagers) {
+        if (manager && std::find(unique.begin(), unique.end(), manager) == unique.end())
+            unique.push_back(manager);
+    }
+    if (_viewerManagers == unique) {
         syncUiFromManager();
         return;
     }
 
-    if (_viewerManager) {
-        disconnect(_viewerManager, nullptr, this, nullptr);
+    for (const auto& connection : _managerConnections)
+        disconnect(connection);
+    _managerConnections.clear();
+    _viewerManagers = std::move(unique);
+    for (auto* manager : _viewerManagers) {
+        _managerConnections.push_back(connect(
+            manager, &ViewerManager::baseViewerCreated,
+            this, &ViewerCompositePanel::applyInitialSettingsToViewer));
     }
-    _viewerManager = viewerManager;
-    if (_viewerManager) {
-        connect(_viewerManager, &ViewerManager::baseViewerCreated,
-                this, &ViewerCompositePanel::applyInitialSettingsToViewer);
+
+    // The first manager supplies the canonical complete settings. Copy them by
+    // viewer role so fields not represented by today's controls remain intact.
+    if (!_viewerManagers.empty()) {
+        for (auto* source : _viewerManagers.front()->baseViewers()) {
+            if (!source) continue;
+            const auto settings = source->compositeRenderSettings();
+            for (std::size_t i = 1; i < _viewerManagers.size(); ++i) {
+                _viewerManagers[i]->forEachBaseViewer(
+                    [source, &settings](VolumeViewerBase* target) {
+                        if (target && target->surfName() == source->surfName())
+                            target->setCompositeRenderSettings(settings);
+                    });
+            }
+        }
     }
     syncUiFromManager();
 }
 
 void ViewerCompositePanel::toggleSegmentationComposite()
 {
-    applyToSegmentationViewer([this](VolumeViewerBase* viewer) {
+    const bool enabled = !(_uiRefs.compositeEnabled &&
+                           _uiRefs.compositeEnabled->isChecked());
+    applyToSegmentationViewer([enabled](VolumeViewerBase* viewer) {
         auto s = viewer->compositeRenderSettings();
-        s.enabled = !s.enabled;
+        s.enabled = enabled;
         viewer->setCompositeRenderSettings(s);
-        setSegmentationCompositeChecked(s.enabled);
     });
+    setSegmentationCompositeChecked(enabled);
 }
 
 void ViewerCompositePanel::setSegmentationCompositeChecked(bool checked)
@@ -300,7 +325,19 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
         return;
     }
     auto s = viewer->compositeRenderSettings();
-    s.params.method = compositeMethodForModeIndex(_uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0);
+    bool foundCanonical = false;
+    for (auto* manager : _viewerManagers) {
+        for (auto* existing : manager->baseViewers()) {
+            if (existing && existing != viewer && existing->surfName() == viewer->surfName()) {
+                s = existing->compositeRenderSettings();
+                foundCanonical = true;
+                break;
+            }
+        }
+        if (foundCanonical) break;
+    }
+    s.params.method = compositeMethodForModeIndex(
+        _uiRefs.compositeMode ? _uiRefs.compositeMode->currentIndex() : 0);
     viewer->setCompositeRenderSettings(s);
     if (viewer->surfName() == "segmentation") {
         setSegmentationCompositeChecked(s.enabled);
@@ -309,13 +346,13 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
 
 void ViewerCompositePanel::syncUiFromManager()
 {
-    if (!_viewerManager) {
+    if (_viewerManagers.empty()) {
         return;
     }
 
     VolumeViewerBase* segmentationViewer = nullptr;
     VolumeViewerBase* firstPlaneViewer = nullptr;
-    for (auto* viewer : _viewerManager->baseViewers()) {
+    for (auto* viewer : _viewerManagers.front()->baseViewers()) {
         if (!viewer) {
             continue;
         }
@@ -406,27 +443,23 @@ void ViewerCompositePanel::updateCompositeParamsVisibility()
 
 void ViewerCompositePanel::applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply)
 {
-    if (!_viewerManager || !apply) {
+    if (_viewerManagers.empty() || !apply) {
         return;
     }
-    for (auto* viewer : _viewerManager->baseViewers()) {
-        if (viewer && viewer->surfName() == "segmentation") {
-            apply(viewer);
-            return;
-        }
-    }
+    for (auto* manager : _viewerManagers)
+        for (auto* viewer : manager->baseViewers())
+            if (viewer && viewer->surfName() == "segmentation") apply(viewer);
 }
 
 void ViewerCompositePanel::applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply)
 {
-    if (!_viewerManager || !apply) {
+    if (_viewerManagers.empty() || !apply) {
         return;
     }
-    _viewerManager->forEachBaseViewer([&apply](VolumeViewerBase* viewer) {
-        if (viewer) {
-            apply(viewer);
-        }
-    });
+    for (auto* manager : _viewerManagers)
+        manager->forEachBaseViewer([&apply](VolumeViewerBase* viewer) {
+            if (viewer) apply(viewer);
+        });
 }
 
 void ViewerCompositePanel::applyToPlaneViewers(const std::function<void(VolumeViewerBase*)>& apply)

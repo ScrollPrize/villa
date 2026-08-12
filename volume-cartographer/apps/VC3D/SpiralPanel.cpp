@@ -1183,8 +1183,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _service->removeEphemeralInput(item->data(Qt::UserRole).toString(),
                                        item->data(Qt::UserRole + 1).toString());
     });
-    connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
     for (QSpinBox* spin : {_zBegin, _zEnd, _legacyCheckpointStep,
                            _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
@@ -1465,11 +1463,6 @@ void SpiralPanel::addPclItem(const QString& path, const QString& role, bool requ
     item->setData(Qt::UserRole + 1, role);
     item->setData(Qt::UserRole + 2, required);
     item->setToolTip(path);
-}
-
-void SpiralPanel::setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId)
-{
-    _volumeSelector->setVolumes(volumes, selectedId);
 }
 
 void SpiralPanel::setLossMapOptions(const QStringList& names)
