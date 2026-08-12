@@ -228,6 +228,24 @@ TEST_CASE("generated display tangent sign is independent of stored point order")
     CHECK(generatedDisplayTangentSign({axialPoints.rbegin(), axialPoints.rend()},
                                       {axialNormals.rbegin(), axialNormals.rend()}) == -1.0f);
 
+    // Sparse valid normals must still decide a circumferential fiber: the
+    // primary tie band scales with the pairs that voted, not the tangent
+    // count, or a fiber long enough that 1e-3 * tangentCount exceeds the few
+    // normal votes would fall through to the useless z fallback and stay
+    // order-dependent.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> longCirclePoints;
+    for (int i = 0; i < 2048; ++i) {
+        const float angle = static_cast<float>(i) * 3.0e-3f;
+        const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+        longCirclePoints.push_back(radial * 4000.0f + cv::Vec3f{5000.0f, 5000.0f, 3000.0f});
+    }
+    std::vector<cv::Vec3f> sparseNormals(longCirclePoints.size(), cv::Vec3f{nan, nan, nan});
+    sparseNormals[1024] = cv::Vec3f{std::cos(1024 * 3.0e-3f), std::sin(1024 * 3.0e-3f), 0.0f};
+    CHECK(generatedDisplayTangentSign(longCirclePoints, sparseNormals) == 1.0f);
+    CHECK(generatedDisplayTangentSign({longCirclePoints.rbegin(), longCirclePoints.rend()},
+                                      {sparseNormals.rbegin(), sparseNormals.rend()}) == -1.0f);
+
     // Degenerate inputs are decided as +1 rather than left arbitrary: no
     // normals to vote with, and a z = const line has nothing to fall back on.
     CHECK(generatedDisplayTangentSign({}, {}) == 1.0f);

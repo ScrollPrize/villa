@@ -471,7 +471,8 @@ inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoint
     const bool haveNormals = lineNormals.size() == linePoints.size();
     double primary = 0.0;
     double fallback = 0.0;
-    size_t validCount = 0;
+    size_t tangentCount = 0;
+    size_t normalPairCount = 0;
     for (size_t i = 0; i < linePoints.size(); ++i) {
         cv::Vec3f tangent;
         if (i == 0) {
@@ -485,7 +486,7 @@ inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoint
         if (!finiteGeneratedPoint(tangent)) {
             continue;
         }
-        ++validCount;
+        ++tangentCount;
         fallback += static_cast<double>(tangent[2]);
         if (!haveNormals) {
             continue;
@@ -494,15 +495,21 @@ inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoint
         if (!finiteGeneratedPoint(normal)) {
             continue;
         }
+        ++normalPairCount;
         primary += static_cast<double>(normal.cross(tangent)[2]);
     }
-    // Scale the tie band with the number of contributing points so rounding
-    // noise on a long near-axial fiber cannot masquerade as a decision.
-    const double tie = std::max(1.0e-3, 1.0e-3 * static_cast<double>(validCount));
-    if (std::abs(primary) > tie) {
+    // Scale each tie band with the number of points that actually voted, so
+    // rounding noise on a long near-axial fiber cannot masquerade as a
+    // decision -- and so sparse valid normals on a long fiber are not drowned
+    // out by a threshold sized to the tangent count.
+    const double primaryTie =
+        std::max(1.0e-3, 1.0e-3 * static_cast<double>(normalPairCount));
+    if (std::abs(primary) > primaryTie) {
         return primary > 0.0 ? 1.0f : -1.0f;
     }
-    if (std::abs(fallback) > tie) {
+    const double fallbackTie =
+        std::max(1.0e-3, 1.0e-3 * static_cast<double>(tangentCount));
+    if (std::abs(fallback) > fallbackTie) {
         return fallback > 0.0 ? 1.0f : -1.0f;
     }
     return 1.0f;
