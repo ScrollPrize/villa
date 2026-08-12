@@ -25,7 +25,6 @@ from vesuvius.ink_detection.training.dilation import (
     resolve_dilation_distances,
 )
 from vesuvius.ink_detection.training.optimizers import (
-    OptimizerParamGroupTarget,
     create_training_optimizer,
     plan_optimizer_target,
 )
@@ -73,8 +72,8 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
 
     target = plan_optimizer_target(model, config)
 
-    assert isinstance(target, OptimizerParamGroupTarget)
-    groups = target.parameters()
+    assert isinstance(target, list)
+    groups = target
     assert [id(value) for value in groups[0]["params"]] == [
         id(model.decoder.weight)
     ]
@@ -82,6 +81,14 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
         id(model.shared_encoder.weight)
     ]
     assert groups[1]["lr"] == 0.0025
+    optimizer = create_training_optimizer(model, config)
+    assert [id(value) for value in optimizer.param_groups[0]["params"]] == [
+        id(model.decoder.weight)
+    ]
+    assert [id(value) for value in optimizer.param_groups[1]["params"]] == [
+        id(model.shared_encoder.weight)
+    ]
+    assert [group["lr"] for group in optimizer.param_groups] == [0.01, 0.0025]
 
     frozen_mapping = _training_mapping()
     frozen_mapping["model_config"]["pretrained_backbone"] = "/weights.pth"
@@ -90,7 +97,7 @@ def test_optimizer_group_freeze_and_multiplier_order_are_literal():
     frozen = plan_optimizer_target(
         frozen_model, _training_config(frozen_mapping)
     )
-    assert [id(value) for value in frozen.parameters()[0]["params"]] == [
+    assert [id(value) for value in frozen[0]["params"]] == [
         id(frozen_model.decoder.weight)
     ]
     assert frozen_model.shared_encoder.weight.requires_grad is False

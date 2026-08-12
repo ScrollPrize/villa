@@ -7,19 +7,9 @@ from torch import nn
 from vesuvius.ink_detection.config import TrainingConfig
 
 
-class OptimizerParamGroupTarget:
-    """Expose an authored parameter-group list through parameters()."""
-
-    def __init__(self, param_groups: list[dict]) -> None:
-        self._param_groups = param_groups
-
-    def parameters(self) -> list[dict]:
-        return self._param_groups
-
-
 def plan_optimizer_target(
     model: nn.Module, config: TrainingConfig
-) -> nn.Module | OptimizerParamGroupTarget:
+) -> nn.Module | list[dict]:
     """Freeze or separately scale a configured pretrained shared encoder."""
 
     if config.ink.model.pretrained_backbone is None:
@@ -58,7 +48,7 @@ def plan_optimizer_target(
         raise ValueError(
             "No trainable parameters remain after applying freeze_encoder"
         )
-    return OptimizerParamGroupTarget(param_groups)
+    return param_groups
 
 
 def create_training_optimizer(model: nn.Module, config: TrainingConfig):
