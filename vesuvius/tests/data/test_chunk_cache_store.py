@@ -99,6 +99,17 @@ def _read(store, key: str):
     return asyncio.run(exercise())
 
 
+def _probe(store, key: str) -> bool:
+    """Existence-check one key through the store, without reading it."""
+    if not ZARR_V3:
+        return key in store
+
+    async def exercise():
+        return await store.exists(key)
+
+    return asyncio.run(exercise())
+
+
 def _cached_bytes(root) -> int:
     """Total size of the non-temp files under a cache root."""
     total = 0
@@ -282,6 +293,57 @@ def test_hit_refreshes_recency(tmp_path):
     assert not _cached_path(store, keys[1]).exists()
     assert _cached_path(store, keys[0]).exists()
     assert _cached_path(store, keys[2]).exists()
+
+
+def test_existence_probe_refreshes_recency(tmp_path):
+    # An existence check served from disk is a cache hit too: it skips the
+    # remote round-trip, so it must count as use.
+    payload = b"e" * 100
+    keys = [_chunk_key(i) for i in range(3)]
+    store = DiskCacheStore(
+        _remote_with({key: payload for key in keys}),
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=250,
+    )
+
+    stamp = time.time() - 1000.0
+    assert _read(store, keys[0]) == payload
+    os.utime(_cached_path(store, keys[0]), (stamp, stamp))
+    assert _read(store, keys[1]) == payload
+    os.utime(_cached_path(store, keys[1]), (stamp + 1, stamp + 1))
+
+    assert _probe(store, keys[0]) is True
+
+    # This write pushes the cache over the cap and evicts exactly one chunk.
+    assert _read(store, keys[2]) == payload
+
+    assert not _cached_path(store, keys[1]).exists()
+    assert _cached_path(store, keys[0]).exists()
+
+
+def test_v2_contains_refreshes_recency(tmp_path):
+    payload = b"c" * 100
+    keys = [f"0.0.{i}" for i in range(3)]
+    store = DiskCacheStoreV2(
+        {key: payload for key in keys},
+        str(tmp_path),
+        url="memory://dataset",
+        max_bytes=250,
+    )
+
+    stamp = time.time() - 1000.0
+    assert store[keys[0]] == payload
+    os.utime(_cached_path(store, keys[0]), (stamp, stamp))
+    assert store[keys[1]] == payload
+    os.utime(_cached_path(store, keys[1]), (stamp + 1, stamp + 1))
+
+    assert keys[0] in store
+
+    assert store[keys[2]] == payload  # write, crossing the cap
+
+    assert not _cached_path(store, keys[1]).exists()
+    assert _cached_path(store, keys[0]).exists()
 
 
 def test_eviction_skips_temp_files(tmp_path):
