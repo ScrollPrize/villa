@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,17 @@ def test_public_api_exports() -> None:
     assert hasattr(vesuvius, "utils")
     assert hasattr(vesuvius, "models")
     assert hasattr(vesuvius, "install")
+
+
+def test_list_files_imports_without_async_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "aiohttp", None)
+    monkeypatch.setitem(sys.modules, "nest_asyncio", None)
+
+    importlib.reload(catalog)
+
+    assert isinstance(catalog.list_files(), dict)
 
 
 def test_data_paths_lazy_exports() -> None:

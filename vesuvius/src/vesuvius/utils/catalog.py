@@ -7,8 +7,6 @@ import ssl
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import aiohttp
-import nest_asyncio
 import requests
 import yaml
 
@@ -31,6 +29,8 @@ async def scrape_website(
 ) -> Tuple[CatalogTree, CatalogListing]:
     """Collect directory metadata and Zarr links from a remote listing."""
 
+    import aiohttp
+
     from vesuvius.data.paths import parser
 
     ssl_context = ssl.create_default_context()
@@ -50,6 +50,8 @@ async def scrape_website(
 
 async def collect_subfolders(base_url: str, ignore_list: List[str]) -> List[str]:
     """Return subfolder paths beneath ``base_url`` ignoring provided patterns."""
+
+    import aiohttp
 
     from vesuvius.data.paths import parser
 
@@ -91,6 +93,8 @@ def update_list(
 
     loop = _ensure_loop()
     if loop.is_running():
+        import nest_asyncio
+
         nest_asyncio.apply()
 
     tree, zarr_files = loop.run_until_complete(scrape_website(base_url, ignore_list))
