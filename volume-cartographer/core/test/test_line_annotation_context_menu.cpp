@@ -144,5 +144,20 @@ int main(int argc, char** argv)
     QApplication::sendEvent(view.viewport(), &leaveEvent);
     require(leaveSpy.count() == 1, "Leave event did not emit mouse-left-view signal");
 
+    const int contextBeforeErase = contextSpy.count();
+    const int pressBeforeErase = pressSpy.count();
+    const int releaseBeforeErase = releaseSpy.count();
+    QTest::mousePress(view.viewport(), Qt::RightButton,
+                      Qt::ControlModifier | Qt::ShiftModifier, pos);
+    QTest::mouseMove(view.viewport(), pos + QPoint(5, 2),
+                     Qt::ControlModifier | Qt::ShiftModifier);
+    QTest::mouseRelease(view.viewport(), Qt::RightButton,
+                        Qt::ControlModifier | Qt::ShiftModifier,
+                        pos + QPoint(5, 2));
+    require(contextSpy.count() == contextBeforeErase &&
+                pressSpy.count() == pressBeforeErase + 1 &&
+                releaseSpy.count() == releaseBeforeErase + 1,
+            "Ctrl+Shift+Right should be forwarded to tools instead of opening the action menu");
+
     return 0;
 }
