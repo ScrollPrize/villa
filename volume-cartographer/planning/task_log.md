@@ -56,3 +56,28 @@
 - Direct test runs passed 42 `test_chunk_cache` cases and 12
   `test_chunked_plane_sampler` cases before the final CTest run.
 - `git diff --check` passed.
+
+## Synthetic render gate
+
+- Merged `origin/main` at `5b2ca4ff3`, which contains the synthetic rendering
+  harness, and configured its documented GCC 15 Release build with native
+  architecture tuning disabled.
+- Native fixture and no-site harness checks passed: 2/2.
+- Full Valgrind/DRD replay gate passed all eight cases against the frozen main
+  reference (maximum allowed ratio `1.10x`):
+
+  | Fixture | Scenario | Modeled ns | Ratio |
+  | --- | --- | ---: | ---: |
+  | serial | full_res | 332507.608 | 1.015x |
+  | serial | fallback_3 | 892944.275 | 1.032x |
+  | serial | mixed_correlated | 620216.920 | 1.020x |
+  | serial | mixed_shuffled | 926286.997 | 1.022x |
+  | parallel | full_res | 870894.808 | 0.964x |
+  | parallel | fallback_3 | 2644150.191 | 1.036x |
+  | parallel | mixed_correlated | 1877335.942 | 1.049x |
+  | parallel | mixed_shuffled | 7298099.253 | 1.057x |
+
+- The gate exercises the production `ChunkedPlaneSampler` fine-to-coarse path.
+  VC3D logs `prepass_ms`, retained occurrence count, and unique chunk count for
+  interactive profiling; the headless gate does not construct a GUI viewer and
+  therefore does not assign a standalone wall-time claim to the viewer pre-pass.

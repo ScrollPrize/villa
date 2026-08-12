@@ -19,30 +19,16 @@ from sample_spiral import (
 from spiral_helpers import _huber_abs
 
 
-cfg = None
-z_begin = None
-z_end = None
-
-
-def configure_losses(config, z_begin_value, z_end_value):
-    global cfg, z_begin, z_end
-    cfg = config
-    z_begin = z_begin_value
-    z_end = z_end_value
-    if cfg['patch_strip_sampling'] == 'dijkstra':
-        strip_path_pools.warm_workers()
-
-
 def _masked_mean(values, mask):
     mask_f = mask.to(values.dtype)
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
-def _pcl_sampling_group_weight(group):
+def _pcl_sampling_group_weight(group, cfg):
     # Look up the per-step sampling weight of a sampling group in
     # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
     # .json suffix stripped, so the source json stem (e.g. 'relative_windings') or the
-    # fiber tag ('fibers:H' / 'fibers:V'). When the dict is in use every group must
+    # single 'fibers' group. When the dict is in use every group must
     # have an explicit key, so a missing one is an error rather than a silent default.
     key = os.path.splitext(os.path.basename(str(group)))[0]
     try:
@@ -54,47 +40,77 @@ def _pcl_sampling_group_weight(group):
         )
 
 
-def build_pcl_sampling_strata(sampling_groups):
+def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
-    # member's sampling group (source json file; fibers split into fibers:H /
-    # fibers:V). Members whose group is None are ineligible and excluded. When
+    # member's sampling group (source json file; all fibers share one 'fibers'
+    # group). Members whose group is None are ineligible and excluded. When
     # cfg['pcl_sampling_weights'] is a dict, every group must have an explicit weight
     # and groups with weight <= 0 are switched off (dropped from the pool entirely).
     # Otherwise all groups stay eligible; the legacy stratified_pcl_sampling flag
     # controls whether selection uses equal strata or the combined pool.
+    # member_weights (parallel to sampling_groups) sets each member's relative draw
+    # probability within its stratum (and within the combined pool); used to give a
+    # fiber-link component the sampling pressure of its member count rather than a
+    # single strip's. None means uniform.
     # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
-    # per stratum], 'weights': float weight per stratum, 'all': all eligible indices}.
+    # per stratum], 'weights': float weight per stratum, 'member_probs': [per-stratum
+    # draw probabilities or None], 'all': all eligible indices, 'all_probs': draw
+    # probabilities over 'all' or None, 'effective_size': eligible member count
+    # after expanding component multiplicities}.
+    sampling_groups = list(sampling_groups)
+    if member_weights is not None:
+        member_weights = np.asarray(list(member_weights), dtype=np.float64)
+        assert len(member_weights) == len(sampling_groups)
     group_to_indices = {}
     for idx, group in enumerate(sampling_groups):
         if group is None:
             continue
         group_to_indices.setdefault(group, []).append(idx)
     weighted = cfg['pcl_sampling_weights'] is not None
-    strata, groups, weights = [], [], []
+    strata, groups, weights, member_probs = [], [], [], []
     for group, indices in group_to_indices.items():
-        weight = _pcl_sampling_group_weight(group) if weighted else 1.0
+        weight = _pcl_sampling_group_weight(group, cfg) if weighted else 1.0
         if weighted and weight <= 0:
             continue  # switched off
-        strata.append(np.asarray(indices, dtype=np.int64))
+        indices = np.asarray(indices, dtype=np.int64)
+        strata.append(indices)
         groups.append(group)
         weights.append(weight)
+        if member_weights is None:
+            member_probs.append(None)
+        else:
+            w = member_weights[indices]
+            member_probs.append(w / w.sum())
     all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
+    all_probs = None
+    if member_weights is not None and len(all_indices):
+        w = member_weights[all_indices]
+        all_probs = w / w.sum()
+        effective_size = int(round(w.sum()))
+    else:
+        effective_size = len(all_indices)
     return {
         'strata': strata,
         'groups': groups,
         'weights': np.asarray(weights, dtype=np.float64),
+        'member_probs': member_probs,
         'all': all_indices,
+        'all_probs': all_probs,
+        'effective_size': effective_size,
     }
 
 
-def _choose_pcl_indices(sampling_strata, num_to_sample):
+def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
     # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
     # Explicit weights allocate draws proportionally. Without them, the legacy
     # stratified_pcl_sampling switch selects equal group shares or uniform sampling
-    # over the combined pool.
+    # over the combined pool. Per-member weights (member_probs / all_probs), when
+    # the bundle carries them, skew the within-pool draws.
     weighted = cfg['pcl_sampling_weights'] is not None
     if not weighted and not cfg['pcl_stratified_pcl_sampling']:
-        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
+        return np.random.choice(sampling_strata['all'], num_to_sample,
+                                replace=num_to_sample > len(sampling_strata['all']),
+                                p=sampling_strata['all_probs'])
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
         len(strata), dtype=np.float64)
@@ -106,15 +122,15 @@ def _choose_pcl_indices(sampling_strata, num_to_sample):
         probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
         quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
     chosen = [
-        np.random.choice(stratum, quota, replace=quota > len(stratum))
-        for stratum, quota in zip(strata, quotas)
+        np.random.choice(stratum, quota, replace=quota > len(stratum), p=probs)
+        for stratum, quota, probs in zip(strata, quotas, sampling_strata['member_probs'])
         if quota > 0
     ]
     return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
 
 
 
-def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
+def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx, *, cfg, z_begin, z_end):
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if shell_map is None or outer_winding_idx is None:
@@ -279,7 +295,7 @@ def _masked_all_pairs_l1(p1, p2, mask1, mask2, expected_diff):
 
 
 
-def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
+def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg):
     # CPU part of the patch-strip sampler: for each patch, one row strip and
     # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
     # the prefetch worker for the next step while the GPU works on this one.
@@ -356,7 +372,7 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
 
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
-                        num_points_per_direction, patch_atlas=None):
+                        num_points_per_direction, cfg, patch_atlas=None):
     # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,),
     # slice_zyxs_gpu (2,N,P,3)). The atlas is host-resident and the ijs are
     # born on the CPU, so the bilinear gather runs here at batch-build time
@@ -379,7 +395,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             ))
         else:
             ijs_np = _build_patch_ijs(
-                patches, patch_indices, num_points_per_direction, rng)
+                patches, patch_indices, num_points_per_direction, rng, cfg)
         ijs_cpu = torch.from_numpy(ijs_np)
         idx_cpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64))
@@ -560,7 +576,7 @@ def _patch_radius_and_dt_losses(
 
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None, *, cfg):
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
@@ -583,7 +599,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         batch = _sample_patch_batch(
             'verified_patches', patches, patch_sampling_probabilities,
             num_patches_to_sample, cfg['sample_count_points_per_patch'] // 2,
-            patch_atlas)
+            cfg, patch_atlas)
 
         (
             sample_ijs,
@@ -648,7 +664,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
 
 
-def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
+def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None, *, cfg):
     # Radius + DT losses for the untrusted 'unverified' patch set. Same machinery as the
     # verified patches (shared _sample_patch_tracks + _patch_radius_and_dt_losses) but with the
     # independent unverified_* hyperparameters and no umbilicus/shell extras. These patches are
@@ -658,7 +674,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
     batch = _sample_patch_batch(
         'unverified_patches', patches, patch_sampling_probabilities,
         num_patches_to_sample, cfg['sample_count_unverified_points_per_patch'] // 2,
-        patch_atlas)
+        cfg, patch_atlas)
 
     (
         sample_ijs,
@@ -762,7 +778,7 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
 
 
 
-def _sample_l_shapes_at_ij(patch, i, j, num_points):
+def _sample_l_shapes_at_ij(patch, i, j, num_points, cfg):
     # Sample 4 strips anchored on the annotated point (i, j) of `patch`, one per cardinal
     # primary direction. In 'dijkstra' mode these are geodesic strips to distant endpoints
     # (one per cardinal cone; see _sample_dijkstra_strips_at_ij); otherwise L-shapes, one per
@@ -794,7 +810,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points):
+def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points, cfg):
     """Sample four L-shapes for each ``(patch_id, i, j)`` request."""
     if not requests:
         return []
@@ -803,7 +819,7 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points):
         native_atlas = None
     if native_atlas is None:
         return [
-            _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points)
+            _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points, cfg)
             for pid, i, j in requests
         ]
     patch_indices = np.fromiter(
@@ -846,7 +862,7 @@ def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_windin
         return chain_adjustments[:, -1]
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata):
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata, *, cfg, z_begin, z_end):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -860,9 +876,9 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # crossings along the whole strip (the corner only introduces a ~sqrt(2)-quad ij
     # jump). We then pool all 4 L-strips per annotated point into one set of sample
     # points and take a single all-pairs diff between p1's and p2's pooled sets,
-    # regressing it onto winding_diff * dr_per_winding. If the selected PCL
-    # points (adjacent mode) or the PCL chain between them (non-adjacent mode)
-    # crosses theta=0, adjust the expected delta by that branch-cut jump.
+    # regressing it onto winding_diff * dr_per_winding. If the PCL chain between
+    # the selected points crosses theta=0, adjust the expected delta by that
+    # branch-cut jump.
 
     num_points_per_strip = cfg['sample_count_points_per_patch'] // 2
     num_strips_per_pcl = 4
@@ -876,20 +892,23 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # sampling_strata indexes into point_collections and already excludes single-point
     # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
     # pair; see the build_pcl_sampling_strata call in fit_spiral.main.
-    num_pcls_per_step = min(cfg['sample_count_relative_winding_pcls'], len(sampling_strata['all']))
+    num_pcls_per_step = min(
+        cfg['sample_count_relative_winding_pcls'],
+        sampling_strata['effective_size'],
+    )
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
-    selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step)
+    selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step, cfg)
     selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
-        sorted_pcl_points = None
-        sorted_pcl_point_idx = None
-        if not cfg['pcl_rel_winding_adjacent_patches_only']:
-            sorted_pcl_points = [
-                point for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-            ]
-            sorted_pcl_point_idx = {id(point): idx for idx, point in enumerate(sorted_pcl_points)}
+        # Uniform chain interface (spiral_helpers.Chain): id-sorted order for
+        # ordinary pcls, the fiber-graph route (hopping fibers at junctions)
+        # for merged fiber-link components -- whose id-sorted order is NOT
+        # chain-valid across members. The full chain is used even in
+        # adjacent-patches mode, since adjacent patches may sit far apart along
+        # the pcl (or on different fibers).
+        chain = pcl['chain']
 
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
@@ -916,15 +935,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            if cfg['pcl_rel_winding_adjacent_patches_only']:
-                pcl_chain = [p1, p2]
-            else:
-                idx1, idx2 = sorted_pcl_point_idx[id(p1)], sorted_pcl_point_idx[id(p2)]
-                if idx1 <= idx2:
-                    pcl_chain = sorted_pcl_points[idx1:idx2 + 1]
-                else:
-                    pcl_chain = list(reversed(sorted_pcl_points[idx2:idx1 + 1]))
-            pcl_chain_zyxs = np.stack([point['zyx'] for point in pcl_chain], axis=0).astype(np.float32)
+            pcl_chain_zyxs = chain.zyxs_between(p1, p2)
             pair_requests.append((
                 (pid1, i1, j1), (pid2, i2, j2),
                 pid1, pid2, winding_diff, pcl_chain_zyxs,
@@ -935,6 +946,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         patch_atlas,
         [request for pair in pair_requests for request in pair[:2]],
         num_points_per_strip,
+        cfg,
     )
     for pair_index, pair in enumerate(pair_requests):
         ls1 = sampled_l_shapes[2 * pair_index]
@@ -1024,7 +1036,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
 
 
-def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
+def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, *, cfg, z_begin, z_end):
     # For PCL points carrying an absolute winding annotation (only pcls flagged
     # metadata.winding_is_absolute), pin the spiral shifted-radius at each annotated
     # point to its absolute target, winding_annotation * dr_per_winding (the spiral has
@@ -1069,6 +1081,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         patch_atlas,
         [entry[0] for entry in strip_requests],
         num_points_per_strip,
+        cfg,
     )
     for entry, ls in zip(strip_requests, sampled_l_shapes):
         if ls is not None:
@@ -1188,7 +1201,7 @@ def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spi
 
 
 
-def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
+def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points, z_begin, z_end):
     # Sample points from discrete spiral windings embedded in spiral yx (over the z-ROI) and return
     # each point's orthonormal in-surface frame in spiral space: e1 = z-axis, e2 = the winding tangent.
     # Winding indices are sampled with probability proportional to their approximate circumference,
@@ -1213,7 +1226,7 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
 
 
 
-def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True):
+def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True, *, cfg, z_begin, z_end):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
@@ -1364,10 +1377,53 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
 
 
 
+def _sample_component_walk(members, edges, strip_lengths, branch_probability):
+    """Sample a chain walk through a link component.
+
+    members are the component's strip indices; edges its junctions as
+    (strip_a, pos_a, strip_b, pos_b); strip_lengths maps strip index -> point
+    count. Starting from a random member end, walk along the strip; at each
+    junction passed, hop onto the linked strip (at its junction position, in a
+    random direction) with branch_probability, never revisiting a strip.
+    Returns ordered segments [(strip, pos_from, pos_to)] (inclusive, pos_from >
+    pos_to when walking backwards); consecutive segments meet at a junction,
+    whose two nearly-coincident endpoints appear as consecutive walk points, so
+    the sequential theta=0 unwrap treats the hop like any other step."""
+    junctions = {s: [] for s in members}
+    for strip_a, pos_a, strip_b, pos_b in edges:
+        junctions[strip_a].append((pos_a, strip_b, pos_b))
+        junctions[strip_b].append((pos_b, strip_a, pos_a))
+    strip = members[np.random.randint(len(members))]
+    direction = 1 if np.random.rand() < 0.5 else -1
+    pos = 0 if direction == 1 else strip_lengths[strip] - 1
+    visited = {strip}
+    segments = []
+    while True:
+        ahead = [(p, other, other_pos) for p, other, other_pos in junctions[strip]
+                 if other not in visited
+                 and (p >= pos if direction == 1 else p <= pos)]
+        ahead.sort(key=lambda t: t[0], reverse=direction == -1)
+        hopped = False
+        for p, other, other_pos in ahead:
+            if np.random.rand() < branch_probability:
+                segments.append((strip, pos, p))
+                visited.add(other)
+                strip, pos = other, other_pos
+                direction = 1 if np.random.rand() < 0.5 else -1
+                hopped = True
+                break
+        if not hopped:
+            end = strip_lengths[strip] - 1 if direction == 1 else 0
+            segments.append((strip, pos, end))
+            return segments
+
+
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
     pcl_strips,
+    component_strip_lists,
+    component_edges,
     sampling_strata,
     get_or_build_unattached_pcl_flat,
     num_pcls_per_step,
@@ -1375,6 +1431,8 @@ def get_unattached_pcl_strip_losses(
     compute_dt,
     dt_max_winding=None,
     dt_target_cache=None,
+    *,
+    cfg,
 ):
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
     # assumed to be locally dense enough that adjacent samples have |dtheta| < pi
@@ -1386,29 +1444,66 @@ def get_unattached_pcl_strip_losses(
     # when dt_target_cache is given, the cached whole-strip quantile target from
     # dt_targets.py, transferred into this sample's unwrap frame through the cached
     # point nearest a sampled point by within-strip index).
+    #
+    # Graph awareness (cross-fiber links): sampling_strata indexes *components* --
+    # groups of strips joined by same-winding links (component_strip_lists gives
+    # each component's member strip indices, component_edges its junctions as
+    # (strip_a, pos_a, strip_b, pos_b)). Each chosen component contributes one row
+    # sampled along a chain *walk* through its strips (_sample_component_walk):
+    # along a strip, hopping to the linked strip at a junction with
+    # cfg['loss_fiber_link_branch_probability'], so a junction hop is an ordinary
+    # |dtheta| < pi step and the sequential unwrap stitches theta=0 crossings
+    # through it like any other. The constant-shifted-radius target (1) along the
+    # walk then pulls points on either side of every traversed junction onto one
+    # shared winding; over steps, random walks cover all of a component's
+    # junctions. Rows mix strips, so the DT snap (2) passes per-point strip
+    # indices to the cache lookup. A singleton component reduces exactly to the
+    # legacy per-strip row.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if not pcl_strips:
         return zero, zero
 
-    num_to_sample = min(num_pcls_per_step, len(sampling_strata['all']))
+    num_to_sample = min(num_pcls_per_step, sampling_strata['effective_size'])
     if num_to_sample <= 0:
         return zero, zero
-    chosen = _choose_pcl_indices(sampling_strata, num_to_sample)
+    chosen_comps = _choose_pcl_indices(sampling_strata, num_to_sample, cfg)
 
     flat = get_or_build_unattached_pcl_flat(pcl_strips, device)
     if flat is None or flat['total'] == 0:
         return zero, zero
 
+    branch_probability = cfg['loss_fiber_link_branch_probability']
+    num_rows = len(chosen_comps)
     starts_cpu = flat['starts_cpu'].numpy()
-    sampled_local_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
-    sampled_flat_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
-    for k, pcl_idx in enumerate(chosen):
-        strip = pcl_strips[pcl_idx]
-        N = len(strip['zyxs'])
-        coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
-        sampled_local_indices[k] = coords
-        sampled_flat_indices[k] = starts_cpu[pcl_idx] + coords
+    sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    for k, comp_idx in enumerate(chosen_comps):
+        members = component_strip_lists[comp_idx]
+        edges = component_edges[comp_idx]
+        if len(members) == 1 or not edges:
+            strip_idx = members[np.random.randint(len(members))]
+            segments = [(strip_idx, 0, len(pcl_strips[strip_idx]['zyxs']) - 1)]
+        else:
+            segments = _sample_component_walk(
+                members, edges,
+                {s: len(pcl_strips[s]['zyxs']) for s in members},
+                branch_probability,
+            )
+        walk_strips = np.concatenate([
+            np.full(abs(pos_to - pos_from) + 1, strip_idx, dtype=np.int64)
+            for strip_idx, pos_from, pos_to in segments])
+        walk_locals = np.concatenate([
+            np.arange(pos_from, pos_to + 1, dtype=np.int64) if pos_from <= pos_to
+            else np.arange(pos_from, pos_to - 1, -1, dtype=np.int64)
+            for strip_idx, pos_from, pos_to in segments])
+        walk_len = len(walk_locals)
+        picks = np.sort(np.random.choice(
+            walk_len, num_points_per_pcl, replace=num_points_per_pcl > walk_len))
+        sampled_strip_indices[k] = walk_strips[picks]
+        sampled_local_indices[k] = walk_locals[picks]
+        sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
@@ -1450,9 +1545,13 @@ def get_unattached_pcl_strip_losses(
     if not compute_dt:
         return radius_loss, zero
 
+    # Per-point strip indices: a walk row can span several strips, each with its
+    # own cache entry; the snap anchors the row on its best valid (point, cache)
+    # pair and takes that strip's cached target (the component is same-winding, so
+    # any member's target names the same winding).
     target_normalised = strip_dt_target_in_sample_frame(
         normalised_radii, sampled_local_indices, theta, crossing_adjustments,
-        dr_per_winding, dt_target_cache, chosen,
+        dr_per_winding, dt_target_cache, sampled_strip_indices,
     )
     target_shifted = target_normalised + winding_t * dr_per_winding
     target_radii = radius_from_unwrapped_shifted(
@@ -1485,7 +1584,7 @@ def get_unattached_pcl_strip_losses(
 
 
 
-def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=None):
+def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=None, *, cfg, z_begin, z_end):
     # In-surface symmetric Dirichlet energy of the spiral<->scroll map, evaluated at points sampled
     # uniformly over the spiral cylinder (see sample_spiral_surface_frame).
     # At each point we take the orthonormal in-surface frame (e1, e2) in spiral space, map it to scroll
@@ -1500,7 +1599,7 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     if epsilon is None:
         epsilon = cfg['model_sym_dirichlet_finite_difference_epsilon']
 
-    spiral_zyx, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
+    spiral_zyx, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points, z_begin, z_end)
 
     spiral_shift_1 = spiral_zyx + e1 * epsilon
     spiral_shift_2 = spiral_zyx + e2 * epsilon

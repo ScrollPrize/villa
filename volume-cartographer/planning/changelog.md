@@ -14,3 +14,8 @@
   coarse level, and pointer distance while background requests receive bounded
   fair service; direct and SurfaceCache rendering reuse their existing geometry
   paths.
+
+## 2026-08-08
+
+- Added a synthetic Valgrind rendering benchmark with native replay scoring and
+  a one-sided performance-only CI regression gate.

@@ -11,5 +11,5 @@
 - [x] Reuse full generated coordinates and SurfaceGeometryTileCache geometry.
 - [x] Integrate stable view IDs, focus state, snapshot publication, and cleanup.
 - [x] Add and run focused correctness tests.
-- [ ] Run the synthetic render performance gate and record results.
+- [x] Run the synthetic render performance gate and record results.
 - [x] Update specification, documentation, changelog, and task log.
