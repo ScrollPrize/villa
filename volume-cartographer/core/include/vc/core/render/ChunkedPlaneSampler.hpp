@@ -115,6 +115,17 @@ public:
         const Options& options = Options(),
         float dedupRadiusPixels = 8.0f);
 
+    // Selects how far a GUI viewport should queue coarse fallback data. Stops
+    // after `maximumFallbackLevels`, or earlier when one average chunk edge at
+    // a candidate level spans the average viewport edge in level-0 units.
+    static int fallbackLevelCountForViewport(
+        IChunkedArray& array,
+        int startLevel,
+        int viewportWidth,
+        int viewportHeight,
+        float pixelsPerLevel0Unit,
+        int maximumFallbackLevels = 5);
+
     // Samples one pyramid level into `out` for pixels not already marked in
     // `coverage`. Coordinates are logical level-0 XYZ voxel coordinates.
     static Stats samplePlaneLevel(IChunkedArray& array,

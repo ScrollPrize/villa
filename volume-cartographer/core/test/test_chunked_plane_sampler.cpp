@@ -11,6 +11,7 @@
 #include <opencv2/core.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -117,6 +118,41 @@ private:
     ChunkStatus status_;
 };
 
+class PyramidArray final : public vc::render::IChunkedArray {
+public:
+    int numLevels() const override { return 8; }
+    std::array<int, 3> shape(int level) const override
+    {
+        const int extent = std::max(1, 4096 >> level);
+        return {extent, extent, extent};
+    }
+    std::array<int, 3> chunkShape(int) const override { return {32, 32, 32}; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int level) const override
+    {
+        LevelTransform transform;
+        const double scale = std::ldexp(1.0, -level);
+        transform.scaleFromLevel0 = {scale, scale, scale};
+        return transform;
+    }
+    ChunkResult tryGetChunk(int level, int, int, int) override
+    {
+        ChunkResult result;
+        result.status = ChunkStatus::MissQueued;
+        result.dtype = dtype();
+        result.shape = chunkShape(level);
+        return result;
+    }
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+};
+
 cv::Mat_<cv::Vec3f> axisAlignedCoords(int rows, int cols, float z = 0.f)
 {
     cv::Mat_<cv::Vec3f> c(rows, cols);
@@ -178,6 +214,33 @@ TEST_CASE("collectViewportDependencies is resident-only and keeps distant occurr
     CHECK(array.queuedReads == 0);
     REQUIRE(samples.size() == 2);
     CHECK(samples[0].key == samples[1].key);
+}
+
+TEST_CASE("viewport fallback range stops at coverage or five levels")
+{
+    PyramidArray array;
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 300, 100, 1.0f) == 3);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 4096, 4096, 1.0f) == 5);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 20, 20, 1.0f) == 0);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 6, 4096, 4096, 1.0f) == 1);
+}
+
+TEST_CASE("viewport dependencies publish coarse levels first")
+{
+    PyramidArray array;
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 3;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, {{64.0f, 64.0f, 64.0f}}, {{4.0f, 4.0f}}, options);
+    REQUIRE(samples.size() == 4);
+    CHECK(samples[0].key.level == 3);
+    CHECK(samples[1].key.level == 2);
+    CHECK(samples[2].key.level == 1);
+    CHECK(samples[3].key.level == 0);
 }
 
 TEST_CASE("requestPlaneDependencies / requestCoordsDependencies run without crashing")

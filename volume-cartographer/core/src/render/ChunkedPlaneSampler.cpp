@@ -13,6 +13,7 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1226,7 +1227,60 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
         for (const auto& viewport : bins.points)
             result.push_back({key, viewport});
     }
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.key.level != rhs.key.level)
+            return lhs.key.level > rhs.key.level;
+        return std::tuple(lhs.key.iz, lhs.key.iy, lhs.key.ix,
+                          lhs.viewportPosition[1], lhs.viewportPosition[0]) <
+               std::tuple(rhs.key.iz, rhs.key.iy, rhs.key.ix,
+                          rhs.viewportPosition[1], rhs.viewportPosition[0]);
+    });
     return result;
+}
+
+int ChunkedPlaneSampler::fallbackLevelCountForViewport(
+    IChunkedArray& array,
+    int startLevel,
+    int viewportWidth,
+    int viewportHeight,
+    float pixelsPerLevel0Unit,
+    int maximumFallbackLevels)
+{
+    if (array.numLevels() <= 0 || startLevel < 0 ||
+        startLevel >= array.numLevels() || maximumFallbackLevels <= 0) {
+        return 0;
+    }
+
+    const int lastLevel = std::min(
+        array.numLevels() - 1, startLevel + maximumFallbackLevels);
+    if (viewportWidth <= 0 || viewportHeight <= 0 ||
+        !std::isfinite(pixelsPerLevel0Unit) || pixelsPerLevel0Unit <= 0.0f) {
+        return lastLevel - startLevel;
+    }
+
+    const double averageViewportExtent =
+        (double(viewportWidth) + double(viewportHeight)) /
+        (2.0 * double(pixelsPerLevel0Unit));
+    for (int level = startLevel; level <= lastLevel; ++level) {
+        const auto shape = array.shape(level);
+        if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)
+            continue;
+        const auto chunkShape = array.chunkShape(level);
+        const auto transform = array.levelTransform(level);
+        double averageChunkExtent = 0.0;
+        bool valid = true;
+        for (int dimension = 0; dimension < 3; ++dimension) {
+            const double scale = std::abs(transform.scaleFromLevel0[dimension]);
+            if (chunkShape[dimension] <= 0 || !std::isfinite(scale) || scale <= 0.0) {
+                valid = false;
+                break;
+            }
+            averageChunkExtent += double(chunkShape[dimension]) / scale;
+        }
+        if (valid && averageChunkExtent / 3.0 >= averageViewportExtent)
+            return level - startLevel;
+    }
+    return lastLevel - startLevel;
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(

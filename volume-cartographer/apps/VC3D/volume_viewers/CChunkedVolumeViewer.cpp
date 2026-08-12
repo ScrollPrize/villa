@@ -1838,12 +1838,19 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         ctx.overlaySamplingMethod, options.tileSize);
     options.request = ctx.renderJob.chunkRequest;
     overlayOptions.request = ctx.renderJob.chunkRequest;
-    // A new view may queue one adjacent coarse level for a quick preview.
-    // Once that geometry has produced a frame, only the requested level may
-    // create more cache work. Resident fallback chunks can still fill holes,
-    // but those reads do not promote them over the target working set.
-    options.queuedFallbackLevels = continuingSameGeometry ? 0 : 1;
-    overlayOptions.queuedFallbackLevels = 0;
+    // Keep enough coarse demand for a useful whole-view preview: at most five
+    // levels, stopping once one average chunk spans the average viewport edge.
+    // Recompute this on every render so a chunk-ready repaint cannot demote
+    // incomplete fallback coverage while the requested level is still filling.
+    options.queuedFallbackLevels =
+        vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
+            *ctx.chunkArray, ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale);
+    overlayOptions.queuedFallbackLevels =
+        ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f
+        ? vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              *ctx.overlayChunkArray, ctx.overlayStartLevel,
+              ctx.fbW, ctx.fbH, ctx.scale)
+        : 0;
 
     auto initializeOverlayProgress = [&]() {
         overlayValues.create(ctx.fbH, ctx.fbW);

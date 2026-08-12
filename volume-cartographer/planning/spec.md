@@ -52,8 +52,11 @@
 - Before an accepted interactive render samples the volume, it probes the
   viewport on a deterministic stratified 8-pixel grid. Each probe records the
   2-D viewport occurrence of every required requested-level and permitted
-  fallback chunk. Nearby occurrences of the same chunk are deduplicated, but
-  distant occurrences on folded surfaces are retained.
+  fallback chunk. It queues at most five coarser levels and stops earlier when
+  one average chunk edge at a candidate level spans the average viewport edge.
+  This fallback demand remains present on refinement renders until it resolves.
+  Nearby occurrences of the same chunk are deduplicated, but distant
+  occurrences on folded surfaces are retained.
 - A completed pre-pass atomically replaces that source's previous snapshot for
   the view. Snapshot construction and surface-coordinate generation occur
   without the chunk-cache state lock. Older view versions cannot replace a
@@ -61,7 +64,8 @@
 - Pending interactive work is ordered by active view, coarser pyramid level,
   nearest retained occurrence to that view's focus, then FIFO. A GUI miss not
   observed by the sparse pre-pass has no location and sorts after located work
-  at the same view and level.
+  at the same view and level. Dependency publication is coarse-to-fine so
+  workers cannot admit fine work before its coarse entries are visible.
 - Mouse interaction marks that view active and updates distances against its
   retained point index. Before any pointer has been observed, viewport center
   is the focus.

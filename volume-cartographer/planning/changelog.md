@@ -14,6 +14,9 @@
   coarse level, and pointer distance while background requests receive bounded
   fair service; direct and SurfaceCache rendering reuse their existing geometry
   paths.
+- Expanded interactive fallback demand to as many as five coarser levels,
+  bounded by average chunk-to-viewport coverage, and retained that demand during
+  refinement renders.
 
 ## 2026-08-08
 
