@@ -23,9 +23,6 @@ from vesuvius.data.chunk_cache import (
     ZarrCacheTraceStats,
     begin_zarr_cache_trace,
     end_zarr_cache_trace,
-    _record_zarr_cache_event,
-    _atomic_write_bytes,
-    _NEGATIVE_MARKER_SUFFIX,
 )
 from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 import tifffile
