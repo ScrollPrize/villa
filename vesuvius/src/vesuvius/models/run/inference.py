@@ -1099,14 +1099,9 @@ class Inferer():
         if self.verbose: print("Inference complete.")
 
     def infer(self):
-        try:
-            self._run_inference()
-            main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-            return main_output_path, self.coords_store_path
-        except Exception as e:
-            print(f"An error occurred during inference: {e}")
-            import traceback
-            traceback.print_exc() 
+        self._run_inference()
+        main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
+        return main_output_path, self.coords_store_path
 
 
 def _parse_bbox_arg(value):
