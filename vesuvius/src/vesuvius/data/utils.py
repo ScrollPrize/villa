@@ -40,8 +40,8 @@ def open_zarr(path: str, mode: str = 'r',
               verbose: bool = False,
               cache: bool = False,
               cache_size_mb: int = 256,
-              cache_dir: Optional[Union[str, os.PathLike]] = None,
-              cache_max_gb: Optional[float] = None,
+              chunk_cache_dir: Optional[Union[str, os.PathLike]] = None,
+              chunk_cache_max_gb: Optional[float] = None,
               # Additional zarr creation parameters
               shape: Optional[Tuple] = None,
               chunks: Optional[Tuple] = None,
@@ -75,7 +75,7 @@ def open_zarr(path: str, mode: str = 'r',
     cache_size_mb : int, default 256
         Maximum size of the in-memory LRU chunk cache, in megabytes. Ignored
         unless ``cache=True``.
-    cache_dir : Optional[Union[str, os.PathLike]], default None
+    chunk_cache_dir : Optional[Union[str, os.PathLike]], default None
         Persistent on-disk chunk cache. If set, and the path is a remote URL
         opened in read mode, chunks are mirrored into this directory as they
         are fetched and served from there on every later read, by any process.
@@ -86,17 +86,17 @@ def open_zarr(path: str, mode: str = 'r',
         cached entries are never revalidated against the remote; delete the
         directory to reset the cache. Ignored (falls through to existing
         behavior) for local paths, for write modes, and when
-        ``cache_max_gb=0`` (or negative). If both ``cache_dir`` and
-        ``cache=True`` are given, the disk cache wins.
-    cache_max_gb : Optional[float], default None
-        Size cap for the ``cache_dir`` tree, in GiB, enforced by
+        ``chunk_cache_max_gb=0`` (or negative). If both ``chunk_cache_dir``
+        and ``cache=True`` are given, the disk cache wins.
+    chunk_cache_max_gb : Optional[float], default None
+        Size cap for the ``chunk_cache_dir`` tree, in GiB, enforced by
         least-recently-used eviction. Default None means unbounded. 0 (or a
         negative value) disables the disk cache entirely, so the call behaves
-        as if ``cache_dir`` had not been passed, mirroring how
+        as if ``chunk_cache_dir`` had not been passed, mirroring how
         ``cache_size_mb=0`` makes the in-memory cache retain nothing. Ignored
-        unless ``cache_dir`` is set. Eviction treats ``cache_dir`` as
-        cache-owned and may delete any file under it, so point it at a
-        dedicated directory.
+        unless ``chunk_cache_dir`` is set. Eviction only sweeps a directory
+        the cache created or that carries its stamp file, so give the cache a
+        directory of its own if you want the cap enforced.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
     zarr_format : Optional[int], default 2
@@ -204,22 +204,37 @@ def open_zarr(path: str, mode: str = 'r',
         return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
-        if (cache_dir is not None and mode == 'r' and is_remote
-                and (cache_max_gb is None or cache_max_gb > 0)):
+        if (chunk_cache_dir is not None and mode == 'r' and is_remote
+                and (chunk_cache_max_gb is None or chunk_cache_max_gb > 0)):
             # Mirror fetched chunks into a local directory, keyed by the source
             # URL. Unlike the in-memory cache below this outlives the process,
             # so repeat epochs, DataLoader workers and separate runs all reuse
             # the same bytes, and it works on zarr 2 as well as zarr 3.
             from vesuvius.data.chunk_cache import DiskCacheStore
-            max_bytes = int(cache_max_gb * 2**30) if cache_max_gb is not None else None
+            # A positive cap must not round down to 0, which the store rejects.
+            max_bytes = (max(1, int(chunk_cache_max_gb * 2**30))
+                         if chunk_cache_max_gb is not None else None)
+            # Zarr turns every exception in this tuple into a None from
+            # store.get, which DiskCacheStore then records as a missing chunk.
+            # Anything wider makes a transient network failure a permanent miss.
+            missing_exceptions = (KeyError, FileNotFoundError)
             if _ZARR_V3:
                 from zarr.storage import FsspecStore
-                inner = FsspecStore.from_url(path, storage_options=storage_options, read_only=True)
+                inner = FsspecStore.from_url(
+                    path.rstrip('/'),
+                    storage_options=storage_options,
+                    read_only=True,
+                    allowed_exceptions=missing_exceptions,
+                )
             else:
-                inner = zarr.storage.FSStore(path.rstrip('/'), mode='r', **(storage_options or {}))
-            store = DiskCacheStore(inner, cache_dir=str(cache_dir), url=path, max_bytes=max_bytes)
+                inner = zarr.storage.FSStore(
+                    path.rstrip('/'), mode='r',
+                    exceptions=missing_exceptions,
+                    **(storage_options or {}),
+                )
+            store = DiskCacheStore(inner, cache_dir=str(chunk_cache_dir), url=path, max_bytes=max_bytes)
             if verbose:
-                print(f"Wrapping store in persistent disk chunk cache at {cache_dir}")
+                print(f"Wrapping store in persistent disk chunk cache at {chunk_cache_dir}")
             return zarr.open(store, mode=mode, **kwargs)
         if cache and mode == 'r':
             if not _ZARR_V3:

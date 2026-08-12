@@ -162,8 +162,8 @@ class Volume:
                  anon: bool = False,
                  cache: bool = False,
                  cache_size_mb: int = 256,
-                 cache_dir: Optional[Union[str, os.PathLike]] = None,
-                 cache_max_gb: Optional[float] = None,
+                 chunk_cache_dir: Optional[Union[str, os.PathLike]] = None,
+                 chunk_cache_max_gb: Optional[float] = None,
                  read_retries: int = 4,
                  ):
 
@@ -215,17 +215,17 @@ class Volume:
         cache_size_mb : int, default = 256
             Maximum size of the in-memory chunk cache in megabytes. Ignored
             unless ``cache=True``.
-        cache_dir : Optional[Union[str, os.PathLike]], default = None
+        chunk_cache_dir : Optional[Union[str, os.PathLike]], default = None
             If set, cache fetched chunks on disk under this directory instead of
             in memory, so a second run (or another process) reads them locally
-            rather than re-fetching. This is the chunk cache for the zarr store,
-            unrelated to ``Cube.cache_dir``. Applies only to remote stores opened
-            in read mode.
-        cache_max_gb : Optional[float], default = None
+            rather than re-fetching. Applies only to remote stores opened in
+            read mode.
+        chunk_cache_max_gb : Optional[float], default = None
             Size cap in GiB for the disk cache, evicting least-recently-used
-            chunks. Unbounded if omitted; ignored unless ``cache_dir`` is set.
-            Eviction treats ``cache_dir`` as cache-owned and may delete any file
-            under it, so point it at a dedicated directory.
+            chunks. Unbounded if omitted; ignored unless ``chunk_cache_dir`` is
+            set. Eviction only sweeps a directory the cache created or that
+            carries its stamp file, so give the cache a directory of its own if
+            you want the cap enforced.
         read_retries : int, default = 4
             Attempts per read in __getitem__. Transient remote failures — dropped
             connections, truncated payloads, 429/5xx — are retried with exponential
@@ -245,8 +245,8 @@ class Volume:
         self.verbose = verbose
         self.cache = cache
         self.cache_size_mb = cache_size_mb
-        self.cache_dir = cache_dir
-        self.cache_max_gb = cache_max_gb
+        self.chunk_cache_dir = chunk_cache_dir
+        self.chunk_cache_max_gb = chunk_cache_max_gb
         self.anon = anon
         self.read_retries = max(1, int(read_retries))
         self.inklabel = None  # Initialize inklabel
@@ -421,8 +421,8 @@ class Volume:
                 verbose=self.verbose,
                 cache=self.cache,
                 cache_size_mb=self.cache_size_mb,
-                cache_dir=self.cache_dir,
-                cache_max_gb=self.cache_max_gb
+                chunk_cache_dir=self.chunk_cache_dir,
+                chunk_cache_max_gb=self.chunk_cache_max_gb
             )
 
             # Get original dtype - handle both Array and Group cases
@@ -684,8 +684,8 @@ class Volume:
                     verbose=self.verbose,
                     cache=self.cache,
                     cache_size_mb=self.cache_size_mb,
-                    cache_dir=self.cache_dir,
-                    cache_max_gb=self.cache_max_gb
+                    chunk_cache_dir=self.chunk_cache_dir,
+                    chunk_cache_max_gb=self.chunk_cache_max_gb
                 )
                 
                 # Get attributes from the store
@@ -752,8 +752,8 @@ class Volume:
                 verbose=self.verbose,
                 cache=self.cache,
                 cache_size_mb=self.cache_size_mb,
-                cache_dir=self.cache_dir,
-                cache_max_gb=self.cache_max_gb
+                chunk_cache_dir=self.chunk_cache_dir,
+                chunk_cache_max_gb=self.chunk_cache_max_gb
             )
             
             if self.verbose:
