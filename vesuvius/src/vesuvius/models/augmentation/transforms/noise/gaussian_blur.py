@@ -3,7 +3,6 @@ from copy import deepcopy
 import numpy as np
 from time import time
 import torch
-from skimage.data import camera
 from torch.nn.functional import pad, conv3d, conv1d, conv2d
 
 from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
