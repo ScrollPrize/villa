@@ -415,6 +415,9 @@ private:
     QString _surfacePatchIndexCacheKey;
     void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
+    // A first surface entering an empty index has no other builder.
+    bool _surfacePatchIndexPrimeQueued{false};
+    void schedulePrimeSurfacePatchIndices();
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
