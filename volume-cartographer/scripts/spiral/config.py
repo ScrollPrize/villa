@@ -289,6 +289,17 @@ class Config:
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
+        # Cross-fiber links ("branches"): same-winding continuations between
+        # fibers. When on, linked collections merge into per-component
+        # cross-patch pcls with an explicit fiber graph (winding ties propagate
+        # through junctions whether or not the junction points attach to
+        # patches), and the unattached-strip loss samples chain walks that hop
+        # fibers at junctions. Link endpoints are resolved by their explicit
+        # control_point indices (mapped through decimation via
+        # kept_orig_indices).
+        self.pcl_use_fiber_links = True
+        # Include unapproved (pending) links.
+        self.pcl_use_pending_fiber_links = False
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -358,6 +369,10 @@ class Config:
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
         self.loss_weight_unattached_pcl_dt = 4.0
+        # Probability of hopping onto the linked fiber at each junction while
+        # sampling a chain walk through a link component in the
+        # unattached-strip loss.
+        self.loss_fiber_link_branch_probability = 0.5
         self.loss_weight_track_radius = 50.0
         self.loss_weight_track_dt = 10.0
         self.loss_weight_sym_dirichlet = 10.0

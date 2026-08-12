@@ -98,6 +98,11 @@ from spiral_helpers import (
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
+    _decimate_ordered_points_min_spacing,
+    resolve_fiber_links,
+    build_link_components,
+    merge_linked_point_collections,
+    SequenceChain,
     scale_and_split_counts,
     _infer_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
@@ -480,6 +485,41 @@ def get_interactive_dt_resume_iteration(start_iteration, target_iteration,
     run_iterations = max(0, int(target_iteration) - int(start_iteration))
     fraction = min(1.0, max(0.0, float(disabled_fraction)))
     return int(start_iteration) + int(run_iterations * fraction)
+
+
+def unresolved_fiber_link_warning(new_fibers, *, use_links, use_pending_links,
+                                  max_named=6):
+    """Warn that uploaded fibers' cross-fiber links are inert this session.
+
+    Cross-fiber links are resolved once, over the resident inputs
+    (load_host_inputs): an uploaded fiber joins the pool as its own singleton
+    component, so any branch the user drew on it does nothing until the input
+    is committed and the fit rebuilt. Rather than let that pass silently, count
+    the links that *would* be used after a rebuild -- so nothing is reported
+    when links are configured off, and pending links only count when they are
+    configured in -- and describe them.
+
+    new_fibers is an iterable of (input_id, pcl). Returns the warning text, or
+    None when there is nothing to warn about.
+    """
+    if not use_links:
+        return None
+    counted = []
+    for input_id, pcl in new_fibers:
+        num_links = sum(1 for branch in pcl.get('branches', ())
+                        if use_pending_links or not branch['pending'])
+        if num_links:
+            counted.append((input_id, num_links))
+    if not counted:
+        return None
+    named = ', '.join(f'{input_id} ({count})' for input_id, count in counted[:max_named])
+    if len(counted) > max_named:
+        named += f', and {len(counted) - max_named} more'
+    return (
+        f'{sum(count for _, count in counted)} cross-fiber link(s) on '
+        f'{len(counted)} added fiber(s) are not used by this session: links are '
+        f'resolved when the fit is built. Commit the inputs and rebuild the fit '
+        f'to apply them. Fibers: {named}')
 
 
 def get_dense_attachment_ramp(cfg, iteration):
@@ -909,13 +949,80 @@ class FitContext:
         holder of the dict observes the rebuilt strata; called again by
         the interactive path whenever it appends pcls.
         """
+        # Weight merged fiber-link components by their member-pcl count: each
+        # draw samples at most sample_count_relative_winding_patch_pairs_per_pcl
+        # patch pairs regardless of pcl size, so without this a component would
+        # get ~1/N the pair-sampling pressure its N members had before merging.
         self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
-            (pcl['sampling_group'] if len(pcl['points']) > 1 else None
-             for pcl in self.cross_patch_pcls),
+            [pcl['sampling_group'] if len(pcl['points']) > 1 else None
+             for pcl in self.cross_patch_pcls],
             self.config,
+            member_weights=[len(pcl.get('link_member_cids', ())) or 1
+                            for pcl in self.cross_patch_pcls],
         )
+        self._rebuild_unattached_components()
+        # Weight each component by its member count so a linked component keeps
+        # the per-strip sampling pressure its members had before merging (each
+        # sampled walk covers only one random path through the component).
         self.pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
-            self.unattached_strip_sampling_groups, self.config)
+            self.unattached_component_groups, self.config,
+            member_weights=[len(members) for members in self.unattached_components])
+
+    def _rebuild_unattached_components(self):
+        """Rebuild the unattached link-component view in place.
+
+        Each entry of self.unattached_components is the list of member strip
+        indices connected by same-winding links (singletons for unlinked
+        strips). The 'unattached' sampling strata index these components; each
+        step the loss samples a chain *walk* through a chosen component -- along
+        a strip, optionally hopping to the linked strip at each junction -- and
+        applies the ordinary constant-winding strip target along the walk (the
+        junction hop is a regular |dtheta| < pi step, so the sequential theta=0
+        unwrap handles the seam). unattached_component_edges[c] lists component
+        c's junctions as (strip_a, pos_a, strip_b, pos_b) with pos_* row indices
+        into the strips' (decimated) point arrays.
+
+        All three lists are mutated in place (never rebound) so the training-loop
+        closures keep the same list objects across interactive rebuilds.
+        """
+        self.unattached_components.clear()
+        self.unattached_component_groups.clear()
+        self.unattached_component_edges.clear()
+        strip_by_coll = {strip['id']: idx
+                         for idx, strip in enumerate(self.unattached_pcl_strips)}
+        # Strip-level view of the shared link_components decomposition. A link's
+        # junction survives here only when both endpoints survived the z-roi trim
+        # (they are exempt from decimation; see the strip loop in
+        # load_host_inputs); a walk simply never crosses a dropped junction, so a
+        # component with trimmed links degrades to islands sampled independently
+        # within one entry.
+        in_linked_component = set()
+        for member_cids, member_links in self.link_components:
+            comp_members = [strip_by_coll[cid] for cid in member_cids if cid in strip_by_coll]
+            if not comp_members:
+                continue
+            in_linked_component.update(comp_members)
+            edges = []
+            for link in member_links:
+                a = strip_by_coll.get(link['a_coll'])
+                b = strip_by_coll.get(link['b_coll'])
+                if a is None or b is None or a == b:
+                    continue
+                pos_a = self.unattached_pcl_strips[a].get('link_points', {}).get(link['a_point'])
+                pos_b = self.unattached_pcl_strips[b].get('link_points', {}).get(link['b_point'])
+                if pos_a is None or pos_b is None:
+                    continue
+                edges.append((a, pos_a, b, pos_b))
+            self.unattached_components.append(comp_members)
+            self.unattached_component_groups.append(
+                self.unattached_strip_sampling_groups[comp_members[0]])
+            self.unattached_component_edges.append(edges)
+        for idx in range(len(self.unattached_pcl_strips)):
+            if idx not in in_linked_component:
+                self.unattached_components.append([idx])
+                self.unattached_component_groups.append(
+                    self.unattached_strip_sampling_groups[idx])
+                self.unattached_component_edges.append([])
 
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
@@ -942,7 +1049,8 @@ class FitContext:
           (+ unverified_patches_list), shell_patch
         - point collections: cross_patch_pcls, unattached_pcl_strips,
           unattached_strip_sampling_groups, pcl_sampling_strata, next_id,
-          link_distance_tolerance
+          link_distance_tolerance, resolved_links, link_components,
+          unattached_components / _component_groups / _component_edges
         - sampling: patch_sampling_probabilities, patch_atlas,
           unverified_patch_sampling_probabilities, unverified_patch_atlas
         - trusted geometry: trusted_geometry_tree,
@@ -1074,17 +1182,10 @@ class FitContext:
             next_id,
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
         )
-        # Fibers form two sampling groups, horizontal and vertical, rather than one
-        # group per source file like the regular pcls.
+        # All fibers (horizontal, vertical, and merged link components) form one
+        # sampling group, rather than one group per source file like the regular pcls.
         for pcl in fiber_point_collections.values():
-            hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
-            if hv_tag not in ('H', 'V'):
-                print(
-                    f'WARNING: fiber {pcl.get("name")!r} has hv_classification.automatic_tag '
-                    f'{hv_tag!r} (expected "H" or "V"); grouping as horizontal'
-                )
-                hv_tag = 'H'
-            pcl['sampling_group'] = f'fibers:{hv_tag}'
+            pcl['sampling_group'] = 'fibers'
         point_collections.update(fiber_point_collections)
 
         for pcl in point_collections.values():
@@ -1124,6 +1225,42 @@ class FitContext:
             distance_scale=1.0,
             general_hit_policy='largest_area',
         )
+
+        # Every pcl carries the uniform chain interface (pcl['chain'], see
+        # spiral_helpers.Chain): a SequenceChain over the id-sorted point order
+        # (lazy, so later point-dict replacements are picked up). Consumers go
+        # through this and never assume id-sorted order is chain-valid.
+        # merge_linked_point_collections below replaces link-connected members with
+        # a merged component pcl carrying a graph-routing ComponentChain instead.
+        for pcl in point_collections.values():
+            pcl['chain'] = SequenceChain(pcl)
+
+        # ==========================================================================
+        # Cross-fiber links ("branches")
+        # ==========================================================================
+        # Resolve stored branch metadata into concrete point-to-point links. Handled
+        # symmetrically for fibers and pcls (pcls simply carry no branches today). Two
+        # effects downstream: link-connected collections merge into one cross-patch
+        # "component pcl" carrying an explicit fiber graph (see
+        # merge_linked_point_collections), so the rel-winding loss ties patches on
+        # different fibers with delta 0 through chains that hop fibers at each junction
+        # (an ordinary |dtheta| < pi chain step, theta=0-unwrapped like any other); and
+        # the unattached-strip loss samples chain walks through the same junctions
+        # (branching randomly at each one), pulling every linked fiber onto one shared
+        # winding via the ordinary constant-radius-along-strip target.
+        resolved_links = []
+        if self.config['pcl_use_fiber_links']:
+            resolved_links = resolve_fiber_links(
+                point_collections,
+                include_pending=self.config['pcl_use_pending_fiber_links'],
+            )
+            print(f'fiber links: {len(resolved_links)} resolved')
+        # One shared component decomposition over the link graph, consumed twice:
+        # the cross-patch merge below unions each component's attached points, and
+        # _rebuild_unattached_components maps the same components onto unattached
+        # strips for the walk-sampling loss.
+        link_components = build_link_components(resolved_links)
+        linked_cids = {cid for member_cids, _ in link_components for cid in member_cids}
 
         # ==========================================================================
         # Point collection classification
@@ -1176,8 +1313,28 @@ class FitContext:
                 continue
             if num_attached >= 2:
                 cross_patch_point_collections[pid] = pcl
-            if num_unattached >= 1:
+            # Link-component members join the unattached pool even when fully
+            # attached: their strip is the geometry the component's chain walks (and
+            # theta=0 unwrap) run through between the fibers they link.
+            if num_unattached >= 1 or pid in linked_cids:
                 unattached_point_collections[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
+
+        # Merge each set of collections joined by cross-fiber links into one
+        # cross-patch "component pcl" with an explicit graph over its members. The
+        # merged pcl exposes the union of the members' attached points (so pairs of
+        # patches on different fibers feed the rel-winding loss with delta 0) plus a
+        # chain function that routes between any two points along the fibers, hopping
+        # to the linked fiber at each junction. A junction hop is just another chain
+        # step between nearly-coincident points (|dtheta| < pi), so the ordinary
+        # theta=0 unwrap along the chain handles the seam. Members are removed
+        # from the cross-patch pool (the merged pcl subsumes their within-fiber
+        # pairs); their unattached role is untouched (handled by the walk-sampling in
+        # the unattached-strip loss).
+        if link_components:
+            cross_patch_point_collections, num_merged = merge_linked_point_collections(
+                point_collections, link_components, cross_patch_point_collections)
+            if num_merged:
+                print(f'fiber links: merged into {num_merged} cross-patch components')
 
         # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
         # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
@@ -1229,32 +1386,41 @@ class FitContext:
         # corresponding winding annotations. Strips with <2 points are dropped.
         # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
         # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
-        # The first and last points are always kept.
+        # The first and last points are always kept, as are cross-fiber link endpoints
+        # (their strip positions are recorded in strip['link_points'], keyed by the
+        # pcl-local point id, so _rebuild_unattached_components can place junctions).
+        link_point_ids_by_coll = {}
+        for link in resolved_links:
+            link_point_ids_by_coll.setdefault(link['a_coll'], set()).add(link['a_point'])
+            link_point_ids_by_coll.setdefault(link['b_coll'], set()).add(link['b_point'])
         for pcl_id, pcl in unattached_point_collections.items():
             sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
             if len(sorted_items) < 2:
                 continue
+            link_ids = link_point_ids_by_coll.get(pcl_id, ())
+            force_keep = {pos for pos, (point_id, _) in enumerate(sorted_items)
+                          if int(point_id) in link_ids}
 
             zyxs = np.stack([point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
             windings = np.array([point['winding_annotation'] for _, point in sorted_items], dtype=np.float32)
 
-            if min_point_spacing > 0 and len(zyxs) > 2:
-                keep = [0]
-                last_kept = zyxs[0]
-                for i in range(1, len(zyxs) - 1):
-                    if np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
-                        keep.append(i)
-                        last_kept = zyxs[i]
-                keep.append(len(zyxs) - 1)
-                zyxs = zyxs[keep]
-                windings = windings[keep]
+            zyxs, keep = _decimate_ordered_points_min_spacing(
+                zyxs, min_point_spacing, return_indices=True,
+                force_keep=force_keep | {len(zyxs) - 1})
+            windings = windings[keep]
 
+            link_points = {
+                int(sorted_items[orig_pos][0]): strip_pos
+                for strip_pos, orig_pos in enumerate(keep)
+                if orig_pos in force_keep
+            }
             unattached_pcl_strips.append({
                 'id': pcl_id,
                 'name': pcl.get('name'),
                 'source_file': pcl.get('source_file'),
                 'zyxs': zyxs,
                 'windings': windings,
+                'link_points': link_points,
             })
             unattached_strip_sampling_groups.append(pcl['sampling_group'])
 
@@ -1290,6 +1456,13 @@ class FitContext:
         self.cross_patch_pcls = cross_patch_pcls
         self.unattached_pcl_strips = unattached_pcl_strips
         self.unattached_strip_sampling_groups = unattached_strip_sampling_groups
+        self.resolved_links = resolved_links
+        self.link_components = link_components
+        # The unattached loss consumes strips through these link components; see
+        # _rebuild_unattached_components, which fills them from link_components.
+        self.unattached_components = []
+        self.unattached_component_groups = []
+        self.unattached_component_edges = []
         self.pcl_sampling_strata = {}
         self._rebuild_pcl_sampling_strata()
 
@@ -2567,6 +2740,8 @@ class FitContext:
                 if self.unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
                         transform, dr, self.unattached_pcl_strips,
+                        self.unattached_components,
+                        self.unattached_component_edges,
                         self.pcl_sampling_strata['unattached'],
                         get_or_build_unattached_pcl_flat,
                         self.config['sample_count_unattached_pcls_per_step'],
@@ -2629,6 +2804,10 @@ class FitContext:
         and prepared samplers are reused untouched. The record order is the
         service's deterministic order, so a multi-rank session would append the
         same items in the same order on every rank.
+
+        Returns the warnings this incorporation raised, for the runtime to
+        publish on the session status (nothing here is fatal enough to refuse
+        the inputs).
         """
         # Incorporation has its own saved RNG envelope so adding inputs does
         # not alter the stochastic training sequence (same discipline as the
@@ -2644,6 +2823,9 @@ class FitContext:
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            # (input_id, pcl) per uploaded fiber, for the unresolved-link
+            # warning below.
+            new_fibers = []
             for record in records:
                 kind = record.get('kind')
                 path = record.get('path')
@@ -2671,8 +2853,8 @@ class FitContext:
                     pcl['source_file'] = path
                     pcl.setdefault('metadata', {})['winding_is_absolute'] = False
                     pcl['metadata']['input_role'] = 'fiber'
-                    hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
-                    pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
+                    pcl['sampling_group'] = 'fibers'
+                    new_fibers.append((input_id, pcl))
                     new_collections[self.next_id] = pcl
                     self.next_id += 1
                 elif kind == 'pcl':
@@ -2722,6 +2904,7 @@ class FitContext:
                         point['zyx'] = np.array(
                             [point['p'][2], point['p'][1], point['p'][0]],
                             dtype=np.float32)
+                    pcl['chain'] = SequenceChain(pcl)
                 link_points_to_patches(
                     self.verified_patches,
                     new_collections,
@@ -2813,6 +2996,10 @@ class FitContext:
                         'windings': windings,
                     })
                     self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
+                # No 'link_points' on these strips: an uploaded fiber's
+                # branches are not resolved (see unresolved_links above), so
+                # each new strip is its own singleton component with no
+                # junctions to walk.
                 # The flat GPU bundle is derived from the strip list; drop it so
                 # the next consumer rebuilds it including the appended strips.
                 self.unattached_pcl_strips.flat = None
@@ -2854,6 +3041,16 @@ class FitContext:
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session; '
                   f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
+
+            warnings = []
+            link_warning = unresolved_fiber_link_warning(
+                new_fibers,
+                use_links=self.config['pcl_use_fiber_links'],
+                use_pending_links=self.config['pcl_use_pending_fiber_links'])
+            if link_warning is not None:
+                print(f'WARNING: {link_warning}')
+                warnings.append(link_warning)
+            return warnings
         finally:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
@@ -3282,6 +3479,8 @@ class FitContext:
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
                 self.unattached_pcl_strips,
+                self.unattached_components,
+                self.unattached_component_edges,
                 self.pcl_sampling_strata['unattached'],
                 get_or_build_unattached_pcl_flat,
                 self.config['sample_count_unattached_pcls_per_step'],

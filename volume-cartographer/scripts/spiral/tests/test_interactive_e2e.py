@@ -23,6 +23,22 @@ import unittest
 DATASET = "/home/paul/projects/vesuvius-scrolls/spiral/dataset"
 
 
+def _fiber_with_links():
+    """A dataset fiber carrying at least one approved cross-fiber link.
+
+    Chosen from the dataset rather than hardcoded, so the test follows the
+    local fiber set; None when nothing there declares a link.
+    """
+    import json
+
+    for path in sorted(glob.glob(f"{DATASET}/fibers/*.json")):
+        with open(path) as fiber_file:
+            branches = json.load(fiber_file).get("branches") or []
+        if any(not branch.get("pending") for branch in branches):
+            return path
+    return None
+
+
 @unittest.skipUnless(
     os.environ.get("SPIRAL_INTERACTIVE_E2E") == "1",
     "set SPIRAL_INTERACTIVE_E2E=1 (needs a GPU and the local dataset; "
@@ -120,6 +136,29 @@ class InteractiveEndToEndTests(unittest.TestCase):
                 # exported only when a client asks for one.
                 self.assertIsNone(status["preview_manifest_path"])
                 self.assertEqual(status["preview_generation"], 0)
+
+                # Adding a fiber that carries cross-fiber links: the links are
+                # resolved when the fit is built, so this session cannot honour
+                # them and has to say so on the status the panel displays.
+                linked_fiber = _fiber_with_links()
+                if linked_fiber is not None:
+                    session.run(2, pending_inputs=[{
+                        "id": Path(linked_fiber).stem,
+                        "kind": "fiber",
+                        "path": linked_fiber,
+                    }])
+                    while (session.status()["state"] not in {SessionState.Idle,
+                                                             SessionState.Error}
+                           and time.monotonic() < deadline):
+                        time.sleep(0.5)
+                    status = session.status()
+                    self.assertEqual(status["state"], SessionState.Idle,
+                                     status.get("error"))
+                    self.assertEqual(status["current_iteration"], 4)
+                    self.assertTrue(
+                        any("cross-fiber link" in warning
+                            for warning in status["warnings"]),
+                        status["warnings"])
 
                 exported = session.export_preview(timeout=900.0)
                 status = session.status()
