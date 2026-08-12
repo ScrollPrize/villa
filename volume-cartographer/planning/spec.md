@@ -15,6 +15,12 @@
 
 ## Download label
 
+The main window uses one permanent status label for cache diagnostics and
+Z-scroll sensitivity; these fields must not be rendered by overlapping status
+widgets. RAM and persistent-disk values share one trailing `GiB` unit:
+
+`RAM X/Y disk X/Y GiB`
+
 During active remote downloads, the existing cache status bar appends:
 
 `qK X/Y/Z`
@@ -26,4 +32,5 @@ During active remote downloads, the existing cache status bar appends:
 - The queue item is shown only for remote volumes while remote fetches are in
   flight. Remote volumes otherwise show `net idle`; local volumes have no
   network field.
-- The full active status is `RAM X/Y GiB disk X/Y GiB net N@XMiB/s qK X/Y/Z`.
+- The full active status is
+  `RAM X/Y disk X/Y GiB net Nx XMiB/s qK X/Y/Z Z sens: N.N`.

@@ -2636,9 +2636,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
-    _sharedCacheStatsLabel->setMinimumWidth(320);
-    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  net --"));
+    _sharedCacheStatsLabel->setToolTip(
+        tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+    updateSharedStatusLabel();
 
     _persistentCacheLowSpaceLabel = new QLabel(this);
     _persistentCacheLowSpaceLabel->setObjectName(QStringLiteral("persistentCacheLowSpaceLabel"));
@@ -2681,14 +2682,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             updatePersistentCacheSpace);
     _persistentCacheSpaceTimer->start();
     updatePersistentCacheSpace();
-
-    // Z-scroll sensitivity label in status bar
-    _sliceStepLabel = new QLabel(this);
-    _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    double initialSensitivity = _viewerManager->zScrollSensitivity();
-    _sliceStepLabel->setText(tr("Z sens: %1").arg(initialSensitivity, 0, 'f', 1));
-    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
-    statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
@@ -8545,19 +8538,35 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
 
 void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label. Persistence + viewer refresh happen in
-    // ViewerManager::setZScrollSensitivity (the single source of truth).
-    if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
-    }
+    Q_UNUSED(sensitivity);
+    updateSharedStatusLabel();
 }
 
 void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 {
-    if (!_sharedCacheStatsLabel || items.isEmpty()) {
+    if (!items.isEmpty())
+        _sharedCacheStatsItems = items;
+    updateSharedStatusLabel();
+}
+
+void CWindow::updateSharedStatusLabel()
+{
+    if (!_sharedCacheStatsLabel)
         return;
+
+    QStringList items = _sharedCacheStatsItems;
+    if (items.isEmpty())
+        items << tr("RAM --  disk -- GiB  net --");
+    if (_viewerManager) {
+        items << tr("Z sens: %1")
+            .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
     }
-    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
+    const QString text = items.join(QStringLiteral("  "));
+    _sharedCacheStatsLabel->setText(text);
+    const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
+    _sharedCacheStatsLabel->setMinimumWidth(
+        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
+        margins.left() + margins.right());
 }
 
 // Open volume package

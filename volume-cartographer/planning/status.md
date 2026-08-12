@@ -1,12 +1,9 @@
 # Status
 
-- [x] Read the task workflow and relevant VC3D/core code.
-- [x] Create task, overarching plan, specification, and implementation plan.
-- [x] Review the plan against the task and specification.
-- [x] Add per-level unresolved fetch statistics.
-- [x] Add and test shared queue formatting.
-- [x] Add queue details to the existing cache status bar.
-- [x] Restrict network details to remote volumes and queue details to active downloads.
-- [x] Update documentation and changelog.
+- [x] Read the current task workflow and status-bar implementation.
+- [x] Create and review the focused task plan against the specification.
+- [x] Correct RAM/disk unit placement.
+- [x] Merge Z sensitivity into the cache status label.
+- [x] Add focused regression coverage.
+- [x] Update specification, documentation, changelog, and task log.
 - [x] Build and run focused tests.
-- [x] Record final results and deviations in `task_log.md`.

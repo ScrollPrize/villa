@@ -349,6 +349,7 @@ private slots:
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
+    void updateSharedStatusLabel();
     void onZScrollSensitivityChanged(double sensitivity);
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
@@ -400,10 +401,10 @@ private:
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
-    QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
+    QStringList _sharedCacheStatsItems;
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};

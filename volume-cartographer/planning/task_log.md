@@ -2,26 +2,29 @@
 
 ## 2026-08-12
 
-- Read the requested workflow, current chunk-cache statistics and scheduling
-  paths, slice status rendering, settings persistence, and viewer-manager global
-  update path.
-- Plan review: the plan covers every task requirement and preserves the spec's
-  diagnostic-only boundary. Queue counts are sourced once from cache entries.
-- Added mutex-protected per-level unresolved request accounting to `ChunkCache`.
-  Duplicate requests and reprioritization retain one count; resolution,
-  invalidation, and stale-view cancellation remove it.
-- Initially added a per-slice diagnostic setting, then removed that approach
-  after confirming VC3D already has a shared cache status bar.
-- Added a shared queue formatter to the existing cache-status path. Remote idle
-  volumes show `net idle`; active remote downloads append `qK A/B/C` after the
-  compact throughput field. Local volumes omit network information.
-- Normalized RAM and disk cache usage to fixed GiB units.
-- Documented the status fields in `docs/remote_file_cache.md`.
+- Confirmed the main window creates separate permanent cache-stat and
+  Z-sensitivity labels. Their independent sizing allows the expanded download
+  diagnostics to be obscured.
+- Plan review: composing both fields from retained state in one label directly
+  addresses overlap while preserving both existing update signals. The change
+  is display-only and does not alter cache or rendering behavior.
+- Added a tested storage formatter with one shared trailing GiB unit for RAM
+  and persistent-disk values.
+- Removed the separate Z-sensitivity status widget. `CWindow` now retains the
+  latest cache fields and composes them with the current sensitivity into the
+  existing cache status label on either update signal.
+- Updated the specification, remote-cache documentation, and changelog.
 - Validation:
-  - `cmake -S volume-cartographer -B volume-cartographer/build`
-  - `cmake --build volume-cartographer/build --target test_chunk_cache test_download_queue_stats VC3D -j4`
-  - `ctest --test-dir volume-cartographer/build --output-on-failure -R '^(test_chunk_cache|download_queue_stats)$'`
-- Result: VC3D built successfully and both focused tests passed.
-- Existing Qt deprecation and MOC completeness warnings remained during the
-  full build; this task introduced no new build errors.
+  - `git diff --check`
+  - `cmake --build volume-cartographer/build --target test_download_queue_stats VC3D -j4`
+  - `ctest --test-dir volume-cartographer/build --output-on-failure -R '^download_queue_stats$'`
+- Result: the focused formatter test passed and VC3D linked successfully.
+  Existing Qt SFINAE completeness warnings remained during the application
+  build; this task introduced no build errors.
+- Follow-up visual correction: the first merged-label implementation retained
+  a fixed 320-pixel minimum, allowing Qt to compress longer active-download
+  text. The label now derives its minimum width from the current rendered text
+  after every cache or Z-sensitivity update.
+- Changed active network formatting from `N@S.SMiB/s` to
+  `Nx S.SMiB/s` for clearer separation of concurrency and speed.
 - No task simplifications, deferred requirements, or implementation deviations.

@@ -487,12 +487,6 @@ QString formatByteSize(std::size_t bytes)
     return QString("%1 B").arg(bytes);
 }
 
-QString formatGigabytes(std::size_t bytes)
-{
-    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-    return QString("%1").arg(static_cast<double>(bytes) / kGiB, 0, 'f', 1);
-}
-
 constexpr std::size_t kOverlayDecodedCacheCapacity =
     1ULL * 1024ULL * 1024ULL * 1024ULL;
 
@@ -5940,26 +5934,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
     }
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        sharedCacheItems << QString("RAM %1/%2 GiB")
-            .arg(formatGigabytes(stats.decodedBytes))
-            .arg(formatGigabytes(stats.decodedByteCapacity));
-        if (stats.persistentCacheEnabled) {
-            QString disk = QString("disk %1/").arg(formatGigabytes(stats.persistentCacheBytes));
-            disk += stats.persistentCacheMaximumBytes
-                ? formatGigabytes(*stats.persistentCacheMaximumBytes)
-                : QStringLiteral("unlimited");
-            disk += QStringLiteral(" GiB");
-            if (stats.persistentCacheScanInFlight)
-                disk += QStringLiteral(" (scanning)");
-            else if (stats.persistentCacheTrimInFlight)
-                disk += QStringLiteral(" (trimming)");
-            sharedCacheItems << disk;
-            if (stats.persistentCacheLowSpace) {
-                sharedCacheItems << QString("⚠ low disk: %1 free")
-                    .arg(formatByteSize(stats.persistentCacheFreeBytes));
-            }
-        } else {
-            sharedCacheItems << QStringLiteral("disk off");
+        sharedCacheItems << vc3d::formatCacheStorageStats(stats);
+        if (stats.persistentCacheEnabled && stats.persistentCacheLowSpace) {
+            sharedCacheItems << QString("⚠ low disk: %1 free")
+                .arg(formatByteSize(stats.persistentCacheFreeBytes));
         }
         const QString network = vc3d::formatNetworkDownloadStats(
             stats, _volume && _volume->isRemote());

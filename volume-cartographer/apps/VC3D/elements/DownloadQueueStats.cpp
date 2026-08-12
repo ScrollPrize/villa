@@ -6,6 +6,37 @@
 
 namespace vc3d {
 
+namespace {
+
+QString formatGigabytes(std::size_t bytes)
+{
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    return QString::number(static_cast<double>(bytes) / kGiB, 'f', 1);
+}
+
+} // namespace
+
+QString formatCacheStorageStats(const vc::render::ChunkCache::Stats& stats)
+{
+    QString result = QStringLiteral("RAM %1/%2")
+        .arg(formatGigabytes(stats.decodedBytes))
+        .arg(formatGigabytes(stats.decodedByteCapacity));
+    if (!stats.persistentCacheEnabled)
+        return result + QStringLiteral(" GiB disk off");
+
+    result += QStringLiteral(" disk %1/")
+        .arg(formatGigabytes(stats.persistentCacheBytes));
+    result += stats.persistentCacheMaximumBytes
+        ? formatGigabytes(*stats.persistentCacheMaximumBytes)
+        : QStringLiteral("unlimited");
+    result += QStringLiteral(" GiB");
+    if (stats.persistentCacheScanInFlight)
+        result += QStringLiteral(" (scanning)");
+    else if (stats.persistentCacheTrimInFlight)
+        result += QStringLiteral(" (trimming)");
+    return result;
+}
+
 QString formatDownloadQueueStats(const vc::render::ChunkCache::Stats& stats)
 {
     const auto first = std::find_if(
@@ -40,7 +71,7 @@ QString formatNetworkDownloadStats(const vc::render::ChunkCache::Stats& stats,
         return QStringLiteral("net idle");
 
     constexpr double kMiB = 1024.0 * 1024.0;
-    QString result = QStringLiteral("net %1@%2MiB/s")
+    QString result = QStringLiteral("net %1x %2MiB/s")
         .arg(stats.remoteFetchesInFlight)
         .arg(std::max(0.0, stats.remoteDownloadBytesPerSecond) / kMiB,
              0, 'f', 1);

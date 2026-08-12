@@ -7,6 +7,24 @@ class DownloadQueueStatsTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void storageStatusUsesOneSharedUnit()
+    {
+        constexpr std::size_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+        vc::render::ChunkCache::Stats stats;
+        stats.decodedBytes = 3 * kGiB;
+        stats.decodedByteCapacity = 10 * kGiB;
+        stats.persistentCacheEnabled = true;
+        stats.persistentCacheBytes = 82 * kGiB;
+        stats.persistentCacheMaximumBytes = 500 * kGiB;
+
+        QCOMPARE(vc3d::formatCacheStorageStats(stats),
+                 QStringLiteral("RAM 3.0/10.0 disk 82.0/500.0 GiB"));
+
+        stats.persistentCacheEnabled = false;
+        QCOMPARE(vc3d::formatCacheStorageStats(stats),
+                 QStringLiteral("RAM 3.0/10.0 GiB disk off"));
+    }
+
     void idleIsEmpty()
     {
         vc::render::ChunkCache::Stats stats;
@@ -34,7 +52,7 @@ private slots:
 
         stats.remoteFetchesInFlight = 7;
         QCOMPARE(vc3d::formatNetworkDownloadStats(stats, true),
-                 QStringLiteral("net 7@12.3MiB/s q1 3/0/5"));
+                 QStringLiteral("net 7x 12.3MiB/s q1 3/0/5"));
     }
 };
 
