@@ -5,7 +5,7 @@ data. Skipped by default; run with:
         tests/data/test_chunk_cache_network.py -v -s
 
 The local tests stub the remote store out, so nothing there proves the cache
-behaves against a real HTTPS zarr. These read one 128^3 chunk from a high
+behaves against a real HTTPS zarr. These read one 128³ chunk from a high
 pyramid level of the Scroll 1A standardized volume, which keeps the whole file
 to a couple of megabytes over the wire, and check three things: cached reads
 are byte-identical to uncached ones, a second store on the same cache
@@ -32,7 +32,7 @@ VOLUME_URL = (
     "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/"
     "volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr"
 )
-# Level 5 of the pyramid is (450, 247, 253) in 128^3 chunks, so the region
+# Level 5 of the pyramid is (450, 247, 253) in 128³ chunks, so the region
 # below is exactly one chunk: one request, a few MB.
 ARRAY_URL = f"{VOLUME_URL}/5"
 REGION = (slice(128, 256), slice(0, 128), slice(0, 128))
@@ -93,7 +93,7 @@ def cold_cache_read(cache_root):
     """Populate a fresh cache directory, returning the patch and its requests."""
     with _counted_http_requests() as urls:
         started = time.perf_counter()
-        patch = _read_region(open_zarr(ARRAY_URL, mode="r", cache_dir=str(cache_root)))
+        patch = _read_region(open_zarr(ARRAY_URL, mode="r", chunk_cache_dir=str(cache_root)))
         elapsed = time.perf_counter() - started
     chunk_urls = [u for u in urls if not _is_metadata(u)]
     print(f"cold cache read: {len(chunk_urls)} chunk request(s) in {elapsed:.1f} s")
@@ -112,7 +112,7 @@ def test_second_store_fetches_no_chunks(cache_root, cold_cache_read, uncached_pa
     """A new store over a warm cache directory must not touch the network."""
     with _counted_http_requests() as urls:
         started = time.perf_counter()
-        patch = _read_region(open_zarr(ARRAY_URL, mode="r", cache_dir=str(cache_root)))
+        patch = _read_region(open_zarr(ARRAY_URL, mode="r", chunk_cache_dir=str(cache_root)))
         elapsed = time.perf_counter() - started
     chunk_urls = [u for u in urls if not _is_metadata(u)]
     print(
