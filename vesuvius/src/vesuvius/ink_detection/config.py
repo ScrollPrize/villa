@@ -1372,6 +1372,8 @@ class TrainingConfig:
             if "pin_memory" not in canonical
             else bool(canonical["pin_memory"])
         )
+        if "wandb_project" in canonical and "wandb_entity" not in canonical:
+            raise ValueError("wandb_project requires wandb_entity")
         raw_wandb_run_id = canonical.get("wandb_run_id")
         return cls(
             ink=ink,

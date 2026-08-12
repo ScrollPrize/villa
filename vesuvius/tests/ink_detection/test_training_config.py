@@ -99,6 +99,14 @@ def test_training_rejects_contradicted_forced_target_settings(key, value, messag
         resolve_training_mapping(authored)
 
 
+def test_wandb_project_requires_entity_at_config_load():
+    authored = _training_mapping()
+    authored["wandb_project"] = "ink"
+
+    with pytest.raises(ValueError, match="wandb_project requires wandb_entity"):
+        _parse_training(authored)
+
+
 def test_canonical_mutations_are_complete_without_local_default_materialization():
     authored = _training_mapping()
     canonical = resolve_training_mapping(authored)
