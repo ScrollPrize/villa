@@ -1091,6 +1091,216 @@ TEST_CASE("line annotation control point index returns sorted line position wind
     CHECK(candidates[1] == 0);
 }
 
+TEST_CASE("line annotation parallax ghost picks the nearest control in each direction")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    constexpr double kSlideRange = 8.0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 20.0, false},
+        {{0.0f, 0.0f, 0.0f}, nan, false},
+        {{0.0f, 0.0f, 0.0f}, 4.0, false},
+        {{0.0f, 0.0f, 0.0f}, 12.0, false},
+        {{0.0f, 0.0f, 0.0f}, 9.0, false},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+
+    const auto ahead = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 10.0, 1, kSlideRange, 1000.0);
+    REQUIRE(ahead.has_value());
+    CHECK(ahead->controlIndex == 3);
+    CHECK(ahead->linePosition == doctest::Approx(12.0));
+    CHECK(ahead->offsetFraction == doctest::Approx(2.0 / kSlideRange));
+    CHECK(ahead->offsetFraction > 0.0);
+
+    const auto behind = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 10.0, -1, kSlideRange, 1000.0);
+    REQUIRE(behind.has_value());
+    CHECK(behind->controlIndex == 4);
+    CHECK(behind->linePosition == doctest::Approx(9.0));
+    CHECK(behind->offsetFraction == doctest::Approx(-1.0 / kSlideRange));
+    CHECK(behind->offsetFraction < 0.0);
+}
+
+TEST_CASE("line annotation parallax ghost requires a control strictly in the direction")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    constexpr double kSlideRange = 8.0;
+
+    const std::vector<GeneratedOverlay::ControlPointMarker> empty;
+    const auto emptyIndex =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(empty);
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    empty, emptyIndex, 3.0, 1, kSlideRange, 1000.0)
+                    .has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    empty, emptyIndex, 3.0, -1, kSlideRange, 1000.0)
+                    .has_value());
+
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 5.0, false},
+        {{0.0f, 0.0f, 0.0f}, 9.0, false},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+
+    // Nothing beyond the last control ahead, nothing before the first behind.
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 9.0, 1, kSlideRange, 1000.0)
+                    .has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 5.0, -1, kSlideRange, 1000.0)
+                    .has_value());
+
+    // A control exactly at the current position is neither ahead nor behind.
+    const auto ahead = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 5.0, 1, kSlideRange, 1000.0);
+    REQUIRE(ahead.has_value());
+    CHECK(ahead->controlIndex == 1);
+    const auto behind = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 9.0, -1, kSlideRange, 1000.0);
+    REQUIRE(behind.has_value());
+    CHECK(behind->controlIndex == 0);
+
+    // Unusable inputs.
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls,
+                    index,
+                    std::numeric_limits<double>::quiet_NaN(),
+                    1,
+                    kSlideRange, 1000.0)
+                    .has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 5.0, 1, 0.0, 1000.0)
+                    .has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 5.0, 0, kSlideRange, 1000.0)
+                    .has_value());
+}
+
+TEST_CASE("line annotation parallax ghost skips non finite control line positions")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    constexpr double kSlideRange = 8.0;
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, std::numeric_limits<double>::quiet_NaN(), false},
+        {{0.0f, 0.0f, 0.0f}, 14.0, false},
+        {{0.0f, 0.0f, 0.0f}, std::numeric_limits<double>::infinity(), false},
+        {{0.0f, 0.0f, 0.0f}, 2.0, false},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+
+    const auto ahead = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 6.0, 1, kSlideRange, 1000.0);
+    REQUIRE(ahead.has_value());
+    CHECK(ahead->controlIndex == 1);
+
+    const auto behind = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 6.0, -1, kSlideRange, 1000.0);
+    REQUIRE(behind.has_value());
+    CHECK(behind->controlIndex == 3);
+}
+
+TEST_CASE("line annotation parallax ghost clamps offset and ramps opacity")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    constexpr double kSlideRange = 8.0;
+    const double minimumOpacity = vc3d::line_annotation::kGeneratedParallaxGhostMinimumOpacity;
+    const double maximumOpacity = vc3d::line_annotation::kGeneratedParallaxGhostMaximumOpacity;
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{0.0f, 0.0f, 0.0f}, 100.0, false},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+
+    // Far beyond the slide range in both directions: full offset, floor opacity.
+    const auto farAhead = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 50.0, 1, kSlideRange, 1000.0);
+    REQUIRE(farAhead.has_value());
+    CHECK(farAhead->offsetFraction == doctest::Approx(1.0));
+    CHECK(farAhead->opacity == doctest::Approx(minimumOpacity));
+
+    const auto farBehind = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 50.0, -1, kSlideRange, 1000.0);
+    REQUIRE(farBehind.has_value());
+    CHECK(farBehind->offsetFraction == doctest::Approx(-1.0));
+    CHECK(farBehind->opacity == doctest::Approx(minimumOpacity));
+
+    // Exactly at the slide range: still full offset and floor opacity.
+    const auto atRange = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 100.0 - kSlideRange, 1, kSlideRange, 1000.0);
+    REQUIRE(atRange.has_value());
+    CHECK(atRange->offsetFraction == doctest::Approx(1.0));
+    CHECK(atRange->opacity == doctest::Approx(minimumOpacity));
+
+    // Half a slide range out: half the offset, opacity halfway up the ramp.
+    const auto halfway = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 100.0 - 0.5 * kSlideRange, 1, kSlideRange, 1000.0);
+    REQUIRE(halfway.has_value());
+    CHECK(halfway->offsetFraction == doctest::Approx(0.5));
+    CHECK(halfway->opacity ==
+          doctest::Approx(minimumOpacity + 0.5 * (maximumOpacity - minimumOpacity)));
+
+    // Converging on the solid marker: offset to zero, opacity to the ceiling.
+    const auto landing = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 100.0 - 1.0e-6, 1, kSlideRange, 1000.0);
+    REQUIRE(landing.has_value());
+    CHECK(landing->offsetFraction == doctest::Approx(0.0).epsilon(1.0e-6));
+    CHECK(landing->opacity == doctest::Approx(maximumOpacity).epsilon(1.0e-6));
+}
+
+TEST_CASE("line annotation parallax ghost hides beyond the visibility distance")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    constexpr double kSlideRange = 8.0;
+    const double minimumOpacity = vc3d::line_annotation::kGeneratedParallaxGhostMinimumOpacity;
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{0.0f, 0.0f, 0.0f}, 30.0, false},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+
+    // The control 20 line positions ahead is hidden when the visibility
+    // distance is shorter than that, visible when it is longer.
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 10.0, 1, kSlideRange, 15.0)
+                    .has_value());
+    const auto visible = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 10.0, 1, kSlideRange, 40.0);
+    REQUIRE(visible.has_value());
+    // Inside the un-faded core (within 75% of the visibility distance) the
+    // base ramp applies unchanged: fully clamped offset, floor opacity.
+    CHECK(visible->offsetFraction == doctest::Approx(1.0));
+    CHECK(visible->opacity == doctest::Approx(minimumOpacity));
+
+    // In the outer quarter of the visibility distance the opacity fades
+    // linearly toward zero.
+    const auto fading = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 10.0, 1, kSlideRange, 22.0);
+    REQUIRE(fading.has_value());
+    const double edgeFade = (22.0 - 20.0) / (0.25 * 22.0);
+    CHECK(fading->opacity == doctest::Approx(minimumOpacity * edgeFade));
+
+    // Exactly at the visibility distance the ghost is fully faded out.
+    const auto atLimit = vc3d::line_annotation::generatedParallaxGhost(
+        controls, index, 10.0, 1, kSlideRange, 20.0);
+    REQUIRE(atLimit.has_value());
+    CHECK(atLimit->opacity == doctest::Approx(0.0));
+
+    // Non-positive or non-finite visibility distances are unusable inputs.
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 10.0, 1, kSlideRange, 0.0)
+                    .has_value());
+    CHECK_FALSE(vc3d::line_annotation::generatedParallaxGhost(
+                    controls, index, 10.0, 1, kSlideRange,
+                    std::numeric_limits<double>::quiet_NaN())
+                    .has_value());
+}
+
 TEST_CASE("line annotation line position radius uses local spacing and minimum")
 {
     const std::vector<cv::Vec3f> points{

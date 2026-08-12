@@ -672,6 +672,123 @@ inline std::optional<double> closestGeneratedControlPointLinePosition(
     return closest;
 }
 
+inline constexpr double kGeneratedParallaxGhostMinimumOpacity = 0.3;
+inline constexpr double kGeneratedParallaxGhostMaximumOpacity = 0.85;
+// Fraction of the visibility distance over which a ghost fades out at the far
+// edge, so it eases in and out instead of popping at the cutoff.
+inline constexpr double kGeneratedParallaxGhostEdgeFadeFraction = 0.25;
+
+// Parallax slide-in cue for the nearest control point on one side of the current
+// cut. All positions, deltas and the slide range are line-position units (one unit
+// is one index step in GeneratedViews::linePoints, roughly 30 base voxels of arc
+// length); nothing here is expressed in voxels or scene pixels. The viewer-side
+// geometry (scene offset, viewport width) stays in the dialog.
+struct GeneratedParallaxGhost {
+    size_t controlIndex = 0;
+    double linePosition = 0.0;
+    // Signed, clamped to [-1, 1]; positive means the control point is ahead.
+    double offsetFraction = 0.0;
+    // Ramps from kGeneratedParallaxGhostMinimumOpacity at or beyond the slide
+    // range up to kGeneratedParallaxGhostMaximumOpacity as the delta closes.
+    double opacity = 0.0;
+};
+
+// direction is +1 for the nearest control point strictly ahead of
+// currentLinePosition and -1 for the nearest one strictly behind it. A ghost
+// only exists while the control point is within maxDistanceLinePositions of the
+// current position; its opacity fades to zero over the outer
+// kGeneratedParallaxGhostEdgeFadeFraction of that distance. Returns nullopt
+// when no such control point exists or when any input is unusable.
+inline std::optional<GeneratedParallaxGhost> generatedParallaxGhost(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const GeneratedControlPointLinePositionIndex& index,
+    double currentLinePosition,
+    int direction,
+    double slideRangeLinePositions,
+    double maxDistanceLinePositions)
+{
+    if (controls.empty() || index.sortedControlIndices.empty()) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(currentLinePosition)) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(slideRangeLinePositions) || slideRangeLinePositions <= 0.0) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(maxDistanceLinePositions) || maxDistanceLinePositions <= 0.0) {
+        return std::nullopt;
+    }
+    if (direction != 1 && direction != -1) {
+        return std::nullopt;
+    }
+
+    const auto& indices = index.sortedControlIndices;
+    // Out-of-range entries sort last and are rejected by the scan below; the
+    // sentinel keeps both binary-search comparators consistently ordered.
+    const auto positionForIndex = [&controls](size_t controlIndex) {
+        return controlIndex < controls.size()
+                   ? controls[controlIndex].linePosition
+                   : std::numeric_limits<double>::infinity();
+    };
+    const auto usable = [&controls, &positionForIndex](size_t controlIndex) {
+        return controlIndex < controls.size() && std::isfinite(positionForIndex(controlIndex));
+    };
+
+    std::optional<size_t> selected;
+    if (direction > 0) {
+        auto it = std::upper_bound(
+            indices.begin(),
+            indices.end(),
+            currentLinePosition,
+            [&positionForIndex](double value, size_t controlIndex) {
+                return value < positionForIndex(controlIndex);
+            });
+        for (; it != indices.end(); ++it) {
+            if (usable(*it) && positionForIndex(*it) > currentLinePosition) {
+                selected = *it;
+                break;
+            }
+        }
+    } else {
+        auto it = std::lower_bound(
+            indices.begin(),
+            indices.end(),
+            currentLinePosition,
+            [&positionForIndex](size_t controlIndex, double value) {
+                return positionForIndex(controlIndex) < value;
+            });
+        while (it != indices.begin()) {
+            --it;
+            if (usable(*it) && positionForIndex(*it) < currentLinePosition) {
+                selected = *it;
+                break;
+            }
+        }
+    }
+    if (!selected) {
+        return std::nullopt;
+    }
+
+    GeneratedParallaxGhost ghost;
+    ghost.controlIndex = *selected;
+    ghost.linePosition = positionForIndex(*selected);
+    const double delta = ghost.linePosition - currentLinePosition;
+    if (std::abs(delta) > maxDistanceLinePositions) {
+        return std::nullopt;
+    }
+    ghost.offsetFraction = std::clamp(delta / slideRangeLinePositions, -1.0, 1.0);
+    const double proximity = 1.0 - std::abs(ghost.offsetFraction);
+    ghost.opacity = kGeneratedParallaxGhostMinimumOpacity +
+                    proximity * (kGeneratedParallaxGhostMaximumOpacity -
+                                 kGeneratedParallaxGhostMinimumOpacity);
+    const double edgeFadeSpan =
+        maxDistanceLinePositions * kGeneratedParallaxGhostEdgeFadeFraction;
+    ghost.opacity *= std::clamp(
+        (maxDistanceLinePositions - std::abs(delta)) / edgeFadeSpan, 0.0, 1.0);
+    return ghost;
+}
+
 inline bool generatedControlPointPlacementWithinAnyDistance(
     double linePosition,
     const std::vector<double>& controlLinePositions,

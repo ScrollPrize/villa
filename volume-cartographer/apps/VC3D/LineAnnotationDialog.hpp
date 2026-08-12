@@ -91,6 +91,8 @@ public:
         QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
         QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
         QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
+        QGraphicsPathItem* ghostControlPointPrev = nullptr;
+        QGraphicsPathItem* ghostControlPointNext = nullptr;
     };
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;

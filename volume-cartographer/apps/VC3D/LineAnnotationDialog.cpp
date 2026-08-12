@@ -56,6 +56,7 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -69,6 +70,17 @@ constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
 constexpr double kNormalOffsetEpsilon = 1.0e-6;
+// Slide range of the current-cut parallax ghost markers, in line-position units
+// (one unit is one index step in the generated line points, not one voxel). A
+// control point further away than this parks at the full offset.
+constexpr double kGeneratedGhostSlideRangeLinePositions = 8.0;
+// Full-offset distance of a ghost from its true landing spot, as a fraction of
+// the visible scene width of the current cut viewer.
+constexpr double kGeneratedGhostMaxOffsetViewportFraction = 0.35;
+constexpr qreal kGeneratedGhostRadius = 8.0;
+// Ghosts only show while the control point is within this multiple of the
+// solid-marker window (lineRadius), so distant ones don't linger on screen.
+constexpr double kGeneratedGhostVisibilityRadiusMultiplier = 10.0;
 
 bool normalOffsetActive(double offsetVx)
 {
@@ -3240,7 +3252,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
         !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
+        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors ||
+        !_fastCurrentCutOverlayItems.ghostControlPointPrev ||
+        !_fastCurrentCutOverlayItems.ghostControlPointNext) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
         _fastCurrentCutOverlayItems = {};
         _fastCurrentCutOverlayItems.viewer = viewer;
@@ -3363,6 +3377,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setZValue(164.0);
 
+        // Hollow dashed rings, deliberately unlike the solid control markers:
+        // they sit at a fictional, parallax-shifted spot until they land.
+        QPen ghostControlPen(QColor(255, 230, 0));
+        ghostControlPen.setWidthF(1.5);
+        ghostControlPen.setStyle(Qt::DashLine);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setPen(ghostControlPen);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setZValue(155.0);
+
+        _fastCurrentCutOverlayItems.ghostControlPointNext = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setPen(ghostControlPen);
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setZValue(155.0);
+
         viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
                                 {_fastCurrentCutOverlayItems.centerPoint,
                                  _fastCurrentCutOverlayItems.controlPoints,
@@ -3377,7 +3406,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
                                  _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
                                  _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
+                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors,
+                                 _fastCurrentCutOverlayItems.ghostControlPointPrev,
+                                 _fastCurrentCutOverlayItems.ghostControlPointNext});
     }
 
     // During an in-place update, draw from the held pre-update views until this
@@ -3473,6 +3504,59 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
+
+    // Parallax ghosts: the nearest control point behind and ahead of the cursor
+    // within the visibility distance slide in horizontally from the side they
+    // will arrive from and land on the solid marker as their delta hits 0.
+    double ghostMaxSceneOffset = 0.0;
+    if (auto* ghostView = viewer->graphicsView()) {
+        if (auto* ghostViewport = ghostView->viewport();
+            ghostViewport && ghostViewport->width() > 0 && ghostViewport->height() > 0) {
+            const QRect ghostViewportRect = ghostViewport->rect();
+            const QPointF leftScene = ghostView->mapToScene(ghostViewportRect.topLeft());
+            const QPointF rightScene = ghostView->mapToScene(ghostViewportRect.topRight());
+            if (std::isfinite(leftScene.x()) && std::isfinite(rightScene.x())) {
+                ghostMaxSceneOffset = std::abs(rightScene.x() - leftScene.x()) *
+                                      kGeneratedGhostMaxOffsetViewportFraction;
+            }
+        }
+    }
+
+    const auto ghostPathForDirection = [&](int direction) {
+        QPainterPath ghostPath;
+        const auto ghost = vc3d::line_annotation::generatedParallaxGhost(
+            cutViews.controlPoints,
+            cutIndex,
+            cutPosition,
+            direction,
+            kGeneratedGhostSlideRangeLinePositions,
+            kGeneratedGhostVisibilityRadiusMultiplier * lineRadius);
+        if (!ghost || ghost->controlIndex >= cutViews.controlPoints.size()) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        const auto& control = cutViews.controlPoints[ghost->controlIndex];
+        if (!finitePoint(control.point)) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        const QPointF landingScenePoint = viewer->volumeToScene(control.point);
+        if (!std::isfinite(landingScenePoint.x()) || !std::isfinite(landingScenePoint.y())) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        // Higher line position is to the right in the strips; keep that sense here.
+        const QPointF ghostScenePoint(
+            landingScenePoint.x() + ghost->offsetFraction * ghostMaxSceneOffset,
+            landingScenePoint.y());
+        ghostPath.addEllipse(ghostScenePoint, kGeneratedGhostRadius, kGeneratedGhostRadius);
+        return std::make_pair(ghostPath, ghost->opacity);
+    };
+
+    const auto [nextGhostPath, nextGhostOpacity] = ghostPathForDirection(1);
+    _fastCurrentCutOverlayItems.ghostControlPointNext->setPath(nextGhostPath);
+    _fastCurrentCutOverlayItems.ghostControlPointNext->setOpacity(nextGhostOpacity);
+
+    const auto [prevGhostPath, prevGhostOpacity] = ghostPathForDirection(-1);
+    _fastCurrentCutOverlayItems.ghostControlPointPrev->setPath(prevGhostPath);
+    _fastCurrentCutOverlayItems.ghostControlPointPrev->setOpacity(prevGhostOpacity);
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;

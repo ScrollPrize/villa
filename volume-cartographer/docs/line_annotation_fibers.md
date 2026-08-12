@@ -49,6 +49,23 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
+The current cut view draws its solid yellow control-point marker only while the
+control point is inside the cut plane's thin slab, so fast panning would
+otherwise skip past control points unseen. To keep them findable, the view also
+always draws two parallax ghosts: a hollow dashed yellow ring for the nearest
+control point behind the cursor and one for the nearest ahead. Each ghost sits
+at its true in-plane landing spot shifted horizontally toward the side it will
+arrive from: the ring for a control point ahead of the cursor (higher line
+position) sits to the right, matching the strips where line position runs left
+to right. The shift is proportional to the signed line-position delta over a
+fixed 8 line-position slide range and is clamped at 35% of the visible view
+width, and the ring brightens from a faint floor at or beyond that range to
+nearly opaque as the delta closes. Ghosts only appear while the control point
+is within ten times the solid-marker window (so they don't linger far from any
+control point), fading out over the outer quarter of that distance. Because the
+shift decays continuously to zero, the ghost converges on the solid marker as a
+landing ring instead of popping into place.
+
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
 the initial centerline length and the base-voxel extrapolation distance, and
