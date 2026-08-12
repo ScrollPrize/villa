@@ -53,32 +53,26 @@ class TrainingRequest:
     config: TrainingConfig
     checkpoint_path: Path | None
     checkpoint: Any | None
-    weights_only: bool
 
 
 def stage_training_request(
     config_path: str | Path,
 ) -> TrainingRequest:
-    """Resolve config and load any raw checkpoint before creating frozen views."""
+    """Create the frozen config views and load any selected checkpoint."""
 
     config_path = Path(config_path)
     with config_path.open("r", encoding="utf-8") as stream:
         authored = json.load(stream)
-    canonical = resolve_training_mapping(authored)
-    raw_checkpoint = authored.get("checkpoint")
-    checkpoint_path = resolve_checkpoint_path(raw_checkpoint, config_path)
-    checkpoint = (
-        None
-        if checkpoint_path is None
-        else load_checkpoint(checkpoint_path)
+    config = TrainingConfig.from_mapping(resolve_training_mapping(authored))
+    checkpoint_path = resolve_checkpoint_path(
+        config.ink.checkpoint.path, config_path
     )
-    weights_only = bool(authored.get("weights_only", False))
-
     return TrainingRequest(
-        config=TrainingConfig.from_mapping(canonical),
+        config=config,
         checkpoint_path=checkpoint_path,
-        checkpoint=checkpoint,
-        weights_only=weights_only,
+        checkpoint=(
+            None if checkpoint_path is None else load_checkpoint(checkpoint_path)
+        ),
     )
 
 
@@ -502,18 +496,19 @@ def _run_training(request: TrainingRequest) -> int:
     start_step = 0
     optimizer_step = 0
     if request.checkpoint is not None:
+        weights_only = config.ink.checkpoint.weights_only
         start_step, optimizer_step = restore_training_state(
             unwrapped_model,
             optimizer,
             scheduler,
             request.checkpoint,
             request.checkpoint_path,
-            load_weights_only=request.weights_only,
+            load_weights_only=weights_only,
             ema_model=ema_model,
         )
         suffix = (
             f" and resuming from step {start_step}"
-            if not request.weights_only
+            if not weights_only
             else " (weights only)"
         )
         accelerator.print(

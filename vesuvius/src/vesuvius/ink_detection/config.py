@@ -1268,8 +1268,24 @@ def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
     canonical["stitched_gradient_checkpointing"] = bool(
         canonical.get("stitched_gradient_checkpointing", True)
     )
-    canonical["targets"]["ink"]["out_channels"] = 1
-    canonical["targets"]["ink"]["activation"] = "none"
+    # The reference overwrites these silently; contradicting authored values
+    # fail fast here so TargetConfig's guard is not dead on the training path.
+    ink_target = canonical["targets"]["ink"]
+    authored_channels = ink_target.get("out_channels")
+    if authored_channels is not None and int(authored_channels) != 1:
+        raise ValueError(
+            f"targets.ink.out_channels must be 1, got {authored_channels!r}"
+        )
+    authored_activation = ink_target.get("activation")
+    if (
+        authored_activation is not None
+        and str(authored_activation).strip().lower() != "none"
+    ):
+        raise ValueError(
+            f"targets.ink.activation must be 'none', got {authored_activation!r}"
+        )
+    ink_target["out_channels"] = 1
+    ink_target["activation"] = "none"
     return canonical
 
 

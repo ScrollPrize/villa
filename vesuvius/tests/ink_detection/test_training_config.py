@@ -39,7 +39,7 @@ def _parse_training(authored: dict) -> TrainingConfig:
     return TrainingConfig.from_mapping(resolve_training_mapping(authored))
 
 
-def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(
+def test_relative_checkpoint_resolves_against_the_config_directory(
     tmp_path, monkeypatch
 ):
     authored = _training_mapping(mode="full_3d")
@@ -53,9 +53,6 @@ def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(
 
     def loader(path):
         selected.append(path)
-        still_raw = json.loads(config_path.read_text(encoding="utf-8"))
-        assert "ema" not in still_raw
-        assert "crop_size" not in still_raw
         return {"model": {}}
 
     monkeypatch.setattr(train_module, "load_checkpoint", loader)
@@ -68,6 +65,38 @@ def test_raw_relative_checkpoint_is_selected_before_canonical_mutation(
     assert canonical["model_config"]["z_projection_mode"] == "none"
     assert canonical["targets"]["ink"]["out_channels"] == 1
     assert canonical["targets"]["ink"]["activation"] == "none"
+
+
+def test_weights_only_flows_through_the_typed_checkpoint_config(
+    tmp_path, monkeypatch
+):
+    authored = _training_mapping()
+    authored["checkpoint"] = "weights/start.pth"
+    authored["weights_only"] = True
+    config_path = tmp_path / "run.json"
+    config_path.write_text(json.dumps(authored), encoding="utf-8")
+    monkeypatch.setattr(
+        train_module, "load_checkpoint", lambda path: {"model": {}}
+    )
+
+    request = stage_training_request(config_path)
+
+    assert request.config.ink.checkpoint.weights_only is True
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("out_channels", 2, "out_channels must be 1"),
+        ("activation", "sigmoid", "activation must be 'none'"),
+    ],
+)
+def test_training_rejects_contradicted_forced_target_settings(key, value, message):
+    authored = _training_mapping()
+    authored["targets"]["ink"][key] = value
+
+    with pytest.raises(ValueError, match=message):
+        resolve_training_mapping(authored)
 
 
 def test_canonical_mutations_are_complete_without_local_default_materialization():
