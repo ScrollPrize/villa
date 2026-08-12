@@ -1,0 +1,1 @@
+- 2026-08-08: Added a synthetic Valgrind rendering benchmark with native replay scoring and a one-sided performance-only CI regression gate.
