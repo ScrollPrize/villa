@@ -14,6 +14,7 @@ import asyncio
 import os
 import threading
 import time
+import warnings
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any
@@ -127,14 +128,37 @@ except ImportError:
 # with a real cached chunk filename.
 _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
 
-# Store metadata is exempt from negative caching: a missing .zarray today may
-# exist a second from now (see utils/io/zarr_utils.py::wait_for_zarr_creation),
-# and a permanent marker would make the poll never finish.
+# Store metadata is exempt from negative caching. Chunk absence is durable for
+# an immutable published volume; metadata absence is not. Volume.load_ome_metadata
+# probes candidate paths that 404 by design, and a volume still being uploaded
+# gains its metadata later, so a marker written once would answer "missing" for
+# the life of the cache directory. The cost of skipping it is a couple of
+# no-byte 404 probes per open.
 _METADATA_BASENAMES = frozenset({".zarray", ".zgroup", ".zattrs", ".zmetadata", "zarr.json"})
 
 
 def _is_metadata_key(key: str) -> bool:
     return key.rsplit("/", 1)[-1] in _METADATA_BASENAMES
+
+
+def _cache_subdir(cache_dir: str, url: str) -> str:
+    """Return the subtree of `cache_dir` that holds `url`.
+
+    Cache entries are namespaced by the normalized remote URL to prevent
+    cross-dataset chunk-key collisions. Zarr chunk keys are relative paths
+    inside one store (e.g. "c/0/1/2"), so without a per-URL prefix every
+    dataset would write to the same paths under cache_dir.
+    """
+    normalized = url.rstrip('/')
+    scheme, sep, rest = normalized.partition('://')
+    # os.path.join discards everything before an absolute component, so an
+    # absolute remainder (file:///x.zarr) would otherwise land outside the root.
+    subdir = os.path.join(scheme, rest.lstrip('/')) if sep else normalized.lstrip('/')
+    root = os.path.abspath(cache_dir)
+    path = os.path.normpath(os.path.join(root, subdir))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError(f"cache path for {url!r} escapes cache_dir")
+    return path
 
 
 def _atomic_write_bytes(target: str, data: bytes) -> None:
@@ -164,6 +188,49 @@ def _atomic_write_bytes(target: str, data: bytes) -> None:
 _EVICT_STATE_LOCK = threading.Lock()
 _EVICT_STATE: dict[str, int] = {}
 _EVICT_CHECK_EVERY = 64 * 2**20
+
+# A temp file this old belongs to a writer that died before its os.replace;
+# nothing will ever rename it, so the sweep reclaims it.
+_ORPHAN_TEMP_AGE_SECONDS = 3600.0
+
+# Written at the cache root the first time a store takes an empty or new
+# directory, so eviction can tell a directory it owns from one the user keeps
+# other files in.
+_CACHE_STAMP_NAME = ".vesuvius-chunk-cache"
+_UNSTAMPED_ROOTS_WARNED: set[str] = set()
+
+
+def _ensure_cache_stamp(cache_root: str) -> None:
+    """Claim `cache_root` for this cache, if it is free to claim.
+
+    Best effort: a root that already holds unrelated files stays unstamped, and
+    _maybe_evict then declines to sweep it.
+    """
+    stamp = os.path.join(cache_root, _CACHE_STAMP_NAME)
+    try:
+        if os.path.exists(stamp):
+            return
+        if os.path.isdir(cache_root) and os.listdir(cache_root):
+            return
+        os.makedirs(cache_root, exist_ok=True)
+        with open(stamp, 'ab'):
+            pass
+    except OSError:
+        pass
+
+
+def _warn_unstamped_root(cache_root: str) -> None:
+    """Warn once per root that its size cap cannot be enforced."""
+    with _EVICT_STATE_LOCK:
+        if cache_root in _UNSTAMPED_ROOTS_WARNED:
+            return
+        _UNSTAMPED_ROOTS_WARNED.add(cache_root)
+    warnings.warn(
+        f"chunk cache root {cache_root!r} holds files this cache did not write "
+        f"(no {_CACHE_STAMP_NAME} stamp), so max_bytes is not enforced there; "
+        f"point cache_dir at a directory of its own to cap it",
+        stacklevel=3,
+    )
 
 
 def _check_max_bytes(max_bytes: int | None) -> None:
@@ -198,6 +265,9 @@ def _maybe_evict(cache_root: str, max_bytes: int, written: int) -> None:
     root each sweeps on its own writes, which keeps the cap approximate but
     still bounded. Files another process removes or is midway through writing
     are skipped rather than treated as errors.
+
+    Only a stamped root is swept, so a cache_dir that also holds the user's own
+    files never loses them.
     """
     with _EVICT_STATE_LOCK:
         pending = _EVICT_STATE.get(cache_root, 0) + written
@@ -206,13 +276,27 @@ def _maybe_evict(cache_root: str, max_bytes: int, written: int) -> None:
             return
         _EVICT_STATE[cache_root] = 0
 
+    if not os.path.exists(os.path.join(cache_root, _CACHE_STAMP_NAME)):
+        _warn_unstamped_root(cache_root)
+        return
+
     entries = []
     total = 0
+    now = time.time()
     for dirpath, _dirnames, filenames in os.walk(cache_root):
         for name in filenames:
             # Partial writes belong to whoever is writing them; they become
-            # cache entries only once os.replace renames them.
+            # cache entries only once os.replace renames them. One left behind
+            # by a killed worker is nobody's, so age it out.
             if ".tmp." in name:
+                path = os.path.join(dirpath, name)
+                try:
+                    if now - os.stat(path).st_mtime > _ORPHAN_TEMP_AGE_SECONDS:
+                        os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if name == _CACHE_STAMP_NAME and dirpath == cache_root:
                 continue
             path = os.path.join(dirpath, name)
             try:
@@ -258,14 +342,8 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
         self._url = str(url)
-        # Namespace cache by the normalized remote URL to prevent cross-dataset
-        # chunk-key collisions. Zarr chunk keys are relative paths inside one
-        # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
-        # would write to the same paths under cache_dir.
-        normalized = url.rstrip('/')
-        scheme, sep, rest = normalized.partition('://')
-        subdir = os.path.join(scheme, rest) if sep else normalized
-        self._cache_dir = os.path.join(cache_dir, subdir)
+        self._cache_dir = _cache_subdir(cache_dir, url)
+        _ensure_cache_stamp(cache_dir)
 
     # Also exposed on the instance because callers read it off the store
     # (neural_tracing/fiber_trace/train.py).
@@ -334,7 +412,8 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         elif isinstance(byte_range, OffsetByteRequest):
             data = data[byte_range.offset:]
         elif isinstance(byte_range, SuffixByteRequest):
-            data = data[-byte_range.suffix:]
+            # Indexed from the front: data[-0:] would be the whole object.
+            data = data[max(len(data) - byte_range.suffix, 0):]
         elif byte_range is not None:
             raise ValueError(f"unexpected byte range request: {byte_range!r}")
         return prototype.buffer.from_bytes(data)
@@ -361,8 +440,10 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
                 # Raced with a concurrent replace; fall through to re-fetch.
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
-        # never negative-cache store metadata: concurrent writers poll for .zarray creation
-        if not _is_metadata_key(key) and os.path.isfile(marker):
+        # Metadata markers are ignored online so a re-probe can find metadata
+        # that exists now, but offline they are the only answer available: a
+        # cache tree written before that exemption must not start raising.
+        if os.path.isfile(marker) and (self._offline or not _is_metadata_key(key)):
             _record_zarr_cache_event(
                 "negative_hit",
                 elapsed_ms=(time.perf_counter() - start) * 1000.0,
@@ -380,7 +461,6 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         # remote store and preserve its exact ByteRequest semantics.
         result = await self._remote_get_with_retry(key, prototype, byte_range)
         if result is None:
-            # never negative-cache store metadata: concurrent writers poll for .zarray creation
             if not _is_metadata_key(key):
                 try:
                     _atomic_write_bytes(marker, b"")
@@ -394,10 +474,16 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
 
         if byte_range is None:
             data = result.to_bytes()
-            _atomic_write_bytes(cached, data)
             byte_count = len(data)
-            if self._max_bytes:
-                _maybe_evict(self._cache_root, self._max_bytes, byte_count)
+            # The bytes are already in hand; a full cache dir or a read-only one
+            # costs the next reader a refetch, not this reader its result.
+            try:
+                _atomic_write_bytes(cached, data)
+            except OSError:
+                pass
+            else:
+                if self._max_bytes:
+                    _maybe_evict(self._cache_root, self._max_bytes, byte_count)
         else:
             byte_count = len(result.to_bytes())
         _record_zarr_cache_event(
@@ -414,7 +500,6 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
             if self._max_bytes:
                 _touch(cached)
             return True
-        # never negative-cache store metadata: concurrent writers poll for .zarray creation
         if not _is_metadata_key(key) and os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
             return False
         if self._offline:
@@ -446,7 +531,13 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         )
 
 
-class DiskCacheStoreV2(MutableMapping):
+# Zarr 2 wraps a bare MutableMapping in KVStore, which would hide the listdir
+# and getsize below and send zarr back to its key-iterating fallbacks. Its Store
+# ABC is passed through untouched, so subclass that where it exists.
+_V2_STORE_BASE = MutableMapping if _ZARR_V3 else getattr(zarr.storage, 'Store', MutableMapping)
+
+
+class DiskCacheStoreV2(_V2_STORE_BASE):
     """Read-only Zarr v2 mapping that lazily caches remote bytes to disk."""
 
     _NEGATIVE_MARKER_SUFFIX = _NEGATIVE_MARKER_SUFFIX
@@ -469,10 +560,8 @@ class DiskCacheStoreV2(MutableMapping):
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
         self._url = str(url)
-        normalized = url.rstrip('/')
-        scheme, sep, rest = normalized.partition('://')
-        subdir = os.path.join(scheme, rest) if sep else normalized
-        self._cache_dir = os.path.join(cache_dir, subdir)
+        self._cache_dir = _cache_subdir(cache_dir, url)
+        _ensure_cache_stamp(cache_dir)
 
     def with_read_only(self, read_only: bool = False):
         if not read_only:
@@ -543,8 +632,11 @@ class DiskCacheStoreV2(MutableMapping):
                 # Raced with a concurrent replace; fall through to re-fetch.
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
-        # never negative-cache store metadata: concurrent writers poll for .zarray creation
-        if not _is_metadata_key(key) and os.path.isfile(marker):
+        # Metadata markers are ignored online so a re-probe can find metadata
+        # that exists now, but offline they are the only answer available: a
+        # cache tree written before that exemption must not start raising
+        # OfflineCacheMiss where it used to raise KeyError.
+        if os.path.isfile(marker) and (self._offline or not _is_metadata_key(key)):
             _record_zarr_cache_event(
                 "negative_hit",
                 elapsed_ms=(time.perf_counter() - start) * 1000.0,
@@ -559,7 +651,6 @@ class DiskCacheStoreV2(MutableMapping):
         try:
             result = self._remote_get_with_retry(key)
         except KeyError:
-            # never negative-cache store metadata: concurrent writers poll for .zarray creation
             if not _is_metadata_key(key):
                 try:
                     _atomic_write_bytes(marker, b"")
@@ -572,9 +663,15 @@ class DiskCacheStoreV2(MutableMapping):
             raise
 
         result = bytes(result)
-        _atomic_write_bytes(cached, result)
-        if self._max_bytes:
-            _maybe_evict(self._cache_root, self._max_bytes, len(result))
+        # The bytes are already in hand; a full cache dir or a read-only one
+        # costs the next reader a refetch, not this reader its result.
+        try:
+            _atomic_write_bytes(cached, result)
+        except OSError:
+            pass
+        else:
+            if self._max_bytes:
+                _maybe_evict(self._cache_root, self._max_bytes, len(result))
         _record_zarr_cache_event(
             "download",
             byte_count=len(result),
@@ -595,7 +692,6 @@ class DiskCacheStoreV2(MutableMapping):
             if self._max_bytes:
                 _touch(cached)
             return True
-        # never negative-cache store metadata: concurrent writers poll for .zarray creation
         if not _is_metadata_key(key) and os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
             return False
         if self._offline:
@@ -607,6 +703,15 @@ class DiskCacheStoreV2(MutableMapping):
 
     def __len__(self):
         return len(self._remote)
+
+    def listdir(self, path: str = ""):
+        # Delegated, never cached: zarr's fallback for a store without listdir
+        # iterates every key, which on an FSStore is a full recursive listing of
+        # the remote. Opening a group listing its children is the common path.
+        return zarr.storage.listdir(self._remote, path)
+
+    def getsize(self, path=None):
+        return zarr.storage.getsize(self._remote, path)
 
     def __setitem__(self, key, value):
         raise PermissionError("read-only cache store")
