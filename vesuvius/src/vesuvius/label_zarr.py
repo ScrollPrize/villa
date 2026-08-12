@@ -88,12 +88,37 @@ def create_label_array(
 ):
     """Create one fixed-chunk label level with v2 slash-separated keys."""
 
+    array = create_v2_array(
+        group,
+        name,
+        shape=shape,
+        chunks=CHUNK_SHAPE,
+        dtype=dtype,
+        compressor=LABEL_COMPRESSOR,
+        fill_value=0,
+    )
+    array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
+    return array
+
+
+def create_v2_array(
+    group,
+    name: str,
+    *,
+    shape,
+    chunks,
+    dtype,
+    compressor,
+    fill_value,
+):
+    """Create one explicit-Zarr-v2 array with slash-separated chunk keys."""
+
     kwargs = {
         "shape": shape,
-        "chunks": CHUNK_SHAPE,
+        "chunks": chunks,
         "dtype": dtype,
-        "compressor": LABEL_COMPRESSOR,
-        "fill_value": 0,
+        "compressor": compressor,
+        "fill_value": fill_value,
         "overwrite": True,
     }
     if _ZARR_V3:
@@ -110,5 +135,4 @@ def create_label_array(
             dimension_separator="/",
             write_empty_chunks=False,
         )
-    array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
     return array

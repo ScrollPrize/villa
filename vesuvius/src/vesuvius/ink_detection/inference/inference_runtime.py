@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -13,6 +14,25 @@ from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def iter_mirror_axes(allowed_axes: Sequence[int]) -> list[tuple[int, ...]]:
+    """Enumerate mirror variants in combination order, including identity."""
+
+    allowed = tuple(int(axis) for axis in allowed_axes)
+    return [
+        axes
+        for count in range(len(allowed) + 1)
+        for axes in itertools.combinations(allowed, count)
+    ]
+
+
+def flip_spatial(tensor, axes: Sequence[int]):
+    """Flip tensor BCZYX spatial dimensions named by ZYX axis indices."""
+
+    if not axes:
+        return tensor
+    return torch.flip(tensor, dims=[int(axis) + 2 for axis in axes])
 
 
 class TargetModel(nn.Module):

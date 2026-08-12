@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 import logging
 import math
 import shutil
@@ -30,6 +29,8 @@ from vesuvius.ink_detection.models.checkpoint import (
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.inference_runtime import (
     TargetModel,
+    flip_spatial,
+    iter_mirror_axes,
     parse_gpu_ids,
     prepare_model_for_inference,
     resolve_amp_dtype,
@@ -147,17 +148,6 @@ def compute_equal_length_mirror_axes(shape: Sequence[int]) -> tuple[int, ...]:
         if len(axes) > 1
         for axis in axes
     )
-
-
-def iter_mirror_axes(allowed_axes: Sequence[int]) -> list[tuple[int, ...]]:
-    """Enumerate mirror variants in combination order, including identity."""
-
-    allowed = tuple(int(axis) for axis in allowed_axes)
-    return [
-        axes
-        for count in range(len(allowed) + 1)
-        for axes in itertools.combinations(allowed, count)
-    ]
 
 
 def compute_importance_map_2d(
@@ -552,15 +542,6 @@ class FlatBlockDataset(Dataset):
         return image_CZYX, metadata
 
 
-def flip_tensor_for_patch_axes(
-    tensor: torch.Tensor, patch_axes: Sequence[int]
-) -> torch.Tensor:
-    """Flip BCZYX input over selected Z/Y/X patch axes."""
-
-    axes = tuple(int(axis) for axis in patch_axes)
-    return tensor if not axes else torch.flip(tensor, [axis + 2 for axis in axes])
-
-
 def unflip_spatial_output_for_patch_axes(
     output: torch.Tensor, patch_axes: Sequence[int]
 ) -> torch.Tensor:
@@ -621,7 +602,7 @@ def predict_with_mirror_tta(
     for start in range(0, len(variants), per_forward):
         selected = variants[start : start + per_forward]
         variant_images = torch.cat(
-            [flip_tensor_for_patch_axes(images_BCZYX, axes) for axes in selected]
+            [flip_spatial(images_BCZYX, axes) for axes in selected]
         )
         probabilities_flat = logits_to_probabilities(
             model(variant_images),

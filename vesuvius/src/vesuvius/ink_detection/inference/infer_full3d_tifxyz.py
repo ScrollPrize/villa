@@ -33,6 +33,8 @@ from vesuvius.ink_detection.data.geometry import (
 from vesuvius.ink_detection.data.normalization import normalize_image
 from vesuvius.ink_detection.inference.inference_runtime import (
     TargetModel,
+    flip_spatial,
+    iter_mirror_axes,
     parse_gpu_ids,
     prepare_model_for_inference,
     resolve_amp_dtype,
@@ -48,6 +50,7 @@ from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
 )
+from vesuvius.label_zarr import create_v2_array
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -505,21 +508,7 @@ def create_importance_map(
 def tta_variants(enabled: bool) -> list[tuple[int, ...]]:
     """Return the identity or all eight ZYX mirror combinations."""
 
-    if not enabled:
-        return [()]
-    return [
-        axes
-        for count in range(4)
-        for axes in itertools.combinations((0, 1, 2), count)
-    ]
-
-
-def flip_spatial(tensor, axes: Sequence[int]):
-    """Flip tensor BCZYX spatial dimensions named by ZYX axis indices."""
-
-    if not axes:
-        return tensor
-    return torch.flip(tensor, dims=[int(axis) + 2 for axis in axes])
+    return [()] if not enabled else iter_mirror_axes((0, 1, 2))
 
 
 def logits_to_probabilities(
@@ -739,30 +728,15 @@ def create_output_zarr(
     arrays = []
     for level, shape in enumerate(pyramid_shapes(shape_zyx, levels)):
         chunks = tuple(min(chunks_zyx[axis], shape[axis]) for axis in range(3))
-        if ZARR_V3:
-            array = group.create_array(
-                str(level),
-                shape=shape,
-                chunks=chunks,
-                dtype=np.uint8,
-                compressor=compressor,
-                fill_value=0,
-                overwrite=True,
-                chunk_key_encoding={"name": "v2", "separator": "/"},
-                config={"write_empty_chunks": False},
-            )
-        else:
-            array = group.create_dataset(
-                str(level),
-                shape=shape,
-                chunks=chunks,
-                dtype=np.uint8,
-                compressor=compressor,
-                fill_value=0,
-                overwrite=True,
-                dimension_separator="/",
-                write_empty_chunks=False,
-            )
+        array = create_v2_array(
+            group,
+            str(level),
+            shape=shape,
+            chunks=chunks,
+            dtype=np.uint8,
+            compressor=compressor,
+            fill_value=0,
+        )
         array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
         arrays.append(array)
     return arrays
