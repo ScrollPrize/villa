@@ -46,6 +46,8 @@ vesuvius.predict \
 | `--skip_empty_patches` / `--no_skip_empty_patches` | Toggle automatic removal of homogeneous patches.
 | `--zarr_compressor` / `--zarr_compression_level` | Configure output compression (`zstd` with level `3` by default).
 | `--scroll_id`, `--segment_id`, `--energy`, `--resolution` | Metadata when reading remote scrolls via the `Volume` helper.
+| `--cache_dir` | Directory for a persistent on-disk chunk cache for remote volumes (e.g. `~/.cache/vesuvius/chunks`). Chunks are reused by later runs and by other workers instead of being re-fetched.
+| `--cache_max_gb` | Size cap in GiB for `--cache_dir`, enforced by least-recently-used eviction (unbounded if omitted). Eviction treats the directory as cache-owned and may delete any file under it, so point it at a dedicated directory.
 | `--hf_token` | Hugging Face token for private repositories.
 | `--config-yaml` | Training YAML to resolve model architecture when the checkpoint lacks embedded metadata.
 | `--verbose` | Print detailed progress information.

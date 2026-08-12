@@ -94,6 +94,8 @@ class VCDataset(Dataset):
             cache_dir: Directory for an on-disk chunk cache, reused by later runs and
                 by other processes. Remote volumes only.
             cache_max_gb: Size cap in GiB for the disk cache. Unbounded if omitted.
+                Eviction treats cache_dir as cache-owned and may delete any file
+                under it, so point it at a dedicated directory.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
