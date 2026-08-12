@@ -1422,6 +1422,14 @@ int main(int argc, char *argv[])
         } else {
             logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
         }
+    } else if (useRemoteCache) {
+        if (auto rv = remoteVolumeVoxelSize(remoteUrl, vc::HttpAuth::from_env()); rv.has_value()) {
+            base_voxel_size = *rv;
+            hasPhysicalVoxelSize = true;
+            logPrintf(stdout, "Voxel size (from remote volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
+        } else {
+            logPrintf(stdout, "Voxel size: 1.0 (no remote metadata found; override with --voxel-size)\n");
+        }
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
     }

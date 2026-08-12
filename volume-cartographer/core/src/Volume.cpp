@@ -247,6 +247,25 @@ makeChunkCacheLevelInfo(const vc::render::OpenedChunkedZarr& opened)
 
 } // namespace
 
+std::optional<double> remoteVolumeVoxelSize(const std::string& remoteUrl, const vc::HttpAuth& auth)
+{
+    try {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
+            if (remoteMeta->contains("voxelsize") && (*remoteMeta)["voxelsize"].is_number()) {
+                const double value = (*remoteMeta)["voxelsize"].get_double();
+                if (std::isfinite(value) && value > 0.0) {
+                    return value;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        // Unreachable or malformed remote metadata is an expected miss here:
+        // the caller falls back and warns, exactly as for a local volume
+        // without metadata.
+    }
+    return std::nullopt;
+}
+
 namespace {
 
 template <typename T>

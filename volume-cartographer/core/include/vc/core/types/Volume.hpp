@@ -28,6 +28,13 @@ namespace utils { class ZarrArray; }
 
 struct CompositeParams;
 
+// Voxel size (µm) discovered from a remote volume's meta.json/metadata.json,
+// normalized the same way as remote Volume construction (voxelsize aliases,
+// scan.tomo.acquisition.detector.samplePixelSize mm->µm fallback). nullopt
+// when the metadata is unreachable or carries no usable value.
+std::optional<double> remoteVolumeVoxelSize(const std::string& remoteUrl,
+                                            const vc::HttpAuth& auth);
+
 class Volume
 {
 public:
