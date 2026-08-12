@@ -399,6 +399,9 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
     async def exists(self, key):
         cached = os.path.join(self._cache_dir, key)
         if os.path.isfile(cached):
+            # Answered from disk instead of the remote, so it counts as use.
+            if self._max_bytes:
+                _touch(cached)
             return True
         # never negative-cache store metadata: concurrent writers poll for .zarray creation
         if not _is_metadata_key(key) and os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
@@ -576,6 +579,9 @@ class DiskCacheStoreV2(MutableMapping):
     def __contains__(self, key):
         cached = os.path.join(self._cache_dir, key)
         if os.path.isfile(cached):
+            # Answered from disk instead of the remote, so it counts as use.
+            if self._max_bytes:
+                _touch(cached)
             return True
         # never negative-cache store metadata: concurrent writers poll for .zarray creation
         if not _is_metadata_key(key) and os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
