@@ -1,3 +1,4 @@
+from collections import deque
 from typing import Union, Tuple, List, Callable
 import numpy as np
 import torch
@@ -230,47 +231,40 @@ class SmearTransform(ImageOnlyTransform):
         return {}
 
     def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
-        # Pure torch implementation; runs on CPU or GPU depending on img.device
-        C = img.shape[0]
-        spatial_shape = img.shape[1:]
-        num_spatial_dims = len(spatial_shape)
+        # Pure torch implementation; runs on CPU or GPU depending on img.device.
+        # In-place: `moved` below is a view, so the slice writes update img
+        # directly and img itself is returned.
+        num_spatial_dims = img.ndim - 1
         if not (1 <= self.smear_axis <= num_spatial_dims):
             raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
+        k = self.num_prev_slices
+        if img.shape[self.smear_axis] <= k:
+            return img
 
-        local_smear_axis = self.smear_axis - 1
-        # In-place, like the module's other intensity/noise transforms:
-        # img[ch] and .permute() below are views, so the slice writes update
-        # img directly and img itself is returned.
-        for ch in range(C):
-            chan_img = img[ch]
-            if chan_img.shape[local_smear_axis] <= self.num_prev_slices:
-                continue
-            # Move the smear axis to front: build permutation
-            dims = list(range(chan_img.ndim))
-            if local_smear_axis != 0:
-                dims = [local_smear_axis] + [d for d in dims if d != local_smear_axis]
-                moved = chan_img.permute(*dims)
-            else:
-                moved = chan_img
-            N = moved.shape[0]
-            for i in range(self.num_prev_slices, N):
-                aggregated = torch.zeros_like(moved[i], dtype=torch.float32, device=moved.device)
-                count = 0
-                for j in range(i - self.num_prev_slices, i):
-                    slice_j = moved[j]
-                    # Determine shift behavior based on dimensionality of slice
-                    if slice_j.ndim == 0:
-                        shifted = slice_j
-                    elif slice_j.ndim == 1:
-                        shifted = torch.roll(slice_j, shifts=self.shift[0], dims=0)
-                    else:
-                        # Shift along first two axes of the slice
-                        s0 = self.shift[0] if len(self.shift) >= 1 else 0
-                        s1 = self.shift[1] if len(self.shift) >= 2 else 0
-                        shifted = torch.roll(slice_j, shifts=(s0, s1), dims=(0, 1))
-                    aggregated += shifted.to(aggregated.dtype)
-                    count += 1
-                if count > 0:
-                    aggregated = aggregated / float(count)
-                moved[i] = ((1 - self.alpha) * moved[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
+        # (C, ..., axis, ...) -> (N, C, plane...): slices lead, channels ride
+        # along (the per-element math is channel-independent).
+        moved = img.movedim(self.smear_axis, 0)
+        N = moved.shape[0]
+        plane_ndim = moved.ndim - 2  # dims of one channel-slice
+
+        def rolled(sl: torch.Tensor) -> torch.Tensor:
+            if plane_ndim == 0:
+                return sl
+            if plane_ndim == 1:
+                return torch.roll(sl, shifts=self.shift[0], dims=1)
+            # Shift along the first two axes of the slice
+            s0 = self.shift[0] if len(self.shift) >= 1 else 0
+            s1 = self.shift[1] if len(self.shift) >= 2 else 0
+            return torch.roll(sl, shifts=(s0, s1), dims=(1, 2))
+
+        # Each smeared slice feeds the windows after it: roll it once, reuse it.
+        window = deque(rolled(moved[j]) for j in range(k))
+        for i in range(k, N):
+            aggregated = torch.zeros_like(moved[i], dtype=torch.float32, device=moved.device)
+            for shifted in window:
+                aggregated += shifted.to(aggregated.dtype)
+            aggregated = aggregated / float(k)
+            moved[i] = ((1 - self.alpha) * moved[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
+            window.popleft()
+            window.append(rolled(moved[i]))
         return img
