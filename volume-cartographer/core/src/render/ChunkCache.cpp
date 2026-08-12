@@ -151,6 +151,87 @@ std::string fetchErrorMessage(const ChunkFetchResult& fetch)
 
 } // namespace
 
+struct ChunkCacheService::Impl {
+    Impl(std::size_t capacity,
+         std::shared_ptr<DecodedChunkCacheBudget> budget,
+         bool createBudget)
+        : decodedByteCapacity(capacity)
+        , decodedByteBudget(std::move(budget))
+    {
+        if (!decodedByteBudget && createBudget)
+            decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(capacity);
+    }
+
+    std::size_t decodedByteCapacity = 0;
+    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<void>> sources;
+    std::uint64_t nextSourceId = 1;
+    std::atomic<std::int64_t> nextViewEpoch{1};
+};
+
+ChunkCacheService::ChunkCacheService(
+    std::size_t decodedByteCapacity,
+    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget)
+    : impl_(std::make_shared<Impl>(decodedByteCapacity,
+                                  std::move(decodedByteBudget), true))
+{
+}
+
+ChunkCacheService::ChunkCacheService(
+    std::size_t decodedByteCapacity,
+    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
+    bool createDecodedByteBudget)
+    : impl_(std::make_shared<Impl>(decodedByteCapacity,
+                                  std::move(decodedByteBudget),
+                                  createDecodedByteBudget))
+{
+}
+
+ChunkCacheService::~ChunkCacheService()
+{
+    std::vector<std::shared_ptr<ChunkCache::State>> states;
+    {
+        std::lock_guard lock(impl_->mutex);
+        states.reserve(impl_->sources.size());
+        for (auto& [identity, state] : impl_->sources) {
+            (void)identity;
+            states.push_back(std::static_pointer_cast<ChunkCache::State>(state));
+        }
+        impl_->sources.clear();
+    }
+    for (const auto& state : states) {
+        ChunkCache::invalidateState(state);
+        ChunkCache::unregisterStateBudget(*state);
+    }
+}
+
+std::shared_ptr<DecodedChunkCacheBudget>
+ChunkCacheService::decodedByteBudget() const
+{
+    return impl_->decodedByteBudget;
+}
+
+std::size_t ChunkCacheService::sourceCount() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return impl_->sources.size();
+}
+
+bool ChunkCacheService::invalidateSource(std::string_view sourceIdentity)
+{
+    std::shared_ptr<ChunkCache::State> state;
+    {
+        std::lock_guard lock(impl_->mutex);
+        const auto it = impl_->sources.find(std::string(sourceIdentity));
+        if (it == impl_->sources.end())
+            return false;
+        state = std::static_pointer_cast<ChunkCache::State>(it->second);
+    }
+    ChunkCache::invalidateState(state);
+    return true;
+}
+
 std::uint64_t ChunkCache::nextSchedulerGroup()
 {
     static std::atomic<std::uint64_t> next{1};
@@ -170,8 +251,53 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                        double fillValue,
                        ChunkDtype dtype,
                        Options options)
-    : state_(std::make_shared<State>(std::move(levels), std::move(fetchers), fillValue, dtype, std::move(options)))
+    : ChunkCache(
+          std::shared_ptr<ChunkCacheService>(new ChunkCacheService(
+              options.decodedByteCapacity, options.decodedByteBudget, false)),
+          "private:" + std::to_string(nextSchedulerGroup()),
+          std::move(levels), std::move(fetchers), fillValue, dtype, options)
 {
+}
+
+ChunkCache::ChunkCache(std::shared_ptr<ChunkCacheService> service,
+                       std::string sourceIdentity,
+                       std::vector<LevelInfo> levels,
+                       std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
+                       double fillValue,
+                       ChunkDtype dtype,
+                       Options options)
+    : service_(std::move(service))
+{
+    if (!service_)
+        throw std::invalid_argument("ChunkCache requires a cache service");
+    if (sourceIdentity.empty())
+        throw std::invalid_argument("ChunkCache requires a non-empty source identity");
+    options.decodedByteCapacity = service_->impl_->decodedByteCapacity;
+    options.decodedByteBudget = service_->impl_->decodedByteBudget;
+    options.compressPersistentCache =
+        options.compressPersistentCache || persistentCompressionDefault();
+    options.cacheQuantBinWidth = std::max(
+        options.cacheQuantBinWidth, persistentQuantizationDefault());
+
+    std::lock_guard serviceLock(service_->impl_->mutex);
+    auto existing = service_->impl_->sources.find(sourceIdentity);
+    if (existing != service_->impl_->sources.end()) {
+        auto state = std::static_pointer_cast<State>(existing->second);
+        if (!metadataCompatible(*state, levels, fillValue, dtype, options)) {
+            throw std::invalid_argument(
+                "ChunkCache source was registered with incompatible metadata: " +
+                sourceIdentity);
+        }
+        state_ = std::move(state);
+        return;
+    }
+
+    const VolumeSourceId sourceId{service_->impl_->nextSourceId++};
+    state_ = std::make_shared<State>(
+        std::move(levels), std::move(fetchers), fillValue, dtype,
+        std::move(options), sourceId, sourceIdentity);
+    state_->viewEpoch_ = service_->impl_->nextViewEpoch.fetch_add(
+        1, std::memory_order_relaxed);
     if (!state_->options_.decodedByteBudget)
         state_->options_.decodedByteBudget = decodedByteBudgetDefault();
     if (state_->levels_.empty())
@@ -194,10 +320,6 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                 throw std::invalid_argument("ChunkCache chunk shape must be positive");
         }
     }
-    state_->options_.compressPersistentCache =
-        state_->options_.compressPersistentCache || persistentCompressionDefault();
-    state_->options_.cacheQuantBinWidth = std::max(
-        state_->options_.cacheQuantBinWidth, persistentQuantizationDefault());
     if (state_->options_.persistentCacheBudgetRoot &&
         state_->options_.persistentCachePath)
         state_->persistentBudget_ = PersistentZarrCacheBudget::findForPath(
@@ -218,6 +340,7 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                 },
             });
     }
+    service_->impl_->sources.emplace(state_->sourceIdentity_, state_);
 }
 
 namespace {
@@ -263,11 +386,60 @@ std::shared_ptr<DecodedChunkCacheBudget> ChunkCache::decodedByteBudgetDefault()
 
 ChunkCache::~ChunkCache()
 {
-    auto budget = state_->options_.decodedByteBudget;
-    const auto registration = state_->decodedBudgetRegistration_;
-    invalidate();
-    if (budget && registration != 0)
-        budget->unregisterCache(registration);
+    std::vector<ChunkReadyCallbackId> listenerIds;
+    {
+        std::lock_guard facadeLock(facadeMutex_);
+        listenerIds.assign(listenerIds_.begin(), listenerIds_.end());
+        listenerIds_.clear();
+    }
+    if (!listenerIds.empty()) {
+        std::lock_guard stateLock(state_->mutex_);
+        for (const auto id : listenerIds)
+            state_->callbacks_.erase(id);
+    }
+}
+
+VolumeSourceId ChunkCache::sourceId() const noexcept
+{
+    return state_->sourceId_;
+}
+
+ChunkKey ChunkCache::sourceKey(const State& state, ChunkKey key) noexcept
+{
+    key.sourceId = state.sourceId_;
+    return key;
+}
+
+ChunkKey ChunkCache::fetcherKey(ChunkKey key) noexcept
+{
+    key.sourceId = {};
+    return key;
+}
+
+bool ChunkCache::metadataCompatible(const State& state,
+                                    const std::vector<LevelInfo>& levels,
+                                    double fillValue,
+                                    ChunkDtype dtype,
+                                    const Options& options)
+{
+    if (state.levels_.size() != levels.size() ||
+        state.dtype_ != dtype || state.fillValue_ != fillValue ||
+        state.options_.persistentCachePath != options.persistentCachePath ||
+        state.options_.persistentCacheBudgetRoot != options.persistentCacheBudgetRoot ||
+        state.options_.compressPersistentCache != options.compressPersistentCache ||
+        state.options_.cacheQuantBinWidth != options.cacheQuantBinWidth ||
+        state.options_.detectAllFillChunks != options.detectAllFillChunks) {
+        return false;
+    }
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+        if (state.levels_[i].shape != levels[i].shape ||
+            state.levels_[i].chunkShape != levels[i].chunkShape ||
+            state.levels_[i].transform.scaleFromLevel0 != levels[i].transform.scaleFromLevel0 ||
+            state.levels_[i].transform.offsetFromLevel0 != levels[i].transform.offsetFromLevel0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int ChunkCache::numLevels() const
@@ -303,7 +475,7 @@ IChunkedArray::LevelTransform ChunkCache::levelTransform(int level) const
 ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
 {
     auto state = state_;
-    const ChunkKey key{level, iz, iy, ix};
+    const ChunkKey key{level, iz, iy, ix, state->sourceId_};
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
@@ -337,7 +509,7 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
 ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
 {
     auto state = state_;
-    const ChunkKey key{level, iz, iy, ix};
+    const ChunkKey key{level, iz, iy, ix, state->sourceId_};
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
@@ -366,7 +538,7 @@ ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 {
     auto state = state_;
-    const ChunkKey key{level, iz, iy, ix};
+    const ChunkKey key{level, iz, iy, ix, state->sourceId_};
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
@@ -396,7 +568,8 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
 {
     auto state = state_;
     std::unique_lock lock(state->mutex_);
-    for (const auto& key : keys) {
+    for (auto key : keys) {
+        key = sourceKey(*state, key);
         if (!isValidKey(*state, key))
             continue;
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
@@ -411,7 +584,8 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
         return;
 
     state->cv_.wait(lock, [&] {
-        for (const auto& key : keys) {
+        for (auto key : keys) {
+            key = sourceKey(*state, key);
             if (!isValidKey(*state, key))
                 continue;
             auto it = state->entries_.find(key);
@@ -425,17 +599,19 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
 IChunkedArray::ChunkReadyCallbackId ChunkCache::addChunkReadyListener(ChunkReadyCallback cb)
 {
     auto state = state_;
-    std::lock_guard lock(state->mutex_);
+    std::scoped_lock lock(facadeMutex_, state->mutex_);
     const auto id = state->nextCallbackId_++;
     state->callbacks_.emplace(id, std::move(cb));
+    listenerIds_.insert(id);
     return id;
 }
 
 void ChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
 {
     auto state = state_;
-    std::lock_guard lock(state->mutex_);
+    std::scoped_lock lock(facadeMutex_, state->mutex_);
     state->callbacks_.erase(id);
+    listenerIds_.erase(id);
 }
 
 ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
@@ -455,11 +631,12 @@ ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
     result.valid = static_cast<bool>(fetcher);
     if (!result.valid)
         return result;
-    result.sourceChunkKey = fetcher->sourceChunkKey(key);
+    const ChunkKey externalKey = fetcherKey(key);
+    result.sourceChunkKey = fetcher->sourceChunkKey(externalKey);
     result.persistentPath = persistentPath(*state, key);
     result.persistentEmptyPath = persistentEmptyPath(*state, key);
-    result.persistentExtension = fetcher->persistentCacheExtension(key);
-    result.sourcePayloadMatchesPersistentCache = fetcher->sourcePayloadMatchesPersistentCache(key);
+    result.persistentExtension = fetcher->persistentCacheExtension(externalKey);
+    result.sourcePayloadMatchesPersistentCache = fetcher->sourcePayloadMatchesPersistentCache(externalKey);
     return result;
 }
 
@@ -516,7 +693,11 @@ ChunkCache::Stats ChunkCache::stats() const
 
 void ChunkCache::invalidate()
 {
-    auto state = state_;
+    invalidateState(state_);
+}
+
+void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
+{
     std::uint64_t schedulerEpoch = 0;
     {
         std::lock_guard lock(state->mutex_);
@@ -540,18 +721,31 @@ void ChunkCache::invalidate()
     state->cv_.notify_all();
 }
 
+void ChunkCache::unregisterStateBudget(State& state)
+{
+    if (state.options_.decodedByteBudget &&
+        state.decodedBudgetRegistration_ != 0) {
+        state.options_.decodedByteBudget->unregisterCache(
+            state.decodedBudgetRegistration_);
+        state.decodedBudgetRegistration_ = 0;
+    }
+}
+
 void ChunkCache::beginViewRequest(bool discardPending)
 {
     auto state = state_;
+    if (discardPending && service_.use_count() > 1) {
+        // Shared source state may be serving another workspace/overlay. Newer
+        // requests still receive a newer priority epoch, but one facade must
+        // not erase another facade's unresolved work.
+        discardPending = false;
+    }
+    const auto viewEpoch = service_->impl_->nextViewEpoch.fetch_add(
+        1, std::memory_order_relaxed);
     std::uint64_t schedulerEpoch = 0;
     {
         std::lock_guard lock(state->mutex_);
-        if (state->viewEpoch_ ==
-            std::numeric_limits<utils::PriorityThreadPool::Priority>::max()) {
-            state->viewEpoch_ = 1;
-        } else {
-            ++state->viewEpoch_;
-        }
+        state->viewEpoch_ = viewEpoch;
         if (discardPending) {
             schedulerEpoch = ++state->schedulerEpoch_;
             for (auto it = state->entries_.begin(); it != state->entries_.end();) {
@@ -705,7 +899,7 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
     try {
         if (auto cached = readPersistent(*state, key)) {
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))
-                        ->decodePersistentBytes(key, std::move(*cached));
+                        ->decodePersistentBytes(fetcherKey(key), std::move(*cached));
             resolved = fetch.status == ChunkFetchStatus::Found &&
                        fetch.bytes.size() == expectedChunkBytes(*state, key);
         } else if (readPersistentEmpty(*state, key)) {
@@ -775,12 +969,13 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
                 std::lock_guard lock(state->mutex_);
                 ++state->remoteFetchesInFlight_;
             }
-            return state->fetchers_.at(static_cast<std::size_t>(key.level))->fetch(key);
+            return state->fetchers_.at(static_cast<std::size_t>(key.level))
+                ->fetch(fetcherKey(key));
         };
 
         if (auto cached = readPersistent(*state, key)) {
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))
-                        ->decodePersistentBytes(key, std::move(*cached));
+                        ->decodePersistentBytes(fetcherKey(key), std::move(*cached));
             if (fetch.status == ChunkFetchStatus::Found &&
                 fetch.bytes.size() == expectedChunkBytes(*state, key)) {
                 loadedFromPersistentCache = true;
@@ -1253,7 +1448,7 @@ std::filesystem::path ChunkCache::persistentPath(const State& state, const Chunk
            std::to_string(key.iy) /
            (std::to_string(key.ix) +
             state.fetchers_.at(static_cast<std::size_t>(key.level))
-                ->persistentCacheExtension(key));
+                ->persistentCacheExtension(fetcherKey(key)));
 }
 
 std::filesystem::path ChunkCache::persistentCompressedPath(const State& state, const ChunkKey& key)
@@ -1268,7 +1463,7 @@ std::filesystem::path ChunkCache::persistentCompressedPath(const State& state, c
 bool ChunkCache::persistentEntryIsRaw(const State& state, const ChunkKey& key)
 {
     return state.fetchers_.at(static_cast<std::size_t>(key.level))
-               ->persistentCacheExtension(key) == ".bin";
+               ->persistentCacheExtension(fetcherKey(key)) == ".bin";
 }
 
 std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const ChunkKey& key)

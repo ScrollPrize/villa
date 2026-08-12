@@ -1,4 +1,6 @@
 #include "CState.hpp"
+
+#include "vc/core/render/ChunkCache.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 
@@ -183,11 +185,19 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 CState::CState(
     size_t cacheSizeBytes,
     QObject* parent,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget)
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget,
+    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService)
     : QObject(parent)
     , _cacheSizeBytes(cacheSizeBytes)
     , _decodedCacheBudget(std::move(decodedCacheBudget))
+    , _chunkCacheService(std::move(chunkCacheService))
 {
+    if (!_chunkCacheService) {
+        _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
+            _cacheSizeBytes, _decodedCacheBudget);
+    }
+    if (!_decodedCacheBudget)
+        _decodedCacheBudget = _chunkCacheService->decodedByteBudget();
     _pointCollection = new VCCollection(this);
 
     setSurface("xy plane",
@@ -292,9 +302,18 @@ CState::decodedCacheBudget() const
     return _decodedCacheBudget;
 }
 
+std::shared_ptr<vc::render::ChunkCacheService>
+CState::chunkCacheService() const
+{
+    return _chunkCacheService;
+}
+
 void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
-    if (vol && _cacheSizeBytes > 0) {
+    if (!vol)
+        return;
+    vol->setChunkCacheService(_chunkCacheService);
+    if (_cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes, _decodedCacheBudget);
     }
 }

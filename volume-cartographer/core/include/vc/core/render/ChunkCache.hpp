@@ -15,12 +15,42 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vc::render {
 
 class PersistentZarrCacheBudget;
+class ChunkCache;
+
+// Application-owned decoded chunk-cache service. Source identity strings are
+// interned only when a facade is constructed; all hot lookups use the numeric
+// VolumeSourceId stored on the facade.
+class ChunkCacheService final {
+public:
+    explicit ChunkCacheService(
+        std::size_t decodedByteCapacity,
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget = {});
+    ~ChunkCacheService();
+
+    ChunkCacheService(const ChunkCacheService&) = delete;
+    ChunkCacheService& operator=(const ChunkCacheService&) = delete;
+
+    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget() const;
+    std::size_t sourceCount() const;
+    bool invalidateSource(std::string_view sourceIdentity);
+
+private:
+    friend class ChunkCache;
+    ChunkCacheService(
+        std::size_t decodedByteCapacity,
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
+        bool createDecodedByteBudget);
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
+};
 
 class ChunkCache final : public IChunkedArray {
 public:
@@ -102,7 +132,16 @@ public:
                double fillValue,
                ChunkDtype dtype,
                Options options);
+    ChunkCache(std::shared_ptr<ChunkCacheService> service,
+               std::string sourceIdentity,
+               std::vector<LevelInfo> levels,
+               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
+               double fillValue,
+               ChunkDtype dtype,
+               Options options);
     ~ChunkCache() override;
+
+    VolumeSourceId sourceId() const noexcept;
 
     int numLevels() const override;
     std::array<int, 3> shape(int level) const override;
@@ -147,6 +186,7 @@ public:
     static std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudgetDefault();
 
 private:
+    friend class ChunkCacheService;
     enum class EntryStatus {
         InFlight,
         Missing,
@@ -176,12 +216,16 @@ private:
               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
               double fillValue,
               ChunkDtype dtype,
-              Options options)
+              Options options,
+              VolumeSourceId sourceId,
+              std::string sourceIdentity)
             : levels_(std::move(levels))
             , fetchers_(std::move(fetchers))
             , fillValue_(fillValue)
             , dtype_(dtype)
             , options_(std::move(options))
+            , sourceId_(sourceId)
+            , sourceIdentity_(std::move(sourceIdentity))
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
         {
             unresolvedFetchesByLevel_.resize(levels_.size(), 0);
@@ -192,6 +236,8 @@ private:
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
+        VolumeSourceId sourceId_{};
+        std::string sourceIdentity_;
 
         mutable std::mutex mutex_;
         std::condition_variable cv_;
@@ -276,8 +322,21 @@ private:
     static void notifyListeners(const std::shared_ptr<State>& state);
     static void waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key);
     static std::uint64_t nextSchedulerGroup();
+    static void invalidateState(const std::shared_ptr<State>& state);
+    static void unregisterStateBudget(State& state);
 
+    static ChunkKey sourceKey(const State& state, ChunkKey key) noexcept;
+    static ChunkKey fetcherKey(ChunkKey key) noexcept;
+    static bool metadataCompatible(const State& state,
+                                   const std::vector<LevelInfo>& levels,
+                                   double fillValue,
+                                   ChunkDtype dtype,
+                                   const Options& options);
+
+    std::shared_ptr<ChunkCacheService> service_;
     std::shared_ptr<State> state_;
+    mutable std::mutex facadeMutex_;
+    std::unordered_set<ChunkReadyCallbackId> listenerIds_;
 };
 
 } // namespace vc::render

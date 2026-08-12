@@ -5,6 +5,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
 
@@ -199,6 +200,75 @@ TEST_CASE("Volume: final cache client release drops decoded chunks")
     std::weak_ptr<vc::render::ChunkCache> weakCache = cache;
     cache.reset();
     CHECK(weakCache.expired());
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: shared cache service keeps decoded chunks across release")
+{
+    auto d = tmpDir("cache-service-client");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x3c});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto service =
+        std::make_shared<vc::render::ChunkCacheService>(64 * 1024);
+    v->setChunkCacheService(service);
+    v->setCacheBudget(64 * 1024, service->decodedByteBudget());
+    v->retainCacheClient();
+    auto first = v->sharedChunkCache();
+    REQUIRE(first->getChunkBlocking(0, 0, 0, 0).status ==
+            vc::render::ChunkStatus::Data);
+    const auto sourceId = first->sourceId();
+    std::weak_ptr<vc::render::ChunkCache> weakFirst = first;
+    v->releaseCacheClient();
+    first.reset();
+
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
+    v->retainCacheClient();
+    auto reacquired = v->sharedChunkCache();
+    CHECK(reacquired == weakFirst.lock());
+    CHECK(reacquired->sourceId() == sourceId);
+    CHECK(reacquired->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+    v->releaseCacheClient();
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: writes invalidate service state without a live facade")
+{
+    auto d = tmpDir("cache-service-write");
+    auto reader = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(reader);
+    std::vector<std::byte> chunk(reader->chunkByteSize(0), std::byte{0x21});
+    reader->writeChunk(0, {0, 0, 0}, chunk);
+    auto writer = Volume::New(d);
+    REQUIRE(writer);
+
+    auto service =
+        std::make_shared<vc::render::ChunkCacheService>(64 * 1024);
+    reader->setChunkCacheService(service);
+    reader->setCacheBudget(64 * 1024, service->decodedByteBudget());
+    writer->setChunkCacheService(service);
+    writer->setCacheBudget(64 * 1024, service->decodedByteBudget());
+    reader->retainCacheClient();
+    auto first = reader->sharedChunkCache();
+    auto initial = first->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(initial.status == vc::render::ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*initial.bytes)[0]) == 0x21);
+    reader->releaseCacheClient();
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
+
+    std::fill(chunk.begin(), chunk.end(), std::byte{0x43});
+    // The writer shares the source identity but has never acquired a facade.
+    writer->writeChunk(0, {0, 0, 0}, chunk);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+
+    reader->retainCacheClient();
+    auto refreshed = reader->sharedChunkCache()->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(refreshed.status == vc::render::ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*refreshed.bytes)[0]) == 0x43);
+    reader->releaseCacheClient();
     fs::remove_all(d);
 }
 

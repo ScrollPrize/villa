@@ -3,16 +3,13 @@
 #include "CState.hpp"
 #include "elements/DownloadQueueStats.hpp"
 #include "elements/ViewerStatsBar.hpp"
-#include "RemoteVolumeCachePaths.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "render/ChunkCache.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/SurfaceCache.hpp"
-#include "FrameChunkFootprint.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -487,17 +484,6 @@ QString formatByteSize(std::size_t bytes)
     return QString("%1 B").arg(bytes);
 }
 
-constexpr std::size_t kOverlayDecodedCacheCapacity =
-    1ULL * 1024ULL * 1024ULL * 1024ULL;
-
-std::shared_ptr<vc::render::DecodedChunkCacheBudget> overlayDecodedCacheBudget()
-{
-    static auto budget =
-        std::make_shared<vc::render::DecodedChunkCacheBudget>(
-            kOverlayDecodedCacheCapacity);
-    return budget;
-}
-
 float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
 {
     const int maxLevel = std::max(0, numLevels - 1);
@@ -536,90 +522,20 @@ float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewpor
     return std::clamp(std::min(scaleU, scaleV) * kFitPadding, kMinScale, kMaxScale);
 }
 
-std::shared_ptr<vc::render::ChunkCache> makeOverlayChunkCacheForVolume(
+std::shared_ptr<vc::render::ChunkCache> sharedOverlayChunkCacheForVolume(
     const std::shared_ptr<Volume>& volume,
     const CState* state)
 {
     if (!volume)
         return nullptr;
-
-    vc::render::ChunkCache::Options options;
-    options.decodedByteCapacity = kOverlayDecodedCacheCapacity;
-    options.decodedByteBudget = overlayDecodedCacheBudget();
-    options.maxConcurrentReads = 16;
-    options.detectAllFillChunks = volume->isRemote();
-    if (volume->isRemote()) {
-        const auto budgetRoot = volume->remoteCacheRoot().empty()
-            ? vc3d::remoteCacheRootForState(state)
-            : volume->remoteCacheRoot();
-        options.persistentCachePath = vc3d::persistentCacheDirForVolume(volume, state);
-        options.persistentCacheBudgetRoot = budgetRoot;
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
-        vc::render::PersistentZarrCacheBudget::Limits limits;
-        const auto maximumGiB = settings.value(
-            perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong();
-        if (maximumGiB > 0)
-            limits.maximumBytes = maximumGiB * gib;
-        limits.minimumFreeBytes = settings.value(
-            perf::REMOTE_CACHE_MIN_FREE_GIB,
-            perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
-        vc::render::PersistentZarrCacheBudget::configure(budgetRoot, limits);
-    }
-
-    return volume->createChunkCache(std::move(options));
-}
-
-struct OverlayChunkCacheLease {
-    ~OverlayChunkCacheLease()
-    {
-        if (cache)
-            cache->invalidate();
-    }
-
-    std::shared_ptr<vc::render::ChunkCache> cache;
-};
-
-std::shared_ptr<OverlayChunkCacheLease> sharedOverlayChunkCacheForVolume(
-    const std::shared_ptr<Volume>& volume,
-    const CState* state)
-{
-    if (!volume)
-        return nullptr;
-
-    const std::string key =
-        vc3d::normalizedVolumeCacheIdentity(volume) +
-        "|overlay-cache=" +
-        (volume->isRemote()
-             ? vc3d::remoteCacheRootForState(state).string()
-             : std::string{});
-
-    static std::mutex cacheMutex;
-    static std::unordered_map<std::string, std::weak_ptr<OverlayChunkCacheLease>> caches;
-
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        auto it = caches.find(key);
-        if (it != caches.end()) {
-            if (auto lease = it->second.lock())
-                return lease;
-            caches.erase(it);
+    if (state) {
+        volume->setChunkCacheService(state->chunkCacheService());
+        if (state->cacheSizeBytes() > 0) {
+            volume->setCacheBudget(state->cacheSizeBytes(),
+                                   state->decodedCacheBudget());
         }
     }
-
-    auto cache = makeOverlayChunkCacheForVolume(volume, state);
-    if (!cache)
-        return nullptr;
-    auto lease = std::make_shared<OverlayChunkCacheLease>();
-    lease->cache = std::move(cache);
-
-    std::lock_guard<std::mutex> lock(cacheMutex);
-    auto& slot = caches[key];
-    if (auto existing = slot.lock())
-        return existing;
-    slot = lease;
-    return lease;
+    return volume->sharedChunkCache();
 }
 
 } // namespace
@@ -790,7 +706,6 @@ void CChunkedVolumeViewer::quiesceForClose()
         _overlayChunkCbId = 0;
     }
     _overlayChunkArray.reset();
-    _overlayChunkCacheOwner.reset();
     // Frees tiles and joins any in-flight fill before the widget goes away.
     dropSurfaceCaches();
 }
@@ -912,83 +827,10 @@ std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
     return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
 }
 
-std::size_t CChunkedVolumeViewer::estimatedFrameChunkFootprintBytes() const
-{
-    if (!_volume)
-        return 0;
-
-    const int fbW = !_framebuffer.isNull()
-        ? _framebuffer.width()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
-    const int fbH = !_framebuffer.isNull()
-        ? _framebuffer.height()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
-    auto surf = _surfWeak.lock();
-    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    // The composite layer stack thickens the frame along the view normal, and
-    // plane composite is available in spiral too.
-    double thickness = 1.0;
-    if (plane) {
-        if (_compositeSettings.planeEnabled && !streamingCompositeUnsupported()) {
-            thickness += double(std::max(0, _compositeSettings.planeLayersFront) +
-                                std::max(0, _compositeSettings.planeLayersBehind));
-        }
-    } else if (_compositeSettings.enabled && !streamingCompositeUnsupported()) {
-        thickness += double(std::max(0, _compositeSettings.layersFront) +
-                            std::max(0, _compositeSettings.layersBehind));
-    }
-
-    // Note there is no camera scale here, by construction: see
-    // FrameChunkFootprint.hpp for why a scale-dependent span is a bug.
-    if (!plane) {
-        return vc3d::surfaceFrameChunkFootprintBytes(_volume->chunkShape(0),
-                                                     _volume->dtypeSize(), fbW, fbH,
-                                                     thickness);
-    }
-
-    const cv::Vec3f vx = plane->basisX();
-    const cv::Vec3f vy = plane->basisY();
-    const cv::Vec3f n = plane->normal({0, 0, 0});
-    vc3d::PlaneFrameGeometry frame;
-    frame.fbW = fbW;
-    frame.fbH = fbH;
-    frame.basisX = {double(vx[0]), double(vx[1]), double(vx[2])};
-    frame.basisY = {double(vy[0]), double(vy[1]), double(vy[2])};
-    frame.normal = {double(n[0]), double(n[1]), double(n[2])};
-    frame.layerThicknessVoxels = thickness;
-    return vc3d::planeFrameChunkFootprintBytes(_volume->chunkShape(0), _volume->dtypeSize(),
-                                               frame);
-}
-
-std::size_t CChunkedVolumeViewer::estimatedSurfaceTileChunkFootprintBytes() const
-{
-    if (!_volume)
-        return 0;
-    return vc3d::surfaceTileFillChunkFootprintBytes(
-        _volume->chunkShape(0), _volume->dtypeSize(), vc::render::SurfaceCache::kTileSize,
-        /*bandVoxels=*/32,
-        /*concurrentTiles=*/vc::render::SurfaceCache::fillWorkerCount());
-}
-
-void CChunkedVolumeViewer::noteChunkCacheFootprint()
-{
-    if (!_viewerManager || !_volume)
-        return;
-    if (_viewerManager->chunkCachePolicy() != ViewerManager::ChunkCachePolicy::PrivateBounded)
-        return;
-    _viewerManager->noteChunkFootprint(ViewerManager::ChunkCachePool::PlaneViews,
-                                       estimatedFrameChunkFootprintBytes());
-    if (_surfaceCacheBudgetBytes > 0) {
-        _viewerManager->noteChunkFootprint(ViewerManager::ChunkCachePool::SurfaceTiles,
-                                           estimatedSurfaceTileChunkFootprintBytes());
-    }
-}
-
 void CChunkedVolumeViewer::refreshChunkSource()
 {
     if (_closing || !_volume || !_viewerManager)
         return;
-    noteChunkCacheFootprint();
     auto desired = _viewerManager->chunkCacheFor(_volume,
                                                  ViewerManager::ChunkCachePool::PlaneViews);
     if (desired == _chunkArray)
@@ -1009,7 +851,6 @@ void CChunkedVolumeViewer::rebuildChunkArray()
     if (!_volume)
         return;
 
-    noteChunkCacheFootprint();
     try {
         // Under the default policy this is exactly _volume->sharedChunkCache().
         _chunkArray = _viewerManager
@@ -1130,11 +971,8 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         // Identity unchanged; only the overlay channel may need work.
     } else {
         dropSurfaceCaches();
-        // The filler reads through its own bounded pool, not the plane views':
-        // ~8 concurrent tile jobs have a live working set the same order as one
-        // plane frame, so sharing one pool would have plane panning and tile
-        // filling continuously evict each other.
-        noteChunkCacheFootprint();
+        // Derived surface tiles remain separate; raw source chunks use the
+        // application-wide regular cache.
         auto fillerArray = _viewerManager
             ? _viewerManager->chunkCacheFor(_volume,
                                             ViewerManager::ChunkCachePool::SurfaceTiles)
@@ -1144,12 +982,6 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         vc::render::SurfaceCache::Options options;
         options.byteCapacity = _surfaceCacheBudgetBytes;
         options.sampling = _samplingMethod;
-        // fillerArray is the manager's dedicated SurfaceTiles pool. Let a new
-        // pan supersede unresolved dependencies queued by the previous view.
-        options.supersedeChunkRequests =
-            _viewerManager &&
-            _viewerManager->chunkCachePolicy() ==
-                ViewerManager::ChunkCachePolicy::PrivateBounded;
         try {
             _surfaceCache = std::make_shared<vc::render::SurfaceCache>(fillerArray, quad,
                                                                       options);
@@ -1207,16 +1039,6 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
     overlayOptions.sampling = _overlaySamplingMethod;
     overlayOptions.geometry = _surfaceGeometryTiles;
     auto overlayFillerArray = _overlayChunkArray;
-    if (_viewerManager &&
-        _viewerManager->chunkCachePolicy() ==
-            ViewerManager::ChunkCachePolicy::PrivateBounded) {
-        if (auto dedicated = _viewerManager->chunkCacheFor(
-                _overlayVolume,
-                ViewerManager::ChunkCachePool::OverlaySurfaceTiles)) {
-            overlayFillerArray = std::move(dedicated);
-            overlayOptions.supersedeChunkRequests = true;
-        }
-    }
     try {
         _overlaySurfaceCache = std::make_shared<vc::render::SurfaceCache>(
             overlayFillerArray, quad, overlayOptions);
@@ -2972,18 +2794,12 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     dropOverlaySurfaceCache();
     _overlayVolume = std::move(volume);
     _overlayChunkArray.reset();
-    _overlayChunkCacheOwner.reset();
     if (_overlayVolume) {
         try {
-            auto lease =
+            _overlayChunkArray =
                 sharedOverlayChunkCacheForVolume(_overlayVolume, _state);
-            if (lease) {
-                _overlayChunkArray = lease->cache;
-                _overlayChunkCacheOwner = std::move(lease);
-            }
         } catch (const std::exception&) {
             _overlayChunkArray.reset();
-            _overlayChunkCacheOwner.reset();
         }
         if (_overlayChunkArray) {
             QPointer<CChunkedVolumeViewer> guard(this);

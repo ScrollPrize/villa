@@ -470,7 +470,11 @@ auto main(int argc, char* argv[]) -> int
 
     int rc = 0;
     {
-        CWindow aWin(cacheSizeGB, benchOptions);
+        const std::size_t cacheSizeBytes =
+            cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
+        auto chunkCacheService =
+            std::make_shared<vc::render::ChunkCacheService>(cacheSizeBytes);
+        CWindow aWin(cacheSizeGB, benchOptions, std::move(chunkCacheService));
 
         if (parser.isSet(volumePackageOption)) {
             QString errorMessage;

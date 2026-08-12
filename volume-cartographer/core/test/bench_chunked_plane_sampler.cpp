@@ -4,6 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 
@@ -22,7 +23,10 @@
 namespace {
 
 using vc::render::ChunkDtype;
+using vc::render::ChunkCache;
 using vc::render::ChunkedPlaneSampler;
+using vc::render::ChunkFetchResult;
+using vc::render::ChunkFetchStatus;
 using vc::render::ChunkKey;
 using vc::render::ChunkKeyHash;
 using vc::render::ChunkResult;
@@ -85,6 +89,31 @@ private:
     std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks_;
 };
 
+class SyntheticChunkFetcher final : public vc::render::IChunkFetcher {
+public:
+    explicit SyntheticChunkFetcher(std::array<int, 3> chunkShape)
+        : chunkShape_(chunkShape)
+    {
+    }
+
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        const std::size_t n = std::size_t(chunkShape_[0]) *
+                              std::size_t(chunkShape_[1]) *
+                              std::size_t(chunkShape_[2]);
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes.resize(n);
+        const uint8_t seed = uint8_t((key.iz * 73 + key.iy * 19 + key.ix * 7) & 0xFF);
+        for (std::size_t i = 0; i < n; ++i)
+            result.bytes[i] = std::byte(uint8_t(seed + uint8_t(i)));
+        return result;
+    }
+
+private:
+    std::array<int, 3> chunkShape_;
+};
+
 constexpr int kSize = 1024;
 constexpr int kFrames = 30;
 constexpr int kReps = 9;  // best-of-N; min is the least-interfered run
@@ -107,7 +136,7 @@ struct ScenarioResult {
 // Drives `kFrames` independent sampler calls (each rebuilds its own
 // LocalChunkCache, like a real repaint). originStep/scaleGrowth let a
 // scenario model panning vs. zooming.
-ScenarioResult runScenario(DataChunkedArray& array,
+ScenarioResult runScenario(IChunkedArray& array,
                             vc::Sampling sampling,
                             float originStep,
                             float scaleGrowth)
@@ -205,4 +234,42 @@ TEST_CASE("ChunkedPlaneSampler bench: data-chunk hot path")
     const double pixels = double(kSize) * double(kSize) * double(kFrames);
     CHECK(pixels / triPan.minSeconds / 1e6 > 10.0);
     CHECK(pixels / nnPan.minSeconds / 1e6 > 10.0);
+}
+
+TEST_CASE("ChunkedPlaneSampler bench: warmed ChunkCache hot path")
+{
+    constexpr std::array<int, 3> shape{1024, 1024, 1024};
+    constexpr std::array<int, 3> chunkShape{128, 128, 128};
+    ChunkCache::LevelInfo level;
+    level.shape = shape;
+    level.chunkShape = chunkShape;
+    ChunkCache::Options options;
+    options.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+    options.detectAllFillChunks = false;
+    auto fetcher = std::make_shared<SyntheticChunkFetcher>(chunkShape);
+    ChunkCache cache({level}, {std::move(fetcher)}, 0.0, ChunkDtype::UInt8,
+                     std::move(options));
+
+    std::vector<ChunkKey> warmKeys;
+    for (int iz = 0; iz <= 1; ++iz) {
+        for (int iy = 0; iy < 8; ++iy) {
+            for (int ix = 0; ix < 8; ++ix)
+                warmKeys.push_back({0, iz, iy, ix});
+        }
+    }
+    cache.prefetchChunks(warmKeys, true);
+
+    const ScenarioResult triPan =
+        runScenario(cache, vc::Sampling::Trilinear, /*originStep=*/3.0f, 0.0f);
+    const ScenarioResult nnPan =
+        runScenario(cache, vc::Sampling::Nearest, /*originStep=*/3.0f, 0.0f);
+
+    std::printf("\nChunkedPlaneSampler bench (%dx%d, %d frames, warmed ChunkCache)\n",
+                kSize, kSize, kFrames);
+    report("trilinear pan", triPan);
+    report("nearest pan", nnPan);
+    std::printf("\n");
+
+    CHECK(triPan.covered > 0);
+    CHECK(nnPan.covered > 0);
 }

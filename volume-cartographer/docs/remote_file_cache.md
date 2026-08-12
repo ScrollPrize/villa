@@ -96,3 +96,41 @@ Counts come from `ChunkCache` state, so repeated requests for one unresolved
 chunk count once. Cache diagnostics and Z-scroll sensitivity are composed into
 one permanent status label so growing queue text cannot overlap a neighboring
 status widget.
+
+## VC3D Regular Chunk Cache
+
+VC3D creates one application-lifetime `vc::render::ChunkCacheService` and
+injects it through `CWindow`/`CState` into every `Volume`. A `ChunkCache` is a
+source-bound `IChunkedArray` facade over a service-retained source state. Main
+views, Spiral views, overlays, and `SurfaceCache` fillers therefore reuse the
+same decoded source chunks and in-flight requests.
+
+Source registration is a cold path. `Volume::chunkCacheSourceIdentity()` uses a
+canonical local path, or a normalized remote URL plus selected base scale, and
+the service interns it to a monotonic `VolumeSourceId`. Hot `ChunkKey` values
+contain only that integer plus level and chunk coordinates; paths, URIs,
+credentials, and disk-cache directories are absent from render-time hashes.
+Registering an existing identity validates immutable source metadata and fails
+if it is incompatible.
+
+The service retains one source-local entry map, LRU, request state, listeners,
+and diagnostics record per interned source. All source states use one aggregate
+decoded-byte budget, which provides process-wide eviction and RAM reporting.
+This avoids cross-source scheduler/statistics coupling while still eliminating
+duplicate stores for the same source. Decoded payloads remain ordinary
+heap-owned byte vectors; they are not memory mapped.
+
+Changing the current volume drops viewer references but keeps the `Volume`'s
+lightweight source facade and service state, so switching A -> B -> A neither
+reopens the source nor refetches resident chunks. Cache retention is
+capacity-bound, not guaranteed. Explicit volume invalidation clears only that
+source and rejects stale fetch completion.
+No switch-time fetch/decode cancellation is implemented. The service allocates
+view epochs across all sources, so a newly selected volume gains priority while
+older work may drain.
+
+Persistent Zarr cache directory selection and file naming are unchanged and
+remain separate from in-memory source identity. Surface image and geometry
+caches also remain separate derived caches, but their raw input chunks come
+from the regular service. The former Spiral plane regular-cache setting was
+removed because Spiral no longer owns a competing decoded pool.

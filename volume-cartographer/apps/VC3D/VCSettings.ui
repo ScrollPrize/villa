@@ -852,35 +852,6 @@
             </property>
            </widget>
           </item>
-          <item row="10" column="0">
-           <widget class="QLabel" name="labelSpiralPlaneChunkCache">
-            <property name="text">
-             <string>Spiral plane chunk cache (MB)</string>
-            </property>
-            <property name="toolTip">
-             <string>Hard cap on decoded chunks retained for the spiral slice panes. Private to the spiral workspace, so it can neither evict the main workspace's cache nor be evicted by it. This is a floor: it is raised automatically if it cannot hold one frame, and the status bar shows the effective value.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="10" column="1">
-           <widget class="QSpinBox" name="spinSpiralPlaneChunkCacheMB">
-            <property name="minimum">
-             <number>64</number>
-            </property>
-            <property name="maximum">
-             <number>524288</number>
-            </property>
-            <property name="value">
-             <number>2048</number>
-            </property>
-            <property name="suffix">
-             <string> MB</string>
-            </property>
-            <property name="toolTip">
-             <string>Hard cap on decoded chunks retained for the spiral slice panes. A floor, raised automatically if it cannot hold one frame.</string>
-            </property>
-           </widget>
-          </item>
          </layout>
         </widget>
        </item>

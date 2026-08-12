@@ -85,13 +85,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _state = new CState(
         _mainState ? _mainState->cacheSizeBytes() : 0,
         this,
-        _mainState ? _mainState->decodedCacheBudget() : nullptr);
+        _mainState ? _mainState->decodedCacheBudget() : nullptr,
+        _mainState ? _mainState->chunkCacheService() : nullptr);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // Spiral's plane panes get their own hard-capped decoded-chunk pool instead
-    // of sharing the Volume's, so browsing slices here can never displace the
-    // main workspace's working set, and the flattened pane renders from tiles of
-    // resampled surface space. Applied before the viewers exist so they pick up
-    // the policy on construction.
+    // Surface image/geometry caches remain Spiral-specific; their raw decoded
+    // volume chunks come from the application-wide regular cache.
     _viewerManager->applySpiralCacheSettings();
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.

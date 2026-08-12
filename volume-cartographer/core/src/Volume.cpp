@@ -29,6 +29,7 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -1735,7 +1736,8 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
         options.decodedByteCapacity = cacheBudgetHot_;
         options.decodedByteBudget = decodedCacheBudget_;
         options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16;
-        chunkedCache_ = createChunkCacheConfigured(std::move(options));
+        chunkedCache_ = createChunkCacheConfigured(
+            std::move(options), chunkCacheService_);
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
@@ -1746,16 +1748,19 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
     vc::render::ChunkCache::Options options) const
 {
+    std::shared_ptr<vc::render::ChunkCacheService> service;
     {
         std::lock_guard<std::mutex> lock(cacheMutex_);
         if (!options.decodedByteBudget)
             options.decodedByteBudget = decodedCacheBudget_;
+        service = chunkCacheService_;
     }
-    return createChunkCacheConfigured(std::move(options));
+    return createChunkCacheConfigured(std::move(options), std::move(service));
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
-    vc::render::ChunkCache::Options options) const
+    vc::render::ChunkCache::Options options,
+    std::shared_ptr<vc::render::ChunkCacheService> service) const
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
         options.persistentCachePath = remotePersistentCachePath();
@@ -1780,12 +1785,55 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         return nullptr;
     }
 
+    if (service) {
+        return std::make_shared<vc::render::ChunkCache>(
+            std::move(service), chunkCacheSourceIdentity(),
+            makeChunkCacheLevelInfo(opened), std::move(opened.fetchers),
+            opened.fillValue, opened.dtype, std::move(options));
+    }
     return std::make_shared<vc::render::ChunkCache>(
-        makeChunkCacheLevelInfo(opened),
-        std::move(opened.fetchers),
-        opened.fillValue,
-        opened.dtype,
-        std::move(options));
+        makeChunkCacheLevelInfo(opened), std::move(opened.fetchers),
+        opened.fillValue, opened.dtype, std::move(options));
+}
+
+void Volume::setChunkCacheService(
+    std::shared_ptr<vc::render::ChunkCacheService> service)
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (chunkCacheService_ == service)
+        return;
+    // Releasing a facade does not invalidate its service-owned source state.
+    chunkedCache_.reset();
+    chunkCacheService_ = std::move(service);
+}
+
+std::shared_ptr<vc::render::ChunkCacheService>
+Volume::chunkCacheService() const
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    return chunkCacheService_;
+}
+
+std::string Volume::chunkCacheSourceIdentity() const
+{
+    if (isRemote_) {
+        const auto normalized = vc::core::util::remoteFileCacheSource(
+            vc::core::util::normalizeRemoteFileLocation(remoteUrl_));
+        return "remote|" + normalized +
+               "|base=" + std::to_string(baseScaleLevel_);
+    }
+    if (preparedSourceFactory_) {
+        return "prepared|" + id() + "|instance=" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(this));
+    }
+    std::error_code ec;
+    auto sourcePath = std::filesystem::weakly_canonical(path_, ec);
+    if (ec)
+        sourcePath = std::filesystem::absolute(path_, ec);
+    if (ec)
+        sourcePath = path_;
+    return "local|" + sourcePath.lexically_normal().string() +
+           "|base=" + std::to_string(baseScaleLevel_);
 }
 
 void Volume::setCacheBudget(
@@ -1818,8 +1866,9 @@ void Volume::releaseCacheClient()
     if (cacheClientCount_ == 0)
         return;
     --cacheClientCount_;
-    if (cacheClientCount_ == 0 && chunkedCache_) {
-        chunkedCache_->invalidate();
+    if (cacheClientCount_ == 0 && !chunkCacheService_) {
+        if (chunkedCache_)
+            chunkedCache_->invalidate();
         chunkedCache_.reset();
     }
 }
@@ -1836,8 +1885,11 @@ void Volume::setIOThreads(int count)
 void Volume::invalidateCache()
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (chunkedCache_)
+    if (chunkedCache_) {
         chunkedCache_->invalidate();
+    } else if (chunkCacheService_) {
+        chunkCacheService_->invalidateSource(chunkCacheSourceIdentity());
+    }
     chunkedCache_.reset();
 }
 

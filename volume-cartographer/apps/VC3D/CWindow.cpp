@@ -2381,7 +2381,8 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
+CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions,
+                 std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService) :
     _cmdRunner(nullptr),
     _benchOptions(std::move(benchOptions)),
     _seedingWidget(nullptr),
@@ -2520,11 +2521,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _decodedChunkCacheBudget =
-        std::make_shared<vc::render::DecodedChunkCacheBudget>(_cacheSizeBytes);
+    _chunkCacheService = std::move(chunkCacheService);
+    if (!_chunkCacheService) {
+        _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
+            _cacheSizeBytes);
+    }
+    _decodedChunkCacheBudget = _chunkCacheService->decodedByteBudget();
     vc::render::ChunkCache::setDecodedByteBudgetDefault(
         _decodedChunkCacheBudget);
-    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget);
+    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget,
+                        _chunkCacheService);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,

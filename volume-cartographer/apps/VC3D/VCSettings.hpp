@@ -294,13 +294,6 @@ namespace spiral {
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
     constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
 
-    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
-    // A floor rather than a ceiling: it is raised automatically when it cannot
-    // hold one frame (otherwise a single render thrashes), and the status bar
-    // reports the effective value. The surface-tile filler gets a pool of the
-    // same size as an internal constant.
-    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
-    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
 }
 
 // -----------------------------------------------------------------------------

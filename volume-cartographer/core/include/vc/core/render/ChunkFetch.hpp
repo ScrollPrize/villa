@@ -10,11 +10,19 @@
 
 namespace vc::render {
 
+struct VolumeSourceId {
+    std::uint64_t value = 0;
+
+    explicit operator bool() const noexcept { return value != 0; }
+    friend bool operator==(const VolumeSourceId&, const VolumeSourceId&) = default;
+};
+
 struct ChunkKey {
     int level = 0;
     int iz = 0;
     int iy = 0;
     int ix = 0;
+    VolumeSourceId sourceId{};
 
     friend bool operator==(const ChunkKey&, const ChunkKey&) = default;
 };
@@ -22,7 +30,7 @@ struct ChunkKey {
 struct ChunkKeyHash {
     std::size_t operator()(const ChunkKey& key) const noexcept
     {
-        std::size_t seed = 0;
+        std::size_t seed = std::hash<std::uint64_t>{}(key.sourceId.value);
         auto combine = [&seed](int value) {
             seed ^= std::hash<int>{}(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
         };

@@ -19,6 +19,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +32,7 @@ using vc::render::ChunkFetchStatus;
 using vc::render::ChunkKey;
 using vc::render::ChunkResult;
 using vc::render::ChunkStatus;
+using vc::render::ChunkCacheService;
 using vc::render::IChunkFetcher;
 
 namespace {
@@ -60,6 +62,44 @@ private:
     std::unordered_map<ChunkKey, ChunkFetchResult, vc::render::ChunkKeyHash> canned_;
 };
 
+class BlockingFetcher : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey&) override
+    {
+        ++fetchCalls;
+        started_.count_down();
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [&] { return released_; });
+        }
+        finished_.count_down();
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = std::vector<std::byte>(64, std::byte{17});
+        return result;
+    }
+
+    void waitStarted() { started_.wait(); }
+    void waitFinished() { finished_.wait(); }
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    std::atomic<int> fetchCalls{0};
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::latch started_{1};
+    std::latch finished_{1};
+    bool released_ = false;
+};
+
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
 {
     return std::vector<std::byte>(n, v);
@@ -83,6 +123,24 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
         opts);
 }
 
+std::shared_ptr<ChunkCache> makeServiceCache(
+    const std::shared_ptr<ChunkCacheService>& service,
+    std::string identity,
+    const std::shared_ptr<IChunkFetcher>& fetcher,
+    std::size_t maxConcurrentReads = 4)
+{
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{8, 8, 8}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = maxConcurrentReads;
+    options.detectAllFillChunks = false;
+    return std::make_shared<ChunkCache>(
+        service, std::move(identity), std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, std::move(options));
+}
+
 ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
                             std::chrono::milliseconds timeout = std::chrono::seconds{2})
 {
@@ -96,6 +154,220 @@ ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
 }
 
 } // namespace
+
+static_assert(std::is_trivially_copyable_v<vc::render::VolumeSourceId>);
+static_assert(std::is_trivially_copyable_v<ChunkKey>);
+
+TEST_CASE("ChunkCacheService interns source identity into a numeric hot key")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto firstFetcher = std::make_shared<CountingFetcher>();
+    auto secondFetcher = std::make_shared<CountingFetcher>();
+    auto first = makeServiceCache(service, "local|/volume/a", firstFetcher);
+    auto second = makeServiceCache(service, "local|/volume/a", secondFetcher);
+    auto other = makeServiceCache(service, "local|/volume/b", secondFetcher);
+
+    CHECK(first->sourceId());
+    CHECK(first->sourceId() == second->sourceId());
+    CHECK(first->sourceId() != other->sourceId());
+    CHECK(service->sourceCount() == 2);
+    CHECK(ChunkKey{0, 0, 0, 0, first->sourceId()} !=
+          ChunkKey{0, 0, 0, 0, other->sourceId()});
+}
+
+TEST_CASE("ChunkCacheService rejects incompatible duplicate source metadata")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    auto first = makeServiceCache(service, "same-source", fetcher);
+    std::vector<ChunkCache::LevelInfo> incompatibleLevels = {
+        {{16, 8, 8}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    CHECK_THROWS_AS(
+        ChunkCache(service, "same-source", std::move(incompatibleLevels),
+                   std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+                   0.0, ChunkDtype::UInt8, std::move(options)),
+        std::invalid_argument);
+}
+
+TEST_CASE("ChunkCacheService reuses a source across facade policy options")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    auto first = makeServiceCache(service, "policy-source", fetcher, 4);
+    auto second = makeServiceCache(service, "policy-source", fetcher, 1);
+
+    CHECK(first->sourceId() == second->sourceId());
+    CHECK(service->sourceCount() == 1);
+}
+
+TEST_CASE("ChunkCacheService shares results and keeps sources warm")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult result;
+    result.status = ChunkFetchStatus::Found;
+    result.bytes = makeBytes(64, std::byte{42});
+    fetcher->setCanned({0, 0, 0, 0}, result);
+
+    auto first = makeServiceCache(service, "remote|example/a|base=0", fetcher);
+    REQUIRE(first->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    const auto sourceId = first->sourceId();
+    first.reset();
+
+    auto otherFetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult otherResult;
+    otherResult.status = ChunkFetchStatus::Found;
+    otherResult.bytes = makeBytes(64, std::byte{23});
+    otherFetcher->setCanned({0, 0, 0, 0}, otherResult);
+    auto other = makeServiceCache(service, "remote|example/b|base=0", otherFetcher);
+    REQUIRE(other->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+
+    auto unusedFetcher = std::make_shared<CountingFetcher>();
+    auto reacquired = makeServiceCache(
+        service, "remote|example/a|base=0", unusedFetcher);
+    CHECK(reacquired->sourceId() == sourceId);
+    auto cached = reacquired->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(cached.status == ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*cached.bytes)[0]) == 42);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(unusedFetcher->fetchCalls.load() == 0);
+}
+
+TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across facades")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    auto first = makeServiceCache(service, "shared-in-flight", fetcher);
+    auto second = makeServiceCache(service, "shared-in-flight", fetcher);
+
+    CHECK(first->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    fetcher->waitStarted();
+    CHECK(second->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(fetcher->fetchCalls.load() == 1);
+
+    fetcher->release();
+    CHECK(waitForResolved(*second, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+}
+
+TEST_CASE("ChunkCacheService rejects stale publication after source invalidation")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    auto cache = makeServiceCache(service, "stale-source", fetcher);
+
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    fetcher->waitStarted();
+    cache->invalidate();
+    fetcher->release();
+    fetcher->waitFinished();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status ==
+          ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
+{
+    auto service = std::make_shared<ChunkCacheService>(128);
+    auto fetcherA = std::make_shared<CountingFetcher>();
+    auto fetcherB = std::make_shared<CountingFetcher>();
+    for (int ix : {0, 1}) {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{31 + ix});
+        fetcherA->setCanned({0, 0, 0, ix}, result);
+        fetcherB->setCanned({0, 0, 0, ix}, result);
+    }
+    auto cacheA = makeServiceCache(service, "budget-a", fetcherA);
+    auto cacheB = makeServiceCache(service, "budget-b", fetcherB);
+
+    REQUIRE(cacheA->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(cacheB->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(cacheA->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(cacheB->getChunkBlocking(0, 0, 0, 1).status == ChunkStatus::Data);
+
+    const auto stats = service->decodedByteBudget()->stats();
+    CHECK(stats.decodedBytes == 128);
+    CHECK(stats.cacheCount == 2);
+    CHECK(cacheA->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(cacheB->getChunkIfCached(0, 0, 0, 0).status ==
+          ChunkStatus::MissQueued);
+    CHECK(cacheB->getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCacheService releases aggregate accounting on destruction")
+{
+    auto budget = std::make_shared<DecodedChunkCacheBudget>(1024 * 1024);
+    {
+        auto service =
+            std::make_shared<ChunkCacheService>(1024 * 1024, budget);
+        auto fetcher = std::make_shared<CountingFetcher>();
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{7});
+        fetcher->setCanned({0, 0, 0, 0}, result);
+        auto cache = makeServiceCache(service, "temporary-source", fetcher);
+        REQUIRE(cache->getChunkBlocking(0, 0, 0, 0).status ==
+                ChunkStatus::Data);
+        CHECK(budget->stats().decodedBytes == 64);
+        cache.reset();
+        CHECK(budget->stats().decodedBytes == 64);
+    }
+    CHECK(budget->stats().decodedBytes == 0);
+}
+
+TEST_CASE("ChunkCacheService facade destruction removes only its listeners")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult result;
+    result.status = ChunkFetchStatus::Found;
+    result.bytes = makeBytes(64, std::byte{9});
+    fetcher->setCanned({0, 0, 0, 0}, result);
+    std::atomic<int> callbacks{0};
+    {
+        auto cache = makeServiceCache(service, "listener-source", fetcher);
+        cache->addChunkReadyListener([&] { ++callbacks; });
+    }
+    auto reacquired = makeServiceCache(
+        service, "listener-source", std::make_shared<CountingFetcher>());
+    REQUIRE(reacquired->getChunkBlocking(0, 0, 0, 0).status ==
+            ChunkStatus::Data);
+    CHECK(callbacks.load() == 0);
+}
+
+TEST_CASE("ChunkCacheService isolates and invalidates sources independently")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcherA = std::make_shared<CountingFetcher>();
+    auto fetcherB = std::make_shared<CountingFetcher>();
+    ChunkFetchResult resultA;
+    resultA.status = ChunkFetchStatus::Found;
+    resultA.bytes = makeBytes(64, std::byte{11});
+    ChunkFetchResult resultB;
+    resultB.status = ChunkFetchStatus::Found;
+    resultB.bytes = makeBytes(64, std::byte{22});
+    fetcherA->setCanned({0, 0, 0, 0}, resultA);
+    fetcherB->setCanned({0, 0, 0, 0}, resultB);
+    auto cacheA = makeServiceCache(service, "source-a", fetcherA);
+    auto cacheB = makeServiceCache(service, "source-b", fetcherB);
+
+    auto a = cacheA->getChunkBlocking(0, 0, 0, 0);
+    auto b = cacheB->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(a.status == ChunkStatus::Data);
+    REQUIRE(b.status == ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*a.bytes)[0]) == 11);
+    CHECK(std::to_integer<int>((*b.bytes)[0]) == 22);
+
+    cacheA->invalidate();
+    CHECK(cacheA->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(cacheB->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+}
 
 TEST_CASE("ChunkCache basic IChunkedArray accessors")
 {
@@ -634,7 +906,76 @@ private:
     std::vector<ChunkKey> order_;
 };
 
+struct SharedServiceFetchOrder {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::latch firstStarted{1};
+    bool released = false;
+    std::vector<char> labels;
+};
+
+class LabeledServiceFetcher : public IChunkFetcher {
+public:
+    LabeledServiceFetcher(std::shared_ptr<SharedServiceFetchOrder> order,
+                          char label, bool blockFirst)
+        : order_(std::move(order)), label_(label), blockFirst_(blockFirst)
+    {
+    }
+
+    ChunkFetchResult fetch(const ChunkKey&) override
+    {
+        {
+            std::lock_guard lock(order_->mutex);
+            order_->labels.push_back(label_);
+        }
+        if (blockFirst_) {
+            order_->firstStarted.count_down();
+            std::unique_lock lock(order_->mutex);
+            order_->cv.wait(lock, [&] { return order_->released; });
+            blockFirst_ = false;
+        }
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{41});
+        return result;
+    }
+
+private:
+    std::shared_ptr<SharedServiceFetchOrder> order_;
+    char label_;
+    bool blockFirst_;
+};
+
 } // namespace
+
+TEST_CASE("ChunkCacheService prioritizes the newest view across sources")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto order = std::make_shared<SharedServiceFetchOrder>();
+    auto fetcherB = std::make_shared<LabeledServiceFetcher>(order, 'B', false);
+    auto fetcherA = std::make_shared<LabeledServiceFetcher>(order, 'A', true);
+    // Register B first so a source-local epoch would not outrank A's queued
+    // work after B becomes the newest view.
+    auto cacheB = makeServiceCache(service, "priority-b", fetcherB, 1);
+    auto cacheA = makeServiceCache(service, "priority-a", fetcherA, 1);
+
+    CHECK(cacheA->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    order->firstStarted.wait();
+    CHECK(cacheA->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::MissQueued);
+    cacheB->beginViewRequest();
+    CHECK(cacheB->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    {
+        std::lock_guard lock(order->mutex);
+        order->released = true;
+    }
+    order->cv.notify_all();
+
+    REQUIRE(waitForResolved(*cacheB, 0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(*cacheA, 0, 0, 0, 1).status == ChunkStatus::Data);
+    std::lock_guard lock(order->mutex);
+    REQUIRE(order->labels.size() == 3);
+    CHECK(order->labels == std::vector<char>{'A', 'B', 'A'});
+}
 
 TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
 {

@@ -158,6 +158,11 @@ public:
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
         vc::render::ChunkCache::Options options) const;
+    void setChunkCacheService(
+        std::shared_ptr<vc::render::ChunkCacheService> service);
+    [[nodiscard]] std::shared_ptr<vc::render::ChunkCacheService>
+    chunkCacheService() const;
+    [[nodiscard]] std::string chunkCacheSourceIdentity() const;
 
     // Set the local safety ceiling and optional process-wide decoded budget
     // for the single cache shared by volume sampling and viewers.
@@ -165,9 +170,8 @@ public:
         size_t hotBytes,
         std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
 
-    // CState clients keep a shared Volume active across workspaces. The final
-    // release invalidates and drops its cache even if the Volume object itself
-    // remains retained by a VolumePkg.
+    // CState clients keep a shared Volume active across workspaces. A shared
+    // service keeps the source facade and decoded chunks warm after release.
     void retainCacheClient();
     void releaseCacheClient();
 
@@ -296,6 +300,7 @@ protected:
 
     // Cache ownership
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
+    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService_;
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
@@ -310,7 +315,8 @@ protected:
     mutable std::mutex readArrayCacheMutex_;
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
     std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
-        vc::render::ChunkCache::Options options) const;
+        vc::render::ChunkCache::Options options,
+        std::shared_ptr<vc::render::ChunkCacheService> service) const;
 
     void loadMetadata();
 
