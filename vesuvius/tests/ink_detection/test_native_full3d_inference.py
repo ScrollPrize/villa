@@ -295,11 +295,11 @@ def test_native_dataset_normalizes_only_valid_voxels_and_builds_surface_channel(
         )
     )
     current_volume = {"value": np.full((2, 2, 2), 10, dtype=np.uint8)}
-    monkeypatch.setattr(
-        native,
-        "_open_shared_volume",
-        lambda *args, **kwargs: current_volume["value"],
-    )
+
+    def open_shared_volume_stub(path, resolution, *, cache_dir, cache_max_gb):
+        return current_volume["value"]
+
+    monkeypatch.setattr(native, "_open_shared_volume", open_shared_volume_stub)
     original_params = native.native_tifxyz_pyramid_params
     params_calls = []
     monkeypatch.setattr(
@@ -512,11 +512,15 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
     )
     from vesuvius.ink_detection.config import NormalizationConfig
 
+    blocker = tmp_path / "embedded-io-blocker"
+    blocker.write_bytes(b"")
     config = SimpleNamespace(
         data=SimpleNamespace(
             mode="full_3d",
             normalization=NormalizationConfig.from_value("none"),
-            volume_auth_json=None,
+            volume_auth_json=str(blocker / "auth.json"),
+            volume_cache_dir=str(blocker / "cache"),
+            volume_cache_max_gb=120.0,
         )
     )
     volume = np.zeros((2, 2, 2), dtype=np.uint8)
@@ -540,7 +544,12 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         amp_dtype=None,
     )
     monkeypatch.setattr(native, "_load_native_model", lambda *args: bundle)
-    monkeypatch.setattr(native, "_open_shared_volume", lambda *args, **kwargs: volume)
+
+    def open_shared_volume_stub(path, resolution, *, cache_dir, cache_max_gb):
+        assert (cache_dir, cache_max_gb) == (None, None)
+        return volume
+
+    monkeypatch.setattr(native, "_open_shared_volume", open_shared_volume_stub)
 
     output = tmp_path / "command.zarr"
     args = SimpleNamespace(

@@ -71,8 +71,15 @@ HTTPS volumes may use the username/password JSON selected by
 `volume_auth_json`.
 
 The optional on-disk compressed-chunk cache requires Zarr 3. Set
-`volume_cache_dir` for training or flat inference, or `--cache-dir` for native
-inference. Uncached volume reads remain supported with Zarr 2.18.7 and Zarr 3;
+`volume_cache_dir` for training, or `--cache-dir` for native inference.
+Flat inference opens its input directly: it never reads `volume_auth_json`,
+`volume_cache_dir`, or `volume_cache_max_gb` from the checkpoint-embedded
+config, so published checkpoints whose embedded paths do not exist on the
+local machine still run. Model artifacts are the one exception: a checkpoint
+whose `model_config.pretrained_backbone` names a checkpoint path or a
+downloadable backbone is resolved during model construction, exactly as in
+training (the published `ink_9um` checkpoints embed no backbone reference).
+Uncached volume reads remain supported with Zarr 2.18.7 and Zarr 3;
 the package dependency range remains `zarr>=2.18.7,<4`. Each authored volume
 path receives its own hashed subdirectory, so
 `volume_cache_max_gb` and `--cache-max-gb` are decimal-GB budgets per volume,
@@ -416,9 +423,9 @@ the second output.
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
-| `--overlap` | Inference overlap fraction in `[0,1)`, default `0.25`. |
+| `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
-| `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto`. |
+| `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. |
 | `--batch-size` | Batch size per selected device, default `1`. |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |

@@ -877,7 +877,6 @@ class NativePatchDataset(Dataset):
         patches: Sequence[PatchSpec],
         patch_size_zyx: tuple[int, int, int],
         config,
-        auth_json_path=None,
         cache_dir=None,
         cache_max_gb=None,
     ) -> None:
@@ -888,7 +887,6 @@ class NativePatchDataset(Dataset):
         self.patch_size_zyx = tuple(int(value) for value in patch_size_zyx)
         self.mode = str(config.data.mode)
         self.normalization = config.data.normalization
-        self.auth_json_path = auth_json_path
         self.cache_dir = cache_dir
         self.cache_max_gb = cache_max_gb
         (
@@ -917,7 +915,6 @@ class NativePatchDataset(Dataset):
             self._volume = _open_shared_volume(
                 self.volume_path,
                 self.resolution,
-                self.auth_json_path,
                 cache_dir=self.cache_dir,
                 cache_max_gb=self.cache_max_gb,
             )
@@ -1095,7 +1092,6 @@ def run_native_inference(
 def _open_shared_volume(
     path: str,
     resolution: str,
-    auth_json_path,
     *,
     cache_dir,
     cache_max_gb,
@@ -1103,7 +1099,6 @@ def _open_shared_volume(
     return open_volume(
         path,
         int(resolution),
-        auth_json_path,
         cache_dir=cache_dir,
         cache_max_gb=cache_max_gb,
         root_array_is_requested_level=True,
@@ -1127,7 +1122,6 @@ def _plan_from_args(args):
     volume = _open_shared_volume(
         volume_path,
         args.resolution,
-        config.data.volume_auth_json,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
     )
@@ -1194,7 +1188,6 @@ def run_command(args) -> int:
         patches=plan.patches,
         patch_size_zyx=plan.patch_size_zyx,
         config=config,
-        auth_json_path=config.data.volume_auth_json,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
     )

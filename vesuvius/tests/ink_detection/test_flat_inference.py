@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -459,5 +460,57 @@ def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
             "constant",
         ]
     ) == 0
+    assert np.all(tifffile.imread(output) == 127)
+
+
+@pytest.mark.parametrize("workers", (0, 1))
+def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
+    tmp_path, caplog, monkeypatch, workers
+):
+    """Published checkpoints embed foreign I/O paths; flat inference must not
+    read them, and its defaults must match the reference (overlap 0.5,
+    auto blend resolving to Hann below full stride). The embedded paths sit
+    below a regular file, so consuming any of them fails regardless of
+    filesystem privileges — in the main process and in spawned workers."""
+
+    blocker = tmp_path / "embedded-io-blocker"
+    blocker.write_bytes(b"")
+    config_mapping = _config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
+    config_mapping["volume_cache_dir"] = str(blocker / "cache")
+    config_mapping["volume_cache_max_gb"] = 120.0
+    config_mapping["volume_auth_json"] = str(blocker / "auth.json")
+    config = InkConfig.from_mapping(config_mapping)
+    model = make_model(config)
+    with torch.no_grad():
+        for value in model.state_dict().values():
+            if torch.is_floating_point(value):
+                value.zero_()
+    checkpoint = tmp_path / "model.pth"
+    torch.save({"config": config_mapping, "model": model.state_dict()}, checkpoint)
+    input_path = tmp_path / "surface.zarr"
+    array = zarr.open(
+        input_path,
+        mode="w",
+        shape=(3, 16, 16),
+        chunks=(3, 16, 16),
+        dtype="u1",
+        zarr_format=2,
+    )
+    array[:] = 1
+    output = tmp_path / "prediction.tif"
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with caplog.at_level("INFO"):
+        assert main(
+            [
+                str(input_path),
+                str(checkpoint),
+                str(output),
+                "--workers",
+                str(workers),
+                "--no-compile",
+            ]
+        ) == 0
+    assert "stride=8 requested_overlap=0.500 blend_mode=hann" in caplog.text
     assert np.all(tifffile.imread(output) == 127)
     assert not any(path.name.startswith("ink_flat_infer_") for path in tmp_path.iterdir())

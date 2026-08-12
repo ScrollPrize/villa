@@ -46,7 +46,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
-DEFAULT_OVERLAP = 0.25
+DEFAULT_OVERLAP = 0.5
 
 
 @dataclass(frozen=True)
@@ -76,7 +76,6 @@ class ConfiguredModel:
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
-    config: InkConfig
 
 
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
@@ -420,9 +419,6 @@ class FlatPatchReader:
         layer_indices: np.ndarray,
         output_depth: int,
         preprocessing: str,
-        auth_json_path: str | Path | None = None,
-        cache_dir: str | Path | None = None,
-        cache_max_gb: float | None = None,
     ) -> None:
         self.input_path = input_path
         self.resolution = str(resolution)
@@ -432,9 +428,6 @@ class FlatPatchReader:
         self.layer_indices = np.asarray(layer_indices, dtype=np.int64)
         self.output_depth = int(output_depth)
         self.preprocessing = str(preprocessing)
-        self.auth_json_path = auth_json_path
-        self.cache_dir = cache_dir
-        self.cache_max_gb = cache_max_gb
         if self.layer_indices.size == 0:
             raise ValueError("Flat inference selected no source layers")
         if self.output_depth < self.layer_indices.size:
@@ -463,13 +456,7 @@ class FlatPatchReader:
 
     def _ensure_array(self):
         if self._array is None:
-            self._array = open_volume(
-                self.input_path,
-                self.resolution,
-                self.auth_json_path,
-                cache_dir=self.cache_dir,
-                cache_max_gb=self.cache_max_gb,
-            )
+            self._array = open_volume(self.input_path, self.resolution)
         return self._array
 
     def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
@@ -984,7 +971,6 @@ def configure_model(args: Any) -> ConfiguredModel:
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
-        config=config,
     )
 
 
@@ -1014,13 +1000,7 @@ def infer_single_zarr(
 ) -> None:
     """Run one direction over one surface-volume input and replace a TIFF."""
 
-    config = configured_model.config
-    root = open_volume_root(
-        input_zarr,
-        config.data.volume_auth_json,
-        cache_dir=config.data.volume_cache_dir,
-        cache_max_gb=config.data.volume_cache_max_gb,
-    )
+    root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
@@ -1032,7 +1012,7 @@ def infer_single_zarr(
     )
     blend_mode = str(args.blend_mode)
     if blend_mode == "auto":
-        blend_mode = "constant" if stride >= patch_size else "gaussian"
+        blend_mode = "constant" if stride >= patch_size else "hann"
     tile_shape = (patch_size, patch_size)
     if patch_size % 16:
         tile_shape = (chunk_h, chunk_w)
@@ -1069,9 +1049,6 @@ def infer_single_zarr(
         layer_indices=layer_indices,
         output_depth=configured_model.input_depth,
         preprocessing=configured_model.preprocessing,
-        auth_json_path=config.data.volume_auth_json,
-        cache_dir=config.data.volume_cache_dir,
-        cache_max_gb=config.data.volume_cache_max_gb,
     )
     mask = (
         None
@@ -1370,12 +1347,21 @@ def parse_args(argv: Sequence[str] | None = None):
         "--num-workers", "--workers", dest="num_workers", type=int, default=4
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
-    parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=DEFAULT_OVERLAP,
+        help="Sliding-window overlap fraction. Default: 0.5.",
+    )
     parser.add_argument("--stride", type=int)
     parser.add_argument(
         "--blend-mode",
         choices=("auto", "constant", "gaussian", "hann"),
         default="auto",
+        help=(
+            "Overlap-add importance window. 'auto' selects constant without "
+            "overlap, Hann otherwise."
+        ),
     )
     parser.add_argument("--layer-start", type=int)
     parser.add_argument("--layer-end", type=int)
