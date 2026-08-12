@@ -440,6 +440,10 @@ private:
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
+    // Sign applied to the displayed line tangent so the current cut's screen
+    // left/right and the side cut's vertical do not depend on the arbitrary
+    // stored point order. Recomputed once per materialization.
+    float _displayTangentSign = 1.0f;
     bool _hasGeneratedViews = false;
     // Coalescing of the mouse-follow line-position updates onto a ~render-tick cadence.
     // requestCurrentLinePosition() stashes the latest position here and (re)arms the timer;

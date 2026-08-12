@@ -196,6 +196,47 @@ TEST_CASE("fiber file name identity parsing round-trips canonical names")
     CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
 }
 
+TEST_CASE("generated display tangent sign is independent of stored point order")
+{
+    using vc3d::line_annotation::generatedDisplayTangentSign;
+
+    // Circumferential fiber: a circle in a z = const plane with outward sheet
+    // normals. The decision comes from (normal x tangent) . z.
+    std::vector<cv::Vec3f> circlePoints;
+    std::vector<cv::Vec3f> circleNormals;
+    for (int i = 0; i < 16; ++i) {
+        const float angle = static_cast<float>(i) * 0.25f;
+        const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+        circlePoints.push_back(radial * 100.0f + cv::Vec3f{500.0f, 500.0f, 300.0f});
+        circleNormals.push_back(radial);
+    }
+    CHECK(generatedDisplayTangentSign(circlePoints, circleNormals) == 1.0f);
+
+    std::vector<cv::Vec3f> reversedPoints(circlePoints.rbegin(), circlePoints.rend());
+    std::vector<cv::Vec3f> reversedNormals(circleNormals.rbegin(), circleNormals.rend());
+    CHECK(generatedDisplayTangentSign(reversedPoints, reversedNormals) == -1.0f);
+
+    // Axial fiber: (normal x tangent) . z vanishes, so the tangent's own z
+    // component decides and pins the side cut's vertical.
+    std::vector<cv::Vec3f> axialPoints;
+    std::vector<cv::Vec3f> axialNormals;
+    for (int i = 0; i < 16; ++i) {
+        axialPoints.push_back({500.0f, 500.0f, 300.0f + 10.0f * static_cast<float>(i)});
+        axialNormals.push_back({1.0f, 0.0f, 0.0f});
+    }
+    CHECK(generatedDisplayTangentSign(axialPoints, axialNormals) == 1.0f);
+    CHECK(generatedDisplayTangentSign({axialPoints.rbegin(), axialPoints.rend()},
+                                      {axialNormals.rbegin(), axialNormals.rend()}) == -1.0f);
+
+    // Degenerate inputs are decided as +1 rather than left arbitrary: no
+    // normals to vote with, and a z = const line has nothing to fall back on.
+    CHECK(generatedDisplayTangentSign({}, {}) == 1.0f);
+    CHECK(generatedDisplayTangentSign({circlePoints.front()}, {circleNormals.front()}) == 1.0f);
+    CHECK(generatedDisplayTangentSign(circlePoints, {}) == 1.0f);
+    CHECK(generatedDisplayTangentSign(circlePoints,
+                                      {circleNormals.begin(), circleNormals.end() - 1}) == 1.0f);
+}
+
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
     CState state(64 * 1024 * 1024);

@@ -454,6 +454,60 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
            linePoints[static_cast<size_t>(upper)] * t;
 }
 
+// One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
+// current-cut and side-cut planes. Stored line-point order never changes.
+// The current cut's screen x is (up x normal) with normal = sign * tangent, so
+// pinning sign * sum((normal_i x tangent_i) . z) >= 0 puts increasing slice
+// index on the same screen side for every circumferential fiber, whatever
+// direction it was traced or merged in. Fibers running along the scroll axis
+// score ~0 there; for them the tangent's own z component decides, which pins
+// the side cut's vertical (its up is the signed tangent).
+inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoints,
+                                         const std::vector<cv::Vec3f>& lineNormals)
+{
+    if (linePoints.size() < 2) {
+        return 1.0f;
+    }
+    const bool haveNormals = lineNormals.size() == linePoints.size();
+    double primary = 0.0;
+    double fallback = 0.0;
+    size_t validCount = 0;
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        cv::Vec3f tangent;
+        if (i == 0) {
+            tangent = linePoints[1] - linePoints[0];
+        } else if (i + 1 == linePoints.size()) {
+            tangent = linePoints[i] - linePoints[i - 1];
+        } else {
+            tangent = linePoints[i + 1] - linePoints[i - 1];
+        }
+        tangent = normalizedGeneratedVectorOrNan(tangent);
+        if (!finiteGeneratedPoint(tangent)) {
+            continue;
+        }
+        ++validCount;
+        fallback += static_cast<double>(tangent[2]);
+        if (!haveNormals) {
+            continue;
+        }
+        const cv::Vec3f normal = normalizedGeneratedVectorOrNan(lineNormals[i]);
+        if (!finiteGeneratedPoint(normal)) {
+            continue;
+        }
+        primary += static_cast<double>(normal.cross(tangent)[2]);
+    }
+    // Scale the tie band with the number of contributing points so rounding
+    // noise on a long near-axial fiber cannot masquerade as a decision.
+    const double tie = std::max(1.0e-3, 1.0e-3 * static_cast<double>(validCount));
+    if (std::abs(primary) > tie) {
+        return primary > 0.0 ? 1.0f : -1.0f;
+    }
+    if (std::abs(fallback) > tie) {
+        return fallback > 0.0 ? 1.0f : -1.0f;
+    }
+    return 1.0f;
+}
+
 inline std::optional<std::pair<double, double>> generatedControlLinePositionRange(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
 {

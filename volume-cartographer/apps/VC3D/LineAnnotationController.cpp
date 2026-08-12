@@ -30,7 +30,6 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
-#include <opencv2/core.hpp>
 #include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
@@ -4340,7 +4339,13 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
             side.editSession->optimizedLine =
                 lineModelFromPoints(side.fiber->linePoints,
                                     side.editSession->normalSampler.get());
-            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
+            vc::lasagna::LineViewConfig sideConfig;
+            // Same orientation pin as the annotation views, so the inspection
+            // strip's vertical does not flip between fibers or rebuilds.
+            sideConfig.orientedPointNormals =
+                orientedLineNormalsForSession(*side.editSession);
+            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine,
+                                                                sideConfig);
             Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
                            side.displayPrefix,
                            side.fiber ? side.fiber->id : 0,
@@ -9559,54 +9564,24 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         return false;
     }
 
+    // The builder's frame signs are inherited from an unoriented manifest
+    // normal at an anchor that moves as the line grows; hand it the sheet
+    // normals oriented away from the scroll center so the bottom strip's
+    // vertical, the display ups, and the cut views all agree per fiber and
+    // across rebuilds.
+    std::vector<cv::Vec3f> orientedNormals = orientedLineNormalsForSession(session);
+
     vc::lasagna::LineViewSurfaces views;
     try {
-        views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine);
+        vc::lasagna::LineViewConfig viewConfig;
+        viewConfig.orientedPointNormals = orientedNormals;
+        views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine, viewConfig);
     } catch (const std::exception& ex) {
         session.error = ex.what();
         showError(tr("Could not create line annotation views: %1")
                       .arg(QString::fromStdString(session.error)),
                   session.suppressErrorDialogs);
         return false;
-    }
-
-    // The side-slice ribbon's row axis is the builder's frame mesh normal,
-    // whose global sign is inherited from the manifest normal at the frame
-    // anchor -- a coin flip that can differ per fiber and per rebuild. The
-    // cut views orient the same axis away from the scroll center; flip the
-    // ribbon's rows when they disagree with those oriented normals so the
-    // bottom strip's vertical is deterministic and matches the current cut.
-    // The lineSurface strip extends along the in-sheet side direction, which
-    // sheet normals cannot orient; it stays as built.
-    std::vector<cv::Vec3f> orientedNormals = orientedLineNormalsForSession(session);
-    if (views.lineSideSlice && orientedNormals.size() >= 2) {
-        const cv::Mat_<cv::Vec3f>* stripPoints = views.lineSideSlice->rawPointsPtr();
-        if (stripPoints && stripPoints->rows >= 2 && stripPoints->cols >= 2) {
-            double orientationScore = 0.0;
-            for (const int col : {stripPoints->cols / 4,
-                                  stripPoints->cols / 2,
-                                  (3 * stripPoints->cols) / 4}) {
-                const cv::Vec3f rowDirection =
-                    (*stripPoints)(stripPoints->rows - 1, col) - (*stripPoints)(0, col);
-                const size_t lineIndex = static_cast<size_t>(col) *
-                                         (orientedNormals.size() - 1) /
-                                         static_cast<size_t>(stripPoints->cols - 1);
-                const cv::Vec3f normal = orientedNormals[lineIndex];
-                if (!finitePoint(rowDirection) || !finitePoint(normal)) {
-                    continue;
-                }
-                const double rowNorm = cv::norm(rowDirection);
-                if (rowNorm > 1.0e-6) {
-                    orientationScore += rowDirection.dot(normal) / rowNorm;
-                }
-            }
-            if (orientationScore < 0.0) {
-                cv::Mat_<cv::Vec3f> flipped;
-                cv::flip(*stripPoints, flipped, 0);
-                views.lineSideSlice =
-                    std::make_shared<QuadSurface>(flipped, views.lineSideSlice->scale());
-            }
-        }
     }
 
     for (const auto& name : session.generatedSurfaceNames) {
