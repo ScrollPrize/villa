@@ -13,6 +13,7 @@ import zarr
 
 from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
 from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume_root
+from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -50,10 +51,7 @@ def _create_target_array(
     *,
     shape_zyx: tuple[int, int, int],
 ) -> tuple[zarr.Group, zarr.Array]:
-    group_kwargs: dict[str, object] = {"mode": "w"}
-    if ZARR_V3:
-        group_kwargs["zarr_format"] = 2
-    group = zarr.open_group(str(partial_path), **group_kwargs)
+    group = open_v2_group(partial_path)
     chunks = (
         OUTPUT_Z,
         min(CHUNK_XY, shape_zyx[1]),

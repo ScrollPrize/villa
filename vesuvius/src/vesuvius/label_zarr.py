@@ -101,6 +101,15 @@ def create_label_array(
     return array
 
 
+def open_v2_group(path) -> "zarr.Group":
+    """Open a truncating writable group as explicit Zarr v2 under either zarr major."""
+
+    kwargs: dict[str, object] = {"mode": "w"}
+    if _ZARR_V3:
+        kwargs["zarr_format"] = 2
+    return zarr.open_group(str(path), **kwargs)
+
+
 def create_v2_array(
     group,
     name: str,

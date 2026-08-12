@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import vesuvius.tifxyz as tifxyz
-import zarr
 
 from vesuvius.ink_detection.data.geometry import (
     SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS,
@@ -46,11 +45,10 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
-    ZARR_V3,
     open_volume,
     read_bbox_with_padding,
 )
-from vesuvius.label_zarr import create_v2_array
+from vesuvius.label_zarr import create_v2_array, open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -719,10 +717,7 @@ def create_output_zarr(
             shutil.rmtree(output_path)
         else:
             output_path.unlink()
-    kwargs = {"mode": "w"}
-    if ZARR_V3:
-        kwargs["zarr_format"] = 2
-    group = zarr.open_group(str(output_path), **kwargs)
+    group = open_v2_group(output_path)
     group.attrs.update(multiscales_metadata(output_path.stem, levels))
     compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
     arrays = []

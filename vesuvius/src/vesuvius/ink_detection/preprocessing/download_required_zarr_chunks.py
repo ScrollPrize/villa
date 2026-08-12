@@ -24,6 +24,7 @@ from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_inde
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume, open_volume_root
+from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -387,10 +388,7 @@ def _write_progress(
 
 
 def _create_output_arrays(source_group, output_path: Path, recompress: str):
-    group_kwargs: dict[str, object] = {"mode": "w"}
-    if ZARR_V3:
-        group_kwargs["zarr_format"] = 2
-    root = zarr.open_group(str(output_path), **group_kwargs)
+    root = open_v2_group(output_path)
     compressor = compressor_from_recompress_preset(recompress)
     root.attrs.update(dict(source_group.attrs))
     array_keys = sorted(
