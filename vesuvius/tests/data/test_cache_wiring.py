@@ -36,16 +36,23 @@ def cache_dir(tmp_path) -> str:
     return str(tmp_path / "chunk-cache")
 
 
-def _spy_open_zarr(monkeypatch) -> list[dict]:
-    """Record the kwargs of every open_zarr call made from volume.py."""
+def _spy_open_zarr(monkeypatch, zarr_path: str) -> list[dict]:
+    """Record the kwargs of every open_zarr call made from volume.py.
+
+    The stand-in opens the local store plainly rather than delegating to the real
+    open_zarr, so no cache store is ever constructed. That keeps these forwarding
+    assertions identical across zarr majors: under zarr 2 the real open_zarr
+    rejects cache=True outright (the in-memory CacheStore is a zarr 3 feature),
+    which would turn a test about argument passing into a test about zarr's
+    version.
+    """
     from vesuvius.data import volume as volume_module
 
     calls: list[dict] = []
-    real = volume_module.open_zarr
 
     def spy(**kwargs):
         calls.append(dict(kwargs))
-        return real(**kwargs)
+        return zarr.open(zarr_path, mode="r")
 
     monkeypatch.setattr(volume_module, "open_zarr", spy)
     return calls
@@ -70,7 +77,7 @@ def _volume(zarr_path: str, cache_dir: str) -> Volume:
 
 
 def test_volume_init_forwards_cache_settings(zarr_path, cache_dir, monkeypatch):
-    calls = _spy_open_zarr(monkeypatch)
+    calls = _spy_open_zarr(monkeypatch, zarr_path)
     _volume(zarr_path, cache_dir)
     assert calls, "constructing a Volume opened no zarr store"
     for kwargs in calls:
@@ -79,8 +86,9 @@ def test_volume_init_forwards_cache_settings(zarr_path, cache_dir, monkeypatch):
 
 def test_load_ome_metadata_forwards_cache_settings(zarr_path, cache_dir, monkeypatch):
     """The gap this task closes: metadata reads used to get no cache arguments."""
+    calls = _spy_open_zarr(monkeypatch, zarr_path)
     vol = _volume(zarr_path, cache_dir)
-    calls = _spy_open_zarr(monkeypatch)
+    calls.clear()
     vol.load_ome_metadata()
     assert calls, "load_ome_metadata opened no zarr store"
     for kwargs in calls:
@@ -88,8 +96,9 @@ def test_load_ome_metadata_forwards_cache_settings(zarr_path, cache_dir, monkeyp
 
 
 def test_load_data_forwards_cache_settings(zarr_path, cache_dir, monkeypatch):
+    calls = _spy_open_zarr(monkeypatch, zarr_path)
     vol = _volume(zarr_path, cache_dir)
-    calls = _spy_open_zarr(monkeypatch)
+    calls.clear()
     vol.load_data()
     assert calls, "load_data opened no zarr store"
     for kwargs in calls:
@@ -98,7 +107,7 @@ def test_load_data_forwards_cache_settings(zarr_path, cache_dir, monkeypatch):
 
 def test_volume_defaults_leave_the_disk_cache_off(zarr_path, monkeypatch):
     """Defaults must reach open_zarr unchanged, or every existing caller shifts."""
-    calls = _spy_open_zarr(monkeypatch)
+    calls = _spy_open_zarr(monkeypatch, zarr_path)
     Volume(type="zarr", path=zarr_path)
     assert calls
     for kwargs in calls:
@@ -110,6 +119,9 @@ def test_volume_defaults_leave_the_disk_cache_off(zarr_path, monkeypatch):
 def test_vc_dataset_forwards_cache_settings_to_volume(zarr_path, cache_dir, monkeypatch):
     from vesuvius.data import vc_dataset as vc_dataset_module
 
+    # A real Volume, so the assertion covers the whole VCDataset -> Volume ->
+    # open_zarr chain rather than just the first hop.
+    calls = _spy_open_zarr(monkeypatch, zarr_path)
     seen: dict = {}
     real = vc_dataset_module.Volume
 
@@ -132,6 +144,13 @@ def test_vc_dataset_forwards_cache_settings_to_volume(zarr_path, cache_dir, monk
     assert seen["cache"] is True
     assert seen["cache_dir"] == cache_dir
     assert seen["cache_max_gb"] == 1.5
+    assert calls, "the Volume VCDataset built opened no zarr store"
+    for kwargs in calls:
+        assert kwargs["cache"] is True
+        assert kwargs["cache_dir"] == cache_dir
+        assert kwargs["cache_max_gb"] == 1.5
+        # VCDataset exposes no cache_size_mb, so Volume's default has to survive.
+        assert kwargs["cache_size_mb"] == 256
 
 
 def test_vc_dataset_defaults_leave_the_cache_off(zarr_path, monkeypatch):
