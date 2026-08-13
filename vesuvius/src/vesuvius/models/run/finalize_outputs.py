@@ -100,32 +100,29 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                 fg_prob = softmax[1:2]
                 output_data = fg_prob
     else:  # multiclass
-        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
+        # Quantize the two parts on fixed, chunk-independent scales so a byte means the same
+        # thing in every chunk: the class index is written raw and the softmax probabilities
+        # use the same [0, 1] -> [0, 255] scale as the binary path. The previous code min-max
+        # rescaled the concatenated [softmax, argmax] array, so the largest class index present
+        # in a chunk set the scale. That made the same class land on different bytes in
+        # different chunks and stored a probability of 1.0 as something other than 255 (#1432).
+        argmax = np.argmax(logits_np, axis=0).astype(np.uint8)
         argmax = argmax[np.newaxis, ...]
         if threshold is not None:
             # In multiclass the CLI only allows the bare-flag form (arrives as 0.5); emit argmax only.
-            output_data = argmax
+            output_np = argmax
         else:
             exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-            output_data = np.concatenate([softmax, argmax], axis=0)
-
-    output_np = output_data
+            softmax_u8 = np.clip(softmax * 255.0, 0, 255).astype(np.uint8)
+            output_np = np.concatenate([softmax_u8, argmax], axis=0)
 
     if mode == "binary":
-        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
+        output_np = np.clip(output_data * 255.0, 0, 255).astype(np.uint8)
     else:
-        # Scale to uint8 range [0, 255]
-        min_val = output_np.min()
-        max_val = output_np.max()
-        if min_val < max_val:
-            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-        else:
-            return None, True
-
-        # Final check: if the processed data is homogeneous, don't write it
-        first_processed_value = output_np.flat[0]
-        if np.all(output_np == first_processed_value):
+        # Empty chunks are already handled by the is_empty guard above; skip a finalized chunk
+        # only when every byte is identical, matching the previous behavior.
+        if np.all(output_np == output_np.flat[0]):
             return None, True
 
     return output_np, False
