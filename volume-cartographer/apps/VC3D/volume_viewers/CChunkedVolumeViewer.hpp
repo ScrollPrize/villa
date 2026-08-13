@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -656,6 +657,11 @@ private:
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
         int segNormalOffsetQ = 0;
+        // Slab bound offsets (quantized) when the flattened viewer composites;
+        // INT_MIN when compositing is off so the modes never alias.
+        int segSlabFrontQ = std::numeric_limits<int>::min();
+        int segSlabBehindQ = std::numeric_limits<int>::min();
+        bool segSlabVolumetric = false;
         size_t flattenedPlanesHash = 0;
         size_t cameraHash = 0;
         bool valid = false;

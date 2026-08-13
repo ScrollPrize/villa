@@ -119,11 +119,12 @@ struct IntersectionStyle {
     int z = kIntersectionZ;
     int widthQ = 0;
     bool dashed = false;
+    bool filled = false;
 
     bool operator==(const IntersectionStyle& other) const
     {
         return color == other.color && z == other.z && widthQ == other.widthQ &&
-               dashed == other.dashed;
+               dashed == other.dashed && filled == other.filled;
     }
 };
 
@@ -134,6 +135,7 @@ struct IntersectionStyleHash {
         h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
         h ^= std::hash<bool>{}(style.dashed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(style.filled) + 0x9e3779b9u + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -1935,10 +1937,20 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
         _compositeSettings.params.method != s.params.method ||
         _compositeSettings.planeEnabled != s.planeEnabled ||
         _compositeSettings.enabled != s.enabled;
+    // Plane viewers draw the flattened viewer's slab bounds as dashed
+    // intersection lines; refresh them when the slab changes.
+    const bool slabChanged =
+        _compositeSettings.enabled != s.enabled ||
+        _compositeSettings.layersFront != s.layersFront ||
+        _compositeSettings.layersBehind != s.layersBehind ||
+        _compositeSettings.reverseDirection != s.reverseDirection ||
+        _compositeSettings.params.method != s.params.method;
     _compositeSettings = s;
     updateCameraGizmo();
     if (cameraChanged)
         emit compositeCameraChanged();
+    if (slabChanged)
+        notifyNormalOffsetChanged();
     submitRender("setCompositeRenderSettings");
 }
 
@@ -5750,9 +5762,25 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     // dashed copy of the active segment's intersection displaced by this amount
     // so the mirrored crosshair (which maps through the offset) stays on a line.
     float segNormalOffset = 0.0f;
+    // When the flattened viewer composites a slab, the dashed line splits into
+    // two: the slab's front and behind extents around the offset surface.
+    bool segCompositeActive = false;
+    // Volumetric compositing views the slab from the front side; mark that
+    // line with direction triangles pointing into the slab.
+    bool segVolumetric = false;
+    float segSlabFront = 0.0f;
+    float segSlabBehind = 0.0f;
     if (auto* segViewer = _viewerManager->segmentationViewer();
         segViewer && segViewer != this) {
         segNormalOffset = segViewer->normalOffset();
+        if (segViewer->isCompositeEnabled()) {
+            const auto& cs = segViewer->compositeRenderSettings();
+            const float zStep = cs.reverseDirection ? -1.0f : 1.0f;
+            segCompositeActive = true;
+            segVolumetric = cs.params.method == "volumetric";
+            segSlabFront = segNormalOffset + float(std::max(0, cs.layersFront)) * zStep;
+            segSlabBehind = segNormalOffset - float(std::max(0, cs.layersBehind)) * zStep;
+        }
     }
 
     const std::uint64_t surfacesVersion = _state->surfacesVersion();
@@ -5878,6 +5906,11 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
     fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
+    if (segCompositeActive) {
+        fp.segSlabFrontQ = int(std::lround(segSlabFront * 1000.0f));
+        fp.segSlabBehindQ = int(std::lround(segSlabBehind * 1000.0f));
+        fp.segSlabVolumetric = segVolumetric;
+    }
     fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
                     (std::hash<int>{}(_framebuffer.height()) << 1);
     fp.valid = true;
@@ -5927,6 +5960,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.activeSegHash == b.activeSegHash &&
                a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
                a.segNormalOffsetQ == b.segNormalOffsetQ &&
+               a.segSlabFrontQ == b.segSlabFrontQ &&
+               a.segSlabBehindQ == b.segSlabBehindQ &&
+               a.segSlabVolumetric == b.segSlabVolumetric &&
                a.cameraHash == b.cameraHash;
     };
     if (geometryCacheValid && !_intersectionItems.empty() &&
@@ -6167,16 +6203,36 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
         };
         groupedColors[style] = baseColor;
-        // Dotted copy of the active segment's line, displaced along the surface
-        // normal by the flattened viewer's offset: it marks where that viewer's
-        // mirrored crosshair lands, so cross-referencing works off-surface too.
-        const bool drawOffsetCopy =
-            target == activeSeg && std::abs(segNormalOffset) > 1e-3f;
+        // Dotted copies of the active segment's line, displaced along the
+        // surface normal. Without compositing: one line at the flattened
+        // viewer's offset, marking where its mirrored crosshair lands. With
+        // compositing: two lines at the slab's front and behind extents.
+        std::vector<float> dashOffsets;
+        if (target == activeSeg) {
+            if (segCompositeActive) {
+                dashOffsets = {segSlabFront, segSlabBehind};
+            } else if (std::abs(segNormalOffset) > 1e-3f) {
+                dashOffsets = {segNormalOffset};
+            }
+        }
         IntersectionStyle offsetStyle;
-        if (drawOffsetCopy) {
+        if (!dashOffsets.empty()) {
             offsetStyle = IntersectionStyle{style.color, style.z, style.widthQ, true};
             groupedColors[offsetStyle] = baseColor;
         }
+        // Volumetric compositing views the slab from the front bound looking
+        // toward the behind bound: mark the front line with periodic filled
+        // triangles pointing into the slab.
+        const bool drawCamMarkers = segVolumetric && !dashOffsets.empty();
+        IntersectionStyle camMarkerStyle;
+        if (drawCamMarkers) {
+            camMarkerStyle =
+                IntersectionStyle{style.color, style.z, style.widthQ, false, true};
+            groupedColors[camMarkerStyle] = baseColor;
+        }
+        constexpr qreal kCamMarkerSpacing = 48.0;  // scene px between triangles
+        constexpr qreal kCamMarkerSize = 8.0;      // scene px, base-to-apex
+        qreal camMarkerAccum = kCamMarkerSpacing;  // marker near the start
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
@@ -6187,18 +6243,45 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             if (target == activeSeg) {
                 addApprovalMaskIntersection(seg, opacity, penWidth);
             }
-            if (drawOffsetCopy) {
+            if (!dashOffsets.empty()) {
                 const cv::Vec3f n0 = target->normal(seg.surfaceParams[0]);
                 const cv::Vec3f n1 = target->normal(seg.surfaceParams[1]);
                 if (!std::isfinite(n0[0]) || !std::isfinite(n0[1]) || !std::isfinite(n0[2]) ||
                     !std::isfinite(n1[0]) || !std::isfinite(n1[1]) || !std::isfinite(n1[2]))
                     continue;
-                const QPointF oa = planeToScene(seg.world[0] + n0 * segNormalOffset);
-                const QPointF ob = planeToScene(seg.world[1] + n1 * segNormalOffset);
-                if (!isFinitePoint(oa) || !isFinitePoint(ob))
-                    continue;
-                groupedPaths[offsetStyle].moveTo(oa);
-                groupedPaths[offsetStyle].lineTo(ob);
+                for (size_t oi = 0; oi < dashOffsets.size(); ++oi) {
+                    const QPointF oa = planeToScene(seg.world[0] + n0 * dashOffsets[oi]);
+                    const QPointF ob = planeToScene(seg.world[1] + n1 * dashOffsets[oi]);
+                    if (!isFinitePoint(oa) || !isFinitePoint(ob))
+                        continue;
+                    groupedPaths[offsetStyle].moveTo(oa);
+                    groupedPaths[offsetStyle].lineTo(ob);
+                    // dashOffsets[0] is the front bound — the volumetric
+                    // camera side.
+                    if (!drawCamMarkers || oi != 0)
+                        continue;
+                    camMarkerAccum += std::hypot(ob.x() - oa.x(), ob.y() - oa.y());
+                    if (camMarkerAccum < kCamMarkerSpacing)
+                        continue;
+                    const cv::Vec3f midWorld = (seg.world[0] + seg.world[1]) * 0.5f;
+                    const cv::Vec3f midNormal = (n0 + n1) * 0.5f;
+                    const QPointF from = planeToScene(midWorld + midNormal * segSlabFront);
+                    const QPointF toward = planeToScene(midWorld + midNormal * segSlabBehind);
+                    if (!isFinitePoint(from) || !isFinitePoint(toward))
+                        continue;
+                    QPointF dir = toward - from;
+                    const qreal dirLen = std::hypot(dir.x(), dir.y());
+                    if (dirLen < 1e-6)
+                        continue;
+                    camMarkerAccum = 0.0;
+                    dir /= dirLen;
+                    const QPointF perp(-dir.y(), dir.x());
+                    QPainterPath& markers = groupedPaths[camMarkerStyle];
+                    markers.moveTo(from + perp * (kCamMarkerSize * 0.5));
+                    markers.lineTo(from - perp * (kCamMarkerSize * 0.5));
+                    markers.lineTo(from + dir * kCamMarkerSize);
+                    markers.closeSubpath();
+                }
             }
         }
     }
@@ -6235,6 +6318,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         if (style.dashed) {
             pen.setStyle(Qt::DotLine);
             pen.setCapStyle(Qt::FlatCap);
+        }
+        if (style.filled) {
+            item->setBrush(groupedColors[style]);
+            pen = QPen(Qt::NoPen);
+        } else {
+            item->setBrush(Qt::NoBrush);
         }
         item->setTransform(QTransform());
         item->setPath(path);
