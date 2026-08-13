@@ -168,6 +168,16 @@ struct LineAnnotationController::LineAnnotationSession {
     bool nativeSeedTracePending = false;
     std::optional<std::vector<vc3d::line_annotation::LineControlPoint>>
         controlPointsBeforeModeChange;
+    // Paired with controlPointsBeforeModeChange: applyOptimizationTaskResult
+    // installs the new line and re-anchors branches before its last failure
+    // exit (generated-view materialization), so a failed whole-line task must
+    // restore these too or a later save writes the rolled-back control points
+    // against the new line — a pair no single optimizer run produced.
+    // Peer-fiber sync is deferred until past that failure exit instead of
+    // being rolled back (see the sync call in applyOptimizationTaskResult).
+    std::optional<vc::lasagna::LineModel> optimizedLineBeforeModeChange;
+    std::optional<std::vector<LineAnnotationController::FiberBranchRef>>
+        branchesBeforeModeChange;
     std::optional<fs::path> atlasDir;
     fs::path atlasFiberPath;
     vc::atlas::AtlasPredSnapSet predSnapSet;
@@ -2325,6 +2335,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     session.fiberOptimizationMode;
                 session.restoreFiberOptimizationModeOnFailure = true;
                 session.controlPointsBeforeModeChange = session.controlPoints;
+                session.optimizedLineBeforeModeChange = session.optimizedLine;
+                session.branchesBeforeModeChange = session.branches;
                 session.fiberOptimizationMode = mode;
                 if (ensureDatasetForSession(session))
                     startFiberModeOptimization(session, true, std::nullopt, true);
@@ -2336,6 +2348,16 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                         session.controlPoints =
                             std::move(*session.controlPointsBeforeModeChange);
                         session.controlPointsBeforeModeChange.reset();
+                    }
+                    if (session.optimizedLineBeforeModeChange) {
+                        session.optimizedLine =
+                            std::move(*session.optimizedLineBeforeModeChange);
+                        session.optimizedLineBeforeModeChange.reset();
+                    }
+                    if (session.branchesBeforeModeChange) {
+                        session.branches =
+                            std::move(*session.branchesBeforeModeChange);
+                        session.branchesBeforeModeChange.reset();
                     }
                     if (pane->dialog) {
                         pane->dialog->setFiberOptimizationMode(
@@ -8537,6 +8559,8 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
         return;
 
     session.controlPointsBeforeModeChange = session.controlPoints;
+    session.optimizedLineBeforeModeChange = session.optimizedLine;
+    session.branchesBeforeModeChange = session.branches;
     auto& metadata = session.controlPoints[owner].segmentToNext;
     if (!metadata) {
         metadata.emplace();
@@ -8550,6 +8574,14 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
     if (session.taskState != LineAnnotationSession::TaskState::Running) {
         session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
         session.controlPointsBeforeModeChange.reset();
+        if (session.optimizedLineBeforeModeChange) {
+            session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            session.optimizedLineBeforeModeChange.reset();
+        }
+        if (session.branchesBeforeModeChange) {
+            session.branches = std::move(*session.branchesBeforeModeChange);
+            session.branchesBeforeModeChange.reset();
+        }
     }
 }
 
@@ -8604,10 +8636,13 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls = session.controlPoints;
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     session.controlPoints = std::move(task.controlPoints);
-    syncLinkedBranchMetadataAfterFiberModification(
-        session,
-        &branchRemapControls,
-        &branchRemapBranches);
+    // Only the session-local remap before the generated views are rebuilt:
+    // materializeGeneratedViews reads session.branches for the link markers,
+    // but it can still fail and roll this session back, so the peer-fiber
+    // phases of the sync must wait until it has succeeded — they mutate
+    // other sessions and _fibers, which the rollback cannot restore.
+    remapBranchControlPointIndices(
+        branchRemapControls, session.controlPoints, session.branches);
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -8652,6 +8687,11 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             return false;
         }
     }
+    // Past the last failure exit: complete the deferred reciprocal cleanup
+    // and endpoint refresh on linked fibers (the session-local remap already
+    // ran before the views were rebuilt).
+    syncLinkedBranchMetadataAfterFiberModification(
+        session, nullptr, &branchRemapBranches);
     refreshBranchLineViews(session.fiberId);
 
     if (session.restoreFiberOptimizationModeOnFailure) {
@@ -9099,6 +9139,10 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     session.watcher = nullptr;
     const bool chainNativeSeedTrace = session.nativeSeedTracePending &&
         task.eventName == "seed" && task.ok;
+    // Captured before the move below: a failed apply despite an ok task
+    // means the generated-view rebuild failed after tearing down the
+    // previous surfaces, so the rollback must rematerialize.
+    const bool taskProducedResult = task.ok;
     session.nativeSeedTracePending = false;
     const bool ok = applyOptimizationTaskResult(session,
                                                std::move(task),
@@ -9116,6 +9160,14 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
             session.controlPointsBeforeModeChange.reset();
         }
+        if (session.optimizedLineBeforeModeChange) {
+            session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            session.optimizedLineBeforeModeChange.reset();
+        }
+        if (session.branchesBeforeModeChange) {
+            session.branches = std::move(*session.branchesBeforeModeChange);
+            session.branchesBeforeModeChange.reset();
+        }
         if (session.restoreFiberOptimizationModeOnFailure) {
             session.fiberOptimizationMode =
                 session.fiberOptimizationModeBeforeTask;
@@ -9125,8 +9177,20 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                     session.fiberOptimizationMode);
             }
         }
+        if (taskProducedResult && !session.suppressGeneratedViews &&
+            !session.optimizedLine.points.empty() &&
+            !session.controlPoints.empty()) {
+            // The optimizer succeeded, so the failure came from
+            // materializeGeneratedViews after it had torn down the previous
+            // surfaces and cleaned up its half-built replacements — the
+            // panes are empty. Rebuild them from the restored model,
+            // best-effort: this geometry materialized before.
+            materializeGeneratedViews(session);
+        }
     } else {
         session.controlPointsBeforeModeChange.reset();
+        session.optimizedLineBeforeModeChange.reset();
+        session.branchesBeforeModeChange.reset();
         session.restoreFiberOptimizationModeOnFailure = false;
         if (chainNativeSeedTrace) {
             startFiberModeOptimization(session, true);
