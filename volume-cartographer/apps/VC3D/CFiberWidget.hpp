@@ -98,9 +98,6 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
-    // Emits fiberTraceReviewChanged for the selected non-legacy fibers;
-    // also the programmatic entry the context-menu actions use.
-    void requestMarkTraceReviewed(bool verified);
     void setShowFibersAvailable(bool available);
     void setShowFibersChecked(bool checked);
     [[nodiscard]] bool showFibersChecked() const;
@@ -114,7 +111,6 @@ signals:
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
-    void fiberTraceReviewChanged(std::vector<uint64_t> fiberIds, bool verified);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);

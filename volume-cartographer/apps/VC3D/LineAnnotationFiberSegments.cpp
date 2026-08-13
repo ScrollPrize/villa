@@ -250,19 +250,6 @@ bool anyAcceptedTraceSpan(const std::vector<ControlPointT>& controls) noexcept
                        });
 }
 
-void eraseTag(std::vector<std::string>& tags, const std::string& tag)
-{
-    tags.erase(std::remove(tags.begin(), tags.end(), tag), tags.end());
-}
-
-void addTagSorted(std::vector<std::string>& tags, const std::string& tag)
-{
-    const auto position = std::lower_bound(tags.begin(), tags.end(), tag);
-    if (position == tags.end() || *position != tag) {
-        tags.insert(position, tag);
-    }
-}
-
 }  // namespace
 
 bool hasAcceptedTraceSpan(const std::vector<LineControlPoint>& controls) noexcept
@@ -285,15 +272,6 @@ FiberTraceState deriveTraceState(
     return mode == FiberOptimizationMode::NativeFiberTrace3d
         ? FiberTraceState::Predictions
         : FiberTraceState::Mixed;
-}
-
-void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans)
-{
-    if (hasTraceSpans) {
-        addTagSorted(tags, kTraceNeedsReviewTag);
-    } else {
-        eraseTag(tags, kTraceNeedsReviewTag);
-    }
 }
 
 FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
