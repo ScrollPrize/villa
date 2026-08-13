@@ -69,6 +69,11 @@ REOPTIMIZE_TAG = 'needs_reoptimization'
 # ^ consumed by VC3D's load-time re-optimization prompt; keep the literal
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
 
+REVIEWED_TAG = 'reviewed'
+# ^ the human review verdict and vc_sync.py hfsync's default publish gate;
+#   keep the literal in sync with kReviewedTag in
+#   apps/VC3D/LineAnnotationFiberSegments.hpp.
+
 
 def _cp_position(value):
     return value.get('position') if isinstance(value, dict) else value
@@ -858,6 +863,41 @@ def merge_tags(base_doc, local_doc, remote_doc):
     return merged
 
 
+def _geometry_pair_eq(doc_a, doc_b):
+    return (_seq_eq(doc_a['control_points'], doc_b['control_points']) and
+            _seq_eq(doc_a['line_points'], doc_b['line_points']))
+
+
+def _drop_unreviewed_merge_geometry(merged, local, remote, span_owners,
+                                    notes):
+    """A 'reviewed' verdict covers the geometry the reviewer saw. Keep the
+    merged tag only when every piece of the merged geometry comes from a
+    side that carried the tag: the whole geometry matches a reviewed side,
+    or (version-3 span merges) every spliced span run is owned by a
+    reviewed side. Runs owned by 'both'/'none' are identical on the two
+    sides, so either side's review covers them. Anything else drops the
+    tag — publishing geometry nobody reviewed is exactly what the hfsync
+    gate exists to prevent."""
+    if REVIEWED_TAG not in merged['tags']:
+        return
+    reviewed_local = REVIEWED_TAG in (local.get('tags') or [])
+    reviewed_remote = REVIEWED_TAG in (remote.get('tags') or [])
+    if reviewed_local and _geometry_pair_eq(merged, local):
+        return
+    if reviewed_remote and _geometry_pair_eq(merged, remote):
+        return
+    if span_owners is not None:
+        covered = all(
+            (reviewed_local if owner == 'local' else
+             reviewed_remote if owner == 'remote' else True)
+            for owner in span_owners)
+        if covered:
+            return
+    merged['tags'].remove(REVIEWED_TAG)
+    notes.append("merged geometry includes spans no reviewer saw; dropped "
+                 f"the '{REVIEWED_TAG}' tag")
+
+
 def _rebind_local_anchors(entries, control_points, line_points):
     """Re-anchor link entries against merged geometry: index by position,
     position snapped to the exact control point, local direction from the
@@ -991,6 +1031,7 @@ def merge_fibers(base, local, remote):
     notes = list(branch_notes)
     stats = dict(branch_stats)
     reoptimize = False
+    span_owners = None
 
     if base.get('version', 1) == 3:
         span_geometry, span_conflicts = merge_v3_span_geometry(
@@ -1003,6 +1044,7 @@ def merge_fibers(base, local, remote):
             result['conflicts'] = [mode_conflict]
             return result
         carrier = span_geometry
+        span_owners = span_geometry['owners']
         local_runs = sum(owner == 'local' for owner in span_geometry['owners'])
         remote_runs = sum(owner == 'remote' for owner in span_geometry['owners'])
         both_runs = sum(owner == 'both' for owner in span_geometry['owners'])
@@ -1119,6 +1161,7 @@ def merge_fibers(base, local, remote):
     merged['tags'] = merge_tags(base, local, remote)
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
+    _drop_unreviewed_merge_geometry(merged, local, remote, span_owners, notes)
     merged['generation'] = max(generation_local, generation_remote) + 1
     manual_tag_conflict = _merge_manual_hv_tag(base, local, remote, merged,
                                                notes)

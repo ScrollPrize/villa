@@ -167,6 +167,15 @@ struct LineAnnotationController::LineAnnotationSession {
     bool nativeSeedTracePending = false;
     std::optional<std::vector<vc3d::line_annotation::LineControlPoint>>
         controlPointsBeforeModeChange;
+    // Paired with controlPointsBeforeModeChange: applyOptimizationTaskResult
+    // installs the new line and re-anchors branches before its last failure
+    // exit (generated-view materialization), so a failed whole-line task must
+    // restore these too or a later save writes the rolled-back control points
+    // against the new line — a pair no single optimizer run produced.
+    // Peer-file link side effects are not rolled back.
+    std::optional<vc::lasagna::LineModel> optimizedLineBeforeModeChange;
+    std::optional<std::vector<LineAnnotationController::FiberBranchRef>>
+        branchesBeforeModeChange;
     std::optional<fs::path> atlasDir;
     fs::path atlasFiberPath;
     vc::atlas::AtlasPredSnapSet predSnapSet;
@@ -2324,6 +2333,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     session.fiberOptimizationMode;
                 session.restoreFiberOptimizationModeOnFailure = true;
                 session.controlPointsBeforeModeChange = session.controlPoints;
+                session.optimizedLineBeforeModeChange = session.optimizedLine;
+                session.branchesBeforeModeChange = session.branches;
                 session.fiberOptimizationMode = mode;
                 if (ensureDatasetForSession(session))
                     startFiberModeOptimization(session, true, std::nullopt, true);
@@ -2335,6 +2346,16 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                         session.controlPoints =
                             std::move(*session.controlPointsBeforeModeChange);
                         session.controlPointsBeforeModeChange.reset();
+                    }
+                    if (session.optimizedLineBeforeModeChange) {
+                        session.optimizedLine =
+                            std::move(*session.optimizedLineBeforeModeChange);
+                        session.optimizedLineBeforeModeChange.reset();
+                    }
+                    if (session.branchesBeforeModeChange) {
+                        session.branches =
+                            std::move(*session.branchesBeforeModeChange);
+                        session.branchesBeforeModeChange.reset();
                     }
                     if (pane->dialog) {
                         pane->dialog->setFiberOptimizationMode(
@@ -8530,6 +8551,8 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
         return;
 
     session.controlPointsBeforeModeChange = session.controlPoints;
+    session.optimizedLineBeforeModeChange = session.optimizedLine;
+    session.branchesBeforeModeChange = session.branches;
     auto& metadata = session.controlPoints[owner].segmentToNext;
     if (!metadata) {
         metadata.emplace();
@@ -8543,6 +8566,14 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
     if (session.taskState != LineAnnotationSession::TaskState::Running) {
         session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
         session.controlPointsBeforeModeChange.reset();
+        if (session.optimizedLineBeforeModeChange) {
+            session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            session.optimizedLineBeforeModeChange.reset();
+        }
+        if (session.branchesBeforeModeChange) {
+            session.branches = std::move(*session.branchesBeforeModeChange);
+            session.branchesBeforeModeChange.reset();
+        }
     }
 }
 
@@ -9109,6 +9140,14 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
             session.controlPointsBeforeModeChange.reset();
         }
+        if (session.optimizedLineBeforeModeChange) {
+            session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            session.optimizedLineBeforeModeChange.reset();
+        }
+        if (session.branchesBeforeModeChange) {
+            session.branches = std::move(*session.branchesBeforeModeChange);
+            session.branchesBeforeModeChange.reset();
+        }
         if (session.restoreFiberOptimizationModeOnFailure) {
             session.fiberOptimizationMode =
                 session.fiberOptimizationModeBeforeTask;
@@ -9120,6 +9159,8 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         }
     } else {
         session.controlPointsBeforeModeChange.reset();
+        session.optimizedLineBeforeModeChange.reset();
+        session.branchesBeforeModeChange.reset();
         session.restoreFiberOptimizationModeOnFailure = false;
         if (chainNativeSeedTrace) {
             startFiberModeOptimization(session, true);

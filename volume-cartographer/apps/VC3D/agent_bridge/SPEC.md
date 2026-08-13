@@ -1,6 +1,9 @@
 # VC3D Agent Bridge Protocol
 
-Status: current protocol reference.
+Status: current protocol reference. Protocol version 2.
+
+Version history: v2 removed `traceNeedsReview`/`traceVerified` from
+`fiber.list` — human review state is the ordinary `reviewed` tag in `tags`.
 
 The bridge is an opt-in JSON-RPC 2.0 server embedded in VC3D. A separate
 FastMCP process translates agent-facing tools into bridge calls. The bridge
