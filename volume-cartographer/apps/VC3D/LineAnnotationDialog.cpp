@@ -1402,7 +1402,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
     }
     _generatedOverlayRefreshConnections.push_back(
         viewer->connectOverlaysUpdated(this, [this]() {
-            if (_closing || _generatedOverlayRefreshQueued) {
+            if (_closing) {
+                return;
+            }
+            // Every update bumps the generation, including ones coalesced into
+            // an already-queued callback, so a landing pass can record exactly
+            // which updates its full rebuild covered.
+            ++_generatedOverlayRefreshGeneration;
+            if (_generatedOverlayRefreshQueued) {
                 return;
             }
             _generatedOverlayRefreshQueued = true;
@@ -1411,11 +1418,13 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 _generatedOverlayRefreshQueued = false;
-                if (_queuedGeneratedOverlayRefreshCovered) {
-                    // A landing's rebuildGeneratedOverlays(true) already did
-                    // this refresh (including the intersection request whose
-                    // preparation is the expensive part).
-                    _queuedGeneratedOverlayRefreshCovered = false;
+                if (_generatedOverlayRefreshGeneration ==
+                    _generatedOverlayRefreshCoveredGeneration) {
+                    // A landing's rebuildGeneratedOverlays(true) already
+                    // covered every update this callback was queued for
+                    // (including the intersection request whose preparation is
+                    // the expensive part). Updates arriving after the landing
+                    // rebuild bump the generation, so they are never skipped.
                     return;
                 }
                 if (_arrowPanDirection != 0) {
@@ -1506,7 +1515,8 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
     _linkedCursorSource.clear();
     _pendingLinkedCursorPoint.reset();
     _generatedOverlayRefreshQueued = false;
-    _queuedGeneratedOverlayRefreshCovered = false;
+    _generatedOverlayRefreshGeneration = 0;
+    _generatedOverlayRefreshCoveredGeneration = 0;
 }
 
 void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
@@ -2659,9 +2669,10 @@ void LineAnnotationDialog::finishArrowPan(double position)
     // refresh the pan ticks deferred.
     rebuildGeneratedOverlays(true);
     // The camera apply above queued the coalesced refresh callback; this pass
-    // just did that work, so let the callback consume itself instead of
-    // repeating the full rebuild (and the intersection preparation).
-    _queuedGeneratedOverlayRefreshCovered = _generatedOverlayRefreshQueued;
+    // just did that work, so record the covered generation and let the
+    // callback skip its (otherwise redundant) full rebuild. Any update after
+    // this line bumps the generation and the callback runs normally.
+    _generatedOverlayRefreshCoveredGeneration = _generatedOverlayRefreshGeneration;
     _arrowPanEndedByLanding = true;
 }
 
