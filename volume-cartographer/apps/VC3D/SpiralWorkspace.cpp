@@ -292,7 +292,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         connect(dock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(_panel, &SpiralPanel::volumeSelected, this, &SpiralWorkspace::selectVolume);
     connect(_panel, &SpiralPanel::pythonOutputRequested, this, [this]() {
         _pythonOutputDialog->show();
         _pythonOutputDialog->raise();
@@ -413,14 +412,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
             });
-    if (_mainState) {
-        connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
-        connect(_mainState, &CState::volumeChanged, this, [this](const std::shared_ptr<Volume>& volume, const std::string&) {
-            if (!_state->currentVolume()) _state->setCurrentVolume(volume);
-            refreshVolumes();
-        });
-    }
-    refreshVolumes();
+    synchronizeVolume(_mainState ? _mainState->currentVolume() : nullptr);
 }
 
 QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
@@ -963,50 +955,34 @@ void SpiralWorkspace::initializePreviewFocus()
     _viewerManager->recenterViewersOnCurrentFocus();
 }
 
-void SpiralWorkspace::refreshVolumes()
+QComboBox* SpiralWorkspace::volumeSelectionControl() const
 {
-    QVector<VolumeSelector::VolumeOption> options;
-    auto package = _mainState ? _mainState->vpkg() : nullptr;
-    // Borrow Main's package so volume-ID resolution, coordinate identity and
-    // the remote chunk-cache root all match Main's viewers. Teardown clears it
-    // again before closeAll() so the shared package is never unloaded from here.
-    if (_state->vpkg() != package) _state->setVpkg(package);
-    if (package) {
-        for (const auto& id : package->volumeIDs()) {
-            auto volume = package->volume(id);
-            if (!volume) continue;
-            options.push_back({QString::fromStdString(id), QString::fromStdString(volume->name()),
-                               QString::fromStdString(volume->path().string())});
-        }
-    }
-    QString selected = QString::fromStdString(_state->currentVolumeId());
-    if (selected.isEmpty() && _mainState) selected = QString::fromStdString(_mainState->currentVolumeId());
-    _panel->setVolumes(options, selected);
-    if (!_state->currentVolume() && _mainState) {
-        _state->setCurrentVolume(_mainState->currentVolume());
-    }
-    ensureInitialFocus();
+    return _panel ? _panel->volumeSelectionControl() : nullptr;
 }
 
-void SpiralWorkspace::selectVolume(const QString& id)
+void SpiralWorkspace::synchronizeVolume(
+    const std::shared_ptr<Volume>& volume,
+    const std::optional<cv::Matx44d>& navigationTransform)
 {
-    auto package = _mainState ? _mainState->vpkg() : nullptr;
-    if (!package || id.isEmpty()) return;
-    auto volume = package->volume(id.toStdString());
-    if (!volume) return;
+    const auto package = _mainState ? _mainState->vpkg() : nullptr;
+    if (_state->vpkg() != package) {
+        // Spiral borrows Main's package; it never owns or independently closes it.
+        _state->setVpkg(package);
+    }
     if (volume == _state->currentVolume()) {
         ensureInitialFocus();
         return;
     }
     const bool hadFocus = _state->poi("focus") != nullptr;
-    _viewerManager->switchVolume(volume);
-    if (!hadFocus) {
+    _viewerManager->switchVolume(volume, navigationTransform);
+    if (volume && !hadFocus) {
         // switchVolume created a volume-center default; prefer the preview
         // focus when one is already loaded.
         _focusIsAutoDefault = true;
         initializePreviewFocus();
     }
-    for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
+    for (auto* viewer : _viewerManager->baseViewers())
+        if (viewer) viewer->requestRender("Shared display volume changed");
 }
 
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)

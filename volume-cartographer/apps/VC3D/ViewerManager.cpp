@@ -1942,7 +1942,24 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     _surfacePatchIndexNeedsRebuild = true;
+    schedulePrimeSurfacePatchIndices();
     return true;
+}
+
+void ViewerManager::schedulePrimeSurfacePatchIndices()
+{
+    if (_surfacePatchIndexPrimeQueued) {
+        return;
+    }
+    _surfacePatchIndexPrimeQueued = true;
+    // One prime per event-loop turn, over the final surface set.
+    QMetaObject::invokeMethod(this, [this]() {
+        _surfacePatchIndexPrimeQueued = false;
+        if (_surfacePatchIndexNeedsRebuild
+            && !_shuttingDown.load(std::memory_order_relaxed)) {
+            primeSurfacePatchIndicesAsync();
+        }
+    }, Qt::QueuedConnection);
 }
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
