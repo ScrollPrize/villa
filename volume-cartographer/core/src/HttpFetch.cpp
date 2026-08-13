@@ -25,6 +25,21 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     return utils::HttpClient(std::move(cfg));
 }
 
+// httpGetBytes fetches arbitrary binary payloads -- tifxyz mesh bands and
+// similar can be 100+ MB, well past what a 30s transfer timeout allows at
+// normal bandwidth. makeTextClient's timeout is sized for small JSON/text
+// responses; reusing it here caused large-but-otherwise-fine downloads to
+// time out and be reported as "missing or empty" rather than as a timeout.
+utils::HttpClient makeBinaryClient(const HttpAuth& auth)
+{
+    utils::HttpClient::Config cfg;
+    cfg.aws_auth = auth;
+    cfg.transfer_timeout = std::chrono::seconds{300};
+    cfg.connect_timeout = std::chrono::seconds{5};
+    cfg.max_retries = 2;
+    return utils::HttpClient(std::move(cfg));
+}
+
 bool isAuthError(long status, const std::string& body)
 {
     if (status == 401 || status == 403)
@@ -116,7 +131,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 
 std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth)
 {
-    auto client = makeTextClient(auth);
+    auto client = makeBinaryClient(auth);
     auto resp = client.get(url);
     if (resp.ok()) {
         return std::move(resp.body);
