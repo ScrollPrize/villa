@@ -1908,23 +1908,29 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     const bool continuingSameGeometry =
         ctx.prevResult && !ctx.genCacheDirty &&
         renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob);
+    const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
+    // ctx.scale is pixels per level-0 volume voxel only for PlaneSurface.
+    // Generated surfaces use their own parameterization, so their scale cannot
+    // participate in a volume-chunk coverage comparison.
+    const std::optional<float> pixelsPerLevel0VolumeVoxel =
+        planeView ? std::optional<float>(ctx.scale) : std::nullopt;
     vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
     vc::render::ChunkedPlaneSampler::Options overlayOptions(
         ctx.overlaySamplingMethod, options.tileSize);
     options.request = ctx.renderJob.chunkRequest;
     overlayOptions.request = ctx.renderJob.chunkRequest;
-    // Keep enough coarse demand for a useful whole-view preview: at most five
-    // levels, stopping once one average chunk spans the average viewport edge.
-    // Recompute this on every render so a chunk-ready repaint cannot demote
-    // incomplete fallback coverage while the requested level is still filling.
+    // Keep enough coarse demand for a useful whole-view preview. Affine plane
+    // views can stop when a chunk spans the viewport in volume space;
+    // parameterized surfaces queue the bounded full five-level range.
     options.queuedFallbackLevels =
         vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
-            *ctx.chunkArray, ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale);
+            *ctx.chunkArray, ctx.startLevel, ctx.fbW, ctx.fbH,
+            pixelsPerLevel0VolumeVoxel);
     overlayOptions.queuedFallbackLevels =
         ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f
         ? vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
               *ctx.overlayChunkArray, ctx.overlayStartLevel,
-              ctx.fbW, ctx.fbH, ctx.scale)
+              ctx.fbW, ctx.fbH, pixelsPerLevel0VolumeVoxel)
         : 0;
 
     auto generatedSurfaceCoords = [&](bool needNormals) {
@@ -2136,7 +2142,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
 
     QElapsedTimer prepassTimer;
     prepassTimer.start();
-    const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
     const bool overlayActive =
         ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f;
     const auto viewportSamples = stratifiedViewportSamples(

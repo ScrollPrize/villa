@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -135,15 +136,18 @@ public:
         vc::Sampling sampling = vc::Sampling::Nearest,
         bool zeroIsSentinel = true);
 
-    // Selects how far a GUI viewport should queue coarse fallback data. Stops
-    // after `maximumFallbackLevels`, or earlier when one average chunk edge at
-    // a candidate level spans the larger viewport edge in level-0 units.
+    // Selects how far a GUI viewport should queue coarse fallback data. When
+    // pixelsPerLevel0VolumeVoxel is available, stops early once one average
+    // chunk edge spans the larger viewport edge in level-0 volume voxels.
+    // Parameterized surfaces must pass nullopt: their screen scale is pixels
+    // per surface unit, not pixels per volume voxel, so the bounded full range
+    // is required unless they provide an explicit volume-space conversion.
     static int fallbackLevelCountForViewport(
         IChunkedArray& array,
         int startLevel,
         int viewportWidth,
         int viewportHeight,
-        float pixelsPerLevel0Unit,
+        std::optional<float> pixelsPerLevel0VolumeVoxel,
         int maximumFallbackLevels = 5);
 
     // Samples one pyramid level into `out` for pixels not already marked in

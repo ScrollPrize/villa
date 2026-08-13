@@ -1,18 +1,14 @@
-# Task: separate persistent-cache probe, download, and decode scheduling
+# Task: fix fallback-level units for generated surfaces
 
-Refactor regular `ChunkCache` work into three independent shared queues:
+Fix interactive fallback-range selection so viewport scale is compared with
+volume chunk extents only when it is expressed in pixels per level-0 volume
+voxel.
 
-1. A high-concurrency local persistent-cache probe queue with 32 workers.
-2. A remote download queue retaining the configured download concurrency.
-3. A CPU decode queue independent of both local probing and downloading.
+Plane views have that affine volume-space relationship. Generated,
+parameterized, and flattened surfaces do not: their camera scale is pixels per
+surface parameter unit. Those views must not use that value in volume-space
+chunk coverage calculations and should instead queue the bounded five-level
+fallback range.
 
-The local probe must classify persistent data, persistent empty markers, and
-cache misses without decoding payloads. Cached data proceeds to decode while a
-cache miss proceeds immediately to download, so slow cached decodes cannot
-delay admission of known remote work. Successful remote reads must likewise
-hand encoded payloads to the decode queue instead of decoding on download
-workers.
-
-All three queues must retain the existing interactive/background and
-view-relative priority model, atomic demand publication, invalidation, source
-sharing, rendered values, persistent formats, and diagnostics semantics.
+Preserve queue ordering, rendering, sampling, and the opt-in visual download
+overlay.

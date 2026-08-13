@@ -1332,7 +1332,7 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
     int startLevel,
     int viewportWidth,
     int viewportHeight,
-    float pixelsPerLevel0Unit,
+    std::optional<float> pixelsPerLevel0VolumeVoxel,
     int maximumFallbackLevels)
 {
     if (array.numLevels() <= 0 || startLevel < 0 ||
@@ -1343,13 +1343,15 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
     const int lastLevel = std::min(
         array.numLevels() - 1, startLevel + maximumFallbackLevels);
     if (viewportWidth <= 0 || viewportHeight <= 0 ||
-        !std::isfinite(pixelsPerLevel0Unit) || pixelsPerLevel0Unit <= 0.0f) {
+        !pixelsPerLevel0VolumeVoxel ||
+        !std::isfinite(*pixelsPerLevel0VolumeVoxel) ||
+        *pixelsPerLevel0VolumeVoxel <= 0.0f) {
         return lastLevel - startLevel;
     }
 
     const double maximumViewportExtent =
         double(std::max(viewportWidth, viewportHeight)) /
-        double(pixelsPerLevel0Unit);
+        double(*pixelsPerLevel0VolumeVoxel);
     for (int level = startLevel; level <= lastLevel; ++level) {
         const auto shape = array.shape(level);
         if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)

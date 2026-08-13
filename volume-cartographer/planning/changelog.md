@@ -2,6 +2,10 @@
 
 ## 2026-08-13
 
+- Corrected interactive fallback-range selection for generated surfaces by
+  preventing their parameter-space camera scale from being compared with
+  volume-voxel chunk extents; these views now request the bounded five-level
+  fallback range.
 - Split regular chunk loading into independent 32-worker persistent-cache
   classification, source download/read, and CPU decode queues so cached decode
   work no longer delays discovery and admission of remote misses.

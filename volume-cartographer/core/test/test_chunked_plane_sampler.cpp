@@ -231,6 +231,15 @@ TEST_CASE("viewport fallback range stops at coverage or five levels")
               array, 6, 4096, 4096, 1.0f) == 1);
 }
 
+TEST_CASE("parameterized viewport fallback uses the bounded full range")
+{
+    PyramidArray array;
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 300, 100, std::nullopt) == 5);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 6, 300, 100, std::nullopt) == 1);
+}
+
 TEST_CASE("viewport dependencies publish coarse levels first")
 {
     PyramidArray array;

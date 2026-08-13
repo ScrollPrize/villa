@@ -54,9 +54,14 @@
 - Before an accepted interactive render samples the volume, it probes the
   viewport on a deterministic stratified 8-pixel grid. Each probe records the
   2-D viewport occurrence of every required requested-level and permitted
-  fallback chunk. It queues at most five coarser levels and stops earlier when
-  one average chunk edge at a candidate level spans the average viewport edge.
-  This fallback demand remains present on refinement renders until it resolves.
+  fallback chunk. It queues at most five coarser levels. Affine plane views may
+  stop earlier when one average chunk edge spans the larger viewport extent,
+  with both quantities measured in level-0 volume voxels. Generated,
+  parameterized, and flattened surfaces instead queue the full bounded range
+  unless they provide an explicit surface-to-volume scale. Their camera scale
+  is pixels per surface parameter unit and must never be compared with volume
+  chunk extents. This fallback demand remains present on refinement renders
+  until it resolves.
   Nearby occurrences of the same chunk are deduplicated, but distant
   occurrences on folded surfaces are retained.
 - A completed pre-pass atomically replaces that source's previous snapshot for
@@ -66,7 +71,9 @@
 - Pending interactive work is ordered by active view, coarser pyramid level,
   nearest retained occurrence to that view's focus, then FIFO. A GUI miss not
   observed by the sparse pre-pass has no location and sorts after located work
-  at the same view and level. Dependency publication is coarse-to-fine so
+  at the same view and relative level. It cannot outrank a located coarser
+  fallback because relative level is the primary ordering key. Dependency
+  publication is coarse-to-fine so
   workers cannot admit fine work before its coarse entries are visible.
 - Mouse interaction marks that view active and updates distances against its
   retained point index. Before any pointer has been observed, viewport center
