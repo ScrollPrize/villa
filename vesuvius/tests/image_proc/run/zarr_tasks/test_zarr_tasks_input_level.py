@@ -10,10 +10,25 @@ failed and nothing was written. `--level N` was ignored for the same reason.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
 zarr = pytest.importorskip("zarr")
+
+
+def _write_array(path, shape, chunks, value):
+    """Create a filled zarr v2 array, on either zarr generation.
+
+    zarr 2 writes v2 and has no ``zarr_format`` argument; zarr 3 defaults to v3,
+    which these tasks cannot consume (they read ``Array.compressor``).
+    """
+    kwargs = {} if zarr.__version__.startswith("2.") else {"zarr_format": 2}
+    array = zarr.open_array(str(path), mode="w", shape=shape, chunks=chunks,
+                            dtype="u1", **kwargs)
+    array[:] = value
+    return array
 
 from vesuvius.image_proc.run.zarr_tasks.tasks.scale import ScaleConfig, ScaleTask
 from vesuvius.image_proc.run.zarr_tasks.tasks.threshold import (
@@ -30,11 +45,11 @@ from vesuvius.image_proc.run.zarr_tasks.tasks.transpose import (
 def pyramid(tmp_path):
     """A two-level OME-Zarr group, the v2 layout these tasks read and write."""
     root = tmp_path / "input.zarr"
-    group = zarr.open_group(str(root), mode="w", zarr_format=2)
-    level0 = group.create_array("0", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="u1")
-    level0[:] = 200
-    level1 = group.create_array("1", shape=(4, 4, 4), chunks=(4, 4, 4), dtype="u1")
-    level1[:] = 100
+    root.mkdir()
+    # the layout create_level_dataset writes: a .zgroup beside the level arrays
+    (root / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    _write_array(root / "0", (8, 8, 8), (4, 4, 4), 200)
+    _write_array(root / "1", (4, 4, 4), (4, 4, 4), 100)
     return str(root)
 
 
@@ -42,9 +57,7 @@ def pyramid(tmp_path):
 def bare_array(tmp_path):
     """A plain array input, which must keep working unchanged."""
     path = tmp_path / "plain.zarr"
-    arr = zarr.open_array(str(path), mode="w", shape=(8, 8, 8), chunks=(4, 4, 4),
-                          dtype="u1", zarr_format=2)
-    arr[:] = 200
+    _write_array(path, (8, 8, 8), (4, 4, 4), 200)
     return str(path)
 
 
