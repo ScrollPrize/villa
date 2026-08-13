@@ -241,6 +241,21 @@ class ZarrTask(ABC):
 
         return opened
 
+    def _get_input_path(self, level: Optional[str] = None) -> str:
+        """Path of the input array itself, with the OME-Zarr level resolved.
+
+        Workers receive paths and open them independently, so they need the path
+        of the array rather than of the pyramid root: opening the root yields a
+        Group, whose ``[slices]`` read fails, and the requested level would be
+        ignored either way.
+        """
+        opened = zarr.open(self.config.input_zarr, mode="r")
+
+        if isinstance(opened, zarr.Group):
+            return f"{self.config.input_zarr.rstrip('/')}/{level if level is not None else '0'}"
+
+        return self.config.input_zarr
+
     @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate parsed arguments.
