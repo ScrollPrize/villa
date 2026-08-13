@@ -759,6 +759,17 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                              vc3d::line_annotation::kGeneratedArrowPanMaximumSpeed)
                 : vc3d::line_annotation::kGeneratedArrowPanDefaultSpeed;
     }
+    // Belt and braces for focus loss: ActivationChange delivery varies by
+    // window manager, so the application-state signal (which fires whenever the
+    // whole app loses focus, e.g. Alt-Tab to another program) backs it up.
+    connect(qGuiApp,
+            &QGuiApplication::applicationStateChanged,
+            this,
+            [this](Qt::ApplicationState state) {
+                if (state != Qt::ApplicationActive) {
+                    stopArrowPanForFocusLoss();
+                }
+            });
     auto* tagsLabel = new QLabel(tr("Tags:"), buttonRow);
     tagsLabel->installEventFilter(this);
     buttonLayout->addWidget(tagsLabel);
@@ -2711,6 +2722,14 @@ void LineAnnotationDialog::centerStripsOnLinePosition(double linePosition, bool 
             }
             stripViewer->applyCameraState(camera, false);
         }
+        if (!includeVertical) {
+            // Per-tick X recentering only touches the first strip: the linked
+            // camera echo (syncLinkedStripCamera) already copies surfacePtrX to
+            // the other strip synchronously, so applying it here too did the
+            // same update twice per tick. The initial snap (includeVertical)
+            // still visits every strip because Y is per-strip, not linked.
+            break;
+        }
     }
 }
 
@@ -4271,15 +4290,27 @@ void LineAnnotationDialog::changeEvent(QEvent* event)
 {
     QMainWindow::changeEvent(event);
     if (event && event->type() == QEvent::ActivationChange && !isActiveWindow()) {
-        _arrowKeyLeftDown = false;
-        _arrowKeyRightDown = false;
-        if (_arrowPanKeyHeld && _arrowPanDirection != 0) {
-            // The key-up goes to whichever window took focus (Alt-Tab
-            // mid-hold), so treat deactivation as the release: the pan brakes
-            // into its next target instead of cruising to the boundary.
-            releaseArrowPanKey(_arrowPanDirection);
-        }
+        stopArrowPanForFocusLoss();
     }
+}
+
+bool LineAnnotationDialog::event(QEvent* event)
+{
+    if (event && event->type() == QEvent::WindowDeactivate) {
+        stopArrowPanForFocusLoss();
+    }
+    return QMainWindow::event(event);
+}
+
+void LineAnnotationDialog::stopArrowPanForFocusLoss()
+{
+    // The key-up goes to whichever window took focus (Alt-Tab mid-hold), and
+    // an inactive window must not keep rendering a pan at all: braking into
+    // the next target can mean minutes of four-pane rendering at low speeds
+    // with sparse control points. Cancel outright, like hideEvent.
+    _arrowKeyLeftDown = false;
+    _arrowKeyRightDown = false;
+    cancelArrowPan();
 }
 
 void LineAnnotationDialog::hideEvent(QHideEvent* event)

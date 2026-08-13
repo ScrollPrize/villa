@@ -241,6 +241,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
     void changeEvent(QEvent* event) override;
+    bool event(QEvent* event) override;
     void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -295,6 +296,9 @@ private:
     // the minimum target if the edit removed it, then re-selects the stop
     // target. Cancels when nothing remains in the travel direction.
     void rebaseArrowPanTargets();
+    // Cancels the pan and clears the physical key flags when focus leaves the
+    // window/app (the key-up is delivered elsewhere; don't render unattended).
+    void stopArrowPanForFocusLoss();
     void tickArrowPan();
     void finishArrowPan(double position);
     void cancelArrowPan();
