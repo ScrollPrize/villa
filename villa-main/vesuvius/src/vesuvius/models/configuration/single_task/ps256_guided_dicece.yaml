@@ -1,0 +1,27 @@
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 1
+  guide_loss_weight: 0.25
+  guide_supervision_target: "surface"
+
+model_config:
+  guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
+  guide_freeze: true
+  guide_tokenbook_tokens: 256
+  guide_tokenbook_dropout: 0.0
+  guide_tokenbook_sample_rate: 1.0
+  guide_tokenbook_ema_decay: null
+  guide_tokenbook_use_ema: false
+  input_shape: [256, 256, 256]
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0

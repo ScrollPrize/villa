@@ -1,0 +1,264 @@
+"""Tests for ConfigManager target name validation."""
+
+from pathlib import Path
+import tempfile
+import pytest
+import yaml
+
+from vesuvius.models.configuration.config_manager import ConfigManager
+
+
+class TestTargetNameValidation:
+    """Test suite for target name validation in ConfigManager."""
+
+    def test_valid_names(self):
+        """Test that valid target names pass validation."""
+        mgr = ConfigManager(verbose=False)
+        valid_names = ['ink', 'fiber', 'papyrus', 'damage', 'my_target']
+
+        # Should not raise ValueError
+        mgr.validate_target_names(valid_names)
+
+    @pytest.mark.parametrize("reserved_name", ['mask', 'is_unlabeled', 'plane_mask'])
+    def test_reserved_names(self, reserved_name):
+        """Test that reserved names raise ValueError."""
+        mgr = ConfigManager(verbose=False)
+
+        with pytest.raises(ValueError, match=f"Target name '{reserved_name}' is reserved"):
+            mgr.validate_target_names([reserved_name])
+
+    def test_mixed_names(self):
+        """Test that a mix with one reserved name fails."""
+        mgr = ConfigManager(verbose=False)
+        mixed_names = ['ink', 'mask', 'fiber']
+
+        with pytest.raises(ValueError, match="Target name 'mask' is reserved"):
+            mgr.validate_target_names(mixed_names)
+
+    def test_config_loading_validation(self):
+        """Test validation during config loading with reserved target name."""
+        config = {
+            "dataset_config": {
+                "targets": {
+                    "mask": {"out_channels": 2}
+                }
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="Target name 'mask' is reserved"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_config_loading_validation_model_config(self):
+        """Test validation when targets are in model_config instead of dataset_config."""
+        config = {
+            "model_config": {
+                "targets": {
+                    "is_unlabeled": {"out_channels": 1}
+                }
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="Target name 'is_unlabeled' is reserved"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_set_targets_validation(self):
+        """Test validation in set_targets_and_data."""
+        mgr = ConfigManager(verbose=False)
+        targets_dict = {
+            "is_unlabeled": {"out_channels": 1}
+        }
+        data_dict = {}
+
+        with pytest.raises(ValueError, match="Target name 'is_unlabeled' is reserved"):
+            mgr.set_targets_and_data(targets_dict, data_dict)
+
+    def test_empty_target_list(self):
+        """Test that empty target list doesn't raise error."""
+        mgr = ConfigManager(verbose=False)
+        # Should not raise ValueError
+        mgr.validate_target_names([])
+
+    def test_multiple_reserved_names(self):
+        """Test error message when multiple reserved names are used."""
+        mgr = ConfigManager(verbose=False)
+        names_with_reserved = ['mask', 'plane_mask', 'ink']
+
+        # Should raise for the first reserved name encountered
+        with pytest.raises(ValueError, match="is reserved"):
+            mgr.validate_target_names(names_with_reserved)
+
+    def test_compile_policy_and_startup_timing_load_from_config(self):
+        config = {
+            "tr_config": {
+                "compile_policy": "module",
+                "startup_timing": True,
+                "ddp_find_unused_parameters": False,
+                "ddp_static_graph": True,
+                "ddp_gradient_as_bucket_view": True,
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            mgr.load_config(temp_path)
+            assert mgr.compile_policy == "module"
+            assert mgr.startup_timing is True
+            assert mgr.ddp_find_unused_parameters is False
+            assert mgr.ddp_static_graph is True
+            assert mgr.ddp_gradient_as_bucket_view is True
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_compile_policy_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "compile_policy": "not_a_policy",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="compile_policy"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_ddp_find_unused_parameters_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "ddp_find_unused_parameters": "sometimes",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="ddp_find_unused_parameters"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_invalid_ddp_static_graph_raises_value_error(self):
+        config = {
+            "tr_config": {
+                "ddp_static_graph": "sometimes",
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="ddp_static_graph"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_cross_frame_config_loads(self):
+        """Loading the shipped ps128_fibers.yaml exposes the cross-frame attrs."""
+        import vesuvius
+
+        config_path = (
+            Path(vesuvius.__file__).parent
+            / "models"
+            / "configuration"
+            / "single_task"
+            / "ps128_fibers.yaml"
+        )
+        assert config_path.exists()
+
+        mgr = ConfigManager(verbose=False)
+        mgr.load_config(str(config_path))
+        assert mgr.dataset_type == "cross_frame"
+        assert mgr.dataset_config["image_zarr_url"].startswith("s3://")
+        assert mgr.dataset_config["labels_zarr_url"].startswith("https://")
+        assert mgr.dataset_config["transform_json_url"].startswith("s3://")
+        assert "fibers" in mgr.targets
+        assert mgr.targets["fibers"]["out_channels"] == 2
+
+    def test_cross_frame_requires_urls(self):
+        """dataset_type=cross_frame without URLs must fail."""
+        config = {
+            "dataset_config": {
+                "dataset_type": "cross_frame",
+                "targets": {"fibers": {"out_channels": 2}},
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="image_zarr_url"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_unknown_dataset_type_raises(self):
+        config = {
+            "dataset_config": {"dataset_type": "bogus", "targets": {"ink": {"out_channels": 2}}}
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="dataset_type"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_explicit_single_label_volume_does_not_force_allow_unlabeled(self):
+        config = {
+            "dataset_config": {
+                "targets": {
+                    "surface": {"out_channels": 2}
+                },
+                "volumes": [
+                    {
+                        "image": "/tmp/image.zarr",
+                        "label": "/tmp/label_surface.zarr",
+                    }
+                ],
+            }
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(config, f)
+            temp_path = f.name
+
+        try:
+            mgr = ConfigManager(verbose=False)
+            mgr.load_config(temp_path)
+            assert mgr.allow_unlabeled_data is False
+        finally:
+            Path(temp_path).unlink()

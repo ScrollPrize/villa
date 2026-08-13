@@ -1,0 +1,68 @@
+*.iconset/
+bin/
+flycheck*
+*.o
+*.so
+*.a
+*.gch
+
+# Emacs
+*~
+
+# Intellij
+.idea/
+*.iml
+*.iws
+
+# Mac
+.DS_Store
+._*
+
+# Maven
+log/
+target/
+
+# CMake
+*CMakeCache.txt
+*CMakeFiles
+*Makefile
+*cmake_install.cmake
+*install_manifest.txt
+*build*/
+deps/
+.cache/
+# Machine-local presets (e.g. Windows MSVC toolchain path); see CMakePresets.json
+CMakeUserPresets.json
+# vcpkg manifest-mode install tree (also created under build/ by the toolchain)
+vcpkg_installed/
+
+# Vim
+tags
+.ycm_extra_conf.py
+.ycm_extra_conf.pyc
+
+# Python
+__pycache__
+.ropeproject
+venv/*
+
+# Doxygen
+docs/latex/
+docs/html/
+
+# CLion
+cmake-build*/
+
+# VS Code
+.vscode/
+VC.ini
+
+build/perf.data
+
+# AppImage packaging output (scripts/build_appimage.sh / Dockerfile.appimage)
+dist/
+*.AppImage
+
+# Claude Code runtime (local settings/state are not shared; skills are)
+.claude/*
+!.claude/skills/

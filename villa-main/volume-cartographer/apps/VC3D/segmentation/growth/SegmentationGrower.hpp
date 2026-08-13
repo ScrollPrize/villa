@@ -1,0 +1,116 @@
+#pragma once
+
+#include "SegmentationGrowth.hpp"
+
+#include "vc/core/util/SurfacePatchIndex.hpp"
+
+#include <QFutureWatcher>
+#include <QObject>
+#include <QPointer>
+#include <QString>
+
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+// Bounding box info for corrections annotation saving
+struct CorrectionsBounds {
+    cv::Vec3f worldMin{0.0f, 0.0f, 0.0f};
+    cv::Vec3f worldMax{0.0f, 0.0f, 0.0f};
+    cv::Rect gridRegion;  // 2D crop region on surface grid
+};
+
+class SegmentationModule;
+class SegmentationWidget;
+class CState;
+class ViewerManager;
+class SurfacePanelController;
+class VolumePkg;
+class Volume;
+class QuadSurface;
+
+class SegmentationGrower : public QObject
+{
+    Q_OBJECT
+
+public:
+    struct Context
+    {
+        SegmentationModule* module{nullptr};
+        SegmentationWidget* widget{nullptr};
+        CState* state{nullptr};
+        ViewerManager* viewerManager{nullptr};
+    };
+
+    struct UiCallbacks
+    {
+        std::function<void(const QString&, int)> showStatus;
+        std::function<void(QuadSurface*)> applySliceOrientation;
+    };
+
+    struct VolumeContext
+    {
+        std::shared_ptr<VolumePkg> package;
+        std::shared_ptr<Volume> activeVolume;
+        std::string activeVolumeId;
+        std::string requestedVolumeId;
+        QString normalGridPath;
+        QString normal3dZarrPath;
+    };
+
+    SegmentationGrower(Context context,
+                       UiCallbacks callbacks,
+                       QObject* parent = nullptr);
+
+    void updateContext(Context context);
+    void updateUiCallbacks(UiCallbacks callbacks);
+    void setSurfacePanel(SurfacePanelController* panel);
+
+    bool start(const VolumeContext& volumeContext,
+               SegmentationGrowthMethod method,
+               SegmentationGrowthDirection direction,
+               int steps,
+               bool inpaintOnly);
+
+    bool startCopyWithNt(const VolumeContext& volumeContext);
+
+    bool running() const { return _running; }
+
+private:
+    struct ActiveRequest
+    {
+        VolumeContext volumeContext;
+        std::shared_ptr<Volume> growthVolume;
+        std::string growthVolumeId;
+        std::shared_ptr<QuadSurface> segmentationSurface;
+        double growthVoxelSize{0.0};
+        bool usingCorrections{false};
+        bool inpaintOnly{false};
+        bool denseDisplacement{false};
+        bool denseCreateNewSegment{false};
+        bool copyDisplacement{false};
+        bool manualAddPreview{false};
+        std::optional<cv::Rect> correctionsAffectedBounds;
+        // For corrections annotation saving
+        std::optional<CorrectionsBounds> correctionsBounds;
+        std::unique_ptr<QuadSurface> beforeCrop;
+        SegmentationCorrectionsPayload corrections;
+    };
+
+    void finalize(bool ok);
+    void handleFailure(const QString& message);
+    void onFutureFinished();
+
+    Context _context;
+    UiCallbacks _callbacks;
+    QPointer<SurfacePanelController> _surfacePanel;
+    bool _running{false};
+    std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
+    std::optional<ActiveRequest> _activeRequest;
+    QString _patchTracerCachedSourcePath;
+    std::vector<std::shared_ptr<QuadSurface>> _patchTracerCachedSurfaces;
+    std::shared_ptr<SurfacePatchIndex> _patchTracerCachedIndex;
+};

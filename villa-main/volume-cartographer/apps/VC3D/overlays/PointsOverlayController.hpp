@@ -1,0 +1,36 @@
+#pragma once
+
+#include "ViewerOverlayControllerBase.hpp"
+
+#include <QMetaObject>
+
+#include <array>
+
+class VCCollection;
+
+class PointsOverlayController : public ViewerOverlayControllerBase
+{
+    Q_OBJECT
+
+public:
+    PointsOverlayController(VCCollection* collection, QObject* parent = nullptr);
+    ~PointsOverlayController() override;
+
+    void setCollection(VCCollection* collection);
+    void setViewTolerance(double tolerance);
+    [[nodiscard]] double viewTolerance() const { return _viewTolerance; }
+
+protected:
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
+
+private:
+    void connectCollectionSignals();
+    void disconnectCollectionSignals();
+    void handleCollectionMutated();
+
+    VCCollection* _collection{nullptr};
+    std::array<QMetaObject::Connection, 8> _collectionConnections{};
+    double _viewTolerance{10.0};
+    bool _refreshPending{false};
+};

@@ -1,0 +1,17 @@
+tr_config:
+  patch_size: [96,96,96]
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    surface:
+      activation: "none"
+      losses:
+        - name: "BettiMatchingLoss"
+          weight: 1
+          kwargs:
+            filtration: 'superlevel'
+

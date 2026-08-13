@@ -1,0 +1,187 @@
+- color_mean:
+  - 0.0019584870897233486
+  - 0.0019664596766233444
+  - 0.0019555699545890093
+  color_std:
+  - 5.122488346387399e-06
+  - 5.154736754775513e-06
+  - 5.106263415655121e-06
+  file_len: 42306
+  filepath: data/processed/stpls3d/validation/cell_yxz_015_024_011.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_015_024_011_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_015_024_011_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_015_024_011.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_015_024_011.txt
+- color_mean:
+  - 0.001953395549207926
+  - 0.0019512862199917436
+  - 0.00196497468277812
+  color_std:
+  - 5.095862888992997e-06
+  - 5.095441338198725e-06
+  - 5.137766947882483e-06
+  file_len: 29264
+  filepath: data/processed/stpls3d/validation/cell_yxz_016_025_004.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_016_025_004_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_016_025_004_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_016_025_004.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_016_025_004.txt
+- color_mean:
+  - 0.001963356975466013
+  - 0.001969654345884919
+  - 0.001956638414412737
+  color_std:
+  - 5.130144018039573e-06
+  - 5.149904609424993e-06
+  - 5.115008207212668e-06
+  file_len: 33448
+  filepath: data/processed/stpls3d/validation/cell_yxz_017_014_053.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_017_014_053_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_017_014_053_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_017_014_053.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_017_014_053.txt
+- color_mean:
+  - 0.001957194646820426
+  - 0.001961879665032029
+  - 0.001969629433006048
+  color_std:
+  - 5.114907708048122e-06
+  - 5.135992068971973e-06
+  - 5.161584795132512e-06
+  file_len: 34043
+  filepath: data/processed/stpls3d/validation/cell_yxz_017_021_025.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_017_021_025_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_017_021_025_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_017_021_025.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_017_021_025.txt
+- color_mean:
+  - 0.00195583188906312
+  - 0.0019529619021341205
+  - 0.0019626396242529154
+  color_std:
+  - 5.106691332912305e-06
+  - 5.105724540044321e-06
+  - 5.136110758030554e-06
+  file_len: 42944
+  filepath: data/processed/stpls3d/validation/cell_yxz_018_015_041.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_018_015_041_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_018_015_041_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_018_015_041.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_018_015_041.txt
+- color_mean:
+  - 0.001953242113813758
+  - 0.001965901581570506
+  - 0.0019554251339286566
+  color_std:
+  - 5.091862021799898e-06
+  - 5.1438923946989235e-06
+  - 5.119695288158255e-06
+  file_len: 37852
+  filepath: data/processed/stpls3d/validation/cell_yxz_018_023_052.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_018_023_052_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_018_023_052_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_018_023_052.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_018_023_052.txt
+- color_mean:
+  - 0.0019557310733944178
+  - 0.001961242640390992
+  - 0.001956121763214469
+  color_std:
+  - 5.107453489472391e-06
+  - 5.128705197421368e-06
+  - 5.109813173476141e-06
+  file_len: 36202
+  filepath: data/processed/stpls3d/validation/cell_yxz_019_015_054.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_019_015_054_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_019_015_054_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_019_015_054.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_019_015_054.txt
+- color_mean:
+  - 0.0019545708782970905
+  - 0.001958610489964485
+  - 0.0019541338551789522
+  color_std:
+  - 5.116165539220674e-06
+  - 5.116959528095322e-06
+  - 5.102435352455359e-06
+  file_len: 39742
+  filepath: data/processed/stpls3d/validation/cell_yxz_020_018_043.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_020_018_043_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_020_018_043_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_020_018_043.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_020_018_043.txt
+- color_mean:
+  - 0.001955110114067793
+  - 0.001965627772733569
+  - 0.0019603248219937086
+  color_std:
+  - 5.0993648983421735e-06
+  - 5.135920218890533e-06
+  - 5.114218765811529e-06
+  file_len: 32237
+  filepath: data/processed/stpls3d/validation/cell_yxz_022_010_010.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_022_010_010_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_022_010_010_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_022_010_010.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_022_010_010.txt
+- color_mean:
+  - 0.0019590070005506277
+  - 0.0019616971258074045
+  - 0.0019576174672693014
+  color_std:
+  - 5.117107775731711e-06
+  - 5.127067652210826e-06
+  - 5.115720796311507e-06
+  file_len: 36400
+  filepath: data/processed/stpls3d/validation/cell_yxz_022_012_009.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_022_012_009_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_022_012_009_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_022_012_009.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_022_012_009.txt
+- color_mean:
+  - 0.0019682247657328844
+  - 0.0019635760691016912
+  - 0.001965874806046486
+  color_std:
+  - 5.153280199010624e-06
+  - 5.127783879288472e-06
+  - 5.155546659807442e-06
+  file_len: 36488
+  filepath: data/processed/stpls3d/validation/cell_yxz_023_014_054.npy
+  filepath_crop:
+  - data/processed/stpls3d/validation/cell_yxz_023_014_054_0.npy
+  instance_gt_filepath:
+  - data/processed/stpls3d/instance_gt/validation/cell_yxz_023_014_054_0.txt
+  raw_filepath: data/raw/thaumatoanakalyptor/validation/cell_yxz_023_014_054.txt
+  raw_segmentation_filepath: ''
+  scene: cell_yxz_023_014_054.txt

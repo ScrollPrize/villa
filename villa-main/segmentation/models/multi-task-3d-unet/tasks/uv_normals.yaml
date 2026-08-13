@@ -1,0 +1,34 @@
+tr_setup:
+  model_name: uv_normals_1
+  autoconfigure: true
+  #checkpoint_path: "/home/sean/Documents/GitHub/multi-task-3d-unet/checkpoints/sheet2_9.pth"
+  load_weights_only: false
+
+tr_config:
+  patch_size:
+  - 128
+  - 128
+  - 128
+
+dataset_config:
+  # theres a bit of a gotcha here if using multi-channel data, the first volume listed is the one used for valid patch finding,
+  # so the first one in each target needs to be single channel if 4d or only 3d
+  targets:
+    uv:
+      out_channels: 2
+      activation: none
+      weight: 1
+      loss_fn: MSELoss
+      volumes:
+        - data_volume: "/mnt/raid_nvme/s1.zarr"
+          label_volume: "/mnt/raid_hdd/combined_uv_volume.zarr"
+          format: "zarr_local"
+    normals:
+      out_channels: 3
+      activation: none
+      weight: 1
+      loss_fn: MaskedCosineLoss
+      volumes:
+        - data_volume: "/mnt/raid_nvme/s1.zarr"
+          label_volume: "/mnt/raid_hdd/backup/Documents/GitHub/VC-Surface-Models/models/normals.zarr"
+          format: "zarr_local"

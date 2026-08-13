@@ -1,0 +1,37 @@
+tr_setup:
+  model_name: "inplane_medialsurf"
+
+tr_config:
+  batch_size: 2
+  enable_deep_supervision: false
+
+dataset_config:
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  skip_patch_validation: true
+  targets:
+    surface:
+      weight: 1.0
+      activation: "none"
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0
+
+auxiliary_tasks:
+  inplane_direction:
+    type: inplane_direction
+    source_target: surface
+    compute_from: sdt
+    grad_sigma: 1.0
+    tensor_sigma: 1.5
+    loss_weight: 0.25
+    losses:
+      - name: "SignInvariantCosineLoss"
+        weight: 1.0
+        kwargs:
+          dim: 1
+          eps: 1e-8
+          ignore_index: -100
+
+
+

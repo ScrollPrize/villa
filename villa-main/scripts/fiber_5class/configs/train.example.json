@@ -1,0 +1,51 @@
+{
+  "_comment": "Template config for the 4-class fiber/ink self-distillation trainer. Copy to train.json and fill in the paths marked <...>. Classes: 0 bg, 1 vertical fiber, 2 horizontal/angular fiber, 3 ink.",
+
+  "out_dir": "<OUTPUT_DIR_FOR_CHECKPOINTS>",
+  "debug_dir": null,
+
+  "wandb_project": "paris4-full-features",
+  "wandb_entity":  "<WANDB_ENTITY>",
+  "wandb_run_name": "fiber4c_ddp8",
+  "wandb_tags": ["4class", "fiber-ink", "ddp8", "self-distill", "ink-overrides-fiber"],
+
+  "seed": 27,
+  "patch_size": [256, 256, 256],
+  "target_name": "labels",
+  "out_channels": 4,
+  "activation": "none",
+  "in_channels": 1,
+  "batch_size": 2,
+  "num_iterations": 30000,
+  "warmup_steps": 2000,
+  "val_every": 100,
+  "save_every": 1000,
+  "mixed_precision": "bf16",
+  "dice_label_smoothing": 0.1,
+  "ce_label_smoothing":   0.1,
+  "dataloader_workers": 6,
+  "prefetch_factor": 4,
+
+  "optimizer": {"name": "SGD", "lr": 0.005, "momentum": 0.99, "weight_decay": 3e-5, "nesterov": true},
+  "ema":       {"enabled": true, "decay": 0.9995, "start_step": 1000},
+
+  "dataset": {
+    "volume_url": "<VOLUME_ZARR_URL_OR_PATH>",
+    "storage_options": {"anon": true},
+    "scale": 0,
+    "min_nonempty_frac": 0.1,
+    "dark_threshold": 50
+  },
+
+  "pseudo": {
+    "fiber_teacher":      "<FROZEN_FIBER_TEACHER_CKPT>",
+    "ink_teacher":        "<FROZEN_INK_TEACHER_CKPT>",
+    "fiber_thr":          0.5,
+    "ink_thr":            0.10,
+    "dark_voxel_thr":     90,
+    "ws_image_mode":      "distance",
+    "ws_h_merge":         14000,
+    "ws_min_voxels":      400,
+    "pca_cos_threshold":  0.819
+  }
+}

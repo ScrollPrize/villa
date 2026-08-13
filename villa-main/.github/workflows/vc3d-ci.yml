@@ -1,0 +1,469 @@
+name: Continuous Integration (CI)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Trusted main builds populate sccache entries that all subsequent PRs can
+  # read. Caches written by pull_request runs are scoped to that PR's merge ref.
+  push:
+    branches: [main]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-ci.yml'
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      vc: ${{ steps.filter.outputs.vc }}
+      test_core: ${{ steps.filter.outputs.test_core }}
+      test_specialized: ${{ steps.filter.outputs.test_specialized }}
+      vc3d: ${{ steps.filter.outputs.vc3d }}
+      cli: ${{ steps.filter.outputs.cli }}
+      flatboi: ${{ steps.filter.outputs.flatboi }}
+      mcp: ${{ steps.filter.outputs.mcp }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vc:
+              - 'volume-cartographer/**'
+              - '.github/workflows/vc3d-ci.yml'
+              - '.github/workflows/vc3d-macos.yml'
+            test_core:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            test_specialized:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            vc3d:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            cli:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/CMakeLists.txt'
+              - 'volume-cartographer/apps/src/**'
+              - 'volume-cartographer/apps/diffusion/**'
+              - 'volume-cartographer/apps/VC3D/FiberSliceGeometry.*'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            flatboi:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/FetchLibigl.cmake'
+              - 'volume-cartographer/libs/flatboi/**'
+              - 'volume-cartographer/libs/libigl_changes/**'
+              - '.github/workflows/vc3d-ci.yml'
+            mcp:
+              - 'volume-cartographer/tools/vc3d-mcp/**'
+              - '.github/workflows/vc3d-ci.yml'
+
+  skip:
+    name: Skip (no volume-cartographer changes)
+    needs: changes
+    if: needs.changes.outputs.vc != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "No volume-cartographer changes — skipping build."
+
+  test-core:
+    name: Linux base tests (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.test_core == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Build and test base shard
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-core -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-core --target vc_test_core --parallel 4
+          ctest --test-dir build/ci-fast-core --output-on-failure \
+            --parallel 4 -L '^vc-core$'
+          sccache --show-stats
+
+  test-specialized:
+    name: Linux Lasagna/fiber/GUI tests (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.test_specialized == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Build and test specialized shard
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-specialized -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-specialized --target vc_test_specialized --parallel 4
+          ctest --test-dir build/ci-fast-specialized --output-on-failure \
+            --parallel 4 -L '^vc-specialized$'
+          sccache --show-stats
+
+  render-benchmark:
+    name: Synthetic rendering regression (GCC Release / Valgrind replay)
+    needs: changes
+    if: needs.changes.outputs.test_core == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      # Keep this until the next published dependency image includes the
+      # valgrind entry in scripts/install_build_deps.sh.
+      - name: Install Valgrind profiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends valgrind
+          valgrind --version
+      - name: Configure Release benchmark graph
+        working-directory: volume-cartographer
+        run: |
+          cmake -S . -B build/ci-render-benchmark -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
+            -DVC_RUN_RENDER_BENCHMARKS=ON \
+            -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
+            -DVC_BUILD_FLATBOI=OFF
+      - name: Verify fixture and native parallel execution
+        working-directory: volume-cartographer
+        run: |
+          jobs=$(nproc)
+          echo "Using $jobs Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target bench_render_synthetic bench_thread_sync_replay \
+            --parallel "$jobs"
+          ctest --test-dir build/ci-render-benchmark --output-on-failure \
+            -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
+      - name: Run full fresh Valgrind matrix
+        working-directory: volume-cartographer
+        run: |
+          jobs=$(nproc)
+          echo "Using $jobs Valgrind/Ninja jobs"
+          cmake --build build/ci-render-benchmark \
+            --target render_valgrind_ci --parallel "$jobs"
+      - name: Upload rendering benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-rendering-valgrind
+          path: volume-cartographer/build/ci-render-benchmark/render-valgrind-ci/
+          if-no-files-found: warn
+
+  vc3d-compile-smoke:
+    name: Linux VC3D compile and smoke (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.vc3d == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Build and smoke VC3D
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-vc3d -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
+          QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+            --vc3d build/ci-fast-vc3d/bin/VC3D
+          sccache --show-stats
+
+  cli-compile:
+    name: Linux CLI compile coverage (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Compile every CLI target
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-cli -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-cli --target vc_cli_all --parallel 4
+          sccache --show-stats
+
+  flatboi-compile:
+    name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.flatboi == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Compile Flatboi and PaStiX
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-flatboi -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=ON
+          cmake --build build/ci-fast-flatboi --target flatboi --parallel 4
+          sccache --show-stats
+
+  mcp-test:
+    name: MCP unit tests
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        run: python -m pip install -e .
+      - name: Test MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        env:
+          PYTHONWARNINGS: error::ResourceWarning
+        run: python -m unittest discover -p 'test*.py'
+
+  # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
+  # Full packaging and packaged-app smoke checks run after merge and on releases.
+  macos-build:
+    name: macOS compile (${{ matrix.os }}, Homebrew LLVM)
+    needs: changes
+    # The packaging workflow builds and seeds this same toolchain on main.
+    # Keep the required compile gate on PRs without rebuilding it after merge.
+    if: needs.changes.outputs.vc == 'true' && github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-macos-15-arm64-homebrew-llvm-deps-b21145c7
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ScrollPrize/vc3d-deps
+          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
+          path: vc3d-deps
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Restore prebuilt Homebrew dependencies
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | oras login ghcr.io -u '${{ github.actor }}' --password-stdin
+          oras pull ghcr.io/scrollprize/vc3d-deps/macos:sha-b21145c78af694a0fc574249a3f7ae6f037f8bea -o "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/vc3d-deps/macos/restore.sh" \
+            "$RUNNER_TEMP/vc3d-macos-15-arm64.tar.zst"
+
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+
+      - name: Configure + build
+        run: volume-cartographer/scripts/build_macos.sh --sccache
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        run: |
+          python -m pip install -e .
+          python -m unittest discover -p 'test*.py'
+
+  ci:
+    name: CI
+    needs: [changes, skip, test-core, test-specialized, render-benchmark, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Aggregate required-check result
+        env:
+          R_CHANGES: ${{ needs.changes.result }}
+          R_SKIP: ${{ needs.skip.result }}
+          R_TEST_CORE: ${{ needs.test-core.result }}
+          R_TEST_SPECIALIZED: ${{ needs.test-specialized.result }}
+          R_RENDER_BENCHMARK: ${{ needs.render-benchmark.result }}
+          R_VC3D: ${{ needs.vc3d-compile-smoke.result }}
+          R_CLI: ${{ needs.cli-compile.result }}
+          R_FLATBOI: ${{ needs.flatboi-compile.result }}
+          R_MCP_TEST: ${{ needs.mcp-test.result }}
+          R_MACOS: ${{ needs.macos-build.result }}
+        run: |
+          set -e
+          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED render_benchmark=$R_RENDER_BENCHMARK vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
+          # All non-skipped jobs must succeed (or be skipped legitimately).
+          fail=0
+          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_RENDER_BENCHMARK" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
+            case "$r" in
+              success|skipped) ;;
+              *) fail=1 ;;
+            esac
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more required CI jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All required CI jobs passed."

@@ -1,0 +1,13 @@
+{
+  "dataset_path": "/home/paul/projects/vesuvius-scrolls/spiral/dataset",
+  "z_begin": 10000,
+  "z_end": 11000,
+  "iterations": 401,
+  "cache_path": null,
+  "config_overrides": {
+    "dense_spacing_mode": "grad_mag",
+    "loss_weight_dense_spacing_density": 0.0,
+    "loss_weight_dense_normals": 0.0,
+    "loss_weight_dense_spacing": 0.0
+  }
+}

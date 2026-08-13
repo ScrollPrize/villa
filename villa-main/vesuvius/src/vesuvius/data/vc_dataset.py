@@ -1,0 +1,700 @@
+import os
+from typing import Optional, Tuple, Union
+import numpy as np
+# import zarr # No longer needed directly in VCDataset
+# import tifffile # No longer needed directly in VCDataset
+import torch
+from torch.utils.data import Dataset
+import re
+from pathlib import Path
+
+# Assuming these are in the correct relative paths
+from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
+from vesuvius.data.volume import Volume
+# Import utility functions directly from vesuvius package
+from vesuvius.utils import list_files, is_aws_ec2_instance
+# Import get_max_value from data.utils to avoid import errors
+from vesuvius.data.utils import get_max_value, open_zarr
+from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
+
+class VCDataset(Dataset):
+    def __init__(
+            self,
+            input_path: str,
+            patch_size: Tuple[int, int, int],
+            num_input_channels: Optional[int] = None, # Can often be inferred from Volume
+            input_format: str = 'zarr', # Less critical now, type inferred from input_path/params
+            step_size: float = 0.5,
+            verbose: bool = False,
+            mode: str = 'infer', # Currently only 'infer' logic is fully implemented
+            num_parts: int = 1,
+            part_id: int = 0,
+            bbox: Optional[Tuple[int, int, int, int, int, int]] = None,
+            targets = None,  # Added targets parameter with None default
+            # --- Volume Class Pass-through Parameters ---
+            scroll_id: Optional[Union[int, str]] = None,
+            energy: Optional[int] = None,
+            resolution: Optional[float] = None,
+            segment_id: Optional[int] = None,
+            normalization_scheme: str = 'instance_zscore', # Default to instance z-score
+            global_mean: Optional[float] = None,
+            global_std: Optional[float] = None,
+            intensity_props: Optional[dict] = None,
+            return_as_type: str = 'np.float16', # Default float type for model input
+            # return_as_tensor: bool = True, # Forcing True below
+            domain: Optional[str] = None,
+            skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
+            anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
+            read_retries: int = 4,  # Attempts per read, forwarded to Volume
+            ):
+        """
+        Dataset for nnUNet inference using the Volume class for data access and preprocessing.
+
+        Handles local/remote Zarr, scrolls, and segments uniformly via Volume.
+
+        Args:
+            input_path: Path to input data (local/remote Zarr, scroll ID, segment ID).
+            targets: Output targets configuration (currently unused in inference).
+            patch_size: Patch size for extraction (tuple of 3 ints - Z, Y, X).
+            num_input_channels: Expected number of input channels (optional, can be inferred).
+            input_format: Format hint ('zarr', 'volume'). Type is mainly inferred now.
+            step_size: Step size for sliding window as a fraction of patch size (0.5 = 50% overlap).
+            load_all: Ignored. Volume class handles data loading.
+            verbose: Enable detailed output messages.
+            mode: 'infer' (default). 'train' mode logic is not implemented here.
+            num_parts: Number of parts to split the dataset into along Z-axis.
+            part_id: Which part of the split dataset to use (0-indexed).
+            bbox: Optional region of interest as (z_min, z_max, y_min, y_max, x_min, x_max)
+                  in *global* voxel coordinates, half-open ([min, max)). When given, the
+                  sliding-window grid covers only this region, but patch coordinates stay
+                  in the global volume frame so downstream blending/finalization remain
+                  aligned. Bounds are clamped to the volume; an ROI smaller than the patch
+                  size along an axis is grown to the patch size (shifted back inside the
+                  volume when possible).
+
+            scroll_id: Scroll ID for Volume (if input_path isn't a specific scroll/segment).
+            energy: Energy value for Volume.
+            resolution: Resolution value for Volume.
+            segment_id: Segment ID for Volume (if input_path isn't a specific scroll/segment).
+            normalization_scheme: Normalization method for Volume ('none', 'instance_zscore',
+                                  'global_zscore', 'instance_minmax').
+            global_mean: Global mean for 'global_zscore' scheme.
+            global_std: Global standard deviation for 'global_zscore' scheme.
+            return_as_type: Target NumPy dtype string for Volume output *before* tensor conversion
+                             (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
+            domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
+            anon: Use anonymous requests for input S3 reads.
+            read_retries: Attempts per read, forwarded to Volume (default 4). Transient
+                remote failures are retried with exponential backoff so one dropped
+                connection does not abort a long streaming run. Pass 1 to disable.
+        """
+        self.input_path = input_path
+        self.input_format = input_format # Keep for informational purposes
+        self.targets = targets
+        self.patch_size = patch_size
+        self.step_size = step_size
+        # self.load_all = False # Always false now
+        self.verbose = verbose
+        self.mode = mode
+        self.return_as_tensor = True # Dataset __getitem__ always returns tensors
+        self.skip_empty_patches = skip_empty_patches
+        self.anon = anon
+        self.empty_patches_skipped = 0  # Counter for skipped patches
+        self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
+
+        # Data partitioning parameters
+        if num_parts < 1:
+            raise ValueError(f"num_parts must be >= 1, got {num_parts}")
+        if not (0 <= part_id < num_parts):
+            raise ValueError(f"part_id must be between 0 and {num_parts-1}, got {part_id}")
+        self.num_parts = num_parts
+        self.part_id = part_id
+
+        if bbox is not None:
+            if len(bbox) != 6:
+                raise ValueError(
+                    f"bbox must be (z_min, z_max, y_min, y_max, x_min, x_max), got {bbox}"
+                )
+            for axis, (lo, hi) in enumerate(zip(bbox[0::2], bbox[1::2])):
+                if lo is not None and lo < 0:
+                    raise ValueError(f"bbox axis {axis} min {lo} is negative")
+                if lo is not None and hi is not None and hi <= lo:
+                    raise ValueError(
+                        f"bbox axis {axis} range [{lo}, {hi}) is empty; "
+                        f"bounds are half-open and must satisfy min < max"
+                    )
+        self.bbox = tuple(int(v) if v is not None else None for v in bbox) if bbox is not None else None
+
+        if self.mode != 'infer':
+            print(f"Warning: VCDataset mode is '{self.mode}'. Only 'infer' mode logic (sliding window) is fully implemented.")
+
+        # --- Determine Volume Type and Path ---
+        type_value: Union[str, int]
+        use_path: Optional[str] = None
+
+        if isinstance(input_path, str):
+            input_lower = input_path.lower()
+            # Check for Scroll ID format (e.g., "scroll1", "scroll1b")
+            if re.match(r'scroll[0-9]+[a-z]*$', input_lower):
+                 type_value = input_path # Pass original case potentially
+                 if scroll_id is None: scroll_id = type_value # Set scroll_id if not provided
+                 if self.verbose: print(f"Interpreting input_path '{input_path}' as Volume type 'scroll'.")
+            # Check for Segment ID format (numeric string)
+            elif input_path.isdigit():
+                 type_value = input_path # Keep as string for Volume constructor flexibility
+                 if segment_id is None: segment_id = int(input_path) # Set segment_id if not provided
+                 if self.verbose: print(f"Interpreting input_path '{input_path}' as Volume type 'segment'.")
+            # Check for explicit 'volume' format hint (less common now)
+            elif input_format == 'volume':
+                 # This case requires scroll_id or segment_id to be provided explicitly
+                 if segment_id is not None:
+                      type_value = str(segment_id)
+                      if self.verbose: print(f"Using explicit segment_id {segment_id} as Volume type.")
+                 elif scroll_id is not None:
+                      type_value = f"scroll{scroll_id}" # Construct type
+                      if self.verbose: print(f"Using explicit scroll_id {scroll_id} to set Volume type.")
+                 else:
+                      raise ValueError("input_format='volume' requires scroll_id or segment_id to be provided.")
+            # Otherwise, assume it's a path (Zarr or potentially other formats Volume might support)
+            else:
+                 type_value = "zarr" # Default type when it looks like a path
+                 use_path = input_path
+                 if self.verbose: print(f"Interpreting input_path '{input_path}' as a path for Volume type 'zarr'.")
+                 # Automatically set domain to local for file paths unless overridden
+                 if domain is None and not use_path.startswith(('http://', 'https://', 's3://')):
+                     domain = "local"
+                     if self.verbose: print("Auto-setting domain to 'local' for non-HTTP/S3 path.")
+
+        elif isinstance(input_path, int): # Handle integer scroll_id passed as input_path
+             type_value = f"scroll{input_path}"
+             if scroll_id is None: scroll_id = input_path
+             if self.verbose: print(f"Interpreting integer input_path {input_path} as scroll ID.")
+        else:
+             raise TypeError(f"Unsupported input_path type: {type(input_path)}")
+
+
+        # --- Initialize Volume Class ---
+        try:
+            if self.verbose:
+                print("\n--- Initializing Volume ---")
+                print(f"  Type: {type_value}")
+                print(f"  Path: {use_path}")
+                print(f"  Scroll ID: {scroll_id}")
+                print(f"  Segment ID: {segment_id}")
+                print(f"  Energy: {energy}")
+                print(f"  Resolution: {resolution}")
+                print(f"  Domain: {domain}")
+                print(f"  Normalization: {normalization_scheme}")
+                if normalization_scheme == 'global_zscore':
+                     print(f"    Global Mean: {global_mean}, Global Std: {global_std}")
+                if normalization_scheme == 'ct':
+                     print(f"    Intensity props keys: {list((intensity_props or {}).keys())}")
+                print(f"  Return Type (NumPy): {return_as_type}")
+                print(f"  Return As Tensor: {self.return_as_tensor}") # Use internal dataset flag
+                print(f"  Input Channels: {num_input_channels}")
+                print(f"  Targets: {targets}")
+                print(f"  Anonymous S3 Input: {anon}")
+                print("---------------------------\n")
+
+            # Validate Zarr path if provided - skip validation for remote paths
+            if type_value == "zarr" and use_path is not None and not use_path.startswith(('http://', 'https://', 's3://')):
+                p = Path(use_path)
+                if not p.is_absolute():
+                     abs_p = p.resolve()
+                     if self.verbose: print(f"  Converting relative Zarr path '{use_path}' to absolute '{abs_p}'")
+                     use_path = str(abs_p)
+
+                if not os.path.exists(use_path):
+                    raise FileNotFoundError(f"Zarr path does not exist: {use_path}")
+                if not os.path.isdir(use_path):
+                     if not use_path.endswith('.zip'): # Basic check
+                         print(f"  Warning: Zarr path '{use_path}' exists but is not a directory.")
+                # Check for key Zarr files (optional, Volume handles errors)
+                # if not os.path.exists(os.path.join(use_path, '.zarray')) and not os.path.exists(os.path.join(use_path, '.zgroup')):
+                #     print(f"  Warning: Path {use_path} might not be a Zarr store (missing .zarray/.zgroup).")
+            elif type_value == "zarr" and use_path is not None and use_path.startswith('s3://'):
+                if self.verbose: print(f"  Using S3 path: {use_path}")
+
+            self.volume = Volume(
+                type=type_value,
+                scroll_id=scroll_id,
+                energy=energy,
+                resolution=resolution,
+                segment_id=segment_id,
+                # normalize=False, # Removed, use scheme
+                normalization_scheme=normalization_scheme,
+                global_mean=global_mean,
+                global_std=global_std,
+                intensity_props=intensity_props,
+                return_as_type=return_as_type,
+                return_as_tensor=self.return_as_tensor, # Ensure Volume returns tensors directly
+                verbose=verbose,
+                domain=domain,
+                path=use_path,
+                anon=self.anon,
+                read_retries=read_retries,
+            )
+
+            # Get shape and dtype from the primary resolution level (0)
+            self.input_shape = self.volume.shape(0) # Z, Y, X or C, Z, Y, X
+            self.input_dtype = self.volume.dtype # Original dtype before Volume's processing
+            self.output_dtype = getattr(torch, return_as_type.replace('np.', '')) if self.return_as_tensor else getattr(np, return_as_type.replace('np.', ''))
+
+            if self.verbose:
+                print(f"Volume initialized successfully.")
+                print(f"  Input Shape (from Volume level 0): {self.input_shape}")
+                print(f"  Original Dtype (from Volume): {self.input_dtype}")
+                print(f"  Output Dtype (expected from Volume): {self.output_dtype}")
+
+            # Infer num_input_channels if not provided
+            if num_input_channels is None:
+                if len(self.input_shape) == 4: # Assume C, Z, Y, X
+                    self.num_input_channels = self.input_shape[0]
+                    if self.verbose: print(f"  Inferred num_input_channels: {self.num_input_channels}")
+                else: # Assume Z, Y, X
+                    self.num_input_channels = 1
+                    if self.verbose: print(f"  Assuming single channel input (num_input_channels=1).")
+            else:
+                self.num_input_channels = num_input_channels
+                 # Add a check
+                if len(self.input_shape) == 4 and self.input_shape[0] != self.num_input_channels:
+                     print(f"Warning: Provided num_input_channels ({self.num_input_channels}) does not match "
+                           f"first dimension of Volume shape ({self.input_shape[0]}). Using provided value.")
+                elif len(self.input_shape) == 3 and self.num_input_channels != 1:
+                     print(f"Warning: Provided num_input_channels ({self.num_input_channels}) != 1 for 3D Volume shape. "
+                           f"Will add channel dimension in getitem. Using provided value.")
+
+        except Exception as e:
+            print(f"ERROR: Failed to initialize Volume within VCDataset.")
+            # Log details that might be helpful
+            print(f"  Attempted Volume params: type={type_value}, path={use_path}, scroll={scroll_id}, seg={segment_id}, ...")
+            raise ValueError(f"Error initializing Volume: {e}") from e
+
+
+        # --- Position Calculation (for infer mode) ---
+        self.all_positions = []
+        if mode == 'infer':
+            if not isinstance(self.patch_size, (list, tuple)) or len(self.patch_size) != 3:
+                 raise ValueError(f"patch_size must be a tuple/list of 3 integers (Z, Y, X), got {self.patch_size}")
+
+            pZ, pY, pX = self.patch_size
+            # Get the 3D spatial dimensions (Z, Y, X)
+            if len(self.input_shape) == 3: # Z, Y, X
+                image_size = self.input_shape
+            elif len(self.input_shape) == 4: # C, Z, Y, X
+                image_size = self.input_shape[1:]
+            else:
+                raise ValueError(f"Unsupported input shape dimension from Volume: {self.input_shape}")
+
+            roi = None
+            if self.bbox is not None:
+                roi = self._clamp_bbox_to_image(self.bbox, image_size, self.patch_size)
+
+            if roi is not None:
+                if self.verbose:
+                    print(f"\nUsing bbox-restricted sliding window (global coords): "
+                          f"z=[{roi[0][0]}, {roi[0][1]}), y=[{roi[1][0]}, {roi[1][1]}), "
+                          f"x=[{roi[2][0]}, {roi[2][1]})")
+                # Build the grid the whole volume would have used, then keep the
+                # patches that touch the ROI. Anchoring the grid to the ROI origin
+                # instead would place patches the full-volume run never places -
+                # a 256-long ROI yields stride 64 where the volume yields ~96 - so
+                # every voxel gets a different set of overlapping patches and the
+                # blended result no longer matches the corresponding sub-region of
+                # a full run. Selecting from the global grid keeps them identical,
+                # which is the whole point of being able to redo one region.
+                (z0, z1), (y0, y1), (x0, x1) = roi
+
+                def _overlapping(extent, patch, lo, hi):
+                    return [s for s in compute_steps_for_sliding_window(extent, patch, self.step_size)
+                            if s < hi and s + patch > lo]
+
+                z_positions = _overlapping(image_size[0], pZ, z0, z1)
+                y_positions = _overlapping(image_size[1], pY, y0, y1)
+                x_positions = _overlapping(image_size[2], pX, x0, x1)
+            else:
+                # Full-volume sliding window
+                if self.verbose:
+                    print("\nUsing full volume sliding window")
+
+                # Generate all potential coordinates
+                z_positions = compute_steps_for_sliding_window(image_size[0], pZ, self.step_size)
+                y_positions = compute_steps_for_sliding_window(image_size[1], pY, self.step_size)
+                x_positions = compute_steps_for_sliding_window(image_size[2], pX, self.step_size)
+
+            if self.verbose:
+                print(f"  Image Size (Z, Y, X): {image_size}")
+                print(f"  Patch Size (Z, Y, X): {self.patch_size}")
+                print(f"  Step Size Factor: {self.step_size}")
+                print(f"  Skip Empty Patches: {self.skip_empty_patches}")
+                print(f"  Num Positions (Z, Y, X): ({len(z_positions)}, {len(y_positions)}, {len(x_positions)})")
+                total_patches = len(z_positions) * len(y_positions) * len(x_positions)
+                print(f"  Total potential patches: {total_patches}")
+
+            # Combine positions
+            for z in z_positions:
+                for y in y_positions:
+                    for x in x_positions:
+                        self.all_positions.append((z, y, x))
+
+            # Optional coverage diagnostics in verbose mode
+            if self.verbose and self.all_positions:
+                # Coverage is judged against the tiled extent: the ROI when a bbox is
+                # active, the whole volume otherwise.
+                (tz0, tz1), (ty0, ty1), (tx0, tx1) = roi if roi is not None else (
+                    (0, image_size[0]), (0, image_size[1]), (0, image_size[2]))
+                max_start_z = max(pos[0] for pos in self.all_positions)
+                max_start_y = max(pos[1] for pos in self.all_positions)
+                max_start_x = max(pos[2] for pos in self.all_positions)
+                cov_z = (max_start_z + pZ == tz1) if (tz1 - tz0) >= pZ else (max_start_z == tz0)
+                cov_y = (max_start_y + pY == ty1) if (ty1 - ty0) >= pY else (max_start_y == ty0)
+                cov_x = (max_start_x + pX == tx1) if (tx1 - tx0) >= pX else (max_start_x == tx0)
+                print("\nTiling coverage check:")
+                print(f"  Z axis: start in [{tz0}..{max_start_z}], patch {pZ}, extent [{tz0}, {tz1}) -> covers end: {cov_z}")
+                print(f"  Y axis: start in [{ty0}..{max_start_y}], patch {pY}, extent [{ty0}, {ty1}) -> covers end: {cov_y}")
+                print(f"  X axis: start in [{tx0}..{max_start_x}], patch {pX}, extent [{tx0}, {tx1}) -> covers end: {cov_x}")
+
+            # Apply Z-axis partitioning if num_parts > 1
+            if self.num_parts > 1:
+                # Partition the Z span the selected patches actually occupy. With a
+                # bbox active, splitting the full volume range would leave most parts
+                # empty; splitting the ROI range instead would silently drop the
+                # patches that start before it, since the grid comes from the whole
+                # volume and the first patch covering the ROI usually begins outside.
+                if self.all_positions:
+                    occupied_z = sorted({pos[0] for pos in self.all_positions})
+                    part_z0, part_z1 = occupied_z[0], occupied_z[-1] + 1
+                else:
+                    part_z0, part_z1 = (0, image_size[0])
+                z_per_part = (part_z1 - part_z0) / self.num_parts
+                z_start = part_z0 + int(z_per_part * self.part_id)
+                z_end = part_z0 + int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else part_z1
+
+                if self.verbose:
+                    print(f"\nApplying Z-axis partitioning:")
+                    print(f"  Num Parts: {self.num_parts}, Part ID: {self.part_id}")
+                    print(f"  Z Range for this part: [{z_start}, {z_end})")
+
+                # Filter positions based on the patch *starting* coordinate
+                # A patch belongs to the partition its starting Z coordinate falls into.
+                # This is simpler than checking overlap and ensures non-overlapping assignment.
+                original_count = len(self.all_positions)
+                self.all_positions = [pos for pos in self.all_positions if z_start <= pos[0] < z_end]
+                filtered_count = len(self.all_positions)
+
+                if self.verbose:
+                    print(f"  Filtered positions from {original_count} to {filtered_count}")
+                    if filtered_count > 0:
+                         print(f"  Part {self.part_id} Z-range of positions: [{self.all_positions[0][0]} - {self.all_positions[-1][0]}]")
+                    else:
+                         print(f"  Warning: No patch starting positions found in the Z-range [{z_start}, {z_end}) for part {self.part_id}.")
+
+            # Build per-patch non-empty mask from the input zarr's chunk occupancy.
+            # This lets us drop patches that fall entirely in empty regions of a sparse
+            # input without ever touching the underlying data; fallback to None leaves
+            # today's lazy min/max-based detection untouched.
+            self.non_empty_mask = self._build_non_empty_mask_from_chunks(use_path)
+
+
+    @staticmethod
+    def _clamp_bbox_to_image(bbox, image_size, patch_size):
+        """Clamp a global-coordinate bbox to the volume and grow it to patch size.
+
+        Returns ((z0, z1), (y0, y1), (x0, x1)), half-open. Raises if the bbox lies
+        entirely outside the volume. An ROI shorter than the patch along an axis is
+        grown to the patch size, shifted back inside the volume when it would
+        overhang (matching the sliding window's guarantee that starts stay >= 0).
+        """
+        roi = []
+        for axis in range(3):
+            lo, hi = bbox[2 * axis], bbox[2 * axis + 1]
+            dim = image_size[axis]
+            patch = patch_size[axis]
+            lo = 0 if lo is None else lo
+            hi = dim if hi is None else hi
+            lo_c, hi_c = min(lo, dim), min(hi, dim)
+            if hi_c <= lo_c:
+                raise ValueError(
+                    f"bbox axis {axis} range [{lo}, {hi}) lies outside the volume "
+                    f"(size {dim} along this axis)"
+                )
+            if hi_c - lo_c < patch:
+                hi_c = min(lo_c + patch, dim)
+                lo_c = max(0, hi_c - patch)
+            roi.append((lo_c, hi_c))
+        return tuple(roi)
+
+    def _build_non_empty_mask_from_chunks(self, use_path):
+        if not self.skip_empty_patches or not self.all_positions:
+            return None
+        if use_path is None:
+            return None
+
+        try:
+            import zarr as _zarr
+        except ImportError:
+            return None
+
+        array_obj = getattr(self.volume, 'data', None)
+        if array_obj is None:
+            return None
+
+        if isinstance(array_obj, _zarr.Array):
+            array_url = use_path.rstrip('/')
+            array_chunks = tuple(array_obj.chunks)
+            array_shape = tuple(array_obj.shape)
+        elif isinstance(array_obj, _zarr.Group):
+            # Use level "0" to match what Volume.__getitem__ reads by default.
+            if "0" not in array_obj or not isinstance(array_obj["0"], _zarr.Array):
+                return None
+            sub = array_obj["0"]
+            first_key = "0"
+            array_url = use_path.rstrip('/') + '/' + first_key
+            array_chunks = tuple(sub.chunks)
+            array_shape = tuple(sub.shape)
+        else:
+            return None
+
+        occupancy = build_chunk_occupancy(
+            array_url,
+            chunks=array_chunks,
+            shape=array_shape,
+            verbose=self.verbose,
+            anon=self.anon,
+        )
+        if occupancy is None:
+            return None
+
+        # Drop channel axis for 4D shapes to get spatial chunk sizes.
+        if len(array_chunks) == 4:
+            chunks_spatial = array_chunks[1:]
+        else:
+            chunks_spatial = array_chunks
+
+        mask = compute_patch_non_empty_mask(
+            occupancy,
+            self.all_positions,
+            tuple(self.patch_size),
+            chunks_spatial,
+        )
+
+        if self.verbose:
+            n = int(len(mask))
+            k = int(mask.sum())
+            print(f"  Pre-filtered {n - k} of {n} patches as empty via chunk index ({k} remain)")
+
+        return mask
+
+
+    def active_view(self):
+        """Return the dataset view the DataLoader should iterate.
+
+        If the input zarr's chunk occupancy let us pre-filter empty patches,
+        this returns a `torch.utils.data.Subset` over the non-empty indices
+        (so `len(...)` reflects only patches that will actually run through
+        the model, and tqdm totals/ETAs become honest). Otherwise returns
+        `self`. `Subset[i]` forwards to `self[original_idx]`, so the patch
+        index carried through `__getitem__` and used as the zarr write index
+        is unchanged.
+        """
+        mask = getattr(self, 'non_empty_mask', None)
+        if mask is None or len(mask) != len(self.all_positions):
+            return self
+        indices = np.flatnonzero(mask).tolist()
+        return torch.utils.data.Subset(self, indices)
+
+
+    def set_distributed(self, rank: int, world_size: int):
+        """
+        Configures the dataset for distributed processing by assigning a subset of patches to this rank.
+        """
+        if world_size <= 1 or not (0 <= rank < world_size):
+            if self.verbose: print("Distribution not required or invalid rank/world_size.")
+            return
+
+        total_positions = len(self.all_positions)
+        if total_positions == 0:
+             if self.verbose: print(f"Rank {rank}: No positions to distribute.")
+             return
+
+        # Determine the subset of indices for this rank
+        num_per_rank = total_positions // world_size
+        remainder = total_positions % world_size
+        start_idx = rank * num_per_rank + min(rank, remainder)
+        end_idx = start_idx + num_per_rank + (1 if rank < remainder else 0)
+
+        # Slice the positions
+        assigned_positions = self.all_positions[start_idx:end_idx]
+        num_assigned = len(assigned_positions)
+
+        if self.verbose:
+            partition_info = f"(from Z-partition {self.part_id}/{self.num_parts})" if self.num_parts > 1 else ""
+            print(f"\nDistributing data for Rank {rank}/{world_size} {partition_info}:")
+            print(f"  Total positions in current partition: {total_positions}")
+            print(f"  Assigning indices [{start_idx} to {end_idx -1}] ({num_assigned} positions) to Rank {rank}")
+            if num_assigned > 0:
+                z_values = [pos[0] for pos in assigned_positions]
+                min_z, max_z = min(z_values), max(z_values)
+                print(f"  Rank {rank} Z-range of positions: [{min_z} - {max_z}]")
+            else:
+                 print(f"  Warning: Rank {rank} has been assigned 0 positions.")
+
+
+        self.all_positions = assigned_positions
+
+
+    def __len__(self):
+        return len(self.all_positions)
+        
+    def get_empty_patches_report(self):
+        """Return a report of empty patches that were skipped"""
+        return {
+            "total_skipped": self.empty_patches_skipped,
+            "total_positions": len(self.all_positions),
+            "skip_ratio": self.empty_patches_skipped / (len(self.all_positions) + self.empty_patches_skipped) if self.empty_patches_skipped > 0 else 0
+        }
+
+    def __getitem__(self, idx):
+        if idx >= len(self.all_positions):
+             raise IndexError(f"Index {idx} out of bounds for dataset length {len(self.all_positions)}")
+
+        z, y, x = self.all_positions[idx]
+        pZ, pY, pX = self.patch_size
+
+        # Define the slices for fetching data from Volume
+        # Use spatial dimensions (Z, Y, X) correctly based on input_shape length
+        spatial_dims_indices = slice(1, None) if len(self.input_shape) == 4 else slice(None)
+        image_shape_zyx = self.input_shape[spatial_dims_indices]
+
+        z_slice = slice(z, min(z + pZ, image_shape_zyx[0]))
+        y_slice = slice(y, min(y + pY, image_shape_zyx[1]))
+        x_slice = slice(x, min(x + pX, image_shape_zyx[2]))
+
+        try:
+            # Fetch the (potentially smaller) patch from Volume
+            # Volume's __getitem__ handles normalization, type conversion, and tensor conversion
+            if len(self.input_shape) == 3: # Input is Z, Y, X
+                # For 3D input (Z, Y, X), we always create a single-channel tensor
+                # The model expects a single channel regardless of how many output classes it produces
+                
+                # Volume returns (Z, Y, X) tensor
+                extracted_tensor = self.volume[z_slice, y_slice, x_slice]
+                
+                # Fast check for empty patch - skip if all zeros or all values are the same
+                # This avoids processing empty patches which won't contain any information
+                # Check if tensor is empty (all zeros or same value) - but don't skip entirely
+                is_empty = False
+                if self.skip_empty_patches and extracted_tensor.numel() > 0:
+                    # We use a fast min/max comparison rather than var() which is more expensive
+                    min_val = extracted_tensor.min().item()
+                    max_val = extracted_tensor.max().item()
+                    if min_val == max_val:
+                        # All values are the same - this is likely empty space
+                        self.empty_patches_skipped += 1
+                        if self.verbose and self.empty_patches_skipped % 100 == 0:
+                            print(f"Detected {self.empty_patches_skipped} empty patches so far")
+                        is_empty = True
+                
+                # We need to add channel dim and pad
+                fetched_z, fetched_y, fetched_x = extracted_tensor.shape
+                
+                # Initialize the full-size patch tensor with zeros (for padding)
+                # Use the dtype returned by Volume
+                # ALWAYS use a single channel (1) here since we're coming from Z,Y,X data
+                patch_tensor = torch.zeros((1, pZ, pY, pX), dtype=extracted_tensor.dtype)
+                
+                # Copy fetched data into the patch tensor
+                patch_tensor[0, :fetched_z, :fetched_y, :fetched_x] = extracted_tensor
+
+            elif len(self.input_shape) == 4: # Input is C, Z, Y, X
+                # Volume returns (C, Z, Y, X) tensor
+                
+                # For multiclass models, we need to ensure we're using exactly the right number of input channels
+                available_channels = self.input_shape[0]
+                
+                # Verify that we have enough channels in our data
+                if available_channels < self.num_input_channels:
+                    raise ValueError(f"Model expects {self.num_input_channels} input channels, but data only has {available_channels}")
+                
+                # Extract exactly the number of channels the model needs
+                if self.verbose:
+                    print(f"4D input: Extracting {self.num_input_channels} channels from data with {available_channels} channels")
+                
+                # Take exactly what the model expects
+                extracted_tensor = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
+                
+                # Check for empty patch - flag if all values are the same
+                is_empty = False
+                if self.skip_empty_patches and extracted_tensor.numel() > 0:
+                    # Check if tensor is empty (all same value) across all channels
+                    is_empty = True
+                    
+                    # Check just the first few channels for efficiency
+                    check_channels = min(3, extracted_tensor.shape[0])
+                    for c in range(check_channels):
+                        channel_tensor = extracted_tensor[c]
+                        if channel_tensor.numel() > 0:
+                            min_val = channel_tensor.min().item()
+                            max_val = channel_tensor.max().item()
+                            if min_val != max_val:
+                                # Found variation in this channel, not empty
+                                is_empty = False
+                                break
+                    
+                    if is_empty:
+                        # All checked channels have constant values - likely empty space
+                        self.empty_patches_skipped += 1
+                        if self.verbose and self.empty_patches_skipped % 100 == 0:
+                            print(f"Detected {self.empty_patches_skipped} empty patches so far")
+                
+                # Get dimensions for padding
+                fetched_c, fetched_z, fetched_y, fetched_x = extracted_tensor.shape
+                
+                # Initialize the full-size patch tensor with exact channel count
+                patch_tensor = torch.zeros((self.num_input_channels, pZ, pY, pX), dtype=extracted_tensor.dtype)
+                
+                # Copy fetched data
+                patch_tensor[:, :fetched_z, :fetched_y, :fetched_x] = extracted_tensor
+            else:
+                 # Should have been caught in init, but safety check
+                 raise RuntimeError(f"Unsupported volume shape encountered in getitem: {self.input_shape}")
+
+        except Exception as e:
+             print(f"ERROR fetching/padding patch at ZYX=({z},{y},{x}), index={idx}")
+             print(f"  Slices: Z={z_slice}, Y={y_slice}, X={x_slice}")
+             print(f"  Volume shape: {self.input_shape}")
+             # Re-raise the error with more context
+             raise RuntimeError(f"Failed to get item {idx} (pos {z},{y},{x}): {e}") from e
+
+
+        # Data should already be a tensor of the correct type due to Volume settings
+        # assert isinstance(patch_tensor, torch.Tensor), "Volume did not return a tensor as expected"
+        # assert patch_tensor.dtype == self.output_dtype, f"Expected dtype {self.output_dtype} but got {patch_tensor.dtype}"
+
+
+        position_tuple = (int(z), int(y), int(x))
+
+        return {
+            "data": patch_tensor, # Key required by nnUNet inference
+            "pos": position_tuple, # Pass position for potential stitching later
+            "index": idx, # Pass original index
+            "is_empty": is_empty # Flag to indicate if patch is empty (to skip model inference)
+        }
+    
+    @staticmethod
+    def collate_fn(batch):
+        """
+        Custom collate function that processes empty patches without filtering them.
+        """
+        # Extract items by key (including the is_empty flag)
+        data = torch.stack([item["data"] for item in batch])
+        pos = [item["pos"] for item in batch]
+        indices = [item["index"] for item in batch]
+        is_empty = [item.get("is_empty", False) for item in batch]
+        
+        return {
+            "data": data,
+            "pos": pos,
+            "index": indices,
+            "is_empty": is_empty
+        }

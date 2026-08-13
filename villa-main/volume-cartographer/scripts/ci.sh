@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# Canonical CI driver. Same script runs in GHA, on dev, on EC2.
+#
+# Usage:
+#   ci.sh                                                  # all (default for dev/EC2)
+#   ci.sh all                                              # full matrix + coverage
+#   ci.sh builder <image>                                  # build a builder docker image
+#   ci.sh test <image> <compiler> <preset>                 # configure + build + test
+#   ci.sh coverage [image]                                 # coverage report (in volume-cartographer/coverage/)
+#   ci.sh patch-coverage <base_ref> [image]                # diff-cover gate vs base_ref
+#   ci.sh coverage-regression <base_ref> [image]           # total-coverage non-regression vs base_ref
+#   ci.sh dead-code [image] [compiler]                     # unused-* warnings + linker --print-gc-sections report
+#
+# Environment knobs:
+#   PATCH_COVERAGE_MIN  minimum % required by `patch-coverage` (default 0)
+#   VC_CCACHE_MAXSIZE   compiler-cache size limit (default 3G)
+#
+# In GitHub Actions ($GITHUB_ACTIONS=true) the builder step uses GHA buildx
+# layer cache; locally it falls back to the local docker layer cache.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+IMAGES=(ubuntu-26.04)
+DOCKERFILES=(Dockerfile)
+COMPILERS=(gcc clang)
+TEST_PRESETS=(ci-release-tests)
+
+dockerfile_for() {
+    local image=$1
+    for i in "${!IMAGES[@]}"; do
+        if [[ "${IMAGES[$i]}" == "$image" ]]; then
+            echo "${DOCKERFILES[$i]}"
+            return
+        fi
+    done
+    echo "Unknown image: $image (valid: ${IMAGES[*]})" >&2
+    return 1
+}
+
+# Hash the contents that determine the builder image. If a pulled ghcr
+# image carries a different value of this hash on its vc-builder-deps-hash
+# label, cmd_builder rejects it and falls through to a local build —
+# otherwise a stale ghcr image silently retags over a fresher local one.
+builder_deps_hash() {
+    local image=$1
+    local dockerfile
+    dockerfile="$(dockerfile_for "$image")"
+    cat "$REPO_ROOT/$dockerfile" "$REPO_ROOT/scripts/install_build_deps.sh" \
+        | sha256sum | cut -c1-16
+}
+
+run_in_builder() {
+    local image=$1 src=$2; shift 2
+    # --user host UID/GID: files written under /src land owned by the
+    #   runner user (no `sudo chown` afterward, locally or on GHA).
+    # -e VC_BUILD_SUFFIX: per-image build-dir suffix that the _base
+    #   preset bakes into binaryDir. Different images writing to the
+    #   same bind-mounted /src don't clobber each other's CMake cache,
+    #   and parallel `ci.sh` invocations across images can coexist.
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -v "$src:/src" \
+        -w /src \
+        -e "VC_BUILD_SUFFIX=-$image" \
+        -e "CCACHE_DIR=/src/.ccache" \
+        -e "CCACHE_BASEDIR=/src" \
+        -e "CCACHE_MAXSIZE=${VC_CCACHE_MAXSIZE:-3G}" \
+        -e "CCACHE_COMPRESS=true" \
+        "vc-builder:$image" bash -c "$*"
+}
+
+coverage_in_dir() {
+    local image=$1 src=$2
+    local build_dir="build/ci-coverage-clang-$image"
+    cmd_builder "$image"
+    run_in_builder "$image" "$src" "
+        set -o pipefail &&
+        cmake --preset ci-coverage-clang &&
+        cmake --build --preset ci-coverage-clang &&
+        rm -rf /src/$build_dir/coverage-raw && mkdir -p /src/$build_dir/coverage-raw &&
+        LLVM_PROFILE_FILE=\"/src/$build_dir/coverage-raw/%p-%m.profraw\" \
+            ctest --preset ci-coverage-clang &&
+        mkdir -p coverage &&
+        llvm-profdata merge -sparse -o $build_dir/coverage.profdata \
+            $build_dir/coverage-raw/*.profraw &&
+        objects=( ) &&
+        for b in $build_dir/bin/test_*; do objects+=( -object \"\$b\" ); done &&
+        llvm-cov show \"\${objects[@]}\" \
+            -instr-profile=$build_dir/coverage.profdata \
+            -format=html -output-dir=coverage \
+            -ignore-filename-regex='(/_deps/|/build/|/libs/)' \
+            -show-line-counts-or-regions &&
+        llvm-cov export \"\${objects[@]}\" \
+            -instr-profile=$build_dir/coverage.profdata \
+            -format=lcov \
+            -ignore-filename-regex='(/_deps/|/build/|/libs/)' \
+            > coverage/lcov.info &&
+        llvm-cov report \"\${objects[@]}\" \
+            -instr-profile=$build_dir/coverage.profdata \
+            -ignore-filename-regex='(/_deps/|/build/|/libs/)' \
+            > coverage/summary.txt"
+}
+
+# Extract TOTAL line coverage % from an llvm-cov report.
+# The TOTAL row has 4 trailing %-columns (Region, Function, Line, Branch);
+# track the 3rd (Line).
+total_coverage_pct() {
+    awk '/^TOTAL/ {
+        n = 0
+        for (i = 1; i <= NF; i++) if ($i ~ /%$/) { n++; if (n == 3) { gsub("%", "", $i); print $i; exit } }
+    }' "$1"
+}
+
+cmd_builder() {
+    local image=$1
+    local local_tag="vc-builder:$image"
+    local want_hash
+    want_hash="$(builder_deps_hash "$image")"
+
+    # A local image already stamped with the wanted deps-hash is fresh.
+    local existing_hash
+    existing_hash="$(docker image inspect "$local_tag" \
+        --format '{{ index .Config.Labels "vc-builder-deps-hash" }}' \
+        2>/dev/null || true)"
+    if [[ "$existing_hash" == "$want_hash" ]]; then
+        return 0
+    fi
+
+    # Try pulling the published image from ghcr first. Skip the pull if
+    # VC_BUILDER_FORCE_LOCAL=1 is set (the PR touched a Dockerfile, or
+    # the user explicitly wants a from-scratch local build).
+    if [[ "${VC_BUILDER_FORCE_LOCAL:-0}" != "1" ]]; then
+        local owner
+        owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
+        local remote="ghcr.io/$owner/villa/volume-cartographer:builder-$image"
+        if docker pull "$remote" 2>/dev/null; then
+            local pulled_hash
+            pulled_hash="$(docker image inspect "$remote" \
+                --format '{{ index .Config.Labels "vc-builder-deps-hash" }}' \
+                2>/dev/null || true)"
+            if [[ "$pulled_hash" == "$want_hash" ]]; then
+                docker tag "$remote" "$local_tag"
+                return 0
+            fi
+            echo "ci.sh: ghcr image $remote has deps-hash '$pulled_hash' but tree wants '$want_hash'; building locally" >&2
+        else
+            echo "ci.sh: ghcr pull of $remote failed; building locally" >&2
+        fi
+    fi
+
+    local dockerfile
+    dockerfile="$(dockerfile_for "$image")"
+
+    local cache_args=()
+    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+        cache_args+=(
+            --cache-from "type=gha,scope=vc-builder-$image"
+            --cache-to "type=gha,mode=max,scope=vc-builder-$image"
+        )
+    fi
+
+    docker buildx build \
+        --target builder \
+        --tag "$local_tag" \
+        --label "vc-builder-deps-hash=$want_hash" \
+        --file "$dockerfile" \
+        --load \
+        "${cache_args[@]}" \
+        .
+}
+
+cmd_publish() {
+    local image=$1
+    local owner
+    owner=$(echo "${VC_BUILDER_REGISTRY_OWNER:-${GITHUB_REPOSITORY_OWNER:-scrollprize}}" | tr 'A-Z' 'a-z')
+    local dockerfile
+    dockerfile="$(dockerfile_for "$image")"
+    local repo="ghcr.io/$owner/villa/volume-cartographer"
+    local sha=${GITHUB_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo local)}
+
+    docker buildx build \
+        --target builder \
+        --tag "$repo:builder-$image" \
+        --tag "$repo:builder-$image-$sha" \
+        --label "vc-builder-deps-hash=$(builder_deps_hash "$image")" \
+        --file "$dockerfile" \
+        --push \
+        .
+}
+
+cmd_test() {
+    local image=$1 compiler=$2 preset=$3
+    cmd_builder "$image"
+    run_in_builder "$image" "$REPO_ROOT" "
+        ccache --zero-stats &&
+        cmake --preset $preset-$compiler -DVC_USE_CCACHE=ON &&
+        cmake --build --preset $preset-$compiler &&
+        ctest --preset $preset-$compiler &&
+        ccache --show-stats"
+}
+
+cmd_compile() {
+    local image=$1 compiler=$2 preset=$3
+    cmd_builder "$image"
+    run_in_builder "$image" "$REPO_ROOT" "
+        ccache --zero-stats &&
+        cmake --preset $preset-$compiler -DVC_USE_CCACHE=ON &&
+        cmake --build --preset $preset-$compiler &&
+        ccache --show-stats"
+}
+
+cmd_coverage() {
+    local image=${1:-ubuntu-26.04}
+    coverage_in_dir "$image" "$REPO_ROOT"
+}
+
+cmd_patch_coverage() {
+    local base_ref=$1
+    # Second positional ("image") is accepted for backwards compat but ignored:
+    # diff-cover only needs Python + git history, so we run it on the host.
+    # When volume-cartographer lives as a subdir of a larger repo the .git is
+    # outside the docker mount and diff-cover dies with "not a git repository".
+    local min_pct=${PATCH_COVERAGE_MIN:-0}
+    local lcov="$REPO_ROOT/coverage/lcov.info"
+    if [[ ! -f "$lcov" ]]; then
+        echo "patch-coverage: $lcov missing — run 'ci.sh coverage' first" >&2
+        return 1
+    fi
+
+    local git_root
+    git_root=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
+    git -C "$git_root" fetch --quiet origin "${base_ref#origin/}" || true
+
+    # llvm-cov export -format=lcov writes SF:/src/... absolute paths (cwd inside
+    # the docker mount is /src). Rewrite to git-root-relative so diff-cover's
+    # path lookup matches what git reports as changed.
+    local src_in_git fixed
+    src_in_git=$(realpath --relative-to="$git_root" "$REPO_ROOT")
+    fixed=$(mktemp -t lcov-diffcov.XXXXXX.info)
+    if [[ "$src_in_git" == "." ]]; then
+        sed 's|^SF:/src/|SF:|' "$lcov" > "$fixed"
+    else
+        sed "s|^SF:/src/|SF:${src_in_git}/|" "$lcov" > "$fixed"
+    fi
+
+    # Per-invocation venv so concurrent ci.sh runs on the same host don't
+    # race on pip-install. Cleaned up via the RETURN trap below.
+    local venv
+    venv="$(mktemp -d -t diffcov.XXXXXX)"
+    trap "rm -rf '$venv'; rm -f '$fixed'" RETURN
+    python3 -m venv "$venv" >/dev/null
+    "$venv/bin/pip" install --quiet diff-cover
+    (
+        cd "$git_root"
+        "$venv/bin/diff-cover" "$fixed" \
+            --compare-branch="$base_ref" \
+            --fail-under="$min_pct" \
+            --markdown-report "$REPO_ROOT/coverage/patch.md" \
+            --html-report "$REPO_ROOT/coverage/patch.html"
+    )
+}
+
+cmd_coverage_regression() {
+    local base_ref=$1
+    local image=${2:-ubuntu-26.04}
+    local pr_summary="$REPO_ROOT/coverage/summary.txt"
+    if [[ ! -f "$pr_summary" ]]; then
+        echo "coverage-regression: $pr_summary missing — run 'ci.sh coverage' first" >&2
+        return 1
+    fi
+
+    git -C "$REPO_ROOT" fetch --quiet origin "${base_ref#origin/}" || true
+
+    local worktree_root base_tree
+    worktree_root="$(mktemp -d)/base-tree"
+    git -C "$REPO_ROOT" worktree add --detach "$worktree_root" "$base_ref"
+    trap "git -C '$REPO_ROOT' worktree remove --force '$worktree_root' || true" RETURN
+
+    # $REPO_ROOT may be a subdirectory of the git root (e.g. volume-cartographer/
+    # inside the villa monorepo). The worktree is checked out at the git root,
+    # so resolve our subdir inside the worktree to find CMakePresets.json.
+    local git_root subdir
+    git_root=$(git -C "$REPO_ROOT" rev-parse --show-toplevel)
+    subdir=$(realpath --relative-to="$git_root" "$REPO_ROOT")
+    if [[ "$subdir" == "." ]]; then
+        base_tree="$worktree_root"
+    else
+        base_tree="$worktree_root/$subdir"
+    fi
+
+    # Base branch may not have the ci-coverage-clang preset (e.g. before this
+    # CI lands). In that case, skip the regression gate with a warning rather
+    # than failing — there's no meaningful "base coverage" to compare to.
+    if ! grep -q '"name": "ci-coverage-clang"' "$base_tree/CMakePresets.json" 2>/dev/null; then
+        echo "::warning::base ($base_ref) has no ci-coverage-clang preset; skipping non-regression gate"
+        return 0
+    fi
+
+    coverage_in_dir "$image" "$base_tree"
+
+    local pr_cov base_cov
+    pr_cov=$(total_coverage_pct "$pr_summary")
+    base_cov=$(total_coverage_pct "$base_tree/coverage/summary.txt")
+    echo "Total coverage — base ($base_ref): ${base_cov}%, PR head: ${pr_cov}%"
+    if awk -v p="$pr_cov" -v b="$base_cov" 'BEGIN { exit !(p+0 < b+0) }'; then
+        echo "::error::Coverage regressed: ${pr_cov}% < ${base_cov}%" >&2
+        return 1
+    fi
+}
+
+cmd_dead_code() {
+    local image=${1:-ubuntu-26.04}
+    local compiler=${2:-clang}
+    local build_dir="build/ci-dead-code-$compiler-$image"
+    cmd_builder "$image"
+    mkdir -p "$REPO_ROOT/dead-code"
+
+    # Build inside the container; capture full build log for compile-warning
+    # extraction. Then run nm-based analysis (approach B): symbols defined
+    # somewhere in our source .o files but absent from every final binary.
+    # pipefail required so the `tee` doesn't mask a failed cmake --build.
+    run_in_builder "$image" "$REPO_ROOT" "
+        set -o pipefail &&
+        cmake --preset ci-dead-code-$compiler &&
+        cmake --build --preset ci-dead-code-$compiler 2>&1 | tee dead-code/build.log &&
+        scripts/dead-code-analysis.sh $build_dir"
+}
+
+cmd_all() {
+    # cmd_compile/cmd_test each call cmd_builder up-front; repeats are cheap
+    # (pull+buildx cached), so no pre-warm here.
+    # 26.04: one blocking Release build + test run per compiler.
+    for compiler in "${COMPILERS[@]}"; do
+        for preset in "${TEST_PRESETS[@]}"; do
+            echo "=== ubuntu-26.04: $preset-$compiler ==="
+            cmd_test ubuntu-26.04 "$compiler" "$preset"
+        done
+    done
+    echo
+    echo "All CI passed."
+}
+
+case "${1:-all}" in
+    all)                  cmd_all ;;
+    builder)              shift; cmd_builder "$@" ;;
+    test)                 shift; cmd_test "$@" ;;
+    compile)              shift; cmd_compile "$@" ;;
+    coverage)             shift; cmd_coverage "$@" ;;
+    patch-coverage)       shift; cmd_patch_coverage "$@" ;;
+    coverage-regression)  shift; cmd_coverage_regression "$@" ;;
+    dead-code)            shift; cmd_dead_code "$@" ;;
+    publish)              shift; cmd_publish "$@" ;;
+    *)
+        cat >&2 <<EOF
+Usage: $0 [all
+          | builder <image>
+          | publish <image>
+          | test <image> <compiler> <preset>
+          | compile <image> <compiler> <preset>
+          | coverage [image]
+          | patch-coverage <base_ref> [image]
+          | coverage-regression <base_ref> [image]
+          | dead-code [image] [compiler]]
+EOF
+        exit 1
+        ;;
+esac

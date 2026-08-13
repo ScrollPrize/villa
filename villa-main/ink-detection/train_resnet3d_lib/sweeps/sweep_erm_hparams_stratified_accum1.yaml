@@ -1,0 +1,59 @@
+program: train_resnet3d.py
+project: ink-2um-experiments
+entity: vesuvius-challenge
+method: random
+
+metric:
+  name: val/worst_group_loss_ema.min
+  goal: minimize
+
+parameters:
+  training.objective:
+    value: erm
+  training.loss_mode:
+    value: batch
+  training.sampler:
+    value: group_stratified
+  training.cv_fold:
+    value: 0
+
+
+  training_hyperparameters.training.accumulate_grad_batches:
+    value: 1
+
+  training_hyperparameters.training.epochs:
+    value: 30
+
+  training_hyperparameters.training.lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+
+  training_hyperparameters.training.weight_decay:
+    distribution: log_uniform_values
+    min: 1e-8
+    max: 1e-2
+
+  training.stitch_all_val:
+    value: true
+  training.stitch_train:
+    value: true
+  training.stitch_downsample:
+    value: 1
+  wandb.tags:
+    value:
+      - ink-2um
+      - erm
+      - hparam_sweep
+      - group_stratified
+      - accum1
+      - fold0
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - --metadata_json
+  - metadata.json
+  - --outputs_path
+  - /pscratch/cpa232_scrollprize/data/philodemos/2um_dataset/villa/ink-detection/train_scrolls

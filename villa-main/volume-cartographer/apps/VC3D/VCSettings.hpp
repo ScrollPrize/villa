@@ -1,0 +1,513 @@
+#pragma once
+
+#include <QDebug>
+#include <QDir>
+#include <QFileInfo>
+#include <QString>
+
+namespace vc3d {
+
+// Single source of truth for where downloaded remote-volume chunks land.
+//
+// Priority — first match wins:
+//   1. /volpkgs/remote_cache    (typical EBS mount on EC2 dev hosts)
+//   2. /ephemeral/remote_cache  (NVMe instance store, scripts/ec2_setup.sh)
+//   3. `suggestion` if non-empty
+//   4. ~/.VC3D/remote_cache
+//
+// If /volpkgs or /ephemeral exists, the cache is forced there and any
+// `suggestion` is ignored: these mounts are the whole point of the host
+// being provisioned, and a stale per-volpkg or per-user setting pointing
+// elsewhere silently fills the root disk.
+//
+// Fail-fast: if /volpkgs or /ephemeral exists but isn't writable by the
+// running user (typical: directory owned by root, mode 0755), we abort
+// rather than fall through — that masks the real problem.
+//
+// The chosen path is created on disk before return.
+inline QString remoteCachePath(const QString& suggestion = {})
+{
+    for (const QString& root : {QStringLiteral("/volpkgs"),
+                                QStringLiteral("/ephemeral")}) {
+        QFileInfo fi(root);
+        if (!fi.exists()) {
+            continue;
+        }
+        if (!fi.isDir()) {
+            qFatal("remoteCachePath: %s exists but is not a directory",
+                   qUtf8Printable(root));
+        }
+        // QFileInfo::isWritable() is unreliable on some FUSE/NFS mounts,
+        // so probe by trying to create the cache subtree.
+        const QString p = root + "/remote_cache";
+        if (!QDir().mkpath(p)) {
+            qFatal("remoteCachePath: %s exists but remote_cache/ cannot be "
+                   "created (check ownership/perms — must be writable by "
+                   "this user)",
+                   qUtf8Printable(root));
+        }
+        if (!QFileInfo(p).isWritable()) {
+            qFatal("remoteCachePath: %s is not writable by this user",
+                   qUtf8Printable(p));
+        }
+        return p;
+    }
+
+    QString p = suggestion.trimmed();
+    if (p.isEmpty()) {
+        p = QDir::homePath() + "/.VC3D/remote_cache";
+    }
+    QDir().mkpath(p);
+    return p;
+}
+
+inline QString settingsFilePath()
+{
+    // Settings must stay in the user's home — /ephemeral is lost on stop.
+    // Tests may redirect the otherwise fixed per-user directory without
+    // changing production behavior.
+    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
+    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
+    QDir dir;
+    if (!dir.exists(configDir)) {
+        dir.mkpath(configDir);
+    }
+    return configDir + "/VC3D.ini";
+}
+
+// =============================================================================
+// Setting Keys & Defaults
+// =============================================================================
+// Usage example:
+//   using namespace vc3d::settings;
+//   settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT)
+
+namespace settings {
+
+// -----------------------------------------------------------------------------
+// Volume Package Settings
+// -----------------------------------------------------------------------------
+namespace project {
+    constexpr auto DEFAULT_PATH = "project/default_path";
+    constexpr auto AUTO_OPEN = "project/auto_open";
+    constexpr auto SHOW_OPEN_DATA_CATALOG_ON_STARTUP = "project/show_open_data_catalog_on_startup";
+    constexpr auto RECENT = "project/recent";
+    constexpr auto LAST_VOLUME_PREFIX = "project/last_volume/";
+
+    constexpr bool AUTO_OPEN_DEFAULT = false;
+    constexpr bool SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT = true;
+}
+
+// -----------------------------------------------------------------------------
+// Viewer Settings
+// -----------------------------------------------------------------------------
+namespace viewer {
+    // Navigation & Interaction
+    constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
+    constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
+    constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
+    constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
+    constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
+    constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
+    constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
+    constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
+
+    constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
+    constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
+    constexpr int SCROLL_SPEED_DEFAULT = -1;
+    constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
+    constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
+
+    // Display & Appearance
+    constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
+    constexpr auto SHOW_DIRECTION_HINTS = "viewer/show_direction_hints";
+    constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
+    constexpr auto NORMAL_ARROW_LENGTH_SCALE = "viewer/normal_arrow_length_scale";
+    constexpr auto NORMAL_MAX_ARROWS = "viewer/normal_max_arrows";
+    constexpr auto DIRECTION_STEP = "viewer/direction_step";
+    constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
+    constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
+    constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
+    constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
+    constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
+    constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
+
+    constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
+    constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
+    constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
+    constexpr int NORMAL_ARROW_LENGTH_SCALE_DEFAULT = 100;  // Percentage (100 = 1.0x)
+    constexpr int NORMAL_MAX_ARROWS_DEFAULT = 32;  // Max arrows per axis for sampling
+    constexpr double DIRECTION_STEP_DEFAULT = 10.0;
+    constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
+    constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
+    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
+    constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
+    constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr double POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT = 10.0;
+
+    // Volume Window (Base Grayscale Window)
+    constexpr auto BASE_WINDOW_LOW = "viewer/base_window_low";
+    constexpr auto BASE_WINDOW_HIGH = "viewer/base_window_high";
+
+    constexpr float BASE_WINDOW_LOW_DEFAULT = 0.0f;
+    constexpr float BASE_WINDOW_HIGH_DEFAULT = 255.0f;
+
+    // Intersection Rendering
+    constexpr auto INTERSECTION_OPACITY = "viewer/intersection_opacity";
+    constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
+    constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
+    constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
+
+    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
+
+    constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
+    constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
+    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
+    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
+
+    // Axis Overlays
+    constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
+    constexpr auto AXIS_OVERLAY_OPACITY = "viewer/axis_overlay_opacity";
+    constexpr auto USE_AXIS_ALIGNED_SLICES = "viewer/use_axis_aligned_slices";
+
+    constexpr bool SHOW_AXIS_OVERLAYS_DEFAULT = true;
+    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
+    constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
+
+    // Remote volume chunk cache directory. Resolved through
+    // vc3d::remoteCachePath() — see that function for the priority rules.
+    constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
+
+    // Recent remote zarr URLs used to pre-fill attach dialog
+    constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
+
+    // Audio/UX
+    constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
+    constexpr auto USERNAME = "viewer/username";
+
+    constexpr bool PLAY_SOUND_AFTER_SEG_RUN_DEFAULT = true;
+    constexpr auto USERNAME_DEFAULT = "";
+
+    // Viewer control group expansion states
+    constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
+    constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
+    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
+    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
+    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
+    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
+
+    constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
+}
+
+// -----------------------------------------------------------------------------
+// Atlas Workspace Settings
+// -----------------------------------------------------------------------------
+namespace atlas {
+    constexpr auto SEARCH_MAX_DISTANCE = "atlas/search_max_distance";
+}
+
+// -----------------------------------------------------------------------------
+// Performance Settings
+// -----------------------------------------------------------------------------
+namespace perf {
+    constexpr auto PRELOADED_SLICES = "perf/preloaded_slices";
+    constexpr auto PARALLEL_PROCESSES = "perf/parallel_processes";
+    constexpr auto ITERATION_COUNT = "perf/iteration_count";
+    constexpr auto DOWNSCALE_OVERRIDE = "perf/downscale_override";
+    constexpr auto INTERPOLATION_METHOD = "viewer/interpolation_method";
+    constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
+    constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
+
+    constexpr int PRELOADED_SLICES_DEFAULT = 200;
+    constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
+    constexpr int ITERATION_COUNT_DEFAULT = 1000;
+    constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
+    constexpr int INTERPOLATION_METHOD_DEFAULT = 1;  // 0 = Nearest, 1 = Trilinear
+    constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
+    constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
+
+    // When true, raw chunks downloaded from remote volumes are stored in the
+    // persistent disk cache compressed at the configured quantization width.
+    // Reading understands both formats regardless of this flag; it only
+    // controls the write format. Requires restart.
+    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
+    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
+
+    // Quantization bin width for compressed disk-cache writes
+    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
+    // Only affects newly written chunks; reading is unaffected. Requires
+    // restart, except for the explicit "recompress existing cache" action.
+    // Default lossless: compression saves space without changing voxels.
+    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
+    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
+
+    // Shared budget for every managed remote Zarr chunk beneath the resolved
+    // vc3d cache root. Zero maximum means unlimited.
+    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+
+    // LOD synthesis method.  Selects how c3d chunks are decoded when a
+    // downscaled view is requested.  Value is one of:
+    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
+    //   "full_decode_box"   — full decode + box-average pool.
+    //   "full_decode_min"   — full decode + min pool.
+    //   "full_decode_max"   — full decode + max pool.
+    // Has no effect until the sampler calls into the LOD-synthesis path
+    // (no-op on the current multi-level zarr pyramid).
+    constexpr auto LOD_METHOD = "perf/lod_method";
+    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
+
+    // IO thread count is not configurable — it tracks
+    // std::thread::hardware_concurrency() at runtime.
+
+}
+
+// -----------------------------------------------------------------------------
+// Spiral Workspace Settings
+//
+// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
+// the main workspace's shared decoded-chunk budget. All three apply without a
+// restart.
+// -----------------------------------------------------------------------------
+namespace spiral {
+    // Budget for the flattened view's cache of resampled surface space, for the
+    // displayed (base) volume. 0 disables it, so the flattened view samples the
+    // volume every frame as it did before the cache existed.
+    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
+
+    // Same, for the overlay volume. Its own budget because overlay and base
+    // compete for nothing else. 0 disables it and leaves the overlay channel on
+    // its existing resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+
+    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
+    // A floor rather than a ceiling: it is raised automatically when it cannot
+    // hold one frame (otherwise a single render thrashes), and the status bar
+    // reports the effective value. The surface-tile filler gets a pool of the
+    // same size as an internal constant.
+    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
+    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
+}
+
+// -----------------------------------------------------------------------------
+// Main Window Settings
+// -----------------------------------------------------------------------------
+namespace window {
+    constexpr auto GEOMETRY = "mainWin/geometry";
+    constexpr auto STATE = "mainWin/state";
+    constexpr auto RESTORE_IN_PROGRESS = "mainWin/restore_in_progress";
+    constexpr auto RESTORE_DISABLED = "mainWin/restore_disabled";
+    constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";
+    constexpr auto STATE_META_QT_VERSION = "mainWin/state_meta/qt_version";
+    constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
+}
+
+namespace line_annotation {
+    constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
+    constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
+    constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
+    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
+    constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
+    constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
+    // "_v2" retires ratios saved before the fixed top strip / smaller bottom
+    // strip layout; old values would override the new default proportions.
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
+    constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
+    constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
+    constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
+    constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
+}
+
+// -----------------------------------------------------------------------------
+// Export Settings
+// -----------------------------------------------------------------------------
+namespace export_ {  // underscore because 'export' is reserved keyword
+    constexpr auto CHUNK_WIDTH_PX = "export/chunk_width_px";
+    constexpr auto CHUNK_OVERLAP_PX = "export/chunk_overlap_px";
+    constexpr auto OVERWRITE = "export/overwrite";
+    constexpr auto DIR = "export/dir";
+
+    constexpr int CHUNK_WIDTH_PX_DEFAULT = 40000;
+    constexpr int CHUNK_OVERLAP_PX_DEFAULT = 0;
+    constexpr bool OVERWRITE_DEFAULT = true;
+    constexpr auto DIR_DEFAULT = "";
+}
+
+// -----------------------------------------------------------------------------
+// Neighbor Copy Settings
+// -----------------------------------------------------------------------------
+namespace neighbor_copy {
+    constexpr auto PASS2_PARAMS_PROFILE = "neighbor_copy/pass2_params_profile";
+    constexpr auto PASS2_PARAMS_TEXT = "neighbor_copy/pass2_params_text";
+    constexpr auto PASS2_OMP_THREADS = "neighbor_copy/pass2_omp_threads";
+    constexpr int PASS2_OMP_THREADS_DEFAULT = 1;
+    constexpr auto RESUME_LOCAL_OMP_THREADS = "neighbor_copy/resume_local_omp_threads";
+    constexpr int RESUME_LOCAL_OMP_THREADS_DEFAULT = 1;
+}
+
+// -----------------------------------------------------------------------------
+// AWS Settings
+// -----------------------------------------------------------------------------
+namespace aws {
+    constexpr auto DEFAULT_PROFILE = "aws/default_profile";
+    constexpr auto ACCESS_KEY = "aws/access_key";
+    constexpr auto SECRET_KEY = "aws/secret_key";
+    constexpr auto SESSION_TOKEN = "aws/session_token";
+
+    constexpr auto DEFAULT_PROFILE_DEFAULT = "";
+}
+
+// -----------------------------------------------------------------------------
+// Tools Settings
+// -----------------------------------------------------------------------------
+namespace tools {
+    constexpr auto FLATBOI_PATH = "tools/flatboi_path";
+    constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
+}
+
+// -----------------------------------------------------------------------------
+// Backup Settings
+// -----------------------------------------------------------------------------
+namespace backup {
+    // How many rotating snapshots to keep per segment under <volpkg_dir>/backups/.
+    constexpr auto SEGMENT_COUNT = "backup/segment_count";
+    constexpr int  SEGMENT_COUNT_DEFAULT = 10;
+}
+
+// -----------------------------------------------------------------------------
+// Segmentation Tool Settings
+// -----------------------------------------------------------------------------
+namespace segmentation {
+    // Tool group expansion states
+    constexpr auto GROUP_EDITING_EXPANDED = "group_editing_expanded";
+    constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
+    constexpr auto GROUP_LINE_EXPANDED = "group_line_expanded";
+    constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
+    constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
+    constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
+    constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
+
+    constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_LINE_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
+
+    // Drag tool (note: these are stored in a QSettings group)
+    constexpr auto DRAG_RADIUS_STEPS = "drag_radius_steps";
+    constexpr auto DRAG_SIGMA_STEPS = "drag_sigma_steps";
+    constexpr auto RADIUS_STEPS = "radius_steps";  // Legacy key
+    constexpr auto SIGMA_STEPS = "sigma_steps";    // Legacy key
+
+    // Line tool
+    constexpr auto LINE_RADIUS_STEPS = "line_radius_steps";
+    constexpr auto LINE_SIGMA_STEPS = "line_sigma_steps";
+
+    // Push/Pull tool
+    constexpr auto PUSH_PULL_RADIUS_STEPS = "push_pull_radius_steps";
+    constexpr auto PUSH_PULL_SIGMA_STEPS = "push_pull_sigma_steps";
+    constexpr auto PUSH_PULL_STEP = "push_pull_step";
+    constexpr auto PUSH_PULL_ALPHA_START = "push_pull_alpha_start";
+    constexpr auto PUSH_PULL_ALPHA_STOP = "push_pull_alpha_stop";
+    constexpr auto PUSH_PULL_ALPHA_STEP = "push_pull_alpha_step";
+    constexpr auto PUSH_PULL_ALPHA_LOW = "push_pull_alpha_low";
+    constexpr auto PUSH_PULL_ALPHA_HIGH = "push_pull_alpha_high";
+    constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
+    constexpr auto PUSH_PULL_ALPHA_COMPUTE_SCALE = "push_pull_alpha_compute_scale";
+    constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
+    constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";
+
+    // Edit scale
+    constexpr auto EDIT_SCALE = "edit_scale";
+
+    // Smoothing
+    constexpr auto SMOOTH_STRENGTH = "smooth_strength";
+    constexpr auto SMOOTH_ITERATIONS = "smooth_iterations";
+
+    // Growth
+    constexpr auto GROWTH_METHOD = "growth_method";
+    constexpr auto GROWTH_STEPS = "growth_steps";
+    constexpr auto GROWTH_DIRECTION_MASK = "growth_direction_mask";
+    constexpr auto DIRECTION_FIELDS = "direction_fields";
+    constexpr auto GROWTH_KEYBINDS_ENABLED = "growth_keybinds_enabled";
+
+    constexpr bool GROWTH_KEYBINDS_ENABLED_DEFAULT = true;
+
+    // Corrections
+    constexpr auto CORRECTIONS_ENABLED = "corrections_enabled";
+    constexpr auto CORRECTIONS_Z_RANGE_ENABLED = "corrections_z_range_enabled";
+    constexpr auto CORRECTIONS_Z_MIN = "corrections_z_min";
+    constexpr auto CORRECTIONS_Z_MAX = "corrections_z_max";
+
+    // Custom parameters
+    constexpr auto CUSTOM_PARAMS_TEXT = "custom_params_text";
+
+    // Hover marker
+    constexpr auto SHOW_HOVER_MARKER = "show_hover_marker";
+
+    // Approval brush
+    constexpr auto APPROVAL_BRUSH_RADIUS = "approval_brush_radius";
+    constexpr auto APPROVAL_BRUSH_DEPTH = "approval_brush_depth";
+    constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
+    constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
+    constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
+    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
+
+    // Auto-approval settings
+    constexpr auto AUTO_APPROVAL_ENABLED = "auto_approval_enabled";
+    constexpr auto AUTO_APPROVAL_RADIUS = "auto_approval_radius";
+    constexpr auto AUTO_APPROVAL_THRESHOLD = "auto_approval_threshold";
+    constexpr auto AUTO_APPROVAL_MAX_DISTANCE = "auto_approval_max_distance";
+
+
+    constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
+    constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;
+    constexpr int CORRECTIONS_Z_MIN_DEFAULT = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Volume Overlay Settings (stored in a QSettings group per overlay)
+// -----------------------------------------------------------------------------
+namespace volume_overlay {
+    constexpr auto PATH = "path";
+    constexpr auto VOLUME_ID = "volume_id";
+    constexpr auto OPACITY = "opacity";
+    constexpr auto WINDOW_LOW = "window_low";
+    constexpr auto WINDOW_HIGH = "window_high";
+    constexpr auto THRESHOLD = "threshold";  // Legacy key
+    constexpr auto COLORMAP = "colormap";
+    constexpr auto SAMPLING_METHOD = "sampling_method";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+    constexpr auto COMPOSITE_ENABLED = "composite_enabled";
+    constexpr auto COMPOSITE_METHOD = "composite_method";
+    constexpr auto COMPOSITE_LAYERS_FRONT = "composite_layers_front";
+    constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
+
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr auto SAMPLING_METHOD_DEFAULT = "nearest";
+    constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
+    constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
+    constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
+    constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
+}
+
+} // namespace settings
+} // namespace vc3d

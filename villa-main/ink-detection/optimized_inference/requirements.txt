@@ -1,0 +1,21 @@
+albumentations
+pytorch-lightning
+timesformer-pytorch
+numpy
+torch>=2.0.0
+scipy
+tqdm
+opencv-python-headless>=4.5.0
+boto3
+huggingface_hub>=0.23.0
+tifffile
+psutil
+nvidia-ml-py
+numcodecs>=0.16.3
+imagecodecs
+# Install zarr from git source to access CacheStore experimental feature (not yet in released version)
+# CacheStore provides disk-based caching for S3 zarr access, improving performance and reducing costs
+zarr @ git+https://github.com/zarr-developers/zarr-python.git@eb1b6e869115925f7b653e60bd542abd410a9a4e
+s3fs>=2024.3.0
+fsspec
+#webknossos==0.16.2

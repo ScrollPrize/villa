@@ -1,0 +1,1514 @@
+from __future__ import annotations
+
+import os
+import sys
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+import torch
+import tifffile
+
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+	sys.path.insert(0, ROOT)
+
+import fit
+import fit2tifxyz
+from flatten_clamped_adam import FlattenClampedAdam
+import model as fit_model
+import opt_loss_flatten
+import optimizer
+
+
+def _flat_grid(h: int, w: int, *, sx: float = 1.0, sy: float = 1.0) -> torch.Tensor:
+	yy = torch.arange(h, dtype=torch.float32).view(h, 1).expand(h, w)
+	xx = torch.arange(w, dtype=torch.float32).view(1, w).expand(h, w)
+	zz = torch.zeros(h, w, dtype=torch.float32)
+	return torch.stack([xx * sx, yy * sy, zz], dim=-1)
+
+
+def _make_flatten_model(
+	xyz: torch.Tensor,
+	valid: torch.Tensor | None = None,
+	*,
+	device: torch.device | None = None,
+	mesh_step: float = 1,
+	flatten_filter_source_angles: bool = False,
+	flatten_filter_angle_deg: float = 90.0,
+	flatten_filter_radius: int = 2,
+	flatten_direction: str = "inverse",
+	flatten_output_step: float | None = None,
+	flatten_output_margin: float = 0.10,
+	flatten_initial_uv_rescale: bool = True,
+) -> fit_model.Model3D:
+	if valid is None:
+		valid = torch.ones(xyz.shape[:2], dtype=torch.bool)
+	return fit_model.Model3D.from_flatten_tifxyz_crop(
+		xyz,
+		valid,
+		device=torch.device("cpu") if device is None else device,
+		mesh_step=mesh_step,
+		winding_step=1,
+		subsample_mesh=1,
+		subsample_winding=1,
+		flatten_filter_source_angles=flatten_filter_source_angles,
+		flatten_filter_angle_deg=flatten_filter_angle_deg,
+		flatten_filter_radius=flatten_filter_radius,
+		flatten_direction=flatten_direction,
+		flatten_output_step=flatten_output_step,
+		flatten_output_margin=flatten_output_margin,
+		flatten_initial_uv_rescale=flatten_initial_uv_rescale,
+	)
+
+
+def _set_flatten_map(mdl: fit_model.Model3D, map_yx: torch.Tensor) -> None:
+	flat = map_yx.permute(2, 0, 1).unsqueeze(1).contiguous()
+	mdl.flatten_map_ms = fit_model.Model3D._construct_pyramid_from_flat_3d(
+		flat,
+		len(mdl.flatten_map_ms),
+		pyramid_d=False,
+	)
+
+
+class FlattenLossTest(unittest.TestCase):
+	def test_flatten_output_shape_uses_physical_span_and_requested_step(self) -> None:
+		shape = fit_model.Model3D._flatten_output_shape_for_source
+
+		self.assertEqual(
+			shape(101, 51, source_step=20.0, output_step=20.0),
+			(101, 51),
+		)
+		self.assertEqual(
+			shape(101, 51, source_step=40.0, output_step=20.0),
+			(201, 101),
+		)
+		self.assertEqual(
+			shape(101, 51, source_step=10.0, output_step=20.0),
+			(51, 26),
+		)
+		with self.assertRaisesRegex(ValueError, "output_step"):
+			shape(101, 51, source_step=20.0, output_step=0.0)
+
+	def test_requested_output_step_controls_forward_map_and_domain(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=40.0, sy=40.0),
+			mesh_step=40,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach()
+
+		self.assertEqual(mdl.flatten_output_shape, (7, 7))
+		self.assertEqual(mdl.params.mesh_step, 20)
+		self.assertEqual(mdl.params.flatten_output_step, 20.0)
+		self.assertAlmostEqual(float(mdl.flatten_target_step), 20.0)
+		self.assertAlmostEqual(float(mdl.flatten_map_step), 2.0)
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step), 40.0)
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 6.0)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 6.0)
+
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		sdir_loss, _maps, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+		map_step_loss, _maps, _masks = opt_loss_flatten.flatten_map_step_loss(
+			res=res)
+		self.assertLess(float(sdir_loss.detach()), 1.0e-6)
+		self.assertLess(float(map_step_loss.detach()), 1.0e-6)
+
+		_map, xyz, mask, _quad = mdl._flatten_sample_current()
+		self.assertEqual(tuple(mask.shape), (7, 7))
+		self.assertTrue(bool(mask.all()))
+		xyz = xyz[0]
+		h_step = (xyz[1:] - xyz[:-1]).norm(dim=-1)
+		w_step = (xyz[:, 1:] - xyz[:, :-1]).norm(dim=-1)
+		self.assertAlmostEqual(float(h_step.mean()), 20.0, places=5)
+		self.assertAlmostEqual(float(w_step.mean()), 20.0, places=5)
+
+	def test_forward_inversion_expands_minimum_canvas_to_fitted_extent(self) -> None:
+		xyz = _flat_grid(3, 3)
+		uv = xyz[..., :2].flip(-1) * 2.0
+		cell_valid = torch.ones(2, 2, dtype=torch.bool)
+
+		map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			cell_valid,
+			uv,
+			output_margin=0.0,
+			min_shape=(3, 3),
+		)
+
+		self.assertEqual(tuple(mask.shape), (5, 5))
+		self.assertTrue(bool(mask.all()))
+		self.assertAlmostEqual(float(map_yx[mask, 0].min()), 0.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 0].max()), 2.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 1].min()), 0.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 1].max()), 2.0, places=5)
+
+	def test_forward_inversion_uses_fixed_diagonal_triangles_for_concave_cell(self) -> None:
+		# Both VC triangles have positive signed area, but this concave quad has
+		# a negative bilinear corner Jacobian. Forward export must preserve the
+		# fixed-diagonal mesh instead of trying to invert it as a bilinear patch.
+		xyz = torch.tensor(
+			[
+				[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+				[[1.0, 0.0, 0.0], [1.0, 1.0, 10.0]],
+			],
+			dtype=torch.float32,
+		)
+		uv = torch.tensor(
+			[
+				[[0.0, 0.0], [0.0, 2.0]],
+				[[1.0, 1.0], [3.0, 1.0]],
+			],
+			dtype=torch.float32,
+		)
+
+		map_yx, sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(1, 1, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+			k_candidates=1,
+			chunk_points=8,
+		)
+
+		self.assertEqual(tuple(mask.shape), (4, 3))
+		self.assertTrue(bool(mask[2, 1]))
+		self.assertTrue(torch.allclose(map_yx[2, 1], torch.tensor([1.0, 0.5])))
+		self.assertTrue(torch.allclose(sampled[0, 2, 1], torch.tensor([1.0, 0.5, 5.0])))
+
+	def test_forward_inversion_rejects_cell_with_one_flipped_mesh_triangle(self) -> None:
+		xyz = _flat_grid(2, 2)
+		uv = torch.tensor(
+			[
+				[[0.0, 0.0], [-1.5, 1.0]],
+				[[1.0, -3.0], [1.5, 0.5]],
+			],
+			dtype=torch.float32,
+		)
+
+		_map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(1, 1, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+			k_candidates=1,
+			chunk_points=8,
+		)
+
+		self.assertFalse(bool(mask.any()))
+
+	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_map_step": 0.001,
+				"flatten_avg_offset": 1.0,
+				"flatten_orient": 0.001,
+			},
+			"stages": [{
+				"name": "flatten",
+				"global_opt": {
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["map_flatten_ms"],
+				},
+			}],
+		})
+
+		self.assertEqual(stages[0].global_opt.eff["normal"], 0.0)
+		self.assertEqual(stages[0].global_opt.eff["flatten_sdir"], 1.0)
+		self.assertEqual(stages[0].global_opt.eff["flatten_map_step"], 0.001)
+		self.assertEqual(stages[0].global_opt.eff["flatten_avg_offset"], 1.0)
+		self.assertEqual(stages[0].global_opt.eff["flatten_orient"], 0.001)
+
+	def test_top_level_edge_step_global_scale_applies_to_flatten_stages(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"args": {
+				"model-init": "flatten",
+				"flatten_edge_step_global_scale": 100.0,
+			},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_edge_step": 1.0,
+			},
+			"stages": [
+				{
+					"name": "flatten0",
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["map_flatten_ms"],
+					"args": {},
+				},
+				{
+					"name": "flatten1",
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["map_flatten_ms"],
+					"args": {"flatten_edge_step_global_scale": 5.0},
+				},
+			],
+		})
+
+		self.assertEqual(stages[0].global_opt.args["flatten_edge_step_global_scale"], 100.0)
+		self.assertEqual(stages[1].global_opt.args["flatten_edge_step_global_scale"], 5.0)
+
+	def test_old_flatten_param_name_is_rejected(self) -> None:
+		with self.assertRaisesRegex(ValueError, "map_flatten_ms"):
+			optimizer.load_stages_cfg({
+				"base": {"flatten_avg_offset": 1.0},
+				"stages": [{"name": "bad", "params": ["flatten_map_ms"]}],
+			})
+
+	def test_auto_steps_config_uses_max_cap_for_progress_budget(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {"flatten_avg_offset": 1.0},
+			"stages": [{
+				"name": "flatten",
+				"global_opt": {
+					"steps": "auto",
+					"lr": 0.0,
+					"params": ["map_flatten_ms"],
+					"args": {
+						"auto_steps_max": 12,
+						"auto_steps_window": 3,
+						"auto_steps_min": 3,
+						"auto_steps_rel_threshold": 1.0e-6,
+					},
+				},
+			}],
+		})
+
+		self.assertTrue(stages[0].global_opt.steps_auto)
+		self.assertEqual(stages[0].global_opt.steps, 12)
+		self.assertEqual(optimizer.total_steps_for_stages(stages), 12)
+
+	def test_auto_steps_min_defaults_to_two_windows(self) -> None:
+		self.assertEqual(optimizer._auto_steps_min({}, window=7), 14)
+		self.assertEqual(optimizer._auto_steps_min({"auto_steps_min": 5}, window=7), 5)
+
+	def test_lr_warmup_scales_each_optimizer_group_to_target_lr(self) -> None:
+		p0 = torch.nn.Parameter(torch.tensor([0.0]))
+		p1 = torch.nn.Parameter(torch.tensor([0.0]))
+		opt = torch.optim.Adam([
+			{"params": [p0], "lr": 0.2},
+			{"params": [p1], "lr": 0.05},
+		])
+
+		optimizer._capture_optimizer_target_lrs(opt)
+		optimizer._apply_optimizer_lr_warmup(opt, step1=2, warmup_steps=4)
+
+		self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.1)
+		self.assertAlmostEqual(opt.param_groups[1]["lr"], 0.025)
+
+	def test_auto_steps_relative_improvement_uses_best_before_and_recent_window(self) -> None:
+		history = [10.0, 1.0, 9.0, 8.0, 0.9]
+
+		rel = optimizer._auto_steps_relative_improvement(history, window=2)
+
+		self.assertAlmostEqual(rel, 0.1, places=6)
+
+	def test_auto_steps_stops_when_window_improvement_is_small(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {"flatten_avg_offset": 1.0},
+			"stages": [{
+				"name": "flatten",
+				"global_opt": {
+					"steps": "auto",
+					"lr": 0.0,
+					"params": ["map_flatten_ms"],
+					"args": {
+						"auto_steps_max": 10,
+						"auto_steps_window": 3,
+						"auto_steps_min": 3,
+						"auto_steps_rel_threshold": 1.0e-6,
+						"status_interval": 0,
+						"flatten_max_update": 0.0,
+					},
+				},
+			}],
+		})
+		progress_steps: list[int] = []
+
+		optimizer.optimize(
+			model=mdl,
+			data=fit._dummy_flatten_data(),
+			stages=stages,
+			snapshot_interval=0,
+			snapshot_fn=lambda **_kw: None,
+			progress_fn=lambda **kw: progress_steps.append(int(kw["step"])),
+		)
+
+		self.assertEqual(progress_steps[-1], 3)
+		self.assertLess(progress_steps[-1], stages[0].global_opt.steps)
+
+	def test_auto_steps_min_counts_after_lr_warmup(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {"flatten_avg_offset": 1.0},
+			"stages": [{
+				"name": "flatten",
+				"global_opt": {
+					"steps": "auto",
+					"lr": 0.0,
+					"params": ["map_flatten_ms"],
+					"args": {
+						"auto_steps_max": 10,
+						"auto_steps_window": 2,
+						"auto_steps_rel_threshold": 1.0e-6,
+						"lr_warmup_steps": 2,
+						"status_interval": 0,
+						"flatten_max_update": 0.0,
+					},
+				},
+			}],
+		})
+		progress_steps: list[int] = []
+
+		optimizer.optimize(
+			model=mdl,
+			data=fit._dummy_flatten_data(),
+			stages=stages,
+			snapshot_interval=0,
+			snapshot_fn=lambda **_kw: None,
+			progress_fn=lambda **kw: progress_steps.append(int(kw["step"])),
+		)
+
+		self.assertEqual(progress_steps[-1], 6)
+		self.assertLess(progress_steps[-1], stages[0].global_opt.steps)
+
+	def test_flatten_pyramid_reaches_two_in_longer_dimension(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 9), mesh_step=1)
+		shapes = [(int(p.shape[2]), int(p.shape[3])) for p in mdl.flatten_map_ms]
+
+		self.assertEqual(shapes, [(5, 9), (3, 5), (2, 3), (2, 2)])
+		self.assertEqual(max(shapes[-1]), 2)
+
+	def test_flatten_init_uses_density_derived_output_canvas(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(11, 21), mesh_step=1)
+		map_yx = mdl.flatten_map().detach()
+
+		self.assertEqual(tuple(map_yx.shape), (11, 21, 2))
+		self.assertEqual(mdl.mesh_h, 11)
+		self.assertEqual(mdl.mesh_w, 21)
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 10.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 20.0, places=6)
+
+	def test_forward_flatten_init_optimizes_source_sized_uv_map(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(11, 21), mesh_step=1, flatten_direction="forward")
+		map_yx = mdl.flatten_map().detach()
+
+		self.assertEqual(mdl.flatten_direction, "forward")
+		self.assertEqual(tuple(map_yx.shape), (11, 21, 2))
+		self.assertEqual(mdl.mesh_h, 11)
+		self.assertEqual(mdl.mesh_w, 21)
+		self.assertEqual(mdl.flatten_output_shape, (11, 21))
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 10.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 20.0, places=6)
+
+	def test_initial_forward_inversion_can_be_skipped(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 7), mesh_step=1, flatten_direction="forward")
+		with mock.patch.object(
+			fit_model.Model3D,
+			"_flatten_invert_forward_uv_map",
+			side_effect=AssertionError("initial inversion should be skipped"),
+		):
+			map_yx, xyz, point_mask, quad_mask = fit._initial_flatten_state(
+				mdl,
+				invert_forward=False,
+			)
+
+		self.assertEqual(tuple(map_yx.shape), (5, 7, 2))
+		self.assertEqual(tuple(xyz.shape), (1, 5, 7, 3))
+		self.assertEqual(tuple(point_mask.shape), (5, 7))
+		self.assertEqual(tuple(quad_mask.shape), (1, 4, 6))
+
+	def test_fast_flatten_config_enables_opt_in_speed_flags(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "flatten_fast_nofilter.json").read_text(encoding="utf-8"))
+
+		self.assertFalse(cfg["args"]["flatten_initial_inversion"])
+		for stage in cfg["stages"]:
+			self.assertFalse(stage["args"]["flatten_diagnostics"])
+			self.assertTrue(stage["args"]["compile_flatten"])
+			self.assertTrue(stage["args"]["compile_flatten_combined"])
+			self.assertTrue(stage["args"]["fused_flatten_adam_clamp"])
+
+	def test_bilinear_validity_rejects_cells_with_any_invalid_corner(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		valid[1, 1] = False
+		cell_valid = fit_model.Model3D._source_cell_valid(valid)
+		map_yx = torch.tensor([[[0.25, 0.25], [1.25, 1.25]]], dtype=torch.float32)
+
+		_sampled, point_valid = fit_model.Model3D._flatten_sample_map(xyz, cell_valid, map_yx)
+
+		self.assertFalse(bool(point_valid[0, 0]))
+		self.assertFalse(bool(point_valid[0, 1]))
+
+	def test_source_angle_filter_punches_bad_source_cells(self) -> None:
+		xyz = _flat_grid(5, 5)
+		xyz[2, :, 1] = 0.0
+		mdl = _make_flatten_model(
+			xyz,
+			mesh_step=1,
+			flatten_filter_source_angles=True,
+			flatten_filter_angle_deg=90.0,
+			flatten_filter_radius=0,
+		)
+		stats = mdl.flatten_source_filter_stats
+
+		self.assertGreater(stats["bad_pairs"], 0.0)
+		self.assertGreater(stats["bad_cells"], 0.0)
+		self.assertLess(stats["cell_valid_after"], stats["cell_valid_before"])
+
+		map_yx = torch.tensor([[[1.25, 1.25], [3.25, 1.25]]], dtype=torch.float32)
+		_sampled, point_valid = fit_model.Model3D._flatten_sample_map(
+			mdl.flatten_source_xyz,
+			mdl.flatten_source_cell_valid,
+			map_yx,
+		)
+
+		self.assertFalse(bool(point_valid[0, 0]))
+		self.assertTrue(bool(point_valid[0, 1]))
+
+	def test_measured_source_step_uses_retained_source_cells(self) -> None:
+		xyz = _flat_grid(3, 3)
+		xyz[2, :, 1] = 1000.0
+		valid = torch.ones(3, 3, dtype=torch.bool)
+		cell_valid = torch.tensor(
+			[
+				[True, True],
+				[False, False],
+			],
+			dtype=torch.bool,
+		)
+
+		step = fit_model.Model3D._measured_flatten_target_step(
+			xyz,
+			valid,
+			fallback=1.0,
+			cell_valid=cell_valid,
+		)
+
+		self.assertAlmostEqual(float(step.detach()), 1.0, places=5)
+
+	def test_identity_flat_regular_grid_has_near_zero_sdir(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
+		self.assertGreater(int(res.flatten_quad_mask.sum()), 0)
+
+	def test_forward_identity_flat_regular_grid_has_near_zero_sdir(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(5, 5, sx=3.0, sy=3.0),
+			mesh_step=3,
+			flatten_direction="forward",
+			flatten_output_step=3.0,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+
+		self.assertEqual(res.flatten_direction, "forward")
+		self.assertAlmostEqual(float(res.flatten_target_step.detach()), 3.0, places=5)
+		self.assertLess(float(loss.detach()), 1.0e-6)
+		self.assertGreater(int(res.flatten_quad_mask.sum()), 0)
+
+	def test_flatten_diagnostics_can_be_disabled(self) -> None:
+		opt_loss_flatten.configure(diagnostics=False, reset_history=True)
+		try:
+			mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1, flatten_direction="forward")
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			for loss_fn in (
+				opt_loss_flatten.flatten_sdir_loss,
+				opt_loss_flatten.flatten_map_step_loss,
+				opt_loss_flatten.flatten_avg_offset_loss,
+				opt_loss_flatten.flatten_orient_loss,
+			):
+				loss, maps, masks = loss_fn(res=res)
+				self.assertTrue(bool(torch.isfinite(loss)))
+				self.assertEqual(maps, ())
+				self.assertEqual(masks, ())
+			self.assertEqual(opt_loss_flatten.last_stats(), {})
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, reset_history=True)
+
+	def test_compiled_forward_flatten_kernels_match_eager_loss_and_gradients(self) -> None:
+		def _evaluate(*, compiled: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+			opt_loss_flatten.configure(orient_min_det=1.1, diagnostics=False, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=compiled, backend="eager")
+			mdl = _make_flatten_model(_flat_grid(7, 7), mesh_step=1, flatten_direction="forward")
+			map_yx = mdl.flatten_map().detach().clone()
+			map_yx[..., 1] = map_yx[..., 1] * 1.1
+			_set_flatten_map(mdl, map_yx)
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			sdir, _maps, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+			orient, _maps, _masks = opt_loss_flatten.flatten_orient_loss(res=res)
+			total = sdir + orient
+			total.backward()
+			grads = [p.grad.detach().clone() for p in mdl.flatten_map_ms if p.grad is not None]
+			return total.detach(), grads
+
+		try:
+			eager_loss, eager_grads = _evaluate(compiled=False)
+			compiled_loss, compiled_grads = _evaluate(compiled=True)
+			self.assertIsNotNone(opt_loss_flatten._compiled_forward_sdir_core)
+			self.assertIsNotNone(opt_loss_flatten._compiled_orient_core)
+			self.assertTrue(torch.allclose(compiled_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6))
+			self.assertEqual(len(compiled_grads), len(eager_grads))
+			for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+				self.assertTrue(torch.allclose(compiled_grad, eager_grad, rtol=1.0e-5, atol=1.0e-6))
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_forward_flatten_static_caches_match_source_and_identity(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(7, 9, sx=2.0, sy=3.0),
+			mesh_step=5,
+			flatten_direction="forward",
+		)
+
+		expected_metric = fit_model.Model3D._flatten_source_metric(mdl.flatten_source_xyz)
+		self.assertTrue(torch.equal(mdl.flatten_source_metric, expected_metric))
+		self.assertTrue(torch.equal(mdl.flatten_identity_y, torch.arange(7, dtype=torch.float32)))
+		self.assertTrue(torch.equal(mdl.flatten_identity_x, torch.arange(9, dtype=torch.float32)))
+		self.assertNotIn("flatten_source_metric", mdl.state_dict())
+		self.assertNotIn("flatten_identity_y", mdl.state_dict())
+		self.assertNotIn("flatten_identity_x", mdl.state_dict())
+
+	def _assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+		self,
+		*,
+		device: torch.device,
+		backend: str | None,
+		step_loss: str = "map",
+	) -> None:
+		weights = torch.tensor([1.0, 0.1, 1.0, 10.0], device=device, dtype=torch.float32)
+
+		def _evaluate(*, combined: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+			opt_loss_flatten.configure(orient_min_det=1.1, diagnostics=False, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=combined, backend=backend)
+			mdl = _make_flatten_model(
+				_flat_grid(8, 9),
+				device=device,
+				mesh_step=1,
+				flatten_direction="forward",
+			)
+			map_yx = mdl.flatten_map().detach().clone()
+			map_yx[..., 0] += 0.03 * torch.sin(map_yx[..., 1])
+			map_yx[..., 1] *= 1.07
+			_set_flatten_map(mdl, map_yx)
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			if combined:
+				total = opt_loss_flatten.flatten_combined_loss(res=res, weights=weights, step_loss=step_loss)
+			else:
+				step_term = (
+					opt_loss_flatten.flatten_edge_step_loss(res=res)[0]
+					if step_loss == "edge"
+					else opt_loss_flatten.flatten_map_step_loss(res=res)[0]
+				)
+				losses = (
+					opt_loss_flatten.flatten_sdir_loss(res=res)[0],
+					step_term,
+					opt_loss_flatten.flatten_avg_offset_loss(res=res)[0],
+					opt_loss_flatten.flatten_orient_loss(res=res)[0],
+				)
+				total = sum(weight * loss for weight, loss in zip(weights, losses, strict=True))
+			total.backward()
+			return total.detach(), [p.grad.detach().clone() for p in mdl.flatten_map_ms]
+
+		try:
+			eager_loss, eager_grads = _evaluate(combined=False)
+			combined_loss, combined_grads = _evaluate(combined=True)
+			self.assertIsNotNone(opt_loss_flatten._compiled_combined_core)
+			self.assertTrue(torch.allclose(combined_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6))
+			self.assertEqual(len(combined_grads), len(eager_grads))
+			for combined_grad, eager_grad in zip(combined_grads, eager_grads, strict=True):
+				self.assertTrue(torch.allclose(combined_grad, eager_grad, rtol=1.0e-5, atol=1.0e-6))
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_combined_forward_flatten_loss_matches_individual_losses_and_gradients(self) -> None:
+		self._assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+			device=torch.device("cpu"),
+			backend="eager",
+		)
+
+	def test_combined_forward_edge_step_loss_matches_individual_losses_and_gradients(self) -> None:
+		self._assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+			device=torch.device("cpu"),
+			backend="eager",
+			step_loss="edge",
+		)
+
+	@unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+	def test_combined_forward_flatten_loss_matches_individual_losses_and_gradients_on_cuda(self) -> None:
+		self._assert_combined_forward_flatten_loss_matches_individual_losses_and_gradients(
+			device=torch.device("cuda"),
+			backend=None,
+		)
+
+	def test_optimizer_dispatches_complete_forward_objective_to_combined_loss(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(6, 7), mesh_step=1, flatten_direction="forward")
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_map_step": 0.1,
+				"flatten_avg_offset": 1.0,
+				"flatten_orient": 10.0,
+			},
+			"stages": [{
+				"name": "flatten",
+				"steps": 1,
+				"lr": 0.0,
+				"params": ["map_flatten_ms"],
+				"args": {
+					"compile_flatten": True,
+					"compile_flatten_backend": "eager",
+					"compile_flatten_combined": True,
+					"flatten_diagnostics": False,
+					"flatten_max_update": 0.0,
+					"status_interval": 0,
+				},
+			}],
+		})
+
+		try:
+			with mock.patch.object(
+				opt_loss_flatten,
+				"flatten_combined_loss_parts",
+				wraps=opt_loss_flatten.flatten_combined_loss_parts,
+			) as combined:
+				optimizer.optimize(
+					model=mdl,
+					data=fit._dummy_flatten_data(),
+					stages=stages,
+					snapshot_interval=0,
+					snapshot_fn=lambda **_kw: None,
+					progress_fn=lambda **_kw: None,
+				)
+			self.assertGreaterEqual(combined.call_count, 2)
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_optimizer_dispatches_edge_step_forward_objective_to_combined_loss(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(6, 7), mesh_step=1, flatten_direction="forward")
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_edge_step": 0.1,
+				"flatten_avg_offset": 1.0,
+				"flatten_orient": 10.0,
+			},
+			"stages": [{
+				"name": "flatten",
+				"steps": 1,
+				"lr": 0.0,
+				"params": ["map_flatten_ms"],
+				"args": {
+					"compile_flatten": True,
+					"compile_flatten_backend": "eager",
+					"compile_flatten_combined": True,
+					"flatten_diagnostics": False,
+					"flatten_max_update": 0.0,
+					"status_interval": 0,
+				},
+			}],
+		})
+
+		try:
+			with mock.patch.object(
+				opt_loss_flatten,
+				"flatten_combined_loss_parts",
+				wraps=opt_loss_flatten.flatten_combined_loss_parts,
+			) as combined:
+				optimizer.optimize(
+					model=mdl,
+					data=fit._dummy_flatten_data(),
+					stages=stages,
+					snapshot_interval=0,
+					snapshot_fn=lambda **_kw: None,
+					progress_fn=lambda **_kw: None,
+				)
+			self.assertGreaterEqual(combined.call_count, 2)
+			for call in combined.call_args_list:
+				self.assertEqual(call.kwargs["step_loss"], "edge")
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def test_requested_output_step_overrides_measured_source_step(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 5, sx=3.0, sy=3.0), mesh_step=20)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		self.assertAlmostEqual(float(res.flatten_target_step.detach()), 20.0, places=5)
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step.detach()), 3.0, places=5)
+
+	def test_forward_init_uses_measured_source_step_for_uv_scale(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(5, 5, sx=27.0, sy=27.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		stats = opt_loss_flatten.current_grid_step_stats(res)
+		weights = torch.tensor([2.0, 3.0, 5.0, 7.0], dtype=torch.float32)
+		loss_parts = opt_loss_flatten.flatten_combined_loss_parts(
+			res=res,
+			weights=weights,
+		)
+
+		self.assertEqual(mdl.flatten_output_shape, (7, 7))
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step.detach()), 27.0, places=5)
+		self.assertAlmostEqual(float(mdl.flatten_map_step.detach()), 27.0 / 20.0, places=5)
+		self.assertAlmostEqual(stats["flatten_grid_step_avg"], 20.0, places=5)
+		self.assertEqual(len(loss_parts), 5)
+		self.assertAlmostEqual(
+			float(loss_parts[0].detach()),
+			float(sum(weight * part for weight, part in zip(weights, loss_parts[1:], strict=True)).detach()),
+			places=5,
+		)
+
+	def test_forward_init_uv_rescale_can_be_disabled(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(5, 5, sx=27.0, sy=27.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+			flatten_initial_uv_rescale=False,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		stats = opt_loss_flatten.current_grid_step_stats(res)
+
+		self.assertEqual(mdl.flatten_output_shape, (5, 5))
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step.detach()), 27.0, places=5)
+		self.assertAlmostEqual(float(mdl.flatten_map_step.detach()), 1.0, places=5)
+		self.assertAlmostEqual(stats["flatten_grid_step_avg"], 27.0, places=5)
+
+	def test_anisotropic_deformation_increases_sdir(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(7, 7), mesh_step=1)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[..., 1] = map_yx[..., 1] * 0.5
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+
+		self.assertGreater(float(loss.detach()), 0.5)
+
+	def test_map_step_regularizer_rejects_checkerboard(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		loss_id, _lms, _masks = opt_loss_flatten.flatten_map_step_loss(res=res)
+		self.assertLess(float(loss_id.detach()), 1.0e-6)
+
+		map_yx = mdl.flatten_map().detach().clone()
+		H, W = int(map_yx.shape[0]), int(map_yx.shape[1])
+		yy = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		xx = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		checker = ((yy.long() + xx.long()) % 2).to(dtype=torch.float32) * 0.25
+		map_yx[..., 0] = map_yx[..., 0] + checker
+		map_yx[..., 1] = map_yx[..., 1] - checker
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		loss_checker, _lms, _masks = opt_loss_flatten.flatten_map_step_loss(res=res)
+
+		self.assertGreater(float(loss_checker.detach()), 0.05)
+
+	def test_edge_step_regularizer_uses_measured_physical_edges(self) -> None:
+		xyz = _flat_grid(4, 5, sx=30.0, sy=20.0)
+		mdl = _make_flatten_model(
+			xyz,
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=10.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = torch.empty(4, 5, 2, dtype=torch.float32)
+		map_yx[..., 0] = torch.arange(4, dtype=torch.float32).view(4, 1) * 2.0
+		map_yx[..., 1] = torch.arange(5, dtype=torch.float32).view(1, 5) * 3.0
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
+
+	def test_edge_step_regularizer_rejects_bad_scale(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=20.0, sy=20.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone() * 1.25
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertGreater(float(loss.detach()), 0.03)
+
+	def test_edge_step_regularizer_uses_retained_source_cells(self) -> None:
+		xyz = _flat_grid(3, 3)
+		xyz[2, :, 1] = 1000.0
+		mdl = _make_flatten_model(
+			xyz,
+			mesh_step=1,
+			flatten_direction="forward",
+			flatten_output_step=1.0,
+			flatten_output_margin=0.0,
+			flatten_initial_uv_rescale=False,
+		)
+		mdl.flatten_source_cell_valid = torch.tensor(
+			[
+				[True, True],
+				[False, False],
+			],
+			dtype=torch.bool,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
+
+	def test_edge_step_global_scale_amplifies_average_mismatch(self) -> None:
+		target_step = 20.0
+		avg_mismatch = 0.01
+		global_scale = 10.0
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=target_step, sy=target_step),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=target_step,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone() / (1.0 + avg_mismatch)
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		try:
+			opt_loss_flatten.configure(edge_step_global_scale=global_scale, reset_history=True)
+			loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+		finally:
+			opt_loss_flatten.configure(edge_step_global_scale=1.0, reset_history=True)
+
+		uv_scale = 1.0 / (1.0 + avg_mismatch)
+		target_scale = 1.0 + global_scale * avg_mismatch
+		edge_count = 2 * 4 * 3
+		diag_count = 2 * 3 * 3
+		expected = (
+			edge_count * (uv_scale - target_scale) ** 2
+			+ diag_count * 2.0 * (uv_scale - target_scale) ** 2
+		) / (edge_count + diag_count)
+		self.assertAlmostEqual(float(loss.detach()), expected, places=5)
+
+	def test_edge_step_regularizer_masks_invalid_vertices(self) -> None:
+		xyz = _flat_grid(2, 2, sx=20.0, sy=20.0)
+		valid = torch.tensor([[True, False], [False, False]])
+		mdl = _make_flatten_model(
+			xyz,
+			valid,
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[1, 1] = torch.tensor([10.0, 10.0])
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
+
+	def test_edge_step_regularizer_constrains_diagonals(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(2, 2, sx=20.0, sy=20.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[1, 0] = torch.tensor([1.0, 0.0])
+		map_yx[0, 1] = torch.tensor([0.5, 0.8660254])
+		map_yx[1, 1] = torch.tensor([1.5, 0.8660254])
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertGreater(float(loss.detach()), 0.03)
+
+	def test_avg_offset_regularizer_keeps_initial_valid_mean_offset(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		loss_id, _lms, _masks = opt_loss_flatten.flatten_avg_offset_loss(res=res)
+		self.assertLess(float(loss_id.detach()), 1.0e-6)
+
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[..., 0] = map_yx[..., 0] + 0.5
+		map_yx[..., 1] = map_yx[..., 1] - 0.25
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		loss_shifted, _lms, _masks = opt_loss_flatten.flatten_avg_offset_loss(res=res)
+
+		self.assertAlmostEqual(float(loss_shifted.detach()), 0.5 * 0.5 + 0.25 * 0.25, places=5)
+
+	def test_flatten_update_clamp_limits_each_scale(self) -> None:
+		params = [
+			torch.nn.Parameter(torch.zeros(2, 1, 4, 4)),
+			torch.nn.Parameter(torch.zeros(2, 1, 2, 2)),
+		]
+		before = [p.detach().clone() for p in params]
+		with torch.no_grad():
+			params[0].add_(1.0)
+			params[1].add_(1.0)
+
+		optimizer._clamp_flatten_map_ms_update(params, before, base_step=0.1)
+
+		self.assertLessEqual(float(torch.linalg.vector_norm((params[0] - before[0]).detach(), dim=0).max()), 0.10001)
+		self.assertLessEqual(float(torch.linalg.vector_norm((params[1] - before[1]).detach(), dim=0).max()), 0.20001)
+
+	def _assert_fused_clamped_adam_matches_reference(self, device: torch.device) -> None:
+		torch.manual_seed(7)
+		base_step = 0.005
+		reference_params = [
+			torch.nn.Parameter(torch.randn(2, 1, 17, 19, device=device)),
+			torch.nn.Parameter(torch.randn(2, 1, 9, 10, device=device)),
+		]
+		fused_params = [torch.nn.Parameter(p.detach().clone()) for p in reference_params]
+		reference = torch.optim.Adam([
+			{"params": [p], "lr": 0.01, "_flatten_scale_i": scale_i}
+			for scale_i, p in enumerate(reference_params)
+		])
+		fused = FlattenClampedAdam([
+			{"params": [p], "lr": 0.01, "_flatten_scale_i": scale_i}
+			for scale_i, p in enumerate(fused_params)
+		], base_step=base_step)
+
+		for _step in range(8):
+			grads = [torch.randn_like(p) for p in reference_params]
+			for p, grad in zip(reference_params, grads, strict=True):
+				p.grad = grad
+			for p, grad in zip(fused_params, grads, strict=True):
+				p.grad = grad.clone()
+			reference_before = [p.detach().clone() for p in reference_params]
+			fused_before = [p.detach().clone() for p in fused_params]
+			reference.step()
+			optimizer._clamp_flatten_map_ms_update(
+				reference_params,
+				reference_before,
+				base_step=base_step,
+			)
+			fused.step()
+
+			for scale_i, (p, before) in enumerate(zip(fused_params, fused_before, strict=True)):
+				max_norm = torch.linalg.vector_norm((p - before).detach(), dim=0).max()
+				self.assertLessEqual(float(max_norm), base_step * (2.0 ** scale_i) + 1.0e-6)
+
+		for reference_param, fused_param in zip(reference_params, fused_params, strict=True):
+			self.assertTrue(torch.allclose(reference_param, fused_param, rtol=1.0e-6, atol=5.0e-7))
+			for state_name in ("exp_avg", "exp_avg_sq", "step"):
+				self.assertTrue(torch.allclose(
+					reference.state[reference_param][state_name],
+					fused.state[fused_param][state_name],
+					rtol=1.0e-6,
+					atol=1.0e-7,
+				))
+
+	def test_fused_clamped_adam_matches_reference_on_cpu(self) -> None:
+		self._assert_fused_clamped_adam_matches_reference(torch.device("cpu"))
+
+	@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the Triton fused optimizer test")
+	def test_fused_clamped_adam_matches_reference_on_cuda(self) -> None:
+		self._assert_fused_clamped_adam_matches_reference(torch.device("cuda"))
+
+	def test_orient_regularizer_allows_positive_area_stretch(self) -> None:
+		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)
+		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[..., 0] = map_yx[..., 0] * 0.05
+		map_yx[..., 1] = map_yx[..., 1] * 12.0
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 0.0)
+		self.assertEqual(stats["flatten_orient_lowdet_frac"], 0.0)
+		self.assertGreater(stats["flatten_orient_min_det"], 0.0)
+
+	def test_orient_regularizer_rejects_triangle_fold_with_positive_center_determinant(self) -> None:
+		# All source-row edges increase output Y and all source-column edges
+		# increase output X, but the strong cross-axis shear flips one of the
+		# fixed-diagonal mesh triangles. Its center determinant remains positive,
+		# so the former center-only test accepted it.
+		map_yx = torch.tensor(
+			[
+				[[0.0, 0.0], [-1.5, 1.0]],
+				[[1.0, -3.0], [1.5, 0.5]],
+			],
+			dtype=torch.float32,
+		)
+		dy = 0.5 * ((map_yx[1, 0] - map_yx[0, 0]) + (map_yx[1, 1] - map_yx[0, 1]))
+		dx = 0.5 * ((map_yx[0, 1] - map_yx[0, 0]) + (map_yx[1, 1] - map_yx[1, 0]))
+		center_det = dy[0] * dx[1] - dy[1] * dx[0]
+		self.assertGreater(float(center_det), 0.0)
+		self.assertTrue(bool((map_yx[1:, :, 0] - map_yx[:-1, :, 0] > 0.05).all()))
+		self.assertTrue(bool((map_yx[:, 1:, 1] - map_yx[:, :-1, 1] > 0.05).all()))
+
+		valid_cells = torch.ones((1, 1), dtype=torch.bool)
+		valid_vertices = torch.ones((2, 2), dtype=torch.bool)
+		loss, _lm, mask, min_triangle_det = opt_loss_flatten._flatten_orient_core(
+			map_yx,
+			valid_cells,
+			0.0,
+			valid_vertices,
+			0.05,
+			1.0,
+		)
+
+		self.assertAlmostEqual(float(min_triangle_det), -3.5)
+		self.assertAlmostEqual(float(loss), 12.25)
+		self.assertEqual(int(mask.sum()), 1)
+
+	def test_orient_regularizer_rejects_negative_area_fold(self) -> None:
+		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)
+		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[..., 1] = -map_yx[..., 1]
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		loss, _lms, masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		self.assertGreater(float(loss.detach()), 20.0)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 1.0)
+		self.assertEqual(stats["flatten_orient_lowdet_frac"], 1.0)
+		self.assertLess(stats["flatten_orient_min_det"], 0.0)
+		self.assertEqual(int(masks[0].sum().detach()), 25)
+
+	def test_forward_orient_regularizer_rejects_negative_uv_area(self) -> None:
+		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)
+		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1, flatten_direction="forward")
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[..., 1] = -map_yx[..., 1]
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		self.assertGreater(float(loss.detach()), 20.0)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 1.0)
+		self.assertEqual(stats["flatten_orient_lowdet_frac"], 1.0)
+		self.assertLess(stats["flatten_orient_min_det"], 0.0)
+		self.assertEqual(int(masks[0].sum().detach()), 25)
+
+	def test_forward_orient_regularizer_preserves_source_axis_order(self) -> None:
+		opt_loss_flatten.configure(
+			orient_min_det=0.0,
+			order_margin=0.05,
+			reset_history=True,
+		)
+		mdl = _make_flatten_model(
+			_flat_grid(6, 6),
+			mesh_step=1,
+			flatten_direction="forward",
+		)
+		map_yx = -mdl.flatten_map().detach().clone()
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		# A 180-degree rotation has positive local area and therefore evades the
+		# determinant-only barrier, but reverses both source-grid axes.
+		self.assertGreater(float(loss.detach()), 60.0)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 0.0)
+		self.assertEqual(stats["flatten_order_row_violation_frac"], 1.0)
+		self.assertEqual(stats["flatten_order_column_violation_frac"], 1.0)
+		self.assertEqual(int(masks[0].sum().detach()), 0)
+
+	def test_flatten_stats_track_validity_transitions(self) -> None:
+		opt_loss_flatten.configure(reset_history=True)
+		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		initial_map = mdl.flatten_map().detach().clone()
+		initial_map[0, 0] = torch.tensor([-1.0, -1.0])
+		_set_flatten_map(mdl, initial_map)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		opt_loss_flatten.flatten_sdir_loss(res=res)
+
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[1, 1] = torch.tensor([-1.0, -1.0])
+		map_yx[0, 0] = torch.tensor([0.5, 0.5])
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		opt_loss_flatten.flatten_sdir_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		self.assertAlmostEqual(stats["flatten_valid_to_invalid"], 1.0 / 25.0, places=6)
+		self.assertAlmostEqual(stats["flatten_invalid_to_valid"], 1.0 / 25.0, places=6)
+		self.assertIn("flatten_sdir_no_new", stats)
+
+	def test_flatten_export_writes_invalid_points_as_minus_one(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		valid[1, 1] = False
+		mdl = _make_flatten_model(xyz, valid, mesh_step=1)
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			self.assertFalse((out / "map_y.tif").exists())
+			self.assertFalse((out / "map_x.tif").exists())
+			x = tifffile.imread(str(out / "flatten.tifxyz" / "x.tif"))
+			y = tifffile.imread(str(out / "flatten.tifxyz" / "y.tif"))
+			z = tifffile.imread(str(out / "flatten.tifxyz" / "z.tif"))
+			self.assertTrue(bool(((x == -1.0) & (y == -1.0) & (z == -1.0)).any()))
+
+	def test_flatten_export_preserves_fractional_output_step(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=20.0, sy=20.0),
+			mesh_step=20,
+			flatten_output_step=20.5,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0 / 20.0,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			meta = json.loads(
+				(out / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / 20.5)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / 20.5)
+
+			model_path = out / "flatten_model.pt"
+			checkpoint_out = out / "checkpoint_out"
+			fit._save_flatten_model(
+				str(model_path),
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				fit_config={"args": {"model-init": "flatten"}},
+			)
+			fit2tifxyz.main([
+				"--input", str(model_path),
+				"--output", str(checkpoint_out),
+				"--output-name", "fractional.tifxyz",
+			])
+			checkpoint_meta = json.loads(
+				(checkpoint_out / "fractional.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(checkpoint_meta["scale"][0], 1.0 / 20.5)
+			self.assertAlmostEqual(checkpoint_meta["scale"][1], 1.0 / 20.5)
+
+	def test_default_flatten_output_step_preserves_fractional_source_step(self) -> None:
+		source_step = fit._flatten_source_step_from_tifxyz_meta(
+			{"scale": [1.0 / 20.5, 1.0 / 20.5]},
+			100,
+		)
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=source_step, sy=source_step),
+			mesh_step=source_step,
+		)
+
+		self.assertAlmostEqual(source_step, 20.5)
+		self.assertAlmostEqual(mdl.params.flatten_output_step, 20.5)
+		self.assertEqual(mdl.flatten_output_shape, (4, 4))
+		self.assertAlmostEqual(float(mdl.flatten_map_step), 1.0)
+
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0 / source_step,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			meta = json.loads(
+				(out / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / source_step)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / source_step)
+
+	def test_forward_flatten_export_inverts_uv_and_keeps_holes_invalid(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		valid[1, 1] = False
+		mdl = _make_flatten_model(xyz, valid, mesh_step=1, flatten_direction="forward")
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			x = tifffile.imread(str(out / "flatten.tifxyz" / "x.tif"))
+			y = tifffile.imread(str(out / "flatten.tifxyz" / "y.tif"))
+			z = tifffile.imread(str(out / "flatten.tifxyz" / "z.tif"))
+			valid_out = ~((x == -1.0) & (y == -1.0) & (z == -1.0))
+			self.assertTrue(bool(valid_out.any()))
+			self.assertTrue(bool((~valid_out).any()))
+
+	def test_fit2tifxyz_exports_flatten_checkpoint(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		valid[1, 1] = False
+		mdl = _make_flatten_model(xyz, valid, mesh_step=1)
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			model_path = root / "flatten_model.pt"
+			out = root / "out"
+			fit._save_flatten_model(
+				str(model_path),
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				fit_config={"args": {"model-init": "flatten"}},
+			)
+
+			fit2tifxyz.main([
+				"--input", str(model_path),
+				"--output", str(out),
+				"--output-name", "vc3d_name.tifxyz",
+			])
+
+			self.assertFalse((out / "map_y.tif").exists())
+			self.assertFalse((out / "map_x.tif").exists())
+			self.assertTrue((out / "vc3d_name.tifxyz" / "meta.json").exists())
+			x = tifffile.imread(str(out / "vc3d_name.tifxyz" / "x.tif"))
+			y = tifffile.imread(str(out / "vc3d_name.tifxyz" / "y.tif"))
+			z = tifffile.imread(str(out / "vc3d_name.tifxyz" / "z.tif"))
+			self.assertTrue(bool(((x == -1.0) & (y == -1.0) & (z == -1.0)).any()))
+			self.assertTrue((out / "vc3d_name.tifxyz" / "model.pt").is_file())
+
+	def test_fit2tifxyz_can_export_ephemeral_flatten_without_model(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		mdl = _make_flatten_model(xyz, valid, mesh_step=1)
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			model_path = root / "flatten_model.pt"
+			map_path = root / "out" / ".flatten-map.npy"
+			out = root / "out"
+			fit._save_flatten_model(
+				str(model_path),
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				fit_config={"args": {"model-init": "flatten"}},
+			)
+
+			fit2tifxyz.main([
+				"--input", str(model_path),
+				"--output", str(out),
+				"--output-name", "preview.tifxyz",
+				"--omit-model",
+				"--flatten-map-output", str(map_path),
+			])
+
+			self.assertFalse((out / "preview.tifxyz" / "model.pt").exists())
+			expected = torch.load(
+				model_path, map_location="cpu", weights_only=False
+			)["flatten_map_flat"].numpy()
+			np.testing.assert_array_equal(
+				np.load(map_path, allow_pickle=False), expected)
+
+	def test_forward_fit_mode_writes_normal_flatten_outputs(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			tifxyz = root / "input.tifxyz"
+			tifxyz.mkdir()
+			source_step = 20.5
+			xyz = _flat_grid(
+				4,
+				4,
+				sx=source_step,
+				sy=source_step,
+			).numpy()
+			tifffile.imwrite(str(tifxyz / "x.tif"), xyz[..., 0].astype("float32"))
+			tifffile.imwrite(str(tifxyz / "y.tif"), xyz[..., 1].astype("float32"))
+			tifffile.imwrite(str(tifxyz / "z.tif"), xyz[..., 2].astype("float32"))
+			(tifxyz / "meta.json").write_text(json.dumps({
+				"scale": [1.0 / source_step, 1.0 / source_step],
+			}), encoding="utf-8")
+			cfg_path = root / "flatten_forward.json"
+			cfg_path.write_text(json.dumps({
+				"args": {
+					"model-init": "flatten",
+					"flatten_solver": "forward",
+					"device": "cpu",
+				},
+				"base": {"flatten_sdir": 1.0},
+				"stages": [{
+					"name": "flatten",
+					"steps": 0,
+					"lr": 0.0,
+					"params": ["map_flatten_ms"],
+				}],
+				"external_surfaces": [{"path": str(tifxyz)}],
+			}), encoding="utf-8")
+			out = root / "out"
+
+			rc = fit.main([str(cfg_path), "--out-dir", str(out)])
+
+			self.assertEqual(rc, 0)
+			self.assertTrue((out / "model_final.pt").exists())
+			self.assertTrue((out / "tifxyz" / "flatten.tifxyz" / "x.tif").exists())
+			st = torch.load(out / "model_final.pt", map_location="cpu", weights_only=False)
+			self.assertIn("flatten_map_flat", st)
+			self.assertEqual(tuple(st["flatten_map_flat"].shape[-1:]), (2,))
+			self.assertAlmostEqual(
+				st["_model_params_"]["flatten_output_step"],
+				source_step,
+			)
+			meta = json.loads(
+				(out / "tifxyz" / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / source_step)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / source_step)
+
+	def test_forward_current_grid_step_stats_measure_physical_per_uv_pixel(self) -> None:
+		source_step = 40.0
+		effective_step = 27.0
+		mdl = _make_flatten_model(
+			_flat_grid(5, 6, sx=source_step, sy=source_step),
+			mesh_step=source_step,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		identity = fit_model.Model3D._identity_flatten_map(
+			h=5,
+			w=6,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		_set_flatten_map(mdl, identity * (source_step / effective_step))
+
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		stats = opt_loss_flatten.current_grid_step_stats(res)
+
+		self.assertAlmostEqual(stats["flatten_grid_step_avg"], effective_step, places=5)
+
+	def test_forward_current_grid_step_stats_include_diagonals(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(2, 2, sx=20.0, sy=20.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone()
+		map_yx[1, 0] = torch.tensor([1.0, 0.0])
+		map_yx[0, 1] = torch.tensor([0.5, 0.8660254])
+		map_yx[1, 1] = torch.tensor([1.5, 0.8660254])
+		_set_flatten_map(mdl, map_yx)
+
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		stats = opt_loss_flatten.current_grid_step_stats(res)
+
+		self.assertGreater(stats["flatten_grid_step_avg"], 20.0)
+
+	def test_forward_renorm_rescales_uv_to_target_physical_step(self) -> None:
+		source_step = 40.0
+		before_step = 27.0
+		target_step = 20.0
+		mdl = _make_flatten_model(
+			_flat_grid(5, 6, sx=source_step, sy=source_step),
+			mesh_step=source_step,
+			flatten_direction="forward",
+			flatten_output_step=target_step,
+			flatten_output_margin=0.0,
+		)
+		identity = fit_model.Model3D._identity_flatten_map(
+			h=5,
+			w=6,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		_set_flatten_map(mdl, identity * (source_step / before_step))
+		center_before = mdl.flatten_map().mean(dim=(0, 1))
+
+		stats = optimizer._renorm_forward_flatten_map_step(mdl)
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		step_stats = opt_loss_flatten.current_grid_step_stats(res)
+		center_after = mdl.flatten_map().mean(dim=(0, 1))
+
+		self.assertAlmostEqual(stats["flatten_renorm_step_before"], before_step, places=5)
+		self.assertAlmostEqual(stats["flatten_renorm_step_after"], target_step, places=5)
+		self.assertAlmostEqual(stats["flatten_renorm_scale"], before_step / target_step, places=5)
+		self.assertAlmostEqual(step_stats["flatten_grid_step_avg"], target_step, places=5)
+		self.assertTrue(torch.allclose(center_after, center_before, rtol=1.0e-6, atol=1.0e-6))
+
+
+if __name__ == "__main__":
+	unittest.main()

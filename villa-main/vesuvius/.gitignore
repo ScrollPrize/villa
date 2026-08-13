@@ -1,0 +1,7 @@
+/build/
+/src/vesuvius.egg-info/
+/dev_jupyter/
+.venv/
+__pycache__
+*/__pycache__/*
+**/wandb

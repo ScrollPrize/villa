@@ -1,0 +1,1467 @@
+#include "SegmentationPushPullTool.hpp"
+
+#include "../SegmentationModule.hpp"
+#include "../../ViewerManager.hpp"
+#include "SegmentationEditManager.hpp"
+#include "../SegmentationWidget.hpp"
+#include "../../overlays/SegmentationOverlayController.hpp"
+#include "../../CState.hpp"
+
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/Surface.hpp"
+#include "vc/core/util/Slicing.hpp"
+
+#include <QCoreApplication>
+#include <QTimer>
+#include <QLoggingCategory>
+#include <QtConcurrent/QtConcurrent>
+
+#include <algorithm>
+#include <cmath>
+#include <exception>
+#include <limits>
+#include <optional>
+#include <numeric>
+#include <vector>
+
+#include <opencv2/imgproc.hpp>
+
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
+Q_LOGGING_CATEGORY(lcSegPushPull, "vc.segmentation.pushpull")
+
+namespace
+{
+constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
+constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
+constexpr int kPushPullIntervalMsSlow = 33;   // Alpha mode: ~30fps for responsiveness
+constexpr int kPlaneIntersectionReleaseIdleMs = 180;
+constexpr float kAlphaMinStep = 0.05f;
+constexpr float kAlphaMaxStep = 20.0f;
+constexpr float kAlphaMinRange = 0.01f;
+constexpr float kAlphaDefaultHighDelta = 0.05f;
+constexpr int kAlphaBlurRadiusMax = 15;
+constexpr float kAlphaPerVertexLimitMax = 128.0f;
+constexpr std::size_t kAlphaPerVertexMaxSamples = 512;
+
+bool nearlyEqual(float lhs, float rhs)
+{
+    return std::fabs(lhs - rhs) < 1e-4f;
+}
+
+bool isFiniteVec3(const cv::Vec3f& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+}
+
+bool isValidNormal(const cv::Vec3f& normal)
+{
+    if (!isFiniteVec3(normal)) {
+        return false;
+    }
+    const float norm = static_cast<float>(cv::norm(normal));
+    return norm > 1e-4f;
+}
+
+void setAlphaNoTargetReason(std::string* outReason, const char* reason)
+{
+    if (outReason && outReason->empty()) {
+        *outReason = reason;
+    }
+}
+
+cv::Vec3f normalizeVec(const cv::Vec3f& value)
+{
+    const float norm = static_cast<float>(cv::norm(value));
+    if (!std::isfinite(norm) || norm <= 1e-6f) {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    return value / norm;
+}
+
+std::optional<cv::Vec3f> averageNormals(const std::vector<cv::Vec3f>& normals)
+{
+    if (normals.empty()) {
+        return std::nullopt;
+    }
+    cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+    for (const auto& normal : normals) {
+        sum += normal;
+    }
+    sum = normalizeVec(sum);
+    if (!isValidNormal(sum)) {
+        return std::nullopt;
+    }
+    return sum;
+}
+
+std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
+                                                        const cv::Vec3f& basePtr,
+                                                        const SegmentationEditManager::ActiveDrag& drag,
+                                                        SurfacePatchIndex* patchIndex = nullptr)
+{
+    if (!surface || !drag.active) {
+        return std::nullopt;
+    }
+
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(8);
+
+    // Try the center first, then nearby samples in order of proximity.
+    const auto collectNormalAt = [&](const cv::Vec3f& worldPoint) {
+        cv::Vec3f ptrCandidate = basePtr;
+        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200, patchIndex);
+        const cv::Vec3f candidateNormal = surface->normal(ptrCandidate);
+        if (isValidNormal(candidateNormal)) {
+            normals.push_back(candidateNormal);
+        }
+    };
+
+    collectNormalAt(drag.baseWorld);
+    if (normals.empty()) {
+        // Evaluate additional nearby samples, prioritising the ones closest to the center.
+        auto samples = drag.samples;
+        std::sort(samples.begin(),
+                  samples.end(),
+                  [](const SegmentationEditManager::DragSample& lhs,
+                     const SegmentationEditManager::DragSample& rhs) {
+                      return lhs.distanceWorldSq < rhs.distanceWorldSq;
+                  });
+        for (const auto& sample : samples) {
+            if (sample.row == drag.center.row && sample.col == drag.center.col) {
+                continue;
+            }
+            collectNormalAt(sample.baseWorld);
+            if (normals.size() >= 4) {
+                break;
+            }
+        }
+    }
+
+    return averageNormals(normals);
+}
+
+bool activeDragMovedVertices(const SegmentationEditManager& editManager)
+{
+    const auto& drag = editManager.activeDrag();
+    if (!drag.active || drag.samples.empty()) {
+        return false;
+    }
+
+    for (const auto& sample : drag.samples) {
+        const auto current = editManager.vertexWorldPosition(sample.row, sample.col);
+        if (!current) {
+            continue;
+        }
+        const cv::Vec3f delta = *current - sample.baseWorld;
+        if (delta.dot(delta) >= 1e-8f) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+enum class AxisDirection
+{
+    Row,
+    Column
+};
+
+std::optional<cv::Vec3f> axisVectorFromSamples(AxisDirection axis,
+                                               const SegmentationEditManager::ActiveDrag& drag)
+{
+    if (!drag.active || drag.samples.empty()) {
+        return std::nullopt;
+    }
+
+    const auto& center = drag.center;
+    const cv::Vec3f& centerWorld = drag.baseWorld;
+
+    const SegmentationEditManager::DragSample* posSample = nullptr;
+    const SegmentationEditManager::DragSample* negSample = nullptr;
+
+    int bestPosPrimary = std::numeric_limits<int>::max();
+    int bestPosSecondary = std::numeric_limits<int>::max();
+    float bestPosDist = std::numeric_limits<float>::max();
+
+    int bestNegPrimary = std::numeric_limits<int>::max();
+    int bestNegSecondary = std::numeric_limits<int>::max();
+    float bestNegDist = std::numeric_limits<float>::max();
+
+    for (const auto& sample : drag.samples) {
+        int primaryDelta = 0;
+        int secondaryDelta = 0;
+        if (axis == AxisDirection::Row) {
+            primaryDelta = sample.row - center.row;
+            secondaryDelta = std::abs(sample.col - center.col);
+        } else {
+            primaryDelta = sample.col - center.col;
+            secondaryDelta = std::abs(sample.row - center.row);
+        }
+
+        if (primaryDelta == 0) {
+            continue;
+        }
+
+        const int absPrimary = std::abs(primaryDelta);
+        const float distSq = std::max(sample.distanceWorldSq, 0.0f);
+
+        auto updateCandidate = [&](const SegmentationEditManager::DragSample*& currentSample,
+                                   int& bestPrimary,
+                                   int& bestSecondary,
+                                   float& bestDist) {
+            if (absPrimary < bestPrimary ||
+                (absPrimary == bestPrimary &&
+                 (secondaryDelta < bestSecondary ||
+                  (secondaryDelta == bestSecondary && distSq < bestDist)))) {
+                currentSample = &sample;
+                bestPrimary = absPrimary;
+                bestSecondary = secondaryDelta;
+                bestDist = distSq;
+            }
+        };
+
+        if (primaryDelta > 0) {
+            updateCandidate(posSample, bestPosPrimary, bestPosSecondary, bestPosDist);
+        } else {
+            updateCandidate(negSample, bestNegPrimary, bestNegSecondary, bestNegDist);
+        }
+    }
+
+    cv::Vec3f axisVec(0.0f, 0.0f, 0.0f);
+    if (posSample && negSample) {
+        axisVec = posSample->baseWorld - negSample->baseWorld;
+    } else if (posSample) {
+        axisVec = posSample->baseWorld - centerWorld;
+    } else if (negSample) {
+        axisVec = centerWorld - negSample->baseWorld;
+    } else {
+        return std::nullopt;
+    }
+
+    axisVec = normalizeVec(axisVec);
+    if (!isValidNormal(axisVec)) {
+        return std::nullopt;
+    }
+    return axisVec;
+}
+
+std::optional<cv::Vec3f> fitPlaneNormal(const SegmentationEditManager::ActiveDrag& drag,
+                                        const cv::Vec3f& centerWorld,
+                                        const std::optional<cv::Vec3f>& rowVec,
+                                        const std::optional<cv::Vec3f>& colVec,
+                                        const std::optional<cv::Vec3f>& orientationHint)
+{
+    if (!drag.active) {
+        return std::nullopt;
+    }
+
+    if (drag.samples.size() < 3) {
+        return std::nullopt;
+    }
+
+    std::vector<cv::Vec3d> points;
+    std::vector<double> weights;
+    points.reserve(drag.samples.size());
+    weights.reserve(drag.samples.size());
+
+    double weightSum = 0.0;
+    cv::Vec3d centroid(0.0, 0.0, 0.0);
+
+    for (const auto& sample : drag.samples) {
+        if (!isFiniteVec3(sample.baseWorld)) {
+            continue;
+        }
+        const double dist = std::sqrt(std::max(sample.distanceWorldSq, 0.0f));
+        const double weight = 1.0 / (1.0 + dist);
+        const cv::Vec3d point(sample.baseWorld[0], sample.baseWorld[1], sample.baseWorld[2]);
+        points.push_back(point);
+        weights.push_back(weight);
+        centroid += point * weight;
+        weightSum += weight;
+    }
+
+    if (weightSum <= 0.0 || points.size() < 3) {
+        return std::nullopt;
+    }
+
+    centroid /= weightSum;
+
+    cv::Matx33d covariance = cv::Matx33d::zeros();
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const cv::Vec3d diff = points[i] - centroid;
+        const double w = weights[i];
+        covariance(0, 0) += w * diff[0] * diff[0];
+        covariance(0, 1) += w * diff[0] * diff[1];
+        covariance(0, 2) += w * diff[0] * diff[2];
+        covariance(1, 0) += w * diff[1] * diff[0];
+        covariance(1, 1) += w * diff[1] * diff[1];
+        covariance(1, 2) += w * diff[1] * diff[2];
+        covariance(2, 0) += w * diff[2] * diff[0];
+        covariance(2, 1) += w * diff[2] * diff[1];
+        covariance(2, 2) += w * diff[2] * diff[2];
+    }
+
+    cv::Mat eigenValues, eigenVectors;
+    cv::eigen(covariance, eigenValues, eigenVectors);
+    if (eigenVectors.rows != 3 || eigenVectors.cols != 3) {
+        return std::nullopt;
+    }
+
+    cv::Vec3d normal(eigenVectors.at<double>(2, 0),
+                     eigenVectors.at<double>(2, 1),
+                     eigenVectors.at<double>(2, 2));
+    double normalNorm = cv::norm(normal);
+    if (!std::isfinite(normalNorm) || normalNorm <= 1e-6) {
+        return std::nullopt;
+    }
+    normal /= normalNorm;
+
+    cv::Vec3d orientation(0.0, 0.0, 0.0);
+    bool orientationValid = false;
+    if (rowVec && colVec) {
+        const cv::Vec3f crossHint = rowVec->cross(*colVec);
+        const double hintNorm = cv::norm(crossHint);
+        if (hintNorm > 1e-6) {
+            orientation = cv::Vec3d(crossHint[0] / hintNorm,
+                                    crossHint[1] / hintNorm,
+                                    crossHint[2] / hintNorm);
+            orientationValid = true;
+        }
+    }
+
+    if (!orientationValid && orientationHint) {
+        const cv::Vec3f hintVec = normalizeVec(*orientationHint);
+        const double hintNorm = cv::norm(cv::Vec3d(hintVec[0], hintVec[1], hintVec[2]));
+        if (hintNorm > 1e-6) {
+            orientation = cv::Vec3d(hintVec[0], hintVec[1], hintVec[2]);
+            orientationValid = true;
+        }
+    }
+
+    if (!orientationValid) {
+        cv::Vec3d toCentroid = centroid - cv::Vec3d(centerWorld[0], centerWorld[1], centerWorld[2]);
+        const double hintNorm = cv::norm(toCentroid);
+        if (hintNorm > 1e-6) {
+            orientation = toCentroid / hintNorm;
+            orientationValid = true;
+        }
+    }
+
+    if (orientationValid && normal.dot(orientation) < 0.0) {
+        normal = -normal;
+    }
+
+    return cv::Vec3f(static_cast<float>(normal[0]),
+                     static_cast<float>(normal[1]),
+                     static_cast<float>(normal[2]));
+}
+
+std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
+                                             const cv::Vec3f& centerPtr,
+                                             const cv::Vec3f& centerWorld,
+                                             const SegmentationEditManager::ActiveDrag& drag,
+                                             SurfacePatchIndex* patchIndex = nullptr)
+{
+    if (!surface || !drag.active) {
+        return std::nullopt;
+    }
+
+    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag, patchIndex);
+    const auto rowVec = axisVectorFromSamples(AxisDirection::Row, drag);
+    const auto colVec = axisVectorFromSamples(AxisDirection::Column, drag);
+
+    std::optional<cv::Vec3f> crossNormal;
+    if (rowVec && colVec) {
+        cv::Vec3f candidate = rowVec->cross(*colVec);
+        candidate = normalizeVec(candidate);
+        if (isValidNormal(candidate)) {
+            crossNormal = candidate;
+        }
+    }
+
+    const std::optional<cv::Vec3f> orientationHint = crossNormal ? crossNormal : surfaceNormal;
+    if (auto planeNormal = fitPlaneNormal(drag, centerWorld, rowVec, colVec, orientationHint)) {
+        return planeNormal;
+    }
+
+    if (surfaceNormal) {
+        return surfaceNormal;
+    }
+    if (crossNormal) {
+        return crossNormal;
+    }
+
+    return std::nullopt;
+}
+}
+
+SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
+                                                   SegmentationEditManager* editManager,
+                                                   SegmentationWidget* widget,
+                                                   SegmentationOverlayController* overlay,
+                                                   CState* state)
+    : _module(module)
+    , _editManager(editManager)
+    , _widget(widget)
+    , _overlay(overlay)
+    , _state(state)
+{
+    ensureTimer();
+    _deferredPlaneIntersectionReleaseTimer = new QTimer(&_module);
+    _deferredPlaneIntersectionReleaseTimer->setSingleShot(true);
+    QObject::connect(_deferredPlaneIntersectionReleaseTimer, &QTimer::timeout,
+                     &_module, [this]() {
+        if (!_deferredPlaneIntersectionActiveViewer) {
+            return;
+        }
+        auto* activeViewer = _deferredPlaneIntersectionActiveViewer;
+        _deferredPlaneIntersectionActiveViewer = nullptr;
+        setDeferredPlaneIntersections(activeViewer, false);
+    });
+
+    QObject::connect(&_alphaWatcher, &QFutureWatcher<AlphaResult>::finished,
+                     &_module, [this]() { applyAlphaResult(); });
+}
+
+void SegmentationPushPullTool::setDependencies(SegmentationEditManager* editManager,
+                                               SegmentationWidget* widget,
+                                               SegmentationOverlayController* overlay,
+                                               CState* state)
+{
+    _editManager = editManager;
+    _widget = widget;
+    _overlay = overlay;
+    _state = state;
+}
+
+void SegmentationPushPullTool::setStepMultiplier(float multiplier)
+{
+    _stepMultiplier = std::clamp(multiplier, 0.05f, 40.0f);
+}
+
+AlphaPushPullConfig SegmentationPushPullTool::sanitizeConfig(const AlphaPushPullConfig& config)
+{
+    AlphaPushPullConfig sanitized = config;
+
+    sanitized.start = std::clamp(sanitized.start, -128.0f, 128.0f);
+    sanitized.stop = std::clamp(sanitized.stop, -128.0f, 128.0f);
+    if (sanitized.start > sanitized.stop) {
+        std::swap(sanitized.start, sanitized.stop);
+    }
+
+    const float magnitude = std::clamp(std::fabs(sanitized.step), kAlphaMinStep, kAlphaMaxStep);
+    sanitized.step = (sanitized.step < 0.0f) ? -magnitude : magnitude;
+
+    sanitized.low = std::clamp(sanitized.low, 0.0f, 1.0f);
+    sanitized.high = std::clamp(sanitized.high, 0.0f, 1.0f);
+    if (sanitized.high <= sanitized.low + kAlphaMinRange) {
+        sanitized.high = std::min(1.0f, sanitized.low + kAlphaDefaultHighDelta);
+    }
+
+    sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, kAlphaBlurRadiusMax);
+    sanitized.computeScale = std::clamp(sanitized.computeScale, 0, 5);
+    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, kAlphaPerVertexLimitMax);
+
+    return sanitized;
+}
+
+bool SegmentationPushPullTool::configsEqual(const AlphaPushPullConfig& lhs, const AlphaPushPullConfig& rhs)
+{
+    return nearlyEqual(lhs.start, rhs.start) &&
+           nearlyEqual(lhs.stop, rhs.stop) &&
+           nearlyEqual(lhs.step, rhs.step) &&
+           nearlyEqual(lhs.low, rhs.low) &&
+           nearlyEqual(lhs.high, rhs.high) &&
+           lhs.blurRadius == rhs.blurRadius &&
+           lhs.computeScale == rhs.computeScale &&
+           nearlyEqual(lhs.perVertexLimit, rhs.perVertexLimit) &&
+           lhs.perVertex == rhs.perVertex;
+}
+
+void SegmentationPushPullTool::setAlphaConfig(const AlphaPushPullConfig& config)
+{
+    _alphaConfig = sanitizeConfig(config);
+}
+
+bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOverride)
+{
+    if (direction == 0) {
+        qCWarning(lcSegPushPull) << "Push/pull start ignored: direction is zero.";
+        return false;
+    }
+
+    ensureTimer();
+
+    if (_ppState.active && _ppState.direction == direction) {
+        if (_timer && !_timer->isActive()) {
+            _timer->start();
+        }
+        return true;
+    }
+
+    if (!_module.ensureHoverTarget()) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: no hover target.";
+        return false;
+    }
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: hover target is invalid or not a segmentation viewer.";
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: no active editing session.";
+        return false;
+    }
+
+    _activeAlphaEnabled = alphaOverride.value_or(false);
+    _alphaOverrideActive = alphaOverride.has_value();
+    ++_alphaGeneration;
+    _stopAfterAlphaResult = false;
+
+    _ppState.active = true;
+    _ppState.direction = direction;
+    _activeViewer = hover.viewer;
+    if (_deferredPlaneIntersectionReleaseTimer) {
+        _deferredPlaneIntersectionReleaseTimer->stop();
+    }
+    if (_deferredPlaneIntersectionActiveViewer &&
+        _deferredPlaneIntersectionActiveViewer != _activeViewer) {
+        setDeferredPlaneIntersections(_deferredPlaneIntersectionActiveViewer, false);
+    }
+    _deferredPlaneIntersectionActiveViewer = _activeViewer;
+    setDeferredPlaneIntersections(_activeViewer, true);
+    _undoCaptured = false;
+    _lastAlphaStartFailure.clear();
+
+    // Reset cached position for new operation
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
+    _module.useFalloff(SegmentationModule::FalloffTool::PushPull);
+
+    // Set adaptive timer interval based on alpha mode
+    if (_timer) {
+        const int interval = _activeAlphaEnabled ? kPushPullIntervalMsSlow : kPushPullIntervalMsFast;
+        _timer->setInterval(interval);
+        if (!_timer->isActive()) {
+            _timer->start();
+        }
+    }
+
+    // Start the first step immediately. Alpha mode only launches background
+    // work here; waiting for the timer makes quick key taps appear to do
+    // nothing.
+    if (!applyStepInternal()) {
+        stopAll();
+        return false;
+    }
+    return true;
+}
+
+void SegmentationPushPullTool::stop(int direction)
+{
+    if (!_ppState.active) {
+        return;
+    }
+    if (direction != 0 && direction != _ppState.direction) {
+        return;
+    }
+    stopAll();
+}
+
+void SegmentationPushPullTool::stopAll()
+{
+    const bool wasActive = _ppState.active;
+    VolumeViewerBase* activeViewer = _activeViewer;
+
+    if (wasActive && _activeAlphaEnabled && _alphaComputeRunning) {
+        if (_timer && _timer->isActive()) {
+            _timer->stop();
+        }
+        _alphaComputePending = false;
+        _stopAfterAlphaResult = true;
+        qCInfo(lcSegPushPull) << "Alpha push/pull: waiting for in-flight computation before stopping.";
+        return;
+    }
+
+    _ppState.active = false;
+    _ppState.direction = 0;
+    _activeViewer = nullptr;
+    if (_timer && _timer->isActive()) {
+        _timer->stop();
+    }
+    _alphaOverrideActive = false;
+    _activeAlphaEnabled = false;
+    _alphaComputePending = false;
+    _stopAfterAlphaResult = false;
+
+    ++_alphaGeneration;
+
+    // Clear cached position
+    _cachedRow = -1;
+    _cachedCol = -1;
+    _samplesValid = false;
+
+    if (_module._activeFalloff == SegmentationModule::FalloffTool::PushPull) {
+        _module.useFalloff(SegmentationModule::FalloffTool::Drag);
+    }
+
+    // Finalize the edits and trigger final surface update
+    if (wasActive && _editManager && _editManager->hasSession() && _state) {
+        const auto editedVerts = _editManager->editedVertices();
+
+        // Capture delta for undo before applyPreview() clears edited vertices
+        (void)_module.captureUndoDelta();
+
+        // Auto-approve edited regions before applyPreview() clears them
+        if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
+            if (!editedVerts.empty()) {
+                // Get drag center from the cached row/col if available
+                std::optional<std::pair<int, int>> dragCenter;
+                if (_cachedRow >= 0 && _cachedCol >= 0) {
+                    dragCenter = std::make_pair(_cachedRow, _cachedCol);
+                }
+                const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, dragCenter);
+                _module.performAutoApproval(filteredVerts);
+            }
+        }
+
+        _editManager->applyPreview();
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        _module.emitPendingChanges();
+        _module.queueAutosaveVertexUpdates(editedVerts);
+        _module.markAutosaveNeeded();
+    }
+
+    if (wasActive) {
+        _deferredPlaneIntersectionActiveViewer = activeViewer;
+        if (_deferredPlaneIntersectionReleaseTimer) {
+            _deferredPlaneIntersectionReleaseTimer->start(kPlaneIntersectionReleaseIdleMs);
+        } else {
+            setDeferredPlaneIntersections(activeViewer, false);
+            _deferredPlaneIntersectionActiveViewer = nullptr;
+        }
+    }
+
+    _undoCaptured = false;
+    _lastAlphaStartFailure.clear();
+}
+
+bool SegmentationPushPullTool::applyStep()
+{
+    return applyStepInternal();
+}
+
+bool SegmentationPushPullTool::applyStepInternal()
+{
+    if (!_ppState.active || !_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegPushPull) << "Push/pull aborted: tool inactive or no active editing session.";
+        return false;
+    }
+
+    // If an async alpha computation is already running, note that another tick
+    // is needed and return — the watcher callback will re-launch.
+    if (_activeAlphaEnabled && _alphaComputeRunning) {
+        _alphaComputePending = true;
+        return true;
+    }
+
+    if (!_module.ensureHoverTarget()) {
+        qCWarning(lcSegPushPull) << "Push/pull aborted: no hover target.";
+        return false;
+    }
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
+        qCWarning(lcSegPushPull) << "Push/pull aborted: hover info invalid or viewer not ready.";
+        return false;
+    }
+
+    const int row = hover.row;
+    const int col = hover.col;
+    const auto logFailure = [&](const char* reason) {
+        qCWarning(lcSegPushPull) << reason << "(row" << row << ", col" << col << ")";
+    };
+
+    // Check if we can reuse existing samples (position unchanged and samples still valid)
+    const bool positionChanged = (row != _cachedRow || col != _cachedCol);
+    const bool needRebuild = positionChanged || !_samplesValid || !_editManager->activeDrag().active;
+
+    if (needRebuild) {
+        if (!_editManager->beginActiveDrag({row, col})) {
+            logFailure("Push/pull aborted: beginActiveDrag failed");
+            return false;
+        }
+        _cachedRow = row;
+        _cachedCol = col;
+        _samplesValid = true;
+    }
+
+    auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
+    if (!centerWorldOpt) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: vertex world position unavailable");
+        return false;
+    }
+    const cv::Vec3f centerWorld = *centerWorldOpt;
+
+    auto baseSurface = _editManager->baseSurface();
+    if (!baseSurface) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: base surface missing");
+        return false;
+    }
+
+    auto* patchIndex = _editManager->preferredSurfacePatchIndex();
+
+    // Get normal directly from grid position (avoids expensive pointTo lookup)
+    cv::Vec3f normal = baseSurface->gridNormal(row, col);
+    if (!isValidNormal(normal)) {
+        // Fallback to robust normal computation if direct lookup fails
+        cv::Vec3f ptr(0, 0, 0);
+        baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+            normal = *fallbackNormal;
+        } else {
+            _editManager->cancelActiveDrag();
+            _samplesValid = false;
+            logFailure("Push/pull aborted: surface normal lookup failed");
+            return false;
+        }
+    }
+
+    const float norm = cv::norm(normal);
+    if (norm <= 1e-4f) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: surface normal magnitude too small");
+        return false;
+    }
+    normal /= norm;
+
+    // --- Alpha mode: launch expensive computation on background thread ---
+    if (_activeAlphaEnabled) {
+        launchAlphaCompute();
+        return true;
+    }
+
+    // --- Non-alpha mode: synchronous step (cheap) ---
+    cv::Vec3f targetWorld = centerWorld;
+    const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
+    if (stepWorld <= 0.0f) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: computed step size non-positive");
+        return false;
+    }
+    targetWorld = centerWorld + normal * (static_cast<float>(_ppState.direction) * stepWorld);
+
+    if (!_editManager->updateActiveDrag(targetWorld)) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: failed to update drag target");
+        return false;
+    }
+
+    // Update sample base positions for next tick (allows reusing samples)
+    // Skip commitActiveDrag() and applyPreview() during continuous operation
+    // - they clear samples, causing expensive rebuilds every tick
+    // Final cleanup happens in stopAll()
+    _editManager->refreshActiveDragBasePositions();
+
+    refreshActiveViewer(hover.viewer);
+
+    _module.refreshOverlay();
+    _module.markAutosaveNeeded();
+    return true;
+}
+
+void SegmentationPushPullTool::launchAlphaCompute()
+{
+    if (_alphaComputeRunning) {
+        _alphaComputePending = true;
+        return;
+    }
+
+    const auto failAlphaStart = [this](const QString& message) {
+        qCWarning(lcSegPushPull).noquote() << message;
+        if (message != _lastAlphaStartFailure) {
+            _lastAlphaStartFailure = message;
+            emit _module.statusMessageRequested(message, kStatusMedium);
+        }
+    };
+
+    if (!_editManager || !_editManager->hasSession() || !_ppState.active) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active editing session."));
+        return;
+    }
+
+    if (!_module.ensureHoverTarget()) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: no hover target."));
+        return;
+    }
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: hover target is invalid."));
+        return;
+    }
+    if (!_module.isSegmentationViewer(hover.viewer)) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: hover target is not a segmentation viewer."));
+        return;
+    }
+
+    auto baseSurface = _editManager->baseSurface();
+    if (!baseSurface) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: base surface missing."));
+        return;
+    }
+
+    // Capture all inputs needed by the background thread on the main thread.
+    // Alpha push/pull is an editing interaction against the displayed volume,
+    // not the growth volume selected in the segmentation widget.
+    std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
+    if (!volume && _state) {
+        volume = _state->currentVolume();
+    }
+    if (!volume) {
+        failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
+        return;
+    }
+
+    // Alpha push/pull samples the user-selected OME-Zarr scale, independent of
+    // the viewer's current display LOD.
+    const int datasetIndex = std::clamp(_alphaConfig.computeScale, 0, 5);
+    constexpr float scale = 1.0f;
+
+    const int direction = _ppState.direction;
+    const AlphaPushPullConfig config = _alphaConfig;
+    const std::uint64_t generation = _alphaGeneration;
+    bool perVertex = config.perVertex;
+
+    std::vector<AlphaTargetInput> sampleInputs;
+    cv::Vec3f centerWorld(0, 0, 0);
+    cv::Vec3f centerNormal(0, 0, 0);
+
+    {
+        const int row = _cachedRow;
+        const int col = _cachedCol;
+
+        auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
+        if (!centerWorldOpt) {
+            failAlphaStart(QStringLiteral("Alpha push/pull aborted: vertex world position unavailable."));
+            return;
+        }
+        centerWorld = *centerWorldOpt;
+
+        centerNormal = baseSurface->gridNormal(row, col);
+        if (!isValidNormal(centerNormal)) {
+            auto* patchIndex = _editManager->preferredSurfacePatchIndex();
+            cv::Vec3f ptr(0, 0, 0);
+            baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
+            if (const auto fallback = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+                centerNormal = *fallback;
+            } else {
+                failAlphaStart(QStringLiteral("Alpha push/pull aborted: surface normal lookup failed."));
+                return;
+            }
+        }
+        const float n = cv::norm(centerNormal);
+        if (n <= 1e-4f) {
+            failAlphaStart(QStringLiteral("Alpha push/pull aborted: surface normal magnitude too small."));
+            return;
+        }
+        centerNormal /= n;
+
+        if (perVertex) {
+            const auto& activeSamples = _editManager->activeDrag().samples;
+            const std::size_t totalSamples = activeSamples.size();
+            // Fall back to single-target mode when too many vertices to keep
+            // background computation bounded and avoid blocking on stop.
+            if (totalSamples > kAlphaPerVertexMaxSamples) {
+                perVertex = false;
+            } else {
+                sampleInputs.reserve(totalSamples);
+                for (const auto& sample : activeSamples) {
+                    cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                    if (!isValidNormal(sampleNormal)) {
+                        sampleNormal = centerNormal;
+                    } else {
+                        const float sn = cv::norm(sampleNormal);
+                        if (sn > 1e-4f) {
+                            sampleNormal /= sn;
+                        } else {
+                            sampleNormal = centerNormal;
+                        }
+                    }
+                    sampleInputs.push_back({sample.baseWorld, sampleNormal});
+                }
+            }
+        }
+    }
+
+    _alphaComputeRunning = true;
+    _alphaComputePending = false;
+    _lastAlphaStartFailure.clear();
+
+    auto future = QtConcurrent::run(
+        [volume, datasetIndex, scale, direction, config, generation, perVertex,
+         centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
+        AlphaResult result;
+        result.generation = generation;
+        try {
+
+        if (perVertex && !sampleInputs.empty()) {
+            result.perVertex = true;
+
+            result = computeAlphaTargetsStatic(sampleInputs,
+                                               direction,
+                                               config,
+                                               volume,
+                                               datasetIndex,
+                                               scale,
+                                               generation);
+            if (!result.success) {
+                return result;
+            }
+
+            std::vector<cv::Vec3f>& targets = result.perVertexTargets;
+            std::vector<float> movements;
+            movements.reserve(targets.size());
+            float minMovement = std::numeric_limits<float>::max();
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                const cv::Vec3f delta = targets[i] - sampleInputs[i].baseWorld;
+                const float movement = static_cast<float>(cv::norm(delta));
+                movements.push_back(movement);
+                minMovement = std::min(minMovement, movement);
+            }
+
+            // Apply per-vertex limit clamping
+            const float perVertexLimit = std::max(0.0f, config.perVertexLimit);
+            if (perVertexLimit > 0.0f && !targets.empty() && std::isfinite(minMovement)) {
+                const float maxAllowed = minMovement + perVertexLimit;
+                for (std::size_t i = 0; i < targets.size(); ++i) {
+                    if (movements[i] > maxAllowed + 1e-4f) {
+                        const cv::Vec3f delta = targets[i] - sampleInputs[i].baseWorld;
+                        const float length = movements[i];
+                        if (length > 1e-6f) {
+                            const float s = maxAllowed / length;
+                            targets[i] = sampleInputs[i].baseWorld + delta * s;
+                            movements[i] = maxAllowed;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single-target alpha mode
+            bool unavailable = false;
+            std::string noTargetReason;
+            auto target = computeAlphaTargetStatic(
+                centerWorld, centerNormal, direction, config,
+                volume, datasetIndex, scale, &unavailable, &noTargetReason);
+
+            if (target) {
+                result.singleTarget = *target;
+                result.success = true;
+            } else if (unavailable) {
+                // Volume unavailable — not an error, just skip
+                result.noMovementReason = noTargetReason.empty()
+                    ? "Alpha push/pull could not read the volume data."
+                    : noTargetReason;
+                result.success = false;
+            } else {
+                result.noMovementReason = noTargetReason.empty()
+                    ? "Alpha push/pull computed no movement."
+                    : noTargetReason;
+            }
+        }
+
+        return result;
+        } catch (const std::exception& e) {
+            qCWarning(lcSegPushPull) << "Alpha push/pull worker failed:" << e.what();
+        } catch (...) {
+            qCWarning(lcSegPushPull) << "Alpha push/pull worker failed with an unknown exception";
+        }
+        return result;
+    });
+
+    _alphaWatcher.setFuture(future);
+}
+
+void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
+{
+    if (!_editManager || !viewer) {
+        if (_state && _editManager) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        return;
+    }
+
+    auto surface = _editManager->previewSurface();
+    if (!surface) {
+        return;
+    }
+
+    if (auto* manager = _module.viewerManager()) {
+        _editManager->flushEditSurfacePatchIndex();
+        manager->forEachBaseViewer([viewer](VolumeViewerBase* candidate) {
+            if (!candidate || candidate == viewer) {
+                return;
+            }
+            if (dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+                candidate->invalidateIntersect("segmentation");
+            }
+        });
+    }
+
+    if (const auto touched = _editManager->recentTouchedBounds()) {
+        const cv::Rect changedCells(touched->x - 1,
+                                    touched->y - 1,
+                                    touched->width + 2,
+                                    touched->height + 2);
+        viewer->invalidateVisRegion("segmentation", changedCells);
+        viewer->invalidateIntersectRegion("segmentation", changedCells);
+    } else {
+        viewer->invalidateVis();
+        viewer->invalidateIntersect("segmentation");
+    }
+    viewer->requestRender("push/pull active viewer refresh");
+}
+
+void SegmentationPushPullTool::setDeferredPlaneIntersections(VolumeViewerBase* activeViewer,
+                                                             bool defer)
+{
+    auto* manager = _module.viewerManager();
+    if (!manager) {
+        return;
+    }
+
+    manager->forEachBaseViewer([activeViewer, defer](VolumeViewerBase* candidate) {
+        if (!candidate || candidate == activeViewer) {
+            return;
+        }
+        if (defer && !dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
+            return;
+        }
+        candidate->setSegmentationIntersectionDeferral(defer);
+    });
+}
+
+void SegmentationPushPullTool::applyAlphaResult()
+{
+    _alphaComputeRunning = false;
+    const bool stopAfterResult = _stopAfterAlphaResult;
+    _stopAfterAlphaResult = false;
+
+    const auto finishStopIfRequested = [this, stopAfterResult]() {
+        if (stopAfterResult) {
+            stopAll();
+        }
+    };
+
+    const auto future = _alphaWatcher.future();
+    if (future.isCanceled()) {
+        _alphaComputePending = false;
+        qCWarning(lcSegPushPull) << "Alpha async: computation was canceled before producing a result";
+        finishStopIfRequested();
+        return;
+    }
+    if (future.resultCount() <= 0) {
+        _alphaComputePending = false;
+        qCWarning(lcSegPushPull) << "Alpha async: finished without an available result";
+        finishStopIfRequested();
+        return;
+    }
+
+    const auto result = _alphaWatcher.result();
+    if (result.generation != _alphaGeneration) {
+        if (!stopAfterResult && _alphaComputePending && _ppState.active) {
+            _alphaComputePending = false;
+            launchAlphaCompute();
+        }
+        finishStopIfRequested();
+        return;
+    }
+
+    if (!_ppState.active || !_editManager || !_editManager->hasSession()) {
+        finishStopIfRequested();
+        return;
+    }
+
+    if (result.success) {
+        if (result.perVertex) {
+            if (!_editManager->updateActiveDragTargets(result.perVertexTargets)) {
+                qCWarning(lcSegPushPull) << "Alpha async: failed to update per-vertex drag targets";
+                _editManager->cancelActiveDrag();
+                _samplesValid = false;
+                finishStopIfRequested();
+                return;
+            }
+        } else if (result.singleTarget) {
+            if (!_editManager->updateActiveDrag(*result.singleTarget)) {
+                qCWarning(lcSegPushPull) << "Alpha async: failed to update drag target";
+                _editManager->cancelActiveDrag();
+                _samplesValid = false;
+                finishStopIfRequested();
+                return;
+            }
+        }
+
+        if (!activeDragMovedVertices(*_editManager)) {
+            emit _module.statusMessageRequested(
+                QStringLiteral("Alpha push/pull found a target, but vertex movement was below the edit threshold."),
+                kStatusMedium);
+            qCInfo(lcSegPushPull) << "Alpha push/pull: target movement was below the edit threshold.";
+            finishStopIfRequested();
+            return;
+        }
+
+        // Update sample base positions for next tick
+        _editManager->refreshActiveDragBasePositions();
+
+        const auto hover = _module.hoverInfo();
+        refreshActiveViewer(hover.valid ? hover.viewer : nullptr);
+
+        _module.refreshOverlay();
+        _module.markAutosaveNeeded();
+        qCInfo(lcSegPushPull) << "Alpha push/pull: applied result.";
+    } else if (!result.noMovementReason.empty()) {
+        const QString message = QString::fromStdString(result.noMovementReason);
+        emit _module.statusMessageRequested(message, kStatusMedium);
+        qCInfo(lcSegPushPull).noquote() << message;
+    }
+
+    // If another tick came in while we were computing, launch again
+    if (!stopAfterResult && _alphaComputePending && _ppState.active) {
+        _alphaComputePending = false;
+        launchAlphaCompute();
+    }
+
+    finishStopIfRequested();
+}
+
+void SegmentationPushPullTool::ensureTimer()
+{
+    if (_timer) {
+        return;
+    }
+
+    _timer = new QTimer(&_module);
+    _timer->setInterval(kPushPullIntervalMs);
+    QObject::connect(_timer, &QTimer::timeout, &_module, [this]() {
+        if (!applyStepInternal()) {
+            stopAll();
+        }
+    });
+}
+
+SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTargetsStatic(
+    const std::vector<AlphaTargetInput>& inputs,
+    int direction,
+    const AlphaPushPullConfig& config,
+    const std::shared_ptr<Volume>& volume,
+    int datasetIndex,
+    float scale,
+    std::uint64_t generation)
+{
+    AlphaResult result;
+    result.generation = generation;
+    result.perVertex = true;
+
+    if (inputs.empty()) {
+        result.noMovementReason = "Alpha push/pull computed no vertex movement.";
+        return result;
+    }
+    if (!volume) {
+        result.noMovementReason = "Alpha push/pull has no active volume to sample.";
+        return result;
+    }
+
+    AlphaPushPullConfig cfg = sanitizeConfig(config);
+    if (!volume->hasScaleLevel(datasetIndex)) {
+        result.noMovementReason = "Alpha push/pull requested missing OME-Zarr scale " +
+                                  std::to_string(datasetIndex) + ".";
+        return result;
+    }
+
+    const int radius = std::max(cfg.blurRadius, 0);
+    const int kernel = radius * 2 + 1;
+    const cv::Size patchSize(kernel, kernel);
+    const cv::Point2i centerIndex(radius, radius);
+    const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
+
+    std::vector<cv::Vec3f> normals(inputs.size(), cv::Vec3f(0.0f, 0.0f, 0.0f));
+    std::vector<uint8_t> valid(inputs.size(), 0);
+    std::vector<float> transparent(inputs.size(), 1.0f);
+    std::vector<float> integ(inputs.size(), 0.0f);
+
+    cv::Mat_<cv::Vec3f> baseCoords(static_cast<int>(inputs.size()) * kernel, kernel);
+    cv::Mat_<cv::Vec3f> patchCoords;
+    std::string firstNoTargetReason;
+
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        cv::Vec3f orientedNormal = inputs[i].normal * static_cast<float>(direction);
+        const float norm = cv::norm(orientedNormal);
+        if (norm <= 1e-4f || !std::isfinite(norm)) {
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull could not determine a valid surface normal.";
+            }
+            continue;
+        }
+        orientedNormal /= norm;
+        normals[i] = orientedNormal;
+        valid[i] = 1;
+
+        PlaneSurface plane(inputs[i].baseWorld, orientedNormal);
+        plane.gen(&patchCoords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
+        patchCoords.copyTo(baseCoords.rowRange(static_cast<int>(i) * kernel,
+                                               static_cast<int>(i + 1) * kernel));
+    }
+
+    const float start = cfg.start;
+    const float stop = cfg.stop;
+    const float step = std::fabs(cfg.step);
+
+    cv::Mat_<cv::Vec3f> offsetCoords(baseCoords.size());
+    cv::Mat_<uint8_t> slice;
+    cv::Mat floatPatch(patchSize, CV_32F);
+
+    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const int row0 = static_cast<int>(i) * kernel;
+            auto dstBlock = offsetCoords.rowRange(row0, row0 + kernel);
+            auto srcBlock = baseCoords.rowRange(row0, row0 + kernel);
+            const int total = kernel * kernel;
+            const auto* src = srcBlock.ptr<cv::Vec3f>();
+            auto* dst = dstBlock.ptr<cv::Vec3f>();
+            if (valid[i]) {
+                const cv::Vec3f delta = normals[i] * offset;
+                for (int p = 0; p < total; ++p) {
+                    dst[p] = src[p] + delta;
+                }
+            } else {
+                for (int p = 0; p < total; ++p) {
+                    dst[p] = src[p];
+                }
+            }
+        }
+
+        vc::SampleParams sp;
+        sp.level = datasetIndex;
+        volume->sample(slice, offsetCoords, sp);
+        if (slice.empty()) {
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull sampled an empty volume slice.";
+            }
+            continue;
+        }
+
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            if (!valid[i] || transparent[i] <= 1e-3f) {
+                continue;
+            }
+
+            const int row0 = static_cast<int>(i) * kernel;
+            const cv::Mat srcBlock(slice, cv::Rect(0, row0, kernel, kernel));
+            srcBlock.convertTo(floatPatch, CV_32F, 1.0 / 255.0);
+            cv::GaussianBlur(floatPatch, floatPatch, cv::Size(kernel, kernel), 0);
+
+            cv::Mat_<float> opaq = floatPatch;
+            opaq = (opaq - cfg.low) / range;
+            cv::min(opaq, 1.0f, opaq);
+            cv::max(opaq, 0.0f, opaq);
+
+            const float centerOpacity = opaq(centerIndex);
+            const float joint = transparent[i] * centerOpacity;
+            integ[i] += joint * offset;
+            transparent[i] -= joint;
+        }
+    }
+
+    result.perVertexTargets.reserve(inputs.size());
+    bool anyMovement = false;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        cv::Vec3f targetWorld = inputs[i].baseWorld;
+        if (valid[i] && transparent[i] < 1.0f) {
+            const float denom = 1.0f - transparent[i];
+            if (denom >= 1e-5f) {
+                const float expected = integ[i] / denom;
+                if (std::isfinite(expected) && expected > 0.0f) {
+                    targetWorld = inputs[i].baseWorld + normals[i] * expected;
+                } else if (firstNoTargetReason.empty()) {
+                    firstNoTargetReason = "Alpha push/pull target is at or behind the current surface.";
+                }
+            } else if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull opacity response was too small to choose a target.";
+            }
+        } else if (firstNoTargetReason.empty()) {
+            firstNoTargetReason = "Alpha push/pull found no opacity in the configured alpha range.";
+        }
+
+        if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
+            targetWorld = inputs[i].baseWorld;
+            if (firstNoTargetReason.empty()) {
+                firstNoTargetReason = "Alpha push/pull computed a non-finite target position.";
+            }
+        }
+
+        if (cv::norm(targetWorld - inputs[i].baseWorld) >= 1e-4f) {
+            anyMovement = true;
+        }
+        result.perVertexTargets.push_back(targetWorld);
+    }
+
+    if (!anyMovement) {
+        result.perVertexTargets.clear();
+        result.noMovementReason = firstNoTargetReason.empty()
+            ? "Alpha push/pull computed no vertex movement."
+            : firstNoTargetReason;
+        return result;
+    }
+
+    result.success = true;
+    return result;
+}
+
+std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
+    const cv::Vec3f& centerWorld,
+    const cv::Vec3f& normal,
+    int direction,
+    const AlphaPushPullConfig& config,
+    const std::shared_ptr<Volume>& volume,
+    int datasetIndex,
+    float scale,
+    bool* outUnavailable,
+    std::string* outNoTargetReason)
+{
+    if (outUnavailable) {
+        *outUnavailable = false;
+    }
+
+    if (!volume) {
+        if (outUnavailable) {
+            *outUnavailable = true;
+        }
+        setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull has no active volume to sample.");
+        return std::nullopt;
+    }
+
+    AlphaPushPullConfig cfg = sanitizeConfig(config);
+    if (!volume->hasScaleLevel(datasetIndex)) {
+        if (outUnavailable) {
+            *outUnavailable = true;
+        }
+        if (outNoTargetReason && outNoTargetReason->empty()) {
+            *outNoTargetReason = "Alpha push/pull requested missing OME-Zarr scale " +
+                                 std::to_string(datasetIndex) + ".";
+        }
+        return std::nullopt;
+    }
+
+    cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
+    const float norm = cv::norm(orientedNormal);
+    if (norm <= 1e-4f) {
+        setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull could not determine a valid surface normal.");
+        return std::nullopt;
+    }
+    orientedNormal /= norm;
+
+    const int radius = std::max(cfg.blurRadius, 0);
+    const int kernel = radius * 2 + 1;
+    const cv::Size patchSize(kernel, kernel);
+
+    PlaneSurface plane(centerWorld, orientedNormal);
+    cv::Mat_<cv::Vec3f> coords;
+    plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
+
+    const cv::Point2i centerIndex(radius, radius);
+    const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
+
+    float transparent = 1.0f;
+    float integ = 0.0f;
+
+    const float start = cfg.start;
+    const float stop = cfg.stop;
+    const float step = std::fabs(cfg.step);
+
+    // Pre-allocate mats reused across loop iterations to avoid per-tick allocations
+    cv::Mat_<cv::Vec3f> offsetMat(patchSize);
+    cv::Mat_<cv::Vec3f> offsetCoords(patchSize);
+    cv::Mat_<uint8_t> slice(patchSize);
+    cv::Mat sliceFloat(patchSize, CV_32F);
+
+    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
+        offsetMat.setTo(orientedNormal * offset);
+        cv::add(coords, offsetMat, offsetCoords);
+        vc::SampleParams sp;
+        sp.level = datasetIndex;
+        volume->sample(slice, offsetCoords, sp);
+        if (slice.empty()) {
+            setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull sampled an empty volume slice.");
+            continue;
+        }
+
+        slice.convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
+        cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
+
+        cv::Mat_<float> opaq = sliceFloat;
+        opaq = (opaq - cfg.low) / range;
+        cv::min(opaq, 1.0f, opaq);
+        cv::max(opaq, 0.0f, opaq);
+
+        const float centerOpacity = opaq(centerIndex);
+        const float joint = transparent * centerOpacity;
+        integ += joint * offset;
+        transparent -= joint;
+
+        if (transparent <= 1e-3f) {
+            break;
+        }
+    }
+
+    if (transparent >= 1.0f) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull found no opacity in the configured alpha range.");
+        return std::nullopt;
+    }
+
+    const float denom = 1.0f - transparent;
+    if (denom < 1e-5f) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull opacity response was too small to choose a target.");
+        return std::nullopt;
+    }
+
+    const float expected = integ / denom;
+    if (!std::isfinite(expected)) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull computed a non-finite opacity target.");
+        return std::nullopt;
+    }
+
+    if (expected <= 0.0f) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull target is at or behind the current surface.");
+        return std::nullopt;
+    }
+
+    const cv::Vec3f targetWorld = centerWorld + orientedNormal * expected;
+    if (!std::isfinite(targetWorld[0]) || !std::isfinite(targetWorld[1]) || !std::isfinite(targetWorld[2])) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull computed a non-finite target position.");
+        return std::nullopt;
+    }
+
+    const cv::Vec3f delta = targetWorld - centerWorld;
+    if (cv::norm(delta) < 1e-4f) {
+        setAlphaNoTargetReason(outNoTargetReason,
+                               "Alpha push/pull target is already at the current surface.");
+        return std::nullopt;
+    }
+
+    return targetWorld;
+}

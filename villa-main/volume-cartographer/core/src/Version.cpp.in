@@ -1,0 +1,45 @@
+#include "vc/core/Version.hpp"
+
+
+
+auto ProjectInfo::Name() -> std::string
+{
+    static std::string name{"volume-cartographer"};
+    return name;
+}
+
+// The M.m.p accessors come from project(VC3D VERSION ...) in the top-level
+// CMakeLists.txt. VersionString() returns the git revision (<sha7>-<date>).
+auto ProjectInfo::VersionMajor() -> std::uint32_t { return @PROJECT_VERSION_MAJOR@u; }
+auto ProjectInfo::VersionMinor() -> std::uint32_t { return @PROJECT_VERSION_MINOR@u; }
+auto ProjectInfo::VersionPatch() -> std::uint32_t { return @PROJECT_VERSION_PATCH@u; }
+
+auto ProjectInfo::VersionString() -> std::string
+{
+    static std::string version("@VC_VERSION_STRING@");
+    return version;
+}
+
+auto ProjectInfo::NameAndVersion() -> std::string
+{
+    static std::string nameAndVersion{"volume-cartographer @VC_VERSION_STRING@"};
+    return nameAndVersion;
+}
+
+auto ProjectInfo::RepositoryURL() -> std::string
+{
+    static std::string repo("https://github.com/ScrollPrize/villa/tree/main/volume-cartographer");
+    return repo;
+}
+
+auto ProjectInfo::RepositoryHash() -> std::string
+{
+    static std::string hash("@GIT_SHA1@");
+    return hash;
+}
+
+auto ProjectInfo::RepositoryShortHash() -> std::string
+{
+    static std::string hashShort("@GIT_SHA1_SHORT@");
+    return hashShort;
+}

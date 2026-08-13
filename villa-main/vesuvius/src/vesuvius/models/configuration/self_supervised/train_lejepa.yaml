@@ -1,0 +1,49 @@
+# LeJEPA pretraining configuration with Primus-M encoder
+# Uses SIGReg (Sketched Isotropic Gaussian Regularization) for unsupervised learning
+
+# Placeholder target for compatibility with base trainer
+# (LeJEPA is self-supervised and doesn't use traditional targets)
+targets:
+  lejepa:
+    activation: none
+    weight: 1.0
+
+tr_config:
+  patch_size: [64, 64, 64]  # D, H, W - must be divisible by patch_embed_size
+  initial_lr: 1e-4
+  weight_decay: 0.05
+  max_epoch: 1000
+
+model_config:
+  architecture_type: "primus_m"
+  patch_embed_size: [8, 8, 8]  # Patch size for ViT embedding
+  drop_path_rate: 0.1
+  proj_drop_rate: 0.0
+  attn_drop_rate: 0.0
+  patch_drop_rate: 0.0  # No masking for LeJEPA
+
+# LeJEPA-specific parameters
+lejepa_config:
+  lambda: 0.1  # Balance between invariance and SIGReg loss (higher to escape collapse)
+  num_global_views: 2  # Views with larger crops (capture global structure)
+  num_local_views: 6  # Views with smaller crops (capture local details)
+  sigreg_num_slices: 512  # Random projection directions for SIGReg
+  proj_dim: 256  # Projection dimension (128-512 range recommended)
+  # Crop scale ranges (volume-based: scale=0.3 means 30% of volume)
+  # Multi-scale is critical for self-supervised learning - local should predict global
+  global_crop_scale: [0.4, 1.0]   # Large crops: 40-100% of volume
+  local_crop_scale: [0.05, 0.4]  # Small crops: 5-40% of volume
+
+dataset_config:
+  min_labeled_ratio: 0          # No minimum labeled voxel ratio
+  min_bbox_percent: 0           # No bounding box coverage requirement
+  skip_patch_validation: false  # Validate patches (now works with image-only)
+  allow_unlabeled_data: true    # Accept volumes without labels
+  normalization_scheme: "zscore"  # z-score normalization per volume
+  ome_zarr_resolution: 1
+
+  # Filter out blank/empty patches using image intensity
+  unlabeled_foreground_enabled: true
+  unlabeled_foreground_threshold: 0.5      # Min 10% non-zero voxels
+  unlabeled_foreground_bbox_threshold: 1  # Min 10% bbox coverage
+  valid_patch_find_resolution: 3          # Use zarr level 2 (4x downsample) for faster validation

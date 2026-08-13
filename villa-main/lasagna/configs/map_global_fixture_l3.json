@@ -1,0 +1,117 @@
+{
+	"base": {
+		"distance_scale": 1.0,
+		"huber_delta": 5.0,
+		"map_station_t": 0.001,
+		"map_init": {
+			"subdiv": 1,
+			"scale_levels": 4,
+			"w_dist": 0.0001,
+			"w_vec_normal": 1.0,
+			"w_surface_normal": 1.0,
+			"w_smooth": 0.05,
+			"w_bend": 0.01,
+			"w_jac": 1.0,
+			"w_metric_smooth": 0.05,
+			"w_area_smooth": 0.0,
+			"w_dense_prior": 0.001,
+			"max_sample_distance": 1000.0,
+			"max_sample_angle_deg": 180.0,
+			"max_step_neighbor_ratio": 0.0
+		}
+	},
+	"stages": [
+		{
+			"name": "affine_seed_quad_init",
+			"steps": 100,
+			"lr": 0.1,
+			"params": ["map_surf_affine"],
+			"w_fac": 1.0,
+			"args": {
+				"status_interval": 10,
+				"subdiv": 1,
+				"affine_seed_quad_init": {
+					"enabled": true,
+					"expansion_reopt": false,
+					"quads": 1
+				}
+			}
+		},
+		{
+			"steps": 500,
+			"lr": 0.01,
+			"params": ["map_surf_affine"],
+			"w_fac": 1.0,
+			"args": {
+				"status_interval": 100,
+				"subdiv": 1
+			}
+		},
+		{
+			"steps": 500,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 5,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"steps": 200,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 4,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"steps": 200,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 3,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"steps": 200,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 2,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"steps": 200,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 1,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"steps": 200,
+			"lr": 0.01,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 0,
+			"w_fac": 1.0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		}
+	]
+}

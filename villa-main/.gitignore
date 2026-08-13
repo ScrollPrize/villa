@@ -1,0 +1,65 @@
+# Python venvs, IDE files, build artifacts
+**/.venv*/
+**/.idea/*
+**/__pycache__/
+*.pyc
+*.so
+node_modules/.yarn-integrity
+**/*.egg-info*/
+
+# Vesuvius outputs & metadata
+/vesuvius/outputs/
+/vesuvius/sandbox/
+/vesuvius/utils/tests/s5_test.zarr
+
+*.DS_Store
+
+# Defense in depth for google-github-actions/auth. Progress Prize workflows set
+# create_credentials_file: false and must never produce these files.
+gha-creds-*.json
+
+**/checkpoints/
+
+# WandB (allow general wandb but ignore this one)
+!**/wandb/**
+/segmentation/models/arch/nnunet/wandb/
+
+*.pth
+segmentation/models/arch/nnunet/build/
+segmentation/models/batchgeneratorsv2/build/
+segmentation/napari_trainer/cline_rules.md
+segmentation/napari_trainer/test_1638_debug.png
+/wandb
+/vesuvius/external
+/segmentation/vc_proofreader/wandb
+vesuvius/src/vesuvius/AGENTS.md
+vesuvius/AGENTS.md
+/vesuvius/scratch
+/volume-cartographer/scratch
+/vesuvius/src/external
+
+*.cover
+/vesuvius/src/vesuvius/neural_tracing/tests/test_band_filtering
+
+build/
+volume-cartographer/AGENTS.md
+
+# Coverage outputs
+*.gcov
+*.gcda
+*.gcno
+/volume-cartographer/coverage/
+/coverage/
+
+# Dead-code analysis outputs
+/volume-cartographer/dead-code/
+/dead-code/
+
+# ccache (mounted into builder docker)
+/volume-cartographer/.ccache/
+/.ccache/
+/lasagna/snap_surf_objs
+/volume-cartographer/scripts/spiral/bench
+/volume-cartographer/scripts/cache
+/volume-cartographer/docs/plans
+/volume-cartographer/scripts/spiral/scratch

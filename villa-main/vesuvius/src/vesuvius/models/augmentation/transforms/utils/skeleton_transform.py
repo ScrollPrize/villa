@@ -1,0 +1,84 @@
+from typing import Optional, Sequence
+
+import torch
+from skimage.morphology import skeletonize, dilation, opening, closing
+import numpy as np
+
+from vesuvius.models.augmentation.transforms.base.basic_transform import BasicTransform
+
+
+class MedialSurfaceTransform(BasicTransform):
+    def __init__(self,
+                 do_tube: bool = True,
+                 do_open: bool = False,
+                 do_close: bool = True,
+                 target_keys: Optional[Sequence[str]] = None,
+                 ignore_values: Optional[dict] = None,):
+        """
+        Calculates the medial surface skeleton of the segmentation (plus an optional 2 px tube around it)
+        and adds it to the dict with the key "skel"
+        """
+        super().__init__()
+        self.do_tube = do_tube
+        self.do_open = do_open
+        self.do_close = do_close
+        self.target_keys = tuple(target_keys) if target_keys else None
+        self.ignore_values = dict(ignore_values or {})
+
+    def apply(self, data_dict, **params):
+        # Collect regression keys to avoid processing continuous aux targets
+        regression_keys = set(data_dict.get('regression_keys', []) or [])
+        # Find eligible target keys: tensor-valued, not image/meta, not regression aux
+        candidate_keys = [
+            k for k, v in data_dict.items()
+            if k not in ['image', 'is_unlabeled', 'regression_keys']
+            and isinstance(v, torch.Tensor)
+            and k not in regression_keys
+        ]
+
+        if self.target_keys is not None:
+            target_keys = [k for k in candidate_keys if k in self.target_keys]
+        else:
+            target_keys = candidate_keys
+
+        # Process each target
+        for target_key in target_keys:
+            t = data_dict[target_key]
+            orig_device = t.device
+            seg_all = t.detach().cpu().numpy()
+
+            ignore_value = self.ignore_values.get(target_key)
+            if ignore_value is not None:
+                seg_processed = np.where(seg_all == ignore_value, 0, seg_all)
+            else:
+                seg_processed = seg_all
+
+            bin_seg = seg_processed > 0
+            seg_all_skel = np.zeros_like(seg_processed, dtype=np.float32)
+
+            for c in range(bin_seg.shape[0]):
+                seg_c = bin_seg[c]
+                if seg_c.sum() == 0:
+                    continue
+
+                if seg_c.ndim == 3:
+                    skel = np.zeros_like(seg_c, dtype=bool)
+                    for z in range(seg_c.shape[0]):
+                        skel[z] |= skeletonize(seg_c[z])
+                elif seg_c.ndim == 2:
+                    skel = skeletonize(seg_c)
+                else:
+                    raise ValueError(f"Unsupported segmentation dimensionality {seg_c.ndim} for skeletonization")
+
+                if self.do_tube:
+                    skel = dilation(dilation(skel))
+                if self.do_open:
+                    skel = opening(skel)
+                if self.do_close:
+                    skel = closing(skel)
+
+                seg_all_skel[c] = (skel.astype(np.float32) * seg_processed[c].astype(np.float32))
+
+            data_dict[f"{target_key}_skel"] = torch.from_numpy(seg_all_skel).to(orig_device)
+
+        return data_dict

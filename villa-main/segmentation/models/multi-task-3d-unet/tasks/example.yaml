@@ -1,0 +1,91 @@
+# YOU DO NOT HAVE TO PROVIDE VALUES IN MOST OF THESE FIELDS
+
+tr_setup:
+  model_name: ink                    # required [str] this is the name your model will checkpoint will be saved as
+  vram_max: 22000                    # required if autoconfigure is true, else optional-- the amount in MB you want the model to use
+  autoconfigure: false               # optional, true -- if true, the network will attempt to set some reasonable defaults based on your vram_max
+  tr_val_split: 0.90                 # optional[float] the percentage of your total dataset used for training, with the other part being used for val
+  dilate_label: false                # optional, false [bool] if true, will apply a small dilation to your labels using a 3x3 spherical kernel -- will skip tasks named "normals"
+  # checkpoint_path: "./ink_157.pth" # optional, none [str] if provided, will load the provided checkpoint and begin training from there
+  load_weights_only: false           # optional, false [bool] if true, will not load the optimizer, scheduler, or epoch state from the model -- set true to fine-tune
+  ckpt_out_base: "./checkpoints"     # [str] the path the model checkpoint is saved to
+  tensorboard_log_dir: "./logs"      # optional, './' [str] the path the tensorboard logs will be stored to
+
+tr_config:
+  optimizer: "AdamW"            # optional, AdamW [str] the optimizer to use during training. currently only AdamW and SGD are provided.
+  initial_lr: 0.001             # optional initial learning rate
+  weight_decay: 0.0             # optional, 0.0001 [float]
+  gradient_accumulation: 1      # optional, 1 [int] if 1, no accumulation, if >1 will accumulate this many 'batches' each batch to simulate larger batch size.
+  num_dataloader_workers: 12    # optional, 4 [int]
+  patch_size: [64, 192, 192]    # optional [list] patch size for training
+  batch_size: 3                # optional [int] batch size for training
+  max_steps_per_epoch: 500      # optional, 500 [int] the number of batches seen by the model each epoch
+  max_val_steps_per_epoch: 25   # optional, 25 [int] the number of batches seen in validation each epoch
+  max_epoch: 500                # optional, 500 [int] the maximum number of epochs to train for
+  ignore_label: null            # [NOT YET IMPLEMENTED] if you have an ignore label, you can set it here and loss will not be computed against it
+  loss_only_on_label: false     # [NOT YET IMPLEMENTED]
+
+model_config:
+  f_maps: [32, 64, 128, 256, 320, 528]         # optional, [list] or [int] -- if an int is provided will automatically double each layer
+  basic_module: "nnUNetStyleResNetBlockSE" # optional, ResNetBlockSE [str] - DoubleConv, ResNetBlock, ResNetBlockSE, nnUNetStyleResNetBlockSE
+  se_module: 'sse'                         # optional [str] - squeeze and excitation blocks --  sse: spatial , cse: channel, scse: channel and spatial
+  pool_kernel_size: [2, 2, 2]              # optional, 2 [tuple] or [int] , downsample per level in encoder/decoder -- 2 = 2x per level
+
+dataset_config:
+  # the dataset config is where we build the targets data and the labeled data. you can use any number of inputs and labels.
+  # the dataset is configured to search a zarr volume of labels for valid patches. we consider a valid patch to be one that meets the
+  # criteria set by min_bbox_percent and min_labeled_ratio. the z, y, x starting positions of these are saved to a json so we only
+  # have to compute this once. on large volumes, this can take a long time.
+  # ref label:
+      # used for the valid patch finding. the name of these refers to the volume within volume paths. in the below example
+      # "ink" is referring to the ink volume, defined one line above. you can provide any number of volume paths.
+
+  min_bbox_percent: 0.20      # optional, 0.97 [float] a percentage of the patch size that must be encompassed by a bbox containing all the labels in the patch
+  min_labeled_ratio: 0.20     # optional, 0.15 [float] a percentage of the above bbox that must contain labeled data (ie: the density of the labels)
+  use_cache: true             # optional, True [bool] whether to store a patch position cache. strongly recommended
+  cache_file: "./patch_cache" # optional, './' the location to store the cache
+  volume_paths:               # these are your input volumes. each must have input volume path, target volume path (from your targets defined in targets),
+    - input: "/home/sean/Desktop/s1_segments/0901.zarr/layers.zarr"
+      ink: "/home/sean/Desktop/s1_segments/0901.zarr/inklabels.zarr"
+      ref_label: "ink"
+
+    - input: "/home/sean/Desktop/s1_segments/0926.zarr/layers.zarr"
+      ink: "/home/sean/Desktop/s1_segments/0926.zarr/inklabels.zarr"
+      ref_label: "ink"
+
+    - input: "/home/sean/Desktop/s1_segments/1321.zarr/layers.zarr"
+      ink: "/home/sean/Desktop/s1_segments/1321.zarr/inklabels.zarr"
+      ref_label: "ink"
+
+  targets:                   # the targets provided here are how the model is configured. for each entry here, the model will construct an additional decoder path
+    ink:                     # the name of the target, will be the name used in the data dict
+      channels: 1            # required [int] the number of channels in your input -- your input should be in shape z, y, x, c
+      activation: "none"     # optional, none [str] the activation type you would like your model to perform during training, options are: Sigmoid , Softmax, None.
+      weight: 1              # optional, 1 [float] the weight applied to the task, as a percentage. this is multiplied by the loss value during training, so 1 is 100%
+      loss_fn: "BCEDiceLoss" # optional, 'BCEDiceLoss' [str] the loss you would like to use from the loss_fn_map in train.py. to add losses, simply add to the mapping in train.py
+      loss_kwargs:           # optional, none - any keyword arguments you would like to pass to your loss function, each on its own line
+        alpha: 0.5
+        beta: 0.5
+    normal: # the name of the target, will be the name used in the data dict
+      channels: 3          # required [int] the number of channels in your input -- your input should be in shape z, y, x, c
+      activation: "none"     # optional, none [str] the activation type you would like your model to perform during training, options are: Sigmoid , Softmax, None.
+      weight: 1
+
+inference_config:                           # these parameters only apply on inference
+  checkpoint_path: "./checkpoints/ckpt.pth" # the checkpoint to load
+  num_dataloader_workers: 12                # number of workers for the inference dataloader
+  input_path: "./data/0901/layers.zarr"     # [str] input volume, CURRENTLY MUST BE ZARR
+  input_format: "zarr"                      # not currently implemented, all data is zarr
+  output_path: "./outputs/0901"              # data is saved to zarr in the output dir as predictions.zarr
+  output_format: "zarr"                     # currently does nothing , can only be zarr
+  output_type: "np.uint8"                   # currently does nothing
+  output_targets: ["ink"]                   # optional, if none all targets will be output
+  load_all: true                            # optional, false - if true, will load entire input_path volume into memory
+  overlap: 0.1                              # optional, .01 - the percentage of overlap each patch should have
+  patch_size: [128, 128, 128]               # this can be different than your training setup , but may negatively impact performance
+  batch_size: 4                             # can typically be higher than your train batch size, watch vram
+  targets:                                  # must be the targets you trained with , including num channels and name.
+    - ink:                                    # to the number of channels your model outputs
+        channels: 1
+        activation: "none"
+        weight: 1

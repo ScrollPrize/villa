@@ -1,0 +1,193 @@
+/* ==========================================================================
+   utilities.css — shared .vc-* component recipes (WP0 foundation)
+   The ONE canonical implementation of each recipe in spec §3. WP1 (landing)
+   and WP2 (components/chrome) CONSUME these class names rather than inventing
+   new ones. Plain CSS on var(--vc-*) tokens — no @apply, no Tailwind purge.
+   Loaded after tokens.css, before custom.css. Chrome/landing (loaded after
+   custom.css) may layer page-specific overrides on top.
+
+   Rules (spec §1): no gradients (except solid->transparent overlays ON MEDIA),
+   no box-shadows anywhere, hover = border --vc-line-strong + bg --vc-raised
+   (never translate/scale), radius 8px cards / 6px buttons+chips / 999px
+   avatars only, focus-visible = 2px solid --vc-accent offset 2px.
+   ========================================================================== */
+
+/* --- Card: the ONE recipe (breaking card, news teasers, open-problem boxes,
+       prize cards, sponsor rows, images-in-frames). No shadows, no rounded-2xl. */
+.vc-card {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  padding: var(--vc-card-pad);
+  box-shadow: none;
+}
+.vc-card--hero { padding: 24px; }        /* hero-level cards */
+.vc-card--flush { padding: 0; overflow: hidden; } /* image-in-frame cards */
+a.vc-card, .vc-card--interactive { transition: border-color .15s, background-color .15s; }
+a.vc-card:hover,
+.vc-card--interactive:hover {
+  border-color: var(--vc-line-strong);
+  background: var(--vc-raised);
+  text-decoration: none;
+}
+
+/* --- CTA (text): the ONE style. Uppercase, ember, arrow, underline on hover.
+       The legacy amber variant dies. */
+.vc-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vc-accent);
+  text-decoration: none;
+}
+.vc-cta::after { content: "\2192"; } /* → arrow glyph */
+.vc-cta:hover { color: var(--vc-accent); text-decoration: underline; text-underline-offset: 2px; }
+
+/* --- Button (filled): the ONLY filled element site-wide is the navbar
+       "Get Started". Everything else is a text CTA or a hairline-outline button. */
+.vc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--vc-r-btn);
+  border: 1px solid var(--vc-accent);
+  background: var(--vc-accent);
+  color: #fff;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-decoration: none;
+  box-shadow: none;
+}
+.vc-btn:hover { color: #fff; text-decoration: none; }
+
+.vc-btn-outline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--vc-r-btn);
+  border: 1px solid var(--vc-line);
+  background: transparent;
+  color: var(--vc-text);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-decoration: none;
+}
+.vc-btn-outline:hover { border-color: var(--vc-line-strong); background: var(--vc-raised); color: var(--vc-text); text-decoration: none; }
+
+/* --- Body link: text color + ember underline, hover -> ember.
+       Solid-ember text is reserved for CTAs + active nav. */
+.vc-link {
+  color: var(--vc-text);
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-underline-offset: 2px;
+}
+.vc-link:hover { color: var(--vc-accent); }
+
+/* --- Stat strip: value (tabular-nums) + label, separated by hairlines.
+       Hero: "$1,800,500 awarded · 5 scrolls scanned · 2 read". */
+.vc-stat-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 0;
+}
+.vc-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 24px;
+  border-left: 1px solid var(--vc-line);
+}
+.vc-stat:first-child { padding-left: 0; border-left: 0; }
+.vc-stat__value {
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--vc-text);
+  font-variant-numeric: tabular-nums;
+}
+.vc-stat__label {
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+}
+
+/* --- Admonition: ONE component. Surface card + 2px ember left edge.
+       Variants differ by LABEL TEXT ONLY (NOTE / PRIZE / RESULTS) — no hue swaps. */
+.vc-admonition {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-left: 2px solid var(--vc-accent);
+  border-radius: var(--vc-r-card);
+  padding: var(--vc-card-pad);
+}
+.vc-admonition__label {
+  font-size: 0.8125rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vc-text-faint);
+  margin-bottom: 8px;
+}
+
+/* --- Uppercase label / kicker (metadata, captions, tier labels). */
+.vc-label {
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vc-text-faint);
+}
+/* Timeline year kicker (landing stories): mono, ember, wider tracking. */
+.vc-kicker {
+  font-size: 0.875rem;
+  font-family: var(--vc-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--vc-accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Caption (images in content): small italic faint, 8px top gap. */
+.vc-caption {
+  font-size: 0.8125rem;
+  font-style: italic;
+  color: var(--vc-text-faint);
+  margin-top: 8px;
+}
+
+/* --- Framed media (images in content): 8px radius + hairline, never overflow. */
+.vc-media {
+  max-width: 100%;
+  border-radius: var(--vc-r-card);
+  border: 1px solid var(--vc-line);
+  display: block;
+}
+
+/* --- Tabular numerals helper for $ amounts / dates / stats. */
+.vc-nums { font-variant-numeric: tabular-nums; }
+
+/* --- Shared focus ring (spec §1). */
+.vc-card:focus-visible,
+.vc-cta:focus-visible,
+.vc-btn:focus-visible,
+.vc-btn-outline:focus-visible,
+.vc-link:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* Money: dollar amounts site-wide match the landing GP-card accent. */
+.vc-money {
+  color: var(--vc-accent);
+}

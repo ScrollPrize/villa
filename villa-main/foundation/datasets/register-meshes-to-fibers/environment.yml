@@ -1,0 +1,17 @@
+name: register
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - open3d
+  - pytorch
+  - tqdm
+  - scikit-image
+  - posix_ipc
+  - psutil
+  - pip
+  - pip:
+      - kimimaro

@@ -1,0 +1,57 @@
+tr_setup:
+  model_name: sheet_normals_ink
+  autoconfigure: true
+  #checkpoint_path: "/home/sean/Documents/GitHub/multi-task-3d-unet/checkpoints/sheet_normals_5_126.pth"
+  load_weights_only: false
+
+tr_config:
+  patch_size:
+  - 128
+  - 128
+  - 128
+  initial_lr: 1e-2
+
+dataset_config:
+  min_labeled_ratio: 0.08
+  min_bbox_percent: 0.98
+  # theres a bit of a gotcha here if using multi-channel data, the first volume listed is the one used for valid patch finding,
+  # so the first one in each target needs to be single channel if 4d or only 3d
+  targets:
+    sheet:
+      out_channels: 1
+      activation: none
+      weight: 1
+      loss_fn: BCEDiceLoss
+      volumes:
+#        - data_volume: "/mnt/raid_nvme/scroll_volumes/s4.zarr"
+#          label_volume: "/mnt/raid_nvme/labels/surfaces/s4_surface_label.zarr/volume.zarr"
+#          format: "zarr_local"
+#          bounding_box: [ 2450, 440, 490, 9600, 3000, 3000 ]  # (z_min, y_min, x_min, z_max, y_max, x_max)
+        - data_volume: "/mnt/raid_nvme/scroll_volumes/s1.zarr"
+          label_volume: "/mnt/raid_nvme/labels/surfaces/s1_surface_label.zarr/0.zarr"
+          format: "zarr_local"
+
+    normals:
+      out_channels: 3
+      activation: none
+      weight: .75
+      loss_fn: MaskedCosineLoss
+      volumes:
+#        - data_volume: "/mnt/raid_nvme/scroll_volumes/s4.zarr"
+#          label_volume: "/mnt/raid_nvme/labels/normals/s4_normals.zarr/volume.zarr"
+#          format: "zarr_local"
+#          bounding_box: [ 2450, 440, 490, 9600, 3000, 3000 ]
+        - data_volume: "/mnt/raid_nvme/scroll_volumes/s1.zarr"
+          label_volume: "/mnt/raid_nvme/labels/normals/s1_normals.zarr"
+          format: "zarr_local"
+
+    ink:
+      out_channels: 1
+      activation: none
+      weight: 1
+      loss_fn: BCEDiceLoss
+      volumes:
+        - data_volume: "/mnt/raid_nvme/scroll_volumes/s1.zarr"
+          label_volume: "/mnt/raid_nvme/labels/s1_ink.zarr"
+          format: "zarr_local"
+

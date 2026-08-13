@@ -1,0 +1,184 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include <opencv2/core/mat.hpp>
+
+#include "vc/core/util/Rect3D.hpp"
+
+class QuadSurface;
+class PlaneSurface;
+
+class SurfacePatchIndex {
+public:
+    using SurfacePtr = std::shared_ptr<QuadSurface>;
+
+    struct LookupResult {
+        SurfacePtr surface;
+        cv::Vec3f ptr = {0, 0, 0};
+        float distance = -1.0f;
+    };
+
+    struct TriangleCandidate {
+        SurfacePtr surface;
+        int i = 0; // Grid column index (x)
+        int j = 0; // Grid row index (y)
+        int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01), pXY = (column,row)
+        std::array<cv::Vec3f, 3> world{};
+        std::array<cv::Vec3f, 3> surfaceParams{}; // ptr-space coordinates for vertices
+    };
+
+    struct TriangleSegment {
+        SurfacePtr surface;
+        std::array<cv::Vec3f, 2> world{};
+        std::array<cv::Vec3f, 2> surfaceParams{};
+    };
+
+    struct PatchBounds {
+        cv::Vec3f low = {0, 0, 0};
+        cv::Vec3f high = {0, 0, 0};
+    };
+
+    struct SurfaceFilter {
+        SurfacePtr only;
+        const std::unordered_set<SurfacePtr>* include = nullptr;
+        const std::unordered_set<SurfacePtr>* exclude = nullptr;
+        const std::unordered_set<QuadSurface*>* includeRaw = nullptr;
+        const std::unordered_set<QuadSurface*>* excludeRaw = nullptr;
+    };
+
+    struct TriangleQuery {
+        Rect3D bounds;
+        SurfaceFilter surfaces;
+        std::function<bool(const PatchBounds&)> patchFilter;
+    };
+
+    struct PointQuery {
+        cv::Vec3f worldPoint = {0, 0, 0};
+        float tolerance = 0.0f;
+        SurfaceFilter surfaces;
+    };
+
+    struct RayQuery {
+        cv::Vec3f src = {0, 0, 0};
+        cv::Vec3f end = {0, 0, 0};
+        float minT = 0.0f;
+        float bboxPadding = 0.0f;
+        SurfaceFilter surfaces;
+    };
+
+    SurfacePatchIndex();
+    ~SurfacePatchIndex();
+
+    SurfacePatchIndex(SurfacePatchIndex&&) noexcept;
+    SurfacePatchIndex& operator=(SurfacePatchIndex&&) noexcept;
+
+    SurfacePatchIndex(const SurfacePatchIndex&) = delete;
+    SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
+
+    void rebuild(const std::vector<SurfacePtr>& surfaces,
+                 float bboxPadding = 0.0f,
+                 bool useMappedSurfaces = true);
+    static std::string cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
+                                           int samplingStride,
+                                           float bboxPadding);
+    bool loadCache(const std::filesystem::path& cachePath,
+                   const std::vector<SurfacePtr>& surfaces,
+                   const std::string& expectedKey);
+    bool saveCache(const std::filesystem::path& cachePath,
+                   const std::string& cacheKey) const;
+    void clear();
+    bool empty() const;
+    size_t patchCount() const;
+    size_t surfaceCount() const;
+    bool containsSurface(const SurfacePtr& surface) const;
+
+    std::optional<LookupResult> locate(const PointQuery& query) const;
+    // Cheap overlap-style variant of locate(): returns the first accepted hit
+    // within tolerance instead of scanning every candidate for the nearest,
+    // and filters against the caller's include/exclude sets without copying
+    // them (locate() copies the sets per call). Safe to call concurrently
+    // from many threads while queries hold the shared lock.
+    std::optional<LookupResult> locateAny(const PointQuery& query) const;
+    std::vector<LookupResult> locateAll(const PointQuery& query) const;
+    std::vector<SurfacePtr> locateSurfaces(const PointQuery& query) const;
+
+    void forEachTriangle(const TriangleQuery& query,
+                         const std::function<void(const TriangleCandidate&)>& visitor) const;
+    void forEachTriangle(const RayQuery& query,
+                         const std::function<void(const TriangleCandidate&)>& visitor) const;
+
+    static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
+                                                              const PlaneSurface& plane,
+                                                              float epsilon = 1e-4f);
+
+    std::unordered_map<SurfacePtr, std::vector<TriangleSegment>>
+    computePlaneIntersections(
+        const PlaneSurface& plane,
+        const cv::Rect& planeRoi,
+        const std::unordered_set<SurfacePtr>& targets,
+        float clipTolerance = 1e-4f) const;
+
+    bool updateSurface(const SurfacePtr& surface);
+    bool updateSurfaceRegion(const SurfacePtr& surface,
+                             int rowStart,
+                             int rowEnd,
+                             int colStart,
+                             int colEnd);
+    bool removeSurface(const SurfacePtr& surface);
+    bool setSamplingStride(int stride);
+    int samplingStride() const;
+    void setReadOnly(bool readOnly);
+
+    // Pending update tracking for incremental R-tree updates
+    // Queue the 4 cells surrounding a vertex for update
+    void queueCellUpdateForVertex(const SurfacePtr& surface, int vertexRow, int vertexCol);
+    // Queue a range of cells for update
+    void queueCellRangeUpdate(const SurfacePtr& surface,
+                              int rowStart,
+                              int rowEnd,
+                              int colStart,
+                              int colEnd);
+    // Apply all pending cell updates to R-tree (nullptr = all surfaces)
+    bool flushPendingUpdates(const SurfacePtr& surface = nullptr);
+    // Check if surface has pending cell updates
+    bool hasPendingUpdates(const SurfacePtr& surface = nullptr) const;
+
+    // Generation tracking for undo/redo detection
+    uint64_t generation(const SurfacePtr& surface) const;
+
+    // Index-wide generation: bumped by every successful mutation (rebuild,
+    // cache load, surface update/remove, flush, stride change, move-assign).
+    // Lets callers detect "anything changed" with one O(1) probe instead of
+    // querying generation() per surface, at the cost of over-invalidating
+    // when a non-observed surface changes.
+    uint64_t globalGeneration() const;
+
+private:
+    struct NoPatchFilter {
+        template <typename Box>
+        bool operator()(const Box&) const { return true; }
+    };
+
+    template <typename Visitor, typename PatchFilter = NoPatchFilter>
+    void forEachTriangleImpl(const Rect3D& bounds,
+                             const SurfaceFilter& surfaces,
+                             Visitor&& visitor,
+                             PatchFilter&& patchFilter = NoPatchFilter{}) const;
+
+    struct Impl;
+    mutable std::shared_mutex mutex_;
+    std::unique_ptr<Impl> impl_;
+    std::atomic<uint64_t> globalGeneration_{1};
+};

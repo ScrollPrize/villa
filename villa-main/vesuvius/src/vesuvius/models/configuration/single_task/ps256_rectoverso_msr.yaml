@@ -1,0 +1,63 @@
+# Rectoverso surface segmentation (recto=1, verso=2, intersection=3 masked).
+# From-scratch nnUNet 7-stage, 2-GPU DDP, torch.compile on.
+#
+# Labels: {0=bg, 1=recto, 2=verso, 3=intersection}. Label 3 is delivered to
+# the loss and masked via `ignore_label: 3`; no patch-level rejection.
+# Cross-frame dataset mirrors the fibers config (same image, same transform).
+#
+# Invocation (2-GPU DDP, GPUs 2,3):
+#   uv run vesuvius.train \
+#     --config src/vesuvius/models/configuration/single_task/ps256_rectoverso_msr.yaml \
+#     --input /home/ubuntu/fibers_cache \
+#     --output /ephemeral/rectoverso_ckpts \
+#     --gpus 2,3 \
+#     --wandb-project surfaces --wandb-entity vesuvius-challenge
+
+tr_setup:
+  wandb_project: "surfaces"
+  wandb_entity: "vesuvius-challenge"
+  model_name: "ps256_rectoverso_msr"
+  tr_val_split: 0.85
+
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 2
+  num_dataloader_workers: 6
+  enable_deep_supervision: false
+  max_epoch: 1000
+  max_steps_per_epoch: 250
+  max_val_steps_per_epoch: 50
+  optimizer: "SGD"
+  initial_lr: 0.01
+  weight_decay: 0.00003
+  # User asked for compile on for these runs. Compile the inner module
+  # (before DDP wraps it) -- avoids the compiled-DDP barrier desync we hit
+  # with "ddp_wrapper" earlier.
+  compile_policy: "module"
+  ddp_find_unused_parameters: false
+
+dataset_config:
+  dataset_type: "cross_frame"
+  image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+  # Labels pulled to local disk with rsync:
+  #   rsync -av rsync://dl.ash2txt.org/data/other/dev/meshes/s1a-rectoverso-06032025-ome.zarr /ephemeral/rectoverso_labels/
+  labels_zarr_url: "/ephemeral/rectoverso_labels/s1a-rectoverso-06032025-ome.zarr/0"
+  transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+  storage_options:
+    anon: true
+  labels_scan_level: 3
+  # FG patches must contain recto or verso (not only intersection voxels).
+  valid_label_values: [1, 2]
+  binarize_labels: false
+
+  min_labeled_ratio: 0.001
+  min_bbox_percent: 0.35
+  normalization_scheme: "zscore"
+  targets:
+    rectoverso:
+      out_channels: 3  # bg=0, recto=1, verso=2
+      activation: "none"
+      ignore_label: 3  # intersection voxels masked out of the loss
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0

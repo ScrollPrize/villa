@@ -1,0 +1,153 @@
+#include "spiral2cont.hpp"
+#include "support.hpp"
+
+#include <boost/program_options.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/videoio.hpp>
+#include "spiral_ceres.hpp"
+#include "spiral.hpp"
+#include "spiral2.hpp"
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <optional>
+#include <filesystem>
+#include <chrono>
+#include <unordered_set>
+#include <iomanip>
+#include <random>
+#include <atomic>
+#include <omp.h>
+#include <fstream>
+
+#include <boost/graph/adjacency_list.hpp>
+#include <ceres/ceres.h>
+#include <opencv2/ximgproc.hpp>
+#include "utils/Json.hpp"
+
+#include "vc/core/util/GridStore.hpp"
+#include "vc/ui/VCCollection.hpp"
+
+void optimize_spiral_trace(
+    std::vector<SpiralPoint>& spiral_trace,
+    const vc::core::util::GridStore& normal_grid,
+    double spiral_step,
+    cv::VideoWriter& video_writer,
+    cv::Mat& vis_frame
+);
+
+void populate_normal_grid(const SkeletonGraph& graph, vc::core::util::GridStore& normal_grid, double spiral_step);
+void visualize_spiral(cv::Mat& vis, const std::vector<SpiralPoint>& spiral, const cv::Scalar& color, const cv::Scalar& endpoint_color, bool draw_endpoints);
+int spiral2cont_main(
+    const cv::Mat& slice_mat,
+    const std::optional<cv::Vec3f>& umbilicus_point,
+    const fs::path& output_path,
+    const po::variables_map& vm
+) {
+    if (!vm.count("json-in") || !vm.count("collection-name") || !vm.count("start-winding") || !vm.count("end-winding")) {
+        std::cerr << "Error: For spiral2cont mode, --json-in, --collection-name, --start-winding, and --end-winding are required." << std::endl;
+        return 1;
+    }
+
+    std::string json_in_path = vm["json-in"].as<std::string>();
+    std::string collection_name = vm["collection-name"].as<std::string>();
+    double start_winding = vm["start-winding"].as<double>();
+    double end_winding = vm["end-winding"].as<double>();
+
+    utils::Json json_input = utils::Json::parse_file(json_in_path);
+
+    utils::Json json_collection;
+    bool collection_found = false;
+    for (const auto& col : json_input) {
+        if (col["name"].get_string() == collection_name) {
+            json_collection = col;
+            collection_found = true;
+            break;
+        }
+    }
+
+    if (!collection_found) {
+        std::cerr << "Error: Collection '" << collection_name << "' not found in JSON file." << std::endl;
+        return 1;
+    }
+
+    std::vector<std::vector<SpiralPoint>> all_spiral_wraps;
+    {
+        const utils::Json& spirals_json = json_collection["spirals"];
+        for (size_t wi = 0; wi < spirals_json.size(); ++wi) {
+            std::vector<SpiralPoint> wrap;
+            const utils::Json& wrap_json = spirals_json[wi];
+            for (size_t pi = 0; pi < wrap_json.size(); ++pi) {
+                SpiralPoint sp;
+                from_json(wrap_json[pi], sp);
+                wrap.push_back(sp);
+            }
+            all_spiral_wraps.push_back(wrap);
+        }
+    }
+
+    std::vector<SpiralPoint> target_spiral;
+    for (const auto& spiral : all_spiral_wraps) {
+        if (spiral.empty() || spiral.back().winding < start_winding || spiral.front().winding > end_winding) {
+            continue;
+        }
+
+        bool started = false;
+        for (const auto& p : spiral) {
+            if (p.winding >= start_winding) {
+                started = true;
+            }
+            if (started) {
+                target_spiral.push_back(p);
+            }
+            if (p.winding >= end_winding) {
+                break;
+            }
+        }
+
+        if (!target_spiral.empty()) {
+            break;
+        }
+    }
+
+    if (target_spiral.empty()) {
+        std::cerr << "Error: Could not find the specified spiral wrap." << std::endl;
+        return 1;
+    }
+    else
+        std::cout << "tgt spiral size: " << target_spiral.size() << std::endl;
+
+    double spiral_step = vm["spiral-step"].as<double>();
+    cv::Point umbilicus_p(
+        static_cast<int>(std::round((*umbilicus_point)[0])),
+                        static_cast<int>(std::round((*umbilicus_point)[1]))
+    );
+
+    cv::Mat binary_slice = slice_mat > 0;
+    cv::Mat skeleton_img;
+    cv::ximgproc::thinning(binary_slice, skeleton_img, cv::ximgproc::THINNING_GUOHALL);
+    SkeletonGraph skeleton_graph = trace_skeleton_segments(skeleton_img, vm);
+    vc::core::util::GridStore normal_grid(
+        cv::Rect(0, 0, slice_mat.cols, slice_mat.rows), 32
+    );
+    populate_normal_grid(skeleton_graph, normal_grid, spiral_step);
+
+    cv::Mat vis_frame = cv::Mat::zeros(slice_mat.size(), CV_8UC3);
+    cv::VideoWriter video_writer; // Dummy writer, not used for optimization visualization in this mode yet
+
+    optimize_spiral_trace(target_spiral, normal_grid, spiral_step, video_writer, vis_frame);
+
+    cv::Mat final_vis = cv::Mat::zeros(slice_mat.size(), CV_8UC3);
+    visualize_spiral(final_vis, target_spiral, cv::Scalar(0, 255, 0), cv::Scalar(0, 255, 0), false);
+
+    cv::Mat slice_bgr;
+    cv::cvtColor(slice_mat, slice_bgr, cv::COLOR_GRAY2BGR);
+    cv::addWeighted(slice_bgr, 0.5, final_vis, 0.5, 0.0, final_vis);
+
+    cv::imwrite(output_path.string(), final_vis);
+    std::cout << "Saved optimized spiral to " << output_path << std::endl;
+    return 0;
+}

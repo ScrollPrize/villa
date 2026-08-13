@@ -1,0 +1,28 @@
+{
+    "volume_auth_json": "example_creds.json",
+
+    "patch_size": [512, 512, 512],
+    "bg_distance": 8,
+    "label_distance": 8,
+    "bg_dilate_distance": 192,
+    "normal_sample_step": 1.0,
+    
+    "auto_fix_padding_multiples": [256, 64],
+
+    "wrap_mode": "multi_wrap",
+
+    "patch_cache_filename": "/home/sean/Documents/data/ink_030226/.tifxyz_patch_cache.json",
+    "patch_cache_force_recompute": true,
+
+    "datasets": [
+        {
+            "volume_path": "",
+            "volume_scale": 0,
+            "segments_path": "/home/sean/Documents/data/3d_ink/172/tifxyz"
+        }
+    ],
+
+    "model_config": {
+        "autoconfigure": true
+    }
+}

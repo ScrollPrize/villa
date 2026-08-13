@@ -1,0 +1,29 @@
+tr_setup:
+  model_name: "surface_normals_2d"
+
+tr_config:
+  patch_size: [256,256]
+  in_channels: 1
+
+dataset_config:
+  data_format: "image"
+  min_labeled_ratio: 0
+  min_bbox_percent: 0
+  normalization_scheme: "zscore"
+  skip_patch_validation: true
+  targets:
+    normals:
+      weight: 1.0
+      activation: "none"
+      out_channels: 3
+      losses:
+        - name: "CosineSimilarityLoss"
+          weight: 1.0
+          kwargs:
+            dim: 1
+            eps: 1.0e-8
+        - name: "NormalSmoothnessLoss"
+          weight: 0.25
+          kwargs:
+            sigma: 2.0
+            q: 2.0

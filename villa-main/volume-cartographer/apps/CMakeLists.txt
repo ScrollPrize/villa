@@ -1,0 +1,302 @@
+if(NOT VC_BUILD_APPS)
+    return()
+endif()
+
+############
+# GUI Apps #
+############
+add_subdirectory(VC3D)
+
+#################
+# CMD Line Apps #
+#################
+
+add_executable(vc_render_video src/vc_render_video.cpp)
+target_link_libraries(vc_render_video opencv_core vc_core opencv_videoio)
+
+add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
+target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF)
+
+add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
+target_link_libraries(vc_objrefine vc_core)
+
+add_executable(vc_grow_seg_from_seed src/vc_grow_seg_from_seed.cpp)
+target_link_libraries(vc_grow_seg_from_seed vc_core vc_tracer Boost::program_options)
+
+add_executable(vc_seg_add_overlap src/vc_seg_add_overlap.cpp)
+target_link_libraries(vc_seg_add_overlap vc_core)
+
+add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
+target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
+
+add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
+target_link_libraries(vc_tifxyz2obj vc_core vc_inpaint)
+
+function(vc_find_libigl_core out_var)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    foreach(_pkg IN ITEMS igl libigl Libigl)
+        find_package(${_pkg} CONFIG QUIET)
+        if(TARGET igl::core)
+            set(${out_var} igl::core PARENT_SCOPE)
+            return()
+        endif()
+        if(TARGET igl::igl_core)
+            set(${out_var} igl::igl_core PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+
+    set(_prefixes ${CMAKE_PREFIX_PATH} ${CMAKE_SYSTEM_PREFIX_PATH})
+    foreach(_env_prefix IN ITEMS "$ENV{LIBIGL_ROOT}" "$ENV{HOMEBREW_PREFIX}")
+        if(NOT "${_env_prefix}" STREQUAL "")
+            list(APPEND _prefixes "${_env_prefix}")
+        endif()
+    endforeach()
+    if(_prefixes)
+        list(REMOVE_DUPLICATES _prefixes)
+    endif()
+
+    find_package(igl CONFIG QUIET
+        NAMES igl libigl Libigl
+        HINTS ${_prefixes}
+        PATH_SUFFIXES
+            lib/cmake/igl
+            lib/cmake/libigl
+            share/cmake/igl
+            share/libigl/cmake)
+    if(TARGET igl::core)
+        set(${out_var} igl::core PARENT_SCOPE)
+        return()
+    endif()
+    if(TARGET igl::igl_core)
+        set(${out_var} igl::igl_core PARENT_SCOPE)
+        return()
+    endif()
+
+    message(FATAL_ERROR
+        "vc_obj_uv_lift requires libigl core. Enable VC_BUILD_FLATBOI to "
+        "use the local FetchContent libigl path, or install a libigl CMake "
+        "package exporting igl::core or igl::igl_core.")
+endfunction()
+
+vc_find_libigl_core(_vc_libigl_core_target)
+add_executable(vc_obj_uv_lift src/vc_obj_uv_lift.cpp)
+target_link_libraries(vc_obj_uv_lift PRIVATE ${_vc_libigl_core_target} OpenMP::OpenMP_CXX)
+set_target_properties(vc_obj_uv_lift PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+
+add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
+target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
+
+add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp src/alpha_wrap.cpp)
+target_link_libraries(vc_add_ignore_label
+    vc_core
+    Boost::program_options
+    CGAL::CGAL
+    opencv_core
+    opencv_imgproc
+    opencv_imgcodecs
+)
+
+add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
+target_link_libraries(vc_obj2tifxyz vc_core)
+
+add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
+target_link_libraries(vc_obj2tifxyz_legacy vc_core)
+
+add_executable(vc_flatten src/vc_flatten.cpp)
+target_link_libraries(vc_flatten vc_core vc_flattening Boost::program_options)
+
+add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
+target_link_libraries(vc_tifxyz_inp_mask vc_core)
+
+add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
+target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
+
+add_executable(vc_straighten src/vc_straighten.cpp)
+target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann TIFF::TIFF)
+
+add_executable(vc_cut_windings src/vc_cut_windings.cpp)
+target_link_libraries(vc_cut_windings vc_core opencv_core)
+
+add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
+target_link_libraries(vc_tifxyz_winding vc_core)
+
+add_executable(vc_tifxyz_selfcross src/vc_tifxyz_selfcross.cpp)
+target_link_libraries(vc_tifxyz_selfcross vc_core Boost::program_options opencv_core)
+
+add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
+target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
+
+add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
+target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
+
+add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp)
+target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
+
+add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
+target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
+
+add_executable(vc_atlas_inspect src/vc_atlas_inspect.cpp)
+target_link_libraries(vc_atlas_inspect vc_atlas)
+
+add_executable(vc_atlas_constraints_export src/vc_atlas_constraints_export.cpp)
+target_link_libraries(vc_atlas_constraints_export vc_atlas)
+
+add_executable(vc_atlas_pred_snap_rebuild
+    src/vc_atlas_pred_snap_rebuild.cpp
+    VC3D/FiberSliceGeometry.cpp
+)
+target_link_libraries(vc_atlas_pred_snap_rebuild vc_atlas)
+
+add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
+target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
+
+set(vc_diffuse_winding_sources
+    diffusion/continuous3d.cpp
+    diffusion/continous.cpp
+    diffusion/discrete.cpp
+    diffusion/spiral_ceres.cpp
+    diffusion/spiral_common.cpp
+    diffusion/spiral.cpp
+    diffusion/spiral2.cpp
+    diffusion/spiral2cont.cpp
+    diffusion/support.cpp
+    diffusion/vc_diffuse_winding.cpp
+)
+
+# vc_diffuse_winding constructs a Qt VCCollection, so it compiles the shim
+# directly and links Qt; wrap the header for MOC to emit the vtable.
+qt6_wrap_cpp(vc_diffuse_winding_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources}
+    ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${vc_diffuse_winding_moc})
+target_include_directories(vc_diffuse_winding PRIVATE diffusion)
+target_link_libraries(vc_diffuse_winding
+        opencv_videoio
+        opencv_ximgproc
+        vc_core
+        Qt6::Core
+        Boost::program_options
+        OpenMP::OpenMP_CXX
+        Ceres::ceres
+)
+
+add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
+target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
+
+add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
+target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
+
+add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
+target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+
+add_executable(vc_merge_patch src/vc_merge_patch.cpp)
+target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
+
+add_executable(vc_visualize src/vc_visualize.cpp)
+target_link_libraries(vc_visualize vc_core Boost::program_options)
+
+add_executable(vc_volpkg_convert src/vc_volpkg_convert.cpp)
+target_link_libraries(vc_volpkg_convert vc_core)
+
+
+# Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
+add_executable(vc_transform_geom src/vc_transform_geom.cpp)
+target_link_libraries(vc_transform_geom vc_core Boost::program_options)
+
+
+add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
+target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
+target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
+
+# Read / visualize NormalGridVolume
+add_executable(vc_ngrids src/vc_ngrids.cpp)
+target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
+
+add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
+target_link_libraries(vc_tifxyz2rgb
+    vc_core
+    opencv_core
+    opencv_imgcodecs
+)
+
+add_executable(vc_rgb2tifxyz src/vc_rgb2tifxyz.cpp)
+target_link_libraries(vc_rgb2tifxyz
+    vc_core
+    opencv_core
+    opencv_imgcodecs
+    # nlohmann_json::nlohmann_json
+)
+
+add_executable(vc_thinning src/vc_thinning.cpp)
+target_link_libraries(vc_thinning vc_core opencv_ximgproc)
+
+add_executable(vc_tifxyz src/vc_tifxyz.cpp)
+target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
+
+add_executable(vc_project_tifxyz src/vc_project_tifxyz.cpp)
+target_link_libraries(vc_project_tifxyz vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
+
+add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
+target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
+
+add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
+target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
+
+# Stable compile-coverage entry point for CI. Keep every command-line
+# executable here so the CLI shard cannot silently omit a newly added tool.
+set(VC_CLI_TARGETS
+    vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+    vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj vc_obj_uv_lift
+    vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+    vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+    vc_straighten vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
+    vc_calc_surface_metrics
+    vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
+    vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+    vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
+    vc_create_segment_mask vc_merge_tifxyz vc_merge_patch vc_visualize
+    vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_ngrids
+    vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
+    vc_zarr_to_tiff vc_zarr_recompress)
+get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
+set(_vc_expected_cli_targets ${VC_CLI_TARGETS})
+list(SORT _vc_apps_directory_targets)
+list(SORT _vc_expected_cli_targets)
+if(NOT _vc_apps_directory_targets STREQUAL _vc_expected_cli_targets)
+    message(FATAL_ERROR
+        "VC_CLI_TARGETS must contain every CLI executable.\n"
+        "Actual: ${_vc_apps_directory_targets}\n"
+        "Registered: ${_vc_expected_cli_targets}")
+endif()
+add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
+
+# Reuse the neutral common PCH on the CLI apps that link vc_core.
+# vc_obj_uv_lift and vc_tifxyz_mmap_prepare are omitted — they don't link vc_core (no shared
+# include paths), so REUSE_FROM would fail to compile against them.
+if(VC_USE_PCH)
+    foreach(_app
+        vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+        vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj
+        vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+        vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+        vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
+        vc_calc_surface_metrics
+        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_atlas_inspect vc_atlas_constraints_export vc_tifxyz_gengt vc_diffuse_winding vc_create_segment_mask
+        vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
+        vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
+        vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
+        vc_straighten
+    )
+        target_precompile_headers(${_app} REUSE_FROM vc_common_pch)
+    endforeach()
+endif()

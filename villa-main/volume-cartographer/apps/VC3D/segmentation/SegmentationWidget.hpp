@@ -1,0 +1,279 @@
+#pragma once
+
+#include <QColor>
+#include <QVector>
+#include <QWidget>
+
+#include <optional>
+#include <utility>
+#include <vector>
+
+#include "SegmentationCommon.hpp"
+#include "SegmentationPushPullConfig.hpp"
+
+#include "utils/Json.hpp"
+
+#include "growth/SegmentationGrowth.hpp"
+#include "tools/ManualAddTool.hpp"
+
+class SegmentationHeaderRow;
+class SegmentationEditingPanel;
+class SegmentationGrowthPanel;
+class SegmentationCorrectionsPanel;
+class SegmentationCustomParamsPanel;
+class SegmentationApprovalMaskPanel;
+class SegmentationNeuralTracerPanel;
+class SegmentationDirectionFieldPanel;
+class SegmentationLasagnaPanel;
+class SegmentationManualAddPanel;
+
+class SegmentationWidget : public QWidget
+{
+    Q_OBJECT
+
+public:
+    explicit SegmentationWidget(QWidget* parent = nullptr);
+
+    [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
+    [[nodiscard]] float dragRadius() const;
+    [[nodiscard]] float dragSigma() const;
+    [[nodiscard]] float lineRadius() const;
+    [[nodiscard]] float lineSigma() const;
+    [[nodiscard]] float pushPullRadius() const;
+    [[nodiscard]] float pushPullSigma() const;
+    [[nodiscard]] float pushPullStep() const;
+    [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
+    [[nodiscard]] float editScale() const;
+    [[nodiscard]] float smoothingStrength() const;
+    [[nodiscard]] int smoothingIterations() const;
+    [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
+    [[nodiscard]] int growthSteps() const;
+    [[nodiscard]] QString customParamsText() const;
+    [[nodiscard]] QString customParamsProfile() const;
+    [[nodiscard]] bool customParamsValid() const;
+    [[nodiscard]] QString customParamsError() const;
+    [[nodiscard]] utils::Json customParamsJson() const;
+    [[nodiscard]] bool showHoverMarker() const;
+    [[nodiscard]] bool growthKeybindsEnabled() const;
+    [[nodiscard]] int growthScale() const;
+    [[nodiscard]] QString normal3dZarrPath() const;
+    [[nodiscard]] QString patchTracerSourcePath() const;
+    [[nodiscard]] utils::Json patchTracerParamsJson() const;
+    [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
+    // Neural tracer getters — delegated to panel
+    [[nodiscard]] bool neuralTracerEnabled() const;
+    [[nodiscard]] QString neuralCheckpointPath() const;
+    [[nodiscard]] QString neuralPythonPath() const;
+    [[nodiscard]] QString volumeZarrPath() const;
+    [[nodiscard]] int neuralVolumeScale() const;
+    [[nodiscard]] int neuralBatchSize() const;
+    [[nodiscard]] NeuralTracerModelType neuralModelType() const;
+    [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const;
+    [[nodiscard]] DenseTtaMode denseTtaMode() const;
+    [[nodiscard]] QString denseTtaMergeMethod() const;
+    [[nodiscard]] double denseTtaOutlierDropThresh() const;
+    [[nodiscard]] QString denseCheckpointPath() const;
+    [[nodiscard]] QString copyCheckpointPath() const;
+
+    void setPendingChanges(bool pending);
+    void setEditingEnabled(bool enabled);
+    void setDrawMaskEnabled(bool enabled);
+    void setDragRadius(float value);
+    void setDragSigma(float value);
+    void setLineRadius(float value);
+    void setLineSigma(float value);
+    void setPushPullRadius(float value);
+    void setPushPullSigma(float value);
+    void setPushPullStep(float value);
+    void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setEditScale(float value);
+    void setSmoothingStrength(float value);
+    void setSmoothingIterations(int value);
+    void setGrowthMethod(SegmentationGrowthMethod method);
+    void setGrowthInProgress(bool running);
+    void setShowHoverMarker(bool enabled);
+    void setEraseBrushActive(bool active);
+    void setManualAddActive(bool active);
+    ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
+    // Route direct changes through the panel so manualAddConfigChanged reaches
+    // the module just as it does for a combo-box edit.
+    ManualAddTool::LinePreviewMode setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode);
+    ManualAddTool::InterpolationMode setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode);
+
+    void setNormalGridAvailable(bool available);
+    void setNormalGridPathHint(const QString& hint);
+    void setNormalGridPath(const QString& path);
+
+    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
+
+    void setVolumePackagePath(const QString& path);
+    void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
+                             const QString& activeId);
+    void setActiveVolume(const QString& volumeId);
+
+    void setCorrectionsEnabled(bool enabled);
+    void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
+                                   std::optional<uint64_t> activeId);
+    void setGrowthSteps(int steps, bool persist = true);
+    [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
+
+    [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
+    [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
+
+    // Approval mask getters — delegated to panel
+    [[nodiscard]] bool showApprovalMask() const;
+    [[nodiscard]] bool editApprovedMask() const;
+    [[nodiscard]] bool editUnapprovedMask() const;
+    [[nodiscard]] bool autoApprovalEnabled() const;
+    [[nodiscard]] float autoApprovalRadius() const;
+    [[nodiscard]] float autoApprovalThreshold() const;
+    [[nodiscard]] float autoApprovalMaxDistance() const;
+
+    [[nodiscard]] float approvalBrushRadius() const;
+    [[nodiscard]] float approvalBrushDepth() const;
+    [[nodiscard]] int approvalMaskOpacity() const;
+    [[nodiscard]] QColor approvalBrushColor() const;
+
+    // Approval mask setters
+    void setShowApprovalMask(bool enabled);
+    void setEditApprovedMask(bool enabled);
+    void setEditUnapprovedMask(bool enabled);
+    void setAutoApprovalEnabled(bool enabled);
+    void setAutoApprovalRadius(float radius);
+    void setAutoApprovalThreshold(float threshold);
+    void setAutoApprovalMaxDistance(float distance);
+
+    void setApprovalBrushRadius(float radius);
+    void setApprovalBrushDepth(float depth);
+    void setApprovalMaskOpacity(int opacity);
+    void setApprovalBrushColor(const QColor& color);
+
+    // Neural tracer setters
+    void setNeuralTracerEnabled(bool enabled);
+    void setNeuralCheckpointPath(const QString& path);
+    void setNeuralPythonPath(const QString& path);
+    void setNeuralVolumeScale(int scale);
+    void setNeuralBatchSize(int size);
+    void setNeuralModelType(NeuralTracerModelType type);
+    void setNeuralOutputMode(NeuralTracerOutputMode mode);
+    void setDenseTtaMode(DenseTtaMode mode);
+    void setDenseTtaMergeMethod(const QString& method);
+    void setDenseTtaOutlierDropThresh(double threshold);
+    void setDenseCheckpointPath(const QString& path);
+    void setCopyCheckpointPath(const QString& path);
+
+    /**
+     * Set the volume zarr path for neural tracing.
+     * This is typically set automatically when the volume changes.
+     */
+    void setVolumeZarrPath(const QString& path);
+
+    /** Returns the lasagna panel widget (for hosting in a separate dock). */
+    [[nodiscard]] SegmentationLasagnaPanel* lasagnaPanel() const { return _lasagnaPanel; }
+
+    // Lasagna getters — delegated to panel
+    [[nodiscard]] QString lasagnaDataInputPath() const;
+    [[nodiscard]] QString lasagnaConfigText() const;
+    [[nodiscard]] int lasagnaMode() const;
+    [[nodiscard]] int newModelWidth() const;
+    [[nodiscard]] int newModelHeight() const;
+    [[nodiscard]] int newModelWindings() const;
+    [[nodiscard]] QString seedPointText() const;
+    [[nodiscard]] QString newModelOutputName() const;
+    [[nodiscard]] double offsetValue() const;
+
+    // Lasagna setters
+    void setLasagnaDataInputPath(const QString& path);
+    void setSeedFromFocus(int x, int y, int z);
+
+    void setAnnotateChecked(bool checked);
+
+signals:
+    void annotateToggled(bool enabled);
+    void editingModeChanged(bool enabled);
+    void drawMaskChanged(bool enabled);
+    void dragRadiusChanged(float value);
+    void dragSigmaChanged(float value);
+    void lineRadiusChanged(float value);
+    void lineSigmaChanged(float value);
+    void pushPullRadiusChanged(float value);
+    void pushPullSigmaChanged(float value);
+    void growthMethodChanged(SegmentationGrowthMethod method);
+    void pushPullStepChanged(float value);
+    void alphaPushPullConfigChanged();
+    void editScaleChanged(float value);
+    void smoothingStrengthChanged(float value);
+    void smoothingIterationsChanged(int value);
+    void growSurfaceRequested(SegmentationGrowthMethod method,
+                              SegmentationGrowthDirection direction,
+                              int steps,
+                              bool inpaintOnly);
+    void applyRequested();
+    void resetRequested();
+    void stopToolsRequested();
+    void volumeSelectionChanged(const QString& volumeId);
+    void correctionsCreateRequested();
+    void correctionsCollectionSelected(uint64_t collectionId);
+    void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
+    void hoverMarkerToggled(bool enabled);
+    void showApprovalMaskChanged(bool enabled);
+    void editApprovedMaskChanged(bool enabled);
+    void editUnapprovedMaskChanged(bool enabled);
+    void autoApprovalEnabledChanged(bool enabled);
+    void autoApprovalRadiusChanged(float radius);
+    void autoApprovalThresholdChanged(float threshold);
+    void autoApprovalMaxDistanceChanged(float distance);
+
+    void approvalBrushRadiusChanged(float radius);
+    void approvalBrushDepthChanged(float depth);
+    void approvalMaskOpacityChanged(int opacity);
+    void approvalBrushColorChanged(QColor color);
+    void approvalStrokesUndoRequested();
+
+    // Neural tracer signals
+    void neuralTracerEnabledChanged(bool enabled);
+    void neuralTracerStatusMessage(const QString& message);
+    void copyWithNtRequested();
+
+    // Lasagna signals
+    void lasagnaOptimizeRequested();
+    void lasagnaStopRequested();
+    void lasagnaStatusMessage(const QString& message);
+    void seedFromFocusRequested();
+
+    void manualAddConfigChanged();
+    void manualAddClearPendingRequested();
+    void manualAddRecomputeRequested();
+    void manualAddApplyExitRequested();
+    void manualAddCancelRequested();
+
+private:
+    void buildUi();
+    void syncUiState();
+    void restoreSettings();
+    void writeSetting(const QString& key, const QVariant& value);
+    void updateEditingState(bool enabled, bool notifyListeners);
+    void noteGrowthMethod(SegmentationGrowthMethod method);
+
+    bool _editingEnabled{false};
+    bool _drawMaskEnabled{false};
+    bool _pending{false};
+    bool _growthInProgress{false};
+    bool _restoringSettings{false};
+
+    SegmentationHeaderRow* _headerRow{nullptr};
+    SegmentationGrowthPanel* _growthPanel{nullptr};
+    SegmentationEditingPanel* _editingPanel{nullptr};
+    SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
+    SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
+    SegmentationApprovalMaskPanel* _approvalMaskPanel{nullptr};
+    SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
+    SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
+    SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
+    SegmentationManualAddPanel* _manualAddPanel{nullptr};
+    bool _manualAddActive{false};
+    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
+
+};

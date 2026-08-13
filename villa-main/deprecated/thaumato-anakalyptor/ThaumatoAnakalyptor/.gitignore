@@ -1,0 +1,12 @@
+.tif
+.ply
+/saved
+/__pycache__
+/*/__pycache__
+/old_pys
+/old_pys2
+/3d_instance_segmentation_training_data
+/20231027191953
+/scroll3*
+overlapp_threshold.yaml
+*.ply

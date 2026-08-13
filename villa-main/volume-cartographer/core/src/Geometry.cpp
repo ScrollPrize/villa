@@ -1,0 +1,333 @@
+#include "vc/core/util/Geometry.hpp"
+#include <iostream>
+#include "vc/core/util/QuadSurface.hpp"
+
+
+#include <opencv2/core.hpp>
+#include <opencv2/calib3d.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <random>
+
+//somehow opencvs functions are pretty slow
+static cv::Vec3f normed(const cv::Vec3f& v)
+{
+    return v/sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+}
+
+static cv::Vec2f vmin(const cv::Vec2f &a, const cv::Vec2f &b)
+{
+    return {std::min(a[0],b[0]),std::min(a[1],b[1])};
+}
+
+static cv::Vec2f vmax(const cv::Vec2f &a, const cv::Vec2f &b)
+{
+    return {std::max(a[0],b[0]),std::max(a[1],b[1])};
+}
+
+cv::Vec3f grid_normal_int(const cv::Mat_<cv::Vec3f> &points, int row, int col)
+{
+    // Specialized path for integer grid coordinates. Caller guarantees
+    // 1 <= row <= rows-2 and 1 <= col <= cols-2 so no clamp is needed,
+    // and the fractional bilerp degenerates to a direct corner read.
+    const cv::Vec3f* rPrev = points.ptr<cv::Vec3f>(row - 1);
+    const cv::Vec3f* rCur  = points.ptr<cv::Vec3f>(row);
+    const cv::Vec3f* rNext = points.ptr<cv::Vec3f>(row + 1);
+
+    const cv::Vec3f& xl = rCur[col - 1];
+    const cv::Vec3f& xr = rCur[col + 1];
+    const cv::Vec3f& yu = rPrev[col];
+    const cv::Vec3f& yd = rNext[col];
+
+    // Branchless invalid check: any sentinel (-1) → return NaN.
+    const int bad = (xl[0] == -1.f) | (xr[0] == -1.f)
+                  | (yu[0] == -1.f) | (yd[0] == -1.f);
+    if (bad) return {NAN, NAN, NAN};
+
+    cv::Vec3f xv = xr - xl;
+    cv::Vec3f yv = yd - yu;
+    // Cross product (xv × yv).
+    cv::Vec3f n{
+        xv[1] * yv[2] - xv[2] * yv[1],
+        xv[2] * yv[0] - xv[0] * yv[2],
+        xv[0] * yv[1] - xv[1] * yv[0]
+    };
+    const float len2 = n[0]*n[0] + n[1]*n[1] + n[2]*n[2];
+    if (len2 == 0.0f || len2 != len2) return {NAN, NAN, NAN};
+    const float inv = 1.0f / std::sqrt(len2);
+    return {n[0]*inv, n[1]*inv, n[2]*inv};
+}
+
+cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
+{
+    const cv::Vec3f qnan(NAN, NAN, NAN);
+    if (points.rows < 4 || points.cols < 4)
+        return qnan;
+
+    // loc is (x, y) in grid coords; rows=y, cols=x.
+    float fx = loc[0], fy = loc[1];
+    // Clamp to [1, cols-3] x [1, rows-3] so +/-1 neighbors + bilinear cell fit.
+    const float maxX = float(points.cols - 3);
+    const float maxY = float(points.rows - 3);
+    if (fx < 1.f) fx = 1.f; else if (fx > maxX) fx = maxX;
+    if (fy < 1.f) fy = 1.f; else if (fy > maxY) fy = maxY;
+
+    const int ix = int(fx), iy = int(fy);
+    const float tx = fx - float(ix), ty = fy - float(iy);
+
+    // We need a 4x4 neighborhood: rows [iy-1, iy+2], cols [ix-1, ix+2].
+    // Plus one more row/col for the bilinear cell's lower-right neighbor of
+    // each of the 4 sample points. So the full window is rows [iy-1, iy+2]
+    // cols [ix-1, ix+2]. Check invalids (-1 marker) across that window.
+    for (int dy = -1; dy <= 2; ++dy) {
+        const cv::Vec3f* row = points.ptr<cv::Vec3f>(iy + dy);
+        for (int dx = -1; dx <= 2; ++dx) {
+            if (row[ix + dx][0] == -1.f) return qnan;
+        }
+    }
+
+    auto bilerp = [&](int bx, int by) -> cv::Vec3f {
+        const cv::Vec3f& p00 = points.ptr<cv::Vec3f>(by)[bx];
+        const cv::Vec3f& p01 = points.ptr<cv::Vec3f>(by)[bx + 1];
+        const cv::Vec3f& p10 = points.ptr<cv::Vec3f>(by + 1)[bx];
+        const cv::Vec3f& p11 = points.ptr<cv::Vec3f>(by + 1)[bx + 1];
+        cv::Vec3f a = (1.f - tx) * p00 + tx * p01;
+        cv::Vec3f b = (1.f - tx) * p10 + tx * p11;
+        return (1.f - ty) * a + ty * b;
+    };
+
+    cv::Vec3f xv = normed(bilerp(ix + 1, iy) - bilerp(ix - 1, iy));
+    cv::Vec3f yv = normed(bilerp(ix, iy + 1) - bilerp(ix, iy - 1));
+    cv::Vec3f n = xv.cross(yv);
+    if (n[0] != n[0]) return qnan;
+    return normed(n);
+}
+
+template <typename E>
+static E at_int_impl(const cv::Mat_<E> &points, const cv::Vec2f& p)
+{
+    int x = p[0];
+    int y = p[1];
+    float fx = p[0]-x;
+    float fy = p[1]-y;
+
+    const E& p00 = points(y,x);
+    const E& p01 = points(y,x+1);
+    const E& p10 = points(y+1,x);
+    const E& p11 = points(y+1,x+1);
+
+    E p0 = (1-fx)*p00 + fx*p01;
+    E p1 = (1-fx)*p10 + fx*p11;
+
+    return (1-fy)*p0 + fy*p1;
+}
+// Note (2026-04): explicit row-pointer hoisting was tried here and
+// benchmarked ~23% slower than the operator()-based form above. The
+// compiler's CSE handles the stride-multiply fine; manual hoisting
+// defeats some optimization pass on this codepath. Leaving as-is.
+
+template<typename T, int C>
+static bool loc_valid_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
+{
+    if (m.rows < 2 || m.cols < 2 ||
+        !std::isfinite(l[0]) || !std::isfinite(l[1]))
+        return false;
+
+    if (l[0] < 0.0 || l[0] >= static_cast<double>(m.rows - 1) ||
+        l[1] < 0.0 || l[1] >= static_cast<double>(m.cols - 1))
+        return false;
+
+    cv::Vec2i li = {
+        static_cast<int>(std::floor(l[0])),
+        static_cast<int>(std::floor(l[1]))
+    };
+
+    if (m(li[0],li[1])[0] == -1)
+        return false;
+    if (m(li[0]+1,li[1])[0] == -1)
+        return false;
+    if (m(li[0],li[1]+1)[0] == -1)
+        return false;
+    if (m(li[0]+1,li[1]+1)[0] == -1)
+        return false;
+    return true;
+}
+
+static bool loc_valid_scalar(const cv::Mat_<float> &m, const cv::Vec2d &l)
+{
+    if (m.rows < 2 || m.cols < 2 ||
+        !std::isfinite(l[0]) || !std::isfinite(l[1]))
+        return false;
+
+    if (l[0] < 0.0 || l[0] >= static_cast<double>(m.rows - 1) ||
+        l[1] < 0.0 || l[1] >= static_cast<double>(m.cols - 1))
+        return false;
+
+    cv::Vec2i li = {
+        static_cast<int>(std::floor(l[0])),
+        static_cast<int>(std::floor(l[1]))
+    };
+
+    if (m(li[0],li[1]) == -1)
+        return false;
+    if (m(li[0]+1,li[1]) == -1)
+        return false;
+    if (m(li[0],li[1]+1) == -1)
+        return false;
+    if (m(li[0]+1,li[1]+1) == -1)
+        return false;
+    return true;
+}
+
+template<typename T, int C>
+static bool loc_valid_xy_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
+{
+    return loc_valid_impl(m, {l[1],l[0]});
+}
+
+static bool loc_valid_xy_scalar(const cv::Mat_<float> &m, const cv::Vec2d &l)
+{
+    return loc_valid_scalar(m, {l[1],l[0]});
+}
+
+cv::Vec3f at_int(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &p) {
+    return at_int_impl(points, p);
+}
+
+float at_int(const cv::Mat_<float> &points, const cv::Vec2f& p) {
+    return at_int_impl(points, p);
+}
+
+cv::Vec3d at_int(const cv::Mat_<cv::Vec3d> &points, const cv::Vec2f& p) {
+    return at_int_impl(points, p);
+}
+
+bool loc_valid(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l) {
+    return loc_valid_impl(m, l);
+}
+
+bool loc_valid(const cv::Mat_<cv::Vec3d> &m, const cv::Vec2d &l) {
+    return loc_valid_impl(m, l);
+}
+
+bool loc_valid(const cv::Mat_<float> &m, const cv::Vec2d &l) {
+    return loc_valid_scalar(m, l);
+}
+
+bool loc_valid_xy(const cv::Mat_<cv::Vec3f> &m, const cv::Vec2d &l) {
+    return loc_valid_xy_impl(m, l);
+}
+
+bool loc_valid_xy(const cv::Mat_<cv::Vec3d> &m, const cv::Vec2d &l) {
+    return loc_valid_xy_impl(m, l);
+}
+
+bool loc_valid_xy(const cv::Mat_<float> &m, const cv::Vec2d &l) {
+    return loc_valid_xy_scalar(m, l);
+}
+
+
+float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist)
+{
+    cv::Vec3f d = a-b;
+    float l = sqrtf(d.dot(d));
+
+    return std::abs(l-t_dist);
+}
+
+float tdist_sum(const cv::Vec3f &v, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds)
+{
+    float sum = 0;
+    for(int i=0;i<tgts.size();i++) {
+        float d = tdist(v, tgts[i], tds[i]);
+        sum += d*d;
+    }
+
+    return sum;
+}
+
+// Helper: remove spatial outliers based on robust neighbor-distance stats
+cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, float distance_threshold, bool print_stats)
+{
+    cv::Mat_<cv::Vec3f> cleaned = points.clone();
+
+    std::vector<float> all_neighbor_dists;
+    all_neighbor_dists.reserve(points.rows * points.cols);
+
+    // First pass: gather neighbor distances
+    for (auto [j, i, center] : ValidPointRange<const cv::Vec3f>(&points)) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const int ny = j + dy;
+                const int nx = i + dx;
+                if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                    if (points(ny, nx)[0] != -1.f) {
+                        const cv::Vec3f& neighbor = points(ny, nx);
+                        const float dist = cv::norm(center - neighbor);
+                        if (std::isfinite(dist) && dist > 0.f) {
+                            all_neighbor_dists.push_back(dist);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    float median_dist = 0.0f;
+    float mad = 0.0f;
+    if (!all_neighbor_dists.empty()) {
+        std::sort(all_neighbor_dists.begin(), all_neighbor_dists.end());
+        median_dist = all_neighbor_dists[all_neighbor_dists.size() / 2];
+        std::vector<float> abs_devs;
+        abs_devs.reserve(all_neighbor_dists.size());
+        for (float d : all_neighbor_dists) {
+            abs_devs.push_back(std::abs(d - median_dist));
+        }
+        std::sort(abs_devs.begin(), abs_devs.end());
+        mad = abs_devs[abs_devs.size() / 2];
+    }
+    const float threshold = median_dist + distance_threshold * (mad / 0.6745f);
+
+    if (print_stats) {
+        std::cout << "Outlier detection statistics:" << std::endl;
+        std::cout << "  Median neighbor distance: " << median_dist << std::endl;
+        std::cout << "  MAD: " << mad << std::endl;
+        std::cout << "  K (sigma multiplier): " << distance_threshold << std::endl;
+        std::cout << "  Distance threshold: " << threshold << std::endl;
+    }
+
+    // Second pass: invalidate isolated/far points
+    int removed_count = 0;
+    for (auto [j, i, center] : ValidPointRange<const cv::Vec3f>(&points)) {
+        float min_neighbor = std::numeric_limits<float>::infinity();
+        int neighbor_count = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const int ny = j + dy;
+                const int nx = i + dx;
+                if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
+                    if (points(ny, nx)[0] != -1.f) {
+                        const float dist = cv::norm(center - points(ny, nx));
+                        if (std::isfinite(dist)) {
+                            min_neighbor = std::min(min_neighbor, dist);
+                            neighbor_count++;
+                        }
+                    }
+                }
+            }
+        }
+        if (neighbor_count == 0 || (min_neighbor > threshold && threshold > 0.f)) {
+            cleaned(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
+            if (print_stats) removed_count++;
+        }
+    }
+
+    if (print_stats) {
+        std::cout << "Surface cleaning: removed " << removed_count << " outlier points" << std::endl;
+    }
+
+    return cleaned;
+}

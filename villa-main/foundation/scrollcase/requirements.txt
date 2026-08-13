@@ -1,0 +1,7 @@
+-e .
+uv
+ipykernel
+nbconvert
+tqdm
+meshlib==3.0.5.215
+git+https://github.com/gumyr/bd_warehouse

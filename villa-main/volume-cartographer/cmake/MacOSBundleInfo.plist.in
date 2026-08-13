@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleName</key>
+	<string>VC3D</string>
+	<key>CFBundleDisplayName</key>
+	<string>VC3D</string>
+	<key>CFBundleExecutable</key>
+	<string>VC3D</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.scrollprize.VC3D</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@PROJECT_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VC_VERSION_STRING@</string>
+	<key>CFBundleIconFile</key>
+	<string>logo</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>@VC_MACOS_MIN_VERSION@</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

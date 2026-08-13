@@ -1,0 +1,59 @@
+# HZ / VT fiber segmentation (hz=1, vt=2, label-3 masked).
+# From-scratch nnUNet 7-stage, 2-GPU DDP, torch.compile on.
+#
+# Labels: {0=bg, 1=hz, 2=vt, 3=exclude}. Label 3 is delivered to the loss and
+# masked via `ignore_label: 3`; no patch-level rejection.
+# Same image volume + transform.json as the binary fibers config.
+#
+# Invocation (2-GPU DDP, GPUs 4,5):
+#   uv run vesuvius.train \
+#     --config src/vesuvius/models/configuration/single_task/ps256_hzvt_msr.yaml \
+#     --input /home/ubuntu/fibers_cache \
+#     --output /ephemeral/hzvt_ckpts \
+#     --gpus 4,5 \
+#     --wandb-project fibers --wandb-entity vesuvius-challenge
+
+tr_setup:
+  wandb_project: "fibers"
+  wandb_entity: "vesuvius-challenge"
+  model_name: "ps256_hzvt_msr"
+  tr_val_split: 0.85
+
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 2
+  num_dataloader_workers: 6
+  enable_deep_supervision: false
+  max_epoch: 1000
+  max_steps_per_epoch: 250
+  max_val_steps_per_epoch: 50
+  optimizer: "SGD"
+  initial_lr: 0.01
+  weight_decay: 0.00003
+  compile_policy: "module"
+  ddp_find_unused_parameters: false
+
+dataset_config:
+  dataset_type: "cross_frame"
+  image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+  # Labels pulled to local disk with rsync:
+  #   rsync -av rsync://dl.ash2txt.org/data/other/dev/meshes/s1a-fibers-hzvt-05032025-ome.zarr /ephemeral/fibers_hzvt_labels/
+  labels_zarr_url: "/ephemeral/fibers_hzvt_labels/s1a-fibers-hzvt-05032025-ome.zarr/0"
+  transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+  storage_options:
+    anon: true
+  labels_scan_level: 3
+  valid_label_values: [1, 2]
+  binarize_labels: false
+
+  min_labeled_ratio: 0.001
+  min_bbox_percent: 0.35
+  normalization_scheme: "zscore"
+  targets:
+    hzvt:
+      out_channels: 3  # bg=0, hz=1, vt=2
+      activation: "none"
+      ignore_label: 3
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0

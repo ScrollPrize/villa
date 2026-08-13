@@ -1,0 +1,21 @@
+0:
+  color:
+  - 0
+  - 255
+  - 0
+  name: Noise
+  validation: true
+1:
+  color:
+  - 0
+  - 0
+  - 255
+  name: Papyrus
+  validation: true
+2:
+  color:
+  - 255
+  - 0
+  - 0
+  name: Unlabeled
+  validation: true

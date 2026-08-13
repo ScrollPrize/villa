@@ -1,0 +1,51 @@
+{
+  "z_range": [2000, 2400],
+  "surface_zarr_volume": "../volpkgs/PHerc0172.volpkg/volumes/s5_059_medial_ome.zarr",
+  "bin_path": "./cmake-build-relwithdebinfo/bin",
+  "wrap_labels": "../volpkgs/PHerc0172.volpkg/wrap_labels.json",
+  "existing_patches_for_seeds": "../volpkgs/PHerc0172.volpkg/paths_orig",
+  "out_path": "../out/vc-trace-evaluation/debug",
+  "use_existing_patches": false,
+  "max_num_seeds": 1000000,
+  "seeding_parallel_processes": 14,
+  "num_expansion_patches": 250,
+  "num_trace_starting_patches": 3,
+  "min_trace_starting_patch_size": 7.0,
+  "num_best_traces_to_average": 2,
+  "trace_ranking_metric": "winding_valid_fraction",
+  "wandb_project": "surface-tracer-evaluation-debug",
+  
+  "vc_grow_seg_from_seed_params": {
+    "seeding": {
+      "step_size": 20,
+      "min_area_cm": 0.2,
+      "generations": 200,
+      "thread_limit": 1,
+      "cache_root": "../volpkgs/PHerc0172.volpkg/cache",
+      "direction_fields": [
+        {
+          "zarr": "../out/s5-fiber-directions.zarr/horizontal",
+          "dir": "horizontal",
+          "scale": 2
+        }
+      ]
+    },
+    "expansion": {
+      "step_size": 20,
+      "min_area_cm": 0.2,
+      "tgt_overlap_count": 10,
+      "generations": 200,
+      "thread_limit": 1,
+      "cache_root": "../volpkgs/PHerc0172.volpkg/cache",
+      "direction_fields": []
+    }
+  },
+  
+  "vc_grow_seg_from_segments_params": {
+    "flip_x": true,
+    "global_steps_per_window": 1,
+    "step": 6,
+    "consensus_default_th": 10,
+    "consensus_limit_th": 2
+  }
+}

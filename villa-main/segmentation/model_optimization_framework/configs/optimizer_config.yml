@@ -1,0 +1,244 @@
+experiment_name: "optimizer_scheduler_tuning"
+base_trainer: "nnUNetTrainer"
+dataset_id: "Dataset003_sk-fibers_hzvt-augmented-2"
+configuration: "3d_fullres"
+fold: 0
+num_gpus: 1
+plans: "nnUNetResEncUNetLPlans"
+
+configurations:
+  - name: "lr_1e_3__Adam_CosAnneal_warmup"
+    optimizer:
+      type: "Adam"
+      params:
+        amsgrad: false
+        beta1: 0.9
+        beta2: 0.999
+        eps: 1e-8
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 5
+      weight_decay: 1e-5
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__Adam_CosAnneal"
+    optimizer:
+      type: "Adam"
+      params:
+        amsgrad: false
+        beta1: 0.9
+        beta2: 0.999
+        eps: 1e-8
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 5
+      weight_decay: 1e-5
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+  
+  - name: "lr_1e_3__Adam_Poly_warmup"
+    optimizer:
+      type: "Adam"
+      params:
+        amsgrad: false
+        beta1: 0.9
+        beta2: 0.999
+        eps: 1e-8
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 5
+      weight_decay: 1e-5
+    scheduler:
+      type: "PolyLR"
+      params:
+        exponent: 0.9
+        max_epochs: 150
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__Adam_Poly"
+    optimizer:
+      type: "Adam"
+      params:
+        amsgrad: false
+        beta1: 0.9
+        beta2: 0.999
+        eps: 1e-8
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 5
+      weight_decay: 1e-5
+    scheduler:
+      type: "PolyLR"
+      params:
+        exponent: 0.9
+        max_epochs: 150
+  
+  - name: "lr_1e_3__AdamW_CosAnneal_warmup"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 5
+      weight_decay: 1e-2
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__AdamW_CosAnneal"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 1e-2
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+  
+  - name: "lr_1e_3__AdamW_Poly_warmup"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 1e-2
+    scheduler:
+      type: "PolyLR"
+      params:
+        exponent: 0.9
+        max_epochs: 150
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__AdamW_Poly"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 1e-2
+    scheduler:
+      type: "PolyLR"
+      params:
+        exponent: 0.9
+        max_epochs: 150
+  
+  - name: "lr_2e_3__AdamW_CosAnneal_expWarmup_10"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.002
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 0.01
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "exponential"
+        epochs: 10
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__AdamW_CosAnneal_warmup_wd_1e_5"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 1e-5
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_1e_3__AdamW_CosAnneal_warmup_wd_2e_2"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.001
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 0.02
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "linear"
+        epochs: 5
+        start_factor: 0.001
+  
+  - name: "lr_3e_3__AdamW_CosAnneal_expWarmup_wd_5e_3_10"
+    optimizer:
+      type: "AdamW"
+      params:
+        amsgrad: true
+    params:
+      initial_lr: 0.003
+      num_epochs: 150
+      save_every: 15
+      weight_decay: 0.005
+    scheduler:
+      type: "CosineAnnealingLR"
+      params:
+        T_max: 150
+        eta_min: 1e-6
+      warmup:
+        type: "exponential"
+        epochs: 10
+        start_factor: 0.001
