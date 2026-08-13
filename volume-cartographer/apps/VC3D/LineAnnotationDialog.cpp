@@ -1090,10 +1090,6 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     const QString disabledToolTip =
         tr("Tags become editable once the fiber has been saved.");
     for (const auto& tag : knownTags) {
-        if (tag == vc3d::line_annotation::kTraceNeedsReviewTag) {
-            // Managed by the trace review workflow, not the generic pills.
-            continue;
-        }
         const QString tagText = QString::fromStdString(tag);
         const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
                             activeTags.end();

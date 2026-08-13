@@ -1,6 +1,7 @@
 #include "CFiberWidget.hpp"
 
 #include "FiberNameDisplay.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -46,11 +47,6 @@ enum FiberColumn {
     kInterpStatusColumn,
     kColumnCount,
 };
-
-// Managed by the trace review workflow (context menu / controller), never
-// by the generic tag checkboxes; keep the literal in sync with
-// kTraceNeedsReviewTag in LineAnnotationFiberSegments.hpp.
-constexpr const char* kReservedReviewTag = "interp_unreviewed";
 
 constexpr int kFiberIdRole = Qt::UserRole + 1;
 constexpr int kIsSpanRole = Qt::UserRole + 2;
@@ -495,8 +491,8 @@ QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
 
 QString CFiberWidget::statusTextForFiber(const FiberEntry& fiber)
 {
-    // Interpolation provenance only; the review state lives in the tags
-    // column (interp_unreviewed present = needs review).
+    // Interpolation provenance only; the human review verdict lives in the
+    // tags column as the ordinary 'reviewed' tag.
     switch (fiber.traceState) {
     case FiberEntry::TraceState::Predictions:
         return tr("predictions");
@@ -871,16 +867,10 @@ void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
 {
     _knownTags.clear();
     for (const auto& tag : tags) {
-        if (tag == kReservedReviewTag) {
-            continue;
-        }
         addUniqueSorted(_knownTags, tag);
     }
     for (const auto& fiber : _fibers) {
         for (const auto& tag : fiber.tags) {
-            if (tag == kReservedReviewTag) {
-                continue;
-            }
             addUniqueSorted(_knownTags, tag);
         }
     }
@@ -1062,11 +1052,24 @@ void CFiberWidget::rebuildTagList()
         return;
     }
 
+    // _knownTags is alphabetically sorted, but the review verdict tag is
+    // pinned to the top of the checkbox list and is always offered, even in
+    // a package where no fiber carries it yet.
+    const std::string reviewedTag{vc3d::line_annotation::kReviewedTag};
+    std::vector<std::string> orderedTags;
+    orderedTags.reserve(_knownTags.size() + 1);
+    orderedTags.push_back(reviewedTag);
+    for (const auto& tag : _knownTags) {
+        if (tag != reviewedTag) {
+            orderedTags.push_back(tag);
+        }
+    }
+
     auto checkboxes = tagCheckboxesInLayout(_tagListLayout);
-    bool canReuseCheckboxes = checkboxes.size() == _knownTags.size();
+    bool canReuseCheckboxes = checkboxes.size() == orderedTags.size();
     if (canReuseCheckboxes) {
-        for (size_t i = 0; i < _knownTags.size(); ++i) {
-            if (checkboxes[i]->text() != QString::fromStdString(_knownTags[i])) {
+        for (size_t i = 0; i < orderedTags.size(); ++i) {
+            if (checkboxes[i]->text() != QString::fromStdString(orderedTags[i])) {
                 canReuseCheckboxes = false;
                 break;
             }
@@ -1079,7 +1082,7 @@ void CFiberWidget::rebuildTagList()
             delete item;
         }
 
-        for (const auto& tag : _knownTags) {
+        for (const auto& tag : orderedTags) {
             const QString tagText = QString::fromStdString(tag);
             auto* checkbox = new QCheckBox(tagText, _tagListWidget);
             checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
@@ -1094,14 +1097,14 @@ void CFiberWidget::rebuildTagList()
 
     const FiberEntry* fiber = selectedFiber();
     const bool hasSelection = fiber != nullptr;
-    for (size_t i = 0; i < checkboxes.size() && i < _knownTags.size(); ++i) {
+    for (size_t i = 0; i < checkboxes.size() && i < orderedTags.size(); ++i) {
         QCheckBox* checkbox = checkboxes[i];
         if (!checkbox) {
             continue;
         }
         const QSignalBlocker blocker(checkbox);
         checkbox->setEnabled(hasSelection);
-        checkbox->setChecked(hasSelection && containsTag(fiber->tags, _knownTags[i]));
+        checkbox->setChecked(hasSelection && containsTag(fiber->tags, orderedTags[i]));
     }
 
     const bool canEditTags = hasSelection;
@@ -1238,55 +1241,12 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     auto* renameAction = createRenameFiberFileAction(&menu);
     menu.addAction(renameAction);
     menu.addSeparator();
-    const auto selectedForReview = selectedFiberIds();
-    const bool anyTraced = std::any_of(
-        selectedForReview.begin(), selectedForReview.end(),
-        [this](uint64_t id) {
-            const auto it = std::find_if(_fibers.begin(), _fibers.end(),
-                                         [id](const FiberEntry& fiber) {
-                                             return fiber.id == id;
-                                         });
-            return it != _fibers.end() &&
-                it->traceState != FiberEntry::TraceState::Legacy;
-        });
-    auto* markVerifiedAction = menu.addAction(
-        selectedForReview.size() > 1
-            ? tr("Mark %1 traces verified").arg(selectedForReview.size())
-            : tr("Mark trace verified"));
-    markVerifiedAction->setEnabled(anyTraced);
-    connect(markVerifiedAction, &QAction::triggered, this, [this]() {
-        requestMarkTraceReviewed(true);
-    });
-    auto* markNeedsReviewAction = menu.addAction(tr("Mark as needs review"));
-    markNeedsReviewAction->setEnabled(anyTraced);
-    connect(markNeedsReviewAction, &QAction::triggered, this, [this]() {
-        requestMarkTraceReviewed(false);
-    });
-    menu.addSeparator();
     auto* deleteAction = menu.addAction(tr("Delete"));
     deleteAction->setEnabled(canDeleteSelection());
     connect(deleteAction, &QAction::triggered, this, [this]() {
         requestDeleteSelectedFibers();
     });
     menu.exec(_treeView->viewport()->mapToGlobal(pos));
-}
-
-void CFiberWidget::requestMarkTraceReviewed(bool verified)
-{
-    std::vector<uint64_t> tracedIds;
-    for (const uint64_t id : selectedFiberIds()) {
-        const auto it = std::find_if(_fibers.begin(), _fibers.end(),
-                                     [id](const FiberEntry& fiber) {
-                                         return fiber.id == id;
-                                     });
-        if (it != _fibers.end() &&
-            it->traceState != FiberEntry::TraceState::Legacy) {
-            tracedIds.push_back(id);
-        }
-    }
-    if (!tracedIds.empty()) {
-        emit fiberTraceReviewChanged(tracedIds, verified);
-    }
 }
 
 void CFiberWidget::requestDeleteSelectedFibers()
