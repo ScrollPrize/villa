@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -92,15 +93,40 @@ struct ChunkRequestScheduler::Impl {
         BackgroundQueue::iterator background;
     };
 
+    struct TransferSample {
+        std::size_t bytes = 0;
+        std::chrono::steady_clock::time_point started;
+        std::chrono::steady_clock::time_point completed;
+    };
+
     explicit Impl(std::size_t workerCount,
                   std::size_t burst,
-                  std::shared_ptr<ChunkRequestSelectionGate> gate)
+                  std::shared_ptr<ChunkRequestSelectionGate> gate,
+                  std::optional<AdaptiveConcurrency> adaptiveConfig)
         : selectionGate(std::move(gate))
         , interactiveBurst(std::max<std::size_t>(1, burst))
+        , maximumWorkers(std::max<std::size_t>(1, workerCount))
     {
         if (!selectionGate)
             selectionGate = std::make_shared<ChunkRequestSelectionGate>();
-        workerCount = std::max<std::size_t>(1, workerCount);
+        workerCount = maximumWorkers;
+        if (adaptiveConfig) {
+            adaptive = true;
+            adaptiveConfig->minimum = std::clamp(
+                adaptiveConfig->minimum, std::size_t{1}, maximumWorkers);
+            adaptiveConfig->maximum = std::clamp(
+                adaptiveConfig->maximum, adaptiveConfig->minimum, maximumWorkers);
+            adaptiveConfig->successfulSamplesPerWorker = std::max<std::size_t>(
+                1, adaptiveConfig->successfulSamplesPerWorker);
+            adaptiveConfig->targetInFlightSeconds = std::max(
+                0.0, adaptiveConfig->targetInFlightSeconds);
+            adaptiveOptions = *adaptiveConfig;
+            admissionLimit = adaptiveOptions.minimum;
+        } else {
+            admissionLimit = maximumWorkers;
+            adaptiveOptions.minimum = maximumWorkers;
+            adaptiveOptions.maximum = maximumWorkers;
+        }
         workers.reserve(workerCount);
         for (std::size_t i = 0; i < workerCount; ++i) {
             workers.emplace_back([this](std::stop_token stop) { workerLoop(stop); });
@@ -165,6 +191,48 @@ struct ChunkRequestScheduler::Impl {
         return item;
     }
 
+    bool canSelectLocked() const
+    {
+        return (!gui.empty() || !background.empty()) &&
+               activeCount.load(std::memory_order_acquire) < admissionLimit;
+    }
+
+    void updateTransferEstimateLocked()
+    {
+        const std::size_t required = admissionLimit *
+            adaptiveOptions.successfulSamplesPerWorker;
+        if (required == 0 || transferSamples.size() < required)
+            return;
+
+        const auto first = transferSamples.end() -
+            static_cast<std::ptrdiff_t>(required);
+        auto earliestStart = first->started;
+        auto latestCompletion = first->completed;
+        std::size_t totalBytes = 0;
+        for (auto sample = first; sample != transferSamples.end(); ++sample) {
+            earliestStart = std::min(earliestStart, sample->started);
+            latestCompletion = std::max(latestCompletion, sample->completed);
+            totalBytes += sample->bytes;
+        }
+        const double elapsed = std::chrono::duration<double>(
+            latestCompletion - earliestStart).count();
+        if (elapsed <= 0.0 || totalBytes == 0)
+            return;
+
+        estimatedBytesPerSecond = static_cast<double>(totalBytes) / elapsed;
+        averageChunkBytes = static_cast<double>(totalBytes) /
+            static_cast<double>(required);
+        estimateSampleCount = required;
+        if (adaptive) {
+            const double rawLimit = estimatedBytesPerSecond *
+                adaptiveOptions.targetInFlightSeconds / averageChunkBytes;
+            const auto requested = static_cast<std::size_t>(
+                std::max(1.0, std::ceil(rawLimit)));
+            admissionLimit = std::clamp(
+                requested, adaptiveOptions.minimum, adaptiveOptions.maximum);
+        }
+    }
+
     void workerLoop(std::stop_token stop)
     {
         while (!stop.stop_requested()) {
@@ -172,7 +240,7 @@ struct ChunkRequestScheduler::Impl {
             {
                 std::unique_lock lock(mutex);
                 cv.wait(lock, [&] {
-                    return stop.stop_requested() || !gui.empty() || !background.empty();
+                    return stop.stop_requested() || canSelectLocked();
                 });
                 if (stop.stop_requested() && gui.empty() && background.empty())
                     return;
@@ -184,6 +252,8 @@ struct ChunkRequestScheduler::Impl {
                 std::unique_lock lock(mutex);
                 if (stop.stop_requested() && gui.empty() && background.empty())
                     return;
+                if (!canSelectLocked())
+                    continue;
                 item = popLocked();
                 if (!item)
                     continue;
@@ -199,6 +269,7 @@ struct ChunkRequestScheduler::Impl {
             item->task();
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
+            cv.notify_all();
             if (gui.empty() && background.empty() &&
                 activeCount.load(std::memory_order_acquire) == 0) {
                 idleCv.notify_all();
@@ -221,13 +292,23 @@ struct ChunkRequestScheduler::Impl {
     std::uint64_t nextSequence = 0;
     std::size_t consecutiveInteractive = 0;
     const std::size_t interactiveBurst;
+    const std::size_t maximumWorkers;
+    bool adaptive = false;
+    AdaptiveConcurrency adaptiveOptions;
+    std::size_t admissionLimit = 1;
+    std::deque<TransferSample> transferSamples;
+    double estimatedBytesPerSecond = 0.0;
+    double averageChunkBytes = 0.0;
+    std::size_t estimateSampleCount = 0;
 };
 
 ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
                                              std::size_t interactiveBurst,
-                                             std::shared_ptr<ChunkRequestSelectionGate> selectionGate)
+                                             std::shared_ptr<ChunkRequestSelectionGate> selectionGate,
+                                             std::optional<AdaptiveConcurrency> adaptiveConcurrency)
     : impl_(std::make_unique<Impl>(workers, interactiveBurst,
-                                  std::move(selectionGate)))
+                                  std::move(selectionGate),
+                                  std::move(adaptiveConcurrency)))
 {
 }
 
@@ -307,6 +388,36 @@ std::size_t ChunkRequestScheduler::pending() const
 std::size_t ChunkRequestScheduler::active() const noexcept
 {
     return impl_->activeCount.load(std::memory_order_relaxed);
+}
+
+void ChunkRequestScheduler::recordSuccessfulTransfer(
+    std::size_t encodedBytes,
+    std::chrono::steady_clock::time_point started,
+    std::chrono::steady_clock::time_point completed)
+{
+    if (encodedBytes == 0 || completed <= started)
+        return;
+    std::lock_guard lock(impl_->mutex);
+    impl_->transferSamples.push_back({encodedBytes, started, completed});
+    const std::size_t maximumSamples = impl_->adaptiveOptions.maximum *
+        impl_->adaptiveOptions.successfulSamplesPerWorker;
+    while (impl_->transferSamples.size() > maximumSamples)
+        impl_->transferSamples.pop_front();
+    const auto previousLimit = impl_->admissionLimit;
+    impl_->updateTransferEstimateLocked();
+    if (impl_->admissionLimit > previousLimit)
+        impl_->cv.notify_all();
+}
+
+ChunkRequestScheduler::TransferStats ChunkRequestScheduler::transferStats() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return {
+        impl_->admissionLimit,
+        impl_->estimatedBytesPerSecond,
+        impl_->averageChunkBytes,
+        impl_->estimateSampleCount,
+        impl_->adaptive};
 }
 
 void ChunkRequestScheduler::waitIdle()

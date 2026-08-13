@@ -83,6 +83,10 @@ public:
         // Local cache classification and CPU decoding use separate shared
         // pools.
         std::size_t maxConcurrentReads = 16;
+        // Dynamically admit between two and maxConcurrentReads source fetches
+        // using recent successful encoded-transfer bandwidth and chunk size.
+        // Explicit/batch callers remain fixed unless they opt in.
+        bool adaptiveConcurrentReads = false;
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
         // When set to a root registered with PersistentZarrCacheBudget, disk
@@ -326,7 +330,6 @@ private:
                            RemoteFetchActivityCallback> remoteFetchCallbacks_;
         std::unordered_set<ChunkKey, ChunkKeyHash> activeRemoteFetches_;
         std::size_t remoteFetchesInFlight_ = 0;
-        std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
@@ -423,7 +426,6 @@ private:
         std::filesystem::file_time_type cutoff);
     static std::optional<std::size_t> regularFileSize(const std::filesystem::path& path);
     static void addPersistentCacheBytesDelta(State& state, std::int64_t delta);
-    static void pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
     static void enforceCapacityLocked(const std::shared_ptr<State>& state);
     static std::optional<std::uint64_t> oldestDecodedTouch(

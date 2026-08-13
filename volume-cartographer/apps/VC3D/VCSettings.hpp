@@ -269,8 +269,9 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable. Interactive volume reads currently
-    // use two concurrent fetch/decode workers.
+    // IO thread count is not configurable. Interactive remote volume reads use
+    // adaptive 2-64 source fetches; local reads use two. Decode workers are
+    // managed separately.
 
 }
 

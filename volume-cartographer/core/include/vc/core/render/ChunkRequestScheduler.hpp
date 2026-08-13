@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace vc::render {
 
@@ -43,9 +45,25 @@ public:
     using TaskId = std::uint64_t;
     using TaskGroup = std::uint64_t;
 
+    struct AdaptiveConcurrency {
+        std::size_t minimum = 2;
+        std::size_t maximum = 64;
+        std::size_t successfulSamplesPerWorker = 4;
+        double targetInFlightSeconds = 0.25;
+    };
+
+    struct TransferStats {
+        std::size_t admissionLimit = 0;
+        double bytesPerSecond = 0.0;
+        double averageChunkBytes = 0.0;
+        std::size_t sampleCount = 0;
+        bool adaptive = false;
+    };
+
     explicit ChunkRequestScheduler(std::size_t workers,
                                    std::size_t interactiveBurst = 7,
-                                   std::shared_ptr<ChunkRequestSelectionGate> selectionGate = {});
+                                   std::shared_ptr<ChunkRequestSelectionGate> selectionGate = {},
+                                   std::optional<AdaptiveConcurrency> adaptiveConcurrency = {});
     ~ChunkRequestScheduler();
 
     ChunkRequestScheduler(const ChunkRequestScheduler&) = delete;
@@ -61,6 +79,11 @@ public:
 
     [[nodiscard]] std::size_t pending() const;
     [[nodiscard]] std::size_t active() const noexcept;
+    void recordSuccessfulTransfer(
+        std::size_t encodedBytes,
+        std::chrono::steady_clock::time_point started,
+        std::chrono::steady_clock::time_point completed);
+    [[nodiscard]] TransferStats transferStats() const;
     void waitIdle();
 
 private:

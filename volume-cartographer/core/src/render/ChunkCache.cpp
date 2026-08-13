@@ -24,7 +24,6 @@ namespace vc::render {
 
 namespace {
 
-constexpr auto kDownloadStatsWindow = std::chrono::seconds{3};
 constexpr std::size_t kPersistentWriteBacklogBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kPersistentProbeWorkers = 32;
 constexpr std::size_t kDecodeWorkers = 8;
@@ -140,13 +139,35 @@ struct ChunkCacheService::Impl {
 
     std::shared_ptr<ChunkRequestScheduler> fetchScheduler(std::size_t workers)
     {
+        return fetchScheduler(workers, false);
+    }
+
+    std::shared_ptr<ChunkRequestScheduler> fetchScheduler(
+        std::size_t workers, bool adaptive)
+    {
         workers = normalizedWorkerCount(workers);
+        if (adaptive) {
+            if (!adaptiveFetchScheduler) {
+                ChunkRequestScheduler::AdaptiveConcurrency options;
+                options.maximum = workers;
+                adaptiveFetchScheduler = std::make_shared<ChunkRequestScheduler>(
+                    workers, 7, schedulerSelectionGate, options);
+                adaptiveFetchWorkers = workers;
+            } else if (adaptiveFetchWorkers != workers) {
+                throw std::invalid_argument(
+                    "shared adaptive fetch scheduler worker count mismatch");
+            }
+            return adaptiveFetchScheduler;
+        }
         auto& scheduler = fetchSchedulers[workers];
         if (!scheduler)
             scheduler = std::make_shared<ChunkRequestScheduler>(
                 workers, 7, schedulerSelectionGate);
         return scheduler;
     }
+
+    std::shared_ptr<ChunkRequestScheduler> adaptiveFetchScheduler;
+    std::size_t adaptiveFetchWorkers = 0;
 };
 
 ChunkCacheService::ChunkCacheService(
@@ -277,7 +298,8 @@ ChunkCache::ChunkCache(std::shared_ptr<ChunkCacheService> service,
         std::move(options), sourceId, sourceIdentity);
     state_->probeScheduler_ = service_->impl_->probeScheduler;
     state_->fetchScheduler_ = service_->impl_->fetchScheduler(
-        state_->options_.maxConcurrentReads);
+        state_->options_.maxConcurrentReads,
+        state_->options_.adaptiveConcurrentReads);
     state_->decodeScheduler_ = service_->impl_->decodeScheduler;
     state_->schedulerSelectionGate_ = service_->impl_->schedulerSelectionGate;
     state_->activeViewId_ = service_->impl_->activeViewId;
@@ -694,15 +716,6 @@ ChunkCache::Stats ChunkCache::stats() const
     Stats result;
     {
         std::lock_guard lock(state->mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        pruneDownloadHistoryLocked(*state, now);
-
-        std::size_t recentBytes = 0;
-        for (const auto& [time, bytes] : state->remoteDownloadHistory_) {
-            (void)time;
-            recentBytes += bytes;
-        }
-
         if (state->options_.decodedByteBudget) {
             const auto budget = state->options_.decodedByteBudget->stats();
             result.decodedBytes = budget.decodedBytes;
@@ -712,9 +725,10 @@ ChunkCache::Stats ChunkCache::stats() const
             result.decodedByteCapacity = state->options_.decodedByteCapacity;
         }
         result.remoteFetchesInFlight = state->remoteFetchesInFlight_;
-        result.remoteDownloadBytesPerSecond =
-            static_cast<double>(recentBytes) /
-            std::chrono::duration<double>(kDownloadStatsWindow).count();
+        if (auto scheduler = state->fetchScheduler_.lock()) {
+            result.remoteDownloadBytesPerSecond =
+                scheduler->transferStats().bytesPerSecond;
+        }
         result.unresolvedFetchesByLevel = state->unresolvedFetchesByLevel_;
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
     }
@@ -972,7 +986,6 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
                                    state->activeRemoteFetches_.end());
         state->activeRemoteFetches_.clear();
         state->remoteFetchesInFlight_ = 0;
-        state->remoteDownloadHistory_.clear();
         std::fill(state->unresolvedFetchesByLevel_.begin(),
                   state->unresolvedFetchesByLevel_.end(), 0);
     }
@@ -1421,6 +1434,7 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
 
     ChunkFetchResult fetch;
     bool trackedRemoteFetch = false;
+    const auto fetchStarted = std::chrono::steady_clock::now();
     try {
         if (state->options_.persistentCachePath) {
             trackedRemoteFetch = true;
@@ -1464,12 +1478,13 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
             if (state->remoteFetchesInFlight_ > 0)
                 --state->remoteFetchesInFlight_;
             remoteActivityEnded = state->activeRemoteFetches_.erase(key) != 0;
-            if (fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty()) {
-                const auto now = std::chrono::steady_clock::now();
-                const std::size_t downloadedBytes = fetch.bytes.size();
-                state->remoteDownloadHistory_.emplace_back(now, downloadedBytes);
-                pruneDownloadHistoryLocked(*state, now);
-            }
+        }
+    }
+    if (fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty()) {
+        if (auto scheduler = state->fetchScheduler_.lock()) {
+            scheduler->recordSuccessfulTransfer(
+                fetch.bytes.size(), fetchStarted,
+                std::chrono::steady_clock::now());
         }
     }
     if (remoteActivityEnded)
@@ -2112,15 +2127,6 @@ void ChunkCache::addPersistentCacheBytesDelta(State& state, std::int64_t delta)
                 std::memory_order_acquire)) {
             return;
         }
-    }
-}
-
-void ChunkCache::pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now)
-{
-    const auto cutoff = now - kDownloadStatsWindow;
-    while (!state.remoteDownloadHistory_.empty() &&
-           state.remoteDownloadHistory_.front().first < cutoff) {
-        state.remoteDownloadHistory_.pop_front();
     }
 }
 

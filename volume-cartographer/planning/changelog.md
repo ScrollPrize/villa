@@ -2,6 +2,9 @@
 
 ## 2026-08-13
 
+- Added service-wide adaptive remote download admission from two to 64 fetches,
+  based on recent successful encoded-chunk bandwidth and chunk size; the status
+  bar now uses the same bandwidth estimate.
 - Corrected interactive fallback-range selection for generated surfaces by
   preventing their parameter-space camera scale from being compared with
   volume-voxel chunk extents; these views now request the bounded five-level

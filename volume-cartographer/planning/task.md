@@ -1,14 +1,18 @@
-# Task: fix fallback-level units for generated surfaces
+# Task: adaptive remote download parallelism
 
-Fix interactive fallback-range selection so viewport scale is compared with
-volume chunk extents only when it is expressed in pixels per level-0 volume
-voxel.
+Adapt normal interactive VC3D remote downloads to measured bandwidth and
+encoded chunk size.
 
-Plane views have that affine volume-space relationship. Generated,
-parameterized, and flattened surfaces do not: their camera scale is pixels per
-surface parameter unit. Those views must not use that value in volume-space
-chunk coverage calculations and should instead queue the bounded five-level
-fallback range.
+- Keep up to 64 source-fetch workers available.
+- Start at two admitted downloads.
+- Estimate bandwidth from the latest `parallelism * 4` successful encoded
+  chunk downloads.
+- Set the next parallelism to
+  `ceil(bandwidth * 0.25 seconds / average encoded chunk bytes)`, clamped to
+  `[2, 64]`.
+- Use the same estimate in the existing network status display.
+- Do not add exploratory concurrency changes.
+- Preserve fixed concurrency for explicit callers, tests, and prefill jobs.
 
-Preserve queue ordering, rendering, sampling, and the opt-in visual download
-overlay.
+Changing admission must not change chunk priority order, cache behavior,
+decoding, or rendered values.

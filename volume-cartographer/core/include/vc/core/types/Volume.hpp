@@ -305,7 +305,8 @@ protected:
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
     std::size_t cacheClientCount_ = 0;
-    int ioThreads_ = 0;  // 0 = use the two-worker interactive default
+    // 0 selects adaptive 2-64 remote reads and two fixed local reads.
+    int ioThreads_ = 0;
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
     // and rebuilding the codec registry on every chunk read. ZarrArray is

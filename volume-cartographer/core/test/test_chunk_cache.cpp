@@ -1501,6 +1501,113 @@ TEST_CASE("ChunkRequestScheduler orders level then active view then distance")
     CHECK(order == std::vector<int>{1, 5, 4, 6, 2, 3});
 }
 
+TEST_CASE("ChunkRequestScheduler adapts to encoded bandwidth and chunk size")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    ChunkRequestScheduler scheduler(64, 7, {}, adaptive);
+
+    CHECK(scheduler.transferStats().admissionLimit == 2);
+    const auto start = Clock::time_point{};
+    for (int sample = 0; sample < 8; ++sample) {
+        scheduler.recordSuccessfulTransfer(
+            chunkBytes, start, start + std::chrono::milliseconds(160));
+    }
+    const auto stats = scheduler.transferStats();
+    CHECK(stats.adaptive);
+    CHECK(stats.sampleCount == 8);
+    CHECK(stats.averageChunkBytes == doctest::Approx(double(chunkBytes)));
+    CHECK(stats.bytesPerSecond == doctest::Approx(100.0 * 1024.0 * 1024.0));
+    CHECK(stats.admissionLimit == 13);
+}
+
+TEST_CASE("ChunkRequestScheduler adaptive concurrency keeps its minimum at low bandwidth")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    ChunkRequestScheduler scheduler(64, 7, {}, adaptive);
+    const auto start = Clock::time_point{};
+    for (int sample = 0; sample < 8; ++sample) {
+        scheduler.recordSuccessfulTransfer(
+            chunkBytes, start, start + std::chrono::seconds(8));
+    }
+    CHECK(scheduler.transferStats().bytesPerSecond ==
+          doctest::Approx(2.0 * 1024.0 * 1024.0));
+    CHECK(scheduler.transferStats().admissionLimit == 2);
+
+    ChunkRequestScheduler fourMiB(64, 7, {}, adaptive);
+    for (int sample = 0; sample < 8; ++sample) {
+        fourMiB.recordSuccessfulTransfer(
+            chunkBytes, start, start + std::chrono::seconds(4));
+    }
+    CHECK(fourMiB.transferStats().bytesPerSecond ==
+          doctest::Approx(4.0 * 1024.0 * 1024.0));
+    CHECK(fourMiB.transferStats().admissionLimit == 2);
+}
+
+TEST_CASE("ChunkRequestScheduler adaptive concurrency clamps at 64")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    ChunkRequestScheduler scheduler(64, 7, {}, adaptive);
+    const auto start = Clock::time_point{};
+    for (int sample = 0; sample < 8; ++sample) {
+        scheduler.recordSuccessfulTransfer(
+            chunkBytes, start, start + std::chrono::milliseconds(10));
+    }
+    CHECK(scheduler.transferStats().admissionLimit == 64);
+}
+
+TEST_CASE("ChunkRequestScheduler adaptive admission starts only its current limit")
+{
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.maximum = 8;
+    ChunkRequestScheduler scheduler(8, 7, {}, adaptive);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    int started = 0;
+    for (std::uint64_t id = 1; id <= 8; ++id) {
+        scheduler.submit(id, {}, 1, 0, [&] {
+            std::unique_lock lock(mutex);
+            ++started;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        });
+    }
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(cv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return started == 2;
+        }));
+        CHECK(scheduler.active() == 2);
+        CHECK(scheduler.transferStats().admissionLimit == 2);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+}
+
+TEST_CASE("ChunkRequestScheduler fixed concurrency ignores transfer samples")
+{
+    using Clock = std::chrono::steady_clock;
+    ChunkRequestScheduler scheduler(4);
+    for (int sample = 0; sample < 16; ++sample) {
+        scheduler.recordSuccessfulTransfer(
+            2ULL * 1024ULL * 1024ULL, Clock::time_point{},
+            Clock::time_point{} + std::chrono::milliseconds(320));
+    }
+    const auto stats = scheduler.transferStats();
+    CHECK_FALSE(stats.adaptive);
+    CHECK(stats.admissionLimit == 4);
+    CHECK(stats.sampleCount == 16);
+    CHECK(stats.bytesPerSecond ==
+          doctest::Approx(100.0 * 1024.0 * 1024.0));
+}
+
 TEST_CASE("ChunkRequestScheduler publishes shared priority updates atomically")
 {
     auto gate = std::make_shared<ChunkRequestSelectionGate>();

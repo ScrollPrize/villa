@@ -1735,7 +1735,14 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
         vc::render::ChunkCache::Options options;
         options.decodedByteCapacity = cacheBudgetHot_;
         options.decodedByteBudget = decodedCacheBudget_;
-        options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 2;
+        if (ioThreads_ > 0) {
+            options.maxConcurrentReads = static_cast<std::size_t>(ioThreads_);
+        } else if (isRemote_) {
+            options.maxConcurrentReads = 64;
+            options.adaptiveConcurrentReads = true;
+        } else {
+            options.maxConcurrentReads = 2;
+        }
         chunkedCache_ = createChunkCacheConfigured(
             std::move(options), chunkCacheService_);
         if (!chunkedCache_) {
@@ -1748,14 +1755,16 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
     vc::render::ChunkCache::Options options) const
 {
-    std::shared_ptr<vc::render::ChunkCacheService> service;
     {
         std::lock_guard<std::mutex> lock(cacheMutex_);
         if (!options.decodedByteBudget)
             options.decodedByteBudget = decodedCacheBudget_;
-        service = chunkCacheService_;
     }
-    return createChunkCacheConfigured(std::move(options), std::move(service));
+    // Explicit cache creation is used by bounded prefill/redownload jobs. Keep
+    // its source scheduler private so its requested fixed concurrency cannot
+    // reuse or alter the shared interactive source scheduler. The decoded-byte
+    // budget above remains shared.
+    return createChunkCacheConfigured(std::move(options), {});
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(

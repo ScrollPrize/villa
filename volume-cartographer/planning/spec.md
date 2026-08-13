@@ -84,8 +84,24 @@
 - Regular chunk work passes through three shared pending queues. A 32-worker
   local probe queue classifies persistent data, empty markers, and misses using
   filesystem metadata only. Cache hits enter an eight-worker CPU read/decode
-  queue; misses enter the remote source-read queue, whose concurrency is set by
-  `maxConcurrentReads`. Successful source reads then enter the decode queue.
+  queue; misses enter the remote source-read queue. Successful source reads
+  then enter the decode queue.
+- Normal interactive remote source reads use 64 available workers with a
+  dynamic admission limit initially set to two. After the latest
+  `current_limit * 4` successful encoded chunk transfers are available, the
+  controller measures aggregate bandwidth as their total encoded bytes divided
+  by the interval from their earliest start to latest completion. It computes
+  average encoded chunk size from the same samples and selects
+  `ceil(bandwidth * 0.25 seconds / average_chunk_bytes)`, clamped to `[2,64]`.
+  Failed and missing reads are excluded. A new larger limit is held until its
+  larger sample window is complete. The controller intentionally performs no
+  exploratory increases, so a low current limit may underestimate latent
+  bandwidth.
+- Adaptive admission is service-wide for normal remote rendering and changes
+  only how many source tasks may start; it does not alter pending-task priority.
+  A decrease does not cancel running work. Explicit `maxConcurrentReads`
+  callers, tests, prefill operations, and local volumes retain fixed
+  concurrency.
 - Each queue uses the work-conserving 7:1 interactive/background admission
   policy. Current view-relative priority is recalculated at every stage handoff,
   and atomic view-demand publication reprioritizes pending work in all three
@@ -118,6 +134,10 @@ During active remote downloads, the existing cache status bar appends:
 - The queue item is shown only for remote volumes while remote fetches are in
   flight. Remote volumes otherwise show `net idle`; local volumes have no
   network field.
+- The displayed MiB/s is the adaptive controller's aggregate successful-chunk
+  estimate over its current `parallelism * 4` sample window, not a fixed-time
+  status polling window. The `Nx` value remains the actual current number of
+  source fetches in flight.
 - The full active status is
   `RAM X/Y disk X/Y GiB net Nx XMiB/s qK X/Y/Z Z sens: N.N`.
 
