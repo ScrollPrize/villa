@@ -1352,7 +1352,6 @@ void SurfaceCache::requestView(int startLevel,
     viewTiles.reserve(tileCount);
     candidates.reserve(tileCount);
 
-    bool viewChanged = false;
     {
         std::lock_guard lock(_state->mutex);
         if (_state->shuttingDown)
@@ -1380,17 +1379,9 @@ void SurfaceCache::requestView(int startLevel,
                 candidates.push_back({key, std::hypot(tileU - uCenter, tileV - vCenter)});
             }
         }
-        viewChanged = _state->viewTiles != viewTiles;
         _state->viewTiles = std::move(viewTiles);
         _state->viewGeneration = viewGeneration;
     }
-
-    // Smaller volume chunks make a tile's dependency list large, so keeping
-    // unresolved batches from old pans would otherwise grow the fetch queue
-    // without bound. This legacy supersession path is disabled when the cache
-    // shares the application's regular chunk source.
-    if (viewChanged && _state->options.supersedeChunkRequests)
-        _state->volume->beginViewRequest(/*discardPending=*/true);
 
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });

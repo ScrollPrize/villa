@@ -60,10 +60,6 @@ public:
         // steps. VC_SURFACE_ADMISSION_PAGE_BYTES overrides.
         std::size_t admissionPageBytes = 64ULL << 20;
         vc::Sampling sampling = vc::Sampling::Trilinear;
-        // True only when this cache owns its backing chunk array exclusively.
-        // A changed viewport then discards unresolved dependencies from the
-        // previous view instead of accumulating stale small-chunk fetches.
-        bool supersedeChunkRequests = false;
         // Share one coords/normals tile cache with a second SurfaceCache over
         // the same surface (the overlay channel) so each tile's gen() runs
         // once and fills both. Created privately when null.
