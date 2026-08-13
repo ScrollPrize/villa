@@ -178,6 +178,18 @@ def resample_label_to_image_grid(
     of the image patch (much smaller than the image patch itself when the
     image voxel size is finer than the label voxel size, which is the
     typical fibers setting).
+
+    Some physical-truth label arrays are zarr-chunk-padded past the volume
+    they describe: the array shape is rounded up to a chunk multiple, so it
+    can exceed the labelled volume's extent by up to one chunk per axis. The
+    padded region reads as sparse ``fill_value`` (typically 0) rather than
+    being marked invalid, so nothing here distinguishes "outside the
+    labelled volume" from "inside it, but empty" -- callers that need that
+    distinction must track the volume's true extent themselves. For
+    PHerc1203's ``labels1203_L1.zarr`` (label array ``[2016, 3456, 3456]``
+    against a volume L1 grid of ``[9489, 3422, 3422]``), the valid region is
+    ``y, x < 3422`` and the z-to-label mapping is
+    ``label_z = volume_L0_z / 2 - 3936``. See #1407.
     """
     label_shape = tuple(labels_array.shape[-3:])
     start, stop = image_patch_label_aabb(
