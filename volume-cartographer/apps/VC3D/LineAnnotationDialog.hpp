@@ -500,6 +500,10 @@ private:
     double _currentCutNormalOffsetVx = 0.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
+    // Set when a landing's full rebuild already covered the refresh that the
+    // coalesced overlaysUpdated callback was queued for; the callback consumes
+    // the flag and skips its (otherwise redundant) second full pass.
+    bool _queuedGeneratedOverlayRefreshCovered = false;
     bool _syncingStripCameras = false;
     std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
     QPointer<CChunkedVolumeViewer> _linkedCursorSource;

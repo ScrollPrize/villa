@@ -1411,6 +1411,13 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 _generatedOverlayRefreshQueued = false;
+                if (_queuedGeneratedOverlayRefreshCovered) {
+                    // A landing's rebuildGeneratedOverlays(true) already did
+                    // this refresh (including the intersection request whose
+                    // preparation is the expensive part).
+                    _queuedGeneratedOverlayRefreshCovered = false;
+                    return;
+                }
                 if (_arrowPanDirection != 0) {
                     // During a keyboard pan every tick already rebuilds the
                     // dynamic overlays (via setCurrentLinePosition), so only
@@ -1499,6 +1506,7 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
     _linkedCursorSource.clear();
     _pendingLinkedCursorPoint.reset();
     _generatedOverlayRefreshQueued = false;
+    _queuedGeneratedOverlayRefreshCovered = false;
 }
 
 void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
@@ -2650,6 +2658,10 @@ void LineAnnotationDialog::finishArrowPan(double position)
     // current-cut overlay and span labels), and the side-strip intersection
     // refresh the pan ticks deferred.
     rebuildGeneratedOverlays(true);
+    // The camera apply above queued the coalesced refresh callback; this pass
+    // just did that work, so let the callback consume itself instead of
+    // repeating the full rebuild (and the intersection preparation).
+    _queuedGeneratedOverlayRefreshCovered = _generatedOverlayRefreshQueued;
     _arrowPanEndedByLanding = true;
 }
 
