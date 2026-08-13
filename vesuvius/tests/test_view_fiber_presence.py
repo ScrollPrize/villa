@@ -116,6 +116,8 @@ def _write_nonfailure_replay(tmp_path):
         "termination_reason": "reference_end",
         "reference_points_base_xyz": [[0, 0, 0], [8, 0, 0]],
         "trace_points_base_xyz": [[0, 0, 0], [4, 0, 0]],
+        "comparison_trace_points_base_xyz": [[0, 0, 0], [4, 0, 0]],
+        "comparison": None,
         "trace_cumulative_losses": [0.0, 1.0],
         "matching": {
             "failure_threshold_base_voxels": 20.0,
@@ -129,6 +131,7 @@ def _write_nonfailure_replay(tmp_path):
         },
         "failure_trace_point_index": None,
         "failure_reference_arc_base": None,
+        "fiberlet_replay": None,
         "tube": None,
         "volume_crop_base_xyzwhd": None,
         "artifacts": {
@@ -154,11 +157,22 @@ def test_loads_strict_nonfailure_replay_bundle(tmp_path):
     assert replay.crop_xyzwhd == (0, 0, 0, 9, 1, 1)
     assert replay.prediction_shape_zyx == (4, 4, 4)
     np.testing.assert_array_equal(replay.reference_zyx, [[0, 0, 0], [0, 0, 8]])
+    np.testing.assert_array_equal(replay.trace_zyx, [[0, 0, 0], [0, 0, 4]])
     assert replay.anchors_obj is None
     assert replay.anchor_cells_obj is None
     assert replay.failure_zyx is None
     assert replay.tube_radius_base_voxels is None
     assert replay.fiber_manifest_content_hash == "fnv1a64:1"
+
+
+def test_nonfailure_replay_rejects_comparison_window(tmp_path):
+    path = _write_nonfailure_replay(tmp_path)
+    bundle = json.loads(path.read_text())
+    bundle["comparison"] = {}
+    path.write_text(json.dumps(bundle))
+
+    with pytest.raises(ValueError, match="comparison metadata"):
+        load_fiber_replay_bundle(path)
 
 
 def _reload_fixture():
@@ -199,6 +213,8 @@ def _reload_fixture():
         fiber_manifest_content_hash="fnv1a64:prediction",
         reference_zyx=path,
         trace_zyx=path,
+        fiberlet_replay_status=None,
+        fiberlet_route_zyx=None,
         failure_zyx=np.asarray([[0.0, 0.0, 2.0]]),
         tube_radius_base_voxels=8.0,
         anchors_obj=Path("anchors.obj"),
@@ -233,10 +249,21 @@ def test_replay_reload_compatibility_allows_changed_positive_counts():
     validate_replay_reload_compatibility(
         replay, artifacts, replay, replacement_artifacts
     )
-
     assert replay_visual_topology(replay, artifacts) == replay_visual_topology(
         replay, replacement_artifacts
     )
+
+
+def test_replay_reload_rejects_changed_graph_route_layer_topology():
+    replay, artifacts = _reload_fixture()
+    graph_replay = replace(
+        replay,
+        fiberlet_replay_status="graph_exhausted",
+        fiberlet_route_zyx=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+    )
+
+    with pytest.raises(ValueError, match="visual layer topology"):
+        validate_replay_reload_compatibility(replay, artifacts, graph_replay, artifacts)
 
 
 def test_replay_reload_rejects_prediction_source_and_stage_topology_changes():

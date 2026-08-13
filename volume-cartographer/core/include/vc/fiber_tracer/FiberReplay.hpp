@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
@@ -40,10 +41,28 @@ struct FiberReplayTube {
     const FiberPredictionGridInfo& grid,
     int anchorCellSizePredictionVoxels);
 
+struct FiberReplayComparisonWindow {
+    double requestedHalfExtentBaseVoxels = 0.0;
+    double effectiveHalfExtentBaseVoxels = 0.0;
+    double referenceBeginArcBase = 0.0;
+    double referenceEndArcBase = 0.0;
+    double traceBeginArcBase = 0.0;
+    double traceFailureArcBase = 0.0;
+    double traceEndArcBase = 0.0;
+};
+
+[[nodiscard]] FiberReplayComparisonWindow makeFiberReplayComparisonWindow(
+    const PolylineArcGeometry& reference,
+    double failureReferenceArcBase,
+    const PolylineArcGeometry& trace,
+    size_t failureTracePointIndex,
+    double requestedHalfExtentBaseVoxels);
+
 struct FiberReplayBundleInput {
     FiberReplayTraceRequest request;
     FiberReplayTraceResult replay;
     std::vector<cv::Vec3d> referenceGeometryBase;
+    std::optional<FiberReplayComparisonWindow> comparison;
     std::optional<FiberReplayTube> tube;
     nlohmann::json sources;
     nlohmann::json traceBinding;
@@ -54,6 +73,9 @@ struct FiberReplayBundleInput {
     std::optional<FiberAnchorArtifactInfo> anchorArtifact;
     std::optional<FiberletPathReport> paths;
     std::optional<FiberletArtifactInfo> pathArtifact;
+    std::optional<FiberletGraphReplayResult> graphReplay;
+    std::optional<FiberletGraphReplayConfig> graphReplayConfig;
+    bool graphReplayRequested = false;
 };
 
 [[nodiscard]] nlohmann::json writeFiberReplayBundle(

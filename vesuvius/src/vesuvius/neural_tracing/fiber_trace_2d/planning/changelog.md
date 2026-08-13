@@ -1,3 +1,18 @@
+# 2026-08-13: fiberlet graph replay
+
+- Expanded integer-DP candidate generation from the radius-four shell to every
+  shorter cell offset within the same outer bound and added a strict 25-degree
+  sampled-fiber-direction feasibility constraint.
+- Added deterministic bidirectional fiberlet graphs with strict 45-degree
+  anchor joins and loss-density beam routing with anchor-level lookahead.
+- Added `fiberlet-replay`, shared variable-step reference matching, strict
+  graph/route artifacts, and an independent reloadable napari route layer.
+- Unified reference, greedy, and fiberlet longitudinal comparison scope under
+  `--along`; greedy postroll and exact display cropping now derive from it.
+- Fiberlet graph replay now completes the edge containing its first distance
+  failure and continues for anchor-bounded `--along` postroll, with explicit
+  complete/truncated distances, overshoot/shortfall, and whole-edge identities.
+
 # 2026-08-12: narrower independent anchor NMS
 
 - Decoupled transverse anchor NMS from the peak-refinement window and reduced

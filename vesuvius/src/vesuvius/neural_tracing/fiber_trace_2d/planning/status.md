@@ -1,10 +1,21 @@
-# Status: reduce fiber-anchor NMS radii
+# Status: fiberlet graph replay
 
 - [x] Record the task.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Add independent transverse NMS configuration.
-- [x] Update strict artifact plumbing and CLI reporting.
-- [x] Add focused regression tests.
+- [x] Generate all shorter-distance fiberlet pairs.
+- [x] Enforce the hard sampled-fiber DP constraint.
+- [x] Build and serialize the fiberlet graph.
+- [x] Implement beam/lookahead graph replay.
+- [x] Publish and visualize the fiberlet route.
+- [x] Add focused C++ and Python regression tests.
 - [x] Update specs, documentation, changelog, and task log.
 - [x] Build and run focused validation with `-j32`.
+- [x] Unify reference, greedy, and fiberlet comparison extents under `--along`.
+- [x] Rebuild and rerun focused validation for the unified extent.
+- [x] Record and plan fiberlet graph postroll.
+- [x] Complete independent review of graph postroll plan.
+- [x] Continue graph routing after first distance failure.
+- [x] Persist and strictly validate graph postroll metadata.
+- [x] Add complete/truncated graph postroll tests.
+- [x] Rebuild and run focused validation with `-j32`.

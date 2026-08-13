@@ -184,8 +184,9 @@ and cache-first behavior as the anchor command. Fiber directions and regular
 Lasagna normals are distinct: the fiber manifest's `nx/ny` are never treated as
 surface normals.
 
-Target cells are selected from the integer shell
-`radius-0.5 <= length(cell_offset) < radius+0.5`; the initial radius is four.
+Target cells are selected from the filled integer neighborhood
+`0 < length(cell_offset) < radius+margin`; the initial radius is four and the
+margin is 0.5.
 Endpoint axes must agree with their chord within 45 degrees. Every surviving
 pair is solved independently, so an anchor can currently participate in many
 paths.
@@ -220,14 +221,22 @@ candidates reports `0/0`, 100 percent, and zero ETA. Progress is operational
 output and does not affect stdout or artifacts.
 
 `--corridor-radius` is measured in base voxels. If omitted, it defaults to one
-anchor-cell width. Cell radius and shell width remain dimensionless cell-lattice
-parameters.
+anchor-cell width. Cell radius and neighborhood margin remain dimensionless
+cell-lattice parameters.
 
-The path graph contains only integer stored-prediction voxels. Exact sub-voxel
+The DP graph contains only integer stored-prediction voxels. Exact sub-voxel
 anchors are virtual endpoints connected through nearby integer voxels. A
 cubic-Hermite reference bounds the corridor, and 26-neighbour moves must have
 strictly positive chord progress. DP state retains the incoming move, allowing
 one-step curvature without a cumulative history state.
+
+Every integer-lattice move must have an unoriented angle strictly below 25
+degrees to the dense fiber-prediction axis sampled at its destination. Virtual
+subvoxel-anchor attachments remain governed by the endpoint-axis constraint;
+applying the lattice gate there would make valid half-voxel anchors unreachable
+through quantization alone. Invalid fiber predictions cannot admit lattice
+edges. This hard gate is independent of the Lasagna surface normal, which
+remains used only for curvature.
 
 Valid-data scoring uses the regular native tracer's multiplicative local
 alignment loss. It multiplies presence by six positive-clamped dots among the
@@ -243,13 +252,12 @@ predictions; sink presence is one. Curvature uses the native tracer's shared
 Lasagna-normal tangent-plane/normal-tilt split, with isotropic fallback for an
 invalid normal. Its 45-degree free angle remains the integer-lattice adaptation.
 Cumulative history smoothness remains excluded from the DP state. Invalid
-destination predictions pay only the finite default cost of 4 per prediction
-voxel plus curvature, allowing short gaps to be bridged. On leaving a gap, the
-incoming step substitutes for the unavailable current prediction.
+destination predictions are rejected by the hard direction gate. The
+independent Lasagna normal still uses isotropic curvature fallback when invalid.
 
 The command writes:
 
-- `fiberlets.json`: every shell pair, rejection/failure reason, objective
+- `fiberlets.json`: every neighborhood pair, rejection/failure reason, objective
   breakdown, and successful base-coordinate polyline, plus per-successful-path
   length and loss/quality visualization metadata.
 - `fiberlets.obj`: one named successful polyline per group in base coordinates,
@@ -366,32 +374,82 @@ volume-cartographer/build/bin/vc_fiberlets fiber-replay \
   --normal-manifest /path/to/lasagna.lasagna.json
 ```
 
+`fiberlet-replay` first runs the same greedy failure locator and failure-tube
+extraction, then constructs a graph from every accepted fiberlet and traces
+through that graph:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
+  /path/to/fiber.lasagna.json \
+  /path/to/reference-fiber.json \
+  /tmp/fiberlet-replay \
+  --normal-manifest /path/to/lasagna.lasagna.json \
+  --beam 16 \
+  --lookahead 3
+```
+
+Each accepted fiberlet is an undirected edge with exact forward and reverse
+arcs. A directed transition through a shared anchor exists only when the angle
+between the incoming and outgoing dense endpoint tangents is strictly below 45
+degrees. The deterministic receding-horizon beam search ranks accumulated loss
+per prediction-grid path length, prevents node cycles, and commits one edge at
+a time. It uses the same monotone exact reference matcher as greedy replay, but
+advances it by each actual dense fiberlet segment length. The first route point
+whose error is strictly above `--fail` is recorded as the failure, but its edge
+is completed. Routing then continues through whole fiberlets until the first
+anchor at or beyond the `--along` postroll distance, or until no admissible
+continuation remains.
+
 The command reports start/completion and elapsed time for trace setup, tracing,
 tube selection, anchor extraction, fiberlet tracing, and publication. Anchor
 fitting reports selected-cell and NMS-context progress with ETA once per second;
 fiberlet DP reports candidate-search progress and ETA with the same cadence.
+The final `fiberlet-replay` summary reports `fiberlet_stop_reason` and compares
+`greedy_reference_progress_base_voxels` with
+`fiberlet_reference_progress_base_voxels`. Both are reference arclength within
+the same extracted failure interval: greedy progress runs from the interval
+beginning to its first failed match, while fiberlet progress runs from its first
+to last graph-route match.
+The same line reports `fiberlet_postroll_base_voxels=completed/requested`.
+`failure_with_postroll` ends at an anchor after reaching the request;
+`failure_truncated` also ends at an anchor but reports graph or comparison-
+interval exhaustion before the requested routed distance.
+
+`--along 128` is the one longitudinal comparison control. It selects the
+reference interval before and after failure, supplies the fiberlet graph search
+interval, and derives enough nominal greedy postroll steps to cover the same
+post-failure distance. The full greedy result remains in bundle diagnostics,
+while the greedy OBJ and napari layer are clipped by exact trace arclength.
+After tracing, the effective symmetric half-extent is the minimum arclength
+actually available on all four reference/greedy sides. That one value defines
+both displayed intervals and the graph search interval. A genuinely early
+termination therefore narrows every comparison interval rather than padding
+one trajectory.
 
 All distances are base voxels. The correspondence cursor advances monotonically.
 Each step predicts one nominal trace step along the reference, then computes the
 exact closest point in the bounded forward interval. `--match-refine 1` permits
 zero through two nominal steps of forward reference advance. The first distance
-strictly above `--fail 20` is the failure point; `--after 100` retains that many
-additional native greedy steps. Exhaustive statuses distinguish a complete or
-truncated failure, reference completion without failure, and native termination
-before failure.
+strictly above `--fail 20` is the failure point. The command retains
+`ceil(along / effective_trace_step_base)` additional native greedy steps.
+Exhaustive statuses distinguish a complete or truncated failure, reference
+completion without failure, and native termination before failure.
 
-For failures, `--along 512` selects that much dense-reference arclength on each
-side and `--radius 128` defines an exact Euclidean tube including endpoint caps.
+For failures, `--along 128` selects that much dense-reference arclength on each
+side and `--radius 64` defines an exact Euclidean tube including endpoint caps.
 Anchor cells are selected when their prediction-sample footprint intersects the
 tube. Refined anchors are rejected outside the tube before NMS. Fiberlet virtual
 endpoints and integer DP nodes are also tube constrained, and their scoring data
 uses the sparse replay preload. No central textured slice OBJ is produced.
+`reference_end` from graph replay means the route reached the end of this
+extracted interval, not necessarily the end of the original reference fiber.
 
 Each run is published under `runs/<content-hash>/`; only after the complete
 generation exists is `fiber_replay.json` atomically replaced. The bundle stores
 the two independent trace/canonical scale bindings, requested and forced-effective
 trace configurations, matching diagnostics, reference/trace/failure geometry,
-tube cells, crop, relative artifact paths, and content hashes. It deliberately
+tube cells, crop, requested/effective comparison extents and arc bounds,
+relative artifact paths, and content hashes. It deliberately
 does not store the external presence-Zarr path.
 
 Load the bundle and the independently selected presence Zarr with:
@@ -405,8 +463,9 @@ python -m vesuvius.scripts.view_fiber_presence \
 Replay mode rejects manual crop/anchor/path arguments and verifies the external
 Zarr shape and scale. It strictly validates bundle paths, containment, hashes,
 status-specific artifacts, and OBJ equality with authoritative JSON geometry.
-Reference, greedy trace, failure, anchors, fiberlets, and presence are separate
-toggleable layers. Cell centers and their retained-anchor displacement lines are
+Reference, greedy trace, fiberlet graph route, failure, anchors, fiberlets, and
+presence are separate toggleable layers. The route layer is independent of the
+fiberlet-radius display filter. Cell centers and their retained-anchor displacement lines are
 also separate layers loaded from `anchor_cells.obj`, so zero-anchor cells remain
 visible. The five anchor-stage JSON files are validated as one lineage chain and
 shown as distinct colored line layers. The NMS layer is visible initially;
@@ -434,8 +493,8 @@ Fiberlet paths and the presence mask are independent of this control.
 Use `Reload artifacts` after regenerating the replay output. The viewer rereads
 the original root `fiber_replay.json`, so atomic publication automatically
 selects the newest hashed generation. It updates reference, greedy trace,
-failure marker, final anchors, every anchor stage, cell centers, refinement
-offsets, and fiberlets in their existing layers. Empty layers are retained and
+failure marker, fiberlet graph route, final anchors, every anchor stage, cell
+centers, refinement offsets, and fiberlets in their existing layers. Empty layers are retained and
 can become populated, or vice versa, during reload.
 
 Reload does not reopen or reload the presence Zarr. It retains the exact lazy
@@ -447,7 +506,7 @@ extraction radius, and five-stage contract. A mismatch or malformed/hash-racing
 publication is reported without replacing the current display; change the Zarr
 or crop by restarting the viewer.
 
-This is an overcomplete diagnostic collection. There is no path-quality cutoff,
-degree selection, overlap deduplication, extension, H/V or winding assignment,
-or final graph construction yet. Inspect the OBJ on a small crop before using
-the output for later graph work.
+This remains an overcomplete diagnostic collection. There is no path-quality
+cutoff, degree selection, overlap deduplication, extension, H/V, or winding
+assignment. `fiberlet-replay` additionally builds the experimental graph and
+publishes its selected route for comparison with the greedy trace.

@@ -32,8 +32,9 @@ struct FiberletAnchorId {
 
 struct FiberletPathConfig {
     int cellRadius = 4;
-    double shellHalfWidthCells = 0.5;
+    double neighborhoodMarginCells = 0.5;
     double maximumEndpointAngleDegrees = 45.0;
+    double maximumPredictionDeviationDegrees = 25.0;
     double corridorRadiusPredictionVoxels = 0.0;
     double invalidPredictionCostPerVoxel = 4.0;
     double smoothnessWeight = 2.0;
@@ -131,8 +132,8 @@ using FiberStoredPresenceBatchSampler =
 
 struct FiberletPathDiagnostics {
     size_t occupiedAnchors = 0;
-    size_t shellOffsets = 0;
-    size_t shellTargetsOutOfGrid = 0;
+    size_t neighborhoodOffsets = 0;
+    size_t neighborhoodTargetsOutOfGrid = 0;
     size_t generatedPairs = 0;
     size_t zeroLengthPairs = 0;
     size_t axisRejectedPairs = 0;
@@ -179,7 +180,9 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
 
 [[nodiscard]] LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path);
 
-[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellShellOffsets(int radius, double halfWidth);
+[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(
+    int radius,
+    double margin);
 
 [[nodiscard]] FiberletPathReport traceFiberletPaths(
     const LoadedFiberAnchorArtifact& anchors,

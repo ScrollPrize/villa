@@ -188,4 +188,29 @@ double distanceToPolylineArc(
     return projectPointToPolylineArc(geometry, point, beginArc, endArc).distance;
 }
 
+ForwardPolylineMatch matchForwardPolylinePoint(
+    const PolylineArcGeometry& geometry,
+    const cv::Vec3d& point,
+    double previousArc,
+    double expectedAdvance,
+    double refineAdvanceFactor)
+{
+    if (!std::isfinite(previousArc) || !(expectedAdvance > 0.0) ||
+        !std::isfinite(expectedAdvance) || !(refineAdvanceFactor >= 0.0) ||
+        !std::isfinite(refineAdvanceFactor)) {
+        throw std::invalid_argument("forward polyline match input is invalid");
+    }
+    const double begin = std::clamp(previousArc, 0.0, geometry.length());
+    const double predicted = std::min(
+        geometry.length(), begin + expectedAdvance);
+    const double end = std::min(
+        geometry.length(), predicted + refineAdvanceFactor * expectedAdvance);
+    return {
+        predicted,
+        begin,
+        end,
+        projectPointToPolylineArc(geometry, point, begin, end),
+    };
+}
+
 } // namespace vc::fiber_tracer

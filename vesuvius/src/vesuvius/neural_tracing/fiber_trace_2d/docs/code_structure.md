@@ -2509,7 +2509,7 @@ threads.
 
 `volume-cartographer/core/src/fiber_tracer/FiberAnchors.cpp` extracts the
 versioned cell-anchor artifact. `FiberPaths.cpp` strictly reloads that artifact,
-enumerates fixed-radius cell-shell pairs, and solves integer prediction-voxel
+enumerates filled-radius cell-neighborhood pairs, and solves integer prediction-voxel
 paths. `FiberLocalScoring.cpp` owns the local isotropic and Lasagna-normal split
 smoothness equations shared by the native greedy tracer and fiberlet DP.
 
@@ -2600,7 +2600,9 @@ property, and explicit display width while physically removing complete
 out-of-radius paths. Reload recomputes distances and reapplies all three current
 radii without using the extraction-tube radius as a display default.
 
-`FiberPaths.cpp` first generates all candidates in canonical order. It unions
+`FiberPaths.cpp` first generates all candidates in canonical order from every
+nonzero integer cell offset inside the configured outer radius plus margin, so
+shorter anchor pairs and the old outer-radius pairs are searched together. It unions
 their clipped Hermite-corridor and virtual-attachment bounds into one enclosing
 ZYX box, then batch-loads an immutable dense scoring volume containing exact
 fiber predictions and Lasagna normal vector/validity. A fixed worker pool solves
@@ -2608,6 +2610,21 @@ candidate indices concurrently and writes results only to the corresponding
 preallocated slots. Sampling completes before workers start, so DP has no
 nested decoder or normal-sampler parallelism; a final serial pass derives
 diagnostics and preserves deterministic artifact order.
+Each nonzero DP transition is first gated against the destination-side dense
+fiber prediction and must have an unoriented angle strictly below 25 degrees to
+that axis. Lasagna normals remain separate and affect only the existing local
+curvature split; an invalid Lasagna normal uses isotropic curvature fallback.
+
+`FiberGraph.cpp` converts every accepted fiberlet to one undirected graph edge
+and two directed arcs. Dense endpoint tangents define canonical strict
+45-degree joins. Its receding-horizon beam router ranks variable-length routes
+by accumulated loss density, prevents node cycles, commits one edge, and uses
+the shared variable-step forward polyline matcher to stop at the first
+reference-distance failure. It retains that first crossing as diagnostic
+metadata, completes the selected fiberlet, then continues through complete
+edges until routed base-voxel postroll reaches the requested distance at an
+anchor or the graph is exhausted. Candidate/arc identities and loss totals
+therefore always describe whole published fiberlets.
 
 Completed tasks update an atomic counter. A separately locked, rate-limited
 progress callback suppresses stale concurrent observations; the coordinator
@@ -2616,18 +2633,26 @@ callback exception. `vc_fiberlets` formats this callback on stderr with rate
 and ETA, while the core remains independent of console output.
 
 `volume-cartographer/apps/src/vc_fiberlets.cpp` exposes `anchors`, `paths`,
-`anchor-benchmark`, and `fiber-replay`.
+`anchor-benchmark`, `fiber-replay`, and `fiberlet-replay`.
 The latter requires the matching fiber manifest plus a separate regular
 Lasagna normal manifest and writes machine-readable `fiberlets.json` together
 with base-coordinate `fiberlets.obj` lines. All spatial CLI and JSON/OBJ
 coordinates are base-volume coordinates; prediction coordinates are private to
 the anchor fit and DP implementations.
 
-`PolylineGeometry.cpp` owns dense-polyline arclength sampling, slicing, and
-bounded exact projection. `FiberTrace.cpp::traceFiberReplay` adds a committed-
+`PolylineGeometry.cpp` owns dense-polyline arclength sampling, slicing, bounded
+exact projection, and the shared expected-advance forward matcher used by both
+greedy and graph replay. `FiberTrace.cpp::traceFiberReplay` adds a committed-
 step stop observer to the existing one-way core; ordinary callers omit it and
 retain their prior behavior. `FiberReplay.cpp` constructs exact base-coordinate
-tubes and atomically publishes content-addressed replay generations.
+tubes and atomically publishes content-addressed replay generations. The replay
+CLI uses `--along` as the sole longitudinal comparison extent: it derives the
+greedy postroll count from the effective base-coordinate step and slices the
+displayed greedy trace by exact arclength around failure. Full greedy points,
+losses, and matching indices remain separate authoritative diagnostics in the
+bundle. A shared core helper reduces the requested extent to the symmetric
+arclength available on every reference/greedy side; the reference, greedy
+display, and graph search then share those persisted, strictly checked bounds.
 
 Replay opens separate prediction and normal bindings for native trace space and
 the canonical stored prediction grid. Explicit sparse anchor cells flow through
@@ -2635,3 +2660,6 @@ the same block fit and NMS implementation as rectangular crops. `FiberPaths.cpp`
 uses its dense preload for standalone paths and a sorted sparse tube preload
 when a replay point predicate is present. The Python viewer keeps the presence
 Zarr external and strictly loads the replay bundle plus its relative artifacts.
+Graph replay adds a strict graph JSON, strict route JSON/OBJ agreement, and an
+independent napari route layer that participates in reload topology but not the
+fiberlet distance filter.

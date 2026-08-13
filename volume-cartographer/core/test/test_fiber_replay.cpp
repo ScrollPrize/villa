@@ -3,6 +3,7 @@
 
 #include "vc/fiber_tracer/FiberReplay.hpp"
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -53,6 +54,50 @@ TEST_CASE("fiber replay tube uses exact endpoint caps and sorted explicit cells"
           std::array<size_t, 6>{2, 2, 2, 8, 4, 4});
 }
 
+TEST_CASE("forward replay matching uses caller supplied variable advance")
+{
+    const auto reference = vc::fiber_tracer::makePolylineArcGeometry(
+        {{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}});
+    const auto shortStep = vc::fiber_tracer::matchForwardPolylinePoint(
+        reference, {3.0, 1.0, 0.0}, 0.0, 1.0, 0.0);
+    CHECK(shortStep.predictedArc == doctest::Approx(1.0));
+    CHECK(shortStep.projection.arc == doctest::Approx(1.0));
+    CHECK(shortStep.projection.distance == doctest::Approx(std::sqrt(5.0)));
+
+    const auto longStep = vc::fiber_tracer::matchForwardPolylinePoint(
+        reference, {3.0, 1.0, 0.0}, 0.0, 3.0, 0.0);
+    CHECK(longStep.predictedArc == doctest::Approx(3.0));
+    CHECK(longStep.projection.arc == doctest::Approx(3.0));
+    CHECK(longStep.projection.distance == doctest::Approx(1.0));
+}
+
+TEST_CASE("fiber replay comparison uses one symmetric available extent")
+{
+    const auto reference = vc::fiber_tracer::makePolylineArcGeometry(
+        {{0.0, 0.0, 0.0}, {30.0, 0.0, 0.0}});
+    const auto trace = vc::fiber_tracer::makePolylineArcGeometry(
+        {{0.0, 1.0, 0.0},
+         {4.0, 1.0, 0.0},
+         {10.0, 1.0, 0.0},
+         {18.0, 1.0, 0.0}});
+
+    const auto requested = vc::fiber_tracer::makeFiberReplayComparisonWindow(
+        reference, 15.0, trace, 2, 7.5);
+    CHECK(requested.effectiveHalfExtentBaseVoxels == doctest::Approx(7.5));
+    CHECK(requested.referenceBeginArcBase == doctest::Approx(7.5));
+    CHECK(requested.referenceEndArcBase == doctest::Approx(22.5));
+    CHECK(requested.traceBeginArcBase == doctest::Approx(2.5));
+    CHECK(requested.traceEndArcBase == doctest::Approx(17.5));
+
+    const auto clipped = vc::fiber_tracer::makeFiberReplayComparisonWindow(
+        reference, 3.0, trace, 1, 10.0);
+    CHECK(clipped.effectiveHalfExtentBaseVoxels == doctest::Approx(3.0));
+    CHECK(clipped.referenceBeginArcBase == doctest::Approx(0.0));
+    CHECK(clipped.referenceEndArcBase == doctest::Approx(6.0));
+    CHECK(clipped.traceBeginArcBase == doctest::Approx(1.0));
+    CHECK(clipped.traceEndArcBase == doctest::Approx(7.0));
+}
+
 TEST_CASE("nonfailure replay publication retains only applicable artifacts")
 {
     const auto directory = temporaryDirectory();
@@ -74,8 +119,12 @@ TEST_CASE("nonfailure replay publication retains only applicable artifacts")
 
     const auto bundle = vc::fiber_tracer::writeFiberReplayBundle(directory, input);
     CHECK(bundle.at("status") == "no_failure");
+    CHECK(bundle.at("comparison_trace_points_base_xyz") ==
+          bundle.at("trace_points_base_xyz"));
+    CHECK(bundle.at("comparison").is_null());
     CHECK(bundle.at("tube").is_null());
     CHECK(bundle.at("volume_crop_base_xyzwhd").is_null());
+    CHECK(bundle.at("fiberlet_replay").is_null());
     REQUIRE(bundle.at("artifacts").size() == 2);
     CHECK(bundle.at("artifacts").contains("replay/reference.obj"));
     CHECK(bundle.at("artifacts").contains("replay/trace.obj"));

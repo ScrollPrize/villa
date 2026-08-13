@@ -84,6 +84,27 @@ std::string artifactHash(const std::filesystem::path& path)
     return hashString(readFile(path));
 }
 
+bool nearlyEqual(double left, double right)
+{
+    const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+    return std::abs(left - right) <= 1.0e-10 * scale;
+}
+
+bool samePoints(
+    const std::vector<cv::Vec3d>& left,
+    const std::vector<cv::Vec3d>& right)
+{
+    if (left.size() != right.size())
+        return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!nearlyEqual(left[index][axis], right[index][axis]))
+                return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool FiberReplayTube::containsBasePoint(const cv::Vec3d& point) const
@@ -155,6 +176,40 @@ FiberReplayTube makeFiberReplayTube(
     return tube;
 }
 
+FiberReplayComparisonWindow makeFiberReplayComparisonWindow(
+    const PolylineArcGeometry& reference,
+    double failureReferenceArcBase,
+    const PolylineArcGeometry& trace,
+    size_t failureTracePointIndex,
+    double requestedHalfExtentBaseVoxels)
+{
+    if (!(requestedHalfExtentBaseVoxels > 0.0) ||
+        !std::isfinite(requestedHalfExtentBaseVoxels) ||
+        !std::isfinite(failureReferenceArcBase) ||
+        failureReferenceArcBase < 0.0 ||
+        failureReferenceArcBase > reference.length() ||
+        failureTracePointIndex >= trace.points.size()) {
+        throw std::invalid_argument("fiber replay comparison inputs are invalid");
+    }
+    const double failureTraceArc = trace.vertexArcs.at(failureTracePointIndex);
+    const double extent = std::min({
+        requestedHalfExtentBaseVoxels,
+        failureReferenceArcBase,
+        reference.length() - failureReferenceArcBase,
+        failureTraceArc,
+        trace.length() - failureTraceArc,
+    });
+    return {
+        requestedHalfExtentBaseVoxels,
+        extent,
+        failureReferenceArcBase - extent,
+        failureReferenceArcBase + extent,
+        failureTraceArc - extent,
+        failureTraceArc,
+        failureTraceArc + extent,
+    };
+}
+
 nlohmann::json writeFiberReplayBundle(
     const std::filesystem::path& outputDirectory,
     const FiberReplayBundleInput& input)
@@ -180,9 +235,67 @@ nlohmann::json writeFiberReplayBundle(
     }
     if (failed != input.tube.has_value())
         throw std::invalid_argument("fiber replay failure and tube presence disagree");
+    if (failed != input.comparison.has_value())
+        throw std::invalid_argument("fiber replay failure and comparison window disagree");
     if (failed != (input.anchors.has_value() && input.anchorArtifact.has_value() &&
                    input.paths.has_value() && input.pathArtifact.has_value())) {
         throw std::invalid_argument("fiber replay extraction artifacts disagree with status");
+    }
+    if (input.graphReplay.has_value() != input.graphReplayConfig.has_value())
+        throw std::invalid_argument("fiberlet graph replay result/config disagree");
+    if (input.graphReplay.has_value() && !input.graphReplayRequested)
+        throw std::invalid_argument("unrequested fiberlet graph replay result");
+    if (input.graphReplay.has_value() && !failed)
+        throw std::invalid_argument("fiberlet graph replay requires a failed greedy replay tube");
+
+    std::vector<cv::Vec3d> comparisonTraceGeometryBase =
+        input.replay.tracePointsBase;
+    if (input.comparison.has_value()) {
+        const auto& comparison = *input.comparison;
+        const std::array<double, 7> values{
+            comparison.requestedHalfExtentBaseVoxels,
+            comparison.effectiveHalfExtentBaseVoxels,
+            comparison.referenceBeginArcBase,
+            comparison.referenceEndArcBase,
+            comparison.traceBeginArcBase,
+            comparison.traceFailureArcBase,
+            comparison.traceEndArcBase,
+        };
+        if (std::any_of(values.begin(), values.end(), [](double value) {
+                return !std::isfinite(value);
+            }) ||
+            !(comparison.requestedHalfExtentBaseVoxels > 0.0) ||
+            comparison.effectiveHalfExtentBaseVoxels < 0.0 ||
+            comparison.effectiveHalfExtentBaseVoxels >
+                comparison.requestedHalfExtentBaseVoxels) {
+            throw std::invalid_argument("fiber replay comparison extent is invalid");
+        }
+        const auto trace = makePolylineArcGeometry(input.replay.tracePointsBase);
+        const double failureTraceArc = trace.vertexArcs.at(
+            *input.replay.failureTracePointIndex);
+        const double extent = comparison.effectiveHalfExtentBaseVoxels;
+        if (!nearlyEqual(comparison.referenceBeginArcBase, input.tube->beginArcBase) ||
+            !nearlyEqual(comparison.referenceEndArcBase, input.tube->endArcBase) ||
+            !samePoints(
+                input.referenceGeometryBase,
+                input.tube->referenceIntervalBase) ||
+            !nearlyEqual(
+                comparison.referenceBeginArcBase + extent,
+                *input.replay.failureReferenceArcBase) ||
+            !nearlyEqual(
+                comparison.referenceEndArcBase - extent,
+                *input.replay.failureReferenceArcBase) ||
+            !nearlyEqual(comparison.traceFailureArcBase, failureTraceArc) ||
+            !nearlyEqual(comparison.traceBeginArcBase + extent, failureTraceArc) ||
+            !nearlyEqual(comparison.traceEndArcBase - extent, failureTraceArc) ||
+            comparison.traceBeginArcBase < 0.0 ||
+            comparison.traceEndArcBase > trace.length()) {
+            throw std::invalid_argument("fiber replay comparison window is inconsistent");
+        }
+        comparisonTraceGeometryBase = slicePolylineArc(
+            trace,
+            comparison.traceBeginArcBase,
+            comparison.traceEndArcBase);
     }
     std::filesystem::create_directories(outputDirectory / "runs");
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -195,7 +308,9 @@ nlohmann::json writeFiberReplayBundle(
         lineObj("# vc_fiber_replay_reference version 1", input.referenceGeometryBase));
     vc::core::util::atomicWriteString(
         staging / "replay/trace.obj",
-        lineObj("# vc_fiber_replay_trace version 1", input.replay.tracePointsBase));
+        lineObj(
+            "# vc_fiber_replay_trace version 1",
+            comparisonTraceGeometryBase));
     if (failed) {
         const cv::Vec3d failure = input.replay.tracePointsBase.at(
             *input.replay.failureTracePointIndex);
@@ -206,6 +321,17 @@ nlohmann::json writeFiberReplayBundle(
             staging / "anchors", *input.anchors, *input.anchorArtifact);
         writeFiberletPathArtifacts(
             staging / "paths", *input.paths, *input.pathArtifact);
+        if (input.graphReplay.has_value()) {
+            vc::core::util::atomicWriteString(
+                staging / "replay/fiberlet_trace.json",
+                fiberletGraphReplayJson(
+                    *input.graphReplay, *input.graphReplayConfig).dump(2) + "\n");
+            if (!input.graphReplay->routePointsBaseXYZ.empty()) {
+                vc::core::util::atomicWriteString(
+                    staging / "replay/fiberlet_trace.obj",
+                    fiberletGraphReplayObj(*input.graphReplay));
+            }
+        }
     }
 
     std::vector<std::filesystem::path> relativeArtifacts{
@@ -225,7 +351,13 @@ nlohmann::json writeFiberReplayBundle(
             "anchors/stages/nms.json",
             "paths/fiberlets.json",
             "paths/fiberlets.obj",
+            "paths/fiberlet_graph.json",
         });
+        if (input.graphReplay.has_value()) {
+            relativeArtifacts.push_back("replay/fiberlet_trace.json");
+            if (!input.graphReplay->routePointsBaseXYZ.empty())
+                relativeArtifacts.push_back("replay/fiberlet_trace.obj");
+        }
     }
     std::string generationMaterial;
     for (const auto& relative : relativeArtifacts) {
@@ -266,6 +398,9 @@ nlohmann::json writeFiberReplayBundle(
         {"termination_reason", input.replay.terminationReason},
         {"reference_points_base_xyz", pointsJson(input.referenceGeometryBase)},
         {"trace_points_base_xyz", pointsJson(input.replay.tracePointsBase)},
+        {"comparison_trace_points_base_xyz",
+         pointsJson(comparisonTraceGeometryBase)},
+        {"comparison", nullptr},
         {"trace_cumulative_losses", input.replay.cumulativeLosses},
         {"matching", {
             {"failure_threshold_base_voxels", input.request.errorThresholdBaseVoxels},
@@ -279,6 +414,7 @@ nlohmann::json writeFiberReplayBundle(
         }},
         {"failure_trace_point_index", nullptr},
         {"failure_reference_arc_base", nullptr},
+        {"fiberlet_replay", nullptr},
         {"tube", nullptr},
         {"volume_crop_base_xyzwhd", nullptr},
         {"artifacts", nlohmann::json::object()},
@@ -291,6 +427,20 @@ nlohmann::json writeFiberReplayBundle(
         bundle["failure_reference_arc_base"] =
             *input.replay.failureReferenceArcBase;
     }
+    if (input.comparison.has_value()) {
+        const auto& comparison = *input.comparison;
+        bundle["comparison"] = {
+            {"requested_half_extent_base_voxels",
+             comparison.requestedHalfExtentBaseVoxels},
+            {"effective_half_extent_base_voxels",
+             comparison.effectiveHalfExtentBaseVoxels},
+            {"reference_begin_arc_base", comparison.referenceBeginArcBase},
+            {"reference_end_arc_base", comparison.referenceEndArcBase},
+            {"trace_begin_arc_base", comparison.traceBeginArcBase},
+            {"trace_failure_arc_base", comparison.traceFailureArcBase},
+            {"trace_end_arc_base", comparison.traceEndArcBase},
+        };
+    }
     if (input.tube.has_value()) {
         bundle["tube"] = {
             {"begin_arc_base", input.tube->beginArcBase},
@@ -300,6 +450,15 @@ nlohmann::json writeFiberReplayBundle(
             {"cells_zyx", input.tube->cellsZYX},
         };
         bundle["volume_crop_base_xyzwhd"] = input.tube->volumeCropBaseXYZWHD;
+    }
+    if (input.graphReplay.has_value()) {
+        bundle["fiberlet_replay"] = fiberletGraphReplayJson(
+            *input.graphReplay, *input.graphReplayConfig);
+    } else if (input.graphReplayRequested) {
+        bundle["fiberlet_replay"] = {
+            {"status", "not_run"},
+            {"reason", "greedy_replay_did_not_produce_a_failure_tube"},
+        };
     }
     const std::filesystem::path generationRelative =
         std::filesystem::path("runs") / generationName;

@@ -3,6 +3,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/TexturedMesh.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
+#include "vc/fiber_tracer/FiberGraph.hpp"
 
 #include <algorithm>
 #include <array>
@@ -552,6 +553,23 @@ bool usablePrediction(const FiberStoredPredictionSample& prediction)
            std::isfinite(normSquared) && normSquared > kEpsilon;
 }
 
+bool withinPredictionDeviation(
+    const cv::Vec3d& direction,
+    const FiberStoredPredictionSample& prediction,
+    double maximumDeviationRadians)
+{
+    if (!usablePrediction(prediction))
+        return false;
+    const cv::Vec3d unitDirection = normalized(direction);
+    const cv::Vec3d unitPrediction = normalized(prediction.direction);
+    if (vectorLength(unitDirection) <= kEpsilon ||
+        vectorLength(unitPrediction) <= kEpsilon) {
+        return false;
+    }
+    return std::abs(unitDirection.dot(unitPrediction)) >
+        std::cos(maximumDeviationRadians);
+}
+
 cv::Vec3d alignedAxis(const cv::Vec3d& axis, const cv::Vec3d& reference)
 {
     cv::Vec3d aligned = normalized(axis);
@@ -644,6 +662,8 @@ FiberletCandidateResult solveCandidate(
     }
     const cv::Vec3d chord = chordVector / chordLength;
     const double maximumAngle = config.maximumEndpointAngleDegrees * kPi / 180.0;
+    const double maximumPredictionDeviation =
+        config.maximumPredictionDeviationDegrees * kPi / 180.0;
     const auto sources = endpointAttachments(candidate.startPositionPredictionXYZ, candidate.startAxisXYZ, chord, true, maximumAngle, grid);
     if (sources.empty()) {
         candidate.reason = "no_source_attachment";
@@ -747,6 +767,12 @@ FiberletCandidateResult solveCandidate(
                 const size_t next = found->second;
                 if (!(nodes[next].progress > nodes[node].progress + kEpsilon))
                     continue;
+                if (!withinPredictionDeviation(
+                        move.direction,
+                        nodes[next].prediction,
+                        maximumPredictionDeviation)) {
+                    continue;
+                }
                 FiberletPathCost nextCost = currentState.cost;
                 nextCost += alignmentCost(
                     sourceAttachment && previousLength <= kEpsilon
@@ -1184,11 +1210,18 @@ void validateFiberletPathConfig(const FiberletPathConfig& config)
     const auto finiteNonnegative = [](double value) { return std::isfinite(value) && value >= 0.0; };
     if (config.cellRadius < 1 || config.cellRadius > 64)
         throw std::invalid_argument("fiberlet cell radius must be in [1, 64]");
-    if (!(config.shellHalfWidthCells > 0.0) || !std::isfinite(config.shellHalfWidthCells)) {
-        throw std::invalid_argument("fiberlet shell half width must be positive and finite");
+    if (!(config.neighborhoodMarginCells > 0.0) ||
+        !std::isfinite(config.neighborhoodMarginCells)) {
+        throw std::invalid_argument(
+            "fiberlet neighborhood margin must be positive and finite");
     }
     if (!finiteNonnegative(config.maximumEndpointAngleDegrees) || config.maximumEndpointAngleDegrees > 90.0) {
         throw std::invalid_argument("fiberlet endpoint angle must be in [0, 90]");
+    }
+    if (!finiteNonnegative(config.maximumPredictionDeviationDegrees) ||
+        config.maximumPredictionDeviationDegrees > 90.0) {
+        throw std::invalid_argument(
+            "fiberlet prediction deviation must be in [0, 90]");
     }
     if (!finiteNonnegative(config.corridorRadiusPredictionVoxels))
         throw std::invalid_argument("fiberlet corridor radius must be non-negative");
@@ -1569,13 +1602,15 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     return loaded;
 }
 
-std::vector<std::array<int, 3>> fiberletCellShellOffsets(int radius, double halfWidth)
+std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(
+    int radius,
+    double margin)
 {
-    if (radius < 1 || !(halfWidth > 0.0) || !std::isfinite(halfWidth))
-        throw std::invalid_argument("fiberlet cell shell requires positive radius and half width");
-    const int limit = static_cast<int>(std::ceil(radius + halfWidth));
-    const double lower = std::max(0.0, static_cast<double>(radius) - halfWidth);
-    const double upper = static_cast<double>(radius) + halfWidth;
+    if (radius < 1 || !(margin > 0.0) || !std::isfinite(margin))
+        throw std::invalid_argument(
+            "fiberlet cell neighborhood requires positive radius and margin");
+    const int limit = static_cast<int>(std::ceil(radius + margin));
+    const double upper = static_cast<double>(radius) + margin;
     std::vector<std::array<int, 3>> offsets;
     for (int z = -limit; z <= limit; ++z) {
         for (int y = -limit; y <= limit; ++y) {
@@ -1583,7 +1618,7 @@ std::vector<std::array<int, 3>> fiberletCellShellOffsets(int radius, double half
                 if (x == 0 && y == 0 && z == 0)
                     continue;
                 const double length = std::sqrt(static_cast<double>(x * x + y * y + z * z));
-                if (length >= lower && length < upper)
+                if (length < upper)
                     offsets.push_back({z, y, x});
             }
         }
@@ -1616,8 +1651,9 @@ FiberletPathReport traceFiberletPaths(
     const auto startTime = Clock::now();
     const auto flat = flattenAnchors(anchors.report);
     report.diagnostics.occupiedAnchors = flat.size();
-    const auto offsets = fiberletCellShellOffsets(report.config.cellRadius, report.config.shellHalfWidthCells);
-    report.diagnostics.shellOffsets = offsets.size();
+    const auto offsets = fiberletCellNeighborhoodOffsets(
+        report.config.cellRadius, report.config.neighborhoodMarginCells);
+    report.diagnostics.neighborhoodOffsets = offsets.size();
     std::map<std::array<size_t, 3>, std::vector<const FlatAnchor*>> byCell;
     for (const auto& anchor : flat)
         byCell[anchor.id.cellZYX].push_back(&anchor);
@@ -1639,7 +1675,7 @@ FiberletPathReport traceFiberletPaths(
                 targetCell[axis] = static_cast<size_t>(value);
             }
             if (!inside) {
-                ++report.diagnostics.shellTargetsOutOfGrid;
+                ++report.diagnostics.neighborhoodTargetsOutOfGrid;
                 continue;
             }
             const auto targetAnchors = byCell.find(targetCell);
@@ -1826,8 +1862,9 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
          {
              {"anchor_cell_size_prediction_voxels", report.anchorCellSizePredictionVoxels},
              {"cell_radius", report.config.cellRadius},
-             {"shell_half_width_cells", report.config.shellHalfWidthCells},
+             {"neighborhood_margin_cells", report.config.neighborhoodMarginCells},
              {"maximum_endpoint_angle_degrees", report.config.maximumEndpointAngleDegrees},
+             {"maximum_prediction_deviation_degrees", report.config.maximumPredictionDeviationDegrees},
              {"corridor_radius_base_voxels", report.config.corridorRadiusPredictionVoxels * report.grid.predictionToBaseScale},
              {"invalid_prediction_cost_per_prediction_voxel", report.config.invalidPredictionCostPerVoxel},
              {"smoothness_weight", report.config.smoothnessWeight},
@@ -1838,8 +1875,8 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
         {"diagnostics",
          {
              {"occupied_anchors", report.diagnostics.occupiedAnchors},
-             {"shell_offsets", report.diagnostics.shellOffsets},
-             {"shell_targets_out_of_grid", report.diagnostics.shellTargetsOutOfGrid},
+             {"neighborhood_offsets", report.diagnostics.neighborhoodOffsets},
+             {"neighborhood_targets_out_of_grid", report.diagnostics.neighborhoodTargetsOutOfGrid},
              {"generated_pairs", report.diagnostics.generatedPairs},
              {"zero_length_pairs", report.diagnostics.zeroLengthPairs},
              {"axis_rejected_pairs", report.diagnostics.axisRejectedPairs},
@@ -1966,6 +2003,18 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
     }
     vc::core::util::atomicWriteString(outputDirectory / "fiberlets.json", fiberletPathReportJson(report, artifact).dump(2) + "\n");
     vc::core::util::atomicWriteString(outputDirectory / "fiberlets.obj", fiberletPathReportObj(report));
+    auto graphJson = fiberletGraphJson(buildFiberletGraph(report));
+    graphJson["source"] = {
+        {"fiber_manifest", artifact.fiberManifestLocator},
+        {"fiber_manifest_content_hash", artifact.fiberManifestContentHash},
+        {"normal_manifest", artifact.normalManifestLocator},
+        {"normal_manifest_content_hash", artifact.normalManifestContentHash},
+        {"anchor_artifact", artifact.anchorArtifactLocator},
+        {"anchor_artifact_content_hash", artifact.anchorArtifactContentHash},
+    };
+    vc::core::util::atomicWriteString(
+        outputDirectory / "fiberlet_graph.json",
+        graphJson.dump(2) + "\n");
 }
 
 namespace

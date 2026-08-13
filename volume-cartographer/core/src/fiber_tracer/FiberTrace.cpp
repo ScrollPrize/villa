@@ -5365,26 +5365,26 @@ FiberReplayTraceResult traceFiberReplay(
             referenceExhausted = true;
             return false;
         }
-        const double predictedArc = std::min(
-            reference.length(), previousArcBase + nominalStepBase);
-        const double windowEnd = std::min(
-            reference.length(),
-            predictedArc + request.matchRefineSteps * nominalStepBase);
-        if (!(windowEnd > previousArcBase + kEpsilon)) {
+        const auto forwardMatch = matchForwardPolylinePoint(
+            reference,
+            pointBase,
+            previousArcBase,
+            nominalStepBase,
+            request.matchRefineSteps);
+        if (!(forwardMatch.searchEndArc > previousArcBase + kEpsilon)) {
             referenceExhausted = true;
             return false;
         }
-        const auto match = projectPointToPolylineArc(
-            reference, pointBase, previousArcBase, windowEnd);
+        const auto& match = forwardMatch.projection;
         result.tracePointsBase.push_back(pointBase);
         result.cumulativeLosses.push_back(cumulativeLoss);
         result.matches.push_back({
             result.tracePointsBase.size() - 1,
-            predictedArc,
+            forwardMatch.predictedArc,
             match.arc,
             match.point,
             previousArcBase,
-            windowEnd,
+            forwardMatch.searchEndArc,
             match.distance,
                 request.errorThresholdBaseVoxels > 0.0
                 ? match.distance / request.errorThresholdBaseVoxels

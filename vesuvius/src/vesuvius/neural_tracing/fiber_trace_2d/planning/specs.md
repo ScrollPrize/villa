@@ -2717,12 +2717,14 @@
   without repair. The stored source locator is informational, so identical
   manifest content may be relocated. Fiber prediction `nx/ny` must never be
   used as Lasagna surface normals.
-- Candidate target cells lie on the deterministic half-open integer shell
-  `radius-0.5 <= norm(offset) < radius+0.5`, initially radius four. All retained
-  component pairs are considered once in canonical `(cell_zyx,component)`
-  order. Both unoriented endpoint axes must align to the chord within the
-  configured bound, initially 45 degrees. This stage does not impose degree,
-  mutual-best, overlap, or global graph constraints.
+- Candidate target cells lie in the deterministic filled integer neighborhood
+  `0 < norm(offset) < radius+margin`, initially radius four and margin 0.5.
+  Offsets are symmetric and lexicographically ordered. All shorter distances
+  through the outer half-open bound are therefore searched, including
+  non-integer radial shells. All retained component pairs are considered once
+  under canonical `source_id < target_id` ordering. Both unoriented endpoint
+  axes must align to the chord within the configured bound, initially 45
+  degrees. This stage does not impose degree, mutual-best, or overlap limits.
 - Candidate generation completes before scoring. The inclusive prediction-grid
   bounds of every searchable Hermite corridor and every eligible virtual
   endpoint attachment are clipped to the grid and unioned. The current
@@ -2758,6 +2760,17 @@
   `{-1,0,1}^3` with strictly positive chord projection. The resulting graph is
   acyclic. DP state is `(integer_voxel,incoming_move)` plus deterministic
   source-attachment states. Sink selection scores the real final virtual edge.
+- Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
+  to the sampled dense fiber-prediction axis. Equivalently, for normalized step
+  `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
+  epsilon. Lattice moves use the destination voxel prediction. Virtual edges
+  between a fitted subvoxel anchor and nearby integer voxels are exempt from
+  this lattice-step gate and remain constrained by the fitted endpoint-axis
+  rule; otherwise half-voxel anchor placement could make an aligned path
+  unreachable through quantization alone. A missing, invalid, nonfinite, or
+  degenerate required destination prediction rejects a lattice edge before
+  scoring. The independent Lasagna surface normal does not participate in this
+  hard gate.
 - Valid-data scoring shares the regular native tracer's exact ordered float
   multiplicative alignment loss. For incoming step `a`, outgoing step `b`,
   current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
@@ -2772,15 +2785,10 @@
   the attachment as `b`, and the fitted target axis at presence one as `d`.
   Zero-length attachments add no alignment cost but establish/use the fitted
   endpoint axis.
-- An invalid fiber sample pays only
-  `invalid_prediction_cost_per_prediction_voxel*edge_length`, default 4.0. Presence and
-  alignment components are then zero, while independently valid Lasagna
-  normals may still govern curvature. When leaving an invalid current voxel,
-  the incoming step substitutes for the unavailable current prediction and the
-  first valid destination pays normal multiplicative alignment. Invalid
-  predictions are finite bridges, not obstacles; without a quality threshold,
-  a mostly invalid geometrically reachable path may succeed and must report its
-  invalid cost.
+- Invalid fiber samples cannot be destinations of nonzero DP edges under the
+  hard sampled-direction gate. The pre-existing invalid-prediction cost remains
+  serialized as part of the experimental objective configuration, but it does
+  not turn an invalid destination into a traversable bridge.
 - Direct local curvature shares the native 3D tracer's exact float
   normal-aware equations. With a valid normal it emits tangent-plane and
   normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
@@ -2838,31 +2846,55 @@
   atomic and each OBJ is published after its PNG and MTL, but the nine-file
   collection is not transactionally atomic. `--no-slices` skips sampling and
   removes all bundles without changing path or JSON results.
+- `fiberlet_graph.json` is generated from every successful scored fiberlet.
+  Anchor identity and base-coordinate position define a node. Each canonical
+  fiberlet is one edge with deterministic array-index ID, exact dense polyline,
+  candidate ID, additive loss, and prediction-grid length, and supplies two
+  directed arc IDs: `2*edge` forward and `2*edge+1` exact reverse. Endpoint
+  tangents use the first/last distinct dense point in traversal direction.
+  At a shared anchor an incoming arc may transition to another outgoing arc
+  only when the angle between its tangent pointing into the anchor and the
+  outgoing tangent pointing away is strictly below 45 degrees. Transitions and
+  adjacency are canonically ordered. Graph source metadata binds the exact
+  manifest and anchor hashes used for `fiberlets.json`.
 - Continuous/sub-voxel search, learned path-quality rejection, overlap
-  deduplication, extension, global graph construction, H/V and winding labels,
-  CUDA batching, and production radius selection remain out of scope.
+  deduplication, extension, H/V and winding labels, CUDA batching, and
+  production radius selection remain out of scope.
 
 # C++ dense-fiber failure replay
 
 - `vc_fiberlets fiber-replay` consumes a fiber-prediction Lasagna manifest, a
   strict VC3D fiber JSON, a required regular-normal Lasagna manifest, and an
   output directory. Spatial arguments and artifacts use base-volume XYZ/base
-  voxels. Defaults are `--fail 20`, `--after 100`, `--along 512`,
-  `--radius 128`, and `--match-refine 1`.
+  voxels. Defaults are `--fail 20`, `--along 128`, `--radius 64`, and
+  `--match-refine 1`. `--along` is the single longitudinal comparison extent:
+  it selects reference arclength before and after failure, defines the
+  fiberlet-graph search interval, and derives the greedy postroll budget as
+  `ceil(along / effective_trace_step_base)`. There is no independent postroll
+  CLI setting.
+- After replay, one effective symmetric half-extent is the minimum of the
+  requested `--along` value and the available reference and greedy arclength on
+  each side of their respective failed points. This exact half-extent defines
+  both reference bounds, both greedy comparison bounds, and the graph search
+  interval. An early graph termination may produce a shorter route, but not a
+  different allowed interval. Nonfailure replay has no failure-comparison
+  window and retains its complete reference and greedy trace.
 - Replay uses the regular native one-way candidate generation, prediction loss,
   Lasagna-normal curvature, and validity rules. It forces beam width and
   lookahead to one. The first control point and first subsequent nonzero dense
   edge define the start. Existing tracer calls without the committed-step
   observer remain unchanged.
 - Dense-reference matching is monotone and local. From the previous match it
-  predicts one nominal base-coordinate trace step and computes the exact
-  closest dense-polyline point through at most `match_refine` further nominal
-  steps. Consecutive zero edges contribute no arclength; nonconsecutive repeated
-  vertices are preserved. Deterministic ties select the lowest arclength and
-  then source segment. Failure is the first raw Euclidean distance strictly
-  above the base-voxel threshold.
+  predicts a caller-supplied positive base-coordinate advance and computes the
+  exact closest dense-polyline point through at most `match_refine` further
+  copies of that advance. Greedy replay supplies its nominal trace step;
+  fiberlet graph replay supplies each actual dense path-edge length. Consecutive
+  zero edges contribute no arclength; nonconsecutive repeated vertices are
+  preserved. Deterministic ties select the lowest arclength and then source
+  segment. Failure is the first raw Euclidean distance strictly above the
+  base-voxel threshold.
 - The failing committed point is postroll step zero. Replay retains at most the
-  requested number of further fixed-length greedy steps and reports exactly one
+  derived number of further fixed-length greedy steps and reports exactly one
   of `failure_with_postroll`, `failure_truncated`, `no_failure`, or
   `trace_terminated_before_failure`. Invalid prediction at the initial point is
   a typed termination result. The hard step budget is the native maximum-step
@@ -2882,18 +2914,74 @@
   each once, and exposes a checked immutable sparse lookup. Standalone `paths`
   retains the existing dense rectangular preload and the objective/path solver
   is otherwise shared.
-- Bundle JSON is authoritative for reference, trace, and failure geometry.
+- Bundle JSON is authoritative for reference, trace, comparison trace, and
+  failure geometry. `trace_points_base_xyz`, losses, matching records, and the
+  failure index retain the complete diagnostic greedy replay. The separate
+  `comparison_trace_points_base_xyz` and `replay/trace.obj` are clipped by
+  exact trace arclength to the effective symmetric extent before and after the
+  failed greedy point, and the napari trace layer uses this comparison
+  geometry. The requested/effective half-extents and global reference and
+  trace arc bounds are stored under `comparison`; publication and strict
+  loading reconstruct and verify the trace slice and equal-sided bounds.
   Derived OBJ files and every extraction artifact have relative contained paths
   and content hashes. A run is completed in a staging directory, renamed to an
   immutable `runs/<content-hash>` generation, and only then referenced by an
   atomically replaced root `fiber_replay.json`. Nonfailure statuses omit tube,
   failure marker, anchors, and paths. The experimental version-1 format has no
   repair or compatibility behavior.
+- `vc_fiberlets fiberlet-replay` shares the complete greedy failure locator,
+  tube, anchor, fiberlet, and publication pipeline with `fiber-replay`. If
+  greedy replay produces no failure tube, graph replay is explicitly `not_run`.
+  Otherwise it builds the graph above and seeds at the anchor nearest the
+  reference-interval beginning among nodes within the inclusive failure
+  threshold that have a strictly direction-aligned outgoing arc. Seed ties use
+  canonical node identity, both arc orientations are eligible, and the seed is
+  itself matched.
+- Graph routing uses deterministic receding-horizon beam search. `--beam`
+  defaults to 16 and `--lookahead` to three directed edges. Tentative routes
+  carry committed/tentative visited nodes and cannot revisit one. At each depth
+  the global beam is pruned by additive fiberlet loss divided by additive
+  prediction-grid length, then additive loss and the full directed-arc sequence.
+  Only routes reaching the deepest available horizon compete unless none can
+  expand that far; one leading edge is committed before replanning. Reference
+  geometry is not part of this objective, so the experimental route may drift
+  until the threshold detects it.
+- Before failure graph replay reports `reference_end`, `graph_exhausted`, or
+  `no_usable_start`. The first dense point strictly over threshold is retained
+  immutably with its route-point, directed-arc, candidate, local path-point,
+  matched-reference, and error metadata. Later points remain matched but cannot
+  replace or trigger another failure.
+- Postroll is route-polyline arclength in base voxels beginning at that first
+  failing dense point. The remainder of its selected fiberlet is always
+  appended without replanning, and each later selected fiberlet is likewise
+  published in full. At each target anchor, replay stops inclusively when the
+  accumulated postroll distance is at least the effective comparison
+  half-extent. It reports `failure_with_postroll` on completion and
+  `failure_truncated` if no admissible continuation remains first. Truncation
+  distinguishes topology exhaustion from reaching the comparison-reference
+  endpoint. The complete final fiberlet may overshoot the requested distance;
+  completed distance, overshoot, or truncation shortfall are explicit.
+- Candidate and directed-arc arrays cover every complete published edge,
+  including the failure-containing edge. Total loss, prediction-grid length,
+  and loss density cover that same full-edge set. The stop node is always the
+  final anchor; no graph route artifact terminates inside a fiberlet. Graph and
+  route JSON plus a
+  nonempty base-coordinate route OBJ participate in the immutable generation
+  hash. The route JSON stores configuration, exact points, monotone matches,
+  full edge identities, first-failure metadata, final stop node, postroll,
+  loss, length, and loss density.
+  Here `reference_end` is the end of the extracted replay reference interval,
+  not necessarily the end of the source fiber. The CLI final summary includes
+  the graph reason and reference-arclength progress for greedy and graph routes
+  measured within that same interval.
 - The napari viewer accepts the presence OME-Zarr separately with `--replay`.
   Replay mode rejects manual crop/anchor/path inputs, verifies external Zarr
   shape/scale, path containment, hashes for every artifact it consumes, status
   layout, and JSON/OBJ geometry, and creates independent
-  presence/reference/trace/failure/anchor/fiberlet layers. Declared but unused
+  presence/reference/trace/failure/anchor/fiberlet layers. A requested graph
+  replay has a stable independent lime route layer, including empty/error
+  results; it is clipped by the crop controls but is not filtered by the
+  fiberlet-radius control and does not alter replay distance masks. Declared but unused
   JSON and alternate OBJ artifacts are containment/existence checked without
   paying the pure-Python FNV cost. Six crop controls clip all layers; line
   widths, failure size, and fiberlet quality colormap remain runtime display

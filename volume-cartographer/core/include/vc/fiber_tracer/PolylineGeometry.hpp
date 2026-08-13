@@ -29,6 +29,13 @@ struct PolylineArcProjection {
     size_t segmentIndex = 0;
 };
 
+struct ForwardPolylineMatch {
+    double predictedArc = 0.0;
+    double searchBeginArc = 0.0;
+    double searchEndArc = 0.0;
+    PolylineArcProjection projection;
+};
+
 [[nodiscard]] PolylineArcGeometry makePolylineArcGeometry(
     const std::vector<cv::Vec3d>& points);
 
@@ -52,5 +59,12 @@ struct PolylineArcProjection {
     const cv::Vec3d& point,
     double beginArc,
     double endArc);
+
+[[nodiscard]] ForwardPolylineMatch matchForwardPolylinePoint(
+    const PolylineArcGeometry& geometry,
+    const cv::Vec3d& point,
+    double previousArc,
+    double expectedAdvance,
+    double refineAdvanceFactor);
 
 } // namespace vc::fiber_tracer
