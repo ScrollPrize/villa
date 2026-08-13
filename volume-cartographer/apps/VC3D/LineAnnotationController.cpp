@@ -173,7 +173,8 @@ struct LineAnnotationController::LineAnnotationSession {
     // exit (generated-view materialization), so a failed whole-line task must
     // restore these too or a later save writes the rolled-back control points
     // against the new line — a pair no single optimizer run produced.
-    // Peer-file link side effects are not rolled back.
+    // Peer-fiber sync is deferred until past that failure exit instead of
+    // being rolled back (see the sync call in applyOptimizationTaskResult).
     std::optional<vc::lasagna::LineModel> optimizedLineBeforeModeChange;
     std::optional<std::vector<LineAnnotationController::FiberBranchRef>>
         branchesBeforeModeChange;
@@ -8635,10 +8636,13 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls = session.controlPoints;
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     session.controlPoints = std::move(task.controlPoints);
-    syncLinkedBranchMetadataAfterFiberModification(
-        session,
-        &branchRemapControls,
-        &branchRemapBranches);
+    // Only the session-local remap before the generated views are rebuilt:
+    // materializeGeneratedViews reads session.branches for the link markers,
+    // but it can still fail and roll this session back, so the peer-fiber
+    // phases of the sync must wait until it has succeeded — they mutate
+    // other sessions and _fibers, which the rollback cannot restore.
+    remapBranchControlPointIndices(
+        branchRemapControls, session.controlPoints, session.branches);
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -8683,6 +8687,11 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             return false;
         }
     }
+    // Past the last failure exit: complete the deferred reciprocal cleanup
+    // and endpoint refresh on linked fibers (the session-local remap already
+    // ran before the views were rebuilt).
+    syncLinkedBranchMetadataAfterFiberModification(
+        session, nullptr, &branchRemapBranches);
     refreshBranchLineViews(session.fiberId);
 
     if (session.restoreFiberOptimizationModeOnFailure) {
@@ -9130,6 +9139,10 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     session.watcher = nullptr;
     const bool chainNativeSeedTrace = session.nativeSeedTracePending &&
         task.eventName == "seed" && task.ok;
+    // Captured before the move below: a failed apply despite an ok task
+    // means the generated-view rebuild failed after tearing down the
+    // previous surfaces, so the rollback must rematerialize.
+    const bool taskProducedResult = task.ok;
     session.nativeSeedTracePending = false;
     const bool ok = applyOptimizationTaskResult(session,
                                                std::move(task),
@@ -9163,6 +9176,16 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 pane->dialog->setFiberOptimizationMode(
                     session.fiberOptimizationMode);
             }
+        }
+        if (taskProducedResult && !session.suppressGeneratedViews &&
+            !session.optimizedLine.points.empty() &&
+            !session.controlPoints.empty()) {
+            // The optimizer succeeded, so the failure came from
+            // materializeGeneratedViews after it had torn down the previous
+            // surfaces and cleaned up its half-built replacements — the
+            // panes are empty. Rebuild them from the restored model,
+            // best-effort: this geometry materialized before.
+            materializeGeneratedViews(session);
         }
     } else {
         session.controlPointsBeforeModeChange.reset();
