@@ -17,6 +17,12 @@ struct LineViewConfig {
     double surfaceHalfWidth = 0.0;
     double sideSliceHalfDepth = 0.0;
     int crossSamples = 21;
+    // Optional per-control-point oriented sheet normals, indexed like
+    // LineModel::points (entries may be NaN/zero where unavailable).
+    // When non-empty and size-matched, one global sign flip is applied so the
+    // frame mesh normals AND the display up vectors agree with these on a
+    // cosine-weighted majority. Empty/mismatched/all-invalid -> legacy signs.
+    std::vector<cv::Vec3f> orientedPointNormals;
 };
 
 struct LineViewSurfaces {

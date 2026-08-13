@@ -29,6 +29,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
+
 #include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
@@ -4338,7 +4339,13 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
             side.editSession->optimizedLine =
                 lineModelFromPoints(side.fiber->linePoints,
                                     side.editSession->normalSampler.get());
-            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
+            vc::lasagna::LineViewConfig sideConfig;
+            // Same orientation pin as the annotation views, so the inspection
+            // strip's vertical does not flip between fibers or rebuilds.
+            sideConfig.orientedPointNormals =
+                orientedLineNormalsForSession(*side.editSession);
+            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine,
+                                                                sideConfig);
             Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
                            side.displayPrefix,
                            side.fiber ? side.fiber->id : 0,
@@ -9557,9 +9564,18 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         return false;
     }
 
+    // The builder's frame signs are inherited from an unoriented manifest
+    // normal at an anchor that moves as the line grows; hand it the sheet
+    // normals oriented away from the scroll center so the bottom strip's
+    // vertical, the display ups, and the cut views all agree per fiber and
+    // across rebuilds.
+    std::vector<cv::Vec3f> orientedNormals = orientedLineNormalsForSession(session);
+
     vc::lasagna::LineViewSurfaces views;
     try {
-        views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine);
+        vc::lasagna::LineViewConfig viewConfig;
+        viewConfig.orientedPointNormals = orientedNormals;
+        views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine, viewConfig);
     } catch (const std::exception& ex) {
         session.error = ex.what();
         showError(tr("Could not create line annotation views: %1")
@@ -9609,7 +9625,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSlice = views.lineSideSlice;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
-    generatedViews.lineNormals = orientedLineNormalsForSession(session);
+    generatedViews.lineNormals = std::move(orientedNormals);
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
     generatedViews.seedPoint = seedPoint;
