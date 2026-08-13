@@ -4345,7 +4345,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         }
     };
 
-    const bool accepted =
+    const bool accepted = !_linkedCursorMirroringSuppressed &&
         (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
     // Track the point for the status-bar position readout even when it doesn't
     // project onto this viewer's surface and the crosshair stays hidden. Only

@@ -242,6 +242,13 @@ public:
     // views" toggle (used by the line annotation window's pane group, whose
     // mirroring is dialog-local).
     void setLinkedCursorAlwaysEnabled(bool enabled) { _linkedCursorAlwaysEnabled = enabled; }
+    // Reject linked-cursor points outright, overriding both of the above. The
+    // line annotation window needs this to keep mirrored crosses out of its
+    // panes while the global toggle is on.
+    void setLinkedCursorMirroringSuppressed(bool suppressed)
+    {
+        _linkedCursorMirroringSuppressed = suppressed;
+    }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -691,6 +698,7 @@ private:
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
     bool _linkedCursorAlwaysEnabled = false;
+    bool _linkedCursorMirroringSuppressed = false;
 
     struct MeasurementPoint {
         cv::Vec2f surface{0.0f, 0.0f};

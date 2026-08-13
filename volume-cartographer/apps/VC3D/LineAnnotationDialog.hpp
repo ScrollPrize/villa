@@ -260,6 +260,11 @@ private:
     // projection + crosshair update per non-hovered pane per tick.
     void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
                                    const std::optional<cv::Vec3f>& point);
+    // Pushes the "Mirror cursor across panes" state onto the panes. The block
+    // has to sit on the receiving side: the panes belong to the same
+    // ViewerManager as the main window, so the global cursor sync would keep
+    // feeding them even with this dialog's own broadcast silenced.
+    void applyLinkedCursorMirroringToPanes();
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -344,6 +349,7 @@ private:
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
     bool toggleCurrentCutFollowFromKeyboard();
+    bool placeControlPointAtCurrentLinePosition();
     bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
@@ -428,6 +434,7 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
+    QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
