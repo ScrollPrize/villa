@@ -86,7 +86,7 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.fail("condition not met within timeout")
 
     async def test_reconnects_after_peer_eof(self) -> None:
-        self.assertEqual((await self.client.call("ping"))["protocolVersion"], 1)
+        self.assertEqual((await self.client.call("ping"))["protocolVersion"], 2)
         # Drop the peer: stopping the server EOFs the client's reader.
         await self.fake_server.stop()
         await self._wait_until(lambda: self.client.connected is False)
