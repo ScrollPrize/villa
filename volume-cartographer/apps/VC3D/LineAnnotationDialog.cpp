@@ -1411,6 +1411,16 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 _generatedOverlayRefreshQueued = false;
+                if (_arrowPanDirection != 0) {
+                    // During a keyboard pan every tick already rebuilds the
+                    // dynamic overlays (via setCurrentLinePosition), so only
+                    // the static strip overlays need to track the scrolling
+                    // camera here. The side-strip intersection request (which
+                    // clones geometry and snapshots+hashes every fiber per
+                    // call) waits for the landing's full refresh.
+                    rebuildGeneratedStaticStripOverlays();
+                    return;
+                }
                 rebuildGeneratedOverlays();
             });
         }));
@@ -2636,7 +2646,10 @@ void LineAnnotationDialog::finishArrowPan(double position)
     // Force the apply: the final residual is often below the setter's 1e-3
     // no-op threshold, and the cut planes must land on the exact target too.
     setCurrentLinePosition(position, false, /*forceApply=*/true);
-    rebuildGeneratedDynamicOverlays(true, false);
+    // One full-quality pass at the landing: statics, dynamics (with the
+    // current-cut overlay and span labels), and the side-strip intersection
+    // refresh the pan ticks deferred.
+    rebuildGeneratedOverlays(true);
     _arrowPanEndedByLanding = true;
 }
 
