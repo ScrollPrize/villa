@@ -22,6 +22,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -285,6 +286,33 @@ std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
         return std::nullopt;
     return vc3d::opendata::coordinateIdentityForVolume(
         *state->vpkg(), state->currentVolumeId());
+}
+
+// The volume an umbilicus file's metadata names, looked up among the package's
+// locally attached volumes by store directory name (the "volume" field holds
+// something like "s1_2um_ds2.zarr", which is exactly the basename of the
+// resolved zarr store each Volume was loaded from).
+//
+// Null when the named volume is not attached, is remote, or the lookup throws:
+// in all three cases there is nothing local to cross-check the stamp against,
+// and a missing cross-check is not itself a problem worth reporting.
+std::shared_ptr<Volume> attachedVolumeByStoreName(const VolumePkg& pkg,
+                                                  const std::string& storeName)
+{
+    const std::string wanted = std::filesystem::path(storeName).filename().string();
+    if (wanted.empty())
+        return nullptr;
+    try {
+        for (const std::string& id : pkg.volumeIDs()) {
+            const std::shared_ptr<Volume> volume = pkg.volume(id);
+            if (!volume || volume->isRemote())
+                continue;
+            if (volume->path().filename().string() == wanted)
+                return volume;
+        }
+    } catch (...) {
+    }
+    return nullptr;
 }
 
 void copyCoordinateIdentityToJson(
@@ -6116,6 +6144,366 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     return summaries;
 }
 
+LineAnnotationController::UmbilicusStatus
+LineAnnotationController::umbilicusStatus() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    const vc::core::util::ScrollUmbilicusResolution resolved =
+        vc::core::util::resolveScrollUmbilicus(pkg);
+    if (!resolved.path.empty()) {
+        QString text = QString::fromStdString(resolved.path.filename().string());
+        if (!resolved.info.voxelsizeUm) {
+            // An unstamped file leaves the frame to be guessed, so the status
+            // line says so before the guess shows up in a rebuilt layout.
+            text += tr(" (unstamped)");
+        }
+        return {true, std::move(text)};
+    }
+    if (!resolved.ambiguous.empty()) {
+        // The candidate paths are what makes this error long; a count is enough
+        // for a status line and the full list still appears on rebuild.
+        return {false, tr("multiple umbilicus files found (%1)")
+                           .arg(resolved.ambiguous.size())};
+    }
+    if (!pkg.umbilicusPath().empty()) {
+        // The project named a file the resolver refused: that is worth spelling
+        // out, since nothing in the package directory can fix it. The resolver
+        // keeps the detail after a semicolon, which a status line drops.
+        QString error = QString::fromStdString(resolved.error);
+        const int detail = error.indexOf(QLatin1String("; "));
+        if (detail > 0) {
+            error.truncate(detail);
+        }
+        return {false, std::move(error)};
+    }
+    // Nothing found, or the single candidate would not load; either way the
+    // package has no usable umbilicus and the rebuild carries the resolver's
+    // own words.
+    return {false, tr("no umbilicus")};
+}
+
+LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
+{
+    FiberMapSnapshot snapshot;
+
+    // Fibers are annotated in the volume's level-0 source frame, so the
+    // annotation voxel size is the source resolution, not the (possibly
+    // downsampled) current volume's own voxel size.
+    const auto coordinateIdentity = coordinateIdentityForState(_state);
+    if (coordinateIdentity) {
+        if (coordinateIdentity->sourceOriginalResolution > 0.0 &&
+            std::isfinite(coordinateIdentity->sourceOriginalResolution)) {
+            snapshot.voxelSizeUm = coordinateIdentity->sourceOriginalResolution;
+        }
+    }
+
+    // The scroll's z extent, scaled into that same source frame so it pairs with
+    // voxelSizeUm.
+    if (_state && _state->currentVolume()) {
+        try {
+            const int slices = _state->currentVolume()->numSlices();
+            if (slices > 0) {
+                double sourceSlices = static_cast<double>(slices);
+                if (coordinateIdentity) {
+                    sourceSlices *= static_cast<double>(
+                        coordinateIdentity->sourceCoordinateScaleFactor);
+                }
+                snapshot.annotationZSlices = static_cast<int>(std::llround(sourceSlices));
+            }
+        } catch (...) {
+        }
+    }
+
+    std::unordered_set<uint64_t> loadedIds;
+    loadedIds.reserve(_fibers.size());
+    for (const StoredFiber& fiber : _fibers) {
+        loadedIds.insert(fiber.id);
+    }
+
+    snapshot.fibers.reserve(_fibers.size());
+    for (const StoredFiber& fiber : _fibers) {
+        FiberMapFiber entry;
+        entry.id = fiber.id;
+        // The user part of the label comes from the file name, not the
+        // username field: for some fibers the two disagree and the file name
+        // is what the fiber panel shows.
+        const QString stem =
+            vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+        const int separator = stem.indexOf(QLatin1Char('_'));
+        entry.label = QStringLiteral("%1-%2")
+                          .arg(separator >= 0 ? stem.left(separator) : stem)
+                          .arg(fiber.sequence);
+        switch (vc::atlas::effectiveFiberHvTag(fiber.hvClassification, fiber.manualHvTag)) {
+        case vc3d::line_annotation::FiberHvTag::H:
+            entry.hvTag = 'H';
+            break;
+        case vc3d::line_annotation::FiberHvTag::V:
+            entry.hvTag = 'V';
+            break;
+        case vc3d::line_annotation::FiberHvTag::Unknown:
+        default:
+            entry.hvTag = '?';
+            break;
+        }
+        entry.controlPoints.assign(fiber.controlPoints.begin(), fiber.controlPoints.end());
+        entry.linePoints = fiber.linePoints;
+        const size_t spanCount =
+            fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
+        entry.tracedSegments.reserve(spanCount);
+        for (size_t i = 0; i < spanCount; ++i) {
+            entry.tracedSegments.push_back(vc3d::line_annotation::isAcceptedNativeTrace(
+                fiber.controlPoints[i].segmentToNext));
+        }
+        for (const FiberBranchRef& branch : fiber.branches) {
+            if (loadedIds.count(branch.branchFiberId) == 0) {
+                continue;
+            }
+            entry.links.push_back(FiberMapLink{branch.controlPointIndex,
+                                               branch.branchFiberId,
+                                               branch.branchControlPointIndex,
+                                               branch.pending});
+        }
+        snapshot.fibers.push_back(std::move(entry));
+    }
+
+    // Which umbilicus a package uses is the shared resolver's call: the
+    // project's "umbilicus" field wins, otherwise the package root and the
+    // segment parents are searched and ambiguity is refused outright.
+    if (!_state || !_state->vpkg()) {
+        return snapshot;
+    }
+    const vc::core::util::ScrollUmbilicusResolution resolved =
+        vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
+    if (resolved.path.empty()) {
+        snapshot.umbilicusMessage = QString::fromStdString(resolved.error);
+        for (const auto& candidate : resolved.ambiguous) {
+            snapshot.umbilicusMessage += QLatin1Char('\n');
+            snapshot.umbilicusMessage += QString::fromStdString(candidate.string());
+        }
+        Logger()->warn("Fiber map: no usable umbilicus: {}", resolved.error);
+        return snapshot;
+    }
+
+    std::vector<cv::Vec3f> points = resolved.info.controlPoints;
+    if (points.empty()) {
+        Logger()->warn("Fiber map: umbilicus {} has no points",
+                       resolved.path.string());
+        return snapshot;
+    }
+
+    // The umbilicus may be annotated on a downsampled grid while fibers live in
+    // the level-0 frame (PHercParis4 is x4; see
+    // scripts/fiber_network_unroll.md). A stamped file states the grid it
+    // indexes, so its scale is a division; unstamped files have to be guessed.
+    double scale = 1.0;
+    bool guessed = true;
+    if (resolved.info.voxelsizeUm) {
+        const double ratio = *resolved.info.voxelsizeUm / snapshot.voxelSizeUm;
+        if (std::isfinite(ratio) && ratio > 0.0) {
+            scale = ratio;
+            guessed = false;
+            Logger()->info(
+                "Fiber map: umbilicus {} at scale x{:g} (stamped {:g} um into "
+                "{:g} um)",
+                resolved.path.string(),
+                scale,
+                *resolved.info.voxelsizeUm,
+                snapshot.voxelSizeUm);
+        }
+    }
+
+    if (guessed) {
+        double fiberZLo = std::numeric_limits<double>::infinity();
+        double fiberZHi = -std::numeric_limits<double>::infinity();
+        for (const auto& fiber : snapshot.fibers) {
+            for (const auto& point : fiber.linePoints) {
+                if (std::isfinite(point[2])) {
+                    fiberZLo = std::min(fiberZLo, point[2]);
+                    fiberZHi = std::max(fiberZHi, point[2]);
+                }
+            }
+        }
+        double umbZLo = std::numeric_limits<double>::infinity();
+        double umbZHi = -std::numeric_limits<double>::infinity();
+        for (const auto& point : points) {
+            umbZLo = std::min(umbZLo, static_cast<double>(point[2]));
+            umbZHi = std::max(umbZHi, static_cast<double>(point[2]));
+        }
+
+        // Pick the smallest power-of-two scale whose z span best matches the
+        // fibers' z span. The score is intersection-over-union, not plain
+        // coverage: an oversized scale still "covers" the fibers while placing
+        // the centers far outside the windings, which turns the unroll into an
+        // oscillating angle.
+        if (fiberZHi > fiberZLo) {
+            double bestScore = -1.0;
+            for (const double candidate : {1.0, 2.0, 4.0, 8.0}) {
+                const double overlap = std::min(umbZHi * candidate, fiberZHi) -
+                                       std::max(umbZLo * candidate, fiberZLo);
+                const double unionSpan = std::max(umbZHi * candidate, fiberZHi) -
+                                         std::min(umbZLo * candidate, fiberZLo);
+                const double score =
+                    unionSpan > 0.0 ? std::max(overlap, 0.0) / unionSpan : 0.0;
+                if (score > bestScore + 0.01) {
+                    bestScore = score;
+                    scale = candidate;
+                }
+            }
+            if (bestScore < 0.25) {
+                Logger()->warn(
+                    "Fiber map: umbilicus {} z span matches only {:.0f}% of the "
+                    "fiber z span at any scale; not unrolling",
+                    resolved.path.string(),
+                    std::max(bestScore, 0.0) * 100.0);
+                return snapshot;
+            }
+            Logger()->info(
+                "Fiber map: umbilicus {} at scale x{:g} (z-span match {:.0f}%)",
+                resolved.path.string(),
+                scale,
+                bestScore * 100.0);
+        }
+    }
+
+    // A bare factor says how much the coordinates moved but not what frame they
+    // came from. Within one volpkg the volumes are levels of a single
+    // coordinate space with power-of-two voxel ratios, so a stamped
+    // power-of-two ratio *is* a level offset and reads far better as one; a
+    // ratio that is not a power of two means the stamped grid is not a level of
+    // this one, which the grid size states more usefully than a level would.
+    const QString factor = QString::number(scale, 'g', 6);
+    QString label;
+    if (guessed) {
+        label = tr("umbilicus ×%1 (guessed)").arg(factor);
+    } else {
+        // Not guessed means the file stamped a voxel size, so voxelsizeUm is
+        // set throughout this branch; the volume name is separately optional.
+        const double level = std::log2(scale);
+        const double rounded = std::round(level);
+        if (std::abs(level - rounded) < 1e-6) {
+            // The stamped store name is the most recognizable frame label;
+            // a file that stamped only its voxel size falls back to its own
+            // name, which at least says which umbilicus is in play.
+            const QString frame =
+                resolved.info.volume && !resolved.info.volume->empty()
+                    ? QString::fromStdString(*resolved.info.volume)
+                    : QString::fromStdString(resolved.path.filename().string());
+            const int levelOffset = static_cast<int>(rounded);
+            label = tr("umbilicus: %1 → level %2%3 vs base (×%4)")
+                        .arg(frame)
+                        .arg(levelOffset >= 0 ? QStringLiteral("+") : QString())
+                        .arg(levelOffset)
+                        .arg(factor);
+        } else {
+            label = tr("umbilicus: %1 µm grid → ×%2")
+                        .arg(QString::number(*resolved.info.voxelsizeUm, 'g', 6))
+                        .arg(factor);
+        }
+    }
+
+    // The scalar mapping above is only correct because the stamped volume is
+    // assumed to share this consumer's coordinate space. Two cheap checks make
+    // that assumption visible without changing the mapping: the stamp is
+    // cross-checked against the volume it names, and a volume registered
+    // through an affine transform is called out as outside what a scalar can
+    // express. Neither blocks the unroll; there is no transform-aware consumer
+    // to hand off to yet.
+    if (resolved.info.volume && !resolved.info.volume->empty()) {
+        const std::shared_ptr<Volume> stampedVolume =
+            attachedVolumeByStoreName(*_state->vpkg(), *resolved.info.volume);
+        if (stampedVolume) {
+            // The stamped grid's exact voxel counts pin it against the named
+            // store: uniform axis ratios give the rescale precisely (ratio 1 =
+            // annotated on the store's base grid), and the implied voxel size
+            // must then agree with the stamped one.
+            double impliedVoxelUm = 0.0;
+            try {
+                impliedVoxelUm = stampedVolume->voxelSize();
+            } catch (...) {
+            }
+            bool dimensionMismatch = false;
+            if (impliedVoxelUm > 0.0 && resolved.info.volumeWidth &&
+                resolved.info.volumeHeight && resolved.info.volumeSlices) {
+                double ratioX = 0.0;
+                double ratioY = 0.0;
+                double ratioZ = 0.0;
+                try {
+                    ratioX = static_cast<double>(stampedVolume->sliceWidth()) /
+                             *resolved.info.volumeWidth;
+                    ratioY = static_cast<double>(stampedVolume->sliceHeight()) /
+                             *resolved.info.volumeHeight;
+                    ratioZ = static_cast<double>(stampedVolume->numSlices()) /
+                             *resolved.info.volumeSlices;
+                } catch (...) {
+                    ratioX = ratioY = ratioZ = 0.0;
+                }
+                if (ratioX > 0.0 && ratioY > 0.0 && ratioZ > 0.0) {
+                    const double lo = std::min({ratioX, ratioY, ratioZ});
+                    const double hi = std::max({ratioX, ratioY, ratioZ});
+                    if (hi > lo * 1.02) {
+                        dimensionMismatch = true;
+                        label += tr(" (stamp mismatch: dimensions are not a "
+                                    "uniform rescale of %1)")
+                                     .arg(QString::fromStdString(
+                                         *resolved.info.volume));
+                        Logger()->warn(
+                            "Fiber map: umbilicus {} stamps a {}x{}x{} grid but "
+                            "volume {} is {}x{}x{}; axis ratios disagree",
+                            resolved.path.string(),
+                            *resolved.info.volumeWidth,
+                            *resolved.info.volumeHeight,
+                            *resolved.info.volumeSlices,
+                            *resolved.info.volume,
+                            stampedVolume->sliceWidth(),
+                            stampedVolume->sliceHeight(),
+                            stampedVolume->numSlices());
+                    } else {
+                        impliedVoxelUm *= (ratioX + ratioY + ratioZ) / 3.0;
+                    }
+                }
+            }
+            if (!dimensionMismatch && impliedVoxelUm > 0.0 &&
+                std::isfinite(impliedVoxelUm) && resolved.info.voxelsizeUm &&
+                std::abs(impliedVoxelUm - *resolved.info.voxelsizeUm) >
+                    0.01 * *resolved.info.voxelsizeUm) {
+                label += tr(" (stamp mismatch: volume implies %1 µm)")
+                             .arg(QString::number(impliedVoxelUm, 'g', 6));
+                Logger()->warn(
+                    "Fiber map: umbilicus {} stamps {:g} um but volume {} "
+                    "implies {:g} um",
+                    resolved.path.string(),
+                    *resolved.info.voxelsizeUm,
+                    *resolved.info.volume,
+                    impliedVoxelUm);
+            }
+            const std::filesystem::path transform =
+                stampedVolume->path() / "transform.json";
+            std::error_code transformCheck;
+            if (std::filesystem::exists(transform, transformCheck)) {
+                label += tr(" (registered volume — scalar mapping may not apply)");
+                Logger()->warn(
+                    "Fiber map: umbilicus volume {} is registered via {}; the "
+                    "scalar frame mapping assumes a shared coordinate space "
+                    "and may not apply",
+                    *resolved.info.volume,
+                    transform.string());
+            }
+        }
+    }
+
+    for (auto& point : points) {
+        point *= static_cast<float>(scale);
+    }
+    std::sort(points.begin(), points.end(),
+              [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
+    snapshot.umbilicusCenters = std::move(points);
+    snapshot.umbilicusLabel = std::move(label);
+    return snapshot;
+}
+
 std::vector<LineAnnotationController::FiberLinkOverlayInfo>
 LineAnnotationController::fiberLinkOverlayInfos() const
 {
@@ -9751,13 +10139,9 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
     }
 }
 
-std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
-    const LineAnnotationSession& session)
+const std::optional<vc::core::util::Umbilicus>&
+LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
-    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
-    std::vector<cv::Vec3f> normals;
-    normals.reserve(session.optimizedLine.points.size());
-
     std::shared_ptr<Volume> volume;
     try {
         volume = _state ? _state->currentVolume() : nullptr;
@@ -9765,9 +10149,6 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         volume.reset();
     }
 
-    // One way to find umbilicus data: the shared resolver honours the project's
-    // attachment, refuses several candidates rather than picking one, and
-    // refuses a file whose frame metadata is malformed.
     fs::path volpkgRoot;
     if (_state && _state->vpkg()) {
         auto vpkg = _state->vpkg();
@@ -9812,6 +10193,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         _umbilicusNotice.clear();
         try {
             if (_state && _state->vpkg() && volume) {
+                // One way to find umbilicus data: the shared resolver honours the
+                // project's attachment, refuses several candidates rather than
+                // picking one, and refuses malformed frame metadata.
                 const auto resolved =
                     vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
                 if (resolved.path.empty()) {
@@ -9824,17 +10208,15 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     }
                 } else {
                     std::vector<cv::Vec3f> controlPoints = resolved.info.controlPoints;
-
-                    // The line's own points are in the annotation frame, so the
-                    // umbilicus has to be too, and the dense per-slice centres
-                    // have to be built at that frame's extent rather than the
-                    // volume's own.
+                    // Line points live in the annotation frame, so that is the
+                    // frame to reach, and the dense per-slice centres have to be
+                    // built at its extent rather than the volume's own.
+                    //
                     // The frame from the cache key above, not a fresh derivation:
                     // the two must agree or the cache would record a frame the
                     // geometry was not built in.
                     const auto& frame = currentAnnotationFrame;
-                    const std::array<double, 3>& annotationGrid =
-                        frame.extentXyz;
+                    const std::array<double, 3>& annotationGrid = frame.extentXyz;
                     const auto scale = vc::core::util::deriveUmbilicusScale(
                         resolved.info, annotationGrid, frame.voxelSizeUm);
 
@@ -10053,8 +10435,8 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
                                 std::move(*framed), volumeShape);
                             Logger()->info(
-                                "Line annotation: umbilicus {} carries no frame "
-                                "metadata; read as before",
+                                "Line annotation: umbilicus {} states no frame; "
+                                "read as before",
                                 resolved.path.string());
                         }
                     }
@@ -10064,6 +10446,24 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             _scrollUmbilicus.reset();
         }
         publishUmbilicusNotice();
+    }
+    return _scrollUmbilicus;
+}
+
+std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
+    const LineAnnotationSession& session)
+{
+    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(session.optimizedLine.points.size());
+
+    ensureScrollUmbilicusLoaded();
+
+    std::shared_ptr<Volume> volume;
+    try {
+        volume = _state ? _state->currentVolume() : nullptr;
+    } catch (...) {
+        volume.reset();
     }
 
     cv::Vec2f volumeCenterXY{kNan, kNan};

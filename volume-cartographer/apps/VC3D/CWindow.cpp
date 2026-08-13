@@ -156,6 +156,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -2622,6 +2623,26 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
                 updateAtlasSearchDocks();
             });
+    _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
+    _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
+    const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        tabBar->setTabButton(fiberMapIndex, QTabBar::RightSide, nullptr);
+    }
+    connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberAtControlPointRequested,
+            this, [this](uint64_t fiberId, int controlPointIndex) {
+                if (_fiberWidget) {
+                    _fiberWidget->selectFiber(fiberId);
+                }
+                if (_fiberSliceWidget) {
+                    _fiberSliceWidget->selectFiber(fiberId);
+                }
+                if (_lineAnnotationController) {
+                    _lineAnnotationController->openFiberAtControlPoint(fiberId,
+                                                                      controlPointIndex);
+                }
+            });
+
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;

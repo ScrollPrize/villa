@@ -120,6 +120,58 @@ public:
             vc3d::line_annotation::FiberTraceState::Legacy;
     };
 
+    // Read-only network snapshot for the Fiber Map workspace: every loaded
+    // fiber's unrolling inputs plus the scroll umbilicus, in one pass.
+    struct FiberMapLink {
+        int controlPointIndex = -1;
+        uint64_t branchFiberId = 0;
+        int branchControlPointIndex = -1;
+        // Mirrors FiberBranchRef::pending: the link still awaits reviewer
+        // approval, and the map colours it like the annotation views do.
+        bool pending = false;
+    };
+
+    struct FiberMapFiber {
+        uint64_t id = 0;
+        // "<file prefix>-<sequence>", e.g. "kb-604".
+        QString label;
+        char hvTag = '?';
+        std::vector<cv::Vec3d> controlPoints;
+        std::vector<cv::Vec3d> linePoints;
+        // Per control-point span; size max(0, controlPoints.size() - 1).
+        std::vector<bool> tracedSegments;
+        // Branch links resolving to a loaded fiber, pending included.
+        std::vector<FiberMapLink> links;
+    };
+
+    struct FiberMapSnapshot {
+        std::vector<FiberMapFiber> fibers;
+        // Umbilicus control points scaled into the fibers' frame, sorted by z;
+        // empty when no plausible umbilicus was found.
+        std::vector<cv::Vec3f> umbilicusCenters;
+        double voxelSizeUm = 2.4;
+        // Scroll z extent in the fibers' frame, i.e. the current volume's slice
+        // count scaled back to the annotation (level 0) resolution; 0 when the
+        // volume is unknown.
+        int annotationZSlices = 0;
+        QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
+        // Ready-to-display description of the frame the scale maps from, for
+        // workspace status bars: the stamped volume and its level offset when
+        // the ratio is a power of two, the stamped grid size otherwise, or the
+        // bare guessed factor. Carries the stamp-mismatch and registered-volume
+        // notes when either check fires. Empty when no umbilicus was applied.
+        QString umbilicusLabel;
+    };
+
+    // One-line umbilicus availability summary for workspace status bars:
+    // "<fileName>" on success (with " (unstamped)" suffix when the file
+    // declares no voxelsize_um), empty when no package is loaded, and a
+    // shortened form of the resolver's error otherwise.
+    struct UmbilicusStatus {
+        bool available = false;
+        QString text;
+    };
+
     struct FiberSnapshotWithPath {
         std::filesystem::path fiberPath;
         vc::atlas::FiberPolyline fiber;
@@ -221,6 +273,10 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
+    // Resolves the package's umbilicus for a status line only; nothing is
+    // cached, so call it on user-visible state changes rather than per frame.
+    [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
@@ -562,6 +618,10 @@ private:
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
+    // Loads the volpkg's scroll umbilicus into the session frame on first use
+    // and caches the (possibly empty) result; re-attempted when the volpkg
+    // root changes.
+    const std::optional<vc::core::util::Umbilicus>& ensureScrollUmbilicusLoaded();
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
     // NaN entries mark invalid samples.
