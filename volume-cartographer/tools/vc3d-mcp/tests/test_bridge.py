@@ -85,7 +85,7 @@ class BridgeClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_send_request_and_parse_response(self) -> None:
         result = await self.client.call("ping")
-        self.assertEqual(result["protocolVersion"], 1)
+        self.assertEqual(result["protocolVersion"], 2)
 
     async def test_jsonrpc_error_reply_becomes_bridge_error(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
