@@ -228,6 +228,41 @@ TEST_CASE("generated display tangent sign is independent of stored point order")
     CHECK(generatedDisplayTangentSign({axialPoints.rbegin(), axialPoints.rend()},
                                       {axialNormals.rbegin(), axialNormals.rend()}) == -1.0f);
 
+    // Near-axial fibers with slight helical drift: the drift direction must
+    // not decide the sign -- both drift chiralities read as ascending, so the
+    // side cut's vertical matches across neighboring vertical fibers.
+    for (const float drift : {3.0e-2f, -3.0e-2f}) {
+        std::vector<cv::Vec3f> helixPoints;
+        std::vector<cv::Vec3f> helixNormals;
+        for (int i = 0; i < 64; ++i) {
+            const float angle = drift * static_cast<float>(i);
+            const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+            helixPoints.push_back(radial * 200.0f +
+                                  cv::Vec3f{500.0f, 500.0f, 300.0f + 10.0f * static_cast<float>(i)});
+            helixNormals.push_back(radial);
+        }
+        CHECK(generatedDisplayTangentSign(helixPoints, helixNormals) == 1.0f);
+        CHECK(generatedDisplayTangentSign({helixPoints.rbegin(), helixPoints.rend()},
+                                          {helixNormals.rbegin(), helixNormals.rend()}) == -1.0f);
+    }
+
+    // Circumferential-dominant helix (shallow pitch): the circumferential
+    // vote still owns the decision, whichever way the fiber creeps in z.
+    for (const float climb : {1.0f, -1.0f}) {
+        std::vector<cv::Vec3f> shallowPoints;
+        std::vector<cv::Vec3f> shallowNormals;
+        for (int i = 0; i < 64; ++i) {
+            const float angle = 0.1f * static_cast<float>(i);
+            const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+            shallowPoints.push_back(radial * 200.0f +
+                                    cv::Vec3f{500.0f, 500.0f, 300.0f + climb * static_cast<float>(i)});
+            shallowNormals.push_back(radial);
+        }
+        CHECK(generatedDisplayTangentSign(shallowPoints, shallowNormals) == 1.0f);
+        CHECK(generatedDisplayTangentSign({shallowPoints.rbegin(), shallowPoints.rend()},
+                                          {shallowNormals.rbegin(), shallowNormals.rend()}) == -1.0f);
+    }
+
     // Sparse valid normals must still decide a circumferential fiber: the
     // primary tie band scales with the pairs that voted, not the tangent
     // count, or a fiber long enough that 1e-3 * tangentCount exceeds the few

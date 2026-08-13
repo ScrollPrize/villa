@@ -457,11 +457,15 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
 // One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
 // current-cut and side-cut planes. Stored line-point order never changes.
 // The current cut's screen x is (up x normal) with normal = sign * tangent, so
-// pinning sign * sum((normal_i x tangent_i) . z) >= 0 puts increasing slice
+// pinning sign * mean((normal_i x tangent_i) . z) >= 0 puts increasing slice
 // index on the same screen side for every circumferential fiber, whatever
-// direction it was traced or merged in. Fibers running along the scroll axis
-// score ~0 there; for them the tangent's own z component decides, which pins
-// the side cut's vertical (its up is the signed tangent).
+// direction it was traced or merged in. For fibers running along the scroll
+// axis the tangent's own z component decides instead, which pins the side
+// cut's vertical (its up is the signed tangent). Per point the two votes
+// measure the tangent's circumferential and axial magnitudes, so the larger
+// mean identifies the fiber's dominant direction (switching conventions at
+// ~45 degree pitch): a near-axial fiber's slight helical drift must not
+// decide its sign.
 inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoints,
                                          const std::vector<cv::Vec3f>& lineNormals)
 {
@@ -498,19 +502,21 @@ inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoint
         ++normalPairCount;
         primary += static_cast<double>(normal.cross(tangent)[2]);
     }
-    // Scale each tie band with the number of points that actually voted, so
-    // rounding noise on a long near-axial fiber cannot masquerade as a
-    // decision -- and so sparse valid normals on a long fiber are not drowned
-    // out by a threshold sized to the tangent count.
-    const double primaryTie =
-        std::max(1.0e-3, 1.0e-3 * static_cast<double>(normalPairCount));
-    if (std::abs(primary) > primaryTie) {
-        return primary > 0.0 ? 1.0f : -1.0f;
+    // Compare per-vote means, not raw sums: primary only accumulates where a
+    // sampled normal is valid, so on a sparse-normal fiber a raw fallback sum
+    // over every tangent would drown out a decisive primary vote. The means
+    // are per-point direction magnitudes in [-1, 1] and comparable directly;
+    // the tie band keeps rounding noise from masquerading as a decision.
+    constexpr double kTie = 1.0e-3;
+    const double meanPrimary =
+        normalPairCount > 0 ? primary / static_cast<double>(normalPairCount) : 0.0;
+    const double meanFallback =
+        tangentCount > 0 ? fallback / static_cast<double>(tangentCount) : 0.0;
+    if (std::abs(meanPrimary) > std::max(kTie, std::abs(meanFallback))) {
+        return meanPrimary > 0.0 ? 1.0f : -1.0f;
     }
-    const double fallbackTie =
-        std::max(1.0e-3, 1.0e-3 * static_cast<double>(tangentCount));
-    if (std::abs(fallback) > fallbackTie) {
-        return fallback > 0.0 ? 1.0f : -1.0f;
+    if (std::abs(meanFallback) > kTie) {
+        return meanFallback > 0.0 ? 1.0f : -1.0f;
     }
     return 1.0f;
 }
