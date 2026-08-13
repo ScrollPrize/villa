@@ -568,6 +568,42 @@ std::vector<LineFrame> framesAtControlPoints(const std::vector<SegmentNormalSamp
     return frames;
 }
 
+// Only entries where both the hint and the direction are usable contribute, so
+// sparse invalid hints dilute the vote instead of deciding it, and hints
+// orthogonal to the direction contribute ~nothing.
+double orientationAgreementScore(const std::vector<cv::Vec3f>& hints,
+                                 const std::vector<cv::Vec3d>& directions)
+{
+    double score = 0.0;
+    const size_t count = std::min(hints.size(), directions.size());
+    for (size_t i = 0; i < count; ++i) {
+        const cv::Vec3d hint = normalizedOrZero({static_cast<double>(hints[i][0]),
+                                                 static_cast<double>(hints[i][1]),
+                                                 static_cast<double>(hints[i][2])});
+        const cv::Vec3d direction = normalizedOrZero(directions[i]);
+        if (!validDirection(hint) || !validDirection(direction)) {
+            continue;
+        }
+        score += hint.dot(direction);
+    }
+    return score;
+}
+
+bool usableOrientationHints(const std::vector<cv::Vec3f>& hints, size_t sampleCount)
+{
+    if (hints.size() != sampleCount) {
+        return false;
+    }
+    for (const auto& hint : hints) {
+        if (validDirection({static_cast<double>(hint[0]),
+                            static_cast<double>(hint[1]),
+                            static_cast<double>(hint[2])})) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct LineViewFrameData {
     std::vector<SegmentNormalSample> samples;
     std::vector<cv::Vec3d> normals;
@@ -576,7 +612,8 @@ struct LineViewFrameData {
     std::vector<cv::Vec3d> transportedUpVectors;
 };
 
-LineViewFrameData buildControlFrameData(const LineModel& line)
+LineViewFrameData buildControlFrameData(const LineModel& line,
+                                        const std::vector<cv::Vec3f>& orientedPointNormals)
 {
     LineViewFrameData data;
     data.samples = controlPointSamples(line);
@@ -589,6 +626,32 @@ LineViewFrameData buildControlFrameData(const LineModel& line)
     data.transportedUpVectors = buildTransportedUpVectors(
         data.samples,
         displayFrameAnchorIndex(line, data.samples.size()));
+
+    // Frames and display ups are each already sign-chained along the line, so
+    // the only remaining freedom is one global sign per set -- inherited from an
+    // unoriented manifest normal at an anchor that moves as the line grows.
+    // A whole-line vote against the caller's oriented normals pins both signs;
+    // flipping per frame instead would mirror the strips mid-line.
+    if (usableOrientationHints(orientedPointNormals, data.samples.size())) {
+        std::vector<cv::Vec3d> meshNormals;
+        meshNormals.reserve(data.frames.size());
+        for (const auto& frame : data.frames) {
+            meshNormals.push_back(frame.meshNormal);
+        }
+        if (orientationAgreementScore(orientedPointNormals, meshNormals) < 0.0) {
+            for (auto& frame : data.frames) {
+                // Negating both keeps side == meshNormal x tangent.
+                frame.meshNormal *= -1.0;
+                frame.side *= -1.0;
+            }
+        }
+        if (orientationAgreementScore(orientedPointNormals, data.transportedUpVectors) < 0.0) {
+            for (auto& up : data.transportedUpVectors) {
+                up *= -1.0;
+            }
+        }
+    }
+
     data.tangents.reserve(data.samples.size());
     for (size_t row = 0; row < data.samples.size(); ++row) {
         data.tangents.push_back(tangentAt(data.samples, row));
@@ -620,7 +683,7 @@ cv::Vec3d pointTangent(const LineModel& line, size_t index)
 
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& config)
 {
-    const auto frameData = buildControlFrameData(line);
+    const auto frameData = buildControlFrameData(line, config.orientedPointNormals);
     const auto& samples = frameData.samples;
     const auto& frames = frameData.frames;
     if (samples.empty()) {
@@ -658,9 +721,9 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
     return surfaces;
 }
 
-LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const LineViewConfig& /*config*/)
+LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const LineViewConfig& config)
 {
-    const auto frameData = buildControlFrameData(line);
+    const auto frameData = buildControlFrameData(line, config.orientedPointNormals);
     LineViewFrameDiagnostics diagnostics;
     diagnostics.frameCount = frameData.frames.size();
     if (frameData.frames.size() < 2) {
