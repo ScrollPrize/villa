@@ -1175,28 +1175,35 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         _surfaceCacheGeometryEpoch = _surfaceGeometryEpoch;
         ++_surfaceCacheEpoch;
         QPointer<CChunkedVolumeViewer> guard(this);
-        _surfaceTileCbId = _surfaceCache->addTileReadyListener([guard]() {
-            if (!guard || guard->_surfaceTileRenderQueued.exchange(
-                              true, std::memory_order_acq_rel)) {
-                return;
-            }
-            QMetaObject::invokeMethod(qApp, [guard]() {
-                if (!guard)
+        std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _surfaceCache;
+        auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+        _surfaceTileCbId = _surfaceCache->addTileReadyListener(
+            [guard, cacheWeak, notificationQueued]() {
+                // notifyTileReady() runs on fill workers. Gate here so a large tile
+                // publish burst posts only one event to Qt's UI queue.
+                if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                     return;
-                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard, [guard]() {
-                    if (!guard)
+                QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
+                    const auto source = cacheWeak.lock();
+                    if (!guard || !source || guard->_surfaceCache != source) {
+                        notificationQueued->store(false, std::memory_order_release);
                         return;
-                    guard->_surfaceTileRenderQueued.store(false,
-                                                          std::memory_order_release);
-                    if (guard->_closing)
-                        return;
-                    // One epoch represents the whole burst. The render reads
-                    // every tile resident at the time it starts.
-                    ++guard->_chunkContentEpoch;
-                    guard->submitRender("surface tile batch ready");
-                });
-            }, Qt::QueuedConnection);
-        });
+                    }
+                    QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                       [guard, cacheWeak, notificationQueued]() {
+                        notificationQueued->store(false, std::memory_order_release);
+                        const auto source = cacheWeak.lock();
+                        if (!guard || !source || guard->_surfaceCache != source)
+                            return;
+                        if (guard->_closing)
+                            return;
+                        // One epoch represents the whole burst. The render reads
+                        // every tile resident at the time it starts.
+                        ++guard->_chunkContentEpoch;
+                        guard->submitRender("surface tile batch ready");
+                    });
+                }, Qt::QueuedConnection);
+            });
     }
 
     // Overlay channel: its own instance with its own budget over the overlay
@@ -1240,26 +1247,32 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
     ++_surfaceCacheEpoch;
 
     QPointer<CChunkedVolumeViewer> guard(this);
-    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener([guard]() {
-        if (!guard || guard->_surfaceTileRenderQueued.exchange(
-                          true, std::memory_order_acq_rel)) {
-            return;
-        }
-        QMetaObject::invokeMethod(qApp, [guard]() {
-            if (!guard)
+    std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _overlaySurfaceCache;
+    auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener(
+        [guard, cacheWeak, notificationQueued]() {
+            // Keep overlay tile bursts bounded to one queued UI notification too.
+            if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                 return;
-            QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard, [guard]() {
-                if (!guard)
+            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
+                const auto source = cacheWeak.lock();
+                if (!guard || !source || guard->_overlaySurfaceCache != source) {
+                    notificationQueued->store(false, std::memory_order_release);
                     return;
-                guard->_surfaceTileRenderQueued.store(false,
-                                                      std::memory_order_release);
-                if (guard->_closing)
-                    return;
-                ++guard->_chunkContentEpoch;
-                guard->submitRender("surface tile batch ready");
-            });
-        }, Qt::QueuedConnection);
-    });
+                }
+                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                   [guard, cacheWeak, notificationQueued]() {
+                    notificationQueued->store(false, std::memory_order_release);
+                    const auto source = cacheWeak.lock();
+                    if (!guard || !source || guard->_overlaySurfaceCache != source)
+                        return;
+                    if (guard->_closing)
+                        return;
+                    ++guard->_chunkContentEpoch;
+                    guard->submitRender("surface tile batch ready");
+                });
+            }, Qt::QueuedConnection);
+        });
 }
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
@@ -1317,16 +1330,20 @@ void CChunkedVolumeViewer::invalidateVis()
         return;
     }
     _genCacheDirty = true;
+    // A full visual invalidation means cached samples from both channels are
+    // stale as well. Invalidate the shared geometry through the base last.
+    if (_overlaySurfaceCache)
+        _overlaySurfaceCache->invalidateAll();
+    if (_surfaceCache)
+        _surfaceCache->invalidateAll();
+    if (_surfName == "segmentation")
+        _surfaceEditInvalidationPending = true;
 }
 
 void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
 {
     if (changedCells.empty() || name != _surfName || _surfName != "segmentation") {
         invalidateVis();
-        if (_surfaceCache)
-            _surfaceCache->invalidateAll();
-        if (_overlaySurfaceCache)
-            _overlaySurfaceCache->invalidateAll();
         return;
     }
 
@@ -1339,6 +1356,7 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
         _surfaceCache->invalidateSurfaceRegion(changedCells);
 
     _genCacheDirty = true;
+    _surfaceEditInvalidationPending = true;
 }
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
@@ -1351,6 +1369,10 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     const bool isCurrentSurface = (_surfName == name);
     const auto previousSurface = _surfWeak.lock();
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
+    const bool hadExplicitEditInvalidation =
+        isSameCurrentSurface && isEditUpdate && _surfaceEditInvalidationPending;
+    if (isCurrentSurface)
+        _surfaceEditInvalidationPending = false;
     const bool isIntersectionTarget =
         _intersectTgts.count(name) != 0 ||
         (_intersectTgts.count("visible_segmentation") != 0 &&
@@ -1386,6 +1408,15 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
+        // Tools with a known edit region invalidate it before sending this
+        // signal. Other same-object edits (brush/reset/etc.) need a conservative
+        // full tile invalidation so stale geometry is never sampled.
+        if (!hadExplicitEditInvalidation) {
+            if (_overlaySurfaceCache)
+                _overlaySurfaceCache->invalidateAll();
+            if (_surfaceCache)
+                _surfaceCache->invalidateAll();
+        }
         _zOffWorldDir = {0, 0, 0};
         updateContentBounds();
         updateFocusMarker();
@@ -1402,6 +1433,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _zOffWorldDir = {0, 0, 0};
     invalidateIntersect(name);
     if (!surf) {
+        // Deselecting the active surface must release its memory immediately;
+        // returning to it later starts with a cold cache.
+        dropSurfaceCaches();
         clearIntersectionItems();
         _measurement = {};
         _scene->clear();
@@ -1547,8 +1581,10 @@ void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std:
         return;
     }
     auto current = _surfWeak.lock();
-    if (current && current == surf)
+    if (current && current == surf) {
         _surfWeak.reset();
+        dropSurfaceCaches();
+    }
 }
 
 void CChunkedVolumeViewer::onVolumeClosing()
