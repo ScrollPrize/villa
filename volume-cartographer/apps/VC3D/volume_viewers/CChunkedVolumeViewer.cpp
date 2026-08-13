@@ -4357,13 +4357,39 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
         // Match the points-overlay default view tolerance so points that are meant to
         // render faded still project to their true location rather than collapsing.
         constexpr float kQuadProjectTolerance = 10.0f;
+        // The view shows content displaced by the normal offset — and, when
+        // compositing, the whole slab. Points anywhere in that visible signed
+        // depth band along the normal (e.g. the linked cursor from a slice
+        // view) must still project; points outside it — including the mirror
+        // side of the surface — must not.
+        float depthLo = _zOff;
+        float depthHi = _zOff;
+        if (isCompositeEnabled()) {
+            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            const float front = _zOff + float(std::max(0, _compositeSettings.layersFront)) * zStep;
+            const float behind = _zOff - float(std::max(0, _compositeSettings.layersBehind)) * zStep;
+            depthLo = std::min(front, behind);
+            depthHi = std::max(front, behind);
+        }
+        const float tolerance =
+            kQuadProjectTolerance + std::max(std::abs(depthLo), std::abs(depthHi));
         // pointTo() with a patch index signals "no surface point within tolerance" by
         // returning a positive value (~the tolerance) WITHOUT updating ptr, so a bare
         // `< 0.0f` check would silently keep ptr at {0,0,0} and map the point to the
         // segment center. Treat anything outside the tolerance as a failed projection.
-        const float dist = quad->pointTo(ptr, volPoint, kQuadProjectTolerance, 100, patchIndex);
-        if (dist < 0.0f || dist > kQuadProjectTolerance)
+        const float dist = quad->pointTo(ptr, volPoint, tolerance, 100, patchIndex);
+        if (dist < 0.0f || dist > tolerance)
             return {NAN, NAN};
+        // Gate on the signed offset along the surface normal so only the
+        // depth band the view actually displays accepts the point.
+        const cv::Vec3f surfCoord = quad->coord(ptr);
+        const cv::Vec3f surfNormal = quad->normal(ptr);
+        if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
+            const float w = (volPoint - surfCoord).dot(surfNormal);
+            if (w < depthLo - kQuadProjectTolerance ||
+                w > depthHi + kQuadProjectTolerance)
+                return {NAN, NAN};
+        }
         const cv::Vec3f loc = quad->loc(ptr);
         return surfaceToScene(loc[0], loc[1]);
     }
