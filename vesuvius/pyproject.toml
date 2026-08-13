@@ -29,7 +29,6 @@ dependencies = [
     "zarr>=2.18.7,<4",
     "s3fs>=2025.9.0",
     "cachetools>=6.2.4",
-    "volume-cartographer",
     "edt>=3.1.2",
 ]
 
@@ -56,6 +55,10 @@ models = [
     "timm>=1.0.20",
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
+    # Monorepo-only C++ package (resolved via [tool.uv.sources]); provides the vc /
+    # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
+    # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
+    "volume-cartographer",
     "numba>=0.60.0",
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
@@ -128,6 +131,7 @@ all = [
     "numba>=0.60.0",
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
+    "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
     "einops>=0.8.1",
