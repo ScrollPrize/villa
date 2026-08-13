@@ -6,7 +6,7 @@ import torch
 from koine_machines.training.train import (
     _append_jsonl,
     _benchmark_summary,
-    _disable_z_projection_for_normal_pooled_3d,
+    _disable_z_projection_for_volume_targets,
     _full_3d_dilation_distances_for_level,
     _masked_unsmoothed_bce_with_logits,
 )
@@ -82,7 +82,7 @@ def test_full_3d_dilation_distances_reject_mixed_volume_scales():
         _full_3d_dilation_distances_for_level(config)
 
 
-def test_disable_z_projection_for_normal_pooled_3d_forces_projection_off():
+def test_disable_z_projection_for_volume_targets_forces_projection_off():
     config = {
         "mode": "normal_pooled_3d",
         "model_config": {"z_projection_mode": "logsumexp"},
@@ -100,7 +100,7 @@ def test_disable_z_projection_for_normal_pooled_3d_forces_projection_off():
         },
     }
 
-    _disable_z_projection_for_normal_pooled_3d(config)
+    _disable_z_projection_for_volume_targets(config)
 
     assert config["model_config"]["z_projection_mode"] == "none"
     assert config["targets"]["ink"]["z_projection_mode"] == "none"
