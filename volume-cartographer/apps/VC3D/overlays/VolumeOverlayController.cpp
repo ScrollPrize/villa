@@ -149,22 +149,20 @@ bool overlayCoordinatesCompatible(const VolumePkg& pkg,
 
 VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject* parent)
     : QObject(parent)
-    , _viewerManager(manager)
 {
-    if (_viewerManager) {
-        _volumeChangedConnection = connect(
-            _viewerManager,
-            &ViewerManager::currentVolumeChanged,
-            this,
-            &VolumeOverlayController::refreshForCurrentVolume);
-    }
+    setViewerManagers({manager});
+}
+
+ViewerManager* VolumeOverlayController::primaryViewerManager() const
+{
+    return _viewerManagers.empty() ? nullptr : _viewerManagers.front();
 }
 
 VolumeOverlayController::State VolumeOverlayController::state() const
 {
     return {
-        .currentVolumeId = _viewerManager
-            ? _viewerManager->currentVolumeId()
+        .currentVolumeId = primaryViewerManager()
+            ? primaryViewerManager()->currentVolumeId()
             : std::string{},
         .volumeId = _overlayVolumeId,
         .colormap = _overlayColormapName,
@@ -218,27 +216,36 @@ VolumeOverlayController::apply(const Update& update)
     return ApplyResult::Applied;
 }
 
-void VolumeOverlayController::setViewerManager(ViewerManager* manager)
+void VolumeOverlayController::setViewerManagers(
+    const std::vector<ViewerManager*>& managers)
 {
-    if (_viewerManager == manager) {
+    std::vector<ViewerManager*> unique;
+    for (auto* manager : managers) {
+        if (manager && std::find(unique.begin(), unique.end(), manager) == unique.end())
+            unique.push_back(manager);
+    }
+    if (_viewerManagers == unique) {
         return;
     }
-    QObject::disconnect(_volumeChangedConnection);
-    if (_viewerManager) {
-        _viewerManager->setVolumeOverlay(nullptr);
+    for (const auto& connection : _managerConnections)
+        QObject::disconnect(connection);
+    _managerConnections.clear();
+    for (auto* manager : _viewerManagers) {
+        if (manager) manager->setVolumeOverlay(nullptr);
     }
 
-    _viewerManager = manager;
-    if (!_viewerManager) {
+    _viewerManagers = std::move(unique);
+    if (_viewerManagers.empty()) {
         updateUiEnabled();
         return;
     }
 
-    _volumeChangedConnection = connect(
-        _viewerManager,
-        &ViewerManager::currentVolumeChanged,
-        this,
-        &VolumeOverlayController::refreshForCurrentVolume);
+    for (auto* manager : _viewerManagers) {
+        _managerConnections.push_back(connect(
+            manager, &ViewerManager::currentVolumeChanged, this,
+            &VolumeOverlayController::refreshForCurrentVolume));
+        manager->setVolumeOverlay(this);
+    }
 
     // Overlay settings are stored per project, so each workspace receives the
     // same controller state when it becomes active.
@@ -256,7 +263,6 @@ void VolumeOverlayController::setViewerManager(ViewerManager* manager)
         setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
         setMaxDisplayedResolution(_overlayMaxDisplayedResolution);
         setComposite(currentCompositeSettings());
-        _viewerManager->setVolumeOverlay(this);
         updateUiEnabled();
     }
     if (!wasSuspended && _overlayVolumeId != previousVolumeId) {
@@ -401,8 +407,9 @@ void VolumeOverlayController::refreshVolumeOptions()
     int indexToSelect = 0;
 
     if (_volumePkg) {
-        const std::string baseVolumeId = _viewerManager
-            ? _viewerManager->currentVolumeId()
+        auto* primary = primaryViewerManager();
+        const std::string baseVolumeId = primary
+            ? primary->currentVolumeId()
             : std::string{};
         for (const auto& id : _volumePkg->volumeIDs()) {
             if (!baseVolumeId.empty() &&
@@ -433,6 +440,7 @@ void VolumeOverlayController::refreshVolumeOptions()
 
 void VolumeOverlayController::refreshForCurrentVolume()
 {
+    if (_baseVolumeUpdateInProgress) return;
     const std::string previousVolumeId = _overlayVolumeId;
     refreshVolumeOptions();
     applyOverlayVolume();
@@ -440,6 +448,18 @@ void VolumeOverlayController::refreshForCurrentVolume()
     if (_overlayVolumeId != previousVolumeId && !_suspendPersistence) {
         saveState();
     }
+}
+
+void VolumeOverlayController::beginBaseVolumeUpdate()
+{
+    _baseVolumeUpdateInProgress = true;
+}
+
+void VolumeOverlayController::endBaseVolumeUpdate()
+{
+    if (!_baseVolumeUpdateInProgress) return;
+    _baseVolumeUpdateInProgress = false;
+    refreshForCurrentVolume();
 }
 
 void VolumeOverlayController::toggleVisibility()
@@ -645,17 +665,17 @@ void VolumeOverlayController::populateColormapOptions()
     }
     _ui.colormapSelect->setCurrentIndex(indexToSelect);
 
-    if (_viewerManager) {
-        _viewerManager->setOverlayColormap(_overlayColormapName);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayColormap(_overlayColormapName);
 }
 
 void VolumeOverlayController::applyOverlayVolume()
 {
     std::shared_ptr<Volume> overlayVolume;
     if (_volumePkg && !_overlayVolumeId.empty()) {
-        const std::string baseVolumeId = _viewerManager
-            ? _viewerManager->currentVolumeId()
+        auto* primary = primaryViewerManager();
+        const std::string baseVolumeId = primary
+            ? primary->currentVolumeId()
             : std::string{};
         if (!baseVolumeId.empty() &&
             !overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
@@ -682,9 +702,8 @@ void VolumeOverlayController::applyOverlayVolume()
     }
 
     _overlayVolume = std::move(overlayVolume);
-    if (_viewerManager) {
-        _viewerManager->setOverlayVolume(_overlayVolume, _overlayVolumeId);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayVolume(_overlayVolume, _overlayVolumeId);
 
     const bool visible = hasOverlaySelection() && _overlayOpacity > 0.0f;
     _overlayVisible = visible;
@@ -734,6 +753,8 @@ void VolumeOverlayController::updateUiEnabled()
 
 void VolumeOverlayController::syncWindowFromManager(float low, float high)
 {
+    if (_broadcastingWindow) return;
+    const QScopedValueRollback<bool> broadcasting(_broadcastingWindow, true);
     const bool wasSuspended = _suspendPersistence;
     _suspendPersistence = true;
 
@@ -744,6 +765,12 @@ void VolumeOverlayController::syncWindowFromManager(float low, float high)
     if (_ui.thresholdSpin) {
         const QSignalBlocker blocker(_ui.thresholdSpin);
         _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
+    }
+
+    for (auto* manager : _viewerManagers) {
+        if (std::abs(manager->overlayWindowLow() - _overlayWindowLow) > 1e-6f ||
+            std::abs(manager->overlayWindowHigh() - _overlayWindowHigh) > 1e-6f)
+            manager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     }
 
     _suspendPersistence = wasSuspended;
@@ -916,9 +943,8 @@ void VolumeOverlayController::setColormap(const std::string& id)
         }
     }
 
-    if (_viewerManager) {
-        _viewerManager->setOverlayColormap(_overlayColormapName);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayColormap(_overlayColormapName);
 }
 
 void VolumeOverlayController::setOpacity(float value)
@@ -931,9 +957,8 @@ void VolumeOverlayController::setOpacity(float value)
         _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
     }
 
-    if (_viewerManager) {
-        _viewerManager->setOverlayOpacity(_overlayOpacity);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayOpacity(_overlayOpacity);
 
     const bool visible = hasOverlaySelection() && _overlayOpacity > 0.0f;
     _overlayVisible = visible;
@@ -955,9 +980,8 @@ void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
         }
     }
 
-    if (_viewerManager) {
-        _viewerManager->setOverlaySamplingMethod(_overlaySamplingMethod);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlaySamplingMethod(_overlaySamplingMethod);
 }
 
 void VolumeOverlayController::setThreshold(float value)
@@ -982,9 +1006,9 @@ void VolumeOverlayController::setWindowBounds(float low, float high)
         _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
 
-    if (_viewerManager) {
-        _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
-    }
+    const QScopedValueRollback<bool> broadcasting(_broadcastingWindow, true);
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 }
 
 void VolumeOverlayController::setMaxDisplayedResolution(int value)
@@ -995,10 +1019,8 @@ void VolumeOverlayController::setMaxDisplayedResolution(int value)
         _ui.maxDisplayedResolutionSpin->setValue(
             _overlayMaxDisplayedResolution);
     }
-    if (_viewerManager) {
-        _viewerManager->setOverlayMaxDisplayedResolution(
-            _overlayMaxDisplayedResolution);
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
 }
 
 void VolumeOverlayController::setComposite(
@@ -1049,9 +1071,8 @@ void VolumeOverlayController::syncCompositeUi()
 
 void VolumeOverlayController::pushCompositeToManager()
 {
-    if (_viewerManager) {
-        _viewerManager->setOverlayComposite(currentCompositeSettings());
-    }
+    for (auto* manager : _viewerManagers)
+        manager->setOverlayComposite(currentCompositeSettings());
 }
 
 void VolumeOverlayController::handleCompositeEnabledChanged(bool enabled)

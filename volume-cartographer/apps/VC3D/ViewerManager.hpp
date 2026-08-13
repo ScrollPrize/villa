@@ -98,21 +98,17 @@ public:
     // source-bound facade.
     enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
 
-    // Opt this manager into Spiral's derived surface caches and re-read their
-    // two budgets. Called once when the workspace is built and again
-    // whenever the settings dialog applies, so a budget change takes effect
-    // without reopening the workspace.
-    void applySpiralCacheSettings();
+    // Re-read the derived surface-cache settings. Called during manager
+    // construction and whenever the settings dialog applies.
+    void applyViewerCacheSettings();
     std::shared_ptr<vc::render::ChunkCache> chunkCacheFor(
         const std::shared_ptr<Volume>& volume,
         ChunkCachePool pool = ChunkCachePool::PlaneViews);
 
-    // --- SurfaceCache budgets (spiral's flattened view) ---
+    // --- SurfaceCache budgets (flattened segmentation view) ---
     //
-    // Off unless a workspace opts in, so the main workspace never builds one.
     // Zero disables a channel and leaves it on the legacy render path.
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-    bool surfaceCacheEnabled() const { return _surfaceCacheEnabled; }
     std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
     std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
@@ -352,7 +348,6 @@ private:
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
-    bool _surfaceCacheEnabled{false};
     std::size_t _surfaceCacheBudgetBytes{0};
     std::size_t _overlaySurfaceCacheBudgetBytes{0};
 
@@ -370,6 +365,9 @@ private:
     QString _surfacePatchIndexCacheKey;
     void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
+    // A first surface entering an empty index has no other builder.
+    bool _surfacePatchIndexPrimeQueued{false};
+    void schedulePrimeSurfacePatchIndices();
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;

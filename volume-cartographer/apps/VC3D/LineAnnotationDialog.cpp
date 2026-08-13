@@ -1090,10 +1090,6 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     const QString disabledToolTip =
         tr("Tags become editable once the fiber has been saved.");
     for (const auto& tag : knownTags) {
-        if (tag == vc3d::line_annotation::kTraceNeedsReviewTag) {
-            // Managed by the trace review workflow, not the generic pills.
-            continue;
-        }
         const QString tagText = QString::fromStdString(tag);
         const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
                             activeTags.end();
@@ -1483,6 +1479,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
+        _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
+            _generatedViews.linePoints,
+            _generatedViews.lineNormals);
         _generatedControlIndex =
             vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
                 _generatedViews.controlPoints);
@@ -1692,6 +1691,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
+    _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
+        _generatedViews.linePoints,
+        _generatedViews.lineNormals);
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -3583,7 +3585,10 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    return normalizedOrNan(tangent);
+    // One sign for the whole fiber (see generatedDisplayTangentSign): the cut
+    // planes are posed from this tangent, so the displayed left/right must not
+    // follow the stored point order.
+    return normalizedOrNan(tangent) * _displayTangentSign;
 }
 
 cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const

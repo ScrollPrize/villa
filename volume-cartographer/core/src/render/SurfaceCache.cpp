@@ -1385,9 +1385,10 @@ void SurfaceCache::requestView(int startLevel,
         _state->viewGeneration = viewGeneration;
     }
 
-    // The base Spiral surface cache has an exclusive chunk pool. Smaller
-    // volume chunks make a tile's dependency list large, so keeping unresolved
-    // batches from old pans would otherwise grow the fetch queue without bound.
+    // Smaller volume chunks make a tile's dependency list large, so keeping
+    // unresolved batches from old pans would otherwise grow the fetch queue
+    // without bound. This legacy supersession path is disabled when the cache
+    // shares the application's regular chunk source.
     if (viewChanged && _state->options.supersedeChunkRequests)
         _state->volume->beginViewRequest(/*discardPending=*/true);
 

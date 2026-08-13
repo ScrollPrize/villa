@@ -210,6 +210,10 @@ ViewerManager::ViewerManager(CState* state,
     _intersectionThickness = std::max(0.0f, storedThickness);
     _intersectionMaxSurfaces = viewer::INTERSECTION_MAX_SURFACES_DEFAULT;
 
+    // Derived surface tiles are workspace-local, while their decoded volume
+    // chunks come from the application-wide cache service.
+    applyViewerCacheSettings();
+
     _surfacePatchIndexWatcher =
         new QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>(this);
     connect(_surfacePatchIndexWatcher,
@@ -262,18 +266,18 @@ const std::vector<ViewerManager*>& ViewerManager::allManagers()
     return managerRegistry();
 }
 
-void ViewerManager::applySpiralCacheSettings()
+void ViewerManager::applyViewerCacheSettings()
 {
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     constexpr std::size_t mib = 1024ULL * 1024ULL;
     constexpr std::size_t gib = 1024ULL * mib;
     const auto surfaceGb = std::max<qlonglong>(
-        0, settings.value(spiral::SURFACE_CACHE_GB,
-                          spiral::SURFACE_CACHE_GB_DEFAULT).toLongLong());
+        0, settings.value(viewer_cache::SURFACE_CACHE_GB,
+                          viewer_cache::SURFACE_CACHE_GB_DEFAULT).toLongLong());
     const auto overlayGb = std::max<qlonglong>(
-        0, settings.value(spiral::OVERLAY_SURFACE_CACHE_GB,
-                          spiral::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
+        0, settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
+                          viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
 
     setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
 }
@@ -289,7 +293,6 @@ std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
 
 void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
 {
-    _surfaceCacheEnabled = true;
     if (_surfaceCacheBudgetBytes == baseBytes &&
         _overlaySurfaceCacheBudgetBytes == overlayBytes) {
         return;
@@ -433,10 +436,8 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
-    if (_surfaceCacheEnabled) {
-        baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
-                                           _overlaySurfaceCacheBudgetBytes);
-    }
+    baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
+                                       _overlaySurfaceCacheBudgetBytes);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -1814,7 +1815,24 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     _surfacePatchIndexNeedsRebuild = true;
+    schedulePrimeSurfacePatchIndices();
     return true;
+}
+
+void ViewerManager::schedulePrimeSurfacePatchIndices()
+{
+    if (_surfacePatchIndexPrimeQueued) {
+        return;
+    }
+    _surfacePatchIndexPrimeQueued = true;
+    // One prime per event-loop turn, over the final surface set.
+    QMetaObject::invokeMethod(this, [this]() {
+        _surfacePatchIndexPrimeQueued = false;
+        if (_surfacePatchIndexNeedsRebuild
+            && !_shuttingDown.load(std::memory_order_relaxed)) {
+            primeSurfacePatchIndicesAsync();
+        }
+    }, Qt::QueuedConnection);
 }
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)

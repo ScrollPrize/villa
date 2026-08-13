@@ -48,7 +48,10 @@ class AgentBridgeServer : public QObject
     Q_OBJECT
 
 public:
-    static constexpr int kProtocolVersion = 1;
+    // v2: fiber.list dropped traceNeedsReview/traceVerified (review state
+    // is the ordinary 'reviewed' tag in tags). Keep in sync with
+    // BRIDGE_PROTOCOL_VERSION in tools/vc3d-mcp/vc3d_mcp/server.py.
+    static constexpr int kProtocolVersion = 2;
 
     explicit AgentBridgeServer(CWindow* window, QObject* parent = nullptr);
     ~AgentBridgeServer() override;

@@ -347,7 +347,10 @@ int main(int argc, char** argv)
     require(requestedRenameFiberId == 2, "Rename JSON file emitted the wrong fiber ID");
 
     auto tagCheckboxes = widget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxes.size() == 3, "Known tags did not create three checkboxes");
+    // Three known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxes.size() == 4, "Known tags did not create four checkboxes");
+    require(tagCheckboxes.front()->text() == QStringLiteral("reviewed"),
+            "The 'reviewed' tag checkbox should be pinned first");
     QCheckBox* reviewCheckbox = nullptr;
     QCheckBox* todoCheckbox = nullptr;
     for (auto* checkbox : tagCheckboxes) {
@@ -430,7 +433,8 @@ int main(int argc, char** argv)
 
     const auto tagCheckboxesBefore =
         scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxesBefore.size() == 4, "Scrollable fiber widget should expose four tag checkboxes");
+    // Four known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxesBefore.size() == 5, "Scrollable fiber widget should expose five tag checkboxes");
     scrollBar->setValue(scrollBar->maximum());
     QApplication::processEvents();
     const int directSelectionScroll = scrollBar->value();
@@ -505,7 +509,7 @@ int main(int argc, char** argv)
     require(batchDeletes == 1, "Confirmed delete did not emit one batch delete request");
     require(sameIds(deletedIds, {1, 3}), "Batch delete request IDs are wrong");
 
-    // Interpolation-status column and trace review actions.
+    // Interpolation-status column.
     auto legacyFiber = makeFiber(11, "aa_20260605T184821587_000011.json", 2, 20, 12.0);
     legacyFiber.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38), 'L'});
     auto tracedFiber = makeFiber(12, "kb_20260605T184821587_000012.json", 3, 30, 24.0);
@@ -559,31 +563,6 @@ int main(int argc, char** argv)
                               Q_ARG(int, 8));
     require(widget.orderedFiberIds() == std::vector<uint64_t>({12, 13, 11}),
             "Descending interp sort should order predictions, mixed, legacy");
-
-    int reviewRequests = 0;
-    std::vector<uint64_t> reviewIds;
-    bool reviewVerified = false;
-    QObject::connect(&widget,
-                     &CFiberWidget::fiberTraceReviewChanged,
-                     &widget,
-                     [&](std::vector<uint64_t> ids, bool verified) {
-                         ++reviewRequests;
-                         reviewIds = std::move(ids);
-                         reviewVerified = verified;
-                     });
-    widget.selectFibers({11});
-    widget.requestMarkTraceReviewed(true);
-    require(reviewRequests == 0,
-            "Legacy-only selection should not emit a trace review change");
-    widget.selectFibers({11, 12, 13});
-    widget.requestMarkTraceReviewed(true);
-    require(reviewRequests == 1, "Trace review request was not emitted once");
-    require(sameIds(reviewIds, {12, 13}),
-            "Trace review should target only non-legacy fibers");
-    require(reviewVerified, "Trace review request should carry verified=true");
-    widget.requestMarkTraceReviewed(false);
-    require(reviewRequests == 2 && !reviewVerified,
-            "Needs-review request should carry verified=false");
 
     QThreadPool::globalInstance()->waitForDone();
     return 0;
