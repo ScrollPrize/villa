@@ -1,13 +1,13 @@
 #pragma once
 
 // Camera pad for the volumetric composite mode. Lives as a child widget of
-// the viewer's CVolumeViewerView (viewport corner, does not pan or zoom with
-// the scene). Two independent halves:
+// the viewer's CVolumeViewerView (centered in the viewport, does not pan or
+// zoom with the scene). Three independent panes:
 //  - left: azimuth dial (compass) — drag rotates the in-plane tilt direction
-//  - right: elevation gauge — drag sets the tilt angle away from the surface
+//  - middle: elevation gauge — drag sets the tilt angle away from the surface
 //    normal (needle vertical = straight down, 0..45 degrees)
-// Double-click resets the half under the cursor; scroll adjusts the
-// perspective strength (shown as an arc on the azimuth dial's rim).
+//  - right: perspective gauge — drag sets the perspective strength (0..1)
+// Double-click resets the pane under the cursor.
 
 #include <QWidget>
 
@@ -22,9 +22,6 @@ public:
 
     // Update the displayed state without emitting cameraChanged.
     void setCamera(float azimuthDeg, float tiltDeg, float perspective);
-    // Extra space kept free to the right (e.g. for the plane views'
-    // tilt handle, which also lives in the bottom-right corner).
-    void setRightInset(int inset);
     float azimuthDeg() const { return _azimuthDeg; }
     float tiltDeg() const { return _tiltDeg; }
     float perspective() const { return _perspective; }
@@ -37,23 +34,21 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
-    void wheelEvent(QWheelEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
-    enum class Pane { None, Azimuth, Elevation };
+    enum class Pane { None, Azimuth, Elevation, Perspective };
 
     Pane paneAt(const QPointF& pos) const;
     void updateFromDrag(const QPointF& pos);
     void repositionInParent();
     QPointF azimuthCenter() const;
     QPointF elevationCenter() const;
+    QRectF perspectiveTrackRect() const;
     double dialRadius() const;
 
     float _azimuthDeg = 0.0f;
     float _tiltDeg = 0.0f;
     float _perspective = 0.0f;
-    int _wheelAccum = 0;
-    int _rightInset = 0;
     Pane _dragPane = Pane::None;
 };

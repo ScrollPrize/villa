@@ -206,11 +206,4 @@ public:
     virtual QObject* asQObject() = 0;
     virtual QMetaObject::Connection connectOverlaysUpdated(
         QObject* receiver, const std::function<void()>& callback) = 0;
-    // Fires when the volumetric composite camera is edited from inside the
-    // viewer (gizmo drag). Default: no such editing, nothing to connect.
-    virtual QMetaObject::Connection connectCompositeCameraChanged(
-        QObject* /*receiver*/, const std::function<void()>& /*callback*/)
-    {
-        return {};
-    }
 };

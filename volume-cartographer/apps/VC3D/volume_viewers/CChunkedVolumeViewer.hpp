@@ -255,11 +255,6 @@ public:
         QObject* receiver, const std::function<void()>& callback) override {
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
-    QMetaObject::Connection connectCompositeCameraChanged(
-        QObject* receiver, const std::function<void()>& callback) override {
-        return connect(this, &CChunkedVolumeViewer::compositeCameraChanged, receiver, callback);
-    }
-
     void reloadPerfSettings() override;
     void refreshChunkSource() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;

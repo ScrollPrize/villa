@@ -2046,12 +2046,6 @@ void CChunkedVolumeViewer::updateCameraGizmo()
     _cameraGizmo->setCamera(_compositeSettings.params.camAzimuthDeg,
                             _compositeSettings.params.camTiltDeg,
                             _compositeSettings.params.camPerspective);
-    // Plane views draw their tilt handle in the bottom-right corner (46 px
-    // square, 14 px margin — CVolumeViewerView::tiltHandleRect); sit to its
-    // left there.
-    auto surf = _surfWeak.lock();
-    const bool planeView = surf && dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
-    _cameraGizmo->setRightInset(planeView ? 60 : 0);
     _cameraGizmo->setVisible(volumetricCameraActive());
 }
 
