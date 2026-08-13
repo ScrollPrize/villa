@@ -126,8 +126,10 @@ struct ChunkCacheService::Impl {
         std::make_shared<std::atomic<std::uint64_t>>(0);
     std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId =
         std::make_shared<std::atomic<std::uint64_t>>(1);
+    std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate =
+        std::make_shared<ChunkRequestSelectionGate>();
     std::shared_ptr<ChunkRequestScheduler> probeScheduler =
-        std::make_shared<ChunkRequestScheduler>(4);
+        std::make_shared<ChunkRequestScheduler>(4, 7, schedulerSelectionGate);
     std::unordered_map<std::size_t, std::shared_ptr<ChunkRequestScheduler>> fetchSchedulers;
 
     std::shared_ptr<ChunkRequestScheduler> fetchScheduler(std::size_t workers)
@@ -135,7 +137,8 @@ struct ChunkCacheService::Impl {
         workers = normalizedWorkerCount(workers);
         auto& scheduler = fetchSchedulers[workers];
         if (!scheduler)
-            scheduler = std::make_shared<ChunkRequestScheduler>(workers);
+            scheduler = std::make_shared<ChunkRequestScheduler>(
+                workers, 7, schedulerSelectionGate);
         return scheduler;
     }
 };
@@ -269,6 +272,7 @@ ChunkCache::ChunkCache(std::shared_ptr<ChunkCacheService> service,
     state_->probeScheduler_ = service_->impl_->probeScheduler;
     state_->fetchScheduler_ = service_->impl_->fetchScheduler(
         state_->options_.maxConcurrentReads);
+    state_->schedulerSelectionGate_ = service_->impl_->schedulerSelectionGate;
     state_->activeViewId_ = service_->impl_->activeViewId;
     state_->nextTaskId_ = service_->impl_->nextTaskId;
     state_->viewEpoch_ = service_->impl_->nextViewEpoch.fetch_add(
@@ -733,50 +737,52 @@ void ChunkCache::replaceViewDemand(const ChunkRequestContext& request,
     }
 
     auto state = state_;
-    std::lock_guard lock(state->mutex_);
-    const auto previousSnapshot = state->viewSnapshots_.find(request.viewId);
-    if (previousSnapshot != state->viewSnapshots_.end() &&
-        previousSnapshot->second.version > request.viewVersion) {
-        return;
-    }
-
-    if (auto old = state->viewDemandKeys_.find(request.viewId);
-        old != state->viewDemandKeys_.end()) {
-        for (const ChunkKey& key : old->second) {
-            const auto entry = state->entries_.find(key);
-            if (entry == state->entries_.end())
-                continue;
-            entry->second.viewDemands.erase(request.viewId);
-            reprioritizeEntryLocked(*state, key, entry->second);
+    state->schedulerSelectionGate_->publish([&] {
+        std::lock_guard lock(state->mutex_);
+        const auto previousSnapshot = state->viewSnapshots_.find(request.viewId);
+        if (previousSnapshot != state->viewSnapshots_.end() &&
+            previousSnapshot->second.version > request.viewVersion) {
+            return;
         }
-        old->second.clear();
-    }
 
-    State::ViewSnapshot snapshot;
-    snapshot.version = request.viewVersion;
-    snapshot.focus = focus;
-    snapshot.collectionKeys = collectionKeys;
-    snapshot.pointIndex = std::move(pointIndex);
-    state->viewSnapshots_[request.viewId] = std::move(snapshot);
+        if (auto old = state->viewDemandKeys_.find(request.viewId);
+            old != state->viewDemandKeys_.end()) {
+            for (const ChunkKey& key : old->second) {
+                const auto entry = state->entries_.find(key);
+                if (entry == state->entries_.end())
+                    continue;
+                entry->second.viewDemands.erase(request.viewId);
+                reprioritizeEntryLocked(*state, key, entry->second);
+            }
+            old->second.clear();
+        }
 
-    auto& demanded = state->viewDemandKeys_[request.viewId];
-    demanded.reserve(collectionKeys.size());
-    for (std::size_t i = 0; i < collectionKeys.size(); ++i) {
-        const ChunkKey& key = collectionKeys[i];
-        if (!isValidKey(*state, key))
-            continue;
-        auto [entryIt, inserted] = state->entries_.emplace(key, Entry{});
-        if (!inserted && entryIt->second.status != EntryStatus::InFlight)
-            continue;
-        demanded.insert(key);
-        auto& slot = entryIt->second.viewDemands[request.viewId];
-        slot.version = request.viewVersion;
-        slot.distanceSquared = distances[i];
-        if (inserted)
-            queueFetchLocked(state, key, state->generation_, 0);
-        else
-            reprioritizeEntryLocked(*state, key, entryIt->second);
-    }
+        State::ViewSnapshot snapshot;
+        snapshot.version = request.viewVersion;
+        snapshot.focus = focus;
+        snapshot.collectionKeys = collectionKeys;
+        snapshot.pointIndex = std::move(pointIndex);
+        state->viewSnapshots_[request.viewId] = std::move(snapshot);
+
+        auto& demanded = state->viewDemandKeys_[request.viewId];
+        demanded.reserve(collectionKeys.size());
+        for (std::size_t i = 0; i < collectionKeys.size(); ++i) {
+            const ChunkKey& key = collectionKeys[i];
+            if (!isValidKey(*state, key))
+                continue;
+            auto [entryIt, inserted] = state->entries_.emplace(key, Entry{});
+            if (!inserted && entryIt->second.status != EntryStatus::InFlight)
+                continue;
+            demanded.insert(key);
+            auto& slot = entryIt->second.viewDemands[request.viewId];
+            slot.version = request.viewVersion;
+            slot.distanceSquared = distances[i];
+            if (inserted)
+                queueFetchLocked(state, key, state->generation_, 0);
+            else
+                reprioritizeEntryLocked(*state, key, entryIt->second);
+        }
+    });
 }
 
 void ChunkCache::updateViewFocus(std::uint64_t viewId,
@@ -785,106 +791,110 @@ void ChunkCache::updateViewFocus(std::uint64_t viewId,
 {
     if (viewId == 0)
         return;
-    bool activeChanged = false;
-    if (makeActive) {
-        const auto previous = service_->impl_->activeViewId->exchange(
-            viewId, std::memory_order_acq_rel);
-        activeChanged = previous != viewId;
-    }
-
-    std::vector<std::shared_ptr<State>> states;
-    {
-        std::lock_guard serviceLock(service_->impl_->mutex);
-        states.reserve(service_->impl_->sources.size());
-        for (const auto& [identity, source] : service_->impl_->sources) {
-            (void)identity;
-            states.push_back(std::static_pointer_cast<State>(source));
+    service_->impl_->schedulerSelectionGate->publish([&] {
+        bool activeChanged = false;
+        if (makeActive) {
+            const auto previous = service_->impl_->activeViewId->exchange(
+                viewId, std::memory_order_acq_rel);
+            activeChanged = previous != viewId;
         }
-    }
 
-    for (const auto& state : states) {
-        std::lock_guard lock(state->mutex_);
-        auto snapshot = state->viewSnapshots_.find(viewId);
-        if (snapshot != state->viewSnapshots_.end()) {
-            snapshot->second.focus = focus;
-            auto demanded = state->viewDemandKeys_.find(viewId);
-            if (demanded != state->viewDemandKeys_.end()) {
+        std::vector<std::shared_ptr<State>> states;
+        {
+            std::lock_guard serviceLock(service_->impl_->mutex);
+            states.reserve(service_->impl_->sources.size());
+            for (const auto& [identity, source] : service_->impl_->sources) {
+                (void)identity;
+                states.push_back(std::static_pointer_cast<State>(source));
+            }
+        }
+
+        for (const auto& state : states) {
+            std::lock_guard lock(state->mutex_);
+            auto snapshot = state->viewSnapshots_.find(viewId);
+            if (snapshot != state->viewSnapshots_.end()) {
+                snapshot->second.focus = focus;
+                auto demanded = state->viewDemandKeys_.find(viewId);
+                if (demanded != state->viewDemandKeys_.end()) {
+                    for (const ChunkKey& key : demanded->second) {
+                        auto entry = state->entries_.find(key);
+                        if (entry == state->entries_.end())
+                            continue;
+                        auto slot = entry->second.viewDemands.find(viewId);
+                        if (slot != entry->second.viewDemands.end())
+                            slot->second.distanceSquared.reset();
+                    }
+                }
+                if (snapshot->second.pointIndex) {
+                    for (const auto& nearest : snapshot->second.pointIndex->nearestPerCollection(
+                             cv::Vec3f(focus[0], focus[1], 0.0f))) {
+                        if (nearest.collectionId >= snapshot->second.collectionKeys.size())
+                            continue;
+                        const ChunkKey& key =
+                            snapshot->second.collectionKeys[nearest.collectionId];
+                        auto entry = state->entries_.find(key);
+                        if (entry == state->entries_.end())
+                            continue;
+                        auto slot = entry->second.viewDemands.find(viewId);
+                        if (slot != entry->second.viewDemands.end())
+                            slot->second.distanceSquared = nearest.distanceSq;
+                    }
+                }
+            }
+
+            if (activeChanged) {
+                for (auto& [key, entry] : state->entries_)
+                    reprioritizeEntryLocked(*state, key, entry);
+            } else if (auto demanded = state->viewDemandKeys_.find(viewId);
+                       demanded != state->viewDemandKeys_.end()) {
                 for (const ChunkKey& key : demanded->second) {
                     auto entry = state->entries_.find(key);
-                    if (entry == state->entries_.end())
-                        continue;
-                    auto slot = entry->second.viewDemands.find(viewId);
-                    if (slot != entry->second.viewDemands.end())
-                        slot->second.distanceSquared.reset();
-                }
-            }
-            if (snapshot->second.pointIndex) {
-                for (const auto& nearest : snapshot->second.pointIndex->nearestPerCollection(
-                         cv::Vec3f(focus[0], focus[1], 0.0f))) {
-                    if (nearest.collectionId >= snapshot->second.collectionKeys.size())
-                        continue;
-                    const ChunkKey& key =
-                        snapshot->second.collectionKeys[nearest.collectionId];
-                    auto entry = state->entries_.find(key);
-                    if (entry == state->entries_.end())
-                        continue;
-                    auto slot = entry->second.viewDemands.find(viewId);
-                    if (slot != entry->second.viewDemands.end())
-                        slot->second.distanceSquared = nearest.distanceSq;
+                    if (entry != state->entries_.end())
+                        reprioritizeEntryLocked(*state, key, entry->second);
                 }
             }
         }
-
-        if (activeChanged) {
-            for (auto& [key, entry] : state->entries_)
-                reprioritizeEntryLocked(*state, key, entry);
-        } else if (auto demanded = state->viewDemandKeys_.find(viewId);
-                   demanded != state->viewDemandKeys_.end()) {
-            for (const ChunkKey& key : demanded->second) {
-                auto entry = state->entries_.find(key);
-                if (entry != state->entries_.end())
-                    reprioritizeEntryLocked(*state, key, entry->second);
-            }
-        }
-    }
+    });
 }
 
 void ChunkCache::clearViewDemand(std::uint64_t viewId)
 {
     if (viewId == 0)
         return;
-    std::uint64_t expected = viewId;
-    const bool activeChanged = service_->impl_->activeViewId->compare_exchange_strong(
-        expected, 0, std::memory_order_acq_rel);
+    service_->impl_->schedulerSelectionGate->publish([&] {
+        std::uint64_t expected = viewId;
+        const bool activeChanged = service_->impl_->activeViewId->compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel);
 
-    std::vector<std::shared_ptr<State>> states;
-    {
-        std::lock_guard serviceLock(service_->impl_->mutex);
-        states.reserve(service_->impl_->sources.size());
-        for (const auto& [identity, source] : service_->impl_->sources) {
-            (void)identity;
-            states.push_back(std::static_pointer_cast<State>(source));
-        }
-    }
-    for (const auto& state : states) {
-        std::lock_guard lock(state->mutex_);
-        if (auto demanded = state->viewDemandKeys_.find(viewId);
-            demanded != state->viewDemandKeys_.end()) {
-            for (const ChunkKey& key : demanded->second) {
-                auto entry = state->entries_.find(key);
-                if (entry == state->entries_.end())
-                    continue;
-                entry->second.viewDemands.erase(viewId);
-                reprioritizeEntryLocked(*state, key, entry->second);
+        std::vector<std::shared_ptr<State>> states;
+        {
+            std::lock_guard serviceLock(service_->impl_->mutex);
+            states.reserve(service_->impl_->sources.size());
+            for (const auto& [identity, source] : service_->impl_->sources) {
+                (void)identity;
+                states.push_back(std::static_pointer_cast<State>(source));
             }
-            state->viewDemandKeys_.erase(demanded);
         }
-        state->viewSnapshots_.erase(viewId);
-        if (activeChanged) {
-            for (auto& [key, entry] : state->entries_)
-                reprioritizeEntryLocked(*state, key, entry);
+        for (const auto& state : states) {
+            std::lock_guard lock(state->mutex_);
+            if (auto demanded = state->viewDemandKeys_.find(viewId);
+                demanded != state->viewDemandKeys_.end()) {
+                for (const ChunkKey& key : demanded->second) {
+                    auto entry = state->entries_.find(key);
+                    if (entry == state->entries_.end())
+                        continue;
+                    entry->second.viewDemands.erase(viewId);
+                    reprioritizeEntryLocked(*state, key, entry->second);
+                }
+                state->viewDemandKeys_.erase(demanded);
+            }
+            state->viewSnapshots_.erase(viewId);
+            if (activeChanged) {
+                for (auto& [key, entry] : state->entries_)
+                    reprioritizeEntryLocked(*state, key, entry);
+            }
         }
-    }
+    });
 }
 
 void ChunkCache::invalidateState(const std::shared_ptr<State>& state)

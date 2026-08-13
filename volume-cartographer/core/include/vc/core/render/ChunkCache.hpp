@@ -27,6 +27,7 @@ namespace vc::render {
 class PersistentZarrCacheBudget;
 class ChunkCache;
 class ChunkRequestScheduler;
+class ChunkRequestSelectionGate;
 struct ChunkWorkPriority;
 
 // Application-owned decoded chunk-cache service. Source identity strings are
@@ -281,6 +282,7 @@ private:
         std::uint64_t nextFetchSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
+        std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate_;
         std::shared_ptr<std::atomic<std::uint64_t>> activeViewId_;
         std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId_;
         struct ViewSnapshot {

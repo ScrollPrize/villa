@@ -7,6 +7,25 @@
 
 namespace vc::render {
 
+// Shared by schedulers which must publish related queue changes atomically.
+// Workers may finish running work while an update is published, but cannot
+// select their next task until the complete update is visible.
+class ChunkRequestSelectionGate final {
+public:
+    ChunkRequestSelectionGate();
+    ~ChunkRequestSelectionGate();
+
+    ChunkRequestSelectionGate(const ChunkRequestSelectionGate&) = delete;
+    ChunkRequestSelectionGate& operator=(const ChunkRequestSelectionGate&) = delete;
+
+    void publish(const std::function<void()>& update);
+
+private:
+    friend class ChunkRequestScheduler;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 struct ChunkWorkPriority {
     bool interactive = false;
     bool activeView = false;
@@ -23,7 +42,8 @@ public:
     using TaskGroup = std::uint64_t;
 
     explicit ChunkRequestScheduler(std::size_t workers,
-                                   std::size_t interactiveBurst = 7);
+                                   std::size_t interactiveBurst = 7,
+                                   std::shared_ptr<ChunkRequestSelectionGate> selectionGate = {});
     ~ChunkRequestScheduler();
 
     ChunkRequestScheduler(const ChunkRequestScheduler&) = delete;

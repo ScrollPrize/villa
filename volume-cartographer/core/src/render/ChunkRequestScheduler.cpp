@@ -24,6 +24,25 @@ float finiteDistance(float value) noexcept
 
 } // namespace
 
+struct ChunkRequestSelectionGate::Impl {
+    std::mutex mutex;
+};
+
+ChunkRequestSelectionGate::ChunkRequestSelectionGate()
+    : impl_(std::make_unique<Impl>())
+{
+}
+
+ChunkRequestSelectionGate::~ChunkRequestSelectionGate() = default;
+
+void ChunkRequestSelectionGate::publish(const std::function<void()>& update)
+{
+    if (!update)
+        return;
+    std::lock_guard lock(impl_->mutex);
+    update();
+}
+
 struct ChunkRequestScheduler::Impl {
     struct Item {
         TaskId id = 0;
@@ -73,9 +92,14 @@ struct ChunkRequestScheduler::Impl {
         BackgroundQueue::iterator background;
     };
 
-    explicit Impl(std::size_t workerCount, std::size_t burst)
-        : interactiveBurst(std::max<std::size_t>(1, burst))
+    explicit Impl(std::size_t workerCount,
+                  std::size_t burst,
+                  std::shared_ptr<ChunkRequestSelectionGate> gate)
+        : selectionGate(std::move(gate))
+        , interactiveBurst(std::max<std::size_t>(1, burst))
     {
+        if (!selectionGate)
+            selectionGate = std::make_shared<ChunkRequestSelectionGate>();
         workerCount = std::max<std::size_t>(1, workerCount);
         workers.reserve(workerCount);
         for (std::size_t i = 0; i < workerCount; ++i) {
@@ -152,6 +176,14 @@ struct ChunkRequestScheduler::Impl {
                 });
                 if (stop.stop_requested() && gui.empty() && background.empty())
                     return;
+            }
+            {
+                // Do not hold the queue mutex while waiting for publication:
+                // the publisher updates queued items through reprioritize().
+                std::lock_guard selectionLock(selectionGate->impl_->mutex);
+                std::unique_lock lock(mutex);
+                if (stop.stop_requested() && gui.empty() && background.empty())
+                    return;
                 item = popLocked();
                 if (!item)
                     continue;
@@ -181,6 +213,9 @@ struct ChunkRequestScheduler::Impl {
     BackgroundQueue background;
     std::unordered_map<TaskId, Location> locations;
     std::unordered_map<TaskGroup, std::uint64_t> minimumGroupEpoch;
+    std::shared_ptr<ChunkRequestSelectionGate> selectionGate;
+    // Declared after the gate so jthread destruction joins every worker before
+    // the gate they may be waiting on is released.
     std::vector<std::jthread> workers;
     std::atomic_size_t activeCount{0};
     std::uint64_t nextSequence = 0;
@@ -189,8 +224,10 @@ struct ChunkRequestScheduler::Impl {
 };
 
 ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
-                                             std::size_t interactiveBurst)
-    : impl_(std::make_unique<Impl>(workers, interactiveBurst))
+                                             std::size_t interactiveBurst,
+                                             std::shared_ptr<ChunkRequestSelectionGate> selectionGate)
+    : impl_(std::make_unique<Impl>(workers, interactiveBurst,
+                                  std::move(selectionGate)))
 {
 }
 

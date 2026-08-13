@@ -37,6 +37,7 @@ using vc::render::ChunkStatus;
 using vc::render::ChunkCacheService;
 using vc::render::IChunkFetcher;
 using vc::render::ChunkRequestScheduler;
+using vc::render::ChunkRequestSelectionGate;
 using vc::render::ChunkWorkPriority;
 
 namespace {
@@ -1205,6 +1206,63 @@ TEST_CASE("ChunkRequestScheduler orders active view then level then distance")
     cv.notify_all();
     scheduler.waitIdle();
     CHECK(order == std::vector<int>{1, 5, 4, 6, 3, 2});
+}
+
+TEST_CASE("ChunkRequestScheduler publishes shared priority updates atomically")
+{
+    auto gate = std::make_shared<ChunkRequestSelectionGate>();
+    ChunkRequestScheduler probeScheduler(1, 7, gate);
+    ChunkRequestScheduler fetchScheduler(1, 7, gate);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch blockersStarted{2};
+    std::latch blockersFinished{2};
+    std::atomic_bool publishing{false};
+    std::atomic_int selectedDuringPublication{0};
+
+    auto submitBlocker = [&](ChunkRequestScheduler& scheduler, std::uint64_t id) {
+        scheduler.submit(id, {}, 1, 0, [&] {
+            blockersStarted.count_down();
+            std::unique_lock lock(mutex);
+            cv.wait(lock, [&] { return release; });
+            lock.unlock();
+            blockersFinished.count_down();
+        });
+    };
+    submitBlocker(probeScheduler, 1);
+    submitBlocker(fetchScheduler, 2);
+    blockersStarted.wait();
+
+    auto submitFollower = [&](ChunkRequestScheduler& scheduler, std::uint64_t id) {
+        ChunkWorkPriority priority;
+        priority.interactive = true;
+        scheduler.submit(id, priority, 1, 0, [&] {
+            if (publishing.load(std::memory_order_acquire))
+                selectedDuringPublication.fetch_add(1, std::memory_order_relaxed);
+        });
+    };
+    submitFollower(probeScheduler, 3);
+    submitFollower(fetchScheduler, 4);
+
+    gate->publish([&] {
+        publishing.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+        blockersFinished.wait();
+        // Give both workers an opportunity to request their next task while
+        // the shared publication remains deliberately incomplete.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(selectedDuringPublication.load(std::memory_order_relaxed) == 0);
+        publishing.store(false, std::memory_order_release);
+    });
+
+    probeScheduler.waitIdle();
+    fetchScheduler.waitIdle();
+    CHECK(selectedDuringPublication.load(std::memory_order_relaxed) == 0);
 }
 
 TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replacement")
