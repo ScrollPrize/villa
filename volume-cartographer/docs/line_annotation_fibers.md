@@ -49,6 +49,39 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
+The current cut view draws its solid yellow control-point marker only while the
+control point is inside the cut plane's thin slab, so fast panning would
+otherwise skip past control points unseen. To keep them findable, the view also
+always draws two parallax ghosts: a hollow dashed yellow ring for the nearest
+control point behind the cursor and one for the nearest ahead. Each ghost sits
+at its true in-plane landing spot shifted horizontally toward the side it will
+arrive from: the ring for a control point ahead of the cursor (higher line
+position) sits to the right, matching the strips where line position runs left
+to right. The shift is proportional to the signed line-position delta over a
+fixed 8 line-position slide range and is clamped at 35% of the visible view
+width, and the ring brightens from a faint floor at or beyond that range to
+nearly opaque as the delta closes. Ghosts only appear while the control point
+is within ten times the solid-marker window (so they don't linger far from any
+control point), fading out over the outer quarter of that distance. Because the
+shift decays continuously to zero, the ghost converges on the solid marker as a
+landing ring instead of popping into place.
+
+The Left and Right arrow keys pan the current position between control points
+with a smooth velocity ramp. A tap accelerates, brakes, and lands exactly on
+the nearest control point in that direction; holding the key cruises straight
+through the intermediate points at a constant speed and, when it is released,
+decelerates onto the next control point ahead (never short of the one a tap
+would have reached). Beyond the outermost control point the pan continues one
+more hop, to the Max CP distance allowance or the end of the extrapolated
+line, whichever is shorter. Pressing the opposite arrow
+mid-pan decelerates through zero and reverses. Up and Down scale the cruising
+speed (default 12 line positions per second, roughly 360 voxels per second),
+which is shown in a transient badge and remembered between sessions. A Left or
+Right press pauses the mouse hover-follow exactly as the space bar does, so the
+❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow
+and cancels the pan. While the keyboard is panning, the strips stay centered
+on the current-position line and scroll underneath it.
+
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
 the initial centerline length and the base-voxel extrapolation distance, and

@@ -321,6 +321,10 @@ namespace line_annotation {
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
+    // Cruise speed of the Left/Right arrow pan between control points, in line
+    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
+    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
+    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
     // "_v2" retires ratios saved before the fixed top strip / smaller bottom
     // strip layout; old values would override the new default proportions.
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
