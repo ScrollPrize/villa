@@ -1,46 +1,49 @@
 # Task log
 
-## Findings
+## Audit findings
 
-- `replaceViewDemand()` previously removed old per-view priority slots but left
-  their unresolved tasks in the schedulers as background work. Repeated renders
-  could therefore grow the queue faster than it drained.
-- Probe, source-read, and decode schedulers already have separate interactive
-  and background lanes. The missing state was request ownership on each cache
-  entry, not another scheduler split.
-- The scheduler supported reprioritization and cache-wide epoch cancellation,
-  but not targeted cancellation of one pending keyed task.
-- A stale asynchronous GUI miss was previously accepted as background work when
-  its view generation had already been superseded.
-- Clearing by view ID alone could not reject a render allocated before closure
-  but publishing afterward. VC3D now supplies its latest render request serial
-  as the cleared generation watermark.
+- `beginViewRequest()` has no production caller. Its six calls are confined to
+  `test_chunk_cache.cpp` and test behavior from the retired implicit frame
+  epoch/exclusive-cache model.
+- Context-free `tryGetChunk()` and `prefetchChunks()` are live background APIs.
+  They are used by Python bindings, CLI tools, static volume/slicing paths, and
+  blocking plane/corner samplers and will remain.
+- `schedulerGroup_` and `schedulerEpoch_` are live: `invalidate()` advances the
+  epoch and cancels pending tasks from the old cache generation.
+- `ViewerManager::ChunkCachePool`, `chunkCacheFor()`, and
+  `refreshChunkSource()` only preserve the removed private decoded-cache policy.
+  Current routing always returns `Volume::sharedChunkCache()`.
+- `SurfaceCache::viewGeneration` is written but never read.
+- `FrameChunkFootprint.hpp` has no includes or callers and only supported
+  private pool sizing.
 
-## Implementation notes
+## Deviations
 
-- Entries retain a background-demand flag and independent per-view generation
-  slots. An unresolved entry is removable only when both are empty.
-- Snapshot replacement and task cancellation happen under the shared scheduler
-  selection gate, so workers cannot observe a partially published render.
-- Pending work is canceled by task ID and removed from unresolved counters.
-  Running work finishes its current stage; stale probe/download results are
-  discarded before another stage is submitted, while an already-running decode
-  may populate the cache.
-- View closure removes that view from every registered source and retains a
-  closed generation watermark. A strictly newer render generation reopens the
-  stable view ID after a cache rebuild.
+- None.
 
-## Test cleanup
+## Implementation
 
-- The decode-priority test previously released a worker immediately after
-  creating two requests. Persistent probes could race that release, so the test
-  sometimes asserted before both decode tasks existed. Cache stats now expose
-  the decode scheduler's pending count, and the test waits for both candidates
-  before releasing one worker.
+- Removed `beginViewRequest()` and its service/facade epoch allocators. Calls
+  without a `ChunkRequestContext` now enter the existing background lane
+  directly.
+- Removed the unused scalar entry priority while retaining scheduler group
+  epochs used by source invalidation.
+- Replaced VC3D's no-op cache pool selector with direct
+  `Volume::sharedChunkCache()` access for plane and surface-tile source reads.
+- Removed the unused viewer cache refresh hook, write-only surface view
+  generation, and unreferenced private-pool footprint helper.
+- Deleted implicit-epoch-only tests and retained capacity, explicit active-view
+  priority, per-view cancellation, and source invalidation coverage.
 
 ## Validation
 
-- `test_chunk_cache`: 60 cases passed.
-- Complete `test_chunk_cache` executable passed 20 consecutive runs.
-- `VC3D` target built successfully.
-- `git diff --check` passed.
+- Built `VC3D`, `test_chunk_cache`, `test_chunk_cache_persist`, all chunked
+  plane sampler targets, generated annotation views, and Lasagna line-view
+  surfaces with the existing CMake build.
+- Focused CTest selection passed 7/7 in 3.83 seconds.
+- `test_chunk_cache` passed all 57 cases in its normal run. Repeated whole-suite
+  stress can exceed a five-second per-run cap while constructing the unchanged
+  64-worker adaptive-concurrency test; case-boundary diagnostics localized the
+  delay there rather than in explicit view ownership, and all temporary
+  diagnostics were removed.
+- Removed-symbol search and `git diff --check` passed.

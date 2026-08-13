@@ -887,19 +887,6 @@ std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
     return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
 }
 
-void CChunkedVolumeViewer::refreshChunkSource()
-{
-    if (_closing || !_volume || !_viewerManager)
-        return;
-    auto desired = _viewerManager->chunkCacheFor(_volume,
-                                                 ViewerManager::ChunkCachePool::PlaneViews);
-    if (desired == _chunkArray)
-        return;
-    rebuildChunkArray();
-    submitRender("chunk source changed");
-    updateStatusLabel();
-}
-
 void CChunkedVolumeViewer::rebuildChunkArray()
 {
     if (_chunkArray)
@@ -918,11 +905,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         return;
 
     try {
-        // Under the default policy this is exactly _volume->sharedChunkCache().
-        _chunkArray = _viewerManager
-            ? _viewerManager->chunkCacheFor(_volume,
-                                            ViewerManager::ChunkCachePool::PlaneViews)
-            : _volume->sharedChunkCache();
+        _chunkArray = _volume->sharedChunkCache();
     } catch (const std::exception& e) {
         if (_statsBar)
             _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
@@ -1053,12 +1036,7 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         dropSurfaceCaches();
         // Derived surface tiles remain separate; raw source chunks use the
         // application-wide regular cache.
-        auto fillerArray = _viewerManager
-            ? _viewerManager->chunkCacheFor(_volume,
-                                            ViewerManager::ChunkCachePool::SurfaceTiles)
-            : _chunkArray;
-        if (!fillerArray)
-            fillerArray = _chunkArray;
+        auto fillerArray = _chunkArray;
         vc::render::SurfaceCache::Options options;
         options.byteCapacity = _surfaceCacheBudgetBytes;
         options.sampling = _samplingMethod;
@@ -2350,14 +2328,13 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (ctx.surfaceCache) {
             ctx.surfaceCache->requestView(
                 ctx.startLevel, prepassUMin, prepassVMin, double(ctx.scale),
-                ctx.fbW, ctx.fbH, ctx.renderJob.surfaceViewGeneration,
-                ctx.renderJob.chunkRequest);
+                ctx.fbW, ctx.fbH, ctx.renderJob.chunkRequest);
         }
         if (ctx.overlaySurfaceCache) {
             ctx.overlaySurfaceCache->requestView(
                 ctx.overlayStartLevel, prepassUMin, prepassVMin,
                 double(ctx.scale), ctx.fbW, ctx.fbH,
-                ctx.renderJob.surfaceViewGeneration, ctx.renderJob.chunkRequest);
+                ctx.renderJob.chunkRequest);
         }
     }
     phasePrepassMs = prepassTimer.elapsed();
@@ -2909,7 +2886,6 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
         return;
     }
 
-    job.surfaceViewGeneration = ++_surfaceViewGeneration;
     _renderWorkerBusy.store(true, std::memory_order_release);
     _activeRenderJob = job;
     _pendingRenderDirty = false;

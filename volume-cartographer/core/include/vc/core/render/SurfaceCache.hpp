@@ -164,7 +164,6 @@ public:
                      double scale,
                      int fbW,
                      int fbH,
-                     std::uint64_t viewGeneration,
                      ChunkRequestContext request = {});
 
     TileReadyCallbackId addTileReadyListener(std::function<void()> callback);

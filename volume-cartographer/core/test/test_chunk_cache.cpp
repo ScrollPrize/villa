@@ -1133,43 +1133,6 @@ TEST_CASE("ChunkCache: every store enforces the configured byte capacity")
     CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
 }
 
-TEST_CASE("ChunkCache: a new view priority epoch does not relax capacity")
-{
-    auto f = std::make_shared<CountingFetcher>();
-    cannedDataChunks(*f, 5);
-    auto c = makeTinyCapacityCache(f);
-
-    c->beginViewRequest();
-    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
-
-    // View epochs affect fetch priority only; decoded storage remains strict.
-    CHECK(c->stats().decodedBytes <= 128);
-    CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
-}
-
-TEST_CASE("ChunkCache: entries from an earlier view epoch stay evictable")
-{
-    auto f = std::make_shared<CountingFetcher>();
-    cannedDataChunks(*f, 4);
-    auto c = makeTinyCapacityCache(f);
-
-    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
-
-    // Advancing request priority does not change ordinary LRU eviction.
-    c->beginViewRequest();
-    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
-
-    CHECK(c->stats().decodedBytes <= 128);
-    CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
-    CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
-}
-
 TEST_CASE("ChunkCache: a large view working set never exceeds capacity")
 {
     // 16x8x8 volume of 4x4x4 chunks: 16 chunks.
@@ -1192,7 +1155,6 @@ TEST_CASE("ChunkCache: a large view working set never exceeds capacity")
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
         0.0, ChunkDtype::UInt8, opts);
 
-    c->beginViewRequest();
     for (int i = 0; i < 9; ++i) {
         const int iz = i / 4;
         const int iy = (i / 2) % 2;
@@ -1296,22 +1258,22 @@ private:
 
 } // namespace
 
-TEST_CASE("ChunkCacheService prioritizes the newest view across sources")
+TEST_CASE("ChunkCacheService prioritizes the active view across sources")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
     auto order = std::make_shared<SharedServiceFetchOrder>();
     auto fetcherB = std::make_shared<LabeledServiceFetcher>(order, 'B', false);
     auto fetcherA = std::make_shared<LabeledServiceFetcher>(order, 'A', true);
-    // Register B first so a source-local epoch would not outrank A's queued
-    // work after B becomes the newest view.
     auto cacheB = makeServiceCache(service, "priority-b", fetcherB, 1);
     auto cacheA = makeServiceCache(service, "priority-a", fetcherA, 1);
 
     CHECK(cacheA->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     order->firstStarted.wait();
     CHECK(cacheA->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::MissQueued);
-    cacheB->beginViewRequest();
-    CHECK(cacheB->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    cacheB->replaceViewDemand({61, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+    cacheB->updateViewFocus(61, {0.0f, 0.0f}, true);
     {
         std::lock_guard lock(order->mutex);
         order->released = true;
@@ -1387,52 +1349,6 @@ TEST_CASE("ChunkCache: invalidation clears unresolved fetch counts")
     CHECK(c->stats().unresolvedFetchesByLevel ==
           std::vector<std::size_t>{0});
     f->release();
-}
-
-TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetches")
-{
-    auto f = std::make_shared<BlockingOrderFetcher>();
-    std::vector<ChunkCache::LevelInfo> levels = {
-        {{4, 4, 4096}, {4, 4, 4}, {}},
-    };
-    ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
-    opts.detectAllFillChunks = false;
-    auto c = std::make_shared<ChunkCache>(
-        std::move(levels),
-        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
-
-    // One old-view fetch is running and three more are queued.
-    (void)c->tryGetChunk(0, 0, 0, 0);
-    f->waitFirstStarted();
-    for (int ix = 1; ix < 4; ++ix)
-        (void)c->tryGetChunk(0, 0, 0, ix);
-    CHECK(c->stats().unresolvedFetchesByLevel ==
-          std::vector<std::size_t>{4});
-    c->beginViewRequest(/*discardPending=*/true);
-    CHECK(c->stats().unresolvedFetchesByLevel ==
-          std::vector<std::size_t>{0});
-
-    // Repeated pans while the old fetch is still running must not accumulate
-    // executor work outside the ChunkCache entry map.
-    for (int view = 0; view < 20; ++view) {
-        const int firstChunk = 5 + view * 32;
-        for (int ix = firstChunk; ix < firstChunk + 32; ++ix)
-            (void)c->tryGetChunk(0, 0, 0, ix);
-        c->beginViewRequest(/*discardPending=*/true);
-    }
-    CHECK(c->stats().unresolvedFetchesByLevel ==
-          std::vector<std::size_t>{0});
-
-    f->release();
-    // The new view remains usable. Superseded queued jobs were removed before
-    // they could call the fetcher; the one already-running old job may finish.
-    CHECK(waitForResolved(*c, 0, 0, 0, 4).status == ChunkStatus::Data);
-    const auto order = f->order();
-    REQUIRE(order.size() == 2);
-    CHECK(order[0].ix == 0);
-    CHECK(order[1].ix == 4);
 }
 
 TEST_CASE("ChunkRequestScheduler reprioritizes pending keyed work")

@@ -1,12 +1,12 @@
 # Status
 
-- [x] Trace GUI and background request ownership through all cache stages.
-- [x] Add targeted scheduler cancellation.
-- [x] Prune stale GUI work during atomic render publication.
-- [x] Prune closed-view work across all registered sources.
-- [x] Prevent stale running work from entering another queue stage.
-- [x] Preserve shared-view and explicit background ownership.
-- [x] Add lifecycle regression tests.
-- [x] Repair timing-sensitive decode-order coverage.
-- [x] Build VC3D and repeatedly run the complete chunk-cache suite.
-- [x] Update specification and task documentation.
+- [x] Audit implicit and explicit chunk request APIs and all callers.
+- [x] Write and independently review the removal plan against the specification.
+- [x] Remove `beginViewRequest()` and implicit epoch state.
+- [x] Rewrite or delete obsolete epoch tests while preserving live coverage.
+- [x] Remove dead VC3D cache routing and refresh APIs.
+- [x] Remove write-only surface generation plumbing.
+- [x] Delete unused private-pool footprint helpers.
+- [x] Update specification and changelog.
+- [x] Build VC3D and run focused cache/render tests.
+- [x] Verify removed symbols have no remaining references.

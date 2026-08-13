@@ -251,7 +251,6 @@ public:
     }
 
     void reloadPerfSettings() override;
-    void refreshChunkSource() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
 
 protected:
@@ -355,7 +354,6 @@ private:
         std::uint64_t requestId = 0;
         vc::render::ChunkRequestContext chunkRequest;
         std::array<float, 2> renderFocus{};
-        std::uint64_t surfaceViewGeneration = 0;
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -514,7 +512,6 @@ private:
     std::uint64_t _surfaceCacheGeometryEpoch = 0;
     Volume* _overlaySurfaceCacheVolume = nullptr;
     std::uint64_t _surfaceCacheEpoch = 0;
-    std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
     // Last frame fell outside the stored band and used the legacy path, so the

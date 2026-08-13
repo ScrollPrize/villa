@@ -22,10 +22,6 @@
 
 #include <array>
 
-namespace vc::render {
-class ChunkCache;
-}
-
 class QMdiArea;
 class QTimer;
 class AxisAlignedSliceController;
@@ -93,17 +89,9 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
-    // Regular decoded chunks are application-wide. The pool value only names
-    // the requesting use for call-site clarity; every path returns the same
-    // source-bound facade.
-    enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
-
     // Re-read the derived surface-cache settings. Called during manager
     // construction and whenever the settings dialog applies.
     void applyViewerCacheSettings();
-    std::shared_ptr<vc::render::ChunkCache> chunkCacheFor(
-        const std::shared_ptr<Volume>& volume,
-        ChunkCachePool pool = ChunkCachePool::PlaneViews);
 
     // --- SurfaceCache budgets (flattened segmentation view) ---
     //

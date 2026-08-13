@@ -197,9 +197,6 @@ public:
 
     Stats stats() const;
     void invalidate();
-    // Advances fetch priority so newer view renders supersede stale requests.
-    // discardPending is only safe for an exclusively-owned interactive cache.
-    void beginViewRequest(bool discardPending = false) override;
     void waitForPersistentWrites() const;
 
     // Process-wide default for Options::compressPersistentCache, OR-ed into
@@ -257,7 +254,6 @@ private:
         bool unresolvedCounted = false;
         bool inLru = false;
         int basePriority = 0;
-        std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
         std::uint64_t probeTaskId = 0;
         std::uint64_t fetchTaskId = 0;
@@ -304,10 +300,8 @@ private:
         std::size_t decodedBytes_ = 0;
         std::uint64_t decodedBudgetRegistration_ = 0;
         std::uint64_t generation_ = 0;
-        std::int64_t viewEpoch_ = 1;
-        // Shared executor tasks carry this cache-specific group/epoch. A new
-        // exclusive view can compact only its own stale tasks without
-        // disturbing other ChunkCache instances using the same pools.
+        // Shared executor tasks carry this cache-specific group/epoch so
+        // invalidation can cancel only this source's stale pending tasks.
         const std::uint64_t schedulerGroup_;
         std::uint64_t schedulerEpoch_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
@@ -471,8 +465,6 @@ private:
     mutable std::mutex facadeMutex_;
     std::unordered_set<ChunkReadyCallbackId> listenerIds_;
     std::unordered_set<RemoteFetchActivityCallbackId> remoteFetchListenerIds_;
-    std::atomic<std::uint64_t> legacyViewId_{0};
-    std::atomic<std::uint64_t> legacyViewVersion_{0};
 };
 
 } // namespace vc::render

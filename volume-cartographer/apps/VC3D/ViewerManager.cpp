@@ -21,7 +21,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 
 #include <QApplication>
 #include <QCursor>
@@ -280,15 +279,6 @@ void ViewerManager::applyViewerCacheSettings()
                           viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
 
     setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
-}
-
-std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
-    const std::shared_ptr<Volume>& volume, ChunkCachePool pool)
-{
-    if (!volume)
-        return nullptr;
-    (void)pool;
-    return volume->sharedChunkCache();
 }
 
 void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)

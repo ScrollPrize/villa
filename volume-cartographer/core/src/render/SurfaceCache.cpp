@@ -682,7 +682,6 @@ struct SurfaceCache::State {
     // actually change the outcome.
     std::unordered_map<TileKey, unsigned, TileKeyHash> failedAttempts;
     IChunkedArray::ChunkReadyCallbackId chunkReadyId = 0;
-    std::uint64_t viewGeneration = 0;
     std::uint64_t epoch = 0;
     bool shuttingDown = false;
     std::unordered_map<TileReadyCallbackId, std::function<void()>> listeners;
@@ -1318,7 +1317,6 @@ void SurfaceCache::requestView(int startLevel,
                                double scale,
                                int fbW,
                                int fbH,
-                               std::uint64_t viewGeneration,
                                ChunkRequestContext request)
 {
     if (!_state->volume || !_state->surface || fbW <= 0 || fbH <= 0 || !(scale > 0.0))
@@ -1380,7 +1378,6 @@ void SurfaceCache::requestView(int startLevel,
             }
         }
         _state->viewTiles = std::move(viewTiles);
-        _state->viewGeneration = viewGeneration;
     }
 
     std::sort(candidates.begin(), candidates.end(),

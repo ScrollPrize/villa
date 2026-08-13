@@ -2,32 +2,58 @@
 
 ## Implementation
 
-1. Add task-ID cancellation to the keyed scheduler. Cancellation succeeds only
-   while a task remains pending; running tasks are not interrupted.
-2. Add explicit background ownership to unresolved cache entries while
-   retaining per-view generation slots for GUI ownership.
-3. During atomic view-snapshot replacement, remove the old view slots, install
-   the new slots, and cancel entries with no remaining owner.
-4. Pass the latest allocated render generation when clearing a view. Retain a
-   generation watermark so late asynchronous work cannot recreate a closed
-   view slot; a later generation may reopen the same stable view ID.
-5. Guard probe-to-source and source-to-decode handoffs with the same scheduler
-   selection gate used for view publication. Stale running work may finish its
-   current stage but cannot queue another one.
+1. Remove `beginViewRequest()` from `IChunkedArray` and `ChunkCache`.
+2. Remove its implicit legacy request state: facade view ID/version, service
+   view ID/epoch allocators, source view epoch, and the unused scalar entry
+   priority.
+3. Make context-free `tryGetChunk()` and `prefetchChunks()` explicitly use an
+   empty `ChunkRequestContext`, retaining their background ownership semantics.
+4. Keep scheduler group/epoch cancellation because `invalidate()` uses it to
+   invalidate pending probe, source, and decode tasks.
+5. Delete or rewrite tests whose only behavior is the obsolete implicit epoch.
+   Preserve equivalent live coverage through explicit view snapshots and
+   targeted ownership cancellation.
+6. Remove dead VC3D private-cache compatibility surfaces:
+   `ChunkCachePool`, `ViewerManager::chunkCacheFor()`, and the viewer
+   `refreshChunkSource()` hook. Route all raw decoded reads directly through
+   `Volume::sharedChunkCache()`.
+7. Remove the write-only `SurfaceCache` view generation from its state, API,
+   render jobs, and viewers.
+8. Delete the unreferenced private-pool `FrameChunkFootprint.hpp` helper.
+
+## Spec update
+
+- Remove the obsolete service-wide view-epoch invariant.
+- State that stable view IDs are allocated by viewers and only explicit
+  versioned snapshots own interactive work.
+- Clarify that scheduler group epochs remain an internal invalidation tool and
+  are not an interactive priority mechanism.
+
+## Documentation updates
+
+- Update the current task log and status as each compatibility layer is
+  removed.
+- Add a changelog entry for retiring the implicit interactive epoch and private
+  cache routing APIs.
+- No user-facing documentation is needed because no in-tree production caller
+  uses the removed interfaces.
 
 ## Testing
 
-- Verify targeted cancellation does not affect running scheduler tasks.
-- Verify render replacement and view closure remove stale pending work.
-- Verify another view and explicit background demand preserve shared work.
-- Verify a running stale download does not enter decode.
-- Verify closed-generation work is rejected and a newer generation reopens the
-  same view ID.
-- Make decode-priority coverage wait until both candidates are genuinely
-  pending before asserting their selection order.
-- Build VC3D and repeatedly run the complete chunk-cache suite.
+- Build `VC3D` and all directly affected test targets.
+- Run `test_chunk_cache`, `test_chunk_cache_persist`, all chunked plane sampler
+  tests, generated annotation view tests, and Lasagna line-view surface tests.
+- Run repository-wide symbol searches to verify removed APIs and state have no
+  references.
+- Run `git diff --check`.
 
-## Documentation
+## Independent plan review
 
-- Update the render/fetch specification and changelog with ownership and
-  cancellation semantics.
+- The plan preserves the specification's shared source cache, explicit
+  per-view ownership, background lane, atomic publication, and invalidation
+  guarantees.
+- Context-free access remains because it has live Python, CLI, slicing, and
+  blocking-sampler callers.
+- Scheduler group epochs remain because cache invalidation still cancels
+  pending work by group and generation.
+- No numerical, rendering, or cache-capacity behavior is intentionally changed.

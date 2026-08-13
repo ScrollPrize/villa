@@ -2,6 +2,10 @@
 
 ## 2026-08-13
 
+- Removed the obsolete implicit `beginViewRequest()` epoch API, dead private
+  decoded-cache routing hooks, and write-only surface-view generation state.
+  Context-free chunk calls remain explicit background work, while interactive
+  ownership continues through versioned per-view demand snapshots.
 - Added per-view generation ownership for interactive chunk work. Superseded or
   closed-view probe/download/decode tasks are canceled while shared-view and
   explicit background requests are retained.

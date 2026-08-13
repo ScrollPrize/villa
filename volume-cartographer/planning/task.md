@@ -1,17 +1,15 @@
-# Task: retire stale interactive chunk work
+# Task: remove obsolete interactive chunk-cache compatibility APIs
 
-Prevent repeated interactive renders from growing the probe, source-read, and
-decode queues with chunks that no current view still needs.
+Remove the implicit `beginViewRequest()` frame-epoch model and other dead
+compatibility surfaces left by the retired per-workspace private decoded-cache
+architecture.
 
-- Track GUI ownership by `(view ID, view version)` on each unresolved chunk.
-- Track explicit non-GUI/background ownership independently.
-- Atomically remove superseded GUI ownership when a render publishes its new
-  dependency snapshot.
-- Remove a view's ownership from every source when that view closes or changes
-  source, rejecting late work from the cleared generation.
-- Cancel only pending work that has no remaining owner.
-- Do not interrupt running work, but prevent stale work from entering another
-  queue stage.
-- Preserve shared chunks requested by another view or background caller.
-
-Decoded values, rendering, and cache residency semantics must remain unchanged.
+- Keep explicit `(view ID, view version)` demand publication and cancellation
+  as the only interactive scheduling model.
+- Keep context-free chunk access as explicit background/batch work because it
+  is used by Python bindings, CLI tools, slicing, and blocking samplers.
+- Keep cache-wide scheduler group epochs used by `invalidate()`.
+- Remove dead VC3D cache-policy routing, refresh hooks, surface-view generation
+  plumbing, and private-pool footprint helpers.
+- Preserve rendering values, cache residency, background access, invalidation,
+  queue fairness, and active-view priority.

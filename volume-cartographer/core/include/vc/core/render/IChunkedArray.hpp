@@ -133,14 +133,6 @@ public:
         (void)viewId;
         (void)viewVersion;
     }
-    // Starts a newer interactive request. An exclusively-owned backing array
-    // may discard unresolved work from the superseded view; resident chunks
-    // are preserved.
-    virtual void beginViewRequest(bool discardPending = false)
-    {
-        (void)discardPending;
-    }
-
     virtual ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) = 0;
     virtual void removeChunkReadyListener(ChunkReadyCallbackId id) = 0;
 };

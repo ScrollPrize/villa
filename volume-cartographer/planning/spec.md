@@ -46,8 +46,11 @@
   but it cannot enqueue the next stage after all of its demand has become stale.
   A chunk independently requested by CLI/batch/background work remains in the
   scheduler's separate background lane after GUI demand is removed.
-- View epochs are allocated by the application cache service, not independently
-  per source, so newly selected volume work outranks older queued source work.
+- Viewers allocate stable numeric view IDs and monotonically increasing request
+  versions. The cache service stores only explicit per-view snapshots and the
+  active view ID; it does not maintain an implicit frame epoch. Scheduler group
+  epochs are internal to source invalidation and do not affect interactive
+  priority.
 
 ## Interactive chunk scheduling
 

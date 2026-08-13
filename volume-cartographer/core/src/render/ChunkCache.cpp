@@ -121,8 +121,6 @@ struct ChunkCacheService::Impl {
     mutable std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<void>> sources;
     std::uint64_t nextSourceId = 1;
-    std::atomic<std::uint64_t> nextViewId{1};
-    std::atomic<std::int64_t> nextViewEpoch{1};
     std::shared_ptr<std::atomic<std::uint64_t>> activeViewId =
         std::make_shared<std::atomic<std::uint64_t>>(0);
     std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId =
@@ -304,8 +302,6 @@ ChunkCache::ChunkCache(std::shared_ptr<ChunkCacheService> service,
     state_->schedulerSelectionGate_ = service_->impl_->schedulerSelectionGate;
     state_->activeViewId_ = service_->impl_->activeViewId;
     state_->nextTaskId_ = service_->impl_->nextTaskId;
-    state_->viewEpoch_ = service_->impl_->nextViewEpoch.fetch_add(
-        1, std::memory_order_relaxed);
     if (!state_->options_.decodedByteBudget)
         state_->options_.decodedByteBudget = decodedByteBudgetDefault();
     if (state_->levels_.empty())
@@ -488,10 +484,7 @@ IChunkedArray::LevelTransform ChunkCache::levelTransform(int level) const
 
 ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
 {
-    ChunkRequestContext request;
-    request.viewId = legacyViewId_.load(std::memory_order_acquire);
-    request.viewVersion = legacyViewVersion_.load(std::memory_order_acquire);
-    return tryGetChunk(level, iz, iy, ix, request);
+    return tryGetChunk(level, iz, iy, ix, {});
 }
 
 ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
@@ -599,10 +592,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset)
 {
-    ChunkRequestContext request;
-    request.viewId = legacyViewId_.load(std::memory_order_acquire);
-    request.viewVersion = legacyViewVersion_.load(std::memory_order_acquire);
-    prefetchChunks(keys, wait, priorityOffset, request);
+    prefetchChunks(keys, wait, priorityOffset, {});
 }
 
 void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
@@ -1049,77 +1039,6 @@ void ChunkCache::unregisterStateBudget(State& state)
     }
 }
 
-void ChunkCache::beginViewRequest(bool discardPending)
-{
-    auto state = state_;
-    if (discardPending && service_.use_count() > 1) {
-        // Shared source state may be serving another workspace/overlay. Newer
-        // requests still receive a newer priority epoch, but one facade must
-        // not erase another facade's unresolved work.
-        discardPending = false;
-    }
-    const auto viewEpoch = service_->impl_->nextViewEpoch.fetch_add(
-        1, std::memory_order_relaxed);
-    std::uint64_t viewId = legacyViewId_.load(std::memory_order_acquire);
-    if (viewId == 0) {
-        const auto allocated = service_->impl_->nextViewId.fetch_add(
-            1, std::memory_order_relaxed);
-        std::uint64_t expected = 0;
-        if (!legacyViewId_.compare_exchange_strong(
-                expected, allocated, std::memory_order_acq_rel)) {
-            viewId = expected;
-        } else {
-            viewId = allocated;
-        }
-    }
-    legacyViewVersion_.fetch_add(1, std::memory_order_acq_rel);
-    service_->impl_->activeViewId->store(viewId, std::memory_order_release);
-    std::uint64_t schedulerEpoch = 0;
-    {
-        std::lock_guard lock(state->mutex_);
-        state->viewEpoch_ = viewEpoch;
-        if (discardPending) {
-            schedulerEpoch = ++state->schedulerEpoch_;
-            for (auto it = state->entries_.begin(); it != state->entries_.end();) {
-                if (it->second.status == EntryStatus::InFlight) {
-                    it = state->entries_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            std::fill(state->unresolvedFetchesByLevel_.begin(),
-                      state->unresolvedFetchesByLevel_.end(), 0);
-        }
-    }
-    if (discardPending) {
-        // entries_ cancellation alone is insufficient: the shared executors
-        // would otherwise retain one stale lambda per chunk until their queues
-        // drained. Compact only this cache's task group immediately.
-        if (auto scheduler = state->fetchScheduler_.lock())
-            scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-        if (auto scheduler = state->probeScheduler_.lock())
-            scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-        if (auto scheduler = state->decodeScheduler_.lock())
-            scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-        state->cv_.notify_all();
-    } else {
-        std::vector<std::shared_ptr<State>> states;
-        {
-            std::lock_guard serviceLock(service_->impl_->mutex);
-            states.reserve(service_->impl_->sources.size());
-            for (const auto& [identity, source] : service_->impl_->sources) {
-                (void)identity;
-                states.push_back(std::static_pointer_cast<State>(source));
-            }
-        }
-        for (const auto& source : states) {
-            std::lock_guard lock(source->mutex_);
-            for (auto& [key, entry] : source->entries_)
-                reprioritizeEntryLocked(*source, key, entry);
-        }
-    }
-}
-
 void ChunkCache::waitForPersistentWrites() const
 {
     auto state = state_;
@@ -1323,7 +1242,6 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
     }
     entry.status = EntryStatus::InFlight;
     entry.basePriority = fetchBasePriority(*state, key, priorityOffset);
-    entry.priority = entry.basePriority;
     const std::uint64_t fetchSerial = state->nextFetchSerial_++;
     entry.fetchSerial = fetchSerial;
     const auto priority = workPriorityLocked(*state, key, entry);

@@ -139,9 +139,10 @@ lightweight source facade and service state, so switching A -> B -> A neither
 reopens the source nor refetches resident chunks. Cache retention is
 capacity-bound, not guaranteed. Explicit volume invalidation clears only that
 source and rejects stale fetch completion.
-No switch-time fetch/decode cancellation is implemented. The service allocates
-view epochs across all sources, so a newly selected volume gains priority while
-older work may drain.
+No switch-time cancellation of already-running fetch/decode work is
+implemented. Interactive ownership comes only from explicit versioned per-view
+demand snapshots; pending work without current interactive or background
+ownership is canceled, while already-running work may drain.
 
 Interactive VC3D renders publish versioned per-view demand before normal
 sampling starts. A sparse, stratified viewport probe associates missing chunks
