@@ -214,6 +214,8 @@ class SmearTransform(ImageOnlyTransform):
                 Blending factor for the aggregated shifted slices (0 = no influence, 1 = full replacement).
             num_prev_slices : int
                 The number of previous slices to aggregate and use for blending.
+                Any value below 1 leaves an empty window, which scales the image
+                by (1 - alpha).
             smear_axis : int
                 The spatial axis (in the full tensor) along which to apply the smear.
                 For an input image with shape (C, X, Y) or (C, X, Y, Z), spatial dimensions are indices 1,2,(3).
@@ -238,6 +240,10 @@ class SmearTransform(ImageOnlyTransform):
         if not (1 <= self.smear_axis <= num_spatial_dims):
             raise ValueError(f"smear_axis must be between 1 and {num_spatial_dims} for input with shape {tuple(img.shape)}")
         k = self.num_prev_slices
+        if k < 1:
+            # An empty window blends each slice with nothing: the (1 - alpha)
+            # share is kept and there is no average to add.
+            return img.mul_(1 - self.alpha)
         if img.shape[self.smear_axis] <= k:
             return img
 
