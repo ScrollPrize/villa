@@ -127,6 +127,170 @@ def render_crossing_only_targets(
     }
 
 
+def render_column_targets_batched(
+    crossing_t: np.ndarray,
+    crossing_indices: np.ndarray,
+    num_crossings: np.ndarray,
+    *,
+    ray_length: int,
+    spacing: float,
+    crossing_sigma_wv: float,
+    crossings_only: bool = False,
+) -> dict[str, np.ndarray]:
+    """Vectorized render_column_targets over N columns at once.
+
+    ``crossing_t`` [N, K] (padded; pad values are never read), ``num_crossings``
+    [N]. Column-for-column equivalent to the per-column renderers, without
+    the per-column Python loop that dominated dataset CPU time: each
+    sample's gap is found with one flat ``searchsorted`` (per-column offsets
+    keep the concatenated crossing list globally sorted), and the nearest
+    crossing of a sorted list is always one of its two gap neighbours.
+
+    Columns with fewer than two crossings (one with ``crossings_only``)
+    render all-zero/invalid.
+    """
+    ct = np.asarray(crossing_t, dtype=np.float64)
+    indices = np.asarray(crossing_indices, dtype=np.float64)
+    counts = np.asarray(num_crossings, dtype=np.int64)
+    n, k_max = ct.shape
+    active = counts >= (1 if crossings_only else 2)
+    sample_ts = np.arange(ray_length, dtype=np.float64) * spacing
+
+    valid_slot = np.arange(k_max)[None, :] < counts[:, None]
+    ct = np.where(valid_slot, ct, 0.0)
+    # Per-column offsets larger than any t keep the concatenation sorted.
+    span = ray_length * spacing + 1.0
+    offsets = np.arange(n, dtype=np.float64) * span
+    flat_ct = (ct + offsets[:, None])[valid_slot]
+    starts = np.r_[0, np.cumsum(counts)]
+    queries = (sample_ts[None, :] + offsets[:, None]).ravel()
+    gap = (
+        np.searchsorted(flat_ct, queries, side="right").reshape(n, ray_length)
+        - starts[:-1, None]
+        - 1
+    )
+
+    last = np.maximum(counts[:, None] - 1, 0)
+    j0 = np.clip(gap, 0, last)
+    # Equivalent to clip(gap + 1, 0, last): advance only where gap >= 0.
+    j1 = np.minimum(j0 + (gap >= 0), last)
+    # Everything after the (exact, float64) gap search runs in float32:
+    # positions and winding indices are far below 2^24, so errors stay
+    # ~1e-5 winding — orders of magnitude under label noise — while the
+    # dense [N, L] arithmetic that dominates this function runs twice as
+    # fast.
+    ct = ct.astype(np.float32)
+    t32 = sample_ts.astype(np.float32)[None, :]
+    ct0 = np.take_along_axis(ct, j0, axis=1)
+    ct1 = np.take_along_axis(ct, j1, axis=1)
+    deviation = np.minimum(np.abs(t32 - ct0), np.abs(t32 - ct1))
+    heatmap = np.exp(
+        -0.5 * (deviation / np.float32(crossing_sigma_wv)) ** 2
+    )
+    pin_row, pin_slot = np.nonzero(valid_slot & active[:, None])
+    pin_col = np.clip(
+        np.rint(ct[pin_row, pin_slot] / spacing).astype(np.int64),
+        0,
+        ray_length - 1,
+    )
+    heatmap[pin_row, pin_col] = 1.0
+    if not active.all():
+        heatmap[~active] = 0.0
+
+    if crossings_only:
+        zeros = np.zeros((n, ray_length), dtype=np.float32)
+        return {
+            "phase_target": zeros,
+            "phase_valid": np.zeros((n, ray_length), dtype=bool),
+            "crossing_target": heatmap,
+            "crossing_valid": heatmap > _CROSSING_SUPPORT,
+            "density_target": zeros,
+            "density_gap_wv": zeros,
+        }
+
+    indices32 = indices.astype(np.float32)
+    f0 = np.take_along_axis(indices32, j0, axis=1)
+    f1 = np.take_along_axis(indices32, j1, axis=1)
+    width = ct1 - ct0
+    positive = width > 0.0
+    fraction = (t32 - ct0) / np.where(positive, width, np.float32(1.0))
+    fraction[~positive] = 0.0
+    phase = f0 + fraction * (f1 - f0)
+
+    density_target = np.zeros((n, ray_length), dtype=np.float32)
+    density_target[:, 1:] = np.diff(phase, axis=-1)
+    in_gap = (gap >= 0) & (gap < counts[:, None] - 1)
+    gap_at_sample = np.where(in_gap, width, np.float32(0.0))
+    density_gap = np.zeros((n, ray_length), dtype=np.float32)
+    density_gap[:, 1:] = np.minimum(gap_at_sample[:, 1:], gap_at_sample[:, :-1])
+
+    first_t = ct[:, 0][:, None]
+    last_t = np.take_along_axis(ct, last, axis=1)
+    winding_valid = (t32 >= first_t) & (t32 <= last_t)
+    # Gaps whose winding indices differ by more than one may hide unlabeled
+    # wraps: their strict interior is untrusted. Each sample lies in exactly
+    # one gap, so the per-gap loop reduces to one mask.
+    hole = (
+        in_gap
+        & (np.abs(f1 - f0) > 1.0)
+        & (t32 > ct0)
+        & (t32 < ct1)
+    )
+    winding_valid &= ~hole
+    winding_valid &= active[:, None]
+
+    if not active.all():
+        inactive = ~active
+        phase[inactive] = 0.0
+        density_target[inactive] = 0.0
+        density_gap[inactive] = 0.0
+    return {
+        "phase_target": phase,
+        "phase_valid": winding_valid,
+        "crossing_target": heatmap,
+        "crossing_valid": winding_valid | (heatmap > _CROSSING_SUPPORT),
+        "density_target": density_target,
+        "density_gap_wv": density_gap,
+    }
+
+
+def passage_kernels(phase: np.ndarray, sigma_samples: float) -> np.ndarray:
+    """Unit-height Gaussian kernels at a monotone phase's integer passages.
+
+    The headless stand-in for the sigmoid crossing map, shared by training
+    visualization and volume inference: ``phase`` is [..., L] registered
+    columns, and every sample gets ``exp(-d^2 / 2 sigma^2)`` of its distance
+    to the nearest integer passage. Peak height is deliberately uniform —
+    increment mass near a passage scales with 1/gap, so scaling by it would
+    fade sparse regions and (measured) carries no confidence signal.
+    Segments passing several integers render their first passage only,
+    exact at kernel resolution whenever gaps exceed one sample.
+    """
+    phase = np.asarray(phase, dtype=np.float64)
+    level = np.floor(phase)
+    crossed = level[..., 1:] > level[..., :-1]
+    step = np.maximum(np.diff(phase, axis=-1), 1e-9)
+    fraction = np.clip(
+        (level[..., :-1] + 1.0 - phase[..., :-1]) / step, 0.0, 1.0
+    )
+    positions = np.arange(phase.shape[-1] - 1, dtype=np.float64) + fraction
+
+    # Distance to the nearest passage via forward/backward running scans.
+    big = 1e9
+    pad = np.full(phase.shape[:-1] + (1,), big)
+    last = np.maximum.accumulate(np.where(crossed, positions, -big), axis=-1)
+    ahead = np.minimum.accumulate(
+        np.where(crossed, positions, big)[..., ::-1], axis=-1
+    )[..., ::-1]
+    samples = np.arange(phase.shape[-1], dtype=np.float64)
+    forward = samples - np.concatenate([-pad, last], axis=-1)
+    backward = np.concatenate([ahead, pad], axis=-1) - samples
+    distance = np.clip(np.minimum(forward, backward), 0.0, None)
+    return np.exp(
+        -0.5 * (distance / float(sigma_samples)) ** 2
+    ).astype(np.float32)
+
+
 _PADDED_KEYS = {"crossing_t": float("nan"), "crossing_indices": 0}
 
 
@@ -229,7 +393,7 @@ def density_supervision_mask(
 
 def density_loss(
     phase_increments: torch.Tensor,
-    density_log_variance: torch.Tensor,
+    density_log_variance: torch.Tensor | None,
     density_target: torch.Tensor,
     density_gap_wv: torch.Tensor,
     phase_valid: torch.Tensor,
@@ -237,6 +401,7 @@ def density_loss(
     min_gap_wv: float = 4.0,
     beta: float = 0.5,
     log_variance_range: tuple[float, float] = (-12.0, 6.0),
+    huber_delta: float = 0.05,
 ) -> torch.Tensor:
     """Heteroscedastic Gaussian NLL on per-segment phase increments.
 
@@ -262,19 +427,32 @@ def density_loss(
     off once the model inflates their variance -- and the hard samples are
     tight gaps and near-tears, exactly where the consumer needs signal.
     ``beta = 0`` recovers the plain NLL.
+
+    Models without a variance head (``use_variance_head`` off) pass ``None``
+    for the log-variance; the loss then falls back to the fixed-scale Huber
+    on the residuals (``huber_delta``) that the NLL's self-attenuation
+    otherwise replaces.
     """
     increments = phase_increments.float()
-    log_variance = density_log_variance.float().clamp(*log_variance_range)
     target = density_target.to(increments.dtype)
     weight = density_supervision_mask(
         density_gap_wv, phase_valid, min_gap_wv=min_gap_wv
     ).to(increments.dtype)
     residual = increments - target
-    per_sample = 0.5 * (
-        torch.exp(-log_variance) * residual.square() + log_variance
-    )
-    if beta:
-        per_sample = per_sample * torch.exp(beta * log_variance).detach()
+    if density_log_variance is None:
+        per_sample = F.huber_loss(
+            residual,
+            torch.zeros_like(residual),
+            delta=huber_delta,
+            reduction="none",
+        )
+    else:
+        log_variance = density_log_variance.float().clamp(*log_variance_range)
+        per_sample = 0.5 * (
+            torch.exp(-log_variance) * residual.square() + log_variance
+        )
+        if beta:
+            per_sample = per_sample * torch.exp(beta * log_variance).detach()
     count = weight.sum(dim=-1)
     per_column = (per_sample * weight).sum(dim=-1) / count.clamp_min(1.0)
     active = (count > 0).to(increments.dtype)
@@ -463,6 +641,190 @@ def crossing_distillation_loss(
     return (per_column * active).sum() / active.sum().clamp_min(1.0)
 
 
+def _phase_at_positions(
+    phase: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """Linearly interpolate each column's phase at fractional ray positions.
+
+    ``positions`` is in sample units; NaN entries (crossing-list padding)
+    read as position zero and must be masked out by the caller.
+    """
+    length = phase.shape[-1]
+    positions = positions.nan_to_num(0.0).clamp(0.0, float(length - 1))
+    lower = positions.floor().long().clamp(0, length - 2)
+    frac = positions - lower.to(positions.dtype)
+    at_lower = phase.gather(-1, lower)
+    at_upper = phase.gather(-1, lower + 1)
+    return at_lower + (at_upper - at_lower) * frac
+
+
+def span_delta_loss(
+    phase: torch.Tensor,
+    crossing_t: torch.Tensor,
+    crossing_indices: torch.Tensor,
+    num_crossings: torch.Tensor,
+    *,
+    spacing: float,
+    min_index_delta: int = 2,
+    huber_delta: float = 0.25,
+) -> torch.Tensor:
+    """Winding-count supervision across gaps whose interior is unsupervised.
+
+    When a labeled ray misses intermediate wraps (holes in a bracket mesh,
+    grazing hits), consecutive kept crossings differ by more than one
+    winding index and every dense target masks the whole gap out — but the
+    endpoint indices still come from mesh identity in the labeled chain,
+    not from counting hits, so the *total* stays known even though the
+    interior positions don't: the predicted phase difference across the gap
+    must equal the index difference. Differencing cancels the slab's free
+    phase offset, so no registration is needed.
+
+    Gaps with an index delta below ``min_index_delta`` are already densely
+    supervised by the phase loss and contribute nothing here; position-only
+    columns carry all-zero indices and never qualify. Predicted phase is
+    read at the labeled crossing positions by linear interpolation.
+    Per-column means over supervised gaps, columns averaging uniformly,
+    matching the other losses.
+    """
+    phase = phase.float()
+    at_crossings = _phase_at_positions(phase, crossing_t.float() / float(spacing))
+    delta = at_crossings[..., 1:] - at_crossings[..., :-1]
+    index_delta = (
+        crossing_indices[..., 1:] - crossing_indices[..., :-1]
+    ).to(phase.dtype)
+    slot = torch.arange(crossing_t.shape[-1], device=phase.device)
+    in_range = slot[1:] < num_crossings[..., None]
+    weight = (in_range & (index_delta >= float(min_index_delta))).to(phase.dtype)
+    residual = delta - index_delta
+    per_pair = F.huber_loss(
+        residual, torch.zeros_like(residual), delta=huber_delta, reduction="none"
+    )
+    count = weight.sum(dim=-1)
+    per_column = (per_pair * weight).sum(dim=-1) / count.clamp_min(1.0)
+    active = (count > 0).to(phase.dtype)
+    return (per_column * active).sum() / active.sum().clamp_min(1.0)
+
+
+def multiview_consistency_loss(
+    phase_a: torch.Tensor,
+    phase_b: torch.Tensor,
+    frame_a: dict[str, torch.Tensor],
+    frame_b: dict[str, torch.Tensor],
+    valid_a: torch.Tensor,
+    valid_b: torch.Tensor,
+    has_pair: torch.Tensor,
+    *,
+    column_stride: int,
+    spacing: float,
+    huber_delta: float = 0.5,
+    min_shared_samples: int = 64,
+) -> torch.Tensor:
+    """Label-free agreement between two overlapping slabs' phase fields.
+
+    The winding coordinate is a scalar field of the volume, so two slabs
+    observing the same points must predict phase fields that differ by one
+    constant per pair (each slab's phase carries a free offset). Slab A's
+    output-column samples map through world space into slab B's output grid,
+    B's phase field is sampled there trilinearly, and the running
+    difference is penalized shift-invariantly with a Huber loss —
+    gradients flow into both views.
+
+    ``frame_a``/``frame_b`` hold each slab's frame as ``origin``,
+    ``axis_a``, ``axis_b``, ``direction`` tensors [B, 3] in one consistent
+    component order (the dataset's zyx works: the mapping only uses dot
+    products, which any consistent permutation preserves). Pair generation
+    keeps the two ray directions inside a cone well under 90 degrees, so
+    both phases ascend the same winding direction and no sign registration
+    is needed. Supervision holds where both slabs actually observed data:
+    A's own column validity, in-bounds mapping, and B's sampled validity
+    (strict: every trilinear neighbour valid). Pairs with fewer than
+    ``min_shared_samples`` shared samples — including absent pairs, whose
+    ``has_pair`` is False — contribute nothing.
+    """
+    phase_a = phase_a.float()
+    batch, height, width, length = phase_a.shape
+    stride = float(column_stride)
+    device = phase_a.device
+
+    def axes(frame: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            frame[key].float().reshape(batch, 1, 1, 1, 3)
+            for key in ("origin", "axis_a", "axis_b", "direction")
+        )
+
+    # Dataset targets and inference both place output column i at input
+    # coordinate i * stride. Keep the consistency warp on that same lattice.
+    rows = torch.arange(height, device=device, dtype=torch.float32) * stride
+    cols = torch.arange(width, device=device, dtype=torch.float32) * stride
+    samples = torch.arange(length, device=device, dtype=torch.float32)
+
+    origin_a, axis_a_a, axis_b_a, direction_a = axes(frame_a)
+    world = origin_a + float(spacing) * (
+        rows[None, :, None, None, None] * axis_a_a
+        + cols[None, None, :, None, None] * axis_b_a
+        + samples[None, None, None, :, None] * direction_a
+    )
+    origin_b, axis_a_b, axis_b_b, direction_b = axes(frame_b)
+    offsets = world - origin_b
+    row_b = (offsets * axis_a_b).sum(-1) / float(spacing)
+    col_b = (offsets * axis_b_b).sum(-1) / float(spacing)
+    sample_b = (offsets * direction_b).sum(-1) / float(spacing)
+
+    grid_row = row_b / stride
+    grid_col = col_b / stride
+    in_bounds = (
+        (grid_row >= 0.0)
+        & (grid_row <= height - 1.0)
+        & (grid_col >= 0.0)
+        & (grid_col <= width - 1.0)
+        & (sample_b >= 0.0)
+        & (sample_b <= length - 1.0)
+    )
+    # grid_sample over [N, C, D=rows, H=cols, W=samples]: grid xyz order is
+    # (W, H, D).
+    grid = torch.stack(
+        [
+            sample_b / max(length - 1, 1) * 2.0 - 1.0,
+            grid_col / max(width - 1, 1) * 2.0 - 1.0,
+            grid_row / max(height - 1, 1) * 2.0 - 1.0,
+        ],
+        dim=-1,
+    )
+    sampled_b = F.grid_sample(
+        phase_b.float()[:, None],
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )[:, 0]
+
+    columns_a = valid_a[:, ::column_stride, ::column_stride, :]
+    columns_b = valid_b[:, ::column_stride, ::column_stride, :]
+    sampled_valid = F.grid_sample(
+        columns_b.float()[:, None],
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )[:, 0]
+    weight = (
+        (columns_a.bool() & in_bounds & (sampled_valid > 0.999))
+        .reshape(batch, -1)
+        .to(phase_a.dtype)
+    ) * has_pair.reshape(batch, 1).to(phase_a.dtype)
+
+    difference = phase_a.reshape(batch, -1) - sampled_b.reshape(batch, -1)
+    count = weight.sum(dim=-1)
+    shift = (difference * weight).sum(dim=-1) / count.clamp_min(1.0)
+    residual = difference - shift[:, None]
+    per_sample = F.huber_loss(
+        residual, torch.zeros_like(residual), delta=huber_delta, reduction="none"
+    )
+    per_pair = (per_sample * weight).sum(dim=-1) / count.clamp_min(1.0)
+    active = (count >= float(min_shared_samples)).to(phase_a.dtype)
+    return (per_pair * active).sum() / active.sum().clamp_min(1.0)
+
+
 def position_only_phase_loss(
     phase: torch.Tensor,
     crossing_t: torch.Tensor,
@@ -500,15 +862,7 @@ def position_only_phase_loss(
     interpolation along the ray.
     """
     phase = phase.float()
-    length = phase.shape[-1]
-    positions = (crossing_t.float() / float(spacing)).nan_to_num(0.0)
-    positions = positions.clamp(0.0, float(length - 1))
-
-    lower = positions.floor().long().clamp(0, length - 2)
-    frac = positions - lower.to(positions.dtype)
-    at_lower = phase.gather(-1, lower)
-    at_upper = phase.gather(-1, lower + 1)
-    at_crossings = at_lower + (at_upper - at_lower) * frac
+    at_crossings = _phase_at_positions(phase, crossing_t.float() / float(spacing))
 
     delta = at_crossings[..., 1:] - at_crossings[..., :-1]
     slot = torch.arange(crossing_t.shape[-1], device=phase.device)
@@ -536,6 +890,47 @@ def position_only_phase_loss(
         (hinge_column * active).sum() / denominator,
         (snap_column * active).sum() / denominator,
     )
+
+
+def phase_passages(phase: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Sub-sample positions and integer levels where a monotone phase passes
+    integers.
+
+    The headless crossing decode: a monotone phase passes each integer in
+    its range exactly once, so — unlike heatmap peaks — the returned
+    crossings are duplicate-free by construction and each carries its
+    winding level directly. The caller registers the phase's free offset
+    first (against targets in training, against the seed crossing at
+    inference) so integer levels sit at crossings.
+
+    Returns ``(positions, levels)``: fractional ray-sample positions via
+    linear interpolation, and the integer passed at each.
+    """
+    phase = np.asarray(phase, dtype=np.float64)
+    levels = np.arange(math.floor(phase[0]) + 1, math.floor(phase[-1]) + 1)
+    # A strictly increasing copy keeps np.interp well-defined across
+    # zero-increment runs (softplus increments can underflow to zero).
+    strict = phase + np.arange(len(phase)) * 1e-9
+    positions = np.interp(levels, strict, np.arange(len(phase), dtype=np.float64))
+    return positions, levels
+
+
+def increment_window_mass(increments: np.ndarray, *, window: int) -> np.ndarray:
+    """Rolling phase-increment mass over +-``window`` samples, clipped to 1.
+
+    A crossing-probability surrogate for models without a crossing head:
+    one full winding of increment mass concentrated near a sample drives
+    the value toward 1, empty spans toward 0. Operates on the last axis.
+    """
+    cumulative = np.cumsum(np.asarray(increments, dtype=np.float64), axis=-1)
+    length = cumulative.shape[-1]
+    positions = np.arange(length)
+    upper = np.minimum(positions + window, length - 1)
+    lower = positions - window
+    mass = cumulative[..., upper] - np.where(
+        lower > 0, cumulative[..., np.maximum(lower - 1, 0)], 0.0
+    )
+    return np.clip(mass, 0.0, 1.0)
 
 
 def extract_peaks(

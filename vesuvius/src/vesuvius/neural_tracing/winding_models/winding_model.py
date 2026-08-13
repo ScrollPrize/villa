@@ -8,8 +8,16 @@ residual blocks mixes features locally, and a stack of axial attention
 blocks does the long-range work: one attention over the ray axis per
 column (relative position bias, as a sequence of length L) and one over
 the transverse plane per ray position
-(2-D relative bias). A light decoder restores one transverse level with a
-skip connection, and every prediction head runs per column — a
+(2-D relative bias). A light decoder restores ``decoder_levels`` transverse
+levels with skip connections (each level halves the column stride at 4x
+the decoder cost; the trunk is untouched), optionally followed by a
+sub-pixel head (``head_upsample``): each head predicts s^2 values per
+column, pixel-shuffled onto an s-times-finer transverse grid — learned
+interpolation from the coarse features, cheaper but weaker than a real
+decoder level. ``full_resolution_head`` provides a cheaper native-resolution
+alternative: it upsamples the stride-4 decoder once, concatenates the
+stride-2 encoder skip, and uses two 1x1 projections plus a 2x sub-pixel
+shuffle. Every prediction head runs per column — a
 ray-parallel line of voxels at the model's column stride — so the network
 predicts winding structure everywhere in the slab rather than only on the
 central ray. The central ray is only the sampling frame; it receives no
@@ -23,10 +31,14 @@ Per column sample the model predicts:
   Winding indices are globally consistent across a slab's columns, so the
   whole phase field shares one free offset, absorbed by the shift-invariant
   loss and the consumer's per-ray registration.
-- a per-sample log-variance for those increments (heteroscedastic head),
+- optionally (``use_variance_head``, kept for older checkpoints) a
+  per-sample log-variance for those increments (heteroscedastic head),
   so the consumer can precision-weight registered observations instead
   of trusting every column equally.
-- a crossing logit whose sigmoid peaks where the phase passes an integer.
+- optionally (``use_crossing_head``, kept for older checkpoints) a
+  crossing logit whose sigmoid peaks where the phase passes an integer.
+  Without the head, crossings decode as the integer passages of the
+  monotone phase itself.
 """
 
 from __future__ import annotations
@@ -50,6 +62,11 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "max_relative_distance",
         "transverse_size",
         "decoder_dim",
+        "decoder_levels",
+        "head_upsample",
+        "full_resolution_head",
+        "use_crossing_head",
+        "use_variance_head",
         "crossing_head_kernel_size",
         "crossing_prior_prob",
         "phase_initial_increment",
@@ -311,6 +328,12 @@ class WindingModel(nn.Module):
             for _ in range(attention_blocks)
         )
 
+        decoder_levels = int(cfg.get("decoder_levels", 1))
+        if not 1 <= decoder_levels <= len(channels) - 1:
+            raise ValueError(
+                "decoder_levels must be between 1 and one less than the "
+                "number of encoder stages"
+            )
         self.decoder = nn.Sequential(
             nn.Conv3d(trunk_dim + channels[-2], decoder_dim, 3, padding=1),
             _norm(decoder_dim),
@@ -319,53 +342,164 @@ class WindingModel(nn.Module):
             _norm(decoder_dim),
             nn.GELU(),
         )
-
-        self.phase_head = nn.Conv3d(decoder_dim, 1, 1)
-        self.log_variance_head = nn.Conv3d(decoder_dim, 1, 1)
-        crossing_kernel = int(cfg.get("crossing_head_kernel_size", 5))
-        if crossing_kernel <= 0 or crossing_kernel % 2 == 0:
-            raise ValueError("crossing_head_kernel_size must be a positive odd integer")
-        self.crossing_head = nn.Conv3d(
-            decoder_dim,
-            1,
-            kernel_size=(1, 1, crossing_kernel),
-            padding=(0, 0, crossing_kernel // 2),
+        # Additional transverse restoration levels consuming the earlier
+        # encoder skips; kept out of ``decoder`` so level-1 checkpoints warm
+        # start the shared level unchanged.
+        self.extra_decoders = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv3d(
+                    decoder_dim + channels[-2 - level], decoder_dim, 3,
+                    padding=1,
+                ),
+                _norm(decoder_dim),
+                nn.GELU(),
+                nn.Conv3d(decoder_dim, decoder_dim, 3, padding=1),
+                _norm(decoder_dim),
+                nn.GELU(),
+            )
+            for level in range(1, decoder_levels)
         )
 
-        crossing_prior = cfg.get("crossing_prior_prob")
-        if crossing_prior is not None:
-            crossing_prior = float(crossing_prior)
-            if not 0.0 < crossing_prior < 1.0:
-                raise ValueError("crossing_prior_prob must be between zero and one")
-            nn.init.constant_(
-                self.crossing_head.bias,
-                math.log(crossing_prior / (1.0 - crossing_prior)),
+        # Sub-pixel (pixel shuffle) head upsampling: each head predicts
+        # head_upsample^2 values per column, rearranged onto a finer
+        # transverse grid. Cheap learned interpolation from the coarse
+        # features, versus a real decoder level's skip-fed resolution.
+        head_upsample = int(cfg.get("head_upsample", 1))
+        base_stride = 2 ** (len(channels) - decoder_levels)
+        if head_upsample < 1 or head_upsample & (head_upsample - 1):
+            raise ValueError("head_upsample must be a positive power of two")
+        if head_upsample > base_stride:
+            raise ValueError(
+                "head_upsample cannot push the column stride below one voxel"
             )
+        self.head_upsample = head_upsample
+        head_channels = head_upsample**2
+
+        # Native output without a wide stride-2 decoder. The stride-4 decoder
+        # is interpolated to the first encoder skip, fused through a narrow
+        # 1x1 projection, and four logits are shuffled to the voxel grid.
+        self.full_resolution_head_enabled = bool(
+            cfg.get("full_resolution_head", False)
+        )
+        if self.full_resolution_head_enabled:
+            if decoder_levels != 1 or base_stride != 4 or len(channels) < 3:
+                raise ValueError(
+                    "full_resolution_head requires three encoder stages and "
+                    "decoder_levels=1"
+                )
+            if head_upsample != 1:
+                raise ValueError(
+                    "full_resolution_head cannot be combined with head_upsample"
+                )
+            if bool(cfg.get("use_crossing_head", True)) or bool(
+                cfg.get("use_variance_head", True)
+            ):
+                raise ValueError(
+                    "full_resolution_head currently requires the crossing "
+                    "and variance heads to be disabled"
+                )
+            detail_dim = channels[0]
+            self.full_resolution_head = nn.Sequential(
+                nn.Conv3d(decoder_dim + channels[0], detail_dim, 1),
+                _norm(detail_dim),
+                nn.GELU(),
+                nn.Conv3d(detail_dim, 4, 1),
+            )
+            self.phase_head = None
+        else:
+            self.full_resolution_head = None
+            self.phase_head = nn.Conv3d(decoder_dim, head_channels, 1)
+        # The heteroscedastic variance head is likewise optional (the
+        # default keeps older checkpoints loading); without it the density
+        # loss falls back to a fixed-scale Huber and the consumer treats
+        # increments as homoscedastic.
+        if bool(cfg.get("use_variance_head", True)):
+            self.log_variance_head = nn.Conv3d(decoder_dim, head_channels, 1)
+        else:
+            self.log_variance_head = None
+        # The crossing head is retained for older checkpoints (the default
+        # keeps their saved configs loading); without it, crossings decode
+        # as the integer passages of the monotone phase, which are
+        # duplicate-free by construction.
+        if bool(cfg.get("use_crossing_head", True)):
+            crossing_kernel = int(cfg.get("crossing_head_kernel_size", 5))
+            if crossing_kernel <= 0 or crossing_kernel % 2 == 0:
+                raise ValueError(
+                    "crossing_head_kernel_size must be a positive odd integer"
+                )
+            self.crossing_head = nn.Conv3d(
+                decoder_dim,
+                head_channels,
+                kernel_size=(1, 1, crossing_kernel),
+                padding=(0, 0, crossing_kernel // 2),
+            )
+
+            crossing_prior = cfg.get("crossing_prior_prob")
+            if crossing_prior is not None:
+                crossing_prior = float(crossing_prior)
+                if not 0.0 < crossing_prior < 1.0:
+                    raise ValueError(
+                        "crossing_prior_prob must be between zero and one"
+                    )
+                nn.init.constant_(
+                    self.crossing_head.bias,
+                    math.log(crossing_prior / (1.0 - crossing_prior)),
+                )
+        else:
+            self.crossing_head = None
 
         phase_increment = cfg.get("phase_initial_increment")
         if phase_increment is not None:
             phase_increment = float(phase_increment)
             if phase_increment <= 0.0:
                 raise ValueError("phase_initial_increment must be positive")
-            nn.init.zeros_(self.phase_head.weight)
+            phase_output = (
+                self.full_resolution_head[-1]
+                if self.full_resolution_head is not None
+                else self.phase_head
+            )
+            nn.init.zeros_(phase_output.weight)
             nn.init.constant_(
-                self.phase_head.bias,
+                phase_output.bias,
                 math.log(math.expm1(phase_increment)),
             )
 
         # Start with a moderate predicted variance: confident enough that the
         # density NLL has teeth from early on, loose enough that early large
         # residuals don't dominate the total loss.
-        nn.init.zeros_(self.log_variance_head.weight)
-        nn.init.constant_(
-            self.log_variance_head.bias,
-            float(cfg.get("density_log_variance_init", -4.0)),
-        )
+        if self.log_variance_head is not None:
+            nn.init.zeros_(self.log_variance_head.weight)
+            nn.init.constant_(
+                self.log_variance_head.bias,
+                float(cfg.get("density_log_variance_init", -4.0)),
+            )
 
     @property
     def column_stride(self) -> int:
         """Input voxels per output column on each transverse axis."""
-        return 2 ** (len(self.stages) - 1)
+        if self.full_resolution_head_enabled:
+            return 1
+        decoder_levels = 1 + len(self.extra_decoders)
+        return 2 ** (len(self.stages) - decoder_levels) // self.head_upsample
+
+    @staticmethod
+    def _pixel_shuffle_output(out: torch.Tensor, scale: int) -> torch.Tensor:
+        """Pixel-shuffle head channels onto the transverse spatial axes."""
+        if scale == 1:
+            return out.squeeze(1)
+        batch, _, height, width, length = out.shape
+        out = out.reshape(batch, scale, scale, height, width, length)
+        out = out.permute(0, 3, 1, 4, 2, 5)
+        return out.reshape(batch, height * scale, width * scale, length)
+
+    def _head_output(self, head: nn.Module, features: torch.Tensor) -> torch.Tensor:
+        """Apply a prediction head and pixel-shuffle it transversely.
+
+        With ``head_upsample`` s, the head's s^2 channels rearrange onto an
+        s-times-finer transverse grid: channel s_i * s + s_j lands at
+        transverse offset (s_i, s_j) within each column's footprint.
+        """
+        return self._pixel_shuffle_output(head(features), self.head_upsample)
 
     def forward(
         self, slab_image: torch.Tensor, slab_valid: torch.Tensor
@@ -403,16 +537,53 @@ class WindingModel(nn.Module):
             tokens = block(tokens)
         features = tokens.permute(0, 4, 1, 2, 3)
 
-        features = F.interpolate(features, scale_factor=(2, 2, 1), mode="nearest")
-        features = self.decoder(torch.cat([features, skips[-2]], dim=1))
-
-        phase_increments = F.softplus(
-            self.phase_head(features).squeeze(1).float()
+        # Trilinear rather than nearest upsampling: nearest duplicates one
+        # trunk vector across a token's whole transverse footprint, so any
+        # disagreement between adjacent tokens surfaces as a phase shelf
+        # exactly on the token boundary (the two 3x3 decoder convs cannot
+        # hide the seam). The ray axis keeps scale 1, so only the transverse
+        # axes interpolate.
+        features = F.interpolate(
+            features, scale_factor=(2, 2, 1), mode="trilinear", align_corners=False
         )
+        features = self.decoder(torch.cat([features, skips[-2]], dim=1))
+        for level, decoder in enumerate(self.extra_decoders):
+            features = F.interpolate(
+                features, scale_factor=(2, 2, 1), mode="trilinear",
+                align_corners=False,
+            )
+            features = decoder(
+                torch.cat([features, skips[-3 - level]], dim=1)
+            )
+
+        if self.full_resolution_head is None:
+            phase_logits = self._head_output(self.phase_head, features)
+        else:
+            fine_features = F.interpolate(
+                features,
+                size=skips[0].shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            phase_logits = self._pixel_shuffle_output(
+                self.full_resolution_head(
+                    torch.cat([fine_features, skips[0]], dim=1)
+                ),
+                2,
+            )
+
+        phase_increments = F.softplus(phase_logits.float())
         phase = phase_increments.cumsum(dim=-1)
-        return {
+        output = {
             "phase": phase,
             "phase_increments": phase_increments,
-            "density_log_variance": self.log_variance_head(features).squeeze(1),
-            "crossing_logits": self.crossing_head(features).squeeze(1),
         }
+        if self.log_variance_head is not None:
+            output["density_log_variance"] = self._head_output(
+                self.log_variance_head, features
+            )
+        if self.crossing_head is not None:
+            output["crossing_logits"] = self._head_output(
+                self.crossing_head, features
+            )
+        return output

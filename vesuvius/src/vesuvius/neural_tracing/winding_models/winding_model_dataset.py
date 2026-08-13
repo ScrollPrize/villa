@@ -24,8 +24,7 @@ from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
     VolumeSlabExtractor,
 )
 from vesuvius.neural_tracing.winding_models.winding_targets import (
-    render_column_targets,
-    render_crossing_only_targets,
+    render_column_targets_batched,
 )
 
 _WINDING_NAME = re.compile(r"(?:^|-)w(?P<index>\d+)(?:_|$)")
@@ -201,6 +200,16 @@ class WindingModelDataset(torch.utils.data.Dataset):
         self.spacing = float(cfg.get("spacing", 1.0))
         self.column_stride = int(cfg.get("column_stride", 4))
         self.min_supervised_columns = int(cfg.get("min_supervised_columns", 1))
+        # Fraction of samples that carry a second overlapping slab for the
+        # multiview consistency loss; the pair's ray direction stays within
+        # this cone of the primary's so both phases ascend the same winding
+        # direction.
+        self.multiview_fraction = float(cfg.get("multiview_fraction", 0.0))
+        if not 0.0 <= self.multiview_fraction <= 1.0:
+            raise ValueError("multiview_fraction must be in [0, 1]")
+        self.multiview_cone_degrees = float(cfg.get("multiview_cone_degrees", 20.0))
+        if not 0.0 < self.multiview_cone_degrees < 90.0:
+            raise ValueError("multiview_cone_degrees must be in (0, 90)")
         if self.ray_length < 2:
             raise ValueError("ray_length must be at least 2")
         self._validate_transverse_size(self.transverse_size)
@@ -397,6 +406,20 @@ class WindingModelDataset(torch.utils.data.Dataset):
     @property
     def columns_per_axis(self) -> int:
         return self.transverse_size // self.column_stride
+
+    @property
+    def max_crossings(self) -> int:
+        """Fixed width of the per-column crossing lists.
+
+        Kept crossings are separated by more than the crossing merge
+        distance along a ray of ray_length samples, which bounds their
+        count; padding every sample to that bound (rather than the
+        batch's widest column) makes batches shape-static, so a
+        dispatching dataloader can concatenate independently collated
+        batches.
+        """
+        merge_samples = self.crossing_merge_distance / self.spacing
+        return int(self.ray_length / max(merge_samples, 1e-6)) + 2
 
     def set_slab_dimensions(self, *, ray_length: int, transverse_size: int) -> None:
         """Set the output dimensions used for subsequent samples."""
@@ -655,11 +678,16 @@ class WindingModelDataset(torch.utils.data.Dataset):
     def _read_patch_pack(pack_dir: Path) -> PatchPack:
         with np.load(pack_dir / "index.npz") as data:
             index = {name: data[name] for name in data.files}
+        # The quad mask and block bounds sit on the candidate-quad hot path
+        # (hundreds of patches per drawn sample), where memmap slicing
+        # overhead exceeds the cost of holding them resident; fork()ed
+        # dataloader workers share the parent's copy. Only the vertex grid
+        # (~2.5 GB) stays memory-mapped.
         return PatchPack(
             xyz=np.load(pack_dir / "xyz.npy", mmap_mode="r"),
-            quads=np.load(pack_dir / "quads.npy", mmap_mode="r"),
-            block_min=np.load(pack_dir / "block_min.npy", mmap_mode="r"),
-            block_max=np.load(pack_dir / "block_max.npy", mmap_mode="r"),
+            quads=np.load(pack_dir / "quads.npy"),
+            block_min=np.load(pack_dir / "block_min.npy"),
+            block_max=np.load(pack_dir / "block_max.npy"),
             names=json.loads((pack_dir / "names.json").read_text()),
             **index,
         )
@@ -774,6 +802,80 @@ class WindingModelDataset(torch.utils.data.Dataset):
 
         offset = self.ray_origin_offset * (0.5 + 0.5 * float(torch.rand(())))
         return point, point - offset * direction, direction
+
+    def _pair_direction(self, direction: np.ndarray) -> np.ndarray:
+        """Second-view ray direction within the multiview cone.
+
+        Never flipped: keeping the pair inside a cone well under 90 degrees
+        of the primary guarantees both views ascend the same winding
+        direction, so the consistency loss needs no sign registration.
+        """
+        axis = np.array([1.0, 0.0, 0.0])
+        if abs(direction[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0])
+        tangent_a = np.cross(direction, axis)
+        tangent_a /= np.linalg.norm(tangent_a)
+        tangent_b = np.cross(direction, tangent_a)
+        azimuth = 2.0 * math.pi * float(torch.rand(()))
+        tangent = math.cos(azimuth) * tangent_a + math.sin(azimuth) * tangent_b
+        angle = math.radians(self.multiview_cone_degrees * float(torch.rand(())))
+        return math.cos(angle) * direction + math.sin(angle) * tangent
+
+    def _multiview_pair(
+        self, volume_idx: int, origin: np.ndarray, frame: SlabFrame
+    ) -> dict[str, torch.Tensor]:
+        """Second overlapping slab for the multiview consistency loss.
+
+        Anchored at the primary ray's midpoint, cast within the multiview
+        cone with a randomized position along the new ray. Needs no
+        targets: the loss is label-free. Samples that draw no pair (or
+        whose extraction hits a truncated chunk) return zero-filled fields
+        with ``has_pair`` False so batch keys stay collate-uniform.
+        """
+        size = self.transverse_size
+        empty = {
+            "pair_image": torch.zeros(
+                (size, size, self.ray_length), dtype=torch.float32
+            ),
+            "pair_valid": torch.zeros(
+                (size, size, self.ray_length), dtype=torch.bool
+            ),
+            "pair_origin_zyx": torch.zeros(3, dtype=torch.float32),
+            "pair_axis_a_zyx": torch.zeros(3, dtype=torch.float32),
+            "pair_axis_b_zyx": torch.zeros(3, dtype=torch.float32),
+            "pair_direction_zyx": torch.zeros(3, dtype=torch.float32),
+            "has_pair": torch.tensor(False),
+        }
+        if float(torch.rand(())) >= self.multiview_fraction:
+            return empty
+        anchor = origin + 0.5 * self.ray_extent * frame.direction
+        direction = self._pair_direction(frame.direction)
+        offset = self.ray_extent * (0.35 + 0.3 * float(torch.rand(())))
+        try:
+            image, valid, pair_frame = self.slab_extractor.extract(
+                volume_idx, direction, anchor - offset * direction
+            )
+        except RuntimeError as exc:
+            if _MALFORMED_CHUNK_ERROR not in str(exc):
+                raise
+            return empty
+        return {
+            "pair_image": torch.from_numpy(np.ascontiguousarray(image)),
+            "pair_valid": torch.from_numpy(np.ascontiguousarray(valid)).bool(),
+            "pair_origin_zyx": torch.from_numpy(
+                pair_frame.origin[::-1].copy()
+            ).float(),
+            "pair_axis_a_zyx": torch.from_numpy(
+                pair_frame.axis_a[::-1].copy()
+            ).float(),
+            "pair_axis_b_zyx": torch.from_numpy(
+                pair_frame.axis_b[::-1].copy()
+            ).float(),
+            "pair_direction_zyx": torch.from_numpy(
+                pair_frame.direction[::-1].copy()
+            ).float(),
+            "has_pair": torch.tensor(True),
+        }
 
     def _hits(
         self,
@@ -1068,9 +1170,38 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 u_grid,
                 v_grid,
             )
-            point_chunks.append(samples.reshape(-1, 3))
-            wind_chunks.append(sample_winds.reshape(-1))
+            # Only samples within the column window of the supervised column
+            # lattice can ever contribute (the exact filter _cluster_column_hits
+            # applies); dropping the rest here keeps ~1/16 of the points, which
+            # shrinks the concatenation and the clustering sort by the same
+            # factor.
+            flat = samples.reshape(-1, 3)
+            flat_winds = sample_winds.reshape(-1)
+            sample_keep = self._column_window_mask(flat)
+            point_chunks.append(flat[sample_keep])
+            wind_chunks.append(flat_winds[sample_keep])
         return np.concatenate(point_chunks), np.concatenate(wind_chunks)
+
+    def _column_window_mask(self, points: np.ndarray) -> np.ndarray:
+        """Samples close enough to a supervised column to be clustered.
+
+        Must match _cluster_column_hits' keep condition exactly: the filter
+        runs once here on the full point set and again there on the survivors
+        (where it keeps everything), so any drift would change the targets.
+        """
+        stride = self.column_stride
+        columns = self.columns_per_axis
+        transverse = points[:, :2]
+        nearest = np.rint(transverse / stride)
+        offset = np.abs(transverse - nearest * stride)
+        ray_position = points[:, 2]
+        return (
+            (offset <= _COLUMN_WINDOW).all(-1)
+            & (nearest >= 0).all(-1)
+            & (nearest <= columns - 1).all(-1)
+            & (ray_position >= -0.5)
+            & (ray_position <= self.ray_length - 0.5)
+        )
 
     def _cluster_column_hits(
         self, points: np.ndarray, winds: np.ndarray
@@ -1172,51 +1303,57 @@ class WindingModelDataset(torch.utils.data.Dataset):
         }
         kept_ts: list[np.ndarray] = [np.zeros(0)] * (columns * columns)
         kept_indices: list[np.ndarray] = [np.zeros(0, np.int64)] * (columns * columns)
-        supervised = 0
+        supervised_columns: list[int] = []
         merge_samples = self.crossing_merge_distance / self.spacing
+
+        # Observability and index rounding are vectorized over all clusters
+        # up front; the sequential dedup walk below then runs on plain
+        # Python lists (per-column numpy calls dominated its cost).
+        nearest = np.clip(np.rint(ray_positions).astype(np.int64), 0, length - 1)
+        observable = (
+            slab_image[
+                (column_ids // columns) * stride,
+                (column_ids % columns) * stride,
+                nearest,
+            ]
+            > 0
+        ) & slab_valid[
+            (column_ids // columns) * stride,
+            (column_ids % columns) * stride,
+            nearest,
+        ]
+        rounded_indices = np.rint(sign * winding_indices).astype(np.int64)
+
         for start, end in zip(boundaries, ends + 1):
             if end - start < (1 if crossings_only else 2):
                 continue
             column = int(column_ids[start])
-            positions = ray_positions[start:end]
-            indices = sign * winding_indices[start:end]
-
-            row = (column // columns) * stride
-            col = (column % columns) * stride
-            nearest = np.clip(np.rint(positions).astype(int), 0, length - 1)
-            observable = (slab_image[row, col, nearest] > 0) & slab_valid[
-                row, col, nearest
-            ]
-            positions, indices = positions[observable], indices[observable]
+            keep = observable[start:end]
+            positions = ray_positions[start:end][keep].tolist()
 
             if crossings_only:
                 kept_pos = []
                 for position in positions:
                     if kept_pos and position - kept_pos[-1] <= merge_samples:
                         continue
-                    kept_pos.append(float(position))
+                    kept_pos.append(position)
                 if not kept_pos:
                     continue
                 ts = np.asarray(kept_pos) * self.spacing
                 idx = np.zeros(len(ts), dtype=np.int64)
-                targets = render_crossing_only_targets(
-                    ts,
-                    ray_length=length,
-                    spacing=self.spacing,
-                    crossing_sigma_wv=self.crossing_sigma_wv,
-                )
             else:
+                indices = rounded_indices[start:end][keep].tolist()
                 kept_pos: list[float] = []
                 kept_idx: list[int] = []
-                for position, index in zip(positions, np.rint(indices).astype(int)):
+                for position, index in zip(positions, indices):
                     if kept_idx:
                         delta = index - kept_idx[-1]
                         if delta == 0 or position - kept_pos[-1] <= merge_samples:
                             continue
                         if delta < 0:
                             break
-                    kept_pos.append(float(position))
-                    kept_idx.append(int(index))
+                    kept_pos.append(position)
+                    kept_idx.append(index)
 
                 anchored = [
                     i
@@ -1228,23 +1365,36 @@ class WindingModelDataset(torch.utils.data.Dataset):
                     continue
                 ts = np.asarray([kept_pos[i] for i in anchored]) * self.spacing
                 idx = np.asarray([kept_idx[i] for i in anchored], dtype=np.int64)
-                targets = render_column_targets(
-                    ts,
-                    idx,
-                    ray_length=length,
-                    spacing=self.spacing,
-                    crossing_sigma_wv=self.crossing_sigma_wv,
-                )
-            for key in dense_keys:
-                dense[key][column] = targets[key]
             kept_ts[column] = ts
             kept_indices[column] = idx
-            supervised += 1
+            supervised_columns.append(column)
 
-        if supervised < self.min_supervised_columns:
+        if len(supervised_columns) < self.min_supervised_columns:
             return None
 
-        max_crossings = max(1, max(len(ts) for ts in kept_ts))
+        # One batched render over the supervised columns replaces the
+        # per-column renderer calls, which dominated dataset CPU time.
+        pad = max(len(kept_ts[column]) for column in supervised_columns)
+        batch_t = np.zeros((len(supervised_columns), pad))
+        batch_idx = np.zeros((len(supervised_columns), pad), dtype=np.int64)
+        batch_counts = np.zeros(len(supervised_columns), dtype=np.int64)
+        for slot, column in enumerate(supervised_columns):
+            batch_counts[slot] = len(kept_ts[column])
+            batch_t[slot, : batch_counts[slot]] = kept_ts[column]
+            batch_idx[slot, : batch_counts[slot]] = kept_indices[column]
+        rendered = render_column_targets_batched(
+            batch_t,
+            batch_idx,
+            batch_counts,
+            ray_length=length,
+            spacing=self.spacing,
+            crossing_sigma_wv=self.crossing_sigma_wv,
+            crossings_only=crossings_only,
+        )
+        for key in dense_keys:
+            dense[key][supervised_columns] = rendered[key]
+
+        max_crossings = self.max_crossings
         crossing_t = np.full(
             (columns * columns, max_crossings), np.nan, dtype=np.float32
         )
@@ -1427,7 +1577,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 continue
             if targets is None:
                 continue
-            return {
+            sample = {
                 "volume_idx": torch.tensor(volume_idx),
                 "slab_image": torch.from_numpy(np.ascontiguousarray(slab_image)),
                 "slab_valid": torch.from_numpy(
@@ -1457,6 +1607,9 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 ),
                 **targets,
             }
+            if self.multiview_fraction > 0.0:
+                sample.update(self._multiview_pair(volume_idx, origin, frame))
+            return sample
 
         raise RuntimeError("Could not find a slab with enough labeled columns")
 

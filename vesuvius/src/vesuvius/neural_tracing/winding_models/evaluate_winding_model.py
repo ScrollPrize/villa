@@ -38,7 +38,8 @@ def _empty_sums() -> dict[str, float | int]:
 def _update_metrics(sums, output, batch, *, threshold, min_distance, config):
     spacing = float(config.get("spacing", 1.0))
     tolerance = float(config.get("crossing_match_tolerance_wv", 2.0)) / spacing
-    prob = torch.sigmoid(output["crossing_logits"].float()).numpy()
+    logits = output.get("crossing_logits")
+    prob = torch.sigmoid(logits.float()).numpy() if logits is not None else None
     phase_pred = output["phase"].float().numpy()
     phase_target = batch["phase_target"].float().numpy()
     phase_valid = batch["phase_valid"].numpy().astype(bool)
@@ -46,24 +47,47 @@ def _update_metrics(sums, output, batch, *, threshold, min_distance, config):
     crossing_t = batch["crossing_t"].float().numpy()
     num_crossings = batch["num_crossings"].numpy()
 
-    length = prob.shape[-1]
-    prob_flat = prob.reshape(-1, length)
+    batch_size, length = phase_pred.shape[0], phase_pred.shape[-1]
+    prob_flat = prob.reshape(-1, length) if prob is not None else None
     phase_pred_flat = phase_pred.reshape(-1, length)
     phase_target_flat = phase_target.reshape(-1, length)
     phase_valid_flat = phase_valid.reshape(-1, length)
     crossing_valid_flat = crossing_valid.reshape(-1, length)
     crossing_t_flat = crossing_t.reshape(-1, crossing_t.shape[-1])
     counts_flat = num_crossings.reshape(-1)
+    columns_per_slab = phase_pred_flat.shape[0] // batch_size
 
-    for column in range(len(prob_flat)):
+    # Headless models decode crossings as integer passages of the phase,
+    # registered per slab against the targets (one free offset).
+    passage_offsets = np.zeros(batch_size)
+    if prob_flat is None:
+        for slab in range(batch_size):
+            valid = phase_valid[slab].reshape(-1)
+            if valid.any():
+                passage_offsets[slab] = float(
+                    phase_pred[slab].reshape(-1)[valid].mean()
+                    - phase_target[slab].reshape(-1)[valid].mean()
+                )
+
+    for column in range(len(phase_pred_flat)):
         if counts_flat[column] < 2:
             continue
-        peaks = winding_targets.extract_peaks(
-            prob_flat[column], threshold=threshold, min_distance=min_distance
-        )
-        peaks = peaks[crossing_valid_flat[column][peaks]]
+        if prob_flat is not None:
+            peaks = winding_targets.extract_peaks(
+                prob_flat[column], threshold=threshold, min_distance=min_distance
+            )
+            peak_positions = peaks.astype(np.float64)
+        else:
+            peak_positions, _ = winding_targets.phase_passages(
+                phase_pred_flat[column]
+                - passage_offsets[column // columns_per_slab]
+            )
+            peaks = np.clip(
+                np.rint(peak_positions).astype(np.int64), 0, length - 1
+            )
+        keep = crossing_valid_flat[column][peaks]
         tp, fp, fn = winding_targets.match_crossings(
-            peaks.astype(np.float64),
+            peak_positions[keep],
             crossing_t_flat[column, : counts_flat[column]] / spacing,
             tolerance=tolerance,
         )
@@ -137,6 +161,16 @@ def evaluate(checkpoints, num_batches, thresholds, min_distances, seed, use_ema)
         )
         model.to(device).eval()
         loaded.append((path, config, model))
+
+    if all(model.crossing_head is None for _, _, model in loaded):
+        # Phase-passage decode has no peak parameters; sweeping would repeat
+        # identical numbers.
+        thresholds, min_distances = thresholds[:1], min_distances[:1]
+        click.echo(
+            "all models are headless (phase-passage decode); collapsing the "
+            "peak-parameter sweep",
+            err=True,
+        )
 
     data_config = loaded[0][1]
     dataset = WindingModelDataset(data_config)
