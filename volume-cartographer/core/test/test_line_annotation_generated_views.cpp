@@ -196,6 +196,100 @@ TEST_CASE("fiber file name identity parsing round-trips canonical names")
     CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
 }
 
+TEST_CASE("generated display tangent sign is independent of stored point order")
+{
+    using vc3d::line_annotation::generatedDisplayTangentSign;
+
+    // Circumferential fiber: a circle in a z = const plane with outward sheet
+    // normals. The decision comes from (normal x tangent) . z.
+    std::vector<cv::Vec3f> circlePoints;
+    std::vector<cv::Vec3f> circleNormals;
+    for (int i = 0; i < 16; ++i) {
+        const float angle = static_cast<float>(i) * 0.25f;
+        const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+        circlePoints.push_back(radial * 100.0f + cv::Vec3f{500.0f, 500.0f, 300.0f});
+        circleNormals.push_back(radial);
+    }
+    CHECK(generatedDisplayTangentSign(circlePoints, circleNormals) == 1.0f);
+
+    std::vector<cv::Vec3f> reversedPoints(circlePoints.rbegin(), circlePoints.rend());
+    std::vector<cv::Vec3f> reversedNormals(circleNormals.rbegin(), circleNormals.rend());
+    CHECK(generatedDisplayTangentSign(reversedPoints, reversedNormals) == -1.0f);
+
+    // Axial fiber: (normal x tangent) . z vanishes, so the tangent's own z
+    // component decides and pins the side cut's vertical.
+    std::vector<cv::Vec3f> axialPoints;
+    std::vector<cv::Vec3f> axialNormals;
+    for (int i = 0; i < 16; ++i) {
+        axialPoints.push_back({500.0f, 500.0f, 300.0f + 10.0f * static_cast<float>(i)});
+        axialNormals.push_back({1.0f, 0.0f, 0.0f});
+    }
+    CHECK(generatedDisplayTangentSign(axialPoints, axialNormals) == 1.0f);
+    CHECK(generatedDisplayTangentSign({axialPoints.rbegin(), axialPoints.rend()},
+                                      {axialNormals.rbegin(), axialNormals.rend()}) == -1.0f);
+
+    // Near-axial fibers with slight helical drift: the drift direction must
+    // not decide the sign -- both drift chiralities read as ascending, so the
+    // side cut's vertical matches across neighboring vertical fibers.
+    for (const float drift : {3.0e-2f, -3.0e-2f}) {
+        std::vector<cv::Vec3f> helixPoints;
+        std::vector<cv::Vec3f> helixNormals;
+        for (int i = 0; i < 64; ++i) {
+            const float angle = drift * static_cast<float>(i);
+            const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+            helixPoints.push_back(radial * 200.0f +
+                                  cv::Vec3f{500.0f, 500.0f, 300.0f + 10.0f * static_cast<float>(i)});
+            helixNormals.push_back(radial);
+        }
+        CHECK(generatedDisplayTangentSign(helixPoints, helixNormals) == 1.0f);
+        CHECK(generatedDisplayTangentSign({helixPoints.rbegin(), helixPoints.rend()},
+                                          {helixNormals.rbegin(), helixNormals.rend()}) == -1.0f);
+    }
+
+    // Circumferential-dominant helix (shallow pitch): the circumferential
+    // vote still owns the decision, whichever way the fiber creeps in z.
+    for (const float climb : {1.0f, -1.0f}) {
+        std::vector<cv::Vec3f> shallowPoints;
+        std::vector<cv::Vec3f> shallowNormals;
+        for (int i = 0; i < 64; ++i) {
+            const float angle = 0.1f * static_cast<float>(i);
+            const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+            shallowPoints.push_back(radial * 200.0f +
+                                    cv::Vec3f{500.0f, 500.0f, 300.0f + climb * static_cast<float>(i)});
+            shallowNormals.push_back(radial);
+        }
+        CHECK(generatedDisplayTangentSign(shallowPoints, shallowNormals) == 1.0f);
+        CHECK(generatedDisplayTangentSign({shallowPoints.rbegin(), shallowPoints.rend()},
+                                          {shallowNormals.rbegin(), shallowNormals.rend()}) == -1.0f);
+    }
+
+    // Sparse valid normals must still decide a circumferential fiber: the
+    // primary tie band scales with the pairs that voted, not the tangent
+    // count, or a fiber long enough that 1e-3 * tangentCount exceeds the few
+    // normal votes would fall through to the useless z fallback and stay
+    // order-dependent.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> longCirclePoints;
+    for (int i = 0; i < 2048; ++i) {
+        const float angle = static_cast<float>(i) * 3.0e-3f;
+        const cv::Vec3f radial{std::cos(angle), std::sin(angle), 0.0f};
+        longCirclePoints.push_back(radial * 4000.0f + cv::Vec3f{5000.0f, 5000.0f, 3000.0f});
+    }
+    std::vector<cv::Vec3f> sparseNormals(longCirclePoints.size(), cv::Vec3f{nan, nan, nan});
+    sparseNormals[1024] = cv::Vec3f{std::cos(1024 * 3.0e-3f), std::sin(1024 * 3.0e-3f), 0.0f};
+    CHECK(generatedDisplayTangentSign(longCirclePoints, sparseNormals) == 1.0f);
+    CHECK(generatedDisplayTangentSign({longCirclePoints.rbegin(), longCirclePoints.rend()},
+                                      {sparseNormals.rbegin(), sparseNormals.rend()}) == -1.0f);
+
+    // Degenerate inputs are decided as +1 rather than left arbitrary: no
+    // normals to vote with, and a z = const line has nothing to fall back on.
+    CHECK(generatedDisplayTangentSign({}, {}) == 1.0f);
+    CHECK(generatedDisplayTangentSign({circlePoints.front()}, {circleNormals.front()}) == 1.0f);
+    CHECK(generatedDisplayTangentSign(circlePoints, {}) == 1.0f);
+    CHECK(generatedDisplayTangentSign(circlePoints,
+                                      {circleNormals.begin(), circleNormals.end() - 1}) == 1.0f);
+}
+
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
     CState state(64 * 1024 * 1024);
@@ -699,6 +793,106 @@ TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
         CHECK(recovery.filename().string().find(".recovery.") != std::string::npos);
     }
     CHECK(recoveryFilesIn(dir).size() == 2);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation save retires originals only after renames succeed")
+{
+    const auto dir = makeTempSaveDir("retire_success");
+    const auto original = dir / "fiber_old.json";
+    const auto target = dir / "fiber_new.json";
+    writeText(original, "{\"old\":true}\n");
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        13,
+        {{1, 1, target, nlohmann::json{{"new", true}}}},
+        {original});
+
+    CHECK(result.ok);
+    CHECK(readText(target).find("\"new\": true") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(original));
+    // The backup is removed after success; only the empty dot-directory
+    // may remain, which every fiber scanner ignores.
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation retire-only job is all-or-nothing")
+{
+    const auto dir = makeTempSaveDir("retire_only");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    const auto missing = dir / "fiber_gone.json";
+    writeText(first, "{\"a\":true}\n");
+    writeText(second, "{\"b\":true}\n");
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        14, {}, {first, second, missing});
+
+    CHECK(result.ok);
+    CHECK_FALSE(std::filesystem::exists(first));
+    CHECK_FALSE(std::filesystem::exists(second));
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed save restores retired originals")
+{
+    const auto dir = makeTempSaveDir("retire_failure");
+    const auto original = dir / "fiber_old.json";
+    const auto firstTarget = dir / "fiber_a.json";
+    const auto secondTarget = dir / "fiber_b.json";
+    writeText(original, "{\"old\":true}\n");
+
+    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        15,
+        {{1, 1, firstTarget, nlohmann::json{{"new", "a"}}},
+         {2, 1, secondTarget, nlohmann::json{{"new", "b"}}}},
+        {original});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+
+    CHECK_FALSE(result.ok);
+    // The retired original is renamed straight back into place.
+    CHECK(std::filesystem::exists(original));
+    CHECK(readText(original).find("\"old\": true") != std::string::npos ||
+          readText(original).find("\"old\":true") != std::string::npos);
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    // The renamed-in brand-new target is removed too: no orphan half of an
+    // aborted batch survives.
+    CHECK_FALSE(std::filesystem::exists(firstTarget));
+    CHECK_FALSE(std::filesystem::exists(secondTarget));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed multi fiber save removes orphan new targets")
+{
+    const auto dir = makeTempSaveDir("orphan_targets");
+    const auto first = dir / "fiber_new_a.json";
+    const auto second = dir / "fiber_new_b.json";
+
+    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        16,
+        {{1, 1, first, nlohmann::json{{"new", "a"}}},
+         {2, 1, second, nlohmann::json{{"new", "b"}}}});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+
+    CHECK_FALSE(result.ok);
+    // Neither brand-new target survives the aborted batch; a pre-existing
+    // target would instead keep the new content plus its recovery copy.
+    CHECK_FALSE(std::filesystem::exists(first));
+    CHECK_FALSE(std::filesystem::exists(second));
+    CHECK(recoveryFilesIn(dir).empty());
     std::filesystem::remove_all(dir);
 }
 

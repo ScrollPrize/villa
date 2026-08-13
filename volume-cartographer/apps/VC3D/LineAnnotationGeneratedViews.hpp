@@ -53,7 +53,13 @@ struct GeneratedOverlay {
         bool isSeed = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
+        // Same-orientation links (H-H / V-V) render in the orange warning
+        // palette; H-V links keep the default blue/purple. Set by the
+        // controller, which owns the fiber HV state.
+        bool hasSameHvBranches = false;
+        bool hasSameHvPendingLinks = false;
         bool isLinkCandidate = false;
+        bool isSplitCandidate = false;
         bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
         char interpolationModeMarker = 'L';
@@ -171,6 +177,10 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    // Per-line-point sampled sheet normals, sign-oriented away from the
+    // scroll center (NaN where the sample is invalid). Empty when
+    // unavailable.
+    std::vector<cv::Vec3f> lineNormals;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -442,6 +452,73 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
     const float t = static_cast<float>(linePosition - static_cast<double>(lower));
     return linePoints[static_cast<size_t>(lower)] * (1.0f - t) +
            linePoints[static_cast<size_t>(upper)] * t;
+}
+
+// One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
+// current-cut and side-cut planes. Stored line-point order never changes.
+// The current cut's screen x is (up x normal) with normal = sign * tangent, so
+// pinning sign * mean((normal_i x tangent_i) . z) >= 0 puts increasing slice
+// index on the same screen side for every circumferential fiber, whatever
+// direction it was traced or merged in. For fibers running along the scroll
+// axis the tangent's own z component decides instead, which pins the side
+// cut's vertical (its up is the signed tangent). Per point the two votes
+// measure the tangent's circumferential and axial magnitudes, so the larger
+// mean identifies the fiber's dominant direction (switching conventions at
+// ~45 degree pitch): a near-axial fiber's slight helical drift must not
+// decide its sign.
+inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoints,
+                                         const std::vector<cv::Vec3f>& lineNormals)
+{
+    if (linePoints.size() < 2) {
+        return 1.0f;
+    }
+    const bool haveNormals = lineNormals.size() == linePoints.size();
+    double primary = 0.0;
+    double fallback = 0.0;
+    size_t tangentCount = 0;
+    size_t normalPairCount = 0;
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        cv::Vec3f tangent;
+        if (i == 0) {
+            tangent = linePoints[1] - linePoints[0];
+        } else if (i + 1 == linePoints.size()) {
+            tangent = linePoints[i] - linePoints[i - 1];
+        } else {
+            tangent = linePoints[i + 1] - linePoints[i - 1];
+        }
+        tangent = normalizedGeneratedVectorOrNan(tangent);
+        if (!finiteGeneratedPoint(tangent)) {
+            continue;
+        }
+        ++tangentCount;
+        fallback += static_cast<double>(tangent[2]);
+        if (!haveNormals) {
+            continue;
+        }
+        const cv::Vec3f normal = normalizedGeneratedVectorOrNan(lineNormals[i]);
+        if (!finiteGeneratedPoint(normal)) {
+            continue;
+        }
+        ++normalPairCount;
+        primary += static_cast<double>(normal.cross(tangent)[2]);
+    }
+    // Compare per-vote means, not raw sums: primary only accumulates where a
+    // sampled normal is valid, so on a sparse-normal fiber a raw fallback sum
+    // over every tangent would drown out a decisive primary vote. The means
+    // are per-point direction magnitudes in [-1, 1] and comparable directly;
+    // the tie band keeps rounding noise from masquerading as a decision.
+    constexpr double kTie = 1.0e-3;
+    const double meanPrimary =
+        normalPairCount > 0 ? primary / static_cast<double>(normalPairCount) : 0.0;
+    const double meanFallback =
+        tangentCount > 0 ? fallback / static_cast<double>(tangentCount) : 0.0;
+    if (std::abs(meanPrimary) > std::max(kTie, std::abs(meanFallback))) {
+        return meanPrimary > 0.0 ? 1.0f : -1.0f;
+    }
+    if (std::abs(meanFallback) > kTie) {
+        return meanFallback > 0.0 ? 1.0f : -1.0f;
+    }
+    return 1.0f;
 }
 
 inline std::optional<std::pair<double, double>> generatedControlLinePositionRange(
@@ -968,6 +1045,11 @@ struct GeneratedControlPointContextMenuOptions {
     bool stripViewer = false;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
+    bool mergeWithCandidateEnabled = false;
+    QString mergeWithCandidateLabel;
+    bool splitFromCandidateEnabled = false;
+    QString splitFromCandidateLabel;
+    QString splitFromCandidateAndLinkLabel;
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
@@ -979,6 +1061,10 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
+    std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
+    std::function<void(size_t, cv::Vec3f)> designateSplitCandidate;
+    std::function<void(size_t, cv::Vec3f)> splitFromCandidate;
+    std::function<void(size_t, cv::Vec3f)> splitFromCandidateAndLink;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
     std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
 };

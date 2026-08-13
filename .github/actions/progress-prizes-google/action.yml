@@ -3,7 +3,7 @@ description: Run one guarded Progress Prize Google Forms operation from a truste
 
 inputs:
   operation:
-    description: validate, bootstrap, prepare, activate, verify, or cleanup
+    description: validate, bootstrap, prepare, sync-responses, activate, reconcile-active, verify, or cleanup
     required: true
   environment:
     description: staging or production
@@ -130,7 +130,7 @@ runs:
         test "$REF" = refs/heads/main
         test "$EVENT_NAME" = workflow_dispatch
         case "$OPERATION" in
-          validate|bootstrap|prepare|activate|verify|cleanup) ;;
+          validate|bootstrap|prepare|sync-responses|activate|reconcile-active|verify|cleanup) ;;
           *) exit 1 ;;
         esac
         case "$EXPECT_FAULT" in true|false) ;; *) exit 1 ;; esac
@@ -147,8 +147,8 @@ runs:
           [[ "$TARGET_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]] || exit 1
         fi
         case "$OPERATION" in
-          validate|bootstrap) test -n "$SOURCE_CYCLE" ;;
-          prepare|activate|verify|cleanup) test -n "$TARGET_CYCLE" ;;
+          validate|bootstrap|sync-responses) test -n "$SOURCE_CYCLE" ;;
+          prepare|activate|reconcile-active|verify|cleanup) test -n "$TARGET_CYCLE" ;;
         esac
         if test "$OPERATION" = bootstrap; then test "$SOURCE_CYCLE" = 2026-07 || exit 1; fi
         if test "$OPERATION" = activate; then
@@ -165,6 +165,16 @@ runs:
           test "$OPERATION" = bootstrap
           test "$SOURCE_CYCLE" = 2026-07
           test "$TARGET_CYCLE" = 2026-08
+        fi
+        if test "$OPERATION" = reconcile-active; then
+          test "$EVENT_NAME" = workflow_dispatch
+          test -z "$SIMULATED_NOW"
+          test -z "$FAULT"
+          test "$EXPECT_FAULT" = false
+          test "$DRY_RUN" = false
+          test "$ALLOW_ACTIVATION_REWIND" = false
+          test -z "$HEAD_SHA"
+          test -z "$BASE_SHA"
         fi
         if test "$AUTOMATION_ENVIRONMENT" = production; then
           test "$OPERATION" != bootstrap
@@ -329,12 +339,14 @@ runs:
         access_token_lifetime: 1200s
         access_token_scopes: |-
           https://www.googleapis.com/auth/forms.body.readonly
+          https://www.googleapis.com/auth/forms.responses.readonly
           https://www.googleapis.com/auth/drive.readonly
+          https://www.googleapis.com/auth/spreadsheets.readonly
         create_credentials_file: false
         export_environment_variables: false
 
     - name: Authenticate mutating operations without a credential file
-      if: inputs.operation != 'validate' && inputs.operation != 'verify' && inputs['dry-run'] != 'true'
+      if: inputs.operation != 'validate' && inputs.operation != 'verify' && inputs.operation != 'sync-responses' && inputs.operation != 'reconcile-active' && inputs['dry-run'] != 'true'
       id: auth-write
       uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
@@ -344,7 +356,43 @@ runs:
         access_token_lifetime: 1200s
         access_token_scopes: |-
           https://www.googleapis.com/auth/forms.body
+          https://www.googleapis.com/auth/forms.responses.readonly
           https://www.googleapis.com/auth/drive
+          https://www.googleapis.com/auth/spreadsheets
+        create_credentials_file: false
+        export_environment_variables: false
+
+    - name: Authenticate append-only response sync without a credential file
+      if: inputs.operation == 'sync-responses'
+      id: auth-sync
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs['workload-identity-provider'] }}
+        service_account: ${{ inputs['service-account-email'] }}
+        token_format: access_token
+        access_token_lifetime: 1200s
+        access_token_scopes: |-
+          https://www.googleapis.com/auth/forms.body.readonly
+          https://www.googleapis.com/auth/forms.responses.readonly
+          https://www.googleapis.com/auth/drive
+          https://www.googleapis.com/auth/spreadsheets
+        create_credentials_file: false
+        export_environment_variables: false
+
+    - name: Authenticate marker-only reconciliation without a credential file
+      if: inputs.operation == 'reconcile-active'
+      id: auth-reconcile
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs['workload-identity-provider'] }}
+        service_account: ${{ inputs['service-account-email'] }}
+        token_format: access_token
+        access_token_lifetime: 1200s
+        access_token_scopes: |-
+          https://www.googleapis.com/auth/forms.body.readonly
+          https://www.googleapis.com/auth/forms.responses.readonly
+          https://www.googleapis.com/auth/drive
+          https://www.googleapis.com/auth/spreadsheets.readonly
         create_credentials_file: false
         export_environment_variables: false
 
@@ -383,7 +431,7 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.environment == 'production' && inputs.operation == 'activate' && inputs['github-token'] || '' }}
-        GOOGLE_ACCESS_TOKEN: ${{ steps['auth-read'].outputs.access_token || steps['auth-write'].outputs.access_token }}
+        GOOGLE_ACCESS_TOKEN: ${{ steps['auth-read'].outputs.access_token || steps['auth-write'].outputs.access_token || steps['auth-sync'].outputs.access_token || steps['auth-reconcile'].outputs.access_token }}
         PROGRESS_PRIZE_ENVIRONMENT: ${{ inputs.environment }}
         PROGRESS_PRIZE_EVENT_NAME: ${{ github.event_name }}
         PROGRESS_PRIZE_DRIVE_ID: ${{ inputs['drive-id'] }}

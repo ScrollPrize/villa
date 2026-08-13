@@ -680,6 +680,16 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
     connect(_view, &CVolumeViewerView::sendMouseLeftView, this, [this]() {
         clearLineAnnotationPlacementMarker();
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+        _lastCursorVolumePos.reset();
+        updateStatusLabel();
+        // Clear mirrored crosshairs in the other viewers too (nullopt
+        // broadcasts are never gated), so they don't freeze at the last point.
+        if (_viewerManager) {
+            _viewerManager->broadcastLinkedCursor(this, std::nullopt);
+        }
     });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
@@ -714,6 +724,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     _statsBar = new ViewerStatsBar(this);
     _statsBar->move(10, 5);
+    _statsBarRight = new ViewerStatsBar(this);
+    _statsBarRight->setMinimumWidth(0);
+    _statsBarRight->hide();
 
     _cameraGizmo = new CameraGizmoWidget(_view);
     _cameraGizmo->hide();
@@ -752,6 +765,20 @@ void CChunkedVolumeViewer::showEvent(QShowEvent* event)
         _renderStaleWhileHidden = false;
         submitRender("shown after hidden");
     }
+}
+
+void CChunkedVolumeViewer::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    repositionStatsBarRight();
+}
+
+void CChunkedVolumeViewer::repositionStatsBarRight()
+{
+    if (!_statsBarRight) {
+        return;
+    }
+    _statsBarRight->move(std::max(0, width() - _statsBarRight->width() - 10), 5);
 }
 
 bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
@@ -1165,28 +1192,35 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         _surfaceCacheGeometryEpoch = _surfaceGeometryEpoch;
         ++_surfaceCacheEpoch;
         QPointer<CChunkedVolumeViewer> guard(this);
-        _surfaceTileCbId = _surfaceCache->addTileReadyListener([guard]() {
-            if (!guard || guard->_surfaceTileRenderQueued.exchange(
-                              true, std::memory_order_acq_rel)) {
-                return;
-            }
-            QMetaObject::invokeMethod(qApp, [guard]() {
-                if (!guard)
+        std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _surfaceCache;
+        auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+        _surfaceTileCbId = _surfaceCache->addTileReadyListener(
+            [guard, cacheWeak, notificationQueued]() {
+                // notifyTileReady() runs on fill workers. Gate here so a large tile
+                // publish burst posts only one event to Qt's UI queue.
+                if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                     return;
-                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard, [guard]() {
-                    if (!guard)
+                QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
+                    const auto source = cacheWeak.lock();
+                    if (!guard || !source || guard->_surfaceCache != source) {
+                        notificationQueued->store(false, std::memory_order_release);
                         return;
-                    guard->_surfaceTileRenderQueued.store(false,
-                                                          std::memory_order_release);
-                    if (guard->_closing)
-                        return;
-                    // One epoch represents the whole burst. The render reads
-                    // every tile resident at the time it starts.
-                    ++guard->_chunkContentEpoch;
-                    guard->submitRender("surface tile batch ready");
-                });
-            }, Qt::QueuedConnection);
-        });
+                    }
+                    QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                       [guard, cacheWeak, notificationQueued]() {
+                        notificationQueued->store(false, std::memory_order_release);
+                        const auto source = cacheWeak.lock();
+                        if (!guard || !source || guard->_surfaceCache != source)
+                            return;
+                        if (guard->_closing)
+                            return;
+                        // One epoch represents the whole burst. The render reads
+                        // every tile resident at the time it starts.
+                        ++guard->_chunkContentEpoch;
+                        guard->submitRender("surface tile batch ready");
+                    });
+                }, Qt::QueuedConnection);
+            });
     }
 
     // Overlay channel: its own instance with its own budget over the overlay
@@ -1230,26 +1264,32 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
     ++_surfaceCacheEpoch;
 
     QPointer<CChunkedVolumeViewer> guard(this);
-    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener([guard]() {
-        if (!guard || guard->_surfaceTileRenderQueued.exchange(
-                          true, std::memory_order_acq_rel)) {
-            return;
-        }
-        QMetaObject::invokeMethod(qApp, [guard]() {
-            if (!guard)
+    std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _overlaySurfaceCache;
+    auto notificationQueued = std::make_shared<std::atomic_bool>(false);
+    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener(
+        [guard, cacheWeak, notificationQueued]() {
+            // Keep overlay tile bursts bounded to one queued UI notification too.
+            if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                 return;
-            QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard, [guard]() {
-                if (!guard)
+            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
+                const auto source = cacheWeak.lock();
+                if (!guard || !source || guard->_overlaySurfaceCache != source) {
+                    notificationQueued->store(false, std::memory_order_release);
                     return;
-                guard->_surfaceTileRenderQueued.store(false,
-                                                      std::memory_order_release);
-                if (guard->_closing)
-                    return;
-                ++guard->_chunkContentEpoch;
-                guard->submitRender("surface tile batch ready");
-            });
-        }, Qt::QueuedConnection);
-    });
+                }
+                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
+                                   [guard, cacheWeak, notificationQueued]() {
+                    notificationQueued->store(false, std::memory_order_release);
+                    const auto source = cacheWeak.lock();
+                    if (!guard || !source || guard->_overlaySurfaceCache != source)
+                        return;
+                    if (guard->_closing)
+                        return;
+                    ++guard->_chunkContentEpoch;
+                    guard->submitRender("surface tile batch ready");
+                });
+            }, Qt::QueuedConnection);
+        });
 }
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
@@ -1307,16 +1347,20 @@ void CChunkedVolumeViewer::invalidateVis()
         return;
     }
     _genCacheDirty = true;
+    // A full visual invalidation means cached samples from both channels are
+    // stale as well. Invalidate the shared geometry through the base last.
+    if (_overlaySurfaceCache)
+        _overlaySurfaceCache->invalidateAll();
+    if (_surfaceCache)
+        _surfaceCache->invalidateAll();
+    if (_surfName == "segmentation")
+        _surfaceEditInvalidationPending = true;
 }
 
 void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
 {
     if (changedCells.empty() || name != _surfName || _surfName != "segmentation") {
         invalidateVis();
-        if (_surfaceCache)
-            _surfaceCache->invalidateAll();
-        if (_overlaySurfaceCache)
-            _overlaySurfaceCache->invalidateAll();
         return;
     }
 
@@ -1329,6 +1373,7 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
         _surfaceCache->invalidateSurfaceRegion(changedCells);
 
     _genCacheDirty = true;
+    _surfaceEditInvalidationPending = true;
 }
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
@@ -1341,6 +1386,10 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     const bool isCurrentSurface = (_surfName == name);
     const auto previousSurface = _surfWeak.lock();
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
+    const bool hadExplicitEditInvalidation =
+        isSameCurrentSurface && isEditUpdate && _surfaceEditInvalidationPending;
+    if (isCurrentSurface)
+        _surfaceEditInvalidationPending = false;
     const bool isIntersectionTarget =
         _intersectTgts.count(name) != 0 ||
         (_intersectTgts.count("visible_segmentation") != 0 &&
@@ -1405,6 +1454,15 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
+        // Tools with a known edit region invalidate it before sending this
+        // signal. Other same-object edits (brush/reset/etc.) need a conservative
+        // full tile invalidation so stale geometry is never sampled.
+        if (!hadExplicitEditInvalidation) {
+            if (_overlaySurfaceCache)
+                _overlaySurfaceCache->invalidateAll();
+            if (_surfaceCache)
+                _surfaceCache->invalidateAll();
+        }
         _zOffWorldDir = {0, 0, 0};
         updateContentBounds();
         updateFocusMarker();
@@ -1421,6 +1479,9 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _zOffWorldDir = {0, 0, 0};
     invalidateIntersect(name);
     if (!surf) {
+        // Deselecting the active surface must release its memory immediately;
+        // returning to it later starts with a cold cache.
+        dropSurfaceCaches();
         clearIntersectionItems();
         _measurement = {};
         _scene->clear();
@@ -1566,8 +1627,10 @@ void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std:
         return;
     }
     auto current = _surfWeak.lock();
-    if (current && current == surf)
+    if (current && current == surf) {
         _surfWeak.reset();
+        dropSurfaceCaches();
+    }
 }
 
 void CChunkedVolumeViewer::onVolumeClosing()
@@ -4301,10 +4364,17 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     return {};
 }
 
-void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
+void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos, bool projected)
 {
     if (!_scene || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y()))
         return;
+
+    const auto crosshairPen = [](bool greyedOut) {
+        QPen pen(greyedOut ? QColor(160, 160, 160, 190) : QColor(50, 255, 215),
+                 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(true);
+        return pen;
+    };
 
     if (!_cursorCrosshair || !_cursorCrosshair->scene()) {
         QPainterPath path;
@@ -4322,14 +4392,16 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
         path.lineTo(0.0, arm);
 
         auto* marker = new QGraphicsPathItem(path);
-        QPen pen(QColor(50, 255, 215), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
-        pen.setCosmetic(true);
-        marker->setPen(pen);
+        marker->setPen(crosshairPen(projected));
         marker->setBrush(Qt::NoBrush);
         marker->setZValue(120.0);
         marker->setAcceptedMouseButtons(Qt::NoButton);
         _scene->addItem(marker);
         _cursorCrosshair = marker;
+        _cursorCrosshairProjected = projected;
+    } else if (projected != _cursorCrosshairProjected) {
+        static_cast<QGraphicsPathItem*>(_cursorCrosshair)->setPen(crosshairPen(projected));
+        _cursorCrosshairProjected = projected;
     }
 
     _cursorCrosshair->setPos(scenePos);
@@ -4660,12 +4732,28 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         }
     };
 
-    if (!_segmentationCursorMirroring || !point) {
+    const bool accepted =
+        (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
+    // Track the point for the status-bar position readout even when it doesn't
+    // project onto this viewer's surface and the crosshair stays hidden. Only
+    // refresh the (monolithic) status bar when the value changed and this
+    // viewer actually displays the position — this runs per mouse move on
+    // every mirrored viewer.
+    const std::optional<cv::Vec3f> linkedPoint = accepted ? point : std::nullopt;
+    if (linkedPoint != _linkedCursorVolumePos) {
+        _linkedCursorVolumePos = linkedPoint;
+        if (!property("vc_hide_status_position").toBool()) {
+            updateStatusLabel();
+        }
+    }
+
+    if (!accepted) {
         hideCrosshair();
         return;
     }
 
     QPointF scenePos;
+    bool offPlane = false;
     if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
         // The flattened viewer's cursor point includes its normal offset, which
         // pushes it off-plane by up to that amount; widen the depth band so the
@@ -4679,11 +4767,14 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
         if (!std::isfinite(projected[0]) ||
             !std::isfinite(projected[1]) ||
-            !std::isfinite(projected[2]) ||
-            std::abs(projected[2] - _zOff) > tolerance) {
+            !std::isfinite(projected[2])) {
             hideCrosshair();
             return;
         }
+        // Beyond the depth band the point is not on this plane (typically after
+        // a normal-offset scroll); show its in-plane projection greyed out
+        // instead of hiding — the projection is already computed.
+        offPlane = std::abs(projected[2] - _zOff) > tolerance;
         scenePos = surfaceToScene(projected[0], projected[1]);
     } else {
         scenePos = volumeToScene(*point);
@@ -4694,7 +4785,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         return;
     }
 
-    updateCursorCrosshair(scenePos);
+    updateCursorCrosshair(scenePos, offPlane);
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)
@@ -6260,14 +6351,16 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     QStringList items;
     QStringList sharedCacheItems;
-    items << QString("L%1").arg(_dsScaleIdx);
+    // The stats group (mip level, label, scale, framebuffer, composite) can be
+    // routed to the right-anchored bar or dropped per viewer.
+    QStringList statsItems;
+    statsItems << QString("L%1").arg(_dsScaleIdx);
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
-        items << viewerLabel;
-    items << QString("scale %1").arg(_scale, 0, 'f', 2);
-    items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
+        statsItems << viewerLabel;
+    statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);
 
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
     } else if (volumetricCameraActive()) {
         QString volumetric = QString("composite volumetric az %1 tilt %2")
                                  .arg(_compositeSettings.params.camAzimuthDeg, 0, 'f', 0)
@@ -6279,9 +6372,15 @@ void CChunkedVolumeViewer::updateStatusLabel()
         const bool planeView = surf && dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
         if (!planeView && _compositeSettings.params.wScale != 1.0f)
             volumetric += QString(" w×%1").arg(_compositeSettings.params.wScale, 0, 'f', 1);
-        items << volumetric;
+        statsItems << volumetric;
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        items << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+    }
+
+    const bool showStats = !property("vc_hide_status_stats").toBool();
+    const bool statsTopRight = property("vc_status_stats_top_right").toBool();
+    if (showStats && !statsTopRight) {
+        items << statsItems;
     }
 
     if (_chunkArray) {
@@ -6340,19 +6439,31 @@ void CChunkedVolumeViewer::updateStatusLabel()
         sharedCacheItems << QStringLiteral("surface: out of band");
 
     auto surf = _surfWeak.lock();
-    if (_lastCursorVolumePos)
-        items << formatWholeVolumePosition(*_lastCursorVolumePos);
+    const auto& cursorPos =
+        _lastCursorVolumePos ? _lastCursorVolumePos : _linkedCursorVolumePos;
+    if (cursorPos && !property("vc_hide_status_position").toBool())
+        items << formatWholeVolumePosition(*cursorPos);
     if (dynamic_cast<QuadSurface*>(surf.get())) {
-        items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
-        if (_state) {
+        if (_zOff != 0.0f)
+            items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
+        if (_state && !property("vc_hide_status_poi").toBool()) {
             if (auto* poi = _state->poi("focus"))
                 items << QString("POI %1").arg(formatVec3(poi->p));
         }
     } else if (property("vc_show_custom_normal_offset").toBool()) {
-        items << QString("normal offset %1")
-                     .arg(property("vc_custom_normal_offset_vx").toDouble(), 0, 'f', 1);
+        const double offsetVx = property("vc_custom_normal_offset_vx").toDouble();
+        if (offsetVx != 0.0)
+            items << QString("normal offset %1").arg(offsetVx, 0, 'f', 1);
     }
 
     _statsBar->setItems(items);
+    _statsBar->setVisible(!items.isEmpty());
+    if (_statsBarRight) {
+        const QStringList rightItems =
+            (showStats && statsTopRight) ? statsItems : QStringList{};
+        _statsBarRight->setItems(rightItems);
+        _statsBarRight->setVisible(!rightItems.isEmpty());
+        repositionStatsBarRight();
+    }
     emit sharedCacheStatsChanged(sharedCacheItems);
 }

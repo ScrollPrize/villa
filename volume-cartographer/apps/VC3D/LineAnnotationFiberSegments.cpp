@@ -250,19 +250,6 @@ bool anyAcceptedTraceSpan(const std::vector<ControlPointT>& controls) noexcept
                        });
 }
 
-void eraseTag(std::vector<std::string>& tags, const std::string& tag)
-{
-    tags.erase(std::remove(tags.begin(), tags.end(), tag), tags.end());
-}
-
-void addTagSorted(std::vector<std::string>& tags, const std::string& tag)
-{
-    const auto position = std::lower_bound(tags.begin(), tags.end(), tag);
-    if (position == tags.end() || *position != tag) {
-        tags.insert(position, tag);
-    }
-}
-
 }  // namespace
 
 bool hasAcceptedTraceSpan(const std::vector<LineControlPoint>& controls) noexcept
@@ -285,15 +272,6 @@ FiberTraceState deriveTraceState(
     return mode == FiberOptimizationMode::NativeFiberTrace3d
         ? FiberTraceState::Predictions
         : FiberTraceState::Mixed;
-}
-
-void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans)
-{
-    if (hasTraceSpans) {
-        addTagSorted(tags, kTraceNeedsReviewTag);
-    } else {
-        eraseTag(tags, kTraceNeedsReviewTag);
-    }
 }
 
 FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
@@ -1223,6 +1201,143 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
     // resolves dirty spans from interpGoal, so dropping the descriptor here
     // would silently turn an explicit goal back into global.
     (void)found;
+}
+
+namespace
+{
+
+// The loader's exact-membership scan (kControlPointMatchEpsilon in
+// core/src/Atlas.cpp): controls must be an ordered subset of the dense
+// line, so geometry sliced at these indices reloads cleanly.
+std::optional<std::vector<size_t>> orderedControlLineIndices(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints)
+{
+    constexpr double kMatchEpsilon = 1.0e-8;
+    constexpr double kMaxDistanceSq = kMatchEpsilon * kMatchEpsilon;
+    std::vector<size_t> lineIndices;
+    lineIndices.reserve(controlPoints.size());
+    size_t nextLineIndex = 0;
+    for (const auto& control : controlPoints) {
+        std::optional<size_t> matched;
+        for (size_t j = nextLineIndex; j < linePoints.size(); ++j) {
+            const cv::Vec3d delta = control - linePoints[j];
+            if (delta.dot(delta) <= kMaxDistanceSq) {
+                matched = j;
+                break;
+            }
+        }
+        if (!matched) {
+            return std::nullopt;
+        }
+        lineIndices.push_back(*matched);
+        nextLineIndex = *matched + 1;
+    }
+    return lineIndices;
+}
+
+}  // namespace
+
+std::optional<FiberSplitPlan> computeFiberSplitPlan(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints,
+    size_t splitAfterControlIndex)
+{
+    // Both halves must keep at least 2 control points.
+    if (splitAfterControlIndex < 1 ||
+        splitAfterControlIndex + 3 > controlPoints.size()) {
+        return std::nullopt;
+    }
+    const auto scannedIndices = orderedControlLineIndices(controlPoints, linePoints);
+    if (!scannedIndices) {
+        return std::nullopt;
+    }
+    const std::vector<size_t>& lineIndices = *scannedIndices;
+
+    FiberSplitPlan plan;
+    plan.splitAfterControlIndex = splitAfterControlIndex;
+    plan.prefixControlCount = splitAfterControlIndex + 1;
+    plan.prefixLineCount = lineIndices[splitAfterControlIndex] + 1;
+    plan.suffixControlBegin = splitAfterControlIndex + 1;
+    plan.suffixLineBegin = lineIndices[splitAfterControlIndex + 1];
+    return plan;
+}
+
+std::optional<std::pair<bool, int>> remappedSplitControlPointIndex(
+    const FiberSplitPlan& plan, int controlPointIndex)
+{
+    if (controlPointIndex < 0) {
+        return std::nullopt;
+    }
+    const auto index = static_cast<size_t>(controlPointIndex);
+    if (index < plan.suffixControlBegin) {
+        return std::make_pair(false, controlPointIndex);
+    }
+    return std::make_pair(true,
+                          static_cast<int>(index - plan.suffixControlBegin));
+}
+
+std::vector<StoredControlPoint> reversedStoredControlPoints(
+    const std::vector<StoredControlPoint>& controls)
+{
+    const size_t count = controls.size();
+    std::vector<StoredControlPoint> reversed;
+    reversed.reserve(count);
+    for (size_t j = 0; j < count; ++j) {
+        StoredControlPoint control{
+            static_cast<const cv::Vec3d&>(controls[count - 1 - j])};
+        // Span j of the reversed fiber is span (n-2-j) of the original run
+        // in the opposite direction; its descriptor travels with it. The
+        // new final CP carries none.
+        if (j + 1 < count) {
+            control.segmentToNext = controls[count - 2 - j].segmentToNext;
+        }
+        reversed.push_back(std::move(control));
+    }
+    return reversed;
+}
+
+std::optional<FiberMergeGeometry> computeFiberMergeGeometry(
+    const std::vector<StoredControlPoint>& aControls,
+    const std::vector<cv::Vec3d>& aLine,
+    const std::vector<StoredControlPoint>& bControls,
+    const std::vector<cv::Vec3d>& bLine)
+{
+    if (aControls.size() < 2 || bControls.size() < 2) {
+        return std::nullopt;
+    }
+    const auto aIndices =
+        orderedControlLineIndices(storedControlPointPositions(aControls), aLine);
+    const auto bIndices =
+        orderedControlLineIndices(storedControlPointPositions(bControls), bLine);
+    if (!aIndices || !bIndices) {
+        return std::nullopt;
+    }
+
+    FiberMergeGeometry merged;
+    merged.controlPoints.reserve(aControls.size() + bControls.size());
+    merged.controlPoints.assign(aControls.begin(), aControls.end());
+    merged.joinControlIndex = aControls.size() - 1;
+    // The join span is fresh geometry with no producer yet; the default
+    // global/lasagna descriptor matches the serializer's back-fill and
+    // keeps in-memory span consumers valid until the re-fit replaces it.
+    FiberTraceSegmentMetadata joinMetadata;
+    joinMetadata.interpGoal = SegmentInterpolationGoal::Global;
+    joinMetadata.interpMode = SegmentInterpolationMode::Lasagna;
+    joinMetadata.message = "lasagna";
+    merged.controlPoints[merged.joinControlIndex].segmentToNext =
+        std::move(joinMetadata);
+    merged.controlPoints.insert(merged.controlPoints.end(),
+                                bControls.begin(), bControls.end());
+
+    // Drop both extrapolated tails: line points past a's last CP and before
+    // b's first CP would sit between the join CPs and break the strict
+    // line-order mapping in the optimizer.
+    merged.linePoints.assign(aLine.begin(),
+                             aLine.begin() + aIndices->back() + 1);
+    merged.linePoints.insert(merged.linePoints.end(),
+                             bLine.begin() + bIndices->front(), bLine.end());
+    return merged;
 }
 
 void invalidateSegmentSplitByInsertedControl(std::vector<LineControlPoint>& controls, size_t insertedIndex)

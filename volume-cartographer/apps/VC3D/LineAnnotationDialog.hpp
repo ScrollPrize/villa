@@ -32,13 +32,11 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QProgressBar;
-class QPushButton;
 class QCloseEvent;
 class QHBoxLayout;
 class QMenu;
 class QResizeEvent;
 class QTimer;
-class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -83,8 +81,11 @@ public:
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
         QGraphicsPathItem* linkCandidatePoints = nullptr;
+        QGraphicsPathItem* splitCandidatePoints = nullptr;
         QGraphicsPathItem* branchControlPoints = nullptr;
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
@@ -116,7 +117,10 @@ public:
         CChunkedVolumeViewer* viewer,
         const QPointF& scenePoint,
         const QPoint& globalPos,
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {});
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {});
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -189,6 +193,18 @@ signals:
     void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
                                                          size_t controlPointIndex,
                                                          cv::Vec3f volumePoint);
+    void generatedControlPointMergeWithCandidateRequested(const std::string& surfaceName,
+                                                          size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint);
+    void generatedControlPointSplitCandidateRequested(const std::string& surfaceName,
+                                                      size_t controlPointIndex,
+                                                      cv::Vec3f volumePoint);
+    void generatedControlPointSplitFromCandidateRequested(const std::string& surfaceName,
+                                                          size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint);
+    void generatedControlPointSplitAndLinkFromCandidateRequested(const std::string& surfaceName,
+                                                                 size_t controlPointIndex,
+                                                                 cv::Vec3f volumePoint);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,
@@ -227,6 +243,16 @@ private:
     void bindPaneInteractions(const std::string& surfaceName,
                               CChunkedVolumeViewer* viewer,
                               bool seedPlacementEnabled);
+    // One shared cursor cross across the generated panes: the hovered pane
+    // broadcasts its cursor volume point to the others. Dialog-local —
+    // independent of the global "Sync cursor across views" toggle.
+    void connectLinkedCursorMirroring(
+        std::vector<QPointer<CChunkedVolumeViewer>> panes);
+    // Coalesces mirror updates onto a ~render-tick cadence (same pattern as
+    // requestCurrentLinePosition): a burst of mouse moves collapses into one
+    // projection + crosshair update per non-hovered pane per tick.
+    void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
+                                   const std::optional<cv::Vec3f>& point);
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -256,6 +282,11 @@ private:
                                                 const char* renderReason);
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
+    // "B": zero every accumulated normal offset — the side cut plane's and
+    // both strips' surface offsets. The current cut cannot accumulate one
+    // (Shift-scroll steps along the line there) but is reset with the side
+    // cut for symmetry.
+    void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
     cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
@@ -292,11 +323,15 @@ private:
     cv::Vec3f interpolatedLinePoint(double linePosition) const;
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
+    // Interpolated sampled sheet normal (oriented away from the scroll
+    // center, see GeneratedViews::lineNormals). NaN when samples are missing.
+    cv::Vec3f interpolatedOrientedNormal(double linePosition) const;
+    // The same normal projected perpendicular to the tangent. NaN when the
+    // projection is unstable (normal nearly parallel to the tangent, i.e.
+    // extreme bends).
+    cv::Vec3f interpolatedLineNormal(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
-    bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition);
-    // Least-squares fit of the side-view plane orientation for the window centered on the given
-    // (integer) line index. Pure/cacheable: depends only on the static line geometry.
-    bool computeSideFit(int center, cv::Vec3f& normal, cv::Vec3f& upHint) const;
+    bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const;
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
@@ -311,6 +346,9 @@ private:
     // "R": one-shot jump of the other panes to the cursor's line position on the
     // overview bar (works regardless of follow mode; leaves it unchanged).
     void snapPanesToOverviewCursor();
+    // Mirrors the along-line position and zoom from one strip viewer to the
+    // other; vertical offset stays per-strip.
+    void syncLinkedStripCamera(CChunkedVolumeViewer* source);
     // Pause badge on the bottom strip while mouse-follow is toggled off (Space).
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
@@ -326,7 +364,6 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
-    QToolButton* _datasetMenuButton = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
     std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
@@ -339,6 +376,10 @@ private:
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _extrapolationDistanceSpin = nullptr;
+    // Values committed via the menu rows' Apply buttons; the spinboxes hold
+    // uncommitted edits until then (and revert when the menu reopens).
+    int _appliedInitialCenterlineLengthVx = 0;
+    int _appliedExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
@@ -346,7 +387,7 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
-    QPushButton* _resetViewsButton = nullptr;
+    QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
@@ -399,21 +440,10 @@ private:
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
-    // Double-precision copy of _generatedViews.linePoints, built once when views are
-    // generated so the per-cursor-move side plane fit doesn't reconvert the whole polyline.
-    std::vector<cv::Vec3d> _linePointsd;
-    // Cached side-view best-fit plane orientations for the two integer window centers that
-    // straddle the current fractional position. The fit depends only on the (static) line
-    // geometry, so we recompute a center only when the straddling bracket shifts; between the
-    // two cached fits we interpolate by the fractional position so the side view re-orients
-    // continuously instead of snapping at discrete window centers.
-    struct SideFit {
-        int center = std::numeric_limits<int>::min();
-        cv::Vec3f normal{0.0f, 0.0f, 0.0f};
-        cv::Vec3f upHint{0.0f, 0.0f, 0.0f};
-        bool valid = false;
-    };
-    SideFit _sideFitBracket[2];
+    // Sign applied to the displayed line tangent so the current cut's screen
+    // left/right and the side cut's vertical do not depend on the arbitrary
+    // stored point order. Recomputed once per materialization.
+    float _displayTangentSign = 1.0f;
     bool _hasGeneratedViews = false;
     // Coalescing of the mouse-follow line-position updates onto a ~render-tick cadence.
     // requestCurrentLinePosition() stashes the latest position here and (re)arms the timer;
@@ -429,6 +459,14 @@ private:
     double _currentCutNormalOffsetVx = 0.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
+    bool _syncingStripCameras = false;
+    std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
+    QPointer<CChunkedVolumeViewer> _linkedCursorSource;
+    std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
+    // Owned single-shot coalescing timer (like _lineUpdateTimer); stopped on
+    // pane teardown so a pending mirror can't stamp a pre-rebuild point onto
+    // freshly built panes.
+    QTimer* _linkedCursorMirrorTimer = nullptr;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _restoredWindowGeometry = false;

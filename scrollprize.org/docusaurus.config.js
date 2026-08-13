@@ -235,6 +235,7 @@ const config = {
                 },
               ],
             },
+            { to: "/press", label: "Press", position: "left" },
             {
               href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
               label: "Donate",
