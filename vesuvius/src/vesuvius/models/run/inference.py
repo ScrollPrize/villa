@@ -1220,7 +1220,8 @@ def build_parser():
 def main():
     import sys
 
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
