@@ -464,6 +464,10 @@ private:
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
     bool _suppressNextSurfaceEditRender = false;
+    // An editing tool can invalidate all tiles or a precise region before it
+    // emits a same-object surfaceChanged signal. Consume that fact at the
+    // signal so regional invalidation is not widened to the whole surface.
+    bool _surfaceEditInvalidationPending = false;
     std::string _pendingRenderReason;
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
@@ -496,9 +500,9 @@ private:
     bool _genCacheDirty = true;
 
     // --- SurfaceCache (flattened view only) ---
-    // Tiles of resampled surface space. Present only when a workspace set a
-    // non-zero budget and this viewer shows a QuadSurface segmentation; a null
-    // cache means the frame takes the pre-cache render path verbatim.
+    // Tiles of resampled surface space. Present only when the app-wide
+    // per-workspace budget is non-zero and this viewer shows a QuadSurface
+    // segmentation; a null cache means the legacy render path is used.
     std::shared_ptr<vc::render::SurfaceCache> _surfaceCache;
     std::shared_ptr<vc::render::SurfaceCache> _overlaySurfaceCache;
     std::shared_ptr<vc::render::SurfaceGeometryTileCache> _surfaceGeometryTiles;
@@ -513,9 +517,6 @@ private:
     std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
-    // Tile fills finish in bursts. Only one UI callback/render needs to
-    // represent all tiles that became resident during a short debounce window.
-    std::atomic_bool _surfaceTileRenderQueued{false};
     // Last frame fell outside the stored band and used the legacy path, so the
     // status bar can make that performance cliff legible.
     bool _surfaceCacheOutOfBand = false;

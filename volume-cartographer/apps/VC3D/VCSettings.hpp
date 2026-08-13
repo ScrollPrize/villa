@@ -275,31 +275,28 @@ namespace perf {
 }
 
 // -----------------------------------------------------------------------------
-// Spiral Workspace Settings
+// Viewer Cache Settings
 //
-// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
-// the main workspace's shared decoded-chunk budget. All three apply without a
-// restart.
+// Each ViewerManager owns independent decoded-chunk and surface-tile caches, so
+// workspaces cannot evict one another. These settings apply without a restart.
 // -----------------------------------------------------------------------------
-namespace spiral {
-    // Budget for the flattened view's cache of resampled surface space, for the
-    // displayed (base) volume. 0 disables it, so the flattened view samples the
-    // volume every frame as it did before the cache existed.
-    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+namespace viewer_cache {
+    // Per-workspace budget for the flattened segmentation view's cache of
+    // resampled surface space. 0 selects the legacy direct-sampling path.
+    constexpr auto SURFACE_CACHE_GB = "viewer_cache/surface_cache_gb";
     constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
 
-    // Same, for the overlay volume. Its own budget because overlay and base
-    // compete for nothing else. 0 disables it and leaves the overlay channel on
-    // its existing resident-only sampling path.
-    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
-    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+    // Per-workspace budget for the overlay volume's surface-space cache. 0
+    // leaves the overlay channel on its legacy resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
-    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
+    // LRU cap for the private decoded-chunk pool behind a workspace's plane panes.
     // A floor rather than a ceiling: it is raised automatically when it cannot
     // hold one frame (otherwise a single render thrashes), and the status bar
     // reports the effective value. The surface-tile filler gets a pool of the
     // same size as an internal constant.
-    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
+    constexpr auto PLANE_CHUNK_CACHE_MB = "viewer_cache/plane_chunk_cache_mb";
     constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
 }
 
