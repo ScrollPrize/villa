@@ -6,6 +6,7 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -32,6 +33,25 @@ vc::lasagna::LineModel simpleLine(cv::Vec3d n = {0.0, 0.0, 1.0})
           {1.0, {20.0, 0.0, 0.0}, normal(n)}}},
     };
     return line;
+}
+
+// Five straight control points whose sampled normals alternate sign, so the
+// display up sign depends entirely on which point is the display anchor.
+vc::lasagna::LineModel alternatingNormalLine()
+{
+    vc::lasagna::LineModel line;
+    for (int i = 0; i < 5; ++i) {
+        const cv::Vec3d n{0.0, 0.0, (i % 2 == 0) ? 1.0 : -1.0};
+        line.points.push_back({{10.0 * static_cast<double>(i), 0.0, 0.0}, normal(n), true});
+    }
+    return line;
+}
+
+cv::Vec3d toVec3d(const cv::Vec3f& v)
+{
+    return {static_cast<double>(v[0]),
+            static_cast<double>(v[1]),
+            static_cast<double>(v[2])};
 }
 
 void checkVec(const cv::Vec3f& actual, const cv::Vec3d& expected)
@@ -131,6 +151,111 @@ TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
     }
     for (const auto& up : views.lineUpVectors) {
         checkVec(up, {0.0, 0.0, 1.0});
+    }
+}
+
+TEST_CASE("LineViewBuilder flips frames and ups to agree with oriented point normals")
+{
+    vc::lasagna::LineViewConfig config;
+    config.surfaceHalfWidth = 2.0;
+    config.sideSliceHalfDepth = 3.0;
+    config.crossSamples = 3;
+
+    const auto legacy = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+
+    SUBCASE("hints opposite to the legacy sign flip both strips and the ups")
+    {
+        config.orientedPointNormals = {{0.0f, 0.0f, -1.0f},
+                                       {0.0f, 0.0f, -1.0f},
+                                       {0.0f, 0.0f, -1.0f}};
+        const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+        const auto surfacePoints = views.lineSurface->rawPoints();
+        const auto sideSlicePoints = views.lineSideSlice->rawPoints();
+
+        checkVec(sideSlicePoints(0, 1), {10.0, 0.0, 3.0});
+        checkVec(sideSlicePoints(2, 1), {10.0, 0.0, -3.0});
+        checkVec(surfacePoints(0, 1), {10.0, 2.0, 0.0});
+        checkVec(surfacePoints(2, 1), {10.0, -2.0, 0.0});
+
+        REQUIRE(views.lineUpVectors.size() == 3);
+        for (const auto& up : views.lineUpVectors) {
+            checkVec(up, {0.0, 0.0, -1.0});
+        }
+        REQUIRE(views.lineZSlices.size() == 3);
+        for (const auto& slice : views.lineZSlices) {
+            REQUIRE(slice);
+            checkVec(slice->basisY(), {0.0, 0.0, -1.0});
+        }
+    }
+
+    SUBCASE("hints agreeing with the legacy sign change nothing")
+    {
+        config.orientedPointNormals = {{0.0f, 0.0f, 1.0f},
+                                       {0.0f, 0.0f, 1.0f},
+                                       {0.0f, 0.0f, 1.0f}};
+        const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+        checkVec(views.lineSideSlice->rawPoints()(0, 1), legacy.lineSideSlice->rawPoints()(0, 1));
+        checkVec(views.lineSurface->rawPoints()(0, 1), legacy.lineSurface->rawPoints()(0, 1));
+        for (size_t i = 0; i < views.lineUpVectors.size(); ++i) {
+            checkVec(views.lineUpVectors[i], toVec3d(legacy.lineUpVectors[i]));
+        }
+    }
+
+    SUBCASE("sparse invalid hints still decide the vote")
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        config.orientedPointNormals = {{nan, nan, nan},
+                                       {0.0f, 0.0f, -1.0f},
+                                       {nan, nan, nan}};
+        const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+        checkVec(views.lineSideSlice->rawPoints()(0, 1), {10.0, 0.0, 3.0});
+        for (const auto& up : views.lineUpVectors) {
+            checkVec(up, {0.0, 0.0, -1.0});
+        }
+    }
+
+    SUBCASE("all-invalid and wrong-length hints fall back to the legacy signs")
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        config.orientedPointNormals = {{nan, nan, nan}, {0.0f, 0.0f, 0.0f}, {nan, nan, nan}};
+        auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+        checkVec(views.lineSideSlice->rawPoints()(0, 1), legacy.lineSideSlice->rawPoints()(0, 1));
+        checkVec(views.lineUpVectors[0], toVec3d(legacy.lineUpVectors[0]));
+
+        config.orientedPointNormals = {{0.0f, 0.0f, -1.0f}, {0.0f, 0.0f, -1.0f}};
+        views = vc::lasagna::buildLineViewSurfaces(simpleLine(), config);
+        checkVec(views.lineSideSlice->rawPoints()(0, 1), legacy.lineSideSlice->rawPoints()(0, 1));
+        checkVec(views.lineUpVectors[0], toVec3d(legacy.lineUpVectors[0]));
+    }
+}
+
+TEST_CASE("LineViewBuilder oriented point normals pin ups against a moving display anchor")
+{
+    // Alternating sampled normals: without hints the display anchor picks the
+    // global up sign, so anchors 1 and 2 produce opposite ups.
+    auto line = alternatingNormalLine();
+
+    line.displayFrameAnchorIndex = 1;
+    const auto anchorOne = vc::lasagna::buildLineViewSurfaces(line);
+    line.displayFrameAnchorIndex = -1;
+    const auto anchorFallback = vc::lasagna::buildLineViewSurfaces(line);
+
+    REQUIRE(anchorOne.lineUpVectors.size() == 5);
+    REQUIRE(anchorFallback.lineUpVectors.size() == 5);
+    checkVec(anchorOne.lineUpVectors[0], {0.0, 0.0, -1.0});
+    checkVec(anchorFallback.lineUpVectors[0], {0.0, 0.0, 1.0});
+
+    vc::lasagna::LineViewConfig config;
+    config.orientedPointNormals.assign(5, {0.0f, 0.0f, 1.0f});
+    line.displayFrameAnchorIndex = 1;
+    const auto pinnedOne = vc::lasagna::buildLineViewSurfaces(line, config);
+    line.displayFrameAnchorIndex = -1;
+    const auto pinnedFallback = vc::lasagna::buildLineViewSurfaces(line, config);
+
+    REQUIRE(pinnedOne.lineUpVectors.size() == pinnedFallback.lineUpVectors.size());
+    for (size_t i = 0; i < pinnedOne.lineUpVectors.size(); ++i) {
+        checkVec(pinnedOne.lineUpVectors[i], toVec3d(pinnedFallback.lineUpVectors[i]));
+        checkVec(pinnedOne.lineUpVectors[i], {0.0, 0.0, 1.0});
     }
 }
 

@@ -454,6 +454,73 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
            linePoints[static_cast<size_t>(upper)] * t;
 }
 
+// One sign (+1/-1) per fiber for the DISPLAYED tangent used to pose the
+// current-cut and side-cut planes. Stored line-point order never changes.
+// The current cut's screen x is (up x normal) with normal = sign * tangent, so
+// pinning sign * mean((normal_i x tangent_i) . z) >= 0 puts increasing slice
+// index on the same screen side for every circumferential fiber, whatever
+// direction it was traced or merged in. For fibers running along the scroll
+// axis the tangent's own z component decides instead, which pins the side
+// cut's vertical (its up is the signed tangent). Per point the two votes
+// measure the tangent's circumferential and axial magnitudes, so the larger
+// mean identifies the fiber's dominant direction (switching conventions at
+// ~45 degree pitch): a near-axial fiber's slight helical drift must not
+// decide its sign.
+inline float generatedDisplayTangentSign(const std::vector<cv::Vec3f>& linePoints,
+                                         const std::vector<cv::Vec3f>& lineNormals)
+{
+    if (linePoints.size() < 2) {
+        return 1.0f;
+    }
+    const bool haveNormals = lineNormals.size() == linePoints.size();
+    double primary = 0.0;
+    double fallback = 0.0;
+    size_t tangentCount = 0;
+    size_t normalPairCount = 0;
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        cv::Vec3f tangent;
+        if (i == 0) {
+            tangent = linePoints[1] - linePoints[0];
+        } else if (i + 1 == linePoints.size()) {
+            tangent = linePoints[i] - linePoints[i - 1];
+        } else {
+            tangent = linePoints[i + 1] - linePoints[i - 1];
+        }
+        tangent = normalizedGeneratedVectorOrNan(tangent);
+        if (!finiteGeneratedPoint(tangent)) {
+            continue;
+        }
+        ++tangentCount;
+        fallback += static_cast<double>(tangent[2]);
+        if (!haveNormals) {
+            continue;
+        }
+        const cv::Vec3f normal = normalizedGeneratedVectorOrNan(lineNormals[i]);
+        if (!finiteGeneratedPoint(normal)) {
+            continue;
+        }
+        ++normalPairCount;
+        primary += static_cast<double>(normal.cross(tangent)[2]);
+    }
+    // Compare per-vote means, not raw sums: primary only accumulates where a
+    // sampled normal is valid, so on a sparse-normal fiber a raw fallback sum
+    // over every tangent would drown out a decisive primary vote. The means
+    // are per-point direction magnitudes in [-1, 1] and comparable directly;
+    // the tie band keeps rounding noise from masquerading as a decision.
+    constexpr double kTie = 1.0e-3;
+    const double meanPrimary =
+        normalPairCount > 0 ? primary / static_cast<double>(normalPairCount) : 0.0;
+    const double meanFallback =
+        tangentCount > 0 ? fallback / static_cast<double>(tangentCount) : 0.0;
+    if (std::abs(meanPrimary) > std::max(kTie, std::abs(meanFallback))) {
+        return meanPrimary > 0.0 ? 1.0f : -1.0f;
+    }
+    if (std::abs(meanFallback) > kTie) {
+        return meanFallback > 0.0 ? 1.0f : -1.0f;
+    }
+    return 1.0f;
+}
+
 inline std::optional<std::pair<double, double>> generatedControlLinePositionRange(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
 {
