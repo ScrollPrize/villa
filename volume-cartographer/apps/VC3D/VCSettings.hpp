@@ -269,8 +269,8 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable — it tracks
-    // std::thread::hardware_concurrency() at runtime.
+    // IO thread count is not configurable. Interactive volume reads currently
+    // use two concurrent fetch/decode workers.
 
 }
 

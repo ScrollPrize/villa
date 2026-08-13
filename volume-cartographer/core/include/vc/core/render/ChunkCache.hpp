@@ -59,6 +59,10 @@ private:
 
 class ChunkCache final : public IChunkedArray {
 public:
+    using RemoteFetchActivityCallbackId = std::uint64_t;
+    using RemoteFetchActivityCallback =
+        std::function<void(const ChunkKey& key, bool active)>;
+
     struct LevelInfo {
         std::array<int, 3> shape{};
         std::array<int, 3> chunkShape{};
@@ -75,9 +79,9 @@ public:
         // entries are small individually, but sparse remote volumes can touch
         // unbounded empty chunk grids during exploration.
         std::size_t metadataEntryCapacity = 1ULL << 20;
-        // Number of process-wide chunk I/O workers used by this cache. The
-        // pool is shared by caches with the same worker count and is not
-        // destroyed when a viewer is closed.
+        // Number of process-wide remote download workers used by this cache.
+        // Local cache classification and CPU decoding use separate shared
+        // pools.
         std::size_t maxConcurrentReads = 16;
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
@@ -176,6 +180,13 @@ public:
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
 
+    // Reports actual source fetch execution, excluding persistent-cache probes
+    // and decoded-cache hits. Callbacks run on fetch workers.
+    RemoteFetchActivityCallbackId addRemoteFetchActivityListener(
+        RemoteFetchActivityCallback cb);
+    void removeRemoteFetchActivityListener(RemoteFetchActivityCallbackId id);
+    std::vector<ChunkKey> activeRemoteFetches() const;
+
     PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
 
     Stats stats() const;
@@ -215,7 +226,19 @@ private:
 
     struct ViewDemandSlot {
         std::uint64_t version = 0;
+        int relativeLevel = 0;
         std::optional<float> distanceSquared;
+    };
+
+    struct PersistentProbeResult {
+        bool compressedData = false;
+        bool primaryData = false;
+        bool empty = false;
+
+        bool hasData() const noexcept
+        {
+            return compressedData || primaryData;
+        }
     };
 
     struct Entry {
@@ -232,6 +255,7 @@ private:
         std::uint64_t fetchSerial = 0;
         std::uint64_t probeTaskId = 0;
         std::uint64_t fetchTaskId = 0;
+        std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
@@ -282,6 +306,7 @@ private:
         std::uint64_t nextFetchSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
+        std::weak_ptr<ChunkRequestScheduler> decodeScheduler_;
         std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate_;
         std::shared_ptr<std::atomic<std::uint64_t>> activeViewId_;
         std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId_;
@@ -289,6 +314,7 @@ private:
             std::uint64_t version = 0;
             std::array<float, 2> focus{};
             std::vector<ChunkKey> collectionKeys;
+            std::unordered_map<int, int> relativeLevels;
             std::shared_ptr<PointIndex> pointIndex;
         };
         std::unordered_map<std::uint64_t, ViewSnapshot> viewSnapshots_;
@@ -296,6 +322,9 @@ private:
                            std::unordered_set<ChunkKey, ChunkKeyHash>> viewDemandKeys_;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
+        std::unordered_map<RemoteFetchActivityCallbackId,
+                           RemoteFetchActivityCallback> remoteFetchCallbacks_;
+        std::unordered_set<ChunkKey, ChunkKeyHash> activeRemoteFetches_;
         std::size_t remoteFetchesInFlight_ = 0;
         std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
@@ -322,21 +351,61 @@ private:
                                  const ChunkKey& key,
                                  std::uint64_t generation,
                                  int priorityOffset);
-    static void fetchAndStore(const std::shared_ptr<State>& state,
-                              ChunkKey key,
-                              std::uint64_t generation,
-                              std::uint64_t fetchSerial);
-    static void probePersistentAndStore(const std::shared_ptr<State>& state,
-                                        ChunkKey key,
-                                        std::uint64_t generation,
-                                        std::uint64_t fetchSerial,
-                                        std::uint64_t schedulerEpoch);
+    static void probePersistentAndDispatch(const std::shared_ptr<State>& state,
+                                           ChunkKey key,
+                                           std::uint64_t generation,
+                                           std::uint64_t fetchSerial,
+                                           std::uint64_t schedulerEpoch);
+    static void fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
+                                       ChunkKey key,
+                                       std::uint64_t generation,
+                                       std::uint64_t fetchSerial,
+                                       std::uint64_t schedulerEpoch);
+    static void decodePersistentAndStore(const std::shared_ptr<State>& state,
+                                         ChunkKey key,
+                                         std::uint64_t generation,
+                                         std::uint64_t fetchSerial,
+                                         std::uint64_t schedulerEpoch,
+                                         PersistentProbeResult probe);
+    static void decodeFetchedAndStore(
+        const std::shared_ptr<State>& state,
+        ChunkKey key,
+        std::uint64_t generation,
+        std::uint64_t fetchSerial,
+        std::shared_ptr<ChunkFetchResult> fetched);
+    static void queueRemoteFetch(const std::shared_ptr<State>& state,
+                                 const ChunkKey& key,
+                                 std::uint64_t generation,
+                                 std::uint64_t fetchSerial,
+                                 std::uint64_t schedulerEpoch);
+    static void queuePersistentDecode(const std::shared_ptr<State>& state,
+                                      const ChunkKey& key,
+                                      std::uint64_t generation,
+                                      std::uint64_t fetchSerial,
+                                      std::uint64_t schedulerEpoch,
+                                      PersistentProbeResult probe);
+    static void queueFetchedDecode(const std::shared_ptr<State>& state,
+                                   const ChunkKey& key,
+                                   std::uint64_t generation,
+                                   std::uint64_t fetchSerial,
+                                   std::uint64_t schedulerEpoch,
+                                   ChunkFetchResult fetched);
+    static void finishAndStore(const std::shared_ptr<State>& state,
+                               const ChunkKey& key,
+                               std::uint64_t generation,
+                               std::uint64_t fetchSerial,
+                               ChunkFetchResult fetch,
+                               bool loadedFromPersistentCache);
+    static PersistentProbeResult probePersistent(const State& state,
+                                                  const ChunkKey& key);
+    static std::optional<std::vector<std::byte>> readPersistent(
+        const State& state,
+        const ChunkKey& key,
+        const PersistentProbeResult& probe);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,
                                        ChunkFetchResult fetch,
                                        bool loadedFromPersistentCache);
-    static std::optional<std::vector<std::byte>> readPersistent(const State& state, const ChunkKey& key);
-    static bool readPersistentEmpty(const State& state, const ChunkKey& key);
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
@@ -369,6 +438,9 @@ private:
     static std::size_t dtypeSize(ChunkDtype dtype);
     static std::size_t expectedChunkBytes(const State& state, const ChunkKey& key);
     static void notifyListeners(const std::shared_ptr<State>& state);
+    static void notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
+                                           const ChunkKey& key,
+                                           bool active);
     static void waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key);
     static std::uint64_t nextSchedulerGroup();
     static void invalidateState(const std::shared_ptr<State>& state);
@@ -386,6 +458,7 @@ private:
     std::shared_ptr<State> state_;
     mutable std::mutex facadeMutex_;
     std::unordered_set<ChunkReadyCallbackId> listenerIds_;
+    std::unordered_set<RemoteFetchActivityCallbackId> remoteFetchListenerIds_;
     std::atomic<std::uint64_t> legacyViewId_{0};
     std::atomic<std::uint64_t> legacyViewVersion_{0};
 };

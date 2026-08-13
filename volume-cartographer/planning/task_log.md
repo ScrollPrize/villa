@@ -1,83 +1,54 @@
 # Task log
 
-## 2026-08-12
+## Planning review
 
-- Confirmed current render freshness uses service-wide `viewEpoch_`, while
-  source `generation_` is invalidation-only.
-- Confirmed an already in-flight chunk is not promoted by a newer render unless
-  `prefetchChunks()` receives a strictly better scalar base priority; ordinary
-  `tryGetChunk()` misses retain their original immutable executor priority.
-- Confirmed persistent-cache probe/decode and remote fetch/decode are separate
-  executor stages, but both currently carry the priority captured at initial
-  submission. Remote source read and payload decode run in one fetcher call.
-- Confirmed `SurfaceCache` owns a shared `SurfaceGeometryTileCache`: base and
-  overlay fills already reuse each tile's `QuadSurface::gen()` result. Direct
-  fallback rendering instead uses the viewer's full-frame
-  `GeneratedSurfaceCache`.
-- Chosen geometry strategy: direct fallback renders generate full-frame coords
-  once before the pre-pass and reuse them for rendering; fully SurfaceCache-
-  backed renders sparsely probe the shared geometry tiles so the following tile
-  fills reuse exactly that generated geometry.
-- Independent plan review found that `requestSurfaceViewForJob()` currently
-  starts asynchronous SurfaceCache fills on the UI thread before `renderFrame()`
-  can run the pre-pass. The integration plan now moves accepted view admission
-  into the worker immediately after demand publication; otherwise those fills
-  could queue unlocated work ahead of the metadata intended to prioritize it.
+- Current `ChunkCacheService` has a four-worker probe scheduler and download
+  schedulers keyed by `maxConcurrentReads`; there is no decode scheduler.
+- A persistent probe currently reads and decodes a cache hit before processing
+  another probe. A miss is submitted to the download scheduler only after that
+  combined operation finishes.
+- Production Zarr fetch currently performs HTTP/local source read and decoding
+  in one `IChunkFetcher::fetch()` call. The download worker also rechecks the
+  persistent cache, coupling local read, remote transfer, and decode again.
+- The HTTP Zarr path discovers chunk absence through the data `GET`; no remote
+  stat queue is needed for this task.
+- The three schedulers already can share the atomic selection gate. Entry task
+  tracking, reprioritization, and invalidation must be expanded from two to
+  three stages.
+
+## Deviations
+
+- None.
 
 ## Implementation
 
-- Added a service-owned keyed scheduler for persistent probes and fetch/decode
-  work. Pending tasks can move between background and GUI ordering in place;
-  both stages use a work-conserving 7:1 GUI/background policy.
-- Added explicit view ID/version request context and per-source, per-view demand
-  snapshots to `ChunkCache`. One unresolved chunk keeps all interested view
-  slots, and stale snapshot versions are rejected.
-- Added `PointIndex::nearestPerCollection()` so a folded surface can retain
-  multiple viewport occurrences while scheduler priority uses the nearest one.
-- Added sparse viewport dependency collection to `ChunkedPlaneSampler`, with
-  exact nearest/trilinear chunk dependency enumeration and per-chunk 8-pixel
-  occurrence deduplication.
-- VC3D now uses one deterministic random sample per 8x8 viewport cell on every
-  accepted render. Plane coordinates are analytic. Direct surface rendering
-  generates and reuses its full coordinate/normal matrices. A fully cached
-  surface probes `SurfaceGeometryTileCache`, whose tiles are reused by the
-  following `SurfaceCache` fills.
-- Moved `SurfaceCache::requestView()` into the accepted render worker after
-  demand publication and propagated the GUI context into fill prefetches.
-- Pointer moves update pending priorities without requesting an additional
-  render. Viewer shutdown and source replacement remove only that view's
-  demand. Executing work remains non-cancellable by design.
+- Added split encoded-transfer and decode hooks to `IChunkFetcher`, with
+  compatibility defaults for existing synthetic/custom fetchers.
+- Production Zarr source reads now return encoded chunk payloads. Decoding and
+  persistence-format selection happen on the independent decode stage.
+- Replaced the combined four-worker persistent read/decode pool with a
+  32-worker filesystem classification queue and an eight-worker decode queue.
+  Download concurrency remains controlled by `maxConcurrentReads`.
+- Persistent probes retain compressed-entry preference and raw fallback, but
+  defer file reads, cache decompression, and Zarr decoding to decode workers.
+- Added per-entry decode task tracking and included the decode scheduler in
+  atomic reprioritization, source invalidation, and exclusive-view compaction.
+- Remote activity diagnostics continue to bracket source reads only; decode and
+  persistent-cache work do not appear as downloads.
 
 ## Validation
 
-- Built `test_chunk_cache`, `test_chunk_cache_persist`,
-  `test_chunked_plane_sampler`, `test_volume_local`, and `VC3D`.
-- Passed all focused CTest targets: 5/5, including `test_point_index`.
-- Direct test runs passed 42 `test_chunk_cache` cases and 12
-  `test_chunked_plane_sampler` cases before the final CTest run.
-- `git diff --check` passed.
-
-## Synthetic render gate
-
-- Merged `origin/main` at `5b2ca4ff3`, which contains the synthetic rendering
-  harness, and configured its documented GCC 15 Release build with native
-  architecture tuning disabled.
-- Native fixture and no-site harness checks passed: 2/2.
-- Full Valgrind/DRD replay gate passed all eight cases against the frozen main
-  reference (maximum allowed ratio `1.10x`):
-
-  | Fixture | Scenario | Modeled ns | Ratio |
-  | --- | --- | ---: | ---: |
-  | serial | full_res | 332507.608 | 1.015x |
-  | serial | fallback_3 | 892944.275 | 1.032x |
-  | serial | mixed_correlated | 620216.920 | 1.020x |
-  | serial | mixed_shuffled | 926286.997 | 1.022x |
-  | parallel | full_res | 870894.808 | 0.964x |
-  | parallel | fallback_3 | 2644150.191 | 1.036x |
-  | parallel | mixed_correlated | 1877335.942 | 1.049x |
-  | parallel | mixed_shuffled | 7298099.253 | 1.057x |
-
-- The gate exercises the production `ChunkedPlaneSampler` fine-to-coarse path.
-  VC3D logs `prepass_ms`, retained occurrence count, and unique chunk count for
-  interactive profiling; the headless gate does not construct a GUI viewer and
-  therefore does not assign a standalone wall-time claim to the viewer pre-pass.
+- `test_chunk_cache`: 50 test cases passed, including blocked cached-decode vs
+  remote-admission, encoded download/decode separation, decode priority, and
+  decode invalidation fixtures.
+- `test_zarr_chunk_fetcher`: 13 test cases passed.
+- `test_chunk_cache_persist`: 17 test cases passed, including corrupt
+  compressed-cache fallback.
+- `test_chunked_plane_sampler`: 16 test cases passed.
+- `VC3D` built successfully.
+- Synthetic fixture and no-site coordinator tests passed.
+- The fresh eight-case Valgrind rendering gate passed. Modeled score ratios to
+  reference were serial `full_res=1.029`, `fallback_3=1.032`,
+  `mixed_correlated=1.021`, `mixed_shuffled=1.023`; parallel
+  `full_res=0.960`, `fallback_3=1.040`, `mixed_correlated=1.038`, and
+  `mixed_shuffled=1.029`. All remained below the `1.10x` limit.

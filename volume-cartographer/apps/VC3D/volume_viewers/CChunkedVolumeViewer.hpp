@@ -327,6 +327,7 @@ private:
     void notifyNormalOffsetChanged();
     void setZOffset(float value);
     void rebuildChunkArray();
+    void refreshDownloadQueueDebugOverlay();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
@@ -471,6 +472,7 @@ private:
     std::string _surfName;
     std::shared_ptr<vc::render::ChunkCache> _chunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
+    std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
@@ -535,6 +537,7 @@ private:
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
+    std::uint64_t _overlayRemoteFetchCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;

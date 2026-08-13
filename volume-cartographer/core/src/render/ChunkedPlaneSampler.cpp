@@ -1224,8 +1224,13 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
     }
     result.reserve(count);
     for (const auto& [key, bins] : byChunk) {
-        for (const auto& viewport : bins.points)
-            result.push_back({key, viewport});
+        for (const auto& viewport : bins.points) {
+            result.push_back({
+                key,
+                viewport,
+                key.level - firstLevel,
+            });
+        }
     }
     std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
         if (lhs.key.level != rhs.key.level)
@@ -1235,6 +1240,90 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
                std::tuple(rhs.key.iz, rhs.key.iy, rhs.key.ix,
                           rhs.viewportPosition[1], rhs.viewportPosition[0]);
     });
+    return result;
+}
+
+std::vector<ChunkedPlaneSampler::ChunkPixelLookupLevel>
+ChunkedPlaneSampler::buildChunkPixelLookup(
+    IChunkedArray& array,
+    VolumeSourceId sourceId,
+    int startLevel,
+    int fallbackLevels,
+    const cv::Mat_<cv::Vec3f>& coords,
+    vc::Sampling sampling,
+    bool zeroIsSentinel)
+{
+    std::vector<ChunkPixelLookupLevel> result;
+    if (coords.empty() || array.numLevels() <= 0)
+        return result;
+
+    const int firstLevel = std::max(0, startLevel);
+    const int lastLevel = std::min(
+        array.numLevels() - 1, firstLevel + std::max(0, fallbackLevels));
+    if (firstLevel > lastLevel)
+        return result;
+
+    result.reserve(static_cast<std::size_t>(lastLevel - firstLevel + 1));
+    constexpr std::size_t maximumLocalChunks =
+        std::numeric_limits<uint16_t>::max();
+    for (int level = firstLevel; level <= lastLevel; ++level) {
+        const LevelAccess access = makeLevelAccess(array, level);
+        if (!hasSampleableLevel(access))
+            continue;
+
+        ChunkPixelLookupLevel lookup;
+        lookup.level = level;
+        lookup.pixelIds = cv::Mat_<uint16_t>(
+            coords.rows, coords.cols, uint16_t{0});
+        std::unordered_map<ChunkKey, uint16_t, ChunkKeyHash> localIds;
+        localIds.reserve(256);
+
+        for (int y = 0; y < coords.rows; ++y) {
+            const auto* coordRow = coords.ptr<cv::Vec3f>(y);
+            auto* idRow = lookup.pixelIds.ptr<uint16_t>(y);
+            for (int x = 0; x < coords.cols; ++x) {
+                if (!finiteCoord(coordRow[x]) ||
+                    (zeroIsSentinel && surfaceSentinel(coordRow[x])))
+                    continue;
+                const cv::Vec3f point = toLevelCoord(access, coordRow[x]);
+                const float px = point[0];
+                const float py = point[1];
+                const float pz = point[2];
+                if (!inLevelBounds(access.shape, pz, py, px))
+                    continue;
+
+                int ix = sampling == vc::Sampling::Nearest
+                    ? int(px + 0.5f) : int(std::floor(px));
+                int iy = sampling == vc::Sampling::Nearest
+                    ? int(py + 0.5f) : int(std::floor(py));
+                int iz = sampling == vc::Sampling::Nearest
+                    ? int(pz + 0.5f) : int(std::floor(pz));
+                ix = std::clamp(ix, 0, access.shape[2] - 1);
+                iy = std::clamp(iy, 0, access.shape[1] - 1);
+                iz = std::clamp(iz, 0, access.shape[0] - 1);
+                const ChunkKey key{
+                    level,
+                    iz / access.chunkShape[0],
+                    iy / access.chunkShape[1],
+                    ix / access.chunkShape[2],
+                    sourceId};
+
+                auto found = localIds.find(key);
+                if (found == localIds.end()) {
+                    if (lookup.chunks.size() >= maximumLocalChunks) {
+                        lookup.overflowed = true;
+                        continue;
+                    }
+                    const uint16_t id = static_cast<uint16_t>(
+                        lookup.chunks.size() + 1);
+                    lookup.chunks.push_back(key);
+                    found = localIds.emplace(key, id).first;
+                }
+                idRow[x] = found->second;
+            }
+        }
+        result.push_back(std::move(lookup));
+    }
     return result;
 }
 
@@ -1258,9 +1347,9 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
         return lastLevel - startLevel;
     }
 
-    const double averageViewportExtent =
-        (double(viewportWidth) + double(viewportHeight)) /
-        (2.0 * double(pixelsPerLevel0Unit));
+    const double maximumViewportExtent =
+        double(std::max(viewportWidth, viewportHeight)) /
+        double(pixelsPerLevel0Unit);
     for (int level = startLevel; level <= lastLevel; ++level) {
         const auto shape = array.shape(level);
         if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)
@@ -1277,7 +1366,7 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
             }
             averageChunkExtent += double(chunkShape[dimension]) / scale;
         }
-        if (valid && averageChunkExtent / 3.0 >= averageViewportExtent)
+        if (valid && averageChunkExtent / 3.0 >= maximumViewportExtent)
             return level - startLevel;
     }
     return lastLevel - startLevel;

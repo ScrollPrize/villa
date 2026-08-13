@@ -1735,7 +1735,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
         vc::render::ChunkCache::Options options;
         options.decodedByteCapacity = cacheBudgetHot_;
         options.decodedByteBudget = decodedCacheBudget_;
-        options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16;
+        options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 2;
         chunkedCache_ = createChunkCacheConfigured(
             std::move(options), chunkCacheService_);
         if (!chunkedCache_) {

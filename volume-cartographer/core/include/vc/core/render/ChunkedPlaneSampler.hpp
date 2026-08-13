@@ -72,6 +72,14 @@ public:
         std::vector<uint64_t> cornerDependencyIds;
     };
 
+    struct ChunkPixelLookupLevel {
+        int level = 0;
+        // Pixel IDs are one-based indices into this table; zero is invalid.
+        std::vector<ChunkKey> chunks;
+        cv::Mat_<uint16_t> pixelIds;
+        bool overflowed = false;
+    };
+
     // Queue chunk dependencies for pixels not already covered. The viewer can
     // call these before sampling a frame so cache misses start resolving early.
     static Stats requestPlaneDependencies(IChunkedArray& array,
@@ -115,9 +123,21 @@ public:
         const Options& options = Options(),
         float dedupRadiusPixels = 8.0f);
 
+    // Build a debug/diagnostic mapping without reading or queueing cache data.
+    // Each pixel names the containing chunk at every included level through a
+    // compact level-local uint16 ID. Coordinates are logical level-0 XYZ.
+    static std::vector<ChunkPixelLookupLevel> buildChunkPixelLookup(
+        IChunkedArray& array,
+        VolumeSourceId sourceId,
+        int startLevel,
+        int fallbackLevels,
+        const cv::Mat_<cv::Vec3f>& coords,
+        vc::Sampling sampling = vc::Sampling::Nearest,
+        bool zeroIsSentinel = true);
+
     // Selects how far a GUI viewport should queue coarse fallback data. Stops
     // after `maximumFallbackLevels`, or earlier when one average chunk edge at
-    // a candidate level spans the average viewport edge in level-0 units.
+    // a candidate level spans the larger viewport edge in level-0 units.
     static int fallbackLevelCountForViewport(
         IChunkedArray& array,
         int startLevel,

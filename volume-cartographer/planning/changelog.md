@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-13
+
+- Split regular chunk loading into independent 32-worker persistent-cache
+  classification, source download/read, and CPU decode queues so cached decode
+  work no longer delays discovery and admission of remote misses.
+
 ## 2026-08-12
 
 - Added per-scale unresolved-fetch counts to VC3D's existing cache status bar
@@ -17,6 +23,9 @@
 - Expanded interactive fallback demand to as many as five coarser levels,
   bounded by average chunk-to-viewport coverage, and retained that demand during
   refinement renders.
+- Added the opt-in `--debug-download-queue` VC3D overlay, which colors pixels
+  belonging to actively fetched remote chunks by pyramid level in all shared
+  slice viewers.
 
 ## 2026-08-08
 

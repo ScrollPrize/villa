@@ -57,10 +57,10 @@ struct ChunkRequestScheduler::Impl {
         bool operator()(const std::shared_ptr<Item>& lhs,
                         const std::shared_ptr<Item>& rhs) const noexcept
         {
+            if (lhs->priority.levelPriority != rhs->priority.levelPriority)
+                return lhs->priority.levelPriority > rhs->priority.levelPriority;
             if (lhs->priority.activeView != rhs->priority.activeView)
                 return lhs->priority.activeView > rhs->priority.activeView;
-            if (lhs->priority.levelPriority != rhs->priority.levelPriority)
-                return lhs->priority.levelPriority < rhs->priority.levelPriority;
             const float ld = finiteDistance(lhs->priority.distanceSquared);
             const float rd = finiteDistance(rhs->priority.distanceSquared);
             if (ld != rd)

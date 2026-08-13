@@ -186,11 +186,13 @@ CState::CState(
     size_t cacheSizeBytes,
     QObject* parent,
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget,
-    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService)
+    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService,
+    bool debugDownloadQueue)
     : QObject(parent)
     , _cacheSizeBytes(cacheSizeBytes)
     , _decodedCacheBudget(std::move(decodedCacheBudget))
     , _chunkCacheService(std::move(chunkCacheService))
+    , _debugDownloadQueue(debugDownloadQueue)
 {
     if (!_chunkCacheService) {
         _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(

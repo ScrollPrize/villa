@@ -64,6 +64,21 @@ public:
     virtual ~IChunkFetcher() = default;
     virtual ChunkFetchResult fetch(const ChunkKey& key) = 0;
 
+    // Split transfer from CPU decoding for schedulers which provide a
+    // dedicated decode stage. The compatibility default preserves existing
+    // fetchers whose fetch() already returns decoded bytes.
+    virtual ChunkFetchResult fetchEncoded(const ChunkKey& key)
+    {
+        return fetch(key);
+    }
+
+    virtual ChunkFetchResult decodeFetched(
+        const ChunkKey&,
+        ChunkFetchResult fetched) const
+    {
+        return fetched;
+    }
+
     virtual std::string persistentCacheExtension(const ChunkKey&) const
     {
         return ".bin";

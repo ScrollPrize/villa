@@ -10,8 +10,10 @@
   from a parallel accounting system at viewer call sites.
 - A shared cache must report each unresolved chunk once regardless of how many
   viewers requested it.
-- Download diagnostics belong in the existing application cache status bar,
-  not in per-slice overlays or a separate setting.
+- Normal download diagnostics belong in the existing application cache status
+  bar, not in per-slice overlays or a persistent setting. The explicit
+  `--debug-download-queue` process-start diagnostic may additionally render
+  active remote chunks over slice images for request-order investigation.
 
 ## Regular chunk-cache ownership
 
@@ -72,9 +74,17 @@
 - One unresolved source/chunk entry may contain demand from several views.
   New snapshots promote already queued work in place instead of submitting a
   duplicate task. Clearing a view removes only that view's demand.
-- Probe and fetch/decode queues use a work-conserving 7:1 interactive/background
-  admission policy, preventing background callers from starving. Priority is
-  recalculated when a persistent-cache miss enters fetch/decode work.
+- Regular chunk work passes through three shared pending queues. A 32-worker
+  local probe queue classifies persistent data, empty markers, and misses using
+  filesystem metadata only. Cache hits enter an eight-worker CPU read/decode
+  queue; misses enter the remote source-read queue, whose concurrency is set by
+  `maxConcurrentReads`. Successful source reads then enter the decode queue.
+- Each queue uses the work-conserving 7:1 interactive/background admission
+  policy. Current view-relative priority is recalculated at every stage handoff,
+  and atomic view-demand publication reprioritizes pending work in all three
+  queues. Classification never waits for cached payload reads or decoding, so
+  known remote misses can be admitted while cached decodes are busy. There is
+  no cross-stage pyramid-level barrier in this phase.
 - Running probe, download, decode, and render work is not cancelled. Updated
   priorities affect pending work and stage handoffs only.
 - A direct surface render generates its full coordinate/normal matrices before
@@ -103,3 +113,22 @@ During active remote downloads, the existing cache status bar appends:
   network field.
 - The full active status is
   `RAM X/Y disk X/Y GiB net Nx XMiB/s qK X/Y/Z Z sens: N.N`.
+
+## Active-download debug overlay
+
+- `--debug-download-queue` is disabled by default and applies uniformly to all
+  `CChunkedVolumeViewer` instances, including plane, segment, strip, and
+  generated annotation slice views.
+- The overlay reflects actual remote source fetches, not unresolved queue
+  entries, persistent-cache probes, local decode work, or resident chunks.
+- Every accepted debug render maps its full-resolution logical level-0
+  coordinates to source-qualified containing chunks for the requested and
+  queued fallback levels. Per-pixel storage uses level-local `uint16` IDs with
+  compact key tables; zero is invalid and IDs must never alias on overflow.
+- The clean rendered framebuffer remains authoritative. Active matching chunks
+  are composited over a copy at 50 percent opacity with deterministic colors by
+  pyramid level, and removing the last matching active fetch restores the clean
+  framebuffer.
+- Worker callbacks only publish activity state. Framebuffer composition and Qt
+  repaint requests happen on the UI thread, and diagnostics never queue chunks
+  or alter request priority.

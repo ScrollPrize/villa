@@ -1,6 +1,7 @@
 #include "CChunkedVolumeViewer.hpp"
 
 #include "CState.hpp"
+#include "elements/DownloadQueueDebugOverlay.hpp"
 #include "elements/DownloadQueueStats.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
@@ -669,6 +670,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
 {
     quiesceForClose();
+    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
+        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
+        _chunkRemoteFetchCbId = 0;
+    }
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -676,6 +681,11 @@ CChunkedVolumeViewer::~CChunkedVolumeViewer()
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
+    }
+    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
+        _overlayChunkArray->removeRemoteFetchActivityListener(
+            _overlayRemoteFetchCbId);
+        _overlayRemoteFetchCbId = 0;
     }
     clearIntersectionItems();
 }
@@ -742,9 +752,18 @@ void CChunkedVolumeViewer::quiesceForClose()
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
     }
+    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
+        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
+        _chunkRemoteFetchCbId = 0;
+    }
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
+    }
+    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
+        _overlayChunkArray->removeRemoteFetchActivityListener(
+            _overlayRemoteFetchCbId);
+        _overlayRemoteFetchCbId = 0;
     }
     _overlayChunkArray.reset();
     // Frees tiles and joins any in-flight fill before the widget goes away.
@@ -889,6 +908,10 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
     }
+    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
+        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
+        _chunkRemoteFetchCbId = 0;
+    }
     _chunkArray.reset();
     _lastRenderResult.reset();
     if (!_volume)
@@ -922,6 +945,20 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             guard->submitRender("chunk ready");
         }, Qt::QueuedConnection);
     });
+    if (_state && _state->debugDownloadQueueEnabled()) {
+        _chunkRemoteFetchCbId =
+            _chunkArray->addRemoteFetchActivityListener(
+                [guard, volumeWeak](const vc::render::ChunkKey&, bool) {
+                    QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+                        if (!guard)
+                            return;
+                        auto volume = volumeWeak.lock();
+                        if (!volume || guard->_volume != volume || guard->_closing)
+                            return;
+                        guard->refreshDownloadQueueDebugOverlay();
+                    }, Qt::QueuedConnection);
+                });
+    }
 }
 
 void CChunkedVolumeViewer::setSurfaceCacheBudgets(std::size_t baseBytes,
@@ -1417,6 +1454,10 @@ void CChunkedVolumeViewer::onVolumeClosing()
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
     }
+    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
+        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
+        _chunkRemoteFetchCbId = 0;
+    }
     _chunkArray.reset();
     _volume.reset();
     clearDisplayedFramebuffer();
@@ -1749,6 +1790,7 @@ struct CChunkedVolumeViewer::RenderContext {
     std::shared_ptr<const RenderResult> prevResult;
     std::string profileReason;
     std::string profileCaller;
+    bool debugDownloadQueue = false;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -1772,11 +1814,44 @@ struct CChunkedVolumeViewer::RenderResult {
     // back to direct volume sampling. Surfaced in the status bar because the
     // performance cliff is otherwise invisible.
     bool surfaceCacheOutOfBand = false;
+    std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
+        debugBaseLookup;
+    std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
+        debugOverlayLookup;
     double renderFrameElapsedMs = 0.0;
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
     std::chrono::steady_clock::time_point workerFinishedAt;
 };
+
+void CChunkedVolumeViewer::refreshDownloadQueueDebugOverlay()
+{
+    if (_closing || !_state || !_state->debugDownloadQueueEnabled() ||
+        !_lastRenderResult || _lastRenderResult->framebuffer.isNull()) {
+        return;
+    }
+
+    _framebuffer = _lastRenderResult->framebuffer;
+    cv::Mat_<uint8_t> paintedPixels;
+    if (_chunkArray) {
+        const auto active = _chunkArray->activeRemoteFetches();
+        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
+            activeSet(active.begin(), active.end());
+        vc3d::applyDownloadQueueDebugOverlay(
+            _framebuffer, _lastRenderResult->debugBaseLookup, activeSet,
+            &paintedPixels);
+    }
+    if (_overlayChunkArray) {
+        const auto active = _overlayChunkArray->activeRemoteFetches();
+        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
+            activeSet(active.begin(), active.end());
+        vc3d::applyDownloadQueueDebugOverlay(
+            _framebuffer, _lastRenderResult->debugOverlayLookup, activeSet,
+            &paintedPixels);
+    }
+    if (_view && _view->viewport())
+        _view->viewport()->update();
+}
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
@@ -1851,6 +1926,106 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
               *ctx.overlayChunkArray, ctx.overlayStartLevel,
               ctx.fbW, ctx.fbH, ctx.scale)
         : 0;
+
+    auto generatedSurfaceCoords = [&](bool needNormals) {
+        cv::Mat_<cv::Vec3f> coords;
+        cv::Mat_<cv::Vec3f> normals;
+        const cv::Vec3f offset(
+            ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
+            ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f, 0.0f);
+        bool cacheHit = false;
+        if (ctx.genCache) {
+            std::lock_guard lock(ctx.genCache->mutex);
+            if (ctx.genCacheDirty) {
+                ctx.genCache->valid = false;
+                ctx.genCache->coords.release();
+                ctx.genCache->normals.release();
+            }
+            cacheHit = ctx.genCache->valid &&
+                ctx.genCache->surface == ctx.surf.get() &&
+                ctx.genCache->fbW == ctx.fbW && ctx.genCache->fbH == ctx.fbH &&
+                ctx.genCache->scale == ctx.scale && ctx.genCache->offset == offset &&
+                ctx.genCache->zOff == ctx.zOff &&
+                ctx.genCache->zOffWorldDir == ctx.zOffWorldDir &&
+                !ctx.genCache->coords.empty() &&
+                (!needNormals || !ctx.genCache->normals.empty());
+            if (cacheHit) {
+                coords = ctx.genCache->coords;
+                if (needNormals)
+                    normals = ctx.genCache->normals;
+            }
+        }
+        if (phaseGenMs < 0)
+            phaseGenCached = cacheHit;
+        if (!cacheHit) {
+            if (profilePhases)
+                phaseTimer.restart();
+            ctx.surf->gen(&coords, needNormals ? &normals : nullptr,
+                          cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0},
+                          ctx.scale, offset);
+            applyPerPixelNormalOffset(coords, normals, ctx.zOff);
+            if (profilePhases)
+                phaseGenMs = phaseTimer.elapsed();
+            if (ctx.genCache && !coords.empty()) {
+                std::lock_guard lock(ctx.genCache->mutex);
+                ctx.genCache->valid = true;
+                ctx.genCache->surface = ctx.surf.get();
+                ctx.genCache->fbW = ctx.fbW;
+                ctx.genCache->fbH = ctx.fbH;
+                ctx.genCache->scale = ctx.scale;
+                ctx.genCache->offset = offset;
+                ctx.genCache->zOff = ctx.zOff;
+                ctx.genCache->zOffWorldDir = ctx.zOffWorldDir;
+                ctx.genCache->coords = coords;
+                ctx.genCache->normals = normals;
+            }
+        }
+        ctx.genCacheDirty = false;
+        return std::pair(std::move(coords), std::move(normals));
+    };
+
+    if (ctx.debugDownloadQueue) {
+        cv::Mat_<cv::Vec3f> debugCoords;
+        const bool debugPlaneView =
+            dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
+        if (auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get())) {
+            const cv::Vec3f vx = plane->basisX();
+            const cv::Vec3f vy = plane->basisY();
+            const cv::Vec3f normal = plane->normal({0, 0, 0});
+            const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
+            const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
+            const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
+                                   + vy * (ctx.surfacePtrY - halfH)
+                                   + plane->origin() + normal * ctx.zOff;
+            const cv::Vec3f vxStep = vx / ctx.scale;
+            const cv::Vec3f vyStep = vy / ctx.scale;
+            debugCoords.create(ctx.fbH, ctx.fbW);
+            for (int y = 0; y < ctx.fbH; ++y) {
+                auto* row = debugCoords.ptr<cv::Vec3f>(y);
+                const cv::Vec3f rowOrigin = origin + vyStep * float(y);
+                for (int x = 0; x < ctx.fbW; ++x)
+                    row[x] = rowOrigin + vxStep * float(x);
+            }
+        } else {
+            debugCoords = generatedSurfaceCoords(true).first;
+        }
+        if (!debugCoords.empty()) {
+            result.debugBaseLookup =
+                vc::render::ChunkedPlaneSampler::buildChunkPixelLookup(
+                    *ctx.chunkArray, ctx.chunkArray->sourceId(), ctx.startLevel,
+                    options.queuedFallbackLevels, debugCoords,
+                    ctx.samplingMethod, !debugPlaneView);
+            if (ctx.overlayChunkArray && ctx.overlayVolume &&
+                ctx.overlayOpacity > 0.0f) {
+                result.debugOverlayLookup =
+                    vc::render::ChunkedPlaneSampler::buildChunkPixelLookup(
+                        *ctx.overlayChunkArray, ctx.overlayChunkArray->sourceId(),
+                        ctx.overlayStartLevel,
+                        overlayOptions.queuedFallbackLevels, debugCoords,
+                        ctx.overlaySamplingMethod, !debugPlaneView);
+            }
+        }
+    }
 
     auto initializeOverlayProgress = [&]() {
         overlayValues.create(ctx.fbH, ctx.fbW);
@@ -2027,51 +2202,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             !baseCacheUsableForPrepass ||
             (overlayActive && !overlayCacheUsableForPrepass);
         if (needDirectCoords) {
-            const cv::Vec3f offset(
-                ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
-                ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f, 0.0f);
-            cv::Mat_<cv::Vec3f> fullCoords;
-            cv::Mat_<cv::Vec3f> fullNormals;
-            bool cacheHit = false;
-            if (ctx.genCache) {
-                std::lock_guard lock(ctx.genCache->mutex);
-                cacheHit = ctx.genCache->valid && !ctx.genCacheDirty &&
-                    ctx.genCache->surface == ctx.surf.get() &&
-                    ctx.genCache->fbW == ctx.fbW && ctx.genCache->fbH == ctx.fbH &&
-                    ctx.genCache->scale == ctx.scale && ctx.genCache->offset == offset &&
-                    ctx.genCache->zOff == ctx.zOff &&
-                    ctx.genCache->zOffWorldDir == ctx.zOffWorldDir &&
-                    !ctx.genCache->coords.empty() && !ctx.genCache->normals.empty();
-                if (cacheHit) {
-                    fullCoords = ctx.genCache->coords;
-                    fullNormals = ctx.genCache->normals;
-                }
-            }
-            if (!cacheHit) {
-                if (profilePhases)
-                    phaseTimer.restart();
-                ctx.surf->gen(&fullCoords, &fullNormals,
-                              cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0},
-                              ctx.scale, offset);
-                applyPerPixelNormalOffset(fullCoords, fullNormals, ctx.zOff);
-                if (profilePhases)
-                    phaseGenMs = phaseTimer.elapsed();
-                if (ctx.genCache && !fullCoords.empty()) {
-                    std::lock_guard lock(ctx.genCache->mutex);
-                    ctx.genCache->valid = true;
-                    ctx.genCache->surface = ctx.surf.get();
-                    ctx.genCache->fbW = ctx.fbW;
-                    ctx.genCache->fbH = ctx.fbH;
-                    ctx.genCache->scale = ctx.scale;
-                    ctx.genCache->offset = offset;
-                    ctx.genCache->zOff = ctx.zOff;
-                    ctx.genCache->zOffWorldDir = ctx.zOffWorldDir;
-                    ctx.genCache->coords = fullCoords;
-                    ctx.genCache->normals = fullNormals;
-                }
-                ctx.genCacheDirty = false;
-            }
-            phaseGenCached = cacheHit;
+            auto [fullCoords, fullNormals] = generatedSurfaceCoords(true);
             if (!fullCoords.empty() && !fullNormals.empty()) {
                 for (const auto& viewport : viewportSamples) {
                     const int x = std::clamp(int(viewport[0]), 0, fullCoords.cols - 1);
@@ -2406,9 +2537,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
-        const cv::Vec3f offset(ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
-                               ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f,
-                               0.0f);
         const bool overlayWantsComposite =
             overlayActive && ctx.overlayComposite.enabled &&
             (ctx.overlayComposite.method == "max" ||
@@ -2458,55 +2586,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // volume sampling in the frame at all. GeneratedSurfaceCache is still
         // needed whenever either channel falls back.
         const bool needGen = !baseCacheUsable || (overlayActive && !overlayCacheUsable);
-
-        bool genCacheHit = false;
-        if (ctx.genCache && needGen) {
-            std::lock_guard lock(ctx.genCache->mutex);
-            if (ctx.genCacheDirty) {
-                ctx.genCache->valid = false;
-                ctx.genCache->coords.release();
-                ctx.genCache->normals.release();
-            }
-            genCacheHit =
-                ctx.genCache->valid &&
-                ctx.genCache->surface == ctx.surf.get() &&
-                ctx.genCache->fbW == ctx.fbW &&
-                ctx.genCache->fbH == ctx.fbH &&
-                ctx.genCache->scale == ctx.scale &&
-                ctx.genCache->offset == offset &&
-                ctx.genCache->zOff == ctx.zOff &&
-                ctx.genCache->zOffWorldDir == ctx.zOffWorldDir &&
-                !ctx.genCache->coords.empty() &&
-                (!needSurfaceNormals || !ctx.genCache->normals.empty());
-            if (genCacheHit) {
-                coords = ctx.genCache->coords;
-                if (needSurfaceNormals)
-                    normals = ctx.genCache->normals;
-            }
-        }
-
-        phaseGenCached = genCacheHit;
-        if (needGen && !genCacheHit) {
-            if (profilePhases) phaseTimer.restart();
-            ctx.surf->gen(&coords, needSurfaceNormals ? &normals : nullptr,
-                          cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
-            applyPerPixelNormalOffset(coords, normals, ctx.zOff);
-            if (profilePhases) phaseGenMs = phaseTimer.elapsed();
-
-            if (ctx.genCache && !coords.empty()) {
-                std::lock_guard lock(ctx.genCache->mutex);
-                ctx.genCache->valid = true;
-                ctx.genCache->surface = ctx.surf.get();
-                ctx.genCache->fbW = ctx.fbW;
-                ctx.genCache->fbH = ctx.fbH;
-                ctx.genCache->scale = ctx.scale;
-                ctx.genCache->offset = offset;
-                ctx.genCache->zOff = ctx.zOff;
-                ctx.genCache->zOffWorldDir = ctx.zOffWorldDir;
-                ctx.genCache->coords = coords;
-                ctx.genCache->normals = normals;
-            }
-        }
+        if (needGen)
+            std::tie(coords, normals) = generatedSurfaceCoords(needSurfaceNormals);
         if (baseCacheUsable) {
             // A bilinear resample in (u, v) plus a linear blend across two w
             // slices. Composite is a reduction over slices that are already
@@ -2827,6 +2908,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.prevResult = _lastRenderResult;
     ctx.profileReason = job.profileReason;
     ctx.profileCaller = job.profileCaller;
+    ctx.debugDownloadQueue = _state && _state->debugDownloadQueueEnabled();
     _genCacheDirty = false;
 
     QPointer<CChunkedVolumeViewer> guard(this);
@@ -2975,9 +3057,16 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     const bool intersectionInputsChanged =
         !_displayedRenderJob ||
         !renderJobsSameGeometry(result->renderJob, *_displayedRenderJob);
-    _framebuffer = std::move(result->framebuffer);
+    const bool debugDownloadQueue =
+        _state && _state->debugDownloadQueueEnabled();
+    if (debugDownloadQueue)
+        _framebuffer = result->framebuffer;
+    else
+        _framebuffer = std::move(result->framebuffer);
     _displayedRenderJob = result->renderJob;
     _lastRenderResult = result;
+    if (debugDownloadQueue)
+        refreshDownloadQueueDebugOverlay();
     _surfaceCacheOutOfBand = result->surfaceCacheOutOfBand;
     syncCameraTransform();
     // A tile becoming resident changes only sampled intensity pixels. It does
@@ -3076,6 +3165,11 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
     }
+    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
+        _overlayChunkArray->removeRemoteFetchActivityListener(
+            _overlayRemoteFetchCbId);
+        _overlayRemoteFetchCbId = 0;
+    }
     // Only the overlay channel's tiles are wrong; the base cache is untouched.
     dropOverlaySurfaceCache();
     _overlayVolume = std::move(volume);
@@ -3101,6 +3195,24 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     guard->submitRender("overlay chunk ready");
                 }, Qt::QueuedConnection);
             });
+            if (_state && _state->debugDownloadQueueEnabled()) {
+                _overlayRemoteFetchCbId =
+                    _overlayChunkArray->addRemoteFetchActivityListener(
+                        [guard, overlayVolumeWeak](
+                            const vc::render::ChunkKey&, bool) {
+                            QMetaObject::invokeMethod(
+                                qApp, [guard, overlayVolumeWeak]() {
+                                    if (!guard)
+                                        return;
+                                    auto volume = overlayVolumeWeak.lock();
+                                    if (!volume || guard->_overlayVolume != volume ||
+                                        guard->_closing) {
+                                        return;
+                                    }
+                                    guard->refreshDownloadQueueDebugOverlay();
+                                }, Qt::QueuedConnection);
+                        });
+            }
         }
     }
     ensureSurfaceCaches();

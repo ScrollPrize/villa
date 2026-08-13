@@ -86,7 +86,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _mainState ? _mainState->cacheSizeBytes() : 0,
         this,
         _mainState ? _mainState->decodedCacheBudget() : nullptr,
-        _mainState ? _mainState->chunkCacheService() : nullptr);
+        _mainState ? _mainState->chunkCacheService() : nullptr,
+        _mainState && _mainState->debugDownloadQueueEnabled());
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Surface image/geometry caches remain Spiral-specific; their raw decoded
     // volume chunks come from the application-wide regular cache.

@@ -44,6 +44,9 @@ struct ChunkRequestContext {
 struct ChunkViewportSample {
     ChunkKey key;
     std::array<float, 2> viewportPosition{};
+    // Offset from this view's requested level. Larger values are coarser
+    // fallback levels and therefore have higher interactive priority.
+    int relativeLevel = 0;
 };
 
 class IChunkedArray {

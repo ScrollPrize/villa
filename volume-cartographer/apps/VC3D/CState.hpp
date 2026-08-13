@@ -41,7 +41,8 @@ public:
         size_t cacheSizeBytes,
         QObject* parent = nullptr,
         std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {},
-        std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService = {});
+        std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService = {},
+        bool debugDownloadQueue = false);
     ~CState();
 
     // --- VolumePkg ---
@@ -72,6 +73,7 @@ public:
     size_t cacheSizeBytes() const;
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
     std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService() const;
+    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
     // --- Teardown ---
     void closeAll();
@@ -128,6 +130,7 @@ private:
     size_t _cacheSizeBytes;
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
     std::shared_ptr<vc::render::ChunkCacheService> _chunkCacheService;
+    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

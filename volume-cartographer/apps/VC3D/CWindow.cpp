@@ -2530,7 +2530,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions,
     vc::render::ChunkCache::setDecodedByteBudgetDefault(
         _decodedChunkCacheBudget);
     _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget,
-                        _chunkCacheService);
+                        _chunkCacheService, _benchOptions.debugDownloadQueue);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,

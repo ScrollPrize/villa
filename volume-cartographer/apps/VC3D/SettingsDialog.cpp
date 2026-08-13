@@ -131,10 +131,11 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
 
-    // IO threads is no longer user-configurable (tracks hardware_concurrency).
+    // IO threads is no longer user-configurable. Interactive volume reads use
+    // the conservative two-worker default in Volume::sharedChunkCache().
     if (spinIOThreads) {
         spinIOThreads->setEnabled(false);
-        spinIOThreads->setValue(static_cast<int>(std::thread::hardware_concurrency()));
+        spinIOThreads->setValue(2);
     }
     if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
     if (spinIOThreads) spinIOThreads->hide();

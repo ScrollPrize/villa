@@ -118,7 +118,7 @@ private:
     ChunkStatus status_;
 };
 
-class PyramidArray final : public vc::render::IChunkedArray {
+class PyramidArray : public vc::render::IChunkedArray {
 public:
     int numLevels() const override { return 8; }
     std::array<int, 3> shape(int level) const override
@@ -220,7 +220,9 @@ TEST_CASE("viewport fallback range stops at coverage or five levels")
 {
     PyramidArray array;
     CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
-              array, 0, 300, 100, 1.0f) == 3);
+              array, 0, 300, 100, 1.0f) == 4);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 100, 300, 1.0f) == 4);
     CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
               array, 0, 4096, 4096, 1.0f) == 5);
     CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
@@ -238,9 +240,86 @@ TEST_CASE("viewport dependencies publish coarse levels first")
         array, 0, {{64.0f, 64.0f, 64.0f}}, {{4.0f, 4.0f}}, options);
     REQUIRE(samples.size() == 4);
     CHECK(samples[0].key.level == 3);
+    CHECK(samples[0].relativeLevel == 3);
     CHECK(samples[1].key.level == 2);
+    CHECK(samples[1].relativeLevel == 2);
     CHECK(samples[2].key.level == 1);
+    CHECK(samples[2].relativeLevel == 1);
     CHECK(samples[3].key.level == 0);
+    CHECK(samples[3].relativeLevel == 0);
+}
+
+TEST_CASE("compact chunk pixel lookup preserves levels transforms and source")
+{
+    PyramidArray array;
+    cv::Mat_<cv::Vec3f> coords(2, 3);
+    coords(0, 0) = {1.0f, 1.0f, 1.0f};
+    coords(0, 1) = {33.0f, 1.0f, 1.0f};
+    coords(0, 2) = {34.0f, 1.0f, 1.0f};
+    coords(1, 0) = {-1.0f, -1.0f, -1.0f};
+    coords(1, 1) = {0.0f, 0.0f, 0.0f};
+    coords(1, 2) = {4097.0f, 1.0f, 1.0f};
+    const vc::render::VolumeSourceId source{73};
+
+    const auto lookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, source, 0, 1, coords, vc::Sampling::Nearest);
+
+    REQUIRE(lookup.size() == 2);
+    CHECK(lookup[0].level == 0);
+    REQUIRE(lookup[0].chunks.size() == 2);
+    CHECK(lookup[0].pixelIds(0, 0) == 1);
+    CHECK(lookup[0].pixelIds(0, 1) == 2);
+    CHECK(lookup[0].pixelIds(0, 2) == 2);
+    CHECK(lookup[0].pixelIds(1, 0) == 0);
+    CHECK(lookup[0].pixelIds(1, 1) == 0);
+    CHECK(lookup[0].pixelIds(1, 2) == 0);
+    CHECK(lookup[0].chunks[0] == ChunkKey{0, 0, 0, 0, source});
+    CHECK(lookup[0].chunks[1] == ChunkKey{0, 0, 0, 1, source});
+
+    // Level 1 is half-resolution, so both x=33 and x=34 remain in chunk 0.
+    CHECK(lookup[1].level == 1);
+    REQUIRE(lookup[1].chunks.size() == 1);
+    CHECK(lookup[1].pixelIds(0, 0) == 1);
+    CHECK(lookup[1].pixelIds(0, 1) == 1);
+    CHECK(lookup[1].pixelIds(0, 2) == 1);
+    CHECK(lookup[1].chunks[0] == ChunkKey{1, 0, 0, 0, source});
+    CHECK_FALSE(lookup[0].overflowed);
+    CHECK_FALSE(lookup[1].overflowed);
+
+    const auto planeLookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, source, 0, 0, coords, vc::Sampling::Nearest,
+        /*zeroIsSentinel=*/false);
+    REQUIRE(planeLookup.size() == 1);
+    CHECK(planeLookup[0].pixelIds(1, 1) != 0);
+    CHECK(planeLookup[0].chunks[
+        static_cast<std::size_t>(planeLookup[0].pixelIds(1, 1) - 1)] ==
+        ChunkKey{0, 0, 0, 0, source});
+}
+
+TEST_CASE("compact chunk pixel lookup reports uint16 ID overflow")
+{
+    class ManyChunksArray final : public PyramidArray {
+    public:
+        int numLevels() const override { return 1; }
+        std::array<int, 3> shape(int) const override { return {1, 1, 70000}; }
+        std::array<int, 3> chunkShape(int) const override { return {1, 1, 1}; }
+        LevelTransform levelTransform(int) const override { return {}; }
+    } array;
+
+    constexpr int distinctChunks = 65536;
+    cv::Mat_<cv::Vec3f> coords(1, distinctChunks);
+    for (int x = 0; x < distinctChunks; ++x)
+        coords(0, x) = {static_cast<float>(x + 1), 0.0f, 0.0f};
+
+    const auto lookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, vc::render::VolumeSourceId{91}, 0, 0, coords,
+        vc::Sampling::Nearest, /*zeroIsSentinel=*/false);
+
+    REQUIRE(lookup.size() == 1);
+    CHECK(lookup[0].overflowed);
+    CHECK(lookup[0].chunks.size() == 65535);
+    CHECK(lookup[0].pixelIds(0, distinctChunks - 2) == 65535);
+    CHECK(lookup[0].pixelIds(0, distinctChunks - 1) == 0);
 }
 
 TEST_CASE("requestPlaneDependencies / requestCoordsDependencies run without crashing")

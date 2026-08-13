@@ -165,6 +165,11 @@ public:
 
     ChunkFetchResult fetch(const ChunkKey& key) override
     {
+        return decodeFetched(key, fetchEncoded(key));
+    }
+
+    ChunkFetchResult fetchEncoded(const ChunkKey& key) override
+    {
         ChunkFetchResult result;
         const std::array<std::size_t, 3> indices{
             static_cast<std::size_t>(key.iz),
@@ -172,28 +177,13 @@ public:
             static_cast<std::size_t>(key.ix)};
 
         try {
-            if (!persistEncodedExtension_.empty()) {
-                auto encoded = array_->read_chunk_encoded(indices);
-                if (!encoded) {
-                    result.status = ChunkFetchStatus::Missing;
-                    return result;
-                }
-                result.status = ChunkFetchStatus::Found;
-                result.persistentBytes = std::move(*encoded);
-                result.hasPersistentBytes = true;
-                result.bytes = array_->decode_chunk_payload(
-                    std::span<const std::byte>(result.persistentBytes.data(),
-                                               result.persistentBytes.size()));
-                return result;
-            }
-
-            auto bytes = array_->read_chunk(indices);
-            if (!bytes) {
+            auto encoded = array_->read_chunk_encoded(indices);
+            if (!encoded) {
                 result.status = ChunkFetchStatus::Missing;
                 return result;
             }
             result.status = ChunkFetchStatus::Found;
-            result.bytes = std::move(*bytes);
+            result.bytes = std::move(*encoded);
             return result;
         } catch (const HttpStatusError& e) {
             result.status = ChunkFetchStatus::HttpError;
@@ -202,6 +192,30 @@ public:
         } catch (const std::filesystem::filesystem_error& e) {
             result.status = ChunkFetchStatus::IoError;
             result.message = e.what();
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&,
+        ChunkFetchResult fetched) const override
+    {
+        if (fetched.status != ChunkFetchStatus::Found)
+            return fetched;
+
+        ChunkFetchResult result;
+        try {
+            auto encoded = std::move(fetched.bytes);
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = array_->decode_chunk_payload(
+                std::span<const std::byte>(encoded.data(), encoded.size()));
+            if (!persistEncodedExtension_.empty()) {
+                result.persistentBytes = std::move(encoded);
+                result.hasPersistentBytes = true;
+            }
         } catch (const std::exception& e) {
             result.status = ChunkFetchStatus::DecodeError;
             result.message = e.what();

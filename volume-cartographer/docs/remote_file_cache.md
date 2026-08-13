@@ -97,6 +97,20 @@ chunk count once. Cache diagnostics and Z-scroll sensitivity are composed into
 one permanent status label so growing queue text cannot overlap a neighboring
 status widget.
 
+For render-order debugging, start VC3D with
+`--debug-download-queue`. Every shared slice viewer, including plane, segment,
+strip, generated annotation, and Spiral views, then overlays pixels belonging
+to chunks which are actively being fetched from a remote source. The overlay
+uses stable colors by pyramid level at 50-percent opacity and includes both the
+base and volume-overlay sources.
+
+The overlay tracks actual source fetch start/stop events. It does not show
+requests waiting in a queue, persistent-cache reads, decoding, or decoded-cache
+hits. Each accepted render builds compact `uint16` pixel-to-chunk maps for its
+requested and fallback levels. This full-frame pass and its retained maps add
+CPU and memory overhead, so the flag is intended only for diagnostics and is
+disabled by default.
+
 ## VC3D Regular Chunk Cache
 
 VC3D creates one application-lifetime `vc::render::ChunkCacheService` and
@@ -137,12 +151,30 @@ pointer position (or viewport center before pointer activity). Chunks missed by
 the probe still enter the GUI lane, without a location, and sort last within
 their view and level.
 
-GUI and non-GUI callers use separate pending lanes. The shared probe and
-fetch/decode schedulers are work-conserving and admit one background item after
-at most seven consecutive GUI items while both lanes are nonempty. Existing
+GUI and non-GUI callers use separate pending lanes in three shared scheduler
+stages:
+
+1. A 32-worker local probe stage classifies persistent encoded data, persistent
+   empty markers, and cache misses using filesystem metadata only.
+2. A source-read stage performs remote downloads, or direct source reads when
+   no persistent cache is configured. Its concurrency is
+   `ChunkCache::Options::maxConcurrentReads`.
+3. An eight-worker CPU stage reads and decodes persistent hits or decodes
+   successful source reads.
+
+The local probe never reads or decodes payloads. Consequently it can classify
+the visible working set quickly, send known misses to the network, and send
+known hits to CPU decoding without either class blocking discovery of the
+other. HTTP chunk absence is established by the chunk `GET`; the pipeline does
+not add a separate remote `HEAD` request.
+
+All three schedulers are work-conserving and admit one background item after at
+most seven consecutive GUI items while both lanes are nonempty. Existing
 queued chunks are reprioritized in place when a newer view snapshot references
-them. A persistent-cache miss has its current priority recalculated before it
-enters remote fetch/decode. Work already executing is allowed to finish.
+them, and each handoff recomputes current view-relative priority. View-demand
+publication updates all three queues atomically. Running work is allowed to
+finish, and this separation does not yet enforce a pyramid-level barrier across
+different stages.
 
 The viewport probe reuses the render's geometry path. Direct surface rendering
 generates the full coordinate/normal matrices once and uses them for both the

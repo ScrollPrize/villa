@@ -69,6 +69,28 @@ add_test(NAME download_queue_stats COMMAND test_download_queue_stats)
 vc_register_test_target(test_download_queue_stats)
 vc_register_ctest(download_queue_stats test_download_queue_stats)
 
+add_executable(test_download_queue_debug
+    test_download_queue_debug.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueDebugOverlay.cpp)
+
+set_target_properties(test_download_queue_debug PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_download_queue_debug PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_download_queue_debug PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test)
+
+add_test(NAME download_queue_debug COMMAND test_download_queue_debug)
+vc_register_test_target(test_download_queue_debug)
+vc_register_ctest(download_queue_debug test_download_queue_debug)
+set_tests_properties(download_queue_debug PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)

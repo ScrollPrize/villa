@@ -319,6 +319,11 @@ auto main(int argc, char* argv[]) -> int
         "Enable VC3D render profiling logs.");
     parser.addOption(profileOption);
 
+    QCommandLineOption debugDownloadQueueOption(
+        "debug-download-queue",
+        "Overlay currently downloading remote chunks in every slice view.");
+    parser.addOption(debugDownloadQueueOption);
+
     QCommandLineOption recordOption(
         "record",
         "Record a navigation camera-state timeline to the given JSON file.",
@@ -398,6 +403,7 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
     benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
     benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
+    benchOptions.debugDownloadQueue = parser.isSet(debugDownloadQueueOption);
     bool limitOk = false;
     const int replayLimit = parser.value(replayLimitOption).toInt(&limitOk);
     benchOptions.replayLimit = (limitOk && replayLimit > 0) ? replayLimit : 0;

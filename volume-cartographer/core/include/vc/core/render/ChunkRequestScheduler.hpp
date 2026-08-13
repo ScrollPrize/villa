@@ -29,12 +29,14 @@ private:
 struct ChunkWorkPriority {
     bool interactive = false;
     bool activeView = false;
+    // Interactive work uses view-relative level offsets; larger is coarser.
     int levelPriority = 0;
     float distanceSquared = 0.0f;
     int backgroundPriority = 0;
 };
 
-// Keyed worker queue used by regular chunk probes and fetch/decode work.
+// Keyed worker queue shared by regular chunk probe, source-read, and decode
+// stages.
 // Pending tasks can be reprioritized without submitting duplicate lambdas.
 class ChunkRequestScheduler final {
 public:
