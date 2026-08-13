@@ -1,11 +1,12 @@
 # Status
 
-- [x] Read the workflow and current render/fetch implementation.
-- [x] Identify source scheduler, transfer statistics, and remote cache setup.
-- [x] Create and independently review the implementation plan.
-- [x] Implement adaptive scheduler admission and transfer estimation.
-- [x] Enable adaptation for normal interactive remote volumes.
-- [x] Add regression tests.
-- [x] Build VC3D and run focused tests.
-- [x] Update specification and changelog.
-- [x] Record final validation in the task log.
+- [x] Trace GUI and background request ownership through all cache stages.
+- [x] Add targeted scheduler cancellation.
+- [x] Prune stale GUI work during atomic render publication.
+- [x] Prune closed-view work across all registered sources.
+- [x] Prevent stale running work from entering another queue stage.
+- [x] Preserve shared-view and explicit background ownership.
+- [x] Add lifecycle regression tests.
+- [x] Repair timing-sensitive decode-order coverage.
+- [x] Build VC3D and repeatedly run the complete chunk-cache suite.
+- [x] Update specification and task documentation.

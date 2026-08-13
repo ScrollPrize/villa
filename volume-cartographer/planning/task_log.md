@@ -2,47 +2,45 @@
 
 ## Findings
 
-- Source fetch scheduling currently allocates a fixed worker pool selected by
-  `maxConcurrentReads`; probe and decode work already use separate pools.
-- The status bandwidth currently sums completed bytes over a fixed three-second
-  wall-clock window. That estimate is not tied to chunk count or current
-  parallelism.
-- Encoded chunk bytes and source-fetch start/completion timestamps are available
-  at the source-stage boundary without changing fetcher or decoder behavior.
-- A scheduler admission limit can adapt concurrency without rebuilding worker
-  pools or changing pending-task order.
-
-## Accepted limitation
-
-- The controller performs no exploratory increase. If two downloads cannot
-  expose available bandwidth, the estimate may remain conservative.
+- `replaceViewDemand()` previously removed old per-view priority slots but left
+  their unresolved tasks in the schedulers as background work. Repeated renders
+  could therefore grow the queue faster than it drained.
+- Probe, source-read, and decode schedulers already have separate interactive
+  and background lanes. The missing state was request ownership on each cache
+  entry, not another scheduler split.
+- The scheduler supported reprioritization and cache-wide epoch cancellation,
+  but not targeted cancellation of one pending keyed task.
+- A stale asynchronous GUI miss was previously accepted as background work when
+  its view generation had already been superseded.
+- Clearing by view ID alone could not reject a render allocated before closure
+  but publishing afterward. VC3D now supplies its latest render request serial
+  as the cleared generation watermark.
 
 ## Implementation notes
 
-- `ChunkRequestScheduler` now supports a dynamic admission limit independently
-  of its allocated worker count. Priority queues and selection ordering are
-  unchanged.
-- The shared adaptive source scheduler has 64 workers, starts with two admitted
-  transfers, and retains at most 256 successful encoded-transfer samples.
-- Both adaptive and fixed source schedulers compute bandwidth over their latest
-  `admission_limit * 4` successful chunks. Fixed schedulers report that estimate
-  but never change admission.
-- Normal remote `Volume::sharedChunkCache()` enables adaptation. Explicit
-  `Volume::createChunkCache(options)` jobs use private fixed source schedulers
-  while retaining the shared decoded-byte budget.
-- The existing status formatter receives the scheduler estimate through
-  `ChunkCache::Stats`; its displayed `Nx` remains actual in-flight fetches.
+- Entries retain a background-demand flag and independent per-view generation
+  slots. An unresolved entry is removable only when both are empty.
+- Snapshot replacement and task cancellation happen under the shared scheduler
+  selection gate, so workers cannot observe a partially published render.
+- Pending work is canceled by task ID and removed from unresolved counters.
+  Running work finishes its current stage; stale probe/download results are
+  discarded before another stage is submitted, while an already-running decode
+  may populate the cache.
+- View closure removes that view from every registered source and retains a
+  closed generation watermark. A strictly newer render generation reopens the
+  stable view ID after a cache rebuild.
+
+## Test cleanup
+
+- The decode-priority test previously released a worker immediately after
+  creating two requests. Persistent probes could race that release, so the test
+  sometimes asserted before both decode tasks existed. Cache stats now expose
+  the decode scheduler's pending count, and the test waits for both candidates
+  before releasing one worker.
 
 ## Validation
 
-- Built `test_chunk_cache`, `test_chunk_cache_persist`,
-  `test_download_queue_stats`, `test_volume_chunk_errors`, and `VC3D`.
-- New deterministic tests cover 2 MiB chunks at 2, 4, and 100 MiB/s, the
-  two-worker minimum, 64-worker maximum, actual admission, and fixed mode.
-- Three consecutive focused CTest runs passed before upper-clamp coverage was
-  added; the rebuilt complete cache suite then passed twice.
-- During repeated broad runs, the pre-existing
-  `ChunkCache reprioritizes pending decode work by view-relative level` exact
-  order assertion failed twice and passed on immediate reruns. The adaptive
-  tests execute earlier and passed; no production change was made for that
-  unrelated timing-sensitive test.
+- `test_chunk_cache`: 60 cases passed.
+- Complete `test_chunk_cache` executable passed 20 consecutive runs.
+- `VC3D` target built successfully.
+- `git diff --check` passed.

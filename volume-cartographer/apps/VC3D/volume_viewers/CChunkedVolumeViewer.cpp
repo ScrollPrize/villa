@@ -743,10 +743,10 @@ void CChunkedVolumeViewer::quiesceForClose()
     ++_renderSerial;
 
     if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId);
+        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
     if (_overlayChunkArray && (!_chunkArray ||
         _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
-        _overlayChunkArray->clearViewDemand(_chunkViewId);
+        _overlayChunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
 
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
@@ -903,7 +903,7 @@ void CChunkedVolumeViewer::refreshChunkSource()
 void CChunkedVolumeViewer::rebuildChunkArray()
 {
     if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId);
+        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -1449,7 +1449,7 @@ void CChunkedVolumeViewer::onVolumeClosing()
     }
     dropSurfaceCaches();
     if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId);
+        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
     if (_chunkCbId != 0 && _chunkArray) {
         _chunkArray->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -3165,7 +3165,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     }
     if (_overlayChunkArray && (!_chunkArray ||
         _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
-        _overlayChunkArray->clearViewDemand(_chunkViewId);
+        _overlayChunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;

@@ -127,9 +127,11 @@ public:
         (void)focus;
         (void)makeActive;
     }
-    virtual void clearViewDemand(std::uint64_t viewId)
+    virtual void clearViewDemand(std::uint64_t viewId,
+                                 std::uint64_t viewVersion = 0)
     {
         (void)viewId;
+        (void)viewVersion;
     }
     // Starts a newer interactive request. An exclusively-owned backing array
     // may discard unresolved work from the superseded view; resident chunks

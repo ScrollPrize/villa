@@ -38,9 +38,14 @@
   source; stale generation results must not publish afterward.
 - Surface image tiles and surface geometry tiles remain derived caches with
   independent budgets. Their raw volume reads use the regular cache service.
-- Cooperative cancellation is not part of this phase. A shared
-  `beginViewRequest(discardPending=true)` advances newest-view priority without
-  deleting shared unresolved work.
+- Pending interactive work is owned by per-chunk `(view ID, view version)`
+  demand slots. Atomically replacing a view snapshot or closing a view removes
+  its stale slots; a pending probe, source read, or decode with neither another
+  view owner nor an explicit background owner is canceled by task ID.
+- Running work is not interrupted. A running probe or source read may finish,
+  but it cannot enqueue the next stage after all of its demand has become stale.
+  A chunk independently requested by CLI/batch/background work remains in the
+  scheduler's separate background lane after GUI demand is removed.
 - View epochs are allocated by the application cache service, not independently
   per source, so newly selected volume work outranks older queued source work.
 

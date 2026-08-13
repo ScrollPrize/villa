@@ -356,6 +356,21 @@ bool ChunkRequestScheduler::reprioritize(TaskId id, ChunkWorkPriority priority)
     return true;
 }
 
+bool ChunkRequestScheduler::cancel(TaskId id)
+{
+    if (id == 0)
+        return false;
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->locations.find(id) == impl_->locations.end())
+        return false;
+    impl_->eraseLocked(id);
+    if (impl_->gui.empty() && impl_->background.empty() &&
+        impl_->activeCount.load(std::memory_order_acquire) == 0) {
+        impl_->idleCv.notify_all();
+    }
+    return true;
+}
+
 void ChunkRequestScheduler::cancelGroupBefore(TaskGroup group,
                                               std::uint64_t minimumEpoch)
 {

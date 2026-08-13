@@ -75,6 +75,9 @@ public:
                 std::uint64_t groupEpoch,
                 std::function<void()> task);
     bool reprioritize(TaskId id, ChunkWorkPriority priority);
+    // Cancels a task only while it is still pending. Running work is allowed
+    // to complete its current stage.
+    bool cancel(TaskId id);
     void cancelGroupBefore(TaskGroup group, std::uint64_t minimumEpoch);
 
     [[nodiscard]] std::size_t pending() const;

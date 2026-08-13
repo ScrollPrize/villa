@@ -119,6 +119,7 @@ public:
         std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
+        std::size_t pendingDecodeTasks = 0;
         // Unresolved chunk requests (queued or executing), indexed by pyramid
         // level. Persistent-cache probes count while the requested chunk is
         // still unavailable to rendering.
@@ -179,7 +180,8 @@ public:
     void updateViewFocus(std::uint64_t viewId,
                          const std::array<float, 2>& focus,
                          bool makeActive) override;
-    void clearViewDemand(std::uint64_t viewId) override;
+    void clearViewDemand(std::uint64_t viewId,
+                         std::uint64_t viewVersion = 0) override;
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
@@ -261,6 +263,7 @@ private:
         std::uint64_t fetchTaskId = 0;
         std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
+        bool backgroundDemand = false;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -316,6 +319,7 @@ private:
         std::shared_ptr<std::atomic<std::uint64_t>> nextTaskId_;
         struct ViewSnapshot {
             std::uint64_t version = 0;
+            bool closed = false;
             std::array<float, 2> focus{};
             std::vector<ChunkKey> collectionKeys;
             std::unordered_map<int, int> relativeLevels;
@@ -346,10 +350,16 @@ private:
     static void reprioritizeEntryLocked(const State& state,
                                         const ChunkKey& key,
                                         Entry& entry);
-    static void addRequestDemandLocked(State& state,
+    static bool addRequestDemandLocked(State& state,
                                        const ChunkKey& key,
                                        Entry& entry,
                                        const ChunkRequestContext& request);
+    static bool hasDemandLocked(const Entry& entry);
+    static bool cancelUndemandedEntryLocked(State& state,
+                                            const ChunkKey& key,
+                                            Entry& entry);
+    static void eraseUnresolvedEntryLocked(State& state,
+                                           const ChunkKey& key);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  std::uint64_t generation,

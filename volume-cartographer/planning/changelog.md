@@ -2,6 +2,11 @@
 
 ## 2026-08-13
 
+- Added per-view generation ownership for interactive chunk work. Superseded or
+  closed-view probe/download/decode tasks are canceled while shared-view and
+  explicit background requests are retained.
+- Prevented stale running probes and downloads from entering another queue
+  stage, and reject late asynchronous requests from a cleared view generation.
 - Added service-wide adaptive remote download admission from two to 64 fetches,
   based on recent successful encoded-chunk bandwidth and chunk size; the status
   bar now uses the same bandwidth estimate.

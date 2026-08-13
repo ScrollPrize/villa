@@ -107,6 +107,56 @@ private:
     bool released_ = false;
 };
 
+class BlockingEncodedFetcher : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        return decodeFetched(key, fetchEncoded(key));
+    }
+
+    ChunkFetchResult fetchEncoded(const ChunkKey&) override
+    {
+        started_.count_down();
+        {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return released_; });
+        }
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = {std::byte{17}};
+        return result;
+    }
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult) const override
+    {
+        ++decodeCalls;
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = std::vector<std::byte>(64, std::byte{29});
+        return result;
+    }
+
+    void waitStarted() { started_.wait(); }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    mutable std::atomic<int> decodeCalls{0};
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::latch started_{1};
+    bool released_ = false;
+};
+
 class ThrowingFetcher : public IChunkFetcher {
 public:
     ChunkFetchResult fetch(const ChunkKey&) override
@@ -1423,6 +1473,37 @@ TEST_CASE("ChunkRequestScheduler reprioritizes pending keyed work")
     CHECK(order == std::vector<int>{1, 2, 3});
 }
 
+TEST_CASE("ChunkRequestScheduler cancels pending keyed work only once")
+{
+    ChunkRequestScheduler scheduler(1);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{1};
+    std::vector<int> order;
+    scheduler.submit(1, {}, 1, 0, [&] {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+        order.push_back(1);
+    });
+    started.wait();
+    scheduler.submit(2, {}, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(2);
+    });
+    CHECK(scheduler.cancel(2));
+    CHECK_FALSE(scheduler.cancel(2));
+    CHECK_FALSE(scheduler.cancel(1));
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    CHECK(order == std::vector<int>{1});
+}
+
 TEST_CASE("ChunkRequestScheduler bounds interactive bursts")
 {
     ChunkRequestScheduler scheduler(1, 3);
@@ -1708,6 +1789,145 @@ TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replac
     CHECK(cache->getChunkIfCached(0, 0, 0, 3).status == ChunkStatus::MissQueued);
 }
 
+TEST_CASE("ChunkCache superseded view demand cancels pending GUI work")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 24}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0); // running background blocker
+    fetcher->waitFirstStarted();
+    cache->replaceViewDemand({81, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+        {{0, 0, 0, 2}, {1.0f, 0.0f}},
+    });
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{3});
+
+    cache->replaceViewDemand({81, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 3}, {0.0f, 0.0f}},
+    });
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{2});
+
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 3).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 3}});
+}
+
+TEST_CASE("ChunkCache closing a view cancels its pending GUI work")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 16}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+    cache->replaceViewDemand({82, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+        {{0, 0, 0, 2}, {1.0f, 0.0f}},
+    });
+    cache->clearViewDemand(82, 1);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{1});
+    (void)cache->tryGetChunk(0, 0, 0, 3, {82, 1}); // late closed-view fill
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{1});
+    fetcher->release();
+    cache->getChunkBlocking(0, 0, 0, 0);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{{0, 0, 0, 0}});
+
+    cache->replaceViewDemand({82, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 3}, {0.0f, 0.0f}},
+    });
+    CHECK(waitForResolved(*cache, 0, 0, 0, 3).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 3}});
+}
+
+TEST_CASE("ChunkCache stale running download does not enter decode queue")
+{
+    auto fetcher = std::make_shared<BlockingEncodedFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 8}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    cache->replaceViewDemand({85, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+    fetcher->waitStarted();
+    cache->replaceViewDemand({85, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+    });
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(fetcher->decodeCalls.load() == 1);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0});
+}
+
+TEST_CASE("ChunkCache preserves pending work owned by another view or background")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 16}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+    cache->replaceViewDemand({83, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+        {{0, 0, 0, 2}, {1.0f, 0.0f}},
+    });
+    cache->replaceViewDemand({84, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+    });
+    (void)cache->tryGetChunk(0, 0, 0, 2); // explicit background owner
+
+    cache->clearViewDemand(83, 1);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{3});
+    cache->clearViewDemand(84, 1);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{2});
+
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 2}});
+}
+
 TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
 {
     auto fetcher = std::make_shared<BlockingOrderFetcher>();
@@ -1751,7 +1971,7 @@ TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
     CHECK(order[2] == ChunkKey{2, 0, 0, 0});
 }
 
-TEST_CASE("ChunkCache stale asynchronous GUI misses fall back to background priority")
+TEST_CASE("ChunkCache rejects stale asynchronous GUI misses")
 {
     auto fetcher = std::make_shared<BlockingOrderFetcher>();
     std::vector<ChunkCache::LevelInfo> levels = {
@@ -1778,9 +1998,9 @@ TEST_CASE("ChunkCache stale asynchronous GUI misses fall back to background prio
     fetcher->release();
     CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
     CHECK(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
-    CHECK(waitForResolved(*cache, 0, 0, 0, 3).status == ChunkStatus::Data);
     CHECK(fetcher->order() == std::vector<ChunkKey>{
-        {0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 0, 3}});
+        {0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}});
+    CHECK(cache->getChunkIfCached(0, 0, 0, 3).status == ChunkStatus::MissQueued);
 }
 
 TEST_CASE("ChunkCache: disk-cached chunks resolve without touching the fetcher pool")
@@ -1917,6 +2137,13 @@ TEST_CASE("ChunkCache reprioritizes pending decode work by view-relative level")
             {{2, 0, 0, 0}, {0.0f, 0.0f}, 2},
         });
         cache.updateViewFocus(91, {0.0f, 0.0f}, true);
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds{2};
+        while (cache.stats().pendingDecodeTasks < 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        REQUIRE(cache.stats().pendingDecodeTasks >= 2);
         fetcher->releasePersistentDecodes(1);
         REQUIRE(fetcher->waitForPersistentDecodes(9, std::chrono::seconds{2}));
         const auto order = fetcher->persistentDecodeOrder();
