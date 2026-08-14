@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberGraph.hpp"
 
+#include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
@@ -99,6 +100,20 @@ cv::Vec3d arcEndDirection(const FiberletGraph& graph, size_t arc)
     throw std::invalid_argument("fiberlet graph arc has no end tangent");
 }
 
+double arcStartLength(const FiberletGraph& graph, size_t arc)
+{
+    const auto& points = graph.edges.at(arcEdge(arc)).pointsBaseXYZ;
+    const double scale = graph.predictionToBaseScale;
+    return arcForward(arc) ? length(points[1] - points[0]) / scale : length(points[points.size() - 2] - points.back()) / scale;
+}
+
+double arcEndLength(const FiberletGraph& graph, size_t arc)
+{
+    const auto& points = graph.edges.at(arcEdge(arc)).pointsBaseXYZ;
+    const double scale = graph.predictionToBaseScale;
+    return arcForward(arc) ? length(points.back() - points[points.size() - 2]) / scale : length(points[0] - points[1]) / scale;
+}
+
 std::vector<cv::Vec3d> orientedArcPoints(const FiberletGraph& graph, size_t arc)
 {
     auto points = graph.edges.at(arcEdge(arc)).pointsBaseXYZ;
@@ -107,17 +122,21 @@ std::vector<cv::Vec3d> orientedArcPoints(const FiberletGraph& graph, size_t arc)
     return points;
 }
 
-bool transitionAllowed(const FiberletGraph& graph, size_t incomingArc, size_t outgoingArc)
+std::optional<size_t> transitionIndex(const FiberletGraph& graph, size_t incomingArc, size_t outgoingArc)
 {
     const auto found =
         std::lower_bound(graph.transitions.begin(), graph.transitions.end(), std::pair{incomingArc, outgoingArc}, [](const auto& transition, const auto& key) {
             return std::pair{transition.incomingArc, transition.outgoingArc} < key;
         });
-    return found != graph.transitions.end() && found->incomingArc == incomingArc && found->outgoingArc == outgoingArc;
+    if (found == graph.transitions.end() || found->incomingArc != incomingArc || found->outgoingArc != outgoingArc) {
+        return std::nullopt;
+    }
+    return static_cast<size_t>(std::distance(graph.transitions.begin(), found));
 }
 
 struct RouteCandidate {
     std::vector<size_t> arcs;
+    std::vector<size_t> transitions;
     std::set<size_t> visitedNodes;
     double loss = 0.0;
     double pathLength = 0.0;
@@ -151,9 +170,9 @@ std::optional<RouteCandidate> bestLookaheadRoute(
 {
     std::vector<RouteCandidate> frontier;
     for (const size_t arc : graph.nodes.at(currentNode).outgoingArcs) {
-        if (incomingArc.has_value() && !transitionAllowed(graph, *incomingArc, arc)) {
+        const auto join = incomingArc.has_value() ? transitionIndex(graph, *incomingArc, arc) : std::nullopt;
+        if (incomingArc.has_value() && !join.has_value())
             continue;
-        }
         if (initialDirection.has_value() && !(angleDegrees(*initialDirection, arcStartDirection(graph, arc)) < graph.maximumJoinAngleDegrees)) {
             continue;
         }
@@ -165,8 +184,12 @@ std::optional<RouteCandidate> bestLookaheadRoute(
         candidate.arcs.push_back(arc);
         candidate.visitedNodes = committedVisitedNodes;
         candidate.visitedNodes.insert(target);
-        candidate.loss = edge.totalLoss;
+        candidate.loss = edge.cost.total();
         candidate.pathLength = edge.pathLengthPredictionVoxels;
+        if (join.has_value()) {
+            candidate.transitions.push_back(*join);
+            candidate.loss += graph.transitions[*join].cost.total();
+        }
         frontier.push_back(std::move(candidate));
     }
     if (frontier.empty())
@@ -179,16 +202,18 @@ std::optional<RouteCandidate> bestLookaheadRoute(
             const size_t tailArc = route.arcs.back();
             const size_t tailNode = arcTarget(graph, tailArc);
             for (const size_t arc : graph.nodes.at(tailNode).outgoingArcs) {
-                if (!transitionAllowed(graph, tailArc, arc))
+                const auto join = transitionIndex(graph, tailArc, arc);
+                if (!join.has_value())
                     continue;
                 const size_t target = arcTarget(graph, arc);
                 if (route.visitedNodes.contains(target))
                     continue;
                 RouteCandidate next = route;
                 next.arcs.push_back(arc);
+                next.transitions.push_back(*join);
                 next.visitedNodes.insert(target);
                 const auto& edge = graph.edges.at(arcEdge(arc));
-                next.loss += edge.totalLoss;
+                next.loss += edge.cost.total() + graph.transitions[*join].cost.total();
                 next.pathLength += edge.pathLengthPredictionVoxels;
                 expanded.push_back(std::move(next));
             }
@@ -211,6 +236,45 @@ nlohmann::json pointJson(const cv::Vec3d& point)
     return nlohmann::json::array({point[0], point[1], point[2]});
 }
 
+nlohmann::json costJson(const FiberletPathCost& cost)
+{
+    return {
+        {"invalid_prediction", cost.invalidPrediction},
+        {"alignment", cost.alignment},
+        {"isotropic_smoothness", cost.isotropicSmoothness},
+        {"tangent_smoothness", cost.tangentSmoothness},
+        {"normal_smoothness", cost.normalSmoothness},
+        {"total", cost.total()},
+    };
+}
+
+FiberLocalMetricSample localSample(const FiberStoredPredictionSample& sample)
+{
+    return {
+        cv::Vec3f(sample.direction),
+        static_cast<float>(sample.presence),
+        sample.valid,
+    };
+}
+
+FiberletPathCost pathCost(const FiberLocalMetricCost& local)
+{
+    FiberletPathCost cost;
+    cost.invalidPrediction = local.invalidPrediction;
+    cost.alignment = local.alignment;
+    cost.isotropicSmoothness = local.isotropicSmoothness;
+    cost.tangentSmoothness = local.tangentSmoothness;
+    cost.normalSmoothness = local.normalSmoothness;
+    return cost;
+}
+
+bool sameAxis(const cv::Vec3d& left, const cv::Vec3d& right)
+{
+    const cv::Vec3d a = normalized(left);
+    const cv::Vec3d b = normalized(right);
+    return length(a) > kEpsilon && length(b) > kEpsilon && std::abs(a.dot(b)) >= 1.0 - 1.0e-9;
+}
+
 }  // namespace
 
 FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximumJoinAngleDegrees)
@@ -224,16 +288,25 @@ FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximum
     graph.anchorCellSizePredictionVoxels = paths.anchorCellSizePredictionVoxels;
     graph.maximumJoinAngleDegrees = maximumJoinAngleDegrees;
     std::map<FiberletAnchorId, size_t> nodeByAnchor;
-    const auto ensureNode = [&](const FiberletAnchorId& id, const cv::Vec3d& positionPrediction) {
-        const auto [it, inserted] = nodeByAnchor.emplace(id, graph.nodes.size());
-        const cv::Vec3d positionBase = positionPrediction * graph.predictionToBaseScale;
-        if (inserted) {
-            graph.nodes.push_back({id, positionBase, {}});
-        } else if (length(graph.nodes[it->second].positionBaseXYZ - positionBase) > 1.0e-9) {
-            throw std::invalid_argument("fiberlet graph anchor identity has inconsistent positions");
-        }
-        return it->second;
-    };
+    const auto ensureNode =
+        [&](const FiberletAnchorId& id, const cv::Vec3d& positionPrediction, const FiberStoredPredictionSample& prediction, const cv::Vec3d& normal, bool normalValid) {
+            const auto [it, inserted] = nodeByAnchor.emplace(id, graph.nodes.size());
+            const cv::Vec3d positionBase = positionPrediction * graph.predictionToBaseScale;
+            if (inserted) {
+                graph.nodes.push_back({id, positionBase, prediction, normal, normalValid, {}});
+            } else if (length(graph.nodes[it->second].positionBaseXYZ - positionBase) > 1.0e-9) {
+                throw std::invalid_argument("fiberlet graph anchor identity has inconsistent positions");
+            } else {
+                const auto& existing = graph.nodes[it->second];
+                if (existing.prediction.valid != prediction.valid ||
+                    (prediction.valid && (!sameAxis(existing.prediction.direction, prediction.direction) ||
+                                          std::abs(existing.prediction.presence - prediction.presence) > 1.0e-9)) ||
+                    existing.normalValid != normalValid || (normalValid && !sameAxis(existing.normalXYZ, normal))) {
+                    throw std::invalid_argument("fiberlet graph anchor identity has inconsistent scoring samples");
+                }
+            }
+            return it->second;
+        };
 
     const auto visual = fiberletPathVisualMetrics(paths);
     std::map<size_t, FiberletPathVisualMetric> metricByCandidate;
@@ -247,13 +320,15 @@ FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximum
             !std::isfinite(candidate.cost.total())) {
             throw std::invalid_argument("successful fiberlet is incomplete for graph construction");
         }
-        const size_t start = ensureNode(candidate.start, candidate.startPositionPredictionXYZ);
-        const size_t target = ensureNode(candidate.target, candidate.targetPositionPredictionXYZ);
+        const size_t start =
+            ensureNode(candidate.start, candidate.startPositionPredictionXYZ, candidate.startPrediction, candidate.startNormalXYZ, candidate.startNormalValid);
+        const size_t target = ensureNode(
+            candidate.target, candidate.targetPositionPredictionXYZ, candidate.targetPrediction, candidate.targetNormalXYZ, candidate.targetNormalValid);
         FiberletGraphEdge edge;
         edge.candidateIndex = candidateIndex;
         edge.startNode = start;
         edge.targetNode = target;
-        edge.totalLoss = candidate.cost.total();
+        edge.cost = candidate.cost;
         const auto metric = metricByCandidate.find(candidateIndex);
         if (metric == metricByCandidate.end())
             throw std::invalid_argument("successful fiberlet has no visual metric");
@@ -285,8 +360,27 @@ FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximum
                 if (arcEdge(directedIncoming) == arcEdge(outgoingArc))
                     continue;
                 const double angle = angleDegrees(incomingDirection, arcStartDirection(graph, outgoingArc));
-                if (angle < maximumJoinAngleDegrees) {
-                    graph.transitions.push_back({directedIncoming, outgoingArc, angle});
+                if (angle < maximumJoinAngleDegrees && graph.nodes[node].prediction.valid) {
+                    const double incomingLength = arcEndLength(graph, directedIncoming);
+                    const double outgoingLength = arcStartLength(graph, outgoingArc);
+                    const auto sample = localSample(graph.nodes[node].prediction);
+                    const auto cost = fiberLocalMetricCost(
+                        &sample,
+                        sample,
+                        cv::Vec3f(incomingDirection),
+                        static_cast<float>(incomingLength),
+                        cv::Vec3f(arcStartDirection(graph, outgoingArc)),
+                        static_cast<float>(outgoingLength),
+                        cv::Vec3f(graph.nodes[node].normalXYZ),
+                        graph.nodes[node].normalValid,
+                        FiberLocalMetricConfig{
+                            static_cast<float>(paths.config.invalidPredictionCostPerVoxel),
+                            FiberLocalSmoothnessConfig{
+                                static_cast<float>(paths.config.smoothnessWeight),
+                                static_cast<float>(paths.config.smoothnessNormalWeight),
+                                static_cast<float>(paths.config.smoothnessTangentWeight),
+                                static_cast<float>(paths.config.smoothnessFreeAngleDegrees * kPi / 180.0)}});
+                    graph.transitions.push_back({directedIncoming, outgoingArc, angle, incomingLength, outgoingLength, pathCost(cost)});
                 }
             }
         }
@@ -306,8 +400,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(const FiberletGraph& graph, c
     }
     const auto reference = makePolylineArcGeometry(referencePointsBaseXYZ);
     FiberletGraphReplayResult result;
-    result.requestedPostrollDistanceBaseVoxels =
-        config.postrollDistanceBaseVoxels;
+    result.requestedPostrollDistanceBaseVoxels = config.postrollDistanceBaseVoxels;
     const cv::Vec3d startDirection = normalized(referencePointsBaseXYZ[1] - referencePointsBaseXYZ[0]);
 
     std::optional<size_t> startNode;
@@ -368,13 +461,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(const FiberletGraph& graph, c
         const auto selected =
             bestLookaheadRoute(graph, currentNode, incomingArc, visitedNodes, config.beamWidth, config.lookaheadEdges, incomingArc.has_value() ? std::nullopt : std::make_optional(startDirection));
         if (!selected.has_value()) {
-            result.status = failed
-                ? FiberletGraphReplayStatus::FailureTruncated
-                : FiberletGraphReplayStatus::GraphExhausted;
+            result.status = failed ? FiberletGraphReplayStatus::FailureTruncated : FiberletGraphReplayStatus::GraphExhausted;
             if (failed) {
-                result.reason = previousReferenceArc >= reference.length() - kEpsilon
-                    ? "postroll_comparison_interval_exhausted"
-                    : "postroll_graph_exhausted";
+                result.reason = previousReferenceArc >= reference.length() - kEpsilon ? "postroll_comparison_interval_exhausted" : "postroll_graph_exhausted";
             } else {
                 result.reason = "no_admissible_continuation";
             }
@@ -412,13 +501,21 @@ FiberletGraphReplayResult traceFiberletGraphReplay(const FiberletGraph& graph, c
         }
         result.candidateIndices.push_back(edge.candidateIndex);
         result.arcIndices.push_back(arc);
-        result.totalLoss += edge.totalLoss;
+        result.edgeCost += edge.cost;
+        result.totalLoss += edge.cost.total();
+        if (incomingArc.has_value()) {
+            const auto join = transitionIndex(graph, *incomingArc, arc);
+            if (!join.has_value())
+                throw std::logic_error("selected fiberlet route has no graph transition");
+            result.transitionIndices.push_back(*join);
+            result.transitionCost += graph.transitions[*join].cost;
+            result.totalLoss += graph.transitions[*join].cost.total();
+        }
         result.pathLengthPredictionVoxels += edge.pathLengthPredictionVoxels;
         incomingArc = arc;
         currentNode = arcTarget(graph, arc);
         visitedNodes.insert(currentNode);
-        if (failed && result.completedPostrollDistanceBaseVoxels + kEpsilon >=
-                          result.requestedPostrollDistanceBaseVoxels) {
+        if (failed && result.completedPostrollDistanceBaseVoxels + kEpsilon >= result.requestedPostrollDistanceBaseVoxels) {
             result.status = FiberletGraphReplayStatus::FailureWithPostroll;
             result.reason = "postroll_distance_reached_at_anchor";
             result.stopNodeIndex = currentNode;
@@ -466,6 +563,11 @@ nlohmann::json fiberletGraphJson(const FiberletGraph& graph)
             {"anchor", anchorIdJson(node.anchor)},
             {"position_base_xyz", pointJson(node.positionBaseXYZ)},
             {"outgoing_arcs", node.outgoingArcs},
+            {"prediction_direction_xyz", pointJson(node.prediction.direction)},
+            {"prediction_presence", node.prediction.presence},
+            {"prediction_valid", node.prediction.valid},
+            {"normal_xyz", pointJson(node.normalXYZ)},
+            {"normal_valid", node.normalValid},
         });
     }
     for (size_t edgeIndex = 0; edgeIndex < graph.edges.size(); ++edgeIndex) {
@@ -481,7 +583,7 @@ nlohmann::json fiberletGraphJson(const FiberletGraph& graph)
             {"start_node", edge.startNode},
             {"target_node", edge.targetNode},
             {"path_length_prediction_voxels", edge.pathLengthPredictionVoxels},
-            {"total_loss", edge.totalLoss},
+            {"cost", costJson(edge.cost)},
             {"points_base_xyz", std::move(points)},
         });
     }
@@ -490,6 +592,9 @@ nlohmann::json fiberletGraphJson(const FiberletGraph& graph)
             {"incoming_arc", transition.incomingArc},
             {"outgoing_arc", transition.outgoingArc},
             {"angle_degrees", transition.angleDegrees},
+            {"incoming_length_prediction_voxels", transition.incomingLengthPredictionVoxels},
+            {"outgoing_length_prediction_voxels", transition.outgoingLengthPredictionVoxels},
+            {"cost", costJson(transition.cost)},
         });
     }
     return root;
@@ -553,6 +658,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         {"route_points_base_xyz", std::move(points)},
         {"candidate_indices", replay.candidateIndices},
         {"arc_indices", replay.arcIndices},
+        {"transition_indices", replay.transitionIndices},
         {"failure_candidate_index", replay.failureCandidateIndex.has_value() ? nlohmann::json(*replay.failureCandidateIndex) : nlohmann::json(nullptr)},
         {"failure_candidate_path_point_index",
          replay.failureCandidatePathPointIndex.has_value() ? nlohmann::json(*replay.failureCandidatePathPointIndex) : nlohmann::json(nullptr)},
@@ -564,30 +670,22 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
          replay.failureReferenceArcBase.has_value() ? nlohmann::json(*replay.failureReferenceArcBase) : nlohmann::json(nullptr)},
         {"postroll", nullptr},
         {"total_loss", replay.totalLoss},
+        {"edge_cost", costJson(replay.edgeCost)},
+        {"transition_cost", costJson(replay.transitionCost)},
         {"path_length_prediction_voxels", replay.pathLengthPredictionVoxels},
         {"loss_per_prediction_voxel",
          replay.pathLengthPredictionVoxels > kEpsilon ? nlohmann::json(replay.totalLoss / replay.pathLengthPredictionVoxels) : nlohmann::json(nullptr)},
     };
     const bool failed = replay.failureRoutePointIndex.has_value();
     if (failed) {
-        const bool complete =
-            replay.status == FiberletGraphReplayStatus::FailureWithPostroll;
+        const bool complete = replay.status == FiberletGraphReplayStatus::FailureWithPostroll;
         root["postroll"] = {
             {"requested_distance_base_voxels", replay.requestedPostrollDistanceBaseVoxels},
             {"completed_distance_base_voxels", replay.completedPostrollDistanceBaseVoxels},
             {"complete", complete},
             {"overshoot_base_voxels",
-             complete ? std::max(
-                            0.0,
-                            replay.completedPostrollDistanceBaseVoxels -
-                                replay.requestedPostrollDistanceBaseVoxels)
-                      : 0.0},
-            {"shortfall_base_voxels",
-             complete ? 0.0
-                      : std::max(
-                            0.0,
-                            replay.requestedPostrollDistanceBaseVoxels -
-                                replay.completedPostrollDistanceBaseVoxels)},
+             complete ? std::max(0.0, replay.completedPostrollDistanceBaseVoxels - replay.requestedPostrollDistanceBaseVoxels) : 0.0},
+            {"shortfall_base_voxels", complete ? 0.0 : std::max(0.0, replay.requestedPostrollDistanceBaseVoxels - replay.completedPostrollDistanceBaseVoxels)},
         };
     }
     return root;

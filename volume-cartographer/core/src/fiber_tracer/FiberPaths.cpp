@@ -2,6 +2,7 @@
 
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/TexturedMesh.hpp"
+#include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberGraph.hpp"
 
@@ -56,21 +57,40 @@ struct FlatAnchor {
     FiberAnchor anchor;
 };
 
-struct Move {
-    Voxel delta{0, 0, 0};
-    cv::Vec3d direction{1.0, 0.0, 0.0};
-    double length = 1.0;
+struct LocalNodeKey {
+    size_t layer = 0;
+    int transverseU = 0;
+    int transverseV = 0;
+
+    auto operator<=>(const LocalNodeKey&) const = default;
 };
 
-struct Attachment {
-    Voxel voxel{0, 0, 0};
-    cv::Vec3d direction{1.0, 0.0, 0.0};
+struct LocalNodeKeyHash {
+    size_t operator()(const LocalNodeKey& key) const noexcept
+    {
+        size_t hash = std::hash<size_t>{}(key.layer);
+        hash ^= std::hash<int>{}(key.transverseU) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        hash ^= std::hash<int>{}(key.transverseV) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        return hash;
+    }
+};
+
+struct CurvedLayer {
+    double arc = 0.0;
+    cv::Vec3d center{0.0, 0.0, 0.0};
+    cv::Vec3d tangent{1.0, 0.0, 0.0};
+    cv::Vec3d transverseU{0.0, 1.0, 0.0};
+    cv::Vec3d transverseV{0.0, 0.0, 1.0};
+};
+
+struct CurvedDomain {
+    std::vector<CurvedLayer> layers;
     double length = 0.0;
 };
 
 struct SearchNode {
-    Voxel voxel{0, 0, 0};
-    double progress = 0.0;
+    LocalNodeKey key;
+    cv::Vec3d point{0.0, 0.0, 0.0};
     FiberStoredPredictionSample prediction;
     vc::lasagna::NormalSample normal;
 };
@@ -94,10 +114,7 @@ struct ScoringVolume {
     std::vector<ScoringVoxel> voxels;
     std::unordered_map<Voxel, ScoringVoxel, VoxelHash> sparseVoxels;
 
-    [[nodiscard]] size_t size() const noexcept
-    {
-        return voxels.empty() ? sparseVoxels.size() : voxels.size();
-    }
+    [[nodiscard]] size_t size() const noexcept { return voxels.empty() ? sparseVoxels.size() : voxels.size(); }
 
     [[nodiscard]] const ScoringVoxel& at(const Voxel& voxel) const
     {
@@ -130,6 +147,8 @@ struct DpState {
     bool reached = false;
     FiberletPathCost cost;
     BackPointer previous;
+    cv::Vec3d incomingDirection{0.0, 0.0, 0.0};
+    double incomingLength = 0.0;
 };
 
 double vectorLength(const cv::Vec3d& value)
@@ -145,7 +164,7 @@ cv::Vec3d normalized(const cv::Vec3d& value)
     return value / length;
 }
 
-cv::Vec3d voxelPoint(const Voxel& voxel)
+cv::Vec3d nativeVoxelPoint(const Voxel& voxel)
 {
     return {static_cast<double>(voxel[0]), static_cast<double>(voxel[1]), static_cast<double>(voxel[2])};
 }
@@ -162,10 +181,16 @@ bool finiteVector(const cv::Vec3d& value)
     return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
 }
 
-bool insideGrid(const Voxel& voxel, const FiberPredictionGridInfo& grid)
+bool insidePredictionGrid(const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
 {
-    return voxel[0] >= 0 && voxel[1] >= 0 && voxel[2] >= 0 && static_cast<uint64_t>(voxel[0]) < grid.shapeZYX[2] &&
-           static_cast<uint64_t>(voxel[1]) < grid.shapeZYX[1] && static_cast<uint64_t>(voxel[2]) < grid.shapeZYX[0];
+    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (shapeXYZ[axis] == 0 || !std::isfinite(point[axis]) || point[axis] < 0.0)
+            return false;
+        if (point[axis] > static_cast<double>(shapeXYZ[axis] - 1))
+            return false;
+    }
+    return true;
 }
 
 std::array<size_t, 3> storedIndex(const Voxel& voxel)
@@ -227,23 +252,121 @@ std::vector<FlatAnchor> flattenAnchors(const FiberAnchorExtractionReport& report
     return anchors;
 }
 
-std::vector<cv::Vec3d> hermitePolyline(const cv::Vec3d& start, const cv::Vec3d& target, const cv::Vec3d& startAxis, const cv::Vec3d& targetAxis)
+cv::Vec3d hermitePoint(const cv::Vec3d& start, const cv::Vec3d& target, const cv::Vec3d& startDerivative, const cv::Vec3d& targetDerivative, double t)
 {
-    const double distance = vectorLength(target - start);
-    const size_t segments = static_cast<size_t>(std::max(8.0, std::ceil(4.0 * distance)));
-    std::vector<cv::Vec3d> points;
-    points.reserve(segments + 1);
-    const cv::Vec3d firstDerivative = startAxis * distance;
-    const cv::Vec3d secondDerivative = targetAxis * distance;
-    for (size_t index = 0; index <= segments; ++index) {
-        const double t = static_cast<double>(index) / static_cast<double>(segments);
-        const double t2 = t * t;
-        const double t3 = t2 * t;
-        points.push_back(
-            start * (2.0 * t3 - 3.0 * t2 + 1.0) + firstDerivative * (t3 - 2.0 * t2 + t) + target * (-2.0 * t3 + 3.0 * t2) +
-            secondDerivative * (t3 - t2));
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    return start * (2.0 * t3 - 3.0 * t2 + 1.0) + startDerivative * (t3 - 2.0 * t2 + t) + target * (-2.0 * t3 + 3.0 * t2) +
+           targetDerivative * (t3 - t2);
+}
+
+cv::Vec3d hermiteDerivative(const cv::Vec3d& start, const cv::Vec3d& target, const cv::Vec3d& startDerivative, const cv::Vec3d& targetDerivative, double t)
+{
+    const double t2 = t * t;
+    return start * (6.0 * t2 - 6.0 * t) + startDerivative * (3.0 * t2 - 4.0 * t + 1.0) + target * (-6.0 * t2 + 6.0 * t) +
+           targetDerivative * (3.0 * t2 - 2.0 * t);
+}
+
+cv::Vec3d rotateMinimal(const cv::Vec3d& value, const cv::Vec3d& from, const cv::Vec3d& to)
+{
+    const cv::Vec3d cross = from.cross(to);
+    const double sine = vectorLength(cross);
+    const double cosine = std::clamp(from.dot(to), -1.0, 1.0);
+    if (sine <= kEpsilon) {
+        if (cosine >= 0.0)
+            return value;
+        cv::Vec3d axis = normalized(value - from * value.dot(from));
+        if (vectorLength(axis) <= kEpsilon)
+            axis = normalized(cv::Vec3d{1.0, 0.0, 0.0} - from * from[0]);
+        return axis * (2.0 * axis.dot(value)) - value;
     }
+    const cv::Vec3d axis = cross / sine;
+    return value * cosine + axis.cross(value) * sine + axis * axis.dot(value) * (1.0 - cosine);
+}
+
+CurvedDomain makeCurvedDomain(const FiberletCandidateResult& candidate, const FiberletPathConfig& config)
+{
+    const cv::Vec3d chord = candidate.targetPositionPredictionXYZ - candidate.startPositionPredictionXYZ;
+    const double chordLength = vectorLength(chord);
+    if (!(chordLength > kEpsilon))
+        throw std::invalid_argument("fiberlet curved domain requires distinct endpoints");
+    const cv::Vec3d startDerivative = candidate.startAxisXYZ * chordLength;
+    const cv::Vec3d targetDerivative = candidate.targetAxisXYZ * chordLength;
+    const size_t samples = static_cast<size_t>(std::max(64.0, std::ceil(chordLength * 16.0)));
+    std::vector<double> sampleArcs(samples + 1, 0.0);
+    std::vector<cv::Vec3d> samplePoints(samples + 1);
+    for (size_t index = 0; index <= samples; ++index) {
+        const double t = static_cast<double>(index) / static_cast<double>(samples);
+        samplePoints[index] =
+            hermitePoint(candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ, startDerivative, targetDerivative, t);
+        if (index > 0) {
+            sampleArcs[index] = sampleArcs[index - 1] + vectorLength(samplePoints[index] - samplePoints[index - 1]);
+        }
+    }
+    CurvedDomain domain;
+    domain.length = sampleArcs.back();
+    if (!(domain.length > kEpsilon) || !std::isfinite(domain.length))
+        throw std::runtime_error("fiberlet Hermite centerline has invalid length");
+    std::vector<double> layerArcs{0.0};
+    for (double arc = config.longitudinalStepPredictionVoxels; arc < domain.length - kEpsilon; arc += config.longitudinalStepPredictionVoxels) {
+        layerArcs.push_back(arc);
+    }
+    layerArcs.push_back(domain.length);
+    domain.layers.reserve(layerArcs.size());
+    for (const double arc : layerArcs) {
+        double t = 0.0;
+        if (arc >= domain.length) {
+            t = 1.0;
+        } else if (arc > 0.0) {
+            const auto upper = std::lower_bound(sampleArcs.begin(), sampleArcs.end(), arc);
+            const size_t upperIndex = static_cast<size_t>(std::distance(sampleArcs.begin(), upper));
+            const size_t lowerIndex = upperIndex - 1;
+            const double span = sampleArcs[upperIndex] - sampleArcs[lowerIndex];
+            const double fraction = span > kEpsilon ? (arc - sampleArcs[lowerIndex]) / span : 0.0;
+            t = (static_cast<double>(lowerIndex) + fraction) / static_cast<double>(samples);
+        }
+        CurvedLayer layer;
+        layer.arc = arc;
+        layer.center =
+            hermitePoint(candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ, startDerivative, targetDerivative, t);
+        layer.tangent = normalized(
+            hermiteDerivative(candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ, startDerivative, targetDerivative, t));
+        if (vectorLength(layer.tangent) <= kEpsilon)
+            throw std::runtime_error("fiberlet Hermite centerline has a degenerate tangent");
+        if (domain.layers.empty()) {
+            const std::array<cv::Vec3d, 3> axes{cv::Vec3d{1.0, 0.0, 0.0}, cv::Vec3d{0.0, 1.0, 0.0}, cv::Vec3d{0.0, 0.0, 1.0}};
+            const auto reference = *std::min_element(axes.begin(), axes.end(), [&](const auto& left, const auto& right) {
+                return std::abs(left.dot(layer.tangent)) < std::abs(right.dot(layer.tangent));
+            });
+            layer.transverseU = normalized(reference - layer.tangent * reference.dot(layer.tangent));
+        } else {
+            layer.transverseU = rotateMinimal(domain.layers.back().transverseU, domain.layers.back().tangent, layer.tangent);
+            layer.transverseU = normalized(layer.transverseU - layer.tangent * layer.transverseU.dot(layer.tangent));
+        }
+        if (vectorLength(layer.transverseU) <= kEpsilon)
+            throw std::runtime_error("fiberlet transverse frame is degenerate");
+        layer.transverseV = normalized(layer.tangent.cross(layer.transverseU));
+        domain.layers.push_back(layer);
+    }
+    domain.layers.front().center = candidate.startPositionPredictionXYZ;
+    domain.layers.back().center = candidate.targetPositionPredictionXYZ;
+    return domain;
+}
+
+std::vector<cv::Vec3d> domainCenterline(const CurvedDomain& domain)
+{
+    std::vector<cv::Vec3d> points;
+    points.reserve(domain.layers.size());
+    for (const auto& layer : domain.layers)
+        points.push_back(layer.center);
     return points;
+}
+
+cv::Vec3d localNodePoint(const CurvedDomain& domain, const LocalNodeKey& key, const FiberletPathConfig& config)
+{
+    const auto& layer = domain.layers.at(key.layer);
+    return layer.center + layer.transverseU * (static_cast<double>(key.transverseU) * config.transverseStepPredictionVoxels) +
+           layer.transverseV * (static_cast<double>(key.transverseV) * config.transverseStepPredictionVoxels);
 }
 
 SearchCorridor makeSearchCorridor(const FiberletCandidateResult& candidate, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config)
@@ -251,8 +374,7 @@ SearchCorridor makeSearchCorridor(const FiberletCandidateResult& candidate, cons
     SearchCorridor corridor;
     const double radius = config.corridorRadiusPredictionVoxels > 0.0 ? config.corridorRadiusPredictionVoxels : static_cast<double>(cellSize);
     corridor.radiusSquared = radius * radius;
-    corridor.reference =
-        hermitePolyline(candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ, candidate.startAxisXYZ, candidate.targetAxisXYZ);
+    corridor.reference = domainCenterline(makeCurvedDomain(candidate, config));
     cv::Vec3d minimum = corridor.reference.front();
     cv::Vec3d maximum = corridor.reference.front();
     for (const auto& point : corridor.reference) {
@@ -304,63 +426,129 @@ bool insideCorridor(const cv::Vec3d& point, const std::vector<cv::Vec3d>& refere
     return false;
 }
 
-std::vector<Attachment> endpointAttachments(
-    const cv::Vec3d& endpoint, const cv::Vec3d& orientedAxis, const cv::Vec3d& chord, bool source, double maximumAngleRadians, const FiberPredictionGridInfo& grid)
+std::vector<LocalNodeKey> enumerateLocalNodes(
+    const CurvedDomain& domain, const SearchCorridor& corridor, const FiberletPathConfig& config, const FiberPredictionGridInfo& grid, const FiberletPointPredicate& pointPredicate)
 {
-    Voxel lower{};
-    Voxel upper{};
-    for (int axis = 0; axis < 3; ++axis) {
-        lower[axis] = static_cast<int64_t>(std::floor(endpoint[axis])) - 1;
-        upper[axis] = static_cast<int64_t>(std::ceil(endpoint[axis])) + 1;
-    }
-    constexpr double maximumAttachmentLengthSquared = 3.0;
-    std::vector<Attachment> out;
-    for (int64_t z = lower[2]; z <= upper[2]; ++z) {
-        for (int64_t y = lower[1]; y <= upper[1]; ++y) {
-            for (int64_t x = lower[0]; x <= upper[0]; ++x) {
-                const Voxel voxel{x, y, z};
-                if (!insideGrid(voxel, grid))
-                    continue;
-                cv::Vec3d delta = source ? voxelPoint(voxel) - endpoint : endpoint - voxelPoint(voxel);
-                const double length = vectorLength(delta);
-                if (length * length > maximumAttachmentLengthSquared + kEpsilon)
-                    continue;
-                if (!(length > kEpsilon)) {
-                    out.push_back({voxel, orientedAxis, 0.0});
-                    continue;
+    const double radius = std::sqrt(corridor.radiusSquared);
+    const int transverseLimit = static_cast<int>(std::ceil(radius / config.transverseStepPredictionVoxels));
+    std::vector<LocalNodeKey> nodes;
+    if (domain.layers.size() <= 2)
+        return nodes;
+    for (size_t layer = 1; layer + 1 < domain.layers.size(); ++layer) {
+        for (int u = -transverseLimit; u <= transverseLimit; ++u) {
+            for (int v = -transverseLimit; v <= transverseLimit; ++v) {
+                const LocalNodeKey key{layer, u, v};
+                const cv::Vec3d point = localNodePoint(domain, key, config);
+                if (insidePredictionGrid(point, grid) && insideCorridor(point, corridor.reference, corridor.radiusSquared) &&
+                    (!pointPredicate || pointPredicate(point))) {
+                    nodes.push_back(key);
                 }
-                const cv::Vec3d direction = delta / length;
-                if (!(direction.dot(chord) > kEpsilon) || directedAngle(direction, orientedAxis) > maximumAngleRadians + kEpsilon) {
-                    continue;
-                }
-                out.push_back({voxel, direction, length});
             }
         }
     }
-    std::sort(out.begin(), out.end(), [](const Attachment& left, const Attachment& right) { return left.voxel < right.voxel; });
-    out.erase(std::unique(out.begin(), out.end(), [](const Attachment& left, const Attachment& right) { return left.voxel == right.voxel; }), out.end());
-    return out;
+    return nodes;
 }
 
-std::set<Voxel> enumerateCorridorVoxels(
-    const SearchCorridor& corridor,
-    const FiberletPointPredicate& pointPredicate)
+std::vector<std::pair<Voxel, double>> interpolationCorners(const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
 {
-    std::set<Voxel> voxels;
-    for (int64_t z = corridor.begin[2]; z <= corridor.end[2]; ++z) {
-        for (int64_t y = corridor.begin[1]; y <= corridor.end[1]; ++y) {
-            for (int64_t x = corridor.begin[0]; x <= corridor.end[0]; ++x) {
-                const Voxel voxel{x, y, z};
-                const cv::Vec3d point = voxelPoint(voxel);
-                if (insideCorridor(
-                        point, corridor.reference, corridor.radiusSquared) &&
-                    (!pointPredicate || pointPredicate(point))) {
-                    voxels.insert(voxel);
+    if (!insidePredictionGrid(point, grid))
+        throw std::out_of_range("fiberlet sample point is outside the prediction volume");
+    Voxel lower{};
+    Voxel upper{};
+    std::array<double, 3> fraction{};
+    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        lower[axis] = static_cast<int64_t>(std::floor(point[axis]));
+        upper[axis] = std::min<int64_t>(lower[axis] + 1, static_cast<int64_t>(shapeXYZ[axis] - 1));
+        fraction[axis] = point[axis] - static_cast<double>(lower[axis]);
+    }
+    std::vector<std::pair<Voxel, double>> corners;
+    corners.reserve(8);
+    for (int z = 0; z <= 1; ++z) {
+        const double wz = z == 0 ? 1.0 - fraction[2] : fraction[2];
+        if (!(wz > 0.0))
+            continue;
+        for (int y = 0; y <= 1; ++y) {
+            const double wy = y == 0 ? 1.0 - fraction[1] : fraction[1];
+            if (!(wy > 0.0))
+                continue;
+            for (int x = 0; x <= 1; ++x) {
+                const double wx = x == 0 ? 1.0 - fraction[0] : fraction[0];
+                const double weight = wx * wy * wz;
+                if (weight > 0.0) {
+                    corners.push_back({{x == 0 ? lower[0] : upper[0], y == 0 ? lower[1] : upper[1], z == 0 ? lower[2] : upper[2]}, weight});
                 }
             }
         }
     }
-    return voxels;
+    return corners;
+}
+
+ScoringVoxel interpolateScoringVoxel(const ScoringVolume& volume, const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
+{
+    ScoringVoxel output;
+    cv::Matx33d predictionTensor = cv::Matx33d::zeros();
+    cv::Matx33d normalTensor = cv::Matx33d::zeros();
+    bool predictionValid = true;
+    bool normalValid = true;
+    bool predictionAxesIdentical = true;
+    bool normalAxesIdentical = true;
+    std::optional<cv::Vec3d> firstPredictionAxis;
+    std::optional<cv::Vec3d> firstNormalAxis;
+    double presence = 0.0;
+    for (const auto& [corner, weight] : interpolationCorners(point, grid)) {
+        const auto& sample = volume.at(corner);
+        const double directionNorm2 = sample.prediction.direction.dot(sample.prediction.direction);
+        if (!sample.prediction.valid || !finiteVector(sample.prediction.direction) || !std::isfinite(sample.prediction.presence) ||
+            !(directionNorm2 > kEpsilon) || !std::isfinite(directionNorm2)) {
+            predictionValid = false;
+        } else {
+            const cv::Vec3d axis = sample.prediction.direction / std::sqrt(directionNorm2);
+            if (!firstPredictionAxis.has_value())
+                firstPredictionAxis = axis;
+            else if (std::abs(firstPredictionAxis->dot(axis)) < 1.0 - 1.0e-12)
+                predictionAxesIdentical = false;
+            predictionTensor += fiberAxisTensor(axis, weight);
+            presence += weight * sample.prediction.presence;
+        }
+
+        const double normalNorm2 = sample.normal.dot(sample.normal);
+        if (!sample.normalValid || !finiteVector(sample.normal) || !(normalNorm2 > kEpsilon) || !std::isfinite(normalNorm2)) {
+            normalValid = false;
+        } else {
+            const cv::Vec3d axis = sample.normal / std::sqrt(normalNorm2);
+            if (!firstNormalAxis.has_value())
+                firstNormalAxis = axis;
+            else if (std::abs(firstNormalAxis->dot(axis)) < 1.0 - 1.0e-12)
+                normalAxesIdentical = false;
+            normalTensor += fiberAxisTensor(axis, weight);
+        }
+    }
+    if (predictionValid && std::isfinite(presence)) {
+        const auto principal = principalFiberAxis(predictionTensor);
+        if (predictionAxesIdentical && firstPredictionAxis.has_value()) {
+            output.prediction.direction = canonicalFiberAxis(*firstPredictionAxis);
+            output.prediction.presence = presence;
+            output.prediction.presenceValid = true;
+            output.prediction.valid = true;
+        } else if (principal.unique) {
+            output.prediction.direction = principal.axis;
+            output.prediction.presence = presence;
+            output.prediction.presenceValid = true;
+            output.prediction.valid = true;
+        }
+    }
+    if (normalValid) {
+        const auto principal = principalFiberAxis(normalTensor);
+        if (normalAxesIdentical && firstNormalAxis.has_value()) {
+            output.normal = canonicalFiberAxis(*firstNormalAxis);
+            output.normalValid = true;
+        } else if (principal.unique) {
+            output.normal = principal.axis;
+            output.normalValid = true;
+        }
+    }
+    return output;
 }
 
 size_t checkedProduct(size_t left, size_t right, const char* description)
@@ -386,10 +574,12 @@ ScoringVolume preloadScoringVolume(
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
     size_t& estimatedPreloadBytes,
+    size_t& evaluatedNodeCount,
     const FiberletPointPredicate& pointPredicate)
 {
     ScoringVolume volume;
     estimatedPreloadBytes = 0;
+    evaluatedNodeCount = 0;
     if (searchCandidateIndices.empty())
         return volume;
 
@@ -421,38 +611,24 @@ ScoringVolume preloadScoringVolume(
     const size_t xy = checkedProduct(volume.sizeXYZ[0], volume.sizeXYZ[1], "fiberlet preload XY extent");
     const size_t denseCount = checkedProduct(xy, volume.sizeXYZ[2], "fiberlet preload voxel count");
     std::set<Voxel> sparseKeys;
-    if (pointPredicate) {
-        for (const size_t candidateIndex : searchCandidateIndices) {
-            const auto& candidate = candidates.at(candidateIndex);
-            const SearchCorridor corridor = makeSearchCorridor(
-                candidate, grid, cellSize, config);
-            const auto corridorVoxels = enumerateCorridorVoxels(
-                corridor, pointPredicate);
-            sparseKeys.insert(corridorVoxels.begin(), corridorVoxels.end());
-            const cv::Vec3d chord = normalized(
-                candidate.targetPositionPredictionXYZ -
-                candidate.startPositionPredictionXYZ);
-            const double maximumAngle =
-                config.maximumEndpointAngleDegrees * kPi / 180.0;
-            for (const auto& attachment : endpointAttachments(
-                     candidate.startPositionPredictionXYZ,
-                     candidate.startAxisXYZ,
-                     chord,
-                     true,
-                     maximumAngle,
-                     grid)) {
-                if (pointPredicate(voxelPoint(attachment.voxel)))
-                    sparseKeys.insert(attachment.voxel);
-            }
-            for (const auto& attachment : endpointAttachments(
-                     candidate.targetPositionPredictionXYZ,
-                     candidate.targetAxisXYZ,
-                     chord,
-                     false,
-                     maximumAngle,
-                     grid)) {
-                if (pointPredicate(voxelPoint(attachment.voxel)))
-                    sparseKeys.insert(attachment.voxel);
+    for (const size_t candidateIndex : searchCandidateIndices) {
+        const auto& candidate = candidates.at(candidateIndex);
+        const CurvedDomain domain = makeCurvedDomain(candidate, config);
+        const SearchCorridor corridor = makeSearchCorridor(candidate, grid, cellSize, config);
+        const auto localNodes = enumerateLocalNodes(domain, corridor, config, grid, pointPredicate);
+        evaluatedNodeCount = checkedSum(
+            evaluatedNodeCount, checkedSum(localNodes.size(), 2, "fiberlet evaluated node count"), "fiberlet evaluated node count");
+        if (pointPredicate) {
+            const auto addPoint = [&](const cv::Vec3d& point) {
+                for (const auto& [corner, weight] : interpolationCorners(point, grid)) {
+                    (void)weight;
+                    sparseKeys.insert(corner);
+                }
+            };
+            addPoint(candidate.startPositionPredictionXYZ);
+            addPoint(candidate.targetPositionPredictionXYZ);
+            for (const auto& key : localNodes) {
+                addPoint(localNodePoint(domain, key, config));
             }
         }
     }
@@ -485,7 +661,7 @@ ScoringVolume preloadScoringVolume(
         for (const auto& voxel : sparseKeys) {
             orderedVoxels.push_back(voxel);
             indices.push_back(storedIndex(voxel));
-            normalPoints.push_back(voxelPoint(voxel));
+            normalPoints.push_back(nativeVoxelPoint(voxel));
         }
     } else {
         for (int64_t z = unionBegin[2]; z <= unionEnd[2]; ++z) {
@@ -494,7 +670,7 @@ ScoringVolume preloadScoringVolume(
                     const Voxel voxel{x, y, z};
                     orderedVoxels.push_back(voxel);
                     indices.push_back(storedIndex(voxel));
-                    normalPoints.push_back(voxelPoint(voxel));
+                    normalPoints.push_back(nativeVoxelPoint(voxel));
                 }
             }
         }
@@ -511,9 +687,8 @@ ScoringVolume preloadScoringVolume(
     if (pointPredicate) {
         volume.sparseVoxels.reserve(count * 2);
         for (size_t index = 0; index < count; ++index) {
-            volume.sparseVoxels.emplace(orderedVoxels[index], ScoringVoxel{
-                predictions[index], normals[index].sample.normal,
-                normals[index].sample.valid});
+            volume.sparseVoxels
+                .emplace(orderedVoxels[index], ScoringVoxel{predictions[index], normals[index].sample.normal, normals[index].sample.valid});
         }
     } else {
         volume.voxels.resize(count);
@@ -526,56 +701,23 @@ ScoringVolume preloadScoringVolume(
     return volume;
 }
 
-std::vector<Move> forwardMoves(const cv::Vec3d& chord)
-{
-    std::vector<Move> moves;
-    for (int64_t z = -1; z <= 1; ++z) {
-        for (int64_t y = -1; y <= 1; ++y) {
-            for (int64_t x = -1; x <= 1; ++x) {
-                if (x == 0 && y == 0 && z == 0)
-                    continue;
-                const cv::Vec3d delta{static_cast<double>(x), static_cast<double>(y), static_cast<double>(z)};
-                const double length = vectorLength(delta);
-                const cv::Vec3d direction = delta / length;
-                if (direction.dot(chord) > kEpsilon)
-                    moves.push_back({{x, y, z}, direction, length});
-            }
-        }
-    }
-    return moves;
-}
-
 bool usablePrediction(const FiberStoredPredictionSample& prediction)
 {
     const double normSquared = prediction.direction.dot(prediction.direction);
-    return prediction.valid && finiteVector(prediction.direction) &&
-           std::isfinite(prediction.presence) &&
-           std::isfinite(normSquared) && normSquared > kEpsilon;
+    return prediction.valid && finiteVector(prediction.direction) && std::isfinite(prediction.presence) && std::isfinite(normSquared) &&
+           normSquared > kEpsilon;
 }
 
-bool withinPredictionDeviation(
-    const cv::Vec3d& direction,
-    const FiberStoredPredictionSample& prediction,
-    double maximumDeviationRadians)
+bool withinPredictionDeviation(const cv::Vec3d& direction, const FiberStoredPredictionSample& prediction, double maximumDeviationRadians)
 {
     if (!usablePrediction(prediction))
         return false;
     const cv::Vec3d unitDirection = normalized(direction);
     const cv::Vec3d unitPrediction = normalized(prediction.direction);
-    if (vectorLength(unitDirection) <= kEpsilon ||
-        vectorLength(unitPrediction) <= kEpsilon) {
+    if (vectorLength(unitDirection) <= kEpsilon || vectorLength(unitPrediction) <= kEpsilon) {
         return false;
     }
-    return std::abs(unitDirection.dot(unitPrediction)) >
-        std::cos(maximumDeviationRadians);
-}
-
-cv::Vec3d alignedAxis(const cv::Vec3d& axis, const cv::Vec3d& reference)
-{
-    cv::Vec3d aligned = normalized(axis);
-    if (aligned.dot(normalized(reference)) < 0.0)
-        aligned *= -1.0;
-    return aligned;
+    return std::abs(unitDirection.dot(unitPrediction)) > std::cos(maximumDeviationRadians);
 }
 
 cv::Vec3f floatVector(const cv::Vec3d& value)
@@ -587,38 +729,18 @@ cv::Vec3f floatVector(const cv::Vec3d& value)
     };
 }
 
-FiberletPathCost alignmentCost(
-    const FiberStoredPredictionSample* currentPrediction,
-    const FiberStoredPredictionSample& candidatePrediction,
-    const cv::Vec3d& previousStep,
-    const cv::Vec3d& candidateStep,
-    double edgeLength,
-    const FiberletPathConfig& config)
+FiberLocalMetricSample localSample(const FiberStoredPredictionSample& sample)
 {
-    FiberletPathCost cost;
-    if (!usablePrediction(candidatePrediction)) {
-        cost.invalidPrediction = config.invalidPredictionCostPerVoxel * edgeLength;
-        return cost;
-    }
-    const cv::Vec3d previous = normalized(previousStep);
-    const cv::Vec3d outgoing = normalized(candidateStep);
-    const cv::Vec3d current = currentPrediction != nullptr &&
-            usablePrediction(*currentPrediction)
-        ? alignedAxis(currentPrediction->direction, previous)
-        : previous;
-    const cv::Vec3d candidate =
-        alignedAxis(candidatePrediction.direction, outgoing);
-    cost.alignment = static_cast<double>(fiberLocalAlignmentLoss(
-                         static_cast<float>(candidatePrediction.presence),
-                         floatVector(previous),
-                         floatVector(outgoing),
-                         floatVector(current),
-                         floatVector(candidate))) *
-        edgeLength;
-    return cost;
+    return {
+        floatVector(sample.direction),
+        static_cast<float>(sample.presence),
+        usablePrediction(sample),
+    };
 }
 
-FiberletPathCost smoothnessCost(
+FiberletPathCost pathStepCost(
+    const FiberStoredPredictionSample* currentPrediction,
+    const FiberStoredPredictionSample& candidatePrediction,
     const cv::Vec3d& previousDirection,
     double previousLength,
     const cv::Vec3d& candidateDirection,
@@ -626,21 +748,29 @@ FiberletPathCost smoothnessCost(
     const vc::lasagna::NormalSample& normal,
     const FiberletPathConfig& config)
 {
-    const auto local = fiberLocalSmoothnessCost(
-        cv::Vec3f(previousDirection),
-        cv::Vec3f(candidateDirection),
-        cv::Vec3f(normal.normal),
+    const auto current = currentPrediction != nullptr ? std::make_optional(localSample(*currentPrediction)) : std::nullopt;
+    const auto local = fiberLocalMetricCost(
+        current.has_value() ? &*current : nullptr,
+        localSample(candidatePrediction),
+        floatVector(previousDirection),
+        static_cast<float>(previousLength),
+        floatVector(candidateDirection),
+        static_cast<float>(candidateLength),
+        floatVector(normal.normal),
         normal.valid,
-        FiberLocalSmoothnessConfig{
-            static_cast<float>(config.smoothnessWeight),
-            static_cast<float>(config.smoothnessNormalWeight),
-            static_cast<float>(config.smoothnessTangentWeight),
-            static_cast<float>(config.smoothnessFreeAngleDegrees * kPi / 180.0)});
-    const double effectiveLength = std::max(1.0, (previousLength + candidateLength) * 0.5);
+        FiberLocalMetricConfig{
+            static_cast<float>(config.invalidPredictionCostPerVoxel),
+            FiberLocalSmoothnessConfig{
+                static_cast<float>(config.smoothnessWeight),
+                static_cast<float>(config.smoothnessNormalWeight),
+                static_cast<float>(config.smoothnessTangentWeight),
+                static_cast<float>(config.smoothnessFreeAngleDegrees * kPi / 180.0)}});
     FiberletPathCost cost;
-    cost.isotropicSmoothness = local.isotropic / effectiveLength;
-    cost.tangentSmoothness = local.tangent / effectiveLength;
-    cost.normalSmoothness = local.normal / effectiveLength;
+    cost.invalidPrediction = local.invalidPrediction;
+    cost.alignment = local.alignment;
+    cost.isotropicSmoothness = local.isotropicSmoothness;
+    cost.tangentSmoothness = local.tangentSmoothness;
+    cost.normalSmoothness = local.normalSmoothness;
     return cost;
 }
 
@@ -650,7 +780,11 @@ bool betterCost(double candidate, double current)
 }
 
 FiberletCandidateResult solveCandidate(
-    FiberletCandidateResult candidate, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config, const ScoringVolume& scoringVolume,
+    FiberletCandidateResult candidate,
+    const FiberPredictionGridInfo& grid,
+    int cellSize,
+    const FiberletPathConfig& config,
+    const ScoringVolume& scoringVolume,
     const FiberletPointPredicate& pointPredicate)
 {
     candidate.searched = true;
@@ -660,91 +794,83 @@ FiberletCandidateResult solveCandidate(
         candidate.reason = "zero_length";
         return candidate;
     }
-    const cv::Vec3d chord = chordVector / chordLength;
     const double maximumAngle = config.maximumEndpointAngleDegrees * kPi / 180.0;
-    const double maximumPredictionDeviation =
-        config.maximumPredictionDeviationDegrees * kPi / 180.0;
-    const auto sources = endpointAttachments(candidate.startPositionPredictionXYZ, candidate.startAxisXYZ, chord, true, maximumAngle, grid);
-    if (sources.empty()) {
-        candidate.reason = "no_source_attachment";
-        return candidate;
-    }
-    const auto targets = endpointAttachments(candidate.targetPositionPredictionXYZ, candidate.targetAxisXYZ, chord, false, maximumAngle, grid);
-    if (targets.empty()) {
-        candidate.reason = "no_target_attachment";
-        return candidate;
-    }
-    const auto moves = forwardMoves(chord);
-    if (moves.empty()) {
-        candidate.reason = "no_forward_moves";
-        return candidate;
-    }
-
+    const double maximumPredictionDeviation = config.maximumPredictionDeviationDegrees * kPi / 180.0;
+    const CurvedDomain domain = makeCurvedDomain(candidate, config);
     const SearchCorridor corridor = makeSearchCorridor(candidate, grid, cellSize, config);
-    std::set<Voxel> voxelSet = enumerateCorridorVoxels(corridor, pointPredicate);
-    for (const auto& attachment : sources) {
-        if (!pointPredicate || pointPredicate(voxelPoint(attachment.voxel)))
-            voxelSet.insert(attachment.voxel);
+    const auto localKeys = enumerateLocalNodes(domain, corridor, config, grid, pointPredicate);
+    const ScoringVoxel startScoring = interpolateScoringVoxel(scoringVolume, candidate.startPositionPredictionXYZ, grid);
+    const ScoringVoxel targetScoring = interpolateScoringVoxel(scoringVolume, candidate.targetPositionPredictionXYZ, grid);
+    candidate.startPrediction = startScoring.prediction;
+    candidate.targetPrediction = targetScoring.prediction;
+    candidate.startNormalXYZ = startScoring.normal;
+    candidate.targetNormalXYZ = targetScoring.normal;
+    candidate.startNormalValid = startScoring.normalValid;
+    candidate.targetNormalValid = targetScoring.normalValid;
+
+    FiberStoredPredictionSample targetProxy;
+    targetProxy.direction = candidate.targetAxisXYZ;
+    targetProxy.presence = 1.0;
+    targetProxy.valid = true;
+    targetProxy.presenceValid = true;
+
+    if (domain.layers.size() == 2) {
+        const cv::Vec3d direction = chordVector / chordLength;
+        if (directedAngle(candidate.startAxisXYZ, direction) > maximumAngle + kEpsilon ||
+            directedAngle(direction, candidate.targetAxisXYZ) > maximumAngle + kEpsilon ||
+            !withinPredictionDeviation(direction, targetScoring.prediction, maximumPredictionDeviation)) {
+            candidate.reason = "no_path";
+            return candidate;
+        }
+        const vc::lasagna::NormalSample targetNormal{targetScoring.normal, targetScoring.normalValid, targetScoring.normalValid ? std::string{} : "invalid"};
+        candidate.cost =
+            pathStepCost(nullptr, targetScoring.prediction, candidate.startAxisXYZ, chordLength, direction, chordLength, targetNormal, config);
+        candidate.cost +=
+            pathStepCost(&targetScoring.prediction, targetProxy, direction, chordLength, candidate.targetAxisXYZ, 0.0, targetNormal, config);
+        candidate.pointsPredictionXYZ = {candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ};
+        candidate.scoreValid = true;
+        candidate.success = true;
+        candidate.reason = "success";
+        return candidate;
     }
-    for (const auto& attachment : targets) {
-        if (!pointPredicate || pointPredicate(voxelPoint(attachment.voxel)))
-            voxelSet.insert(attachment.voxel);
-    }
-    if (voxelSet.empty()) {
+    if (localKeys.empty()) {
         candidate.reason = "empty_corridor";
         return candidate;
     }
-
     std::vector<SearchNode> nodes;
-    nodes.reserve(voxelSet.size());
-    for (const auto& voxel : voxelSet) {
-        nodes.push_back({voxel, (voxelPoint(voxel) - candidate.startPositionPredictionXYZ).dot(chord)});
+    nodes.reserve(localKeys.size());
+    for (const auto& key : localKeys) {
+        const cv::Vec3d point = localNodePoint(domain, key, config);
+        const ScoringVoxel scoring = interpolateScoringVoxel(scoringVolume, point, grid);
+        nodes.push_back({key, point, scoring.prediction, {scoring.normal, scoring.normalValid, scoring.normalValid ? std::string{} : "invalid preloaded normal"}});
     }
-    std::sort(nodes.begin(), nodes.end(), [](const SearchNode& left, const SearchNode& right) {
-        if (left.progress != right.progress)
-            return left.progress < right.progress;
-        return left.voxel < right.voxel;
-    });
-    std::unordered_map<Voxel, size_t, VoxelHash> nodeIndex;
-    nodeIndex.reserve(nodes.size() * 2);
-    for (size_t index = 0; index < nodes.size(); ++index) {
-        nodeIndex.emplace(nodes[index].voxel, index);
-        const auto& scoring = scoringVolume.at(nodes[index].voxel);
-        nodes[index].prediction = scoring.prediction;
-        nodes[index].normal = {scoring.normal, scoring.normalValid, scoring.normalValid ? std::string{} : "invalid preloaded normal"};
-    }
+    std::unordered_map<LocalNodeKey, size_t, LocalNodeKeyHash> nodeIndex;
+    nodeIndex.reserve(checkedProduct(nodes.size(), 2, "fiberlet DP node hash capacity"));
+    for (size_t index = 0; index < nodes.size(); ++index)
+        nodeIndex.emplace(nodes[index].key, index);
 
-    const size_t stateCount = moves.size() + 1;
-    const size_t sourceState = moves.size();
-    std::vector<DpState> states(nodes.size() * stateCount);
-    std::vector<cv::Vec3d> sourceDirections(nodes.size(), {0.0, 0.0, 0.0});
-    std::vector<double> sourceLengths(nodes.size(), 0.0);
-    for (const auto& attachment : sources) {
-        const auto found = nodeIndex.find(attachment.voxel);
-        if (found == nodeIndex.end())
+    constexpr size_t transitionStateCount = 9;
+    constexpr size_t sourceState = transitionStateCount;
+    constexpr size_t stateCount = transitionStateCount + 1;
+    std::vector<DpState> states(checkedProduct(nodes.size(), stateCount, "fiberlet DP state count"));
+    for (size_t node = 0; node < nodes.size(); ++node) {
+        if (nodes[node].key.layer != 1)
             continue;
-        const size_t node = found->second;
-        FiberletPathCost initial;
-        if (attachment.length > kEpsilon) {
-            initial += alignmentCost(
-                nullptr,
-                nodes[node].prediction,
-                candidate.startAxisXYZ,
-                attachment.direction,
-                attachment.length,
-                config);
-            initial += smoothnessCost(candidate.startAxisXYZ, attachment.length, attachment.direction, attachment.length, nodes[node].normal, config);
+        const cv::Vec3d delta = nodes[node].point - candidate.startPositionPredictionXYZ;
+        const double stepLength = vectorLength(delta);
+        if (!(stepLength > kEpsilon))
+            continue;
+        const cv::Vec3d direction = delta / stepLength;
+        if (directedAngle(candidate.startAxisXYZ, direction) > maximumAngle + kEpsilon ||
+            !withinPredictionDeviation(direction, nodes[node].prediction, maximumPredictionDeviation)) {
+            continue;
         }
         auto& state = states[node * stateCount + sourceState];
-        if (!state.reached || betterCost(initial.total(), state.cost.total())) {
-            state.reached = true;
-            state.cost = initial;
-            state.previous = {-1, -1};
-            sourceDirections[node] = attachment.length > kEpsilon
-                ? attachment.direction
-                : candidate.startAxisXYZ;
-            sourceLengths[node] = attachment.length;
-        }
+        state.reached = true;
+        state.cost = pathStepCost(nullptr, nodes[node].prediction, candidate.startAxisXYZ, stepLength, direction, stepLength, nodes[node].normal, config);
+        state.previous = {-1, -1};
+        state.incomingDirection = direction;
+        state.incomingLength = stepLength;
     }
 
     for (size_t node = 0; node < nodes.size(); ++node) {
@@ -752,43 +878,40 @@ FiberletCandidateResult solveCandidate(
             const auto& currentState = states[node * stateCount + previousState];
             if (!currentState.reached)
                 continue;
-            const bool sourceAttachment = previousState == sourceState;
-            const cv::Vec3d previousDirection = sourceAttachment ? sourceDirections[node] : moves[previousState].direction;
-            const double previousLength = sourceAttachment ? sourceLengths[node] : moves[previousState].length;
-            for (size_t moveIndex = 0; moveIndex < moves.size(); ++moveIndex) {
-                const auto& move = moves[moveIndex];
-                if (sourceAttachment && previousLength <= kEpsilon && directedAngle(candidate.startAxisXYZ, move.direction) > maximumAngle + kEpsilon) {
-                    continue;
-                }
-                const Voxel nextVoxel{nodes[node].voxel[0] + move.delta[0], nodes[node].voxel[1] + move.delta[1], nodes[node].voxel[2] + move.delta[2]};
-                const auto found = nodeIndex.find(nextVoxel);
-                if (found == nodeIndex.end())
-                    continue;
-                const size_t next = found->second;
-                if (!(nodes[next].progress > nodes[node].progress + kEpsilon))
-                    continue;
-                if (!withinPredictionDeviation(
-                        move.direction,
+            for (int deltaU = -1; deltaU <= 1; ++deltaU) {
+                for (int deltaV = -1; deltaV <= 1; ++deltaV) {
+                    const LocalNodeKey nextKey{nodes[node].key.layer + 1, nodes[node].key.transverseU + deltaU, nodes[node].key.transverseV + deltaV};
+                    const auto found = nodeIndex.find(nextKey);
+                    if (found == nodeIndex.end())
+                        continue;
+                    const size_t next = found->second;
+                    const cv::Vec3d delta = nodes[next].point - nodes[node].point;
+                    const double stepLength = vectorLength(delta);
+                    if (!(stepLength > kEpsilon))
+                        continue;
+                    const cv::Vec3d direction = delta / stepLength;
+                    if (!withinPredictionDeviation(direction, nodes[next].prediction, maximumPredictionDeviation)) {
+                        continue;
+                    }
+                    FiberletPathCost nextCost = currentState.cost;
+                    nextCost += pathStepCost(
+                        &nodes[node].prediction,
                         nodes[next].prediction,
-                        maximumPredictionDeviation)) {
-                    continue;
-                }
-                FiberletPathCost nextCost = currentState.cost;
-                nextCost += alignmentCost(
-                    sourceAttachment && previousLength <= kEpsilon
-                        ? nullptr
-                        : &nodes[node].prediction,
-                    nodes[next].prediction,
-                    previousDirection,
-                    move.direction,
-                    move.length,
-                    config);
-                nextCost += smoothnessCost(previousDirection, previousLength, move.direction, move.length, nodes[next].normal, config);
-                auto& destination = states[next * stateCount + moveIndex];
-                if (!destination.reached || betterCost(nextCost.total(), destination.cost.total())) {
-                    destination.reached = true;
-                    destination.cost = nextCost;
-                    destination.previous = {static_cast<int64_t>(node), static_cast<int>(previousState)};
+                        currentState.incomingDirection,
+                        currentState.incomingLength,
+                        direction,
+                        stepLength,
+                        nodes[next].normal,
+                        config);
+                    const size_t transitionState = static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
+                    auto& destination = states[next * stateCount + transitionState];
+                    if (!destination.reached || betterCost(nextCost.total(), destination.cost.total())) {
+                        destination.reached = true;
+                        destination.cost = nextCost;
+                        destination.previous = {static_cast<int64_t>(node), static_cast<int>(previousState)};
+                        destination.incomingDirection = direction;
+                        destination.incomingLength = stepLength;
+                    }
                 }
             }
         }
@@ -798,35 +921,32 @@ FiberletCandidateResult solveCandidate(
     size_t bestNode = 0;
     size_t bestState = 0;
     FiberletPathCost bestCost;
-    for (const auto& attachment : targets) {
-        const auto found = nodeIndex.find(attachment.voxel);
-        if (found == nodeIndex.end())
+    const size_t finalInteriorLayer = domain.layers.size() - 2;
+    for (size_t node = 0; node < nodes.size(); ++node) {
+        if (nodes[node].key.layer != finalInteriorLayer)
             continue;
-        const size_t node = found->second;
         for (size_t stateIndex = 0; stateIndex < stateCount; ++stateIndex) {
             const auto& state = states[node * stateCount + stateIndex];
             if (!state.reached)
                 continue;
-            const bool sourceAttachment = stateIndex == sourceState;
-            const cv::Vec3d incoming = sourceAttachment ? sourceDirections[node] : moves[stateIndex].direction;
-            const double incomingLength = sourceAttachment ? sourceLengths[node] : moves[stateIndex].length;
-            if (attachment.length <= kEpsilon && directedAngle(incoming, candidate.targetAxisXYZ) > maximumAngle + kEpsilon) {
+            const cv::Vec3d delta = candidate.targetPositionPredictionXYZ - nodes[node].point;
+            const double finalLength = vectorLength(delta);
+            if (!(finalLength > kEpsilon))
+                continue;
+            const cv::Vec3d finalDirection = delta / finalLength;
+            if (directedAngle(finalDirection, candidate.targetAxisXYZ) > maximumAngle + kEpsilon) {
                 continue;
             }
             FiberletPathCost finalized = state.cost;
-            const cv::Vec3d finalDirection = attachment.length > kEpsilon ? attachment.direction : candidate.targetAxisXYZ;
-            if (attachment.length > kEpsilon) {
-                const FiberStoredPredictionSample targetPrediction{
-                    candidate.targetAxisXYZ, 1.0, true};
-                finalized += alignmentCost(
-                    &nodes[node].prediction,
-                    targetPrediction,
-                    incoming,
-                    finalDirection,
-                    attachment.length,
-                    config);
-            }
-            finalized += smoothnessCost(incoming, incomingLength, finalDirection, attachment.length, nodes[node].normal, config);
+            finalized += pathStepCost(
+                &nodes[node].prediction,
+                targetProxy,
+                state.incomingDirection,
+                state.incomingLength,
+                finalDirection,
+                finalLength,
+                nodes[node].normal,
+                config);
             if (!foundPath || betterCost(finalized.total(), bestCost.total())) {
                 foundPath = true;
                 bestNode = node;
@@ -844,7 +964,7 @@ FiberletCandidateResult solveCandidate(
     size_t node = bestNode;
     size_t state = bestState;
     while (true) {
-        reversed.push_back(voxelPoint(nodes[node].voxel));
+        reversed.push_back(nodes[node].point);
         const auto previous = states[node * stateCount + state].previous;
         if (previous.node < 0)
             break;
@@ -882,12 +1002,9 @@ nlohmann::json pointJson(const cv::Vec3d& point)
 std::string fiberletId(const FiberletCandidateResult& candidate)
 {
     std::ostringstream output;
-    output << "fiberlet_" << candidate.start.cellZYX[0] << '_'
-           << candidate.start.cellZYX[1] << '_' << candidate.start.cellZYX[2]
-           << '_' << candidate.start.componentIndex << "__"
-           << candidate.target.cellZYX[0] << '_' << candidate.target.cellZYX[1]
-           << '_' << candidate.target.cellZYX[2] << '_'
-           << candidate.target.componentIndex;
+    output << "fiberlet_" << candidate.start.cellZYX[0] << '_' << candidate.start.cellZYX[1] << '_' << candidate.start.cellZYX[2] << '_'
+           << candidate.start.componentIndex << "__" << candidate.target.cellZYX[0] << '_' << candidate.target.cellZYX[1] << '_'
+           << candidate.target.cellZYX[2] << '_' << candidate.target.componentIndex;
     return output.str();
 }
 
@@ -897,13 +1014,10 @@ double fiberletPathLength(const FiberletCandidateResult& candidate)
         throw std::runtime_error("successful fiberlet has fewer than two path points");
     double length = 0.0;
     for (size_t index = 1; index < candidate.pointsPredictionXYZ.size(); ++index) {
-        if (!finiteVector(candidate.pointsPredictionXYZ[index - 1]) ||
-            !finiteVector(candidate.pointsPredictionXYZ[index])) {
+        if (!finiteVector(candidate.pointsPredictionXYZ[index - 1]) || !finiteVector(candidate.pointsPredictionXYZ[index])) {
             throw std::runtime_error("successful fiberlet has a non-finite path point");
         }
-        const double segment = vectorLength(
-            candidate.pointsPredictionXYZ[index] -
-            candidate.pointsPredictionXYZ[index - 1]);
+        const double segment = vectorLength(candidate.pointsPredictionXYZ[index] - candidate.pointsPredictionXYZ[index - 1]);
         if (!std::isfinite(segment))
             throw std::runtime_error("successful fiberlet has a non-finite path segment");
         length += segment;
@@ -932,16 +1046,13 @@ FiberletPathCost& FiberletPathCost::operator+=(const FiberletPathCost& other) no
 
 FiberletPathVisualReport fiberletPathVisualMetrics(const FiberletPathReport& report)
 {
-    if (!(report.grid.predictionToBaseScale > 0.0) ||
-        !std::isfinite(report.grid.predictionToBaseScale)) {
-        throw std::runtime_error(
-            "fiberlet visualization requires a positive prediction-to-base scale");
+    if (!(report.grid.predictionToBaseScale > 0.0) || !std::isfinite(report.grid.predictionToBaseScale)) {
+        throw std::runtime_error("fiberlet visualization requires a positive prediction-to-base scale");
     }
 
     FiberletPathVisualReport visual;
     std::set<std::string> identifiers;
-    for (size_t candidateIndex = 0;
-         candidateIndex < report.candidates.size(); ++candidateIndex) {
+    for (size_t candidateIndex = 0; candidateIndex < report.candidates.size(); ++candidateIndex) {
         const auto& candidate = report.candidates[candidateIndex];
         if (candidate.success && !candidate.scoreValid)
             throw std::runtime_error("successful fiberlet has no valid score");
@@ -957,12 +1068,8 @@ FiberletPathVisualReport fiberletPathVisualMetrics(const FiberletPathReport& rep
             candidate.cost.tangentSmoothness,
             candidate.cost.normalSmoothness,
         };
-        if (std::any_of(componentLosses.begin(), componentLosses.end(),
-                [](double value) {
-                    return !(value >= 0.0) || !std::isfinite(value);
-                })) {
-            throw std::runtime_error(
-                "successful fiberlet has an invalid component loss");
+        if (std::any_of(componentLosses.begin(), componentLosses.end(), [](double value) { return !(value >= 0.0) || !std::isfinite(value); })) {
+            throw std::runtime_error("successful fiberlet has an invalid component loss");
         }
         const double totalLoss = candidate.cost.total();
         if (!(totalLoss >= 0.0) || !std::isfinite(totalLoss))
@@ -979,23 +1086,15 @@ FiberletPathVisualReport fiberletPathVisualMetrics(const FiberletPathReport& rep
             0.0,
         });
         visual.minimumLossPerPredictionVoxel =
-            visual.minimumLossPerPredictionVoxel.has_value()
-            ? std::min(*visual.minimumLossPerPredictionVoxel, density)
-            : density;
+            visual.minimumLossPerPredictionVoxel.has_value() ? std::min(*visual.minimumLossPerPredictionVoxel, density) : density;
         visual.maximumLossPerPredictionVoxel =
-            visual.maximumLossPerPredictionVoxel.has_value()
-            ? std::max(*visual.maximumLossPerPredictionVoxel, density)
-            : density;
+            visual.maximumLossPerPredictionVoxel.has_value() ? std::max(*visual.maximumLossPerPredictionVoxel, density) : density;
     }
     for (auto& path : visual.paths) {
-        path.relativeQuality =
-            *visual.minimumLossPerPredictionVoxel ==
-                *visual.maximumLossPerPredictionVoxel
-            ? 1.0
-            : (*visual.maximumLossPerPredictionVoxel -
-                  path.lossPerPredictionVoxel) /
-                (*visual.maximumLossPerPredictionVoxel -
-                  *visual.minimumLossPerPredictionVoxel);
+        path.relativeQuality = *visual.minimumLossPerPredictionVoxel == *visual.maximumLossPerPredictionVoxel
+                                   ? 1.0
+                                   : (*visual.maximumLossPerPredictionVoxel - path.lossPerPredictionVoxel) /
+                                         (*visual.maximumLossPerPredictionVoxel - *visual.minimumLossPerPredictionVoxel);
         path.relativeQuality = std::clamp(path.relativeQuality, 0.0, 1.0);
     }
     return visual;
@@ -1008,8 +1107,7 @@ FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report)
     statistics.candidates = report.candidates.size();
     double allSum = 0.0;
     double acceptedSum = 0.0;
-    for (size_t candidateIndex = 0;
-         candidateIndex < report.candidates.size(); ++candidateIndex) {
+    for (size_t candidateIndex = 0; candidateIndex < report.candidates.size(); ++candidateIndex) {
         const auto& candidate = report.candidates[candidateIndex];
         if (candidate.searched)
             ++statistics.dpSearched;
@@ -1048,20 +1146,15 @@ FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report)
     for (const auto& path : visual.paths) {
         ++statistics.acceptedLossDensities.count;
         densitySum += path.lossPerPredictionVoxel;
-        statistics.acceptedLossDensities.minimum =
-            statistics.acceptedLossDensities.minimum.has_value()
-            ? std::min(*statistics.acceptedLossDensities.minimum,
-                  path.lossPerPredictionVoxel)
-            : path.lossPerPredictionVoxel;
-        statistics.acceptedLossDensities.maximum =
-            statistics.acceptedLossDensities.maximum.has_value()
-            ? std::max(*statistics.acceptedLossDensities.maximum,
-                  path.lossPerPredictionVoxel)
-            : path.lossPerPredictionVoxel;
+        statistics.acceptedLossDensities.minimum = statistics.acceptedLossDensities.minimum.has_value()
+                                                       ? std::min(*statistics.acceptedLossDensities.minimum, path.lossPerPredictionVoxel)
+                                                       : path.lossPerPredictionVoxel;
+        statistics.acceptedLossDensities.maximum = statistics.acceptedLossDensities.maximum.has_value()
+                                                       ? std::max(*statistics.acceptedLossDensities.maximum, path.lossPerPredictionVoxel)
+                                                       : path.lossPerPredictionVoxel;
     }
     if (statistics.acceptedLossDensities.count > 0) {
-        statistics.acceptedLossDensities.mean = densitySum /
-            static_cast<double>(statistics.acceptedLossDensities.count);
+        statistics.acceptedLossDensities.mean = densitySum / static_cast<double>(statistics.acceptedLossDensities.count);
     }
     return statistics;
 }
@@ -1210,18 +1303,18 @@ void validateFiberletPathConfig(const FiberletPathConfig& config)
     const auto finiteNonnegative = [](double value) { return std::isfinite(value) && value >= 0.0; };
     if (config.cellRadius < 1 || config.cellRadius > 64)
         throw std::invalid_argument("fiberlet cell radius must be in [1, 64]");
-    if (!(config.neighborhoodMarginCells > 0.0) ||
-        !std::isfinite(config.neighborhoodMarginCells)) {
-        throw std::invalid_argument(
-            "fiberlet neighborhood margin must be positive and finite");
+    if (!(config.neighborhoodMarginCells > 0.0) || !std::isfinite(config.neighborhoodMarginCells)) {
+        throw std::invalid_argument("fiberlet neighborhood margin must be positive and finite");
+    }
+    if (!(config.longitudinalStepPredictionVoxels > 0.0) || !std::isfinite(config.longitudinalStepPredictionVoxels) ||
+        !(config.transverseStepPredictionVoxels > 0.0) || !std::isfinite(config.transverseStepPredictionVoxels)) {
+        throw std::invalid_argument("fiberlet local-grid steps must be positive and finite");
     }
     if (!finiteNonnegative(config.maximumEndpointAngleDegrees) || config.maximumEndpointAngleDegrees > 90.0) {
         throw std::invalid_argument("fiberlet endpoint angle must be in [0, 90]");
     }
-    if (!finiteNonnegative(config.maximumPredictionDeviationDegrees) ||
-        config.maximumPredictionDeviationDegrees > 90.0) {
-        throw std::invalid_argument(
-            "fiberlet prediction deviation must be in [0, 90]");
+    if (!finiteNonnegative(config.maximumPredictionDeviationDegrees) || config.maximumPredictionDeviationDegrees > 90.0) {
+        throw std::invalid_argument("fiberlet prediction deviation must be in [0, 90]");
     }
     if (!finiteNonnegative(config.corridorRadiusPredictionVoxels))
         throw std::invalid_argument("fiberlet corridor radius must be non-negative");
@@ -1296,12 +1389,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
             throw std::runtime_error("fiber anchor explicit cells must be a non-empty array");
         for (const auto& cell : cells)
             loaded.report.selectedCellsZYX.push_back(jsonSize3(cell, "cells_zyx"));
-        if (!std::is_sorted(
-                loaded.report.selectedCellsZYX.begin(),
-                loaded.report.selectedCellsZYX.end()) ||
-            std::adjacent_find(
-                loaded.report.selectedCellsZYX.begin(),
-                loaded.report.selectedCellsZYX.end()) !=
+        if (!std::is_sorted(loaded.report.selectedCellsZYX.begin(), loaded.report.selectedCellsZYX.end()) ||
+            std::adjacent_find(loaded.report.selectedCellsZYX.begin(), loaded.report.selectedCellsZYX.end()) !=
                 loaded.report.selectedCellsZYX.end()) {
             throw std::runtime_error("fiber anchor explicit cells must be strictly ordered");
         }
@@ -1342,27 +1431,21 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     config.cellSizePredictionVoxels = parameters.at("cell_size_prediction_voxels").get<int>();
     config.gaussianSigmaPredictionVoxels =
         finiteNumber(parameters.at("gaussian_sigma_prediction_voxels"), "gaussian_sigma_prediction_voxels");
-    config.peakSigmaPredictionVoxels =
-        finiteNumber(parameters.at("peak_sigma_prediction_voxels"), "peak_sigma_prediction_voxels");
+    config.peakSigmaPredictionVoxels = finiteNumber(parameters.at("peak_sigma_prediction_voxels"), "peak_sigma_prediction_voxels");
     config.peakAxialSigmaPredictionVoxels =
         finiteNumber(parameters.at("peak_axial_sigma_prediction_voxels"), "peak_axial_sigma_prediction_voxels");
     config.peakGridStepPredictionVoxels =
         finiteNumber(parameters.at("peak_grid_step_prediction_voxels"), "peak_grid_step_prediction_voxels");
-    config.peakGradientWeight =
-        finiteNumber(parameters.at("peak_gradient_weight"), "peak_gradient_weight");
-    config.peakGradientReliabilityScale = finiteNumber(
-        parameters.at("peak_gradient_reliability_scale"),
-        "peak_gradient_reliability_scale");
-    config.gaussianCutoffSigmas =
-        finiteNumber(parameters.at("gaussian_cutoff_sigmas"), "gaussian_cutoff_sigmas");
+    config.peakGradientWeight = finiteNumber(parameters.at("peak_gradient_weight"), "peak_gradient_weight");
+    config.peakGradientReliabilityScale = finiteNumber(parameters.at("peak_gradient_reliability_scale"), "peak_gradient_reliability_scale");
+    config.gaussianCutoffSigmas = finiteNumber(parameters.at("gaussian_cutoff_sigmas"), "gaussian_cutoff_sigmas");
     config.localWindowRadiusPredictionVoxels =
         finiteNumber(parameters.at("local_window_radius_prediction_voxels"), "local_window_radius_prediction_voxels");
     config.axialSupportHalfWidthPredictionVoxels =
         finiteNumber(parameters.at("axial_support_half_width_prediction_voxels"), "axial_support_half_width_prediction_voxels");
     config.positionConvergenceTolerancePredictionVoxels =
         finiteNumber(parameters.at("position_convergence_tolerance_prediction_voxels"), "position_convergence_tolerance_prediction_voxels");
-    config.nmsMaximumAngleDegrees =
-        finiteNumber(parameters.at("nms_maximum_angle_degrees"), "nms_maximum_angle_degrees");
+    config.nmsMaximumAngleDegrees = finiteNumber(parameters.at("nms_maximum_angle_degrees"), "nms_maximum_angle_degrees");
     config.nmsTransverseRadiusPredictionVoxels =
         finiteNumber(parameters.at("nms_transverse_radius_prediction_voxels"), "nms_transverse_radius_prediction_voxels");
     config.nmsLongitudinalRadiusPredictionVoxels =
@@ -1379,33 +1462,24 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     config.convergenceTolerance = finiteNumber(parameters.at("convergence_tolerance"), "convergence_tolerance");
     config.parallelThreads = 1;
     validateFiberAnchorConfig(config);
-    size_t selectedCellCount = loaded.report.selectedCellsZYX.empty() ? 1 :
-        loaded.report.selectedCellsZYX.size();
+    size_t selectedCellCount = loaded.report.selectedCellsZYX.empty() ? 1 : loaded.report.selectedCellsZYX.size();
     for (size_t axis = 0; axis < 3; ++axis) {
-        const size_t totalCells =
-            (loaded.report.grid.shapeZYX[axis] +
-                static_cast<size_t>(config.cellSizePredictionVoxels) - 1) /
-            static_cast<size_t>(config.cellSizePredictionVoxels);
-        if (loaded.report.selectedCellBeginZYX[axis] >=
-                loaded.report.selectedCellEndZYX[axis] ||
-            loaded.report.selectedCellEndZYX[axis] > totalCells) {
+        const size_t totalCells = (loaded.report.grid.shapeZYX[axis] + static_cast<size_t>(config.cellSizePredictionVoxels) - 1) /
+                                  static_cast<size_t>(config.cellSizePredictionVoxels);
+        if (loaded.report.selectedCellBeginZYX[axis] >= loaded.report.selectedCellEndZYX[axis] || loaded.report.selectedCellEndZYX[axis] > totalCells) {
             throw std::runtime_error("fiber anchor selected cell range is invalid");
         }
         if (loaded.report.selectedCellsZYX.empty()) {
-            const size_t extent = loaded.report.selectedCellEndZYX[axis] -
-                loaded.report.selectedCellBeginZYX[axis];
+            const size_t extent = loaded.report.selectedCellEndZYX[axis] - loaded.report.selectedCellBeginZYX[axis];
             if (selectedCellCount > std::numeric_limits<size_t>::max() / extent)
                 throw std::runtime_error("fiber anchor selected cell count overflows");
             selectedCellCount *= extent;
         }
     }
-    const std::set<std::array<size_t, 3>> explicitCells(
-        loaded.report.selectedCellsZYX.begin(),
-        loaded.report.selectedCellsZYX.end());
+    const std::set<std::array<size_t, 3>> explicitCells(loaded.report.selectedCellsZYX.begin(), loaded.report.selectedCellsZYX.end());
     for (const auto& cell : loaded.report.selectedCellsZYX) {
         for (size_t axis = 0; axis < 3; ++axis) {
-            if (cell[axis] < loaded.report.selectedCellBeginZYX[axis] ||
-                cell[axis] >= loaded.report.selectedCellEndZYX[axis]) {
+            if (cell[axis] < loaded.report.selectedCellBeginZYX[axis] || cell[axis] >= loaded.report.selectedCellEndZYX[axis]) {
                 throw std::runtime_error("fiber anchor explicit cell lies outside its bounds");
             }
         }
@@ -1420,8 +1494,7 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     loaded.report.diagnostics.belowSupportComponents = diagnostics.at("below_support_components").get<size_t>();
     loaded.report.diagnostics.mergedComponentPairs = diagnostics.at("merged_component_pairs").get<size_t>();
     loaded.report.diagnostics.nmsSuppressedComponents = diagnostics.at("nms_suppressed_components").get<size_t>();
-    loaded.report.diagnostics.outsideSelectionComponents =
-        diagnostics.value("outside_selection_components", size_t{0});
+    loaded.report.diagnostics.outsideSelectionComponents = diagnostics.value("outside_selection_components", size_t{0});
 
     std::optional<std::array<size_t, 3>> previousCell;
     size_t storedMergedComponentPairs = 0;
@@ -1433,8 +1506,7 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         FiberCellAnchorResult cell;
         cell.cellZYX = jsonSize3(cellJson.at("cell_zyx"), "cell_zyx");
         for (size_t axis = 0; axis < 3; ++axis) {
-            if (cell.cellZYX[axis] < loaded.report.selectedCellBeginZYX[axis] ||
-                cell.cellZYX[axis] >= loaded.report.selectedCellEndZYX[axis]) {
+            if (cell.cellZYX[axis] < loaded.report.selectedCellBeginZYX[axis] || cell.cellZYX[axis] >= loaded.report.selectedCellEndZYX[axis]) {
                 throw std::runtime_error("fiber anchor cell lies outside the selected cell range");
             }
         }
@@ -1479,7 +1551,8 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
             component.anchor.cellZYX = cell.cellZYX;
             if (!component.retained) {
                 component.rejectionReason = componentJson.at("reason").get<std::string>();
-                const std::set<std::string> validReasons{"empty", "degenerate", "below_support", "merged_same_direction", "nms_suppressed", "outside_selection"};
+                const std::set<std::string>
+                    validReasons{"empty", "degenerate", "below_support", "merged_same_direction", "nms_suppressed", "outside_selection"};
                 if (!validReasons.contains(component.rejectionReason))
                     throw std::runtime_error("rejected fiber anchor component has an unsupported reason");
                 if (component.rejectionReason == "nms_suppressed")
@@ -1494,72 +1567,52 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
                 throw std::runtime_error("fiber anchor axis must be unit length");
             component.anchor.alignedSupport = finiteNumber(componentJson.at("aligned_support"), "aligned_support");
             component.anchor.directionalCoherence = finiteNumber(componentJson.at("directional_coherence"), "directional_coherence");
-            component.anchor.refinementScore = finiteNumber(
-                componentJson.at("refinement_score"), "refinement_score");
-            component.anchor.refinementIterations =
-                componentJson.at("refinement_iterations").get<size_t>();
-            if (component.anchor.alignedSupport < 0.0 ||
-                component.anchor.alignedSupport > 1.0 ||
-                component.anchor.directionalCoherence < 0.0 ||
-                component.anchor.directionalCoherence > 1.0 ||
-                component.anchor.refinementScore < 0.0 ||
-                component.anchor.refinementScore > 1.0 ||
-                std::abs(component.anchor.refinementScore -
-                    component.anchor.alignedSupport) > 1.0e-12 ||
-                component.anchor.refinementIterations >
-                    static_cast<size_t>(config.maximumIterations)) {
+            component.anchor.refinementScore = finiteNumber(componentJson.at("refinement_score"), "refinement_score");
+            component.anchor.refinementIterations = componentJson.at("refinement_iterations").get<size_t>();
+            if (component.anchor.alignedSupport < 0.0 || component.anchor.alignedSupport > 1.0 || component.anchor.directionalCoherence < 0.0 ||
+                component.anchor.directionalCoherence > 1.0 || component.anchor.refinementScore < 0.0 || component.anchor.refinementScore > 1.0 ||
+                std::abs(component.anchor.refinementScore - component.anchor.alignedSupport) > 1.0e-12 ||
+                component.anchor.refinementIterations > static_cast<size_t>(config.maximumIterations)) {
                 throw std::runtime_error("fiber anchor refinement values are inconsistent");
             }
             const cv::Vec3d pivot{
                 (static_cast<double>(cell.cellZYX[2] * static_cast<size_t>(config.cellSizePredictionVoxels)) +
-                    static_cast<double>(std::min(
-                        (cell.cellZYX[2] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels),
-                        loaded.report.grid.shapeZYX[2])) - 1.0) * 0.5,
+                 static_cast<double>(
+                     std::min((cell.cellZYX[2] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels), loaded.report.grid.shapeZYX[2])) -
+                 1.0) *
+                    0.5,
                 (static_cast<double>(cell.cellZYX[1] * static_cast<size_t>(config.cellSizePredictionVoxels)) +
-                    static_cast<double>(std::min(
-                        (cell.cellZYX[1] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels),
-                        loaded.report.grid.shapeZYX[1])) - 1.0) * 0.5,
+                 static_cast<double>(
+                     std::min((cell.cellZYX[1] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels), loaded.report.grid.shapeZYX[1])) -
+                 1.0) *
+                    0.5,
                 (static_cast<double>(cell.cellZYX[0] * static_cast<size_t>(config.cellSizePredictionVoxels)) +
-                    static_cast<double>(std::min(
-                        (cell.cellZYX[0] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels),
-                        loaded.report.grid.shapeZYX[0])) - 1.0) * 0.5,
+                 static_cast<double>(
+                     std::min((cell.cellZYX[0] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels), loaded.report.grid.shapeZYX[0])) -
+                 1.0) *
+                    0.5,
             };
-            const cv::Vec3d pivotOffset =
-                component.anchor.positionPredictionXYZ - pivot;
-            const double planeResidual = std::abs(
-                pivotOffset.dot(component.anchor.axisXYZ));
+            const cv::Vec3d pivotOffset = component.anchor.positionPredictionXYZ - pivot;
+            const double planeResidual = std::abs(pivotOffset.dot(component.anchor.axisXYZ));
             const double pivotDistance = vectorLength(pivotOffset);
             for (int axis = 0; axis < 3; ++axis) {
                 const double position = component.anchor.positionPredictionXYZ[axis];
                 const size_t gridAxis = static_cast<size_t>(2 - axis);
-                if (position < -kEpsilon ||
-                    position > static_cast<double>(loaded.report.grid.shapeZYX[gridAxis] - 1) + kEpsilon) {
+                if (position < -kEpsilon || position > static_cast<double>(loaded.report.grid.shapeZYX[gridAxis] - 1) + kEpsilon) {
                     throw std::runtime_error("fiber anchor position is outside the prediction grid");
                 }
-                const double cellBegin = static_cast<double>(
-                    cell.cellZYX[gridAxis] *
-                    static_cast<size_t>(config.cellSizePredictionVoxels));
-                const double cellEnd = static_cast<double>(std::min(
-                    (cell.cellZYX[gridAxis] + 1) *
-                        static_cast<size_t>(config.cellSizePredictionVoxels),
-                    loaded.report.grid.shapeZYX[gridAxis]));
-                const double ownerLower = cellBegin == 0.0
-                    ? 0.0
-                    : cellBegin - 0.5;
-                const double ownerUpper =
-                    cellEnd == static_cast<double>(loaded.report.grid.shapeZYX[gridAxis])
-                    ? cellEnd - 1.0
-                    : std::nextafter(
-                        cellEnd - 0.5,
-                        -std::numeric_limits<double>::infinity());
-                if (position < ownerLower - kEpsilon ||
-                    position > ownerUpper + kEpsilon) {
-                    throw std::runtime_error(
-                        "fiber anchor position is outside its owning cell");
+                const double cellBegin = static_cast<double>(cell.cellZYX[gridAxis] * static_cast<size_t>(config.cellSizePredictionVoxels));
+                const double cellEnd = static_cast<double>(
+                    std::min((cell.cellZYX[gridAxis] + 1) * static_cast<size_t>(config.cellSizePredictionVoxels), loaded.report.grid.shapeZYX[gridAxis]));
+                const double ownerLower = cellBegin == 0.0 ? 0.0 : cellBegin - 0.5;
+                const double ownerUpper = cellEnd == static_cast<double>(loaded.report.grid.shapeZYX[gridAxis])
+                                              ? cellEnd - 1.0
+                                              : std::nextafter(cellEnd - 0.5, -std::numeric_limits<double>::infinity());
+                if (position < ownerLower - kEpsilon || position > ownerUpper + kEpsilon) {
+                    throw std::runtime_error("fiber anchor position is outside its owning cell");
                 }
             }
-            if (planeResidual > 1.0e-6 ||
-                pivotDistance > config.localWindowRadiusPredictionVoxels + 1.0e-6) {
+            if (planeResidual > 1.0e-6 || pivotDistance > config.localWindowRadiusPredictionVoxels + 1.0e-6) {
                 throw std::runtime_error("fiber anchor position violates its rotating-plane window");
             }
             ++cell.retainedAnchorCount;
@@ -1582,33 +1635,25 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     }
     if (storedMergedComponentPairs > loaded.report.diagnostics.mergedComponentPairs)
         throw std::runtime_error("fiber anchor merged-component diagnostics are inconsistent");
-    if (storedNmsSuppressedComponents >
-        loaded.report.diagnostics.nmsSuppressedComponents) {
+    if (storedNmsSuppressedComponents > loaded.report.diagnostics.nmsSuppressedComponents) {
         throw std::runtime_error("fiber anchor NMS diagnostics are inconsistent");
     }
-    if (loaded.report.diagnostics.zeroAnchorCells +
-            loaded.report.diagnostics.oneAnchorCells +
-            loaded.report.diagnostics.twoAnchorCells !=
+    if (loaded.report.diagnostics.zeroAnchorCells + loaded.report.diagnostics.oneAnchorCells + loaded.report.diagnostics.twoAnchorCells !=
         loaded.report.diagnostics.totalCells) {
         throw std::runtime_error("fiber anchor cell-count diagnostics are inconsistent");
     }
     if (loaded.report.diagnostics.totalCells != selectedCellCount)
         throw std::runtime_error("fiber anchor total cells disagree with the selected lattice");
-    if (loaded.report.nonEmptyCells.size() !=
-        loaded.report.diagnostics.oneAnchorCells +
-            loaded.report.diagnostics.twoAnchorCells) {
+    if (loaded.report.nonEmptyCells.size() != loaded.report.diagnostics.oneAnchorCells + loaded.report.diagnostics.twoAnchorCells) {
         throw std::runtime_error("fiber anchor stored cells disagree with diagnostics");
     }
     return loaded;
 }
 
-std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(
-    int radius,
-    double margin)
+std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(int radius, double margin)
 {
     if (radius < 1 || !(margin > 0.0) || !std::isfinite(margin))
-        throw std::invalid_argument(
-            "fiberlet cell neighborhood requires positive radius and margin");
+        throw std::invalid_argument("fiberlet cell neighborhood requires positive radius and margin");
     const int limit = static_cast<int>(std::ceil(radius + margin));
     const double upper = static_cast<double>(radius) + margin;
     std::vector<std::array<int, 3>> offsets;
@@ -1651,8 +1696,7 @@ FiberletPathReport traceFiberletPaths(
     const auto startTime = Clock::now();
     const auto flat = flattenAnchors(anchors.report);
     report.diagnostics.occupiedAnchors = flat.size();
-    const auto offsets = fiberletCellNeighborhoodOffsets(
-        report.config.cellRadius, report.config.neighborhoodMarginCells);
+    const auto offsets = fiberletCellNeighborhoodOffsets(report.config.cellRadius, report.config.neighborhoodMarginCells);
     report.diagnostics.neighborhoodOffsets = offsets.size();
     std::map<std::array<size_t, 3>, std::vector<const FlatAnchor*>> byCell;
     for (const auto& anchor : flat)
@@ -1701,9 +1745,7 @@ FiberletPathReport traceFiberletPaths(
                 const cv::Vec3d chord = chordVector / distance;
                 candidate.startAxisXYZ = normalized(source.anchor.axisXYZ);
                 candidate.targetAxisXYZ = normalized(target->anchor.axisXYZ);
-                if (pointPredicate &&
-                    (!pointPredicate(candidate.startPositionPredictionXYZ) ||
-                     !pointPredicate(candidate.targetPositionPredictionXYZ))) {
+                if (pointPredicate && (!pointPredicate(candidate.startPositionPredictionXYZ) || !pointPredicate(candidate.targetPositionPredictionXYZ))) {
                     candidate.reason = "outside_selection";
                     report.candidates.push_back(std::move(candidate));
                     continue;
@@ -1737,6 +1779,7 @@ FiberletPathReport traceFiberletPaths(
             predictionSampler,
             normalSampler,
             report.estimatedPreloadBytes,
+            report.evaluatedDpNodes,
             pointPredicate);
         report.preloadedVoxels = scoringVolume.size();
     }
@@ -1834,8 +1877,7 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
         throw std::invalid_argument("fiberlet artifacts require complete source identities");
     }
     const auto visual = fiberletPathVisualMetrics(report);
-    std::vector<const FiberletPathVisualMetric*> visualByCandidate(
-        report.candidates.size(), nullptr);
+    std::vector<const FiberletPathVisualMetric*> visualByCandidate(report.candidates.size(), nullptr);
     for (const auto& path : visual.paths)
         visualByCandidate[path.candidateIndex] = &path;
     nlohmann::json root = {
@@ -1865,6 +1907,10 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
              {"neighborhood_margin_cells", report.config.neighborhoodMarginCells},
              {"maximum_endpoint_angle_degrees", report.config.maximumEndpointAngleDegrees},
              {"maximum_prediction_deviation_degrees", report.config.maximumPredictionDeviationDegrees},
+             {"dp_longitudinal_step_prediction_voxels", report.config.longitudinalStepPredictionVoxels},
+             {"dp_longitudinal_step_base_voxels", report.config.longitudinalStepPredictionVoxels * report.grid.predictionToBaseScale},
+             {"dp_transverse_step_prediction_voxels", report.config.transverseStepPredictionVoxels},
+             {"dp_transverse_step_base_voxels", report.config.transverseStepPredictionVoxels * report.grid.predictionToBaseScale},
              {"corridor_radius_base_voxels", report.config.corridorRadiusPredictionVoxels * report.grid.predictionToBaseScale},
              {"invalid_prediction_cost_per_prediction_voxel", report.config.invalidPredictionCostPerVoxel},
              {"smoothness_weight", report.config.smoothnessWeight},
@@ -1891,20 +1937,15 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
              {"relative_quality_formula", "inverse_min_max_low_loss_is_one"},
              {"count", visual.paths.size()},
              {"minimum_loss_per_prediction_voxel",
-              visual.minimumLossPerPredictionVoxel.has_value()
-                  ? nlohmann::json(*visual.minimumLossPerPredictionVoxel)
-                  : nlohmann::json(nullptr)},
+              visual.minimumLossPerPredictionVoxel.has_value() ? nlohmann::json(*visual.minimumLossPerPredictionVoxel) : nlohmann::json(nullptr)},
              {"maximum_loss_per_prediction_voxel",
-              visual.maximumLossPerPredictionVoxel.has_value()
-                  ? nlohmann::json(*visual.maximumLossPerPredictionVoxel)
-                  : nlohmann::json(nullptr)},
+              visual.maximumLossPerPredictionVoxel.has_value() ? nlohmann::json(*visual.maximumLossPerPredictionVoxel) : nlohmann::json(nullptr)},
          }},
         {"candidates", nlohmann::json::array()},
     };
     if (artifact.baseVoxelSizeUm.has_value())
         root["coordinates"]["base_voxel_size_um"] = *artifact.baseVoxelSizeUm;
-    for (size_t candidateIndex = 0;
-         candidateIndex < report.candidates.size(); ++candidateIndex) {
+    for (size_t candidateIndex = 0; candidateIndex < report.candidates.size(); ++candidateIndex) {
         const auto& candidate = report.candidates[candidateIndex];
         nlohmann::json item = {
             {"start", anchorIdJson(candidate.start)},
@@ -1932,12 +1973,23 @@ nlohmann::json fiberletPathReportJson(const FiberletPathReport& report, const Fi
             const auto* metrics = visualByCandidate[candidateIndex];
             if (metrics == nullptr)
                 throw std::logic_error("successful fiberlet has no visualization metrics");
-            item["path_length_base_voxels"] =
-                metrics->pathLengthPredictionVoxels *
-                report.grid.predictionToBaseScale;
-            item["loss_per_prediction_voxel"] =
-                metrics->lossPerPredictionVoxel;
+            item["path_length_base_voxels"] = metrics->pathLengthPredictionVoxels * report.grid.predictionToBaseScale;
+            item["loss_per_prediction_voxel"] = metrics->lossPerPredictionVoxel;
             item["relative_visual_quality"] = metrics->relativeQuality;
+            item["start_prediction"] = {
+                {"direction_xyz", pointJson(candidate.startPrediction.direction)},
+                {"presence", candidate.startPrediction.presence},
+                {"valid", candidate.startPrediction.valid},
+                {"normal_xyz", pointJson(candidate.startNormalXYZ)},
+                {"normal_valid", candidate.startNormalValid},
+            };
+            item["target_prediction"] = {
+                {"direction_xyz", pointJson(candidate.targetPrediction.direction)},
+                {"presence", candidate.targetPrediction.presence},
+                {"valid", candidate.targetPrediction.valid},
+                {"normal_xyz", pointJson(candidate.targetNormalXYZ)},
+                {"normal_valid", candidate.targetNormalValid},
+            };
             item["points_base_xyz"] = nlohmann::json::array();
             for (const auto& point : candidate.pointsPredictionXYZ)
                 item["points_base_xyz"].push_back(pointJson(point * report.grid.predictionToBaseScale));
@@ -1974,8 +2026,7 @@ std::string fiberletPathReportObj(const FiberletPathReport& report)
         const auto& candidate = report.candidates[path.candidateIndex];
         output << "g " << fiberletId(candidate) << '\n';
         output << "# trace_loss_total " << path.totalLoss << '\n';
-        output << "# trace_loss_per_prediction_voxel "
-               << path.lossPerPredictionVoxel << '\n';
+        output << "# trace_loss_per_prediction_voxel " << path.lossPerPredictionVoxel << '\n';
         output << "# trace_quality_relative " << path.relativeQuality << '\n';
         for (const auto& point : candidate.pointsPredictionXYZ) {
             const cv::Vec3d base = point * report.grid.predictionToBaseScale;
@@ -1996,10 +2047,7 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
     std::error_code error;
     std::filesystem::remove(outputDirectory / "fiberlets.mtl", error);
     if (error) {
-        throw std::filesystem::filesystem_error(
-            "cannot remove stale fiberlet material artifact",
-            outputDirectory / "fiberlets.mtl",
-            error);
+        throw std::filesystem::filesystem_error("cannot remove stale fiberlet material artifact", outputDirectory / "fiberlets.mtl", error);
     }
     vc::core::util::atomicWriteString(outputDirectory / "fiberlets.json", fiberletPathReportJson(report, artifact).dump(2) + "\n");
     vc::core::util::atomicWriteString(outputDirectory / "fiberlets.obj", fiberletPathReportObj(report));
@@ -2012,9 +2060,7 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
         {"anchor_artifact", artifact.anchorArtifactLocator},
         {"anchor_artifact_content_hash", artifact.anchorArtifactContentHash},
     };
-    vc::core::util::atomicWriteString(
-        outputDirectory / "fiberlet_graph.json",
-        graphJson.dump(2) + "\n");
+    vc::core::util::atomicWriteString(outputDirectory / "fiberlet_graph.json", graphJson.dump(2) + "\n");
 }
 
 namespace

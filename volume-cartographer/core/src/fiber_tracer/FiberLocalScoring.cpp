@@ -92,4 +92,41 @@ FiberLocalSmoothnessCost fiberLocalSmoothnessCost(
     return cost;
 }
 
+FiberLocalMetricCost fiberLocalMetricCost(
+    const FiberLocalMetricSample* currentPrediction,
+    const FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& previousStepDirection,
+    float previousStepLength,
+    const cv::Vec3f& candidateStepDirection,
+    float candidateStepLength,
+    const cv::Vec3f& normal,
+    bool normalValid,
+    const FiberLocalMetricConfig& config)
+{
+    FiberLocalMetricCost cost;
+    if (!candidatePrediction.valid) {
+        cost.invalidPrediction = config.invalidPredictionCostPerVoxel * std::max(0.0f, candidateStepLength);
+        return cost;
+    }
+    const cv::Vec3f previous = normalizedOrZero(previousStepDirection);
+    const cv::Vec3f candidate = normalizedOrZero(candidateStepDirection);
+    cv::Vec3f currentAxis = previous;
+    if (currentPrediction != nullptr && currentPrediction->valid) {
+        currentAxis = normalizedOrZero(currentPrediction->direction);
+        if (currentAxis.dot(previous) < 0.0f)
+            currentAxis *= -1.0f;
+    }
+    cv::Vec3f candidateAxis = normalizedOrZero(candidatePrediction.direction);
+    if (candidateAxis.dot(candidate) < 0.0f)
+        candidateAxis *= -1.0f;
+    cost.alignment = fiberLocalAlignmentLoss(candidatePrediction.presence, previous, candidate, currentAxis, candidateAxis) *
+                     std::max(0.0f, candidateStepLength);
+    const auto smoothness = fiberLocalSmoothnessCost(previous, candidate, normal, normalValid, config.smoothness);
+    const float effectiveLength = std::max(1.0f, (std::max(0.0f, previousStepLength) + std::max(0.0f, candidateStepLength)) * 0.5f);
+    cost.isotropicSmoothness = smoothness.isotropic / effectiveLength;
+    cost.tangentSmoothness = smoothness.tangent / effectiveLength;
+    cost.normalSmoothness = smoothness.normal / effectiveLength;
+    return cost;
+}
+
 }  // namespace vc::fiber_tracer

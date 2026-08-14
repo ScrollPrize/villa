@@ -125,7 +125,7 @@ void usage(const char* executable)
               << "  --smoothness-weight N         invalid-normal isotropic weight [2]\n"
               << "  --smoothness-normal-weight N  normal-tilt weight [0.1]\n"
               << "  --smoothness-tangent-weight N tangent-plane turn weight [10]\n"
-              << "  --smoothness-free-angle N     lattice free angle in degrees [45]\n"
+              << "  --smoothness-free-angle N     local curvature free angle in degrees [0]\n"
               << "  --stats                       print path-count and score statistics\n"
               << "  --no-slices                   skip central presence-slice outputs\n";
     std::cerr << "\nReplay options:\n"
@@ -888,6 +888,7 @@ int main(int argc, char** argv)
                           << " accepted="
                           << bundle.paths->diagnostics.successfulPaths
                           << " preloaded_voxels=" << bundle.paths->preloadedVoxels
+                          << " evaluated_dp_nodes=" << bundle.paths->evaluatedDpNodes
                           << '\n';
                 vc::fiber_tracer::FiberletArtifactInfo pathArtifact;
                 pathArtifact.fiberManifestLocator = datasetLocator(dataset);
@@ -968,7 +969,8 @@ int main(int argc, char** argv)
                 std::cout << " cells=" << bundle.tube->cellsZYX.size()
                           << " anchors=" << anchorCount
                           << " fiberlets=" << bundle.paths->diagnostics.successfulPaths
-                          << " preloaded_voxels=" << bundle.paths->preloadedVoxels;
+                          << " preloaded_voxels=" << bundle.paths->preloadedVoxels
+                          << " evaluated_dp_nodes=" << bundle.paths->evaluatedDpNodes;
             }
             if (bundle.graphReplay.has_value()) {
                 const double greedyIntervalProgress =
@@ -1112,6 +1114,7 @@ int main(int argc, char** argv)
                   << " generated_pairs=" << report.diagnostics.generatedPairs << " axis_rejected=" << report.diagnostics.axisRejectedPairs
                   << " searched=" << report.diagnostics.searchedPairs << " successful=" << report.diagnostics.successfulPaths
                   << " no_path=" << report.diagnostics.noPathPairs << " preloaded_voxels=" << report.preloadedVoxels
+                  << " evaluated_dp_nodes=" << report.evaluatedDpNodes
                   << " estimated_preload_bytes=" << report.estimatedPreloadBytes << " candidate_workers=" << report.candidateWorkers
                   << " candidate_seconds=" << report.candidateGenerationSeconds << " preload_seconds=" << report.preloadSeconds
                   << " search_seconds=" << report.searchSeconds << " elapsed_seconds=" << report.elapsedSeconds << '\n';

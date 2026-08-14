@@ -2707,7 +2707,7 @@
   `stage=discrete|separable_1d|joint_2d`; extraction timing is shared. No
   artifacts are written.
 
-# Integer-DP fiberlet paths
+# Curved-domain DP fiberlet paths
 
 - `vc_fiberlets paths` consumes a strict `vc_fiberlet_anchors` version-1 JSON,
   its matching canonical fiber manifest, and a separate regular Lasagna normal
@@ -2726,13 +2726,14 @@
   axes must align to the chord within the configured bound, initially 45
   degrees. This stage does not impose degree, mutual-best, or overlap limits.
 - Candidate generation completes before scoring. The inclusive prediction-grid
-  bounds of every searchable Hermite corridor and every eligible virtual
-  endpoint attachment are clipped to the grid and unioned. The current
+  bounds of every searchable Hermite corridor are clipped to the grid and
+  unioned. The current
   small-crop implementation samples the complete rectangular enclosing ZYX box
-  exactly once into an immutable dense volume of unmodified
+  exactly once into an immutable dense volume of unmodified native-grid
   `FiberStoredPredictionSample` values and `cv::Vec3d` Lasagna normal
-  vector/validity. Candidate DP performs only checked dense lookups; it cannot
-  trigger prediction decoding, normal interpolation, or nested sample workers.
+  vector/validity. Candidate DP performs only checked interpolation from those
+  native values; it cannot trigger prediction decoding, normal sampling, or
+  nested sample workers.
 - Searchable candidate indices are assigned to a fixed pool of at most the
   configured thread count. Each task writes only its preallocated canonical
   result slot. Workers continue after independent exceptions and the
@@ -2746,29 +2747,48 @@
   join and before deterministic error propagation. `vc_fiberlets` writes
   completed/total, percentage, elapsed time, rate, and ETA to stderr; zero
   searches are `0/0`, 100 percent, zero rate, and zero ETA.
-- Searchable states are integer voxels of the stored prediction grid. Exact
-  fitted anchors remain virtual endpoints and connect to every in-bounds
-  integer voxel within `sqrt(3)` prediction voxels whose nonzero edge advances
-  along the chord and satisfies the endpoint-angle bound. Exact integer
-  endpoints use a zero-length attachment carrying the oriented endpoint axis.
-- A cubic Hermite reference uses the exact endpoints, chord-oriented axes, and
-  endpoint-distance derivative magnitudes. It is sampled with
-  `max(8,ceil(4*endpoint_distance))` segments. Corridor membership is exact
-  point-to-polyline-segment distance at the configured radius, defaulting to
-  one anchor-cell side; valid endpoint attachments are inserted explicitly.
-- The directed move stencil is the subset of the 26 nonzero offsets in
-  `{-1,0,1}^3` with strictly positive chord projection. The resulting graph is
-  acyclic. DP state is `(integer_voxel,incoming_move)` plus deterministic
-  source-attachment states. Sink selection scores the real final virtual edge.
+- Every candidate has a deterministic curved local coordinate domain. A cubic
+  Hermite centerline uses exact anchor positions, chord-oriented fitted axes,
+  and endpoint-distance derivative magnitudes. It is tabulated with
+  `max(64,ceil(16*endpoint_distance))` segments and deterministically inverted
+  by linear interpolation of cumulative arclength. Planes are placed every 2
+  prediction voxels of centerline arclength with the exact target inserted once.
+  A nonfinite or degenerate curve/tangent/frame rejects the candidate.
+- Each plane normal is the normalized Hermite derivative. The initial
+  transverse axis is the projection of the least-aligned canonical world axis;
+  deterministic ties use axis order. Later frames use minimal-rotation parallel
+  transport followed by re-orthogonalization. A local key `(layer,u,v)` maps to
+  `center + 0.5*u*U + 0.5*v*V` in prediction XYZ. Finite transverse bounds are
+  derived from corridor radius, then mapped points are filtered by inclusive
+  volume bounds, exact corridor membership, and any replay tube predicate.
+- The exact start `(s=0,u=v=0)` and target `(s=L,u=v=0)` are source and sink.
+  Interior edges advance exactly one layer and change each transverse index by
+  at most one. Their actual mapped XYZ vectors and Euclidean lengths drive all
+  feasibility and scoring. The final interval may be shorter than 2 prediction
+  voxels; exact multiples and curves shorter than 2 do not create duplicate
+  planes. State retains incoming predecessor identity, with up to nine
+  prior-layer transitions plus the source state, because the objective is
+  second-order. Strict cost ties retain the first canonical predecessor.
+- Arbitrary-position presence is the trilinear weighted sum of all positive-weight
+  native corners. Unoriented prediction axes are normalized and combined as
+  `T=sum(w*d*d^T)` without presence weighting; the deterministic shared
+  symmetric eigensolver supplies the unique principal axis. Every positive-
+  weight corner must have finite valid prediction data and the tensor must have
+  a unique principal eigenvalue. Antipodal axes therefore interpolate without
+  cancellation, while an equal orthogonal mixture is invalid. Normals use the
+  same sign-invariant interpolation, but an invalid corner or ambiguous tensor
+  produces an invalid normal and retains isotropic curvature fallback. Sparse
+  replay preload includes all required native corners even when the corner
+  itself lies outside the floating-node tube predicate. Native corners are
+  globally sorted and deduplicated; evaluated nodes retain integer candidate
+  and local keys rather than floating-point hash identity.
 - Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
-  to the sampled dense fiber-prediction axis. Equivalently, for normalized step
+  to the interpolated dense fiber-prediction axis. Equivalently, for normalized step
   `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
-  epsilon. Lattice moves use the destination voxel prediction. Virtual edges
-  between a fitted subvoxel anchor and nearby integer voxels are exempt from
-  this lattice-step gate and remain constrained by the fitted endpoint-axis
-  rule; otherwise half-voxel anchor placement could make an aligned path
-  unreachable through quantization alone. A missing, invalid, nonfinite, or
-  degenerate required destination prediction rejects a lattice edge before
+  epsilon. Interior moves use the interpolated prediction at their mapped
+  destination. Exact source/sink transitions are exempt from this sampled gate
+  and remain constrained by the fitted endpoint-axis rule. A missing, invalid,
+  nonfinite, or degenerate required interior prediction rejects that edge before
   scoring. The independent Lasagna surface normal does not participate in this
   hard gate.
 - Valid-data scoring shares the regular native tracer's exact ordered float
@@ -2776,15 +2796,16 @@
   current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
   aligned to `b`, and candidate presence `p`, `score` is `clamp01(p)` times the
   six positive-clamped dots `a.b`, `a.c`, `a.d`, `c.b`, `c.d`, and `b.d` in
-  that order. Alignment cost is `(1-score)*edge_length`; edge-length weighting
-  keeps axial and diagonal lattice integration comparable. The former lattice
+  that order. Alignment cost is `(1-score)*actual_edge_length`; edge-length weighting
+  keeps differently directed local transitions comparable. The former lattice
   direction floor and independent presence/direction weights do not exist.
-- A nonzero source attachment uses the fitted start axis as both `a` and `c`,
-  the attachment as `b`, and the dense destination prediction as `d`. A
-  nonzero sink attachment uses the current dense prediction and incoming step,
-  the attachment as `b`, and the fitted target axis at presence one as `d`.
-  Zero-length attachments add no alignment cost but establish/use the fitted
-  endpoint axis.
+- The source transition uses the fitted start axis as both `a` and `c`, its
+  actual mapped direction as `b`, and the dense destination prediction as `d`.
+  The sink transition uses the current dense prediction and incoming step, its
+  actual mapped direction as `b`, and the fitted target axis at presence one as
+  `d`. The first and last transition directions must satisfy the configured
+  endpoint-axis bound. Interior destinations alone use the strict sampled-
+  prediction gate.
 - Invalid fiber samples cannot be destinations of nonzero DP edges under the
   hard sampled-direction gate. The pre-existing invalid-prediction cost remains
   serialized as part of the experimental objective configuration, but it does
@@ -2792,8 +2813,8 @@
 - Direct local curvature shares the native 3D tracer's exact float
   normal-aware equations. With a valid normal it emits tangent-plane and
   normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
-  defaults are isotropic/normal/tangent weights `2/0.1/10` and a 45-degree
-  lattice free angle. The per-turn value is divided by
+  defaults are isotropic/normal/tangent weights `2/0.1/10` and a zero-degree
+  free angle, matching greedy tracing. The per-turn value is divided by
   `max(1,(previous_edge_length+candidate_edge_length)/2)`. Cumulative history
   smoothness is not part of this DP.
 - `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates,
@@ -2804,6 +2825,10 @@
   Smoothness terms remain included in the density even though their existing
   per-turn integration differs from the edge-integrated data terms. These are
   reporting values only and cannot change path selection or acceptance.
+  Parameters include nominal longitudinal and transverse spacing in prediction
+  voxels and their derived base-voxel values. Successful candidates retain the
+  exact interpolated endpoint prediction and normal samples needed for graph
+  joins. All path positions remain base XYZ.
 - Relative visual quality is computed over exactly the successful scored paths
   in canonical report order as inverse min-max normalized loss density: the
   lowest density is one and the highest is zero. Equal densities all map to one;
@@ -2847,17 +2872,25 @@
   collection is not transactionally atomic. `--no-slices` skips sampling and
   removes all bundles without changing path or JSON results.
 - `fiberlet_graph.json` is generated from every successful scored fiberlet.
-  Anchor identity and base-coordinate position define a node. Each canonical
+  Anchor identity, base-coordinate position, exact interpolated dense
+  prediction, and exact interpolated Lasagna normal define a node; repeated
+  candidate references must agree. Each canonical
   fiberlet is one edge with deterministic array-index ID, exact dense polyline,
   candidate ID, additive loss, and prediction-grid length, and supplies two
   directed arc IDs: `2*edge` forward and `2*edge+1` exact reverse. Endpoint
   tangents use the first/last distinct dense point in traversal direction.
   At a shared anchor an incoming arc may transition to another outgoing arc
   only when the angle between its tangent pointing into the anchor and the
-  outgoing tangent pointing away is strictly below 45 degrees. Transitions and
-  adjacency are canonically ordered. Graph source metadata binds the exact
-  manifest and anchor hashes used for `fiberlets.json`.
-- Continuous/sub-voxel search, learned path-quality rejection, overlap
+  outgoing tangent pointing away is strictly below 45 degrees and the anchor
+  prediction is valid. Every transition stores the shared local metric's
+  alignment/isotropic/tangent/normal components. It uses the same anchor sample
+  as current and candidate prediction, outgoing segment length for alignment,
+  and `max(1,(incoming_length+outgoing_length)/2)` for smoothness. Invalid
+  normals use isotropic fallback. Join cost is additive to the two fiberlet
+  endpoint-proxy costs and adds no route length. Transitions and adjacency are
+  canonically ordered. Graph source metadata binds the exact manifest and
+  anchor hashes used for `fiberlets.json`.
+- Learned path-quality rejection, overlap
   deduplication, extension, H/V and winding labels, CUDA batching, and
   production radius selection remain out of scope.
 
@@ -2909,11 +2942,11 @@
   footprint has exact distance at most the tube radius. Halo/context reads and
   external NMS suppressors remain allowed, but refined selected anchors outside
   the tube are rejected before NMS and cannot suppress in-tube anchors.
-- Replay fiberlet endpoints and integer DP nodes must be inside the tube. The
-  replay preload enumerates sorted unique admissible corridor voxels, samples
-  each once, and exposes a checked immutable sparse lookup. Standalone `paths`
-  retains the existing dense rectangular preload and the objective/path solver
-  is otherwise shared.
+- Replay fiberlet endpoints and mapped candidate-local DP nodes must be inside
+  the tube. The replay preload expands them to sorted unique native corners,
+  samples each once, and exposes a checked immutable sparse lookup. Standalone
+  `paths` retains the existing dense rectangular preload and the objective/path
+  solver is otherwise shared.
 - Bundle JSON is authoritative for reference, trace, comparison trace, and
   failure geometry. `trace_points_base_xyz`, losses, matching records, and the
   failure index retain the complete diagnostic greedy replay. The separate
@@ -2940,8 +2973,12 @@
 - Graph routing uses deterministic receding-horizon beam search. `--beam`
   defaults to 16 and `--lookahead` to three directed edges. Tentative routes
   carry committed/tentative visited nodes and cannot revisit one. At each depth
-  the global beam is pruned by additive fiberlet loss divided by additive
-  prediction-grid length, then additive loss and the full directed-arc sequence.
+  the global beam is pruned by additive edge-plus-join loss divided by additive
+  edge prediction-grid length, then additive loss and the full directed-arc
+  sequence. A committed incoming arc contributes its join to the first
+  tentative edge; deeper expansions contribute their joins. The first route
+  edge has no join. Publication adds each committed join exactly once despite
+  replanning.
   Only routes reaching the deepest available horizon compete unless none can
   expand that far; one leading edge is committed before replanning. Reference
   geometry is not part of this objective, so the experimental route may drift
@@ -2961,9 +2998,11 @@
   distinguishes topology exhaustion from reaching the comparison-reference
   endpoint. The complete final fiberlet may overshoot the requested distance;
   completed distance, overshoot, or truncation shortfall are explicit.
-- Candidate and directed-arc arrays cover every complete published edge,
+- Candidate, directed-arc, and transition arrays cover every complete published edge
+  and join,
   including the failure-containing edge. Total loss, prediction-grid length,
-  and loss density cover that same full-edge set. The stop node is always the
+  and loss density cover that same edge-plus-join objective with edge-only
+  length. Edge and transition component totals are separate. The stop node is always the
   final anchor; no graph route artifact terminates inside a fiberlet. Graph and
   route JSON plus a
   nonempty base-coordinate route OBJ participate in the immutable generation

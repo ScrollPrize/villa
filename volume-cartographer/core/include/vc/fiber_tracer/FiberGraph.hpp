@@ -16,6 +16,9 @@ namespace vc::fiber_tracer
 struct FiberletGraphNode {
     FiberletAnchorId anchor;
     cv::Vec3d positionBaseXYZ{0.0, 0.0, 0.0};
+    FiberStoredPredictionSample prediction;
+    cv::Vec3d normalXYZ{0.0, 0.0, 0.0};
+    bool normalValid = false;
     std::vector<size_t> outgoingArcs;
 };
 
@@ -25,13 +28,16 @@ struct FiberletGraphEdge {
     size_t targetNode = 0;
     std::vector<cv::Vec3d> pointsBaseXYZ;
     double pathLengthPredictionVoxels = 0.0;
-    double totalLoss = 0.0;
+    FiberletPathCost cost;
 };
 
 struct FiberletGraphTransition {
     size_t incomingArc = 0;
     size_t outgoingArc = 0;
     double angleDegrees = 0.0;
+    double incomingLengthPredictionVoxels = 0.0;
+    double outgoingLengthPredictionVoxels = 0.0;
+    FiberletPathCost cost;
 };
 
 struct FiberletGraph {
@@ -75,6 +81,7 @@ struct FiberletGraphReplayResult {
     std::vector<cv::Vec3d> routePointsBaseXYZ;
     std::vector<size_t> candidateIndices;
     std::vector<size_t> arcIndices;
+    std::vector<size_t> transitionIndices;
     std::optional<size_t> failureCandidateIndex;
     std::optional<size_t> failureCandidatePathPointIndex;
     std::optional<size_t> failureArcIndex;
@@ -85,6 +92,8 @@ struct FiberletGraphReplayResult {
     double requestedPostrollDistanceBaseVoxels = 0.0;
     double completedPostrollDistanceBaseVoxels = 0.0;
     double totalLoss = 0.0;
+    FiberletPathCost edgeCost;
+    FiberletPathCost transitionCost;
     double pathLengthPredictionVoxels = 0.0;
 };
 

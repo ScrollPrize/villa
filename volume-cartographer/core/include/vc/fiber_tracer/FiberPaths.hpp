@@ -33,6 +33,8 @@ struct FiberletAnchorId {
 struct FiberletPathConfig {
     int cellRadius = 4;
     double neighborhoodMarginCells = 0.5;
+    double longitudinalStepPredictionVoxels = 2.0;
+    double transverseStepPredictionVoxels = 0.5;
     double maximumEndpointAngleDegrees = 45.0;
     double maximumPredictionDeviationDegrees = 25.0;
     double corridorRadiusPredictionVoxels = 0.0;
@@ -40,7 +42,7 @@ struct FiberletPathConfig {
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
-    double smoothnessFreeAngleDegrees = 45.0;
+    double smoothnessFreeAngleDegrees = 0.0;
     int parallelThreads = 1;
 };
 
@@ -62,6 +64,12 @@ struct FiberletCandidateResult {
     cv::Vec3d targetPositionPredictionXYZ{0.0, 0.0, 0.0};
     cv::Vec3d startAxisXYZ{1.0, 0.0, 0.0};
     cv::Vec3d targetAxisXYZ{1.0, 0.0, 0.0};
+    FiberStoredPredictionSample startPrediction;
+    FiberStoredPredictionSample targetPrediction;
+    cv::Vec3d startNormalXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d targetNormalXYZ{0.0, 0.0, 0.0};
+    bool startNormalValid = false;
+    bool targetNormalValid = false;
     bool searched = false;
     bool scoreValid = false;
     bool success = false;
@@ -149,6 +157,7 @@ struct FiberletPathReport {
     FiberletPathDiagnostics diagnostics;
     std::vector<FiberletCandidateResult> candidates;
     size_t preloadedVoxels = 0;
+    size_t evaluatedDpNodes = 0;
     size_t estimatedPreloadBytes = 0;
     size_t candidateWorkers = 0;
     double candidateGenerationSeconds = 0.0;
@@ -180,9 +189,7 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
 
 [[nodiscard]] LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path);
 
-[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(
-    int radius,
-    double margin);
+[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(int radius, double margin);
 
 [[nodiscard]] FiberletPathReport traceFiberletPaths(
     const LoadedFiberAnchorArtifact& anchors,

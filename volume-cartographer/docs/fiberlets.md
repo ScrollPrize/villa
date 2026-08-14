@@ -192,20 +192,23 @@ pair is solved independently, so an anchor can currently participate in many
 paths.
 
 Candidate generation finishes before any path search. The path stage computes
-the rectangular enclosing ZYX box of every searchable Hermite corridor and its
-virtual endpoint attachment voxels, clips that box to the prediction grid, and
-materializes every stored prediction and Lasagna normal in the box exactly
-once. Candidate workers then read this immutable dense scoring volume; they do
-not decode chunks, interpolate normals, or launch nested sampling workers.
+the rectangular enclosing ZYX box of every searchable Hermite corridor, clips
+that box to the prediction grid, and materializes every stored prediction and
+Lasagna normal in the box exactly once. Candidate workers then interpolate
+from this immutable native-grid scoring volume; they do not decode chunks,
+sample normals, or launch nested sampling workers.
 Corridors may leave the selected anchor-cell box, so the preload box can extend
 beyond the original crop. This intentionally favors speed for the current
 small test crops and can consume substantial memory on large stored-prediction
 regions.
 
-Replay mode instead enumerates the union of admissible corridor bounding boxes,
-intersects every integer prediction voxel with the replay tube, sorts the voxel
-keys, and samples each key once into an immutable sparse lookup. The standalone
-`paths` command retains the dense rectangular preload described above.
+Replay mode instead maps every candidate-local evaluation node to prediction
+XYZ, intersects that floating point with the replay tube, expands accepted
+nodes and exact endpoints to their positive-weight native interpolation
+corners, sorts and deduplicates those corners globally, and samples each once
+into an immutable sparse lookup. Corners remain required even when the corner
+itself lies outside the tube. The standalone `paths` command retains the dense
+rectangular preload described above.
 
 `--threads` controls both the one-time preload batch and the subsequent fixed
 candidate worker pool. Candidate results are written into their original
@@ -224,42 +227,59 @@ output and does not affect stdout or artifacts.
 anchor-cell width. Cell radius and neighborhood margin remain dimensionless
 cell-lattice parameters.
 
-The DP graph contains only integer stored-prediction voxels. Exact sub-voxel
-anchors are virtual endpoints connected through nearby integer voxels. A
-cubic-Hermite reference bounds the corridor, and 26-neighbour moves must have
-strictly positive chord progress. DP state retains the incoming move, allowing
-one-step curvature without a cumulative history state.
+Each candidate has its own curved coordinate domain. A cubic Hermite centerline
+uses the exact anchors, both chord-oriented fitted directions, and derivative
+magnitudes equal to anchor distance. Deterministic arclength inversion places
+planes about 2 prediction voxels apart and inserts the exact endpoint. Each
+plane is normal to the Hermite derivative. A transverse frame starts from the
+least-aligned world axis and is propagated by minimal-rotation parallel
+transport. Integer transverse coordinates map through that frame at 0.5
+prediction-voxel spacing.
 
-Every integer-lattice move must have an unoriented angle strictly below 25
-degrees to the dense fiber-prediction axis sampled at its destination. Virtual
-subvoxel-anchor attachments remain governed by the endpoint-axis constraint;
-applying the lattice gate there would make valid half-voxel anchors unreachable
-through quantization alone. Invalid fiber predictions cannot admit lattice
-edges. This hard gate is independent of the Lasagna surface normal, which
-remains used only for curvature.
+The exact start and target anchors are source and sink. Interior transitions
+advance exactly one curved plane and change either transverse index by at most
+one. Their directions and lengths are computed from the resulting floating XYZ
+positions, so they are not restricted to world axes or 26 quantized directions.
+The layered graph is acyclic. DP state retains the incoming transition because
+alignment and curvature depend on the previous physical step.
+
+Presence is trilinearly interpolated. Fiber directions are unoriented: the
+positive-weight native corner axes are normalized and accumulated as weighted
+outer products, then the shared deterministic symmetric eigensolver resolves a
+unique principal axis. This preserves antipodal axes without sign cancellation;
+an invalid required corner or ambiguous tensor invalidates the destination.
+Normals use the same interpolation, but invalid normal data keeps the existing
+isotropic curvature fallback rather than rejecting the path.
+
+Every interior mapped move must have an unoriented angle strictly below 25
+degrees to the dense fiber-prediction axis interpolated at its destination.
+Virtual endpoint transitions remain governed by the endpoint-axis constraint.
+Invalid fiber predictions cannot admit interior edges. This hard gate is
+independent of the Lasagna surface normal, which remains used only for
+curvature.
 
 Valid-data scoring uses the regular native tracer's multiplicative local
 alignment loss. It multiplies presence by six positive-clamped dots among the
 incoming and outgoing steps and the sign-aligned current and next prediction
 axes, then charges `1-score`. This jointly penalizes trajectory turns,
 prediction discontinuities, and trajectory/prediction disagreement. The DP
-multiplies that loss by lattice-edge length so axial and diagonal integration
-remain comparable. There is no separate presence/direction weight or local
-direction quantization floor.
+multiplies that loss by the actual mapped prediction-voxel edge length. There
+is no separate presence/direction weight or local direction quantization floor.
 
-Source and sink virtual edges use the fitted endpoint axes as their endpoint
+Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared
 Lasagna-normal tangent-plane/normal-tilt split, with isotropic fallback for an
-invalid normal. Its 45-degree free angle remains the integer-lattice adaptation.
-Cumulative history smoothness remains excluded from the DP state. Invalid
-destination predictions are rejected by the hard direction gate. The
-independent Lasagna normal still uses isotropic curvature fallback when invalid.
+invalid normal. The former 45-degree lattice dead zone is removed: the curved
+floating domain uses the greedy tracer's zero-degree free-angle default.
+Cumulative history smoothness remains excluded from the DP state.
 
 The command writes:
 
 - `fiberlets.json`: every neighborhood pair, rejection/failure reason, objective
   breakdown, and successful base-coordinate polyline, plus per-successful-path
-  length and loss/quality visualization metadata.
+  length and loss/quality visualization metadata. It records the longitudinal
+  2-voxel and transverse 0.5-voxel nominal spacings in prediction and base
+  coordinates.
 - `fiberlets.obj`: one named successful polyline per group in base coordinates,
   with strict loss-density and relative-quality comments for napari.
 - `fiber_presence_xy.{obj,mtl,png}`, `fiber_presence_xz.{obj,mtl,png}`, and
@@ -391,9 +411,15 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
 Each accepted fiberlet is an undirected edge with exact forward and reverse
 arcs. A directed transition through a shared anchor exists only when the angle
 between the incoming and outgoing dense endpoint tangents is strictly below 45
-degrees. The deterministic receding-horizon beam search ranks accumulated loss
-per prediction-grid path length, prevents node cycles, and commits one edge at
-a time. It uses the same monotone exact reference matcher as greedy replay, but
+degrees and the exact interpolated anchor prediction is valid. Every join is
+scored by the same shared multiplicative alignment and Lasagna-normal
+tangent/normal curvature metric as an internal fiberlet step. Alignment uses
+the outgoing dense segment length; smoothness uses the mean incoming/outgoing
+length normalization. Join loss is additive to edge loss but adds no route
+length, and committed joins enter replay totals exactly once. The deterministic
+receding-horizon beam search ranks accumulated edge-plus-join loss per
+prediction-grid edge length, prevents node cycles, and commits one edge at a
+time. It uses the same monotone exact reference matcher as greedy replay, but
 advances it by each actual dense fiberlet segment length. The first route point
 whose error is strictly above `--fail` is recorded as the failure, but its edge
 is completed. Routing then continues through whole fiberlets until the first
@@ -438,9 +464,10 @@ completion without failure, and native termination before failure.
 For failures, `--along 128` selects that much dense-reference arclength on each
 side and `--radius 64` defines an exact Euclidean tube including endpoint caps.
 Anchor cells are selected when their prediction-sample footprint intersects the
-tube. Refined anchors are rejected outside the tube before NMS. Fiberlet virtual
-endpoints and integer DP nodes are also tube constrained, and their scoring data
-uses the sparse replay preload. No central textured slice OBJ is produced.
+tube. Refined anchors are rejected outside the tube before NMS. Fiberlet
+endpoints and mapped candidate-local DP nodes are also tube constrained, and
+their scoring data uses the sparse replay preload. No central textured slice
+OBJ is produced.
 `reference_end` from graph replay means the route reached the end of this
 extracted interval, not necessarily the end of the original reference fiber.
 

@@ -1,5 +1,11 @@
 # 2026-08-13: fiberlet graph replay
 
+- Replaced the quantized world-axis half-grid DP with a deterministic curved
+  cubic-Hermite domain using 2-voxel arclength planes, parallel-transported
+  frames, 0.5-voxel transverse offsets, and floating-point interpolation.
+- Removed the fiberlet lattice's 45-degree smoothness dead zone and scored
+  graph joins with the same shared local alignment and Lasagna-normal
+  tangent/normal objective, including exactly-once replay accounting.
 - Expanded integer-DP candidate generation from the radius-four shell to every
   shorter cell offset within the same outer bound and added a strict 25-degree
   sampled-fiber-direction feasibility constraint.
@@ -485,3 +491,8 @@
   dispatch and restored float16 product rings as the default.
 - Added `--accumulator-workers`, backend/throughput diagnostics, native
   numerical coverage, and process-vs-synchronous output coverage.
+# 2026-08-13: half-voxel fiberlet DP
+
+- Halved anchor-to-anchor fiberlet DP spacing to 0.5 stored prediction voxels,
+  with cached sign-invariant prediction/normal interpolation and unchanged
+  base-coordinate artifacts.

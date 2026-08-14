@@ -1009,6 +1009,7 @@ def load_fiber_replay_bundle(
                 "route_points_base_xyz",
                 "candidate_indices",
                 "arc_indices",
+                "transition_indices",
                 "failure_candidate_index",
                 "failure_candidate_path_point_index",
                 "failure_arc_index",
@@ -1018,6 +1019,8 @@ def load_fiber_replay_bundle(
                 "failure_reference_arc_base",
                 "postroll",
                 "total_loss",
+                "edge_cost",
+                "transition_cost",
                 "path_length_prediction_voxels",
                 "loss_per_prediction_voxel",
             }
@@ -1053,6 +1056,7 @@ def load_fiber_replay_bundle(
             route_has_obj = len(fiberlet_route_xyz) > 0
             candidate_indices = fiberlet_replay.get("candidate_indices")
             arc_indices = fiberlet_replay.get("arc_indices")
+            transition_indices = fiberlet_replay.get("transition_indices")
             failure_candidate = fiberlet_replay.get("failure_candidate_index")
             failure_path_point = fiberlet_replay.get(
                 "failure_candidate_path_point_index"
@@ -1064,9 +1068,40 @@ def load_fiber_replay_bundle(
             failure_route_point = fiberlet_replay.get("failure_route_point_index")
             failure_reference_arc = fiberlet_replay.get("failure_reference_arc_base")
             total_loss = fiberlet_replay.get("total_loss")
+            edge_cost = fiberlet_replay.get("edge_cost")
+            transition_cost = fiberlet_replay.get("transition_cost")
             path_length = fiberlet_replay.get("path_length_prediction_voxels")
             loss_density = fiberlet_replay.get("loss_per_prediction_voxel")
             graph_postroll = fiberlet_replay.get("postroll")
+            cost_keys = {
+                "invalid_prediction",
+                "alignment",
+                "isotropic_smoothness",
+                "tangent_smoothness",
+                "normal_smoothness",
+                "total",
+            }
+
+            def valid_route_cost(value: object) -> bool:
+                if not isinstance(value, dict) or set(value) != cost_keys:
+                    return False
+                components = [
+                    value[key]
+                    for key in cost_keys
+                    if key != "total"
+                ]
+                if any(
+                    not isinstance(item, (int, float))
+                    or isinstance(item, bool)
+                    or not math.isfinite(item)
+                    or item < 0
+                    for item in components + [value["total"]]
+                ):
+                    return False
+                return math.isclose(
+                    value["total"], sum(components), rel_tol=1.0e-12, abs_tol=1.0e-12
+                )
+
             is_failure = fiberlet_replay_status in {
                 "failure_with_postroll",
                 "failure_truncated",
@@ -1085,6 +1120,13 @@ def load_fiber_replay_bundle(
                     for item in arc_indices
                 )
                 or len(set(arc_indices)) != len(arc_indices)
+                or not isinstance(transition_indices, list)
+                or len(transition_indices) != max(0, len(arc_indices) - 1)
+                or any(
+                    not isinstance(item, int) or isinstance(item, bool) or item < 0
+                    for item in transition_indices
+                )
+                or len(set(transition_indices)) != len(transition_indices)
                 or (
                     failure_candidate is not None
                     and (
@@ -1147,6 +1189,14 @@ def load_fiber_replay_bundle(
                 or isinstance(total_loss, bool)
                 or not math.isfinite(total_loss)
                 or total_loss < 0
+                or not valid_route_cost(edge_cost)
+                or not valid_route_cost(transition_cost)
+                or not math.isclose(
+                    total_loss,
+                    edge_cost["total"] + transition_cost["total"],
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-12,
+                )
                 or not isinstance(path_length, (int, float))
                 or isinstance(path_length, bool)
                 or not math.isfinite(path_length)

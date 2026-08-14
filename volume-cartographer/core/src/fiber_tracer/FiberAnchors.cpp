@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberAnchors.hpp"
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
@@ -118,14 +119,6 @@ struct WeightedObservation {
     size_t canonicalIndex = 0;
 };
 
-struct PrincipalAxis {
-    cv::Vec3d axis{0.0, 0.0, 0.0};
-    double largestEigenvalue = 0.0;
-    double secondEigenvalue = 0.0;
-    bool valid = false;
-    bool unique = false;
-};
-
 struct FitState {
     std::array<cv::Vec3d, 2> axes{};
     std::vector<uint8_t> assignments;
@@ -175,23 +168,6 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     if (!(norm2 > kMatrixEpsilon * kMatrixEpsilon) || !std::isfinite(norm2))
         return {0.0, 0.0, 0.0};
     return value / std::sqrt(norm2);
-}
-
-[[nodiscard]] cv::Vec3d canonicalAxis(cv::Vec3d axis)
-{
-    axis = normalized(axis);
-    size_t signAxis = 0;
-    double largestAbsolute = std::abs(axis[0]);
-    for (size_t index = 1; index < 3; ++index) {
-        const double candidate = std::abs(axis[static_cast<int>(index)]);
-        if (candidate > largestAbsolute) {
-            largestAbsolute = candidate;
-            signAxis = index;
-        }
-    }
-    if (axis[static_cast<int>(signAxis)] < 0.0)
-        axis *= -1.0;
-    return axis;
 }
 
 [[nodiscard]] std::array<cv::Vec3d, 2> transverseBasis(
@@ -253,73 +229,6 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
             tensor(row, column) = sums[static_cast<size_t>(row * 3 + column)].sum;
     }
     return tensor;
-}
-
-[[nodiscard]] PrincipalAxis principalAxis(const cv::Matx33d& input)
-{
-    cv::Matx33d matrix = input;
-    cv::Matx33d eigenvectors = cv::Matx33d::eye();
-    constexpr std::array<std::pair<int, int>, 3> rotations = {
-        std::pair{0, 1}, std::pair{0, 2}, std::pair{1, 2}};
-    for (int sweep = 0; sweep < 32; ++sweep) {
-        bool changed = false;
-        for (const auto [p, q] : rotations) {
-            const double app = matrix(p, p);
-            const double aqq = matrix(q, q);
-            const double apq = matrix(p, q);
-            const double scale = std::max({1.0, std::abs(app), std::abs(aqq)});
-            if (std::abs(apq) <= kMatrixEpsilon * scale)
-                continue;
-            changed = true;
-            const double tau = (aqq - app) / (2.0 * apq);
-            const double sign = tau >= 0.0 ? 1.0 : -1.0;
-            const double tangent = sign /
-                (std::abs(tau) + std::sqrt(1.0 + tau * tau));
-            const double cosine = 1.0 / std::sqrt(1.0 + tangent * tangent);
-            const double sine = tangent * cosine;
-            for (int index = 0; index < 3; ++index) {
-                if (index == p || index == q)
-                    continue;
-                const double aip = matrix(index, p);
-                const double aiq = matrix(index, q);
-                matrix(index, p) = matrix(p, index) = cosine * aip - sine * aiq;
-                matrix(index, q) = matrix(q, index) = sine * aip + cosine * aiq;
-            }
-            matrix(p, p) = cosine * cosine * app -
-                2.0 * sine * cosine * apq + sine * sine * aqq;
-            matrix(q, q) = sine * sine * app +
-                2.0 * sine * cosine * apq + cosine * cosine * aqq;
-            matrix(p, q) = matrix(q, p) = 0.0;
-            for (int row = 0; row < 3; ++row) {
-                const double vip = eigenvectors(row, p);
-                const double viq = eigenvectors(row, q);
-                eigenvectors(row, p) = cosine * vip - sine * viq;
-                eigenvectors(row, q) = sine * vip + cosine * viq;
-            }
-        }
-        if (!changed)
-            break;
-    }
-
-    std::array<int, 3> order{0, 1, 2};
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return matrix(a, a) > matrix(b, b);
-    });
-    PrincipalAxis result;
-    result.largestEigenvalue = matrix(order[0], order[0]);
-    result.secondEigenvalue = matrix(order[1], order[1]);
-    result.axis = canonicalAxis({
-        eigenvectors(0, order[0]),
-        eigenvectors(1, order[0]),
-        eigenvectors(2, order[0]),
-    });
-    result.valid = result.largestEigenvalue > kMatrixEpsilon &&
-        finiteVector(result.axis);
-    const double gapTolerance = 1.0e-12 *
-        std::max(1.0, std::abs(result.largestEigenvalue));
-    result.unique = result.valid &&
-        result.largestEigenvalue - result.secondEigenvalue > gapTolerance;
-    return result;
 }
 
 [[nodiscard]] std::vector<uint8_t> assignObservations(
@@ -487,7 +396,7 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     RefinedFitState state;
     state.activeComponents = activeComponents;
     for (size_t component = 0; component < activeComponents; ++component) {
-        state.components[component].axis = canonicalAxis(seedAxes[component]);
+        state.components[component].axis = canonicalFiberAxis(seedAxes[component]);
         state.components[component].position = pivot;
     }
     cv::Vec3d lower{
@@ -537,7 +446,7 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 for (int column = 0; column < 3; ++column)
                     tensor(row, column) = tensorSums[static_cast<size_t>(row * 3 + column)].sum;
             }
-            const PrincipalAxis principal = principalAxis(tensor);
+            const FiberPrincipalAxis principal = principalFiberAxis(tensor);
             if (principal.unique)
                 proposed[component].axis = principal.axis;
 
@@ -591,7 +500,7 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 cv::Vec3d targetAxis = proposed[component].axis;
                 if (state.components[component].axis.dot(targetAxis) < 0.0)
                     targetAxis *= -1.0;
-                interpolated[component].axis = canonicalAxis(normalized(
+                interpolated[component].axis = canonicalFiberAxis(normalized(
                     state.components[component].axis * (1.0 - fraction) +
                     targetAxis * fraction));
                 const cv::Vec3d offset =
@@ -1024,7 +933,7 @@ struct DirectionConditionedPeak {
         auto assignments = assignObservations(observations, axes);
         std::array<cv::Vec3d, 2> updated = axes;
         for (uint8_t component = 0; component < 2; ++component) {
-            const auto principal = principalAxis(
+            const auto principal = principalFiberAxis(
                 weightedTensor(observations, &assignments, component));
             if (principal.unique)
                 updated[component] = principal.axis;
@@ -1546,7 +1455,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
         return result;
     }
 
-    const PrincipalAxis global = principalAxis(weightedTensor(observations, nullptr, 0));
+    const FiberPrincipalAxis global = principalFiberAxis(weightedTensor(observations, nullptr, 0));
     std::vector<cv::Vec3d> seeds;
     seeds.reserve(config.maximumSeedCount);
     if (global.unique) {
@@ -1557,7 +1466,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
             if (observations[index].weight > observations[best].weight)
                 best = index;
         }
-        seeds.push_back(canonicalAxis(observations[best].direction));
+        seeds.push_back(canonicalFiberAxis(observations[best].direction));
     }
     std::vector<bool> selected(observations.size(), false);
     while (seeds.size() < config.maximumSeedCount) {
@@ -1581,7 +1490,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
         if (best == observations.size() || !(bestScore > 0.0))
             break;
         selected[best] = true;
-        seeds.push_back(canonicalAxis(observations[best].direction));
+        seeds.push_back(canonicalFiberAxis(observations[best].direction));
     }
 
     FitState bestFit;
@@ -1602,9 +1511,9 @@ FiberCellAnchorResult fitFiberCellAnchors(
         ? bestFit.objectiveNumerator / denominator.sum
         : 0.0;
 
-    const std::array<PrincipalAxis, 2> fittedComponents{
-        principalAxis(weightedTensor(observations, &bestFit.assignments, 0)),
-        principalAxis(weightedTensor(observations, &bestFit.assignments, 1)),
+    const std::array<FiberPrincipalAxis, 2> fittedComponents{
+        principalFiberAxis(weightedTensor(observations, &bestFit.assignments, 0)),
+        principalFiberAxis(weightedTensor(observations, &bestFit.assignments, 1)),
     };
     std::array<size_t, 2> fittedAssignedCounts{0, 0};
     for (const uint8_t assignment : bestFit.assignments) {
@@ -1736,7 +1645,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
         component.assignedObservationCount =
             refined.evaluation.assignedCounts[componentIndex];
         component.anchor.axisXYZ =
-            canonicalAxis(refined.components[componentIndex].axis);
+            canonicalFiberAxis(refined.components[componentIndex].axis);
         component.anchor.positionPredictionXYZ =
             refined.components[componentIndex].position;
         component.anchor.alignedSupport = denominatorValue > 0.0
