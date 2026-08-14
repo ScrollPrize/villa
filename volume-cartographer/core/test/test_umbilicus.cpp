@@ -296,3 +296,145 @@ TEST_CASE("control_points json format loads via the shared loader")
 
     fs::remove(path);
 }
+
+// ------- LoadFileInfo (frame metadata) -------
+
+TEST_CASE("LoadFileInfo: stamped file reports all three metadata fields")
+{
+    const auto path = tmpFile("info_stamped", ".json");
+    writeFile(path,
+              R"({"metadata": {"total_points": 2, "voxelsize_um": 9.6,)"
+              R"( "volume": "scroll.zarr", "zarr_level": 2},)"
+              R"("control_points": [)"
+              R"({"x": 10, "y": 20, "z": 5, "score": 100},)"
+              R"({"x": 12, "y": 22, "z": 15, "score": 100}]})");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
+    REQUIRE(info.voxelsizeUm.has_value());
+    CHECK(*info.voxelsizeUm == doctest::Approx(9.6));
+    REQUIRE(info.volume.has_value());
+    CHECK(*info.volume == "scroll.zarr");
+    REQUIRE(info.zarrLevel.has_value());
+    CHECK(*info.zarrLevel == 2);
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: metadata without frame keys leaves every field unset")
+{
+    const auto path = tmpFile("info_unstamped", ".json");
+    writeFile(path,
+              R"({"metadata": {"total_points": 1, "timestamp": "2026-04-20T13:16:29Z"},)"
+              R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 1);
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.zarrLevel.has_value());
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: bare-array json parses points with no metadata")
+{
+    const auto path = tmpFile("info_bare", ".json");
+    writeFile(path, "[[0,5,10],[10,6,11]]");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 5.0f, 0.0f));
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.zarrLevel.has_value());
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: text file parses points with no metadata")
+{
+    const auto path = tmpFile("info_text", ".txt");
+    writeFile(path, "0, 5, 10\n10, 6, 11\n");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.zarrLevel.has_value());
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: a malformed field only costs that field")
+{
+    const std::string points =
+        R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
+
+    SUBCASE("malformed voxelsize_um")
+    {
+        const auto path = tmpFile("info_bad_voxelsize", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": "nine point six",)"
+                  R"( "volume": "scroll.zarr", "zarr_level": 2},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.volume.value_or("") == "scroll.zarr");
+        CHECK(info.zarrLevel.value_or(-1) == 2);
+        fs::remove(path);
+    }
+
+    SUBCASE("non-positive voxelsize_um")
+    {
+        const auto path = tmpFile("info_zero_voxelsize", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 0, "zarr_level": 1},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.zarrLevel.value_or(-1) == 1);
+        fs::remove(path);
+    }
+
+    SUBCASE("malformed volume")
+    {
+        const auto path = tmpFile("info_bad_volume", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4, "volume": 7,)"
+                  R"( "zarr_level": 0},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        CHECK_FALSE(info.volume.has_value());
+        CHECK(info.zarrLevel.value_or(-1) == 0);
+        fs::remove(path);
+    }
+
+    SUBCASE("malformed zarr_level")
+    {
+        const auto path = tmpFile("info_bad_level", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4,)"
+                  R"( "volume": "scroll.zarr", "zarr_level": "two"},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        CHECK(info.volume.value_or("") == "scroll.zarr");
+        CHECK_FALSE(info.zarrLevel.has_value());
+        fs::remove(path);
+    }
+
+    SUBCASE("metadata is not an object")
+    {
+        const auto path = tmpFile("info_bad_metadata", ".json");
+        writeFile(path, R"({"metadata": "nope", )" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK_FALSE(info.volume.has_value());
+        CHECK_FALSE(info.zarrLevel.has_value());
+        fs::remove(path);
+    }
+}

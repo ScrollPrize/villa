@@ -25,6 +25,7 @@
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -135,6 +136,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
     connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
 
+    _attachUmbilicusAct = new QAction(QObject::tr("Attach &Umbilicus..."), this);
+    connect(_attachUmbilicusAct, &QAction::triggered, this, &MenuActionController::attachUmbilicus);
+
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
@@ -218,6 +222,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
     _fileMenu->addAction(_attachNormalGridAct);
+    _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -1772,6 +1777,41 @@ void MenuActionController::attachNormalGrid()
         return;
     }
     _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachUmbilicus()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    const auto file = QFileDialog::getOpenFileName(
+        _window, QObject::tr("Attach Umbilicus"),
+        QString::fromStdString(pkg->getVolpkgDirectory()),
+        QObject::tr("Umbilicus (*.json)"));
+    if (file.isEmpty()) return;
+
+    vc::core::util::UmbilicusFileInfo info;
+    try {
+        info = vc::core::util::Umbilicus::LoadFileInfo(
+            std::filesystem::path(file.toStdString()));
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid umbilicus file:\n\n%1").arg(QString::fromUtf8(e.what())));
+        return;
+    }
+
+    pkg->setUmbilicus(file.toStdString());
+    if (_window->statusBar()) {
+        _window->showStatusBarMessage(
+            QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
+    }
+    if (!info.voxelsizeUm) {
+        QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
+            QObject::tr("%1 declares no voxelsize_um, so consumers may have to guess "
+                        "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
+    }
 }
 
 void MenuActionController::attachLasagnaManifest()

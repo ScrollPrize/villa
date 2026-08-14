@@ -45,7 +45,7 @@ namespace vc::core::util {
 
 Umbilicus Umbilicus::FromFile(const std::filesystem::path& path, const cv::Vec3i& volume_shape)
 {
-    return Umbilicus(LoadFile(path), volume_shape);
+    return Umbilicus(LoadFile(path).controlPoints, volume_shape);
 }
 
 Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv::Vec3i& volume_shape)
@@ -54,6 +54,11 @@ Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv:
 }
 
 std::vector<cv::Vec3f> Umbilicus::LoadControlPoints(const std::filesystem::path& path)
+{
+    return LoadFile(path).controlPoints;
+}
+
+UmbilicusFileInfo Umbilicus::LoadFileInfo(const std::filesystem::path& path)
 {
     return LoadFile(path);
 }
@@ -190,7 +195,7 @@ Umbilicus::Umbilicus(std::vector<cv::Vec3f> control_points, const cv::Vec3i& vol
     interpolate_centers();
 }
 
-std::vector<cv::Vec3f> Umbilicus::LoadFile(const std::filesystem::path& path)
+UmbilicusFileInfo Umbilicus::LoadFile(const std::filesystem::path& path)
 {
     const std::string extension = path.extension().string();
     std::string lowered_ext;
@@ -205,7 +210,9 @@ std::vector<cv::Vec3f> Umbilicus::LoadFile(const std::filesystem::path& path)
     if (!stream) {
         throw std::runtime_error("Failed to open umbilicus text file: " + path.string());
     }
-    return LoadTextFile(stream);
+    UmbilicusFileInfo info;
+    info.controlPoints = LoadTextFile(stream);
+    return info;
 }
 
 std::vector<cv::Vec3f> Umbilicus::LoadTextFile(std::istream& stream)
@@ -261,7 +268,7 @@ std::vector<cv::Vec3f> Umbilicus::LoadTextFile(std::istream& stream)
     return points;
 }
 
-std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path)
+UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
 {
     utils::Json document = utils::Json::parse_file(path);
 
@@ -285,7 +292,8 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
             "Umbilicus json root must be an array or contain a 'points' or 'control_points' array");
     }
 
-    std::vector<cv::Vec3f> points;
+    UmbilicusFileInfo info;
+    std::vector<cv::Vec3f>& points = info.controlPoints;
     points.reserve(array->size());
 
     for (std::size_t idx = 0; idx < array->size(); ++idx) {
@@ -319,7 +327,34 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
         throw std::runtime_error("Umbilicus json file contained no points");
     }
 
-    return points;
+    if (document.is_object() && document.contains("metadata")) {
+        const auto& metadata = document.at("metadata");
+        if (metadata.is_object()) {
+            if (metadata.contains("voxelsize_um")) {
+                const auto& value = metadata.at("voxelsize_um");
+                if (value.is_number()) {
+                    const double voxelsize = value.get_double();
+                    if (std::isfinite(voxelsize) && voxelsize > 0.0) {
+                        info.voxelsizeUm = voxelsize;
+                    }
+                }
+            }
+            if (metadata.contains("volume")) {
+                const auto& value = metadata.at("volume");
+                if (value.is_string() && !value.get_string().empty()) {
+                    info.volume = value.get_string();
+                }
+            }
+            if (metadata.contains("zarr_level")) {
+                const auto& value = metadata.at("zarr_level");
+                if (value.is_number_integer() && value.get_int() >= 0) {
+                    info.zarrLevel = value.get_int();
+                }
+            }
+        }
+    }
+
+    return info;
 }
 
 void Umbilicus::interpolate_centers()
