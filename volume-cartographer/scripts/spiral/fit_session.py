@@ -93,7 +93,8 @@ from config import Config
 # advance which it would get. POST /session/load-checkpoint takes
 # "allow_rebuild", and its 409 carries the preflight's "reasons" with either
 # the "stage" a rebuild would need or "refused" when none would help.
-API_VERSION = 28
+# Version 29 adds the compact winding-inference input and dense-spacing mode.
+API_VERSION = 29
 
 
 class SessionState(str, Enum):
@@ -181,7 +182,7 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # mode-derived asset predicates then all read as disabled so the invalid
     # mode never masquerades as missing-file errors.
     mode = str(config.get("dense_spacing_mode", "phase"))
-    return mode if mode in ("phase", "grad_mag") else None
+    return mode if mode in ("phase", "grad_mag", "winding_model") else None
 
 
 def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
@@ -199,6 +200,10 @@ def _normals_required(config: Mapping[str, Any]) -> bool:
 def _grad_mag_required(config: Mapping[str, Any]) -> bool:
     return (_dense_spacing_mode(config) == "grad_mag"
             and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
+
+
+def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
+    return _dense_spacing_mode(config) == "winding_model"
 
 
 @dataclass(frozen=True)
@@ -256,6 +261,10 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("surf_sdt", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
                  required=_phase_bundle_enabled),
+    FitInputSpec("winding_inference", "directory",
+                 conventional_relative="winding_inference",
+                 enabled=_winding_model_enabled,
+                 required=_winding_model_enabled),
 )
 
 _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
@@ -311,6 +320,7 @@ class SpiralInputPaths:
     normal_y: str = ""
     gradient_magnitude: str = ""
     surf_sdt: str = ""
+    winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
     output_directory: str = ""
@@ -638,6 +648,7 @@ def conventional_input_paths(
         normal_y=resolve("normal_y"),
         gradient_magnitude=resolve("gradient_magnitude"),
         surf_sdt=resolve("surf_sdt"),
+        winding_inference=resolve("winding_inference"),
         checkpoint=_normalise_path(checkpoint) if checkpoint else "",
         output_directory=_normalise_path(output_directory) if output_directory else "",
         cache_directory=_normalise_path(cache_directory) if cache_directory else "",
@@ -1074,13 +1085,29 @@ def validate_session_request(
             check_catalog_input(spec)
 
     spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag"):
+    if spacing_mode not in ("phase", "grad_mag", "winding_model"):
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase or grad_mag"})
+                       "message": "Must be phase, grad_mag, or winding_model"})
 
     for spec in FIT_INPUT_CATALOG:
         if spec.kind == "zarr-group":
             check_catalog_input(spec)
+
+    if spacing_mode == "winding_model" and paths.winding_inference:
+        manifest = Path(paths.winding_inference) / "manifest.json"
+        if not manifest.is_file():
+            errors.append({"field": "winding_inference",
+                           "message": "manifest.json is missing"})
+        else:
+            try:
+                metadata = json.loads(manifest.read_text())
+                if metadata.get("artifact_type") != "winding_inference_crossings":
+                    raise ValueError("unexpected artifact_type")
+                if int(metadata.get("format_version", -1)) != 1:
+                    raise ValueError("unsupported format_version")
+            except Exception as exc:
+                errors.append({"field": "winding_inference",
+                               "message": f"Invalid inference manifest: {exc}"})
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
