@@ -19,8 +19,8 @@ import zipfile
 from config import Config
 
 
-# Version 15 adds structured, stage-local operation progress.
-API_VERSION = 15
+# Version 16 adds the compact winding-inference input and spacing mode.
+API_VERSION = 16
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -66,6 +66,7 @@ class SpiralInputPaths:
     normal_y: str = ""
     gradient_magnitude: str = ""
     surf_sdt: str = ""
+    winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
     output_directory: str = ""
@@ -171,6 +172,7 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
     ("normal_y", "lasagna_inputs/las_008_ny.ome.zarr", "directory", False),
     ("gradient_magnitude", "lasagna_inputs/las_008_grad_mag.ome.zarr", "directory", False),
     ("surf_sdt", "lasagna_inputs/las_008_surf_sdt.ome.zarr", "directory", False),
+    ("winding_inference", "winding_inference", "directory", False),
 )
 
 _PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
@@ -378,9 +380,9 @@ def validate_session_request(
     # The dense-spacing mode is checked before any asset-path requirements
     # so an invalid mode errors as itself, not as a missing-file error.
     spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag"):
+    if spacing_mode not in ("phase", "grad_mag", "inference"):
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase or grad_mag"})
+                       "message": "Must be phase, grad_mag, or inference"})
         spacing_mode = None
 
     use_normals = float(
@@ -388,6 +390,7 @@ def validate_session_request(
     spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
     use_phase = spacing_mode == "phase"
     use_grad_mag = spacing_mode == "grad_mag" and spacing_enabled
+    use_inference = spacing_mode == "inference"
     # The phase bundle requires its core inputs (SDT for phase, count, and
     # attachment; both normal channels for band incidence handling) even when
     # individual sub-weights are zero, so run-mutable weights can be raised
@@ -398,8 +401,25 @@ def validate_session_request(
         (paths.normal_y, "normal_y", use_normals or use_phase),
         (paths.gradient_magnitude, "gradient_magnitude", use_grad_mag),
         (paths.surf_sdt, "surf_sdt", use_phase),
+        (paths.winding_inference, "winding_inference", use_inference),
     ):
         optional_dir(value, label, required=required)
+
+    if use_inference and paths.winding_inference:
+        manifest = Path(paths.winding_inference) / "manifest.json"
+        if not manifest.is_file():
+            errors.append({"field": "winding_inference",
+                           "message": "manifest.json is missing"})
+        else:
+            try:
+                metadata = json.loads(manifest.read_text())
+                if metadata.get("artifact_type") != "winding_inference_crossings":
+                    raise ValueError("unexpected artifact_type")
+                if int(metadata.get("format_version", -1)) != 1:
+                    raise ValueError("unsupported format_version")
+            except Exception as exc:
+                errors.append({"field": "winding_inference",
+                               "message": f"Invalid inference manifest: {exc}"})
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})

@@ -4,6 +4,33 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Neural winding-inference losses
+
+Set `dense_spacing_mode` to `inference` and provide the compact exported
+crossing directory as the `winding_inference` session input (or set
+`FIT_SPIRAL_WINDING_INFERENCE_PATH` for the legacy entrypoint). The store is
+checksum-verified and copied to each fitting GPU at startup; optimisation then
+does no inference-store filesystem I/O. The default 24,000 samples per step
+are split evenly between long relative-winding pairs and adjacent-passage
+density pairs. In this mode surf-SDT is neither loaded nor required, while the
+independent Lasagna normal and native minimum-spacing losses remain available.
+
+The compact store is created by the Vesuvius winding-model
+`export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
+exact export command and format.
+
+For a standalone fit driven only by the umbilicus, outer shell, and winding
+inference, set `FIT_SPIRAL_DISABLE_AUXILIARY_INPUTS=1`. This prevents the
+legacy entrypoint from loading verified patches, point-collection JSON files,
+fibers, and tracks. `FIT_SPIRAL_DATASET_PATH` selects the dataset root (the
+default remains `/ephemeral/paul/spiral/dataset`). Select inference mode and
+zero unwanted regularizers/losses independently with
+`FIT_SPIRAL_CONFIG_OVERRIDES`.
+
+For the PHercParis4 inference-only fit on GPUs 0 through 6, the checked-in
+`run_ft7_inference_only.sh` launcher supplies all of those settings, performs
+input preflight checks, and leaves rank-zero progress attached to the terminal.
+
 ## Flattening a fitted checkpoint
 
 `flatten_spiral_checkpoint.py` is a standalone, one-shot exporter. It

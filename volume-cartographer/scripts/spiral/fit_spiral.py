@@ -113,6 +113,10 @@ from satisfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+from winding_supervision import (
+    get_winding_inference_losses,
+    load_winding_inference_store,
+)
 from spiral_progress import ProgressReporter, progress_or_null
 
 
@@ -131,6 +135,7 @@ normal_zarr_group = '4'
 # the store's own metadata, never from normal_zarr_group/lasagna_scale.
 surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
 surf_sdt_zarr_group = '1'
+winding_inference_path = os.environ.get('FIT_SPIRAL_WINDING_INFERENCE_PATH')
 pcl_json_paths = [
     f'{dataset_path}/abs_winding.json',
     f'{dataset_path}/relative_windings.json',
@@ -973,15 +978,15 @@ def main(
     # lasagna and tracks loading
     # ==========================================================================
 
-    # The two-mode dense-spacing contract: 'phase' (production bundle) or
-    # 'grad_mag' (legacy density integral). Checked before any asset paths so
+    # Dense-spacing input contract. Checked before any asset paths so
     # an invalid mode fails as itself, not as a missing-file error.
     dense_spacing_mode = cfg['dense_spacing_mode']
-    if dense_spacing_mode not in ('phase', 'grad_mag'):
+    if dense_spacing_mode not in ('phase', 'grad_mag', 'inference'):
         raise ValueError(
             f'dense_spacing_mode={dense_spacing_mode!r} must be '
-            "'phase' or 'grad_mag'")
+            "'phase', 'grad_mag', or 'inference'")
     phase_mode = dense_spacing_mode == 'phase'
+    inference_mode = dense_spacing_mode == 'inference'
     grad_mag_spacing_enabled = (
         dense_spacing_mode == 'grad_mag'
         and cfg['loss_weight_dense_spacing'] > 0
@@ -1042,24 +1047,49 @@ def main(
         if interactive_driver is not None:
             _active_scalar_stores.append(sdt_volume['store'])
 
+    winding_inference = None
+    if inference_mode:
+        if not winding_inference_path or not os.path.isdir(winding_inference_path):
+            raise RuntimeError(
+                "dense_spacing_mode='inference' requires the compact winding "
+                f"inference store: {winding_inference_path!r}")
+        progress.begin(
+            'loading', 'Loading winding-inference supervision',
+            detail=os.path.basename(os.path.normpath(winding_inference_path)))
+        winding_inference = load_winding_inference_store(
+            winding_inference_path,
+            torch.device('cuda'),
+            verify=os.environ.get(
+                'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
+        )
+        print(
+            f"loaded winding inference: "
+            f"{winding_inference.fingerprint['num_rays']:,} rays, "
+            f"{winding_inference.fingerprint['num_crossings']:,} crossings")
+
     def phase_mode_active():
         return phase_mode and sdt_volume is not None and lasagna_volume is not None
 
     def grad_mag_mode_active():
         return grad_mag_spacing_enabled and lasagna_volume is not None
 
+    def inference_mode_active():
+        return inference_mode and winding_inference is not None
+
     sdt_inactive_warned = set()
 
     def warn_if_sdt_loss_inactive():
         # Run-mutable weights are read afresh every step, but the SDT-backed
-        # components only exist in phase mode; make a grad_mag session's
-        # nonzero SDT-backed weights a visible no-op. The native min-spacing
+        # components only exist in phase mode; make other sessions' nonzero
+        # SDT-only weights a visible no-op. The native min-spacing
         # barrier is asset-independent and remains active in either mode.
         if phase_mode:
             return
-        for weight_key in ('loss_weight_dense_spacing_count',
-                           'loss_weight_dense_spacing_density',
-                           'loss_weight_dense_attachment'):
+        inactive = ['loss_weight_dense_spacing_count',
+                    'loss_weight_dense_attachment']
+        if not inference_mode:
+            inactive.append('loss_weight_dense_spacing_density')
+        for weight_key in inactive:
             if cfg[weight_key] > 0 and weight_key not in sdt_inactive_warned:
                 sdt_inactive_warned.add(weight_key)
                 print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
@@ -1533,6 +1563,22 @@ def main(
                         'checkpoint surf-SDT fingerprint does not match the resolved store '
                         f'while an SDT-driven loss is enabled:\n  checkpoint: '
                         f'{checkpoint_fingerprint}\n  current:    {current_fingerprint}')
+            if inference_mode:
+                checkpoint_fingerprint = resume_checkpoint.get(
+                    'winding_inference_fingerprint')
+                current_fingerprint = (
+                    winding_inference.fingerprint
+                    if winding_inference is not None else None)
+                if checkpoint_fingerprint is None:
+                    print(
+                        'WARNING: checkpoint has no winding-inference '
+                        'fingerprint; the current store cannot be matched')
+                elif checkpoint_fingerprint != current_fingerprint:
+                    raise RuntimeError(
+                        'checkpoint winding-inference fingerprint does not '
+                        'match the resolved store while inference losses are '
+                        f'enabled:\n  checkpoint: {checkpoint_fingerprint}'
+                        f'\n  current:    {current_fingerprint}')
             checkpoint_cfg = resume_checkpoint.get('cfg', {})
             shape_keys = (
                 'model_num_flow_integration_steps', 'model_flow_integration_solver', 'model_num_flow_timesteps',
@@ -1749,6 +1795,9 @@ def main(
             'lasagna_group': normal_zarr_group,
             'surf_sdt_fingerprint': (
                 sdt_volume['fingerprint'] if sdt_volume is not None else None),
+            'winding_inference_fingerprint': (
+                winding_inference.fingerprint
+                if winding_inference is not None else None),
             # The model z-range, not the run window: a resumed session may
             # optimise a narrower window than the flow field covers, and
             # resume rebuilds parameter shapes from these values.
@@ -2030,6 +2079,11 @@ def main(
                     float(cfg['loss_weight_dense_spacing']), 1.0)
                 diagnostic_weights['dense_spacing_count'] = max(
                     float(cfg['loss_weight_dense_spacing_count']), 1.0)
+            if inference_mode_active():
+                diagnostic_weights['dense_spacing_inference_relative'] = max(
+                    float(cfg['loss_weight_dense_spacing']), 1.0)
+                diagnostic_weights['dense_spacing_inference_density'] = max(
+                    float(cfg['loss_weight_dense_spacing_density']), 1.0)
             transform = spiral_and_transform.get_slice_to_spiral_transform()
             dr = spiral_and_transform.get_dr_per_winding()
             progress.begin(
@@ -2089,6 +2143,12 @@ def main(
                             lasagna_volume, shell_outer_winding_idx, cfg,
                             z_begin, z_end, generator=preview_generator):
                         pass
+                if inference_mode_active():
+                    preview_generator = torch.Generator(device=dr.device)
+                    preview_generator.manual_seed(0x13198A2E)
+                    get_winding_inference_losses(
+                        transform, dr, winding_inference, cfg,
+                        z_begin, z_end, generator=preview_generator)
                 if unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
                         transform, dr, unattached_pcl_strips,
@@ -2814,6 +2874,25 @@ def main(
 
         warn_if_sdt_loss_inactive()
         warn_if_dense_losses_structurally_disabled()
+        if inference_mode_active():
+            inference_losses, inference_metrics = get_winding_inference_losses(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                winding_inference,
+                cfg,
+                z_begin,
+                z_end,
+            )
+            backward_family({
+                'dense_spacing_inference_relative': (
+                    inference_losses['dense_spacing_inference_relative']
+                    * cfg['loss_weight_dense_spacing']),
+                'dense_spacing_inference_density': (
+                    inference_losses['dense_spacing_inference_density']
+                    * cfg['loss_weight_dense_spacing_density']),
+            })
+            log_metrics.update(inference_metrics)
+            del inference_losses, inference_metrics
         phase_components_active = phase_mode_active()
         min_spacing_active = cfg['loss_weight_min_spacing'] > 0
         if phase_components_active or min_spacing_active:
@@ -3118,6 +3197,8 @@ if __name__ == '__main__':
             'sample_count_dense_normal_points',
             'sample_count_dense_spacing_pairs',
             'sample_count_dense_spacing_density_extra_pairs',
+            'sample_count_inference_relative_pairs',
+            'sample_count_inference_density_pairs',
             'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',

@@ -12,7 +12,7 @@ _ENUMS = {
     "patch_strip_sampling": ["straight", "dijkstra"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
-    "dense_spacing_mode": ["phase", "grad_mag"],
+    "dense_spacing_mode": ["phase", "grad_mag", "inference"],
     "dense_spacing_support_policy": ["product", "minimum"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
     "dense_spacing_density_lambda": [
@@ -57,6 +57,8 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_regularisation_points",
     "sample_count_dense_spacing_pairs",
     "sample_count_dense_spacing_density_extra_pairs",
+    "sample_count_inference_relative_pairs",
+    "sample_count_inference_density_pairs",
     "sample_count_minimum_spacing_independent_samples",
     "sample_count_dense_attachment_points",
     "sample_count_shell_samples",
@@ -74,6 +76,8 @@ def _runtime_impact(key):
 
 
 def _dependencies(key):
+    if key.startswith("inference_") or key.startswith("sample_count_inference_"):
+        return ["dense_losses"]
     if key.startswith(("patch_", "pcl_")):
         return ["patch_pcl", "trusted_geometry", "tracks"]
     if key.startswith("track_"):
@@ -187,6 +191,8 @@ class Config:
         self.sample_count_dense_spacing_count_extra_pairs = 0
         self.sample_count_dense_spacing_density_extra_pairs = 24000
         self.sample_count_dense_spacing_density_chunk_pairs = 24000
+        self.sample_count_inference_relative_pairs = 12000
+        self.sample_count_inference_density_pairs = 12000
         self.sample_count_minimum_spacing_independent_samples = 2000
         self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
@@ -234,6 +240,8 @@ class Config:
         self.dense_grad_mag_factor = 0.25
         self.dense_spacing_integration_steps = 8
         self.dense_spacing_mode = "phase"
+        self.inference_relative_pair_delta = [3, 15]
+        self.inference_huber_delta = 0.5
         self.dense_spacing_pair_m_short = [
             3,
             7
@@ -395,6 +403,10 @@ class Config:
                     "outer_shell": {
                         "runtime_impact": "shell_reload",
                         "dependencies": ["shell"],
+                    },
+                    "winding_inference": {
+                        "runtime_impact": "prepared_input_rebuild",
+                        "dependencies": ["dense_losses"],
                     },
                 },
                 "fields": fields,

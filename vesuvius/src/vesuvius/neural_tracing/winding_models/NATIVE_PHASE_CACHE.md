@@ -60,6 +60,37 @@ For the 139,205-slab PHercParis4 workload, the phase payload is approximately
 219 GB uncompressed and 144-150 GB losslessly compressed. Validity and frame
 metadata are small by comparison.
 
+## Export compact Spiral supervision
+
+`export_spiral_supervision.py` converts a complete cache into an uncompressed,
+GPU-resident-friendly crossing store. It decodes the centre ray of every slab,
+uses only the contiguous valid interval containing the seed anchor, and drops
+the first and last two crossings. Shards are independently restartable under
+`OUTPUT.partial`; the final output directory appears only after all shards
+complete and their NumPy-array checksums are recorded.
+
+For the PHercParis4 ft7 cache:
+
+```bash
+python export_spiral_supervision.py \
+  /ephemeral/sean/winding_inferences/PHercParis4/winding_native_phase_large11_ws3_ss60.zarr \
+  /ephemeral/sean/winding_inferences/PHercParis4/winding_spiral_supervision_large11_ws3_ss60 \
+  --workers 32 \
+  --edge-trim 2
+```
+
+The output stores ray origins/directions and ragged subvoxel crossing
+positions rather than repeated XYZ points. `fit_spiral.py` reconstructs pairs
+on CUDA and derives adjacent-pair density as one winding divided by the
+physical crossing gap.
+
+The exporter divides every source shard into 256-ray tasks aligned to the
+cache's 32-ray physical files, so worker count is not limited by the number of
+GPU/source shards. Its aggregate `tqdm` bar reports source rays, retained rays,
+decoded crossings, throughput, and ETA. Each completed task is atomic and
+restartable under `OUTPUT.partial/parts`; use `--rays-per-task` to trade finer
+progress/restart granularity for scheduling overhead.
+
 ## Reconstruct the normal full-resolution output
 
 Run the same script with a new `OUTPUT` and pass the cache via `--phase-cache`.

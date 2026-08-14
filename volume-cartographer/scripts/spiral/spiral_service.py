@@ -1298,7 +1298,8 @@ class ServiceState:
         paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
         for key in ("umbilicus", "fibers", "verified_patches", "unverified_patches",
                     "outer_shell", "normal_x", "normal_y", "gradient_magnitude",
-                    "surf_sdt", "tracks_dbm", "output_directory", "cache_directory"):
+                    "surf_sdt", "winding_inference", "tracks_dbm",
+                    "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
         paths["pcls"] = resolution["pcl_inputs"]
 
