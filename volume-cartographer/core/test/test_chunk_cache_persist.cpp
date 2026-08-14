@@ -22,6 +22,7 @@
 
 namespace fs = std::filesystem;
 using vc::render::ChunkCache;
+using vc::render::ChunkCacheService;
 using vc::render::ChunkDtype;
 using vc::render::ChunkFetchResult;
 using vc::render::ChunkFetchStatus;
@@ -71,15 +72,17 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 4;
     opts.detectAllFillChunks = true;
     if (persist) opts.persistentCachePath = *persist;
     if (budgetRoot) opts.persistentCacheBudgetRoot = *budgetRoot;
     opts.compressPersistentCache = compress;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.fetchConcurrency.workerCapacity = 4;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, std::move(serviceOptions));
 }
 
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99});

@@ -212,8 +212,10 @@ TEST_CASE("Volume: shared cache service keeps decoded chunks across release")
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x3c});
     v->writeChunk(0, {0, 0, 0}, chunk);
 
-    auto service =
-        std::make_shared<vc::render::ChunkCacheService>(64 * 1024);
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 64 * 1024;
+    auto service = std::make_shared<vc::render::ChunkCacheService>(
+        std::move(serviceOptions));
     v->setChunkCacheService(service);
     v->setCacheBudget(64 * 1024, service->decodedByteBudget());
     v->retainCacheClient();
@@ -236,7 +238,7 @@ TEST_CASE("Volume: shared cache service keeps decoded chunks across release")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: IO threads reconfigure retained service without eviction")
+TEST_CASE("Volume: service concurrency reconfigures without eviction")
 {
     auto d = tmpDir("cache-service-threads");
     auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
@@ -244,15 +246,21 @@ TEST_CASE("Volume: IO threads reconfigure retained service without eviction")
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x4d});
     v->writeChunk(0, {0, 0, 0}, chunk);
 
+    vc::render::ChunkCacheService::Options sharedServiceOptions;
+    sharedServiceOptions.fetchConcurrency.workerCapacity = 8;
+    sharedServiceOptions.fetchConcurrency.maxConcurrentReads = 2;
+    auto service = std::make_shared<vc::render::ChunkCacheService>(
+        std::move(sharedServiceOptions));
+    v->setChunkCacheService(service);
+
     auto cache = v->sharedChunkCache();
     REQUIRE(cache);
     auto loaded = cache->getChunkBlocking(0, 0, 0, 0);
     REQUIRE(loaded.status == vc::render::ChunkStatus::Data);
     REQUIRE(loaded.bytes);
-    auto service = v->chunkCacheService();
-    REQUIRE(service);
+    CHECK(v->chunkCacheService() == service);
 
-    v->setIOThreads(3);
+    service->configureFetchConcurrency(3, false);
     const auto concurrency = service->fetchConcurrency();
     CHECK(concurrency.maxConcurrentReads == 3);
     CHECK_FALSE(concurrency.adaptive);
@@ -263,8 +271,11 @@ TEST_CASE("Volume: IO threads reconfigure retained service without eviction")
     CHECK(warm.bytes->front() == std::byte{0x4d});
 
     vc::render::ChunkCache::Options isolatedOptions;
-    isolatedOptions.maxConcurrentReads = 7;
-    auto isolated = v->createChunkCache(std::move(isolatedOptions));
+    vc::render::ChunkCacheService::Options isolatedServiceOptions;
+    isolatedServiceOptions.fetchConcurrency.workerCapacity = 7;
+    isolatedServiceOptions.fetchConcurrency.maxConcurrentReads = 7;
+    auto isolated = v->createChunkCache(
+        std::move(isolatedOptions), std::move(isolatedServiceOptions));
     REQUIRE(isolated);
     const auto afterIsolatedOpen = service->fetchConcurrency();
     CHECK(afterIsolatedOpen.maxConcurrentReads == 3);
@@ -282,8 +293,10 @@ TEST_CASE("Volume: writes invalidate service state without a live handle")
     auto writer = Volume::New(d);
     REQUIRE(writer);
 
-    auto service =
-        std::make_shared<vc::render::ChunkCacheService>(64 * 1024);
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 64 * 1024;
+    auto service = std::make_shared<vc::render::ChunkCacheService>(
+        std::move(serviceOptions));
     reader->setChunkCacheService(service);
     reader->setCacheBudget(64 * 1024, service->decodedByteBudget());
     writer->setChunkCacheService(service);

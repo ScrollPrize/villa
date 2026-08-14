@@ -9,6 +9,7 @@
 #include <mutex>
 #include <set>
 #include <stop_token>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -116,6 +117,47 @@ struct ChunkRequestScheduler::Impl {
         BaselineAfterDown,
     };
 
+    AdaptiveConcurrency normalizedAdaptiveOptions(
+        AdaptiveConcurrency options) const
+    {
+        if (options.minimum == 0 || options.maximum == 0 ||
+            options.minimum > options.maximum ||
+            options.maximum > maximumWorkers) {
+            throw std::invalid_argument(
+                "adaptive concurrency bounds exceed scheduler worker capacity");
+        }
+        options.successfulSamplesPerWorker = std::max<std::size_t>(
+            1, options.successfulSamplesPerWorker);
+        options.minimumEpochSeconds = std::max(
+            0.0, options.minimumEpochSeconds);
+        options.maximumEpochSeconds = std::max(
+            options.minimumEpochSeconds, options.maximumEpochSeconds);
+        options.unstableProbeIntervalSeconds = std::max(
+            0.0, options.unstableProbeIntervalSeconds);
+        options.stableProbeIntervalSeconds = std::max(
+            options.unstableProbeIntervalSeconds,
+            options.stableProbeIntervalSeconds);
+        options.minimumStabilityObservationSeconds = std::max(
+            0.0, options.minimumStabilityObservationSeconds);
+        options.bandwidthChangeRatio = std::max(
+            1.000001, options.bandwidthChangeRatio);
+        options.throughputGainRatio = std::max(
+            1.0, options.throughputGainRatio);
+        options.maximumLatencyInflation = std::max(
+            1.0, options.maximumLatencyInflation);
+        options.initialProbeMultiplier = std::max<std::size_t>(
+            2, options.initialProbeMultiplier);
+        options.refinementProbeMultiplier = std::max<std::size_t>(
+            2, options.refinementProbeMultiplier);
+        options.continuousSearchTurns = std::max<std::size_t>(
+            1, options.continuousSearchTurns);
+        options.lowerThroughputRetention = std::clamp(
+            options.lowerThroughputRetention, 0.0, 1.0);
+        options.lowerLatencyRatio = std::clamp(
+            options.lowerLatencyRatio, 0.0, 1.0);
+        return options;
+    }
+
     explicit Impl(std::size_t workerCount,
                   std::size_t burst,
                   std::shared_ptr<ChunkRequestSelectionGate> gate,
@@ -130,41 +172,8 @@ struct ChunkRequestScheduler::Impl {
         workerCount = maximumWorkers;
         if (adaptiveConfig) {
             adaptive = true;
-            adaptiveConfig->minimum = std::clamp(
-                adaptiveConfig->minimum, std::size_t{1}, maximumWorkers);
-            adaptiveConfig->maximum = std::clamp(
-                adaptiveConfig->maximum, adaptiveConfig->minimum, maximumWorkers);
-            adaptiveConfig->successfulSamplesPerWorker = std::max<std::size_t>(
-                1, adaptiveConfig->successfulSamplesPerWorker);
-            adaptiveConfig->minimumEpochSeconds = std::max(
-                0.0, adaptiveConfig->minimumEpochSeconds);
-            adaptiveConfig->maximumEpochSeconds = std::max(
-                adaptiveConfig->minimumEpochSeconds,
-                adaptiveConfig->maximumEpochSeconds);
-            adaptiveConfig->unstableProbeIntervalSeconds = std::max(
-                0.0, adaptiveConfig->unstableProbeIntervalSeconds);
-            adaptiveConfig->stableProbeIntervalSeconds = std::max(
-                adaptiveConfig->unstableProbeIntervalSeconds,
-                adaptiveConfig->stableProbeIntervalSeconds);
-            adaptiveConfig->minimumStabilityObservationSeconds = std::max(
-                0.0, adaptiveConfig->minimumStabilityObservationSeconds);
-            adaptiveConfig->bandwidthChangeRatio = std::max(
-                1.000001, adaptiveConfig->bandwidthChangeRatio);
-            adaptiveConfig->throughputGainRatio = std::max(
-                1.0, adaptiveConfig->throughputGainRatio);
-            adaptiveConfig->maximumLatencyInflation = std::max(
-                1.0, adaptiveConfig->maximumLatencyInflation);
-            adaptiveConfig->initialProbeMultiplier = std::max<std::size_t>(
-                2, adaptiveConfig->initialProbeMultiplier);
-            adaptiveConfig->refinementProbeMultiplier = std::max<std::size_t>(
-                2, adaptiveConfig->refinementProbeMultiplier);
-            adaptiveConfig->continuousSearchTurns = std::max<std::size_t>(
-                1, adaptiveConfig->continuousSearchTurns);
-            adaptiveConfig->lowerThroughputRetention = std::clamp(
-                adaptiveConfig->lowerThroughputRetention, 0.0, 1.0);
-            adaptiveConfig->lowerLatencyRatio = std::clamp(
-                adaptiveConfig->lowerLatencyRatio, 0.0, 1.0);
-            adaptiveOptions = *adaptiveConfig;
+            hasAdaptiveHistory = true;
+            adaptiveOptions = normalizedAdaptiveOptions(*adaptiveConfig);
             admissionLimit = adaptiveOptions.minimum;
             targetAdmissionLimit = admissionLimit;
             settledAdmissionLimit = admissionLimit;
@@ -194,6 +203,7 @@ struct ChunkRequestScheduler::Impl {
                         initialAdaptiveState->saturatedBytesPerSecondPerWorker;
                 }
             }
+            retainedAdaptiveSettledAdmissionLimit = settledAdmissionLimit;
         } else {
             admissionLimit = maximumWorkers;
             adaptiveOptions.minimum = maximumWorkers;
@@ -269,6 +279,63 @@ struct ChunkRequestScheduler::Impl {
     {
         return (!gui.empty() || !background.empty()) &&
                activeCount.load(std::memory_order_acquire) < admissionLimit;
+    }
+
+    void configureConcurrencyLocked(
+        std::size_t fixedAdmissionLimit,
+        std::optional<AdaptiveConcurrency> adaptiveConfig)
+    {
+        if (fixedAdmissionLimit == 0 || fixedAdmissionLimit > maximumWorkers) {
+            throw std::invalid_argument(
+                "concurrency admission exceeds scheduler worker capacity");
+        }
+
+        const auto now = Clock::now();
+        if (!adaptiveConfig) {
+            if (adaptive)
+                retainedAdaptiveSettledAdmissionLimit = settledAdmissionLimit;
+            adaptive = false;
+            adaptiveOptions.minimum = fixedAdmissionLimit;
+            adaptiveOptions.maximum = fixedAdmissionLimit;
+            admissionLimit = fixedAdmissionLimit;
+            targetAdmissionLimit = fixedAdmissionLimit;
+            settledAdmissionLimit = fixedAdmissionLimit;
+        } else {
+            adaptiveConfig->maximum = fixedAdmissionLimit;
+            adaptiveConfig->minimum = std::min(
+                adaptiveConfig->minimum, adaptiveConfig->maximum);
+            adaptiveOptions = normalizedAdaptiveOptions(*adaptiveConfig);
+            const std::size_t previousSettled = adaptive
+                ? settledAdmissionLimit
+                : retainedAdaptiveSettledAdmissionLimit.value_or(
+                      settledAdmissionLimit);
+            adaptive = true;
+            hasAdaptiveHistory = true;
+            settledAdmissionLimit = std::clamp(
+                previousSettled, adaptiveOptions.minimum,
+                adaptiveOptions.maximum);
+            retainedAdaptiveSettledAdmissionLimit = settledAdmissionLimit;
+            admissionLimit = settledAdmissionLimit;
+            targetAdmissionLimit = settledAdmissionLimit;
+        }
+
+        rampingAdmission = false;
+        phase = ProbePhase::Monitor;
+        continuousSearch = adaptive;
+        probeMultiplier = adaptiveOptions.initialProbeMultiplier;
+        searchTurns = 0;
+        lastSearchDirection = 0;
+        baselineBeforeUp.reset();
+        baselineAfterUp.reset();
+        upMeasurement.reset();
+        downMeasurement.reset();
+        currentProbeIntervalSeconds = adaptive
+            ? adaptiveOptions.unstableProbeIntervalSeconds
+            : 0.0;
+        stabilityObservedSeconds = 0.0;
+        nextProbe = Clock::time_point::min();
+        resetEpochLocked(now);
+        cv.notify_all();
     }
 
     void updateTransferEstimateLocked()
@@ -716,6 +783,8 @@ struct ChunkRequestScheduler::Impl {
     const std::size_t interactiveBurst;
     const std::size_t maximumWorkers;
     bool adaptive = false;
+    bool hasAdaptiveHistory = false;
+    std::optional<std::size_t> retainedAdaptiveSettledAdmissionLimit;
     AdaptiveConcurrency adaptiveOptions;
     std::size_t admissionLimit = 1;
     std::size_t targetAdmissionLimit = 1;
@@ -762,6 +831,20 @@ ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
 }
 
 ChunkRequestScheduler::~ChunkRequestScheduler() = default;
+
+void ChunkRequestScheduler::configureConcurrency(
+    std::size_t fixedAdmissionLimit,
+    std::optional<AdaptiveConcurrency> adaptiveConcurrency)
+{
+    std::lock_guard lock(impl_->mutex);
+    impl_->configureConcurrencyLocked(
+        fixedAdmissionLimit, std::move(adaptiveConcurrency));
+}
+
+std::size_t ChunkRequestScheduler::workerCapacity() const noexcept
+{
+    return impl_->maximumWorkers;
+}
 
 void ChunkRequestScheduler::submit(TaskId id,
                                    ChunkWorkPriority priority,
@@ -902,10 +985,13 @@ std::optional<ChunkRequestScheduler::AdaptiveState>
 ChunkRequestScheduler::adaptiveState() const
 {
     std::lock_guard lock(impl_->mutex);
-    if (!impl_->adaptive)
+    if (!impl_->hasAdaptiveHistory)
         return std::nullopt;
     return AdaptiveState{
-        impl_->settledAdmissionLimit,
+        impl_->adaptive
+            ? impl_->settledAdmissionLimit
+            : impl_->retainedAdaptiveSettledAdmissionLimit.value_or(
+                  impl_->settledAdmissionLimit),
         impl_->longTermBytesPerSecond,
         impl_->maximumSaturatedParallelism,
         impl_->saturatedBytesPerSecondPerWorker};

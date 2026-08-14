@@ -2,7 +2,7 @@
 // - uint16 dtype write/read
 // - writeMetadata / updateMetadata
 // - writeRootAttributes / updateRootAttributes
-// - setCacheBudget, setIOThreads
+// - setCacheBudget and explicit cache-service configuration
 // - sample (single-slice) on a seeded uint8 volume
 // - MissingScaleLevelPolicy::AllFill behaviour for a level that exists but is empty
 
@@ -175,13 +175,19 @@ TEST_CASE("Volume::writeRootAttributes / updateRootAttributes")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::setCacheBudget and setIOThreads")
+TEST_CASE("Volume::setCacheBudget uses an explicitly configured service")
 {
     auto d = tmpDir("knobs");
     auto v = Volume::New(d, optsU8());
     REQUIRE(v);
     v->setCacheBudget(1ULL << 20);
-    v->setIOThreads(2);
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 1ULL << 20;
+    serviceOptions.fetchConcurrency.workerCapacity = 2;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 2;
+    v->setChunkCacheService(
+        std::make_shared<vc::render::ChunkCacheService>(
+            std::move(serviceOptions)));
     // No accessor — just verify no crash and chunkedCache works after.
     auto* cache = v->chunkedCache();
     CHECK(cache != nullptr);
@@ -205,8 +211,9 @@ TEST_CASE("Volume::createChunkCache yields a non-null cache pointer")
     auto v = Volume::New(d, optsU8());
     REQUIRE(v);
     vc::render::ChunkCache::Options copts;
-    copts.decodedByteCapacity = 1ULL << 20;
-    auto c = v->createChunkCache(copts);
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 1ULL << 20;
+    auto c = v->createChunkCache(copts, std::move(serviceOptions));
     CHECK(c != nullptr);
     CHECK(c->numLevels() == 1);
     fs::remove_all(d);

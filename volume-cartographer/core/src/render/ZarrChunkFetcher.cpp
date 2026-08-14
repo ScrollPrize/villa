@@ -878,19 +878,31 @@ std::unique_ptr<ChunkCache> createChunkCache(
     }
 
     ChunkCache::Options options;
-    options.decodedByteCapacity = decodedByteCapacity;
-    options.maxConcurrentReads = maxConcurrentReads;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = decodedByteCapacity;
+    serviceOptions.fetchConcurrency.workerCapacity = maxConcurrentReads;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = maxConcurrentReads;
     return std::make_unique<ChunkCache>(
         std::move(levels),
         std::move(opened.fetchers),
         opened.fillValue,
         opened.dtype,
-        std::move(options));
+        std::move(options), std::move(serviceOptions));
 }
 
 std::unique_ptr<ChunkCache> createChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options)
+{
+    return createChunkCache(
+        std::move(array), std::move(options),
+        ChunkCacheService::Options{});
+}
+
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options,
+    ChunkCacheService::Options serviceOptions)
 {
     if (!array)
         throw std::invalid_argument("cannot create a chunk cache for a null Zarr array");
@@ -918,7 +930,7 @@ std::unique_ptr<ChunkCache> createChunkCache(
         std::move(fetchers),
         meta.fill_value.value_or(0.0),
         dtype,
-        std::move(options));
+        std::move(options), std::move(serviceOptions));
 }
 
 } // namespace vc::render

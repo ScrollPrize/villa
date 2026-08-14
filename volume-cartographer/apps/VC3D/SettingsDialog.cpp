@@ -919,10 +919,13 @@ void SettingsDialog::redownloadExistingCache()
         auto freshVolume = Volume::NewFromUrl(
             _currentVolume->remoteLocator(), {}, _currentVolume->remoteAuth());
         vc::render::ChunkCache::Options options;
-        options.maxConcurrentReads = workerCount;
         options.compressPersistentCache = false;
-        options.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
-        source = freshVolume->createChunkCache(std::move(options));
+        vc::render::ChunkCacheService::Options serviceOptions;
+        serviceOptions.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+        serviceOptions.fetchConcurrency.workerCapacity = workerCount;
+        serviceOptions.fetchConcurrency.maxConcurrentReads = workerCount;
+        source = freshVolume->createChunkCache(
+            std::move(options), std::move(serviceOptions));
     } catch (const std::exception& e) {
         QMessageBox::warning(this, tr("Redownload cache"),
             tr("Could not open the remote volume for redownload:\n%1")

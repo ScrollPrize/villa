@@ -119,7 +119,7 @@ source-bound `IChunkedArray` handle over a service-retained source state. Main
 views, Spiral views, overlays, and `SurfaceCache` fillers therefore reuse the
 same decoded source chunks and in-flight requests.
 
-Shared sources are opened only through `ChunkCacheService::openSource()`.
+Shared sources are acquired only through `ChunkCacheService::acquireSource()`.
 Standalone `ChunkCache` construction remains a convenience for tests and batch
 callers, but internally creates and retains a separate one-source service. The
 handle never creates probe, source-read, or decode schedulers of its own.
@@ -144,14 +144,15 @@ decoded-byte budget and the service's shared probe, source-read, and decode
 schedulers. Decoded payloads remain ordinary heap-owned byte vectors; they are
 not memory mapped.
 
-Source-read concurrency is global to a service. Every `openSource()` applies
-the requested fixed/adaptive policy, and `configureFetchConcurrency()` changes
-it explicitly; the latest valid request wins for all registered sources.
-Changing it replaces the active source-read scheduler without evicting decoded
-chunks or changing source IDs. Unresolved demand is requeued in request order,
-while completion from an older scheduler epoch is rejected. Explicit prefill,
-redownload, and batch caches obtain isolation by owning a separate service, not
-by attaching a private scheduler to a source handle.
+Source-read concurrency is global to a service. The service constructor fixes
+the physical worker capacity and initial fixed/adaptive admission policy.
+`acquireSource()` accepts only source-local metadata and persistent-cache
+options, so acquiring or reacquiring a source cannot change concurrency.
+`configureFetchConcurrency()` updates admission on the existing scheduler in
+place: queued and running work remains attached, no request is restarted, and
+completed work publishes normally. Explicit prefill, redownload, and batch
+caches obtain isolation by owning a separate service, not by attaching a
+private scheduler to a source handle.
 
 Changing the current volume drops viewer references but keeps the `Volume`'s
 lightweight source handle and service state, so switching A -> B -> A neither
@@ -203,9 +204,9 @@ stages:
 1. A 32-worker local probe stage classifies persistent encoded data, persistent
    empty markers, and cache misses using filesystem metadata only.
 2. A source-read stage performs remote downloads, or direct source reads when
-   no persistent cache is configured. Its service-global concurrency is set by
-   `ChunkCache::Options::maxConcurrentReads`/`adaptiveConcurrentReads` on the
-   latest source open, or by `ChunkCacheService::configureFetchConcurrency()`.
+   no persistent cache is configured. Its physical capacity and initial
+   admission policy are service construction options; only
+   `ChunkCacheService::configureFetchConcurrency()` changes admission later.
 3. An eight-worker CPU stage reads and decodes persistent hits or decodes
    successful source reads.
 

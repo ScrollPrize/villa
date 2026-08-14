@@ -195,8 +195,14 @@ CState::CState(
     , _debugDownloadQueue(debugDownloadQueue)
 {
     if (!_chunkCacheService) {
+        vc::render::ChunkCacheService::Options options;
+        options.decodedByteCapacity = _cacheSizeBytes;
+        options.decodedByteBudget = _decodedCacheBudget;
+        options.fetchConcurrency.workerCapacity = 64;
+        options.fetchConcurrency.maxConcurrentReads = 64;
+        options.fetchConcurrency.adaptive = true;
         _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
-            _cacheSizeBytes, _decodedCacheBudget);
+            std::move(options));
     }
     if (!_decodedCacheBudget)
         _decodedCacheBudget = _chunkCacheService->decodedByteBudget();

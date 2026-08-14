@@ -21,7 +21,7 @@
   through every window/workspace state. Main, Spiral, overlay, and derived
   surface-tile input reads must acquire source handles from this service rather
   than construct independent decoded regular-chunk pools.
-- `ChunkCacheService::openSource()` is the only shared-service source factory.
+- `ChunkCacheService::acquireSource()` is the only shared-service source factory.
   It interns or reacquires the source and returns a source-bound `ChunkCache`
   implementing `IChunkedArray`. A standalone `ChunkCache` convenience
   constructor creates and retains a one-source service; it never owns local
@@ -43,18 +43,21 @@
   decoded-byte budget. Source state and resident entries survive A -> B -> A
   volume switches until global eviction or explicit source invalidation.
 - Probe, source-read, and decode schedulers belong to the service. Source-read
-  concurrency is one service-global `{maximum workers, adaptive}` setting.
-  `openSource()` applies its options to that setting and
-  `configureFetchConcurrency()` changes it directly; the most recent valid
-  request wins for every source in the service.
-- Replacing source-read concurrency preserves source IDs, decoded entries,
-  demand, listeners, and accounting. Unresolved demanded entries move to the
-  replacement scheduler in stable request order. Already-running stale work
-  may drain but cannot publish or advance another stage after the scheduler
-  epoch changes.
+  concurrency is one service-global policy, bounded by the physical worker
+  capacity fixed when the service is constructed. Source acquisition options
+  contain only source-local metadata and persistent-cache policy and cannot
+  change scheduling.
+- `configureFetchConcurrency()` changes fixed/adaptive admission on the
+  service's existing source-read scheduler. It does not replace the scheduler,
+  increment source epochs, cancel or restart tasks, duplicate requests, or
+  invalidate running results. Increasing admission wakes existing workers;
+  after a decrease, running work drains normally and no new task starts until
+  activity falls below the new limit.
 - Explicit bounded prefill, redownload, and batch caches use a separate
   `ChunkCacheService`. Their fixed concurrency is isolated from the regular
   interactive service even when both services share one decoded-byte budget.
+- `Volume` may receive a service or create a private one, but it neither owns
+  nor exposes a per-volume source-read concurrency setting.
 - Releasing a viewer/cache client does not invalidate service-owned source
   state. Writes and explicit `Volume::invalidateCache()` invalidate only that
   source; stale generation results must not publish afterward.

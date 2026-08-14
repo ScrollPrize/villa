@@ -1690,23 +1690,20 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!chunkedCache_) {
         vc::render::ChunkCache::Options options;
-        options.decodedByteCapacity = cacheBudgetHot_;
-        options.decodedByteBudget = decodedCacheBudget_;
-        if (ioThreads_ > 0) {
-            options.maxConcurrentReads = static_cast<std::size_t>(ioThreads_);
-        } else if (isRemote_) {
-            options.maxConcurrentReads = 64;
-            options.adaptiveConcurrentReads = true;
-        } else {
-            options.maxConcurrentReads = 2;
-        }
         if (!chunkCacheService_) {
+            vc::render::ChunkCacheService::Options serviceOptions;
+            serviceOptions.decodedByteCapacity = cacheBudgetHot_;
+            serviceOptions.decodedByteBudget = decodedCacheBudget_;
+            serviceOptions.fetchConcurrency.workerCapacity = isRemote_ ? 64 : 2;
+            serviceOptions.fetchConcurrency.maxConcurrentReads = isRemote_ ? 64 : 2;
+            serviceOptions.fetchConcurrency.adaptive = isRemote_;
             chunkCacheService_ =
                 std::make_shared<vc::render::ChunkCacheService>(
-                    cacheBudgetHot_, decodedCacheBudget_);
+                    std::move(serviceOptions));
         }
         chunkedCache_ = createChunkCacheConfigured(
-            std::move(options), chunkCacheService_);
+            std::move(options), chunkCacheService_,
+            vc::render::ChunkCacheService::Options{});
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
@@ -1717,20 +1714,30 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
     vc::render::ChunkCache::Options options) const
 {
+    return createChunkCache(
+        std::move(options), vc::render::ChunkCacheService::Options{});
+}
+
+std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
+    vc::render::ChunkCache::Options options,
+    vc::render::ChunkCacheService::Options serviceOptions) const
+{
     {
         std::lock_guard<std::mutex> lock(cacheMutex_);
-        if (!options.decodedByteBudget)
-            options.decodedByteBudget = decodedCacheBudget_;
+        if (!serviceOptions.decodedByteBudget)
+            serviceOptions.decodedByteBudget = decodedCacheBudget_;
     }
     // Explicit cache creation is used by bounded prefill/redownload jobs. Give
     // each one a separate service so its fixed concurrency cannot alter the
     // interactive service. The decoded-byte budget above remains shared.
-    return createChunkCacheConfigured(std::move(options), {});
+    return createChunkCacheConfigured(
+        std::move(options), {}, std::move(serviceOptions));
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
     vc::render::ChunkCache::Options options,
-    std::shared_ptr<vc::render::ChunkCacheService> service) const
+    std::shared_ptr<vc::render::ChunkCacheService> service,
+    vc::render::ChunkCacheService::Options serviceOptions) const
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
         options.persistentCachePath = remotePersistentCachePath();
@@ -1757,10 +1764,10 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
 
     if (!service) {
         service = std::make_shared<vc::render::ChunkCacheService>(
-            options.decodedByteCapacity, options.decodedByteBudget);
+            std::move(serviceOptions));
     }
     auto levels = makeChunkCacheLevelInfo(opened);
-    return service->openSource(
+    return service->acquireSource(
         chunkCacheSourceIdentity(), std::move(levels),
         std::move(opened.fetchers), opened.fillValue, opened.dtype,
         std::move(options));
@@ -1840,23 +1847,6 @@ void Volume::releaseCacheClient()
         if (chunkedCache_)
             chunkedCache_->invalidate();
         chunkedCache_.reset();
-    }
-}
-
-void Volume::setIOThreads(int count)
-{
-    std::shared_ptr<vc::render::ChunkCacheService> service;
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex_);
-        ioThreads_ = count;
-        service = chunkCacheService_;
-    }
-    if (service) {
-        const bool adaptive = count <= 0 && isRemote_;
-        const std::size_t workers = count > 0
-            ? static_cast<std::size_t>(count)
-            : adaptive ? 64U : 2U;
-        service->configureFetchConcurrency(workers, adaptive);
     }
 }
 

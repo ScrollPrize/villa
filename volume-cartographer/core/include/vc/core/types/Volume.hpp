@@ -158,6 +158,9 @@ public:
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
         vc::render::ChunkCache::Options options) const;
+    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
+        vc::render::ChunkCache::Options options,
+        vc::render::ChunkCacheService::Options serviceOptions) const;
     void setChunkCacheService(
         std::shared_ptr<vc::render::ChunkCacheService> service);
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCacheService>
@@ -174,10 +177,6 @@ public:
     // service keeps the source handle and decoded chunks warm after release.
     void retainCacheClient();
     void releaseCacheClient();
-
-    // Set service-wide chunk-fetch concurrency. The most recent setting on any
-    // Volume sharing the service applies to every source in that service.
-    void setIOThreads(int count);
 
     // Drop decoded/read cache state. Writes call this automatically.
     void invalidateCache();
@@ -306,8 +305,6 @@ protected:
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
     std::size_t cacheClientCount_ = 0;
-    // 0 selects adaptive 2-64 remote reads and two fixed local reads.
-    int ioThreads_ = 0;
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
     // and rebuilding the codec registry on every chunk read. ZarrArray is
@@ -318,7 +315,8 @@ protected:
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
     std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
         vc::render::ChunkCache::Options options,
-        std::shared_ptr<vc::render::ChunkCacheService> service) const;
+        std::shared_ptr<vc::render::ChunkCacheService> service,
+        vc::render::ChunkCacheService::Options serviceOptions) const;
 
     void loadMetadata();
 

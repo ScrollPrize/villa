@@ -24,6 +24,7 @@ namespace {
 
 using vc::render::ChunkDtype;
 using vc::render::ChunkCache;
+using vc::render::ChunkCacheService;
 using vc::render::ChunkedPlaneSampler;
 using vc::render::ChunkFetchResult;
 using vc::render::ChunkFetchStatus;
@@ -244,11 +245,12 @@ TEST_CASE("ChunkedPlaneSampler bench: warmed ChunkCache hot path")
     level.shape = shape;
     level.chunkShape = chunkShape;
     ChunkCache::Options options;
-    options.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
     options.detectAllFillChunks = false;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
     auto fetcher = std::make_shared<SyntheticChunkFetcher>(chunkShape);
     ChunkCache cache({level}, {std::move(fetcher)}, 0.0, ChunkDtype::UInt8,
-                     std::move(options));
+                     std::move(options), std::move(serviceOptions));
 
     std::vector<ChunkKey> warmKeys;
     for (int iz = 0; iz <= 1; ++iz) {

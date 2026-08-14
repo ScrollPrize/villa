@@ -97,6 +97,14 @@ public:
     ChunkRequestScheduler(const ChunkRequestScheduler&) = delete;
     ChunkRequestScheduler& operator=(const ChunkRequestScheduler&) = delete;
 
+    // Changes admission on the existing worker pool. Pending and running work
+    // is retained unchanged. The requested bounds must fit the physical worker
+    // capacity supplied to the constructor.
+    void configureConcurrency(
+        std::size_t fixedAdmissionLimit,
+        std::optional<AdaptiveConcurrency> adaptiveConcurrency = {});
+    [[nodiscard]] std::size_t workerCapacity() const noexcept;
+
     void submit(TaskId id,
                 ChunkWorkPriority priority,
                 TaskGroup group,

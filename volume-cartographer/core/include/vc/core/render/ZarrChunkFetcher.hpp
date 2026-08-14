@@ -88,5 +88,9 @@ std::unique_ptr<ChunkCache> createChunkCache(
 std::unique_ptr<ChunkCache> createChunkCache(
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options = {});
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options,
+    ChunkCacheService::Options serviceOptions);
 
 } // namespace vc::render

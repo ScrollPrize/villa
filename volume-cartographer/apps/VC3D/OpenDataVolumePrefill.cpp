@@ -293,10 +293,13 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
         }
 
         vc::render::ChunkCache::Options options;
-        options.decodedByteCapacity = 64ULL * 1024ULL * 1024ULL;
         options.metadataEntryCapacity = std::max<std::size_t>(result.totalChunks, 1ULL << 12);
-        options.maxConcurrentReads = 1;
-        auto cache = volume->createChunkCache(std::move(options));
+        vc::render::ChunkCacheService::Options serviceOptions;
+        serviceOptions.decodedByteCapacity = 64ULL * 1024ULL * 1024ULL;
+        serviceOptions.fetchConcurrency.workerCapacity = 1;
+        serviceOptions.fetchConcurrency.maxConcurrentReads = 1;
+        auto cache = volume->createChunkCache(
+            std::move(options), std::move(serviceOptions));
         if (!cache) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
             result.message = "could not create chunk cache";

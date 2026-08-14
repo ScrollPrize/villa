@@ -2523,8 +2523,13 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions,
 
     _chunkCacheService = std::move(chunkCacheService);
     if (!_chunkCacheService) {
+        vc::render::ChunkCacheService::Options options;
+        options.decodedByteCapacity = _cacheSizeBytes;
+        options.fetchConcurrency.workerCapacity = 64;
+        options.fetchConcurrency.maxConcurrentReads = 64;
+        options.fetchConcurrency.adaptive = true;
         _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
-            _cacheSizeBytes);
+            std::move(options));
     }
     _decodedChunkCacheBudget = _chunkCacheService->decodedByteBudget();
     vc::render::ChunkCache::setDecodedByteBudgetDefault(

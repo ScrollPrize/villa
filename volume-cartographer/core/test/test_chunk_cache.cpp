@@ -107,6 +107,57 @@ private:
     bool released_ = false;
 };
 
+class MultiBlockingFetcher : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        {
+            std::lock_guard lock(mutex_);
+            ++calls_[key];
+            ++started_;
+        }
+        cv_.notify_all();
+        {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return released_; });
+        }
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = std::vector<std::byte>(64, std::byte{17});
+        return result;
+    }
+
+    bool waitForStarted(std::size_t count,
+                        std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return started_ >= count; });
+    }
+
+    int calls(const ChunkKey& key) const
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = calls_.find(key);
+        return found == calls_.end() ? 0 : found->second;
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::unordered_map<ChunkKey, int, vc::render::ChunkKeyHash> calls_;
+    std::size_t started_ = 0;
+    bool released_ = false;
+};
+
 class BlockingEncodedFetcher : public IChunkFetcher {
 public:
     ChunkFetchResult fetch(const ChunkKey& key) override
@@ -312,6 +363,29 @@ std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
     return std::vector<std::byte>(n, v);
 }
 
+ChunkCacheService::Options serviceOptions(
+    std::size_t decodedByteCapacity = 1024 * 1024,
+    std::size_t maxConcurrentReads = 16,
+    bool adaptive = false)
+{
+    ChunkCacheService::Options options;
+    options.decodedByteCapacity = decodedByteCapacity;
+    options.fetchConcurrency.workerCapacity = std::max<std::size_t>(
+        8, maxConcurrentReads);
+    options.fetchConcurrency.maxConcurrentReads = maxConcurrentReads;
+    options.fetchConcurrency.adaptive = adaptive;
+    return options;
+}
+
+std::shared_ptr<ChunkCacheService> makeService(
+    std::size_t decodedByteCapacity = 1024 * 1024,
+    std::size_t maxConcurrentReads = 16,
+    bool adaptive = false)
+{
+    return std::make_shared<ChunkCacheService>(
+        serviceOptions(decodedByteCapacity, maxConcurrentReads, adaptive));
+}
+
 void writeTestBytes(const fs::path& path, std::span<const std::byte> bytes)
 {
     fs::create_directories(path.parent_path());
@@ -330,31 +404,33 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
         {shape, chunkShape, {}},
     };
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 4;
     opts.detectAllFillChunks = true;
+    auto cacheServiceOptions = serviceOptions(512ULL * 1024ULL * 1024ULL, 4);
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
         /*fillValue=*/0.0,
         ChunkDtype::UInt8,
-        opts);
+        opts, std::move(cacheServiceOptions));
 }
 
 std::shared_ptr<ChunkCache> makeServiceCache(
     const std::shared_ptr<ChunkCacheService>& service,
     std::string identity,
     const std::shared_ptr<IChunkFetcher>& fetcher,
-    std::size_t maxConcurrentReads = 4,
+    std::size_t maxConcurrentReads = 0,
     bool adaptiveConcurrentReads = false)
 {
     std::vector<ChunkCache::LevelInfo> levels = {
         {{8, 8, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = maxConcurrentReads;
-    options.adaptiveConcurrentReads = adaptiveConcurrentReads;
     options.detectAllFillChunks = false;
-    return service->openSource(
+    if (maxConcurrentReads != 0) {
+        service->configureFetchConcurrency(
+            maxConcurrentReads, adaptiveConcurrentReads);
+    }
+    return service->acquireSource(
         std::move(identity), std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
@@ -379,7 +455,7 @@ static_assert(std::is_trivially_copyable_v<ChunkKey>);
 
 TEST_CASE("ChunkCacheService interns source identity into a numeric hot key")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto firstFetcher = std::make_shared<CountingFetcher>();
     auto secondFetcher = std::make_shared<CountingFetcher>();
     auto first = makeServiceCache(service, "local|/volume/a", firstFetcher);
@@ -398,11 +474,12 @@ TEST_CASE("ChunkCacheService carries adaptive download state into its shared sch
 {
     const ChunkCacheService::AdaptiveDownloadState initial{
         12, 48.0 * 1024.0 * 1024.0, 8, 6.0 * 1024.0 * 1024.0};
-    auto service = std::make_shared<ChunkCacheService>(
-        1024 * 1024, std::shared_ptr<DecodedChunkCacheBudget>{}, initial);
+    auto options = serviceOptions(1024 * 1024, 16, true);
+    options.initialAdaptiveDownloadState = initial;
+    auto service = std::make_shared<ChunkCacheService>(std::move(options));
     auto fetcher = std::make_shared<CountingFetcher>();
     auto cache = makeServiceCache(
-        service, "adaptive-restore", fetcher, 16, true);
+        service, "adaptive-restore", fetcher);
     REQUIRE(cache);
 
     const auto restored = service->adaptiveDownloadState();
@@ -417,17 +494,16 @@ TEST_CASE("ChunkCacheService carries adaptive download state into its shared sch
 
 TEST_CASE("ChunkCacheService rejects incompatible duplicate source metadata")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService(1024 * 1024, 4);
     auto fetcher = std::make_shared<CountingFetcher>();
     auto first = makeServiceCache(service, "same-source", fetcher);
     std::vector<ChunkCache::LevelInfo> incompatibleLevels = {
         {{16, 8, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 9;
     options.detectAllFillChunks = false;
     CHECK_THROWS_AS(
-        service->openSource(
+        service->acquireSource(
             "same-source", std::move(incompatibleLevels),
             std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
             0.0, ChunkDtype::UInt8, std::move(options)),
@@ -437,18 +513,18 @@ TEST_CASE("ChunkCacheService rejects incompatible duplicate source metadata")
     CHECK_FALSE(concurrency.adaptive);
 }
 
-TEST_CASE("ChunkCacheService applies the latest source concurrency globally")
+TEST_CASE("ChunkCacheService source acquisition cannot change concurrency")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService(1024 * 1024, 4);
     auto fetcher = std::make_shared<CountingFetcher>();
-    auto first = makeServiceCache(service, "policy-source", fetcher, 4);
-    auto second = makeServiceCache(service, "policy-source", fetcher, 12, true);
+    auto first = makeServiceCache(service, "policy-source", fetcher);
+    auto second = makeServiceCache(service, "policy-source", fetcher);
 
     CHECK(first->sourceId() == second->sourceId());
     CHECK(service->sourceCount() == 1);
     auto concurrency = service->fetchConcurrency();
-    CHECK(concurrency.maxConcurrentReads == 12);
-    CHECK(concurrency.adaptive);
+    CHECK(concurrency.maxConcurrentReads == 4);
+    CHECK_FALSE(concurrency.adaptive);
 
     service->configureFetchConcurrency(3, false);
     concurrency = service->fetchConcurrency();
@@ -456,44 +532,37 @@ TEST_CASE("ChunkCacheService applies the latest source concurrency globally")
     CHECK_FALSE(concurrency.adaptive);
 }
 
-TEST_CASE("ChunkCacheService migrates unresolved work to replacement scheduler")
+TEST_CASE("ChunkCacheService increases admission without restarting work")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
-    auto fetcher = std::make_shared<BlockingFetcher>();
-    auto cache = makeServiceCache(service, "scheduler-migration", fetcher, 1);
+    auto service = makeService(1024 * 1024, 1);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "scheduler-reconfigure", fetcher);
     std::atomic<int> callbacks{0};
     cache->addChunkReadyListener([&] { ++callbacks; });
 
     CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
-    fetcher->waitStarted();
-    auto other = makeServiceCache(
-        service, "scheduler-migration-trigger",
-        std::make_shared<CountingFetcher>(), 4, false);
-    REQUIRE(other);
+    CHECK(cache->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::MissQueued);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    CHECK_FALSE(fetcher->waitForStarted(2, std::chrono::milliseconds{50}));
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds{2};
-    while (fetcher->fetchCalls.load() < 2 &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-    CHECK(fetcher->fetchCalls.load() == 2);
+    service->configureFetchConcurrency(2, false);
+    REQUIRE(fetcher->waitForStarted(2, std::chrono::seconds{2}));
+    CHECK(fetcher->calls({0, 0, 0, 0}) == 1);
+    CHECK(fetcher->calls({0, 0, 0, 1}) == 1);
 
     fetcher->release();
-    const auto result = waitForResolved(*cache, 0, 0, 0, 0);
-    REQUIRE(result.status == ChunkStatus::Data);
-    REQUIRE(result.bytes);
-    CHECK(result.bytes->front() == std::byte{17});
+    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
     std::this_thread::sleep_for(std::chrono::milliseconds{20});
-    CHECK(callbacks.load() == 1);
+    CHECK(callbacks.load() == 2);
     const auto concurrency = service->fetchConcurrency();
-    CHECK(concurrency.maxConcurrentReads == 4);
+    CHECK(concurrency.maxConcurrentReads == 2);
     CHECK_FALSE(concurrency.adaptive);
 }
 
 TEST_CASE("ChunkCacheService shares results and keeps sources warm")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<CountingFetcher>();
     ChunkFetchResult result;
     result.status = ChunkFetchStatus::Found;
@@ -527,7 +596,7 @@ TEST_CASE("ChunkCacheService shares results and keeps sources warm")
 
 TEST_CASE("ChunkCacheService refreshes in-flight fetchers without stale publication")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto expired = std::make_shared<BlockingEncodedFetcher>();
     auto first = makeServiceCache(service, "credential-refresh", expired, 2);
 
@@ -559,7 +628,7 @@ TEST_CASE("ChunkCacheService refreshes in-flight fetchers without stale publicat
 
 TEST_CASE("ChunkCacheService refresh preserves decoded chunks")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto original = std::make_shared<CountingFetcher>();
     ChunkFetchResult result;
     result.status = ChunkFetchStatus::Found;
@@ -579,7 +648,7 @@ TEST_CASE("ChunkCacheService refresh preserves decoded chunks")
 
 TEST_CASE("ChunkCacheService refresh retries retained source errors")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto expired = std::make_shared<CountingFetcher>();
     ChunkFetchResult denied;
     denied.status = ChunkFetchStatus::HttpError;
@@ -602,7 +671,7 @@ TEST_CASE("ChunkCacheService refresh retries retained source errors")
 
 TEST_CASE("ChunkCache source-scoped view clear preserves other sources")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto blocker = std::make_shared<BlockingFetcher>();
     auto baseFetcher = std::make_shared<CountingFetcher>();
     auto overlayFetcher = std::make_shared<CountingFetcher>();
@@ -640,7 +709,7 @@ TEST_CASE("ChunkCache source-scoped view clear preserves other sources")
 
 TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across handles")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<BlockingFetcher>();
     auto first = makeServiceCache(service, "shared-in-flight", fetcher);
     auto second = makeServiceCache(service, "shared-in-flight", fetcher);
@@ -657,7 +726,7 @@ TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across handles")
 
 TEST_CASE("ChunkCacheService rejects stale publication after source invalidation")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<BlockingFetcher>();
     auto cache = makeServiceCache(service, "stale-source", fetcher);
 
@@ -674,7 +743,7 @@ TEST_CASE("ChunkCacheService rejects stale publication after source invalidation
 
 TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
 {
-    auto service = std::make_shared<ChunkCacheService>(128);
+    auto service = makeService(128);
     auto fetcherA = std::make_shared<CountingFetcher>();
     auto fetcherB = std::make_shared<CountingFetcher>();
     for (int ix : {0, 1}) {
@@ -706,8 +775,9 @@ TEST_CASE("ChunkCacheService releases aggregate accounting on destruction")
 {
     auto budget = std::make_shared<DecodedChunkCacheBudget>(1024 * 1024);
     {
-        auto service =
-            std::make_shared<ChunkCacheService>(1024 * 1024, budget);
+        auto options = serviceOptions();
+        options.decodedByteBudget = budget;
+        auto service = std::make_shared<ChunkCacheService>(std::move(options));
         auto fetcher = std::make_shared<CountingFetcher>();
         ChunkFetchResult result;
         result.status = ChunkFetchStatus::Found;
@@ -725,7 +795,7 @@ TEST_CASE("ChunkCacheService releases aggregate accounting on destruction")
 
 TEST_CASE("ChunkCacheService handle destruction removes only its listeners")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<CountingFetcher>();
     ChunkFetchResult result;
     result.status = ChunkFetchStatus::Found;
@@ -752,16 +822,15 @@ TEST_CASE("ChunkCache reports source-qualified remote fetch start and stop")
                      ("vc_chunk_activity_" + std::to_string(rng()));
     fs::create_directories(dir);
 
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<BlockingFetcher>();
     std::vector<ChunkCache::LevelInfo> levels = {
         {{8, 8, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = service->openSource(
+    auto cache = service->acquireSource(
         "remote-activity", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
@@ -805,16 +874,15 @@ TEST_CASE("ChunkCache clears remote activity after fetch exceptions and listener
                      ("vc_chunk_activity_error_" + std::to_string(rng()));
     fs::create_directories(dir);
 
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<ThrowingFetcher>();
     std::vector<ChunkCache::LevelInfo> levels = {
         {{4, 4, 4}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = service->openSource(
+    auto cache = service->acquireSource(
         "remote-activity-error", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
@@ -836,16 +904,15 @@ TEST_CASE("ChunkCache invalidation ends remote activity exactly once")
                      ("vc_chunk_activity_invalidate_" + std::to_string(rng()));
     fs::create_directories(dir);
 
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcher = std::make_shared<BlockingFetcher>();
     std::vector<ChunkCache::LevelInfo> levels = {
         {{4, 4, 4}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = service->openSource(
+    auto cache = service->acquireSource(
         "remote-activity-invalidate", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
@@ -879,7 +946,7 @@ TEST_CASE("ChunkCache invalidation ends remote activity exactly once")
 
 TEST_CASE("ChunkCacheService isolates and invalidates sources independently")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto fetcherA = std::make_shared<CountingFetcher>();
     auto fetcherB = std::make_shared<CountingFetcher>();
     ChunkFetchResult resultA;
@@ -971,14 +1038,14 @@ TEST_CASE("ChunkCache: cache-only reads neither queue nor promote decoded chunks
         {{4, 4, 12}, {4, 4, 4}, {}},
     };
     ChunkCache::Options opts;
-    opts.decodedByteCapacity = 1024;
-    opts.decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(128);
-    opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = false;
+    auto cacheServiceOptions = serviceOptions(1024, 1);
+    cacheServiceOptions.decodedByteBudget =
+        std::make_shared<DecodedChunkCacheBudget>(128);
     ChunkCache cache(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, std::move(cacheServiceOptions));
 
     CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     CHECK(f->fetchCalls.load() == 0);
@@ -1177,13 +1244,11 @@ std::shared_ptr<ChunkCache> makeTinyCapacityCache(
     // Capacity of 128 bytes holds exactly two chunks.
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = true;
-    opts.decodedByteCapacity = 128;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, serviceOptions(128, 1));
 }
 
 std::shared_ptr<ChunkCache> makeSharedBudgetCache(
@@ -1192,14 +1257,13 @@ std::shared_ptr<ChunkCache> makeSharedBudgetCache(
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = true;
-    opts.decodedByteCapacity = 1024;
-    opts.decodedByteBudget = budget;
+    auto cacheServiceOptions = serviceOptions(1024, 1);
+    cacheServiceOptions.decodedByteBudget = budget;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, std::move(cacheServiceOptions));
 }
 
 void cannedDataChunks(CountingFetcher& f, int count)
@@ -1335,13 +1399,11 @@ TEST_CASE("ChunkCache: a large view working set never exceeds capacity")
             }
     std::vector<ChunkCache::LevelInfo> levels = {{{16, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = true;
-    opts.decodedByteCapacity = 128;
     auto c = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, serviceOptions(128, 1));
 
     for (int i = 0; i < 9; ++i) {
         const int iz = i / 4;
@@ -1453,12 +1515,11 @@ TEST_CASE("ChunkCache active-view marking defers queue resort until render publi
         {{4, 4, 16}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -1479,7 +1540,7 @@ TEST_CASE("ChunkCache active-view marking defers queue resort until render publi
 
 TEST_CASE("ChunkCacheService prioritizes the active view across sources")
 {
-    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto service = makeService();
     auto order = std::make_shared<SharedServiceFetchOrder>();
     auto fetcherB = std::make_shared<LabeledServiceFetcher>(order, 'B', false);
     auto fetcherA = std::make_shared<LabeledServiceFetcher>(order, 'A', true);
@@ -1514,12 +1575,11 @@ TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
         {{4, 4, 4}, {4, 4, 4}, {}},
     };
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1; // single worker => strict priority order
     opts.detectAllFillChunks = false;
     auto c = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f, f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, serviceOptions(1024 * 1024, 1));
 
     // Occupy the single worker, then queue a fine and a coarse chunk.
     (void)c->tryGetChunk(0, 0, 0, 0);
@@ -1551,12 +1611,11 @@ TEST_CASE("ChunkCache: invalidation clears unresolved fetch counts")
         {{4, 4, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = false;
     auto c = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
+        0.0, ChunkDtype::UInt8, opts, serviceOptions(1024 * 1024, 1));
 
     (void)c->tryGetChunk(0, 0, 0, 0);
     f->waitFirstStarted();
@@ -2035,6 +2094,91 @@ TEST_CASE("ChunkRequestScheduler fixed concurrency ignores transfer samples")
           doctest::Approx(100.0 * 1024.0 * 1024.0));
 }
 
+TEST_CASE("ChunkRequestScheduler decreases admission without cancelling work")
+{
+    ChunkRequestScheduler scheduler(3);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{3};
+    std::atomic<int> finished{0};
+    std::atomic<int> followerSawFinished{-1};
+
+    for (std::uint64_t id = 1; id <= 3; ++id) {
+        scheduler.submit(id, {}, 1, 0, [&] {
+            started.count_down();
+            std::unique_lock lock(mutex);
+            cv.wait(lock, [&] { return release; });
+            lock.unlock();
+            ++finished;
+        });
+    }
+    started.wait();
+    scheduler.submit(4, {}, 1, 0, [&] {
+        followerSawFinished.store(finished.load());
+    });
+
+    scheduler.configureConcurrency(1);
+    CHECK(scheduler.active() == 3);
+    CHECK(scheduler.pending() == 1);
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+
+    CHECK(finished.load() == 3);
+    CHECK(followerSawFinished.load() == 3);
+}
+
+TEST_CASE("ChunkRequestScheduler changes fixed and adaptive modes in place")
+{
+    ChunkRequestScheduler scheduler(8);
+    CHECK(scheduler.workerCapacity() == 8);
+    scheduler.configureConcurrency(3);
+    CHECK(scheduler.transferStats().admissionLimit == 3);
+    CHECK_FALSE(scheduler.transferStats().adaptive);
+
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.minimum = 2;
+    adaptive.maximum = 6;
+    scheduler.configureConcurrency(6, adaptive);
+    CHECK(scheduler.transferStats().adaptive);
+    CHECK(scheduler.transferStats().admissionLimit == 3);
+
+    scheduler.configureConcurrency(5);
+    CHECK_FALSE(scheduler.transferStats().adaptive);
+    CHECK(scheduler.transferStats().admissionLimit == 5);
+
+    scheduler.configureConcurrency(6, adaptive);
+    CHECK(scheduler.transferStats().adaptive);
+    CHECK(scheduler.transferStats().admissionLimit == 3);
+    scheduler.configureConcurrency(5);
+    CHECK_THROWS_AS(scheduler.configureConcurrency(0), std::invalid_argument);
+    CHECK_THROWS_AS(scheduler.configureConcurrency(9), std::invalid_argument);
+}
+
+TEST_CASE("ChunkCacheService rejects invalid fetch capacity and admission")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.fetchConcurrency.workerCapacity = 0;
+    CHECK_THROWS_AS(
+        std::make_shared<ChunkCacheService>(options), std::invalid_argument);
+
+    options.fetchConcurrency.workerCapacity = 2;
+    options.fetchConcurrency.maxConcurrentReads = 3;
+    CHECK_THROWS_AS(
+        std::make_shared<ChunkCacheService>(options), std::invalid_argument);
+
+    auto service = makeService(1024 * 1024, 1);
+    CHECK_THROWS_AS(
+        service->configureFetchConcurrency(0, false), std::invalid_argument);
+    CHECK_THROWS_AS(
+        service->configureFetchConcurrency(9, false), std::invalid_argument);
+    CHECK(service->fetchConcurrency().maxConcurrentReads == 1);
+}
+
 TEST_CASE("ChunkRequestScheduler publishes shared priority updates atomically")
 {
     auto gate = std::make_shared<ChunkRequestSelectionGate>();
@@ -2103,12 +2247,11 @@ TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replac
         {{4, 4, 16}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2142,12 +2285,11 @@ TEST_CASE("ChunkCache superseded view demand cancels pending GUI work")
         {{4, 4, 24}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0); // running background blocker
     fetcher->waitFirstStarted();
@@ -2177,12 +2319,11 @@ TEST_CASE("ChunkCache closing a view cancels its pending GUI work")
         {{4, 4, 16}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2215,12 +2356,11 @@ TEST_CASE("ChunkCache stale running download does not enter decode queue")
         {{4, 4, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     cache->replaceViewDemand({85, 1}, {0.0f, 0.0f}, {
         {{0, 0, 0, 0}, {0.0f, 0.0f}},
@@ -2243,12 +2383,11 @@ TEST_CASE("ChunkCache preserves pending work owned by another view or background
         {{4, 4, 16}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2283,12 +2422,11 @@ TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
         level.chunkShape = {4, 4, 4};
     }
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>(4, fetcher),
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2326,12 +2464,11 @@ TEST_CASE("ChunkCache selects the terminal source level before ordinary fallback
         level.chunkShape = {4, 4, 4};
     }
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>(4, fetcher),
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2366,12 +2503,11 @@ TEST_CASE("ChunkCache rejects stale asynchronous GUI misses")
         {{4, 4, 20}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-        0.0, ChunkDtype::UInt8, options);
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
@@ -2460,12 +2596,12 @@ TEST_CASE("ChunkCache classifies persistent misses while cached decodes are bloc
         };
         ChunkCache::Options options;
         options.persistentCachePath = dir;
-        options.maxConcurrentReads = 1;
         options.detectAllFillChunks = false;
         ChunkCache cache(
             std::move(levels),
             std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-            0.0, ChunkDtype::UInt8, options);
+            0.0, ChunkDtype::UInt8, options,
+            serviceOptions(1024 * 1024, 1));
 
         for (int ix = 0; ix < 16; ++ix)
             (void)cache.tryGetChunk(0, 0, 0, ix);
@@ -2509,12 +2645,12 @@ TEST_CASE("ChunkCache reprioritizes pending decode work by view-relative level")
         }
         ChunkCache::Options options;
         options.persistentCachePath = dir;
-        options.maxConcurrentReads = 1;
         options.detectAllFillChunks = false;
         ChunkCache cache(
             std::move(levels),
             std::vector<std::shared_ptr<IChunkFetcher>>(3, fetcher),
-            0.0, ChunkDtype::UInt8, options);
+            0.0, ChunkDtype::UInt8, options,
+            serviceOptions(1024 * 1024, 1));
 
         for (int ix = 0; ix < 8; ++ix)
             (void)cache.tryGetChunk(0, 0, 0, ix);
@@ -2563,12 +2699,12 @@ TEST_CASE("ChunkCache invalidation cancels pending decode work")
         };
         ChunkCache::Options options;
         options.persistentCachePath = dir;
-        options.maxConcurrentReads = 1;
         options.detectAllFillChunks = false;
         ChunkCache cache(
             std::move(levels),
             std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-            0.0, ChunkDtype::UInt8, options);
+            0.0, ChunkDtype::UInt8, options,
+            serviceOptions(1024 * 1024, 1));
 
         for (int ix = 0; ix < 8; ++ix)
             (void)cache.tryGetChunk(0, 0, 0, ix);

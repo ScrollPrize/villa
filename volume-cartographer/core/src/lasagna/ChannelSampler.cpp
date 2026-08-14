@@ -513,10 +513,13 @@ public:
         if (!binding.array)
             throw std::runtime_error("VC3D corner-batch sampling requires an open Zarr array");
         vc::render::ChunkCache::Options options;
-        options.decodedByteCapacity = std::max<size_t>(1, maxCachedBytes);
-        options.decodedByteBudget = std::move(sharedBudget);
-        options.maxConcurrentReads = 16;
-        cache_ = vc::render::createChunkCache(binding.array, std::move(options));
+        vc::render::ChunkCacheService::Options serviceOptions;
+        serviceOptions.decodedByteCapacity = std::max<size_t>(1, maxCachedBytes);
+        serviceOptions.decodedByteBudget = std::move(sharedBudget);
+        serviceOptions.fetchConcurrency.workerCapacity = 16;
+        serviceOptions.fetchConcurrency.maxConcurrentReads = 16;
+        cache_ = vc::render::createChunkCache(
+            binding.array, std::move(options), std::move(serviceOptions));
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(

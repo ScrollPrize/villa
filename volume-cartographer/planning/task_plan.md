@@ -2,137 +2,181 @@
 
 ## Current problem
 
-`ChunkCacheService` already owns the source registry, decoded-byte budget,
-active-view state, selection gate, probe scheduler, decode scheduler, and fetch
-scheduler instances. However, each source `State` still selects a fetch
-scheduler from its construction options. Reopening a service-retained source
-refreshes fetchers but leaves the previous scheduler attached, so
-`Volume::setIOThreads()` can clear data without changing actual concurrency.
+`ChunkCacheService::openSource()` currently accepts `ChunkCacheOptions`, which
+mixes source-local persistence policy with service-global decoded-budget and
+source-read concurrency policy. Every source acquisition calls
+`configureServiceFetchScheduler()`, so opening or reopening a volume can change
+global concurrency.
 
-The public shared-service `ChunkCache` constructor also reverses the desired
-ownership: a source handle reaches into the service and registers itself.
+Changing concurrency currently replaces the service scheduler, cancels pending
+tasks by scheduler epoch, and blindly requeues every demanded `InFlight` entry.
+Already-running work cannot be cancelled, so a replacement scheduler starts a
+second request for the same chunk and invalidates the first result. The focused
+CI test explicitly expects two fetches and then underflows a one-shot test
+latch. Making that latch multi-call-safe would preserve the wrong production
+behavior.
+
+`Volume::setIOThreads()` compounds the ownership problem: its name and location
+look volume-specific, but it mutates the application-wide service shared by all
+volumes.
 
 ## Implementation
 
-### 1. Make source creation a service operation
+### 1. Split service and source configuration
 
-1. Move source-open input types needed by both classes to namespace-level
-   `ChunkCacheLevelInfo` and `ChunkCacheOptions`, retaining `ChunkCache` aliases
-   for source compatibility.
-2. Add `ChunkCacheService::openSource(identity, levels, fetchers, fill, dtype,
-   options)`, returning `std::shared_ptr<ChunkCache>`.
-3. Move source lookup, immutable metadata validation, source-ID allocation,
-   source-state construction, budget registration, and fetcher refresh into
-   service-owned registration helpers.
-4. Give `ChunkCache` a private constructor accepting an already registered
-   service and source state. Remove the public constructor that accepts a
-   service and source identity.
-5. Keep direct standalone `ChunkCache` constructors as compatibility
-   conveniences. They create one service and register their sole source through
-   the same shared helper; they must not create separate local schedulers.
-6. Update `Volume` and service-sharing tests/callers to use `openSource()`.
+1. Introduce explicit service configuration containing:
+   - aggregate decoded-byte capacity/budget;
+   - physical source-read worker capacity;
+   - current fixed/adaptive admission policy;
+   - optional persisted adaptive-download state.
+2. Introduce source-only acquisition options containing:
+   - metadata-entry capacity and all-fill detection;
+   - persistent-cache path and budget root;
+   - persistent compression and quantization policy.
+3. Remove decoded-budget and concurrency fields from source acquisition
+   options. Do not retain deprecated aliases that allow a source to alter
+   service policy.
+4. Rename `ChunkCacheService::openSource()` to `acquireSource()` because it may
+   either register a new source or return a handle to retained source state.
+5. Keep source identity interning, metadata validation, fetcher refresh,
+   numeric source-ID allocation, and source-handle creation in
+   `acquireSource()`. None of those operations may alter scheduler policy.
+6. Update standalone and isolated-cache creation paths to construct a separate
+   service with their desired service policy, then acquire their source using
+   source-only options.
 
-### 2. Make fetch configuration service-global
+### 2. Keep one source-read scheduler and reconfigure admission in place
 
-1. Store one active `{maximum workers, adaptive}` configuration and active
-   fetch scheduler on `ChunkCacheService::Impl`.
-2. Keep scheduler instances service-owned so switching configurations does not
-   destroy/join a running worker pool synchronously. Reuse an existing scheduler
-   when returning to a previously used configuration.
-3. Every `openSource()` applies its requested fetch configuration to the
-   service. If it differs, it becomes the new global configuration; therefore
-   the last source handle/configuration wins by documented contract.
-4. Add a public service configuration method used by
-   `Volume::setIOThreads()`. An explicit runtime change applies immediately to
-   every registered source, including sources opened by other volumes sharing
-   the service.
-5. Remove fetch concurrency from immutable source metadata compatibility and
-   stop treating `State::options_` as scheduler ownership. Source options keep
-   only source-local cache/persistence policy.
+1. Give each `ChunkCacheService` one source-read scheduler for its lifetime.
+   Remove the scheduler-per-configuration map, active-scheduler replacement,
+   fetch-configuration generations, and source scheduler migration.
+2. Extend `ChunkRequestScheduler` with a synchronized in-place concurrency
+   update:
+   - fixed mode sets the admission limit to the requested value;
+   - adaptive mode updates its bounds and resets only transient search/stability
+     state while retaining the reusable long-term adaptive model;
+   - increasing admission wakes workers immediately;
+   - decreasing admission starts no additional tasks until active work falls
+     below the new limit.
+3. Keep queued tasks, task IDs, FIFO order, priorities, source demand, and
+   scheduler groups untouched by a concurrency update.
+4. Let running work complete and publish normally. A configuration update must
+   not increment source epochs or fetch serials, cancel work, restart work, or
+   invoke extra readiness/activity callbacks.
+5. Configure a service with sufficient physical workers when it is constructed.
+   Runtime admission must not silently exceed that capacity; invalid settings
+   fail loudly.
+6. Preserve adaptive transfer samples and persisted capacity data where valid.
+   Switching modes resets only mode-specific transient probe state, not the
+   queue or completed long-term model.
 
-### 3. Migrate all source work atomically
+### 3. Make global ownership explicit at callers
 
-1. Select/create the replacement scheduler under service synchronization, then
-   publish one migration through the shared scheduler selection gate.
-2. For every registered source, under its state lock:
-   - increment its scheduler epoch;
-   - cancel the source group on the old scheduler;
-   - install the service's active scheduler;
-   - cancel stale probe/decode tasks carrying the old epoch;
-   - retain decoded, missing, all-fill, demand, listener, and accounting state;
-   - reset task IDs/error state only for unresolved demanded entries;
-   - deterministically requeue those entries through the normal probe path.
-3. Use a service configuration generation so overlapping configuration calls
-   cannot install an older scheduler after a newer last-writer update.
-4. Notify source waiters after migration. Running stale work may drain but its
-   existing generation/epoch checks must prevent publication.
-
-### 4. Make Volume always retain a service
-
-1. `Volume::sharedChunkCache()` lazily creates and stores a service when none
-   was supplied, then opens its source through that service.
-2. `Volume::setIOThreads()` stores the requested mode and configures the
-   retained service directly when present. It must not invalidate decoded
-   source state or recreate the source handle solely to change concurrency.
-3. If no service exists yet, the saved setting becomes the configuration when
-   the lazily created service opens its first source.
-4. `Volume::createChunkCache(options)` continues to create an isolated service
-   for bounded prefill/redownload jobs, preserving their fixed concurrency and
-   preventing them from changing the interactive service.
+1. Remove `Volume::setIOThreads()` and its stored per-volume `ioThreads_` state.
+   Callers that intentionally change regular I/O concurrency must use the
+   shared `ChunkCacheService` API.
+2. Construct the production VC3D service once at application startup with the
+   normal adaptive `[2,64]` source-read policy and restored adaptive state.
+   Passing that service into windows, workspaces, and volumes must not modify
+   its policy.
+3. When a `Volume` has no supplied service, create its private service once:
+   remote volumes use the existing adaptive default and local volumes use the
+   existing fixed default. Source acquisition does not revisit that decision.
+4. Explicit prefill, redownload, and batch operations continue to create an
+   isolated service with their requested fixed concurrency. They may share a
+   decoded-byte budget but never the regular scheduler.
+5. Update all core, VC3D, Lasagna, benchmark, and test callers to pass service
+   and source options at their proper ownership boundary.
 
 ## Tests
 
-- Convert shared-source construction tests to `service->openSource()` and prove
-  direct standalone construction still creates a functional service domain.
-- Prove source reuse returns the same numeric source ID and warm decoded data.
-- Prove opening another source with a different worker setting changes the
-  service globally and affects existing sources.
-- Prove `Volume::setIOThreads()` after cache creation changes global service
-  concurrency without evicting decoded chunks.
-- Cover fixed-to-fixed, fixed-to-adaptive, and adaptive-to-fixed migration.
-- Exercise a blocked old-scheduler fetch during migration; stale completion
-  must not publish, retained demand must complete on the replacement scheduler,
-  and no request may be duplicated or stranded.
-- Prove isolated `Volume::createChunkCache()` configuration does not alter the
-  volume's shared service.
-- Run focused `test_chunk_cache`, `test_volume_local`, `test_volume_extras`, and
-  the synthetic render smoke/Valgrind target because scheduler ownership is on
-  the render hot path.
+1. Replace `ChunkCacheService migrates unresolved work to replacement
+   scheduler` with an in-place reconfiguration test:
+   - start one blocked chunk and leave another queued;
+   - increase admission and prove the queued chunk starts without restarting
+     the blocked chunk;
+   - release both and prove each key was fetched exactly once and each result
+     published once.
+2. Add a decrease test proving running work is not cancelled and no new task is
+   admitted until active work falls below the new limit.
+3. Cover fixed-to-fixed, fixed-to-adaptive, and adaptive-to-fixed updates while
+   preserving pending order, view-relative priority, demand, and callbacks.
+4. Prove acquiring and reacquiring sources cannot change service concurrency,
+   while fetcher refresh still preserves source ID and decoded data.
+5. Prove two sources share the explicitly configured service policy and an
+   isolated batch service cannot alter it.
+6. Remove tests of `Volume::setIOThreads()` and replace them with tests of
+   service configuration before and after volume source acquisition.
+7. Run:
+   - `cmake --build build/ci-fast-core --target vc_test_core --parallel 4`
+   - `build/ci-fast-core/bin/test_chunk_cache`
+   - focused `test_volume_local`, `test_volume_extras`,
+     `test_chunk_cache_persist`, and `test_zarr_chunk_fetcher`
+   - `ctest --test-dir build/ci-fast-core --output-on-failure --parallel 4 -L '^vc-core$'`
+   - VC3D compile/smoke and the synthetic render fixture.
+8. Defer the known Valgrind role-attribution failure to its separate archived
+   task, as requested; do not treat it as validation for this API correction.
 
 ## Spec update
 
-Update `planning/spec.md` to define `ChunkCacheService` as the sole owner of all
-regular chunk schedulers and global fetch concurrency. Define `ChunkCache` as a
-source-bound handle returned by `openSource()`, document last-writer-wins
-service configuration, and distinguish separate services used by isolated
-batch work.
+Update `planning/spec.md` to state that:
+
+- `ChunkCacheService::acquireSource()` is source-only and cannot modify service
+  scheduling;
+- source-read concurrency is configured explicitly once per service and may be
+  changed only through the service API;
+- runtime concurrency updates modify admission in place and never cancel,
+  restart, duplicate, or invalidate running/queued work;
+- `Volume` does not own or expose regular source-read concurrency;
+- isolated operations use isolated services.
+
+Remove the existing last-source-open-wins and scheduler-replacement language.
 
 ## Documentation updates
 
-Update `docs/remote_file_cache.md` and API comments with service/source-handle
-ownership, global I/O-thread semantics, scheduler migration guarantees, and
-the isolated-service rule for explicit batch caches. Correct stale text that
-still describes fixed two-worker VC3D interactive reads.
+- Update `docs/remote_file_cache.md` with the service/source option split,
+  source acquisition semantics, explicit global configuration, and in-place
+  admission updates.
+- Update `docs/api/Volume.md` to remove `setIOThreads()` and direct users to the
+  service-level setting.
+- Update public API comments in `ChunkCache.hpp`, `ChunkRequestScheduler.hpp`,
+  and `Volume.hpp` so source acquisition and scheduling ownership cannot be
+  confused again.
 
 ## Changelog
 
-Add one entry describing service-owned source creation and globally effective
-fetch-concurrency changes without decoded-cache eviction.
+Add one entry recording that source acquisition no longer changes global I/O
+policy and runtime concurrency changes preserve all running and queued work.
 
 ## Independent plan review
 
-- The distinction between service and source handle remains necessary because
-  `IChunkedArray` is source-bound; merging them would add source IDs to every
-  sampling call and immediately require another adapter.
-- The plan removes infrastructure ownership from the handle without changing
-  chunk identity, sampling, interpolation, or decoded data.
-- Runtime migration must reuse the established scheduler epoch and stale-result
-  checks rather than introduce a second cancellation mechanism.
-- Applying options on each `openSource()` intentionally makes the most recent
-  source configuration global. This is accepted behavior and must be explicit
-  in docs and tests.
-- Explicit batch caches require a distinct service, not a source-local
-  scheduler, to retain isolation.
-- Scheduler objects cannot be destroyed while holding service/state locks
-  because their destructors may join workers; the service retains reusable
-  scheduler instances until safe shutdown.
+- **Task coverage:** The plan fixes both ownership errors: source acquisition no
+  longer acts as a global setter, and volume-scoped configuration is removed.
+- **CI root cause:** The failing latch test is replaced rather than weakened.
+  The new invariant is one fetch per key across a concurrency change, so the
+  production duplicate request that triggered the test failure is removed.
+- **Specification consistency:** The plan preserves the established single
+  application cache service, source-retained decoded data, numeric source IDs,
+  explicit isolated services, queue priority, and non-cancellation of running
+  work. It intentionally changes the recently documented last-source-wins and
+  scheduler-replacement behavior because those contradict the clarified task.
+- **No numeric/render change:** Chunk values, interpolation, transforms, and
+  rendering are untouched. Only source registration and scheduler admission
+  ownership change.
+- **Concurrency safety:** In-place admission avoids the impossible operation of
+  transferring a running function between executors. Running work remains on
+  the same executor; pending work remains in the same queue.
+- **Portability:** The implementation uses the existing mutex/CV worker model
+  and adds no platform-specific synchronization.
+- **Residual risk:** Mode changes must preserve adaptive-state locking and wake
+  semantics. The fixed/adaptive transition tests and full core shard are
+  required before completion.
+
+## Adequacy
+
+Yes. This design fixes the non-Valgrind CI failure at its source rather than
+making the test tolerate duplicate work. It also removes the API path that
+caused scheduler replacement during ordinary source acquisition. The solution
+is adequate provided implementation uses one persistent scheduler with mutable
+admission; replacing executors and attempting to migrate running work would
+reintroduce the same side effects.

@@ -1,17 +1,18 @@
-# Task: make chunk source handles service-owned
+# Task: separate source acquisition from global I/O configuration
 
-Refactor regular chunk caching so every source is opened by a
-`ChunkCacheService`, every `ChunkCache` is only a lightweight source-bound
-`IChunkedArray` handle, and fetch concurrency is configured once for the whole
-service.
+Correct the shared chunk-cache APIs so acquiring a volume source has no
+service-wide scheduling side effects and I/O concurrency is configured only on
+the `ChunkCacheService`.
 
-- `ChunkCacheService::openSource(...)` creates or reacquires source handles.
-- A cache without an supplied service creates and retains a new service; it
-  does not construct source-local schedulers.
-- Probe, fetch, and decode schedulers and fetch concurrency belong exclusively
-  to the service.
-- Changing I/O threads updates every source in that service. The most recent
-  configuration wins globally.
-- Scheduler replacement preserves decoded chunks, source IDs, demand,
-  listeners, and cache accounting while safely moving unresolved work.
-- Explicit bounded/batch caches remain isolated by using a separate service.
+- Replace the mixed `ChunkCacheOptions` contract at the service source factory
+  with source-only acquisition settings.
+- Rename the source factory to describe its acquire-or-reuse behavior.
+- Remove the volume-scoped I/O-thread setter; regular concurrency is one
+  explicit service-global setting.
+- Reconfigure the service's existing source-read scheduler in place. Running
+  and queued work must remain attached to that scheduler and each chunk request
+  must execute at most once because of a configuration change.
+- Preserve the intended VC3D adaptive default, isolated batch-cache behavior,
+  decoded contents, priorities, demand, listeners, and adaptive state.
+- Replace the scheduler-migration regression test that currently expects a
+  duplicate fetch and causes the non-Valgrind CI failure.

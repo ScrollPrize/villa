@@ -1,77 +1,54 @@
 # Task log
 
-## Findings
+## Planning findings
 
-- All cache scheduling infrastructure is already allocated by
-  `ChunkCacheService::Impl`, but source states retain weak pointers to a fetch
-  scheduler selected from source construction options.
-- Shared source reacquisition validates source-local metadata and refreshes
-  fetchers, but neither compares nor updates fetch concurrency.
-- `Volume::setIOThreads()` invalidates the shared source and drops its handle;
-  reacquisition therefore loses decoded data yet still uses the old scheduler.
-- VC3D hides the old I/O-thread UI, but the public C++ and Python Volume APIs
-  still document and expose runtime configuration.
-- Existing `Volume::createChunkCache()` intentionally isolates prefill and
-  redownload work. Its isolation should be represented by a separate service,
-  not a scheduler attached directly to a source.
-- Every explicit `ChunkCacheService` construction in the repository uses
-  `shared_ptr`, so a service factory can safely return source handles while
-  standalone constructors retain a service internally.
-
-## Constraints
-
-- Fetch configuration is global within one service and last writer wins.
-- No source-local probe, fetch, or decode scheduler may remain.
-- Decoded chunks and source IDs survive scheduler reconfiguration.
-- Stale running work cannot publish after migration.
-- Batch isolation uses a separate service.
-- Rendering and sampling numerics remain unchanged.
+- `ChunkCacheService::openSource()` currently applies
+  `ChunkCacheOptions.maxConcurrentReads` and `adaptiveConcurrentReads` to the
+  entire service before registering or reacquiring a source.
+- `ChunkCacheOptions` mixes service-owned decoded budget/concurrency with
+  source-owned metadata and persistent-cache policy.
+- `Volume::setIOThreads()` is a volume-scoped API that changes its attached
+  shared service, so the apparent ownership and actual effect disagree.
+- Scheduler reconfiguration currently creates/selects another scheduler,
+  cancels pending old-epoch tasks, and requeues all demanded `InFlight`
+  entries. Already-running requests continue, causing duplicate fetches whose
+  first result is discarded by fetch-serial checks.
+- The failing `test_chunk_cache` migration case explicitly expects this
+  duplicate and underflows `BlockingFetcher`'s one-shot latch on the second
+  call. The planned fix changes the production invariant and replaces the test;
+  it will not make the latch accept duplicate same-key work.
 
 ## Implementation
 
-- Added `ChunkCacheService::openSource()` as the shared-source factory. The
-  service now validates metadata, interns identities, allocates/reuses source
-  state, registers decoded-budget participation, refreshes fetchers, and then
-  returns a source-bound handle.
-- Removed the public service-taking `ChunkCache` constructor. Standalone
-  constructors create a one-source service and open their source through the
-  same factory; the handle itself only retains `{service, source state}`.
-- Made source-read concurrency one service-global configuration. The latest
-  valid source open or explicit configuration call wins and migrates every
-  registered source under the shared scheduler-selection gate.
-- Scheduler migration increments source epochs, cancels pending old-stage work,
-  retains decoded and demand state, and deterministically requeues unresolved
-  demanded entries. Running old work cannot publish because its fetch serial is
-  stale. Transfer samples remain attached to the scheduler that admitted them.
-- `Volume` now lazily creates and retains a service. `setIOThreads()` updates
-  that service without invalidating decoded data. Explicit batch cache creation
-  creates a separate service while retaining the shared decoded-byte budget.
-- Materialized Zarr level metadata before moving fetchers into `openSource()`;
-  this avoids argument-evaluation order producing an empty level list.
-- Archived the paused render-replay planning records under
-  `planning/stash/render_valgrind_role_attribution/`.
+- Split source-local `ChunkCacheOptions` from service-owned decoded-budget and
+  fetch-concurrency options.
+- Replaced `openSource()` with source-only `acquireSource()` and removed
+  `Volume::setIOThreads()` plus its Python binding.
+- Replaced scheduler migration with synchronized in-place admission updates.
+  Increasing admission wakes existing workers; decreasing it lets running work
+  drain without admitting another task early.
+- Configured the normal VC3D service explicitly for adaptive operation and kept
+  prefill, redownload, batch, local-volume, and standalone caches isolated.
+- Replaced the duplicate-fetch migration test with exact-once increase and
+  non-cancelling decrease coverage, plus fixed/adaptive transition and source
+  acquisition ownership checks.
 
 ## Deviations
 
-- None. The source handle remains distinct from the service because
-  `IChunkedArray` is source-bound, while all scheduler and registry ownership is
-  service-owned as planned.
+- The known Valgrind trace-role attribution failure remains deferred to its
+  separate task as requested.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build --parallel 4`
-  - Passed, including the VC3D executable and all configured targets.
-- `volume-cartographer/build/bin/test_chunk_cache`
-  - 69 test cases passed.
-- `volume-cartographer/build/bin/test_chunk_cache_persist`
-  - 17 test cases passed.
-- `volume-cartographer/build/bin/test_zarr_chunk_fetcher`
-  - 16 test cases passed.
-- `volume-cartographer/build/bin/test_volume_local`
-  - 15 test cases passed.
-- `volume-cartographer/build/bin/test_volume_extras`
-  - 12 test cases passed.
-- `volume-cartographer/build/bin/test_volume_pyramid`
-  - 10 test cases passed.
-- `ctest --test-dir volume-cartographer/build --output-on-failure -R '^test_render_synthetic_fixture$'`
-  - Passed.
+- `cmake --build build/ci-fast-core --target vc_core --parallel 4`
+- `cmake --build build/ci-fast-core --target vc_test_core --parallel 4`
+- `build/ci-fast-core/bin/test_chunk_cache`: 72 cases passed in three
+  consecutive runs.
+- `test_volume_local`: 15 cases passed.
+- `test_volume_extras`: 12 cases passed.
+- `test_chunk_cache_persist`: 17 cases passed.
+- `test_zarr_chunk_fetcher`: 16 cases passed.
+- `cmake --build build --target VC3D --parallel 4` passed.
+- The complete 131-test `vc-core` shard passed, including both synthetic render
+  fixtures and the live remote-volume tests.
+- `git diff --check` passed.

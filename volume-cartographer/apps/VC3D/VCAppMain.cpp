@@ -544,10 +544,14 @@ auto main(int argc, char* argv[]) -> int
     {
         const std::size_t cacheSizeBytes =
             cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
+        vc::render::ChunkCacheService::Options cacheOptions;
+        cacheOptions.decodedByteCapacity = cacheSizeBytes;
+        cacheOptions.fetchConcurrency.workerCapacity = 64;
+        cacheOptions.fetchConcurrency.maxConcurrentReads = 64;
+        cacheOptions.fetchConcurrency.adaptive = true;
+        cacheOptions.initialAdaptiveDownloadState = loadAdaptiveDownloadState();
         chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
-            cacheSizeBytes,
-            std::shared_ptr<vc::render::DecodedChunkCacheBudget>{},
-            loadAdaptiveDownloadState());
+            std::move(cacheOptions));
         CWindow aWin(cacheSizeGB, benchOptions, chunkCacheService);
 
         if (parser.isSet(volumePackageOption)) {

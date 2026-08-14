@@ -35,16 +35,8 @@ struct ChunkCacheLevelInfo {
 };
 
 struct ChunkCacheOptions {
-    // Per-source decoded-data ceiling. A service-wide budget may impose a
-    // lower aggregate limit across all sources.
-    std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
-    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
     // Bound resolved non-data entries for sparse volumes.
     std::size_t metadataEntryCapacity = 1ULL << 20;
-    // Service-wide source-read configuration. Opening a source applies these
-    // values to every source in the service; the most recent request wins.
-    std::size_t maxConcurrentReads = 16;
-    bool adaptiveConcurrentReads = false;
     bool detectAllFillChunks = true;
     std::optional<std::filesystem::path> persistentCachePath;
     // Optional root registered with PersistentZarrCacheBudget.
@@ -56,9 +48,9 @@ struct ChunkCacheOptions {
 };
 
 // Application-owned decoded chunk-cache service. Source identity strings are
-// interned when a source handle is opened; all hot lookups use the numeric
-// VolumeSourceId stored on that handle. Fetch policy is service-global and the
-// most recently requested policy applies to every registered source.
+// interned when a source handle is acquired; all hot lookups use the numeric
+// VolumeSourceId stored on that handle. Fetch policy belongs to the service and
+// source acquisition cannot change it.
 class ChunkCacheService final : public std::enable_shared_from_this<ChunkCacheService> {
 public:
     struct AdaptiveDownloadState {
@@ -68,10 +60,23 @@ public:
         double saturatedBytesPerSecondPerWorker = 0.0;
     };
 
-    explicit ChunkCacheService(
-        std::size_t decodedByteCapacity,
-        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget = {},
-        std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState = {});
+    struct FetchConcurrency {
+        // Number of physical source-read workers owned by this service.
+        std::size_t workerCapacity = 16;
+        // Fixed admission limit, or the upper adaptive bound.
+        std::size_t maxConcurrentReads = 16;
+        bool adaptive = false;
+    };
+
+    struct Options {
+        std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
+        FetchConcurrency fetchConcurrency;
+        std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
+    };
+
+    ChunkCacheService();
+    explicit ChunkCacheService(Options options);
     ~ChunkCacheService();
 
     ChunkCacheService(const ChunkCacheService&) = delete;
@@ -81,20 +86,15 @@ public:
     // Returns the reusable adaptive download model. Runtime probe phases and
     // stability windows are deliberately excluded.
     std::optional<AdaptiveDownloadState> adaptiveDownloadState() const;
-    struct FetchConcurrency {
-        std::size_t maxConcurrentReads = 0;
-        bool adaptive = false;
-    };
-
-    std::shared_ptr<ChunkCache> openSource(
+    std::shared_ptr<ChunkCache> acquireSource(
         std::string sourceIdentity,
         std::vector<ChunkCacheLevelInfo> levels,
         std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
         double fillValue,
         ChunkDtype dtype,
         ChunkCacheOptions options = {});
-    // Replaces the source-read scheduler for every registered source without
-    // dropping decoded data. The latest call or openSource() request wins.
+    // Changes service-wide source-read admission in place. Running and queued
+    // work is neither cancelled nor restarted.
     void configureFetchConcurrency(std::size_t maxConcurrentReads,
                                    bool adaptive);
     FetchConcurrency fetchConcurrency() const;
@@ -103,11 +103,6 @@ public:
 
 private:
     friend class ChunkCache;
-    ChunkCacheService(
-        std::size_t decodedByteCapacity,
-        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
-        bool createDecodedByteBudget,
-        std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState = {});
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };
@@ -161,6 +156,12 @@ public:
                double fillValue,
                ChunkDtype dtype,
                Options options);
+    ChunkCache(std::vector<LevelInfo> levels,
+               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
+               double fillValue,
+               ChunkDtype dtype,
+               Options options,
+               ChunkCacheService::Options serviceOptions);
     ~ChunkCache() override;
 
     VolumeSourceId sourceId() const noexcept;
@@ -281,6 +282,8 @@ private:
               double fillValue,
               ChunkDtype dtype,
               Options options,
+              std::size_t decodedByteCapacity,
+              std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
               VolumeSourceId sourceId,
               std::string sourceIdentity)
             : levels_(std::move(levels))
@@ -288,6 +291,8 @@ private:
             , fillValue_(fillValue)
             , dtype_(dtype)
             , options_(std::move(options))
+            , decodedByteCapacity_(decodedByteCapacity)
+            , decodedByteBudget_(std::move(decodedByteBudget))
             , sourceId_(sourceId)
             , sourceIdentity_(std::move(sourceIdentity))
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
@@ -309,6 +314,8 @@ private:
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
+        std::size_t decodedByteCapacity_ = 0;
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget_;
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;
 
@@ -325,7 +332,6 @@ private:
         // invalidation can cancel only this source's stale pending tasks.
         const std::uint64_t schedulerGroup_;
         std::uint64_t schedulerEpoch_ = 0;
-        std::uint64_t fetchConfigurationGeneration_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
@@ -485,16 +491,6 @@ private:
     static void refreshFetchers(
         const std::shared_ptr<State>& state,
         std::vector<std::shared_ptr<IChunkFetcher>> fetchers);
-    static void configureServiceFetchScheduler(
-        const std::shared_ptr<ChunkCacheService>& service,
-        std::size_t maxConcurrentReads,
-        bool adaptive);
-    static void migrateFetchScheduler(
-        const std::shared_ptr<State>& state,
-        const std::shared_ptr<ChunkRequestScheduler>& scheduler,
-        std::size_t maxConcurrentReads,
-        bool adaptive,
-        std::uint64_t configurationGeneration);
     static void restartUnresolvedLocked(const std::shared_ptr<State>& state);
     static void clearSourceViewDemandLocked(State& state,
                                             std::uint64_t viewId,

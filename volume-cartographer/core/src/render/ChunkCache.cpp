@@ -12,7 +12,6 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
-#include <map>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -67,11 +66,6 @@ std::string uniqueTmpSuffix()
            std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
-std::size_t normalizedWorkerCount(std::size_t requested)
-{
-    return std::max<std::size_t>(1, requested);
-}
-
 utils::ThreadPool& persistentCacheWriterPool()
 {
     // Keep disk-cache writes off the chunk read/fetch pool. A single writer
@@ -107,16 +101,48 @@ std::string fetchErrorMessage(const ChunkFetchResult& fetch)
 } // namespace
 
 struct ChunkCacheService::Impl {
-    Impl(std::size_t capacity,
-         std::shared_ptr<DecodedChunkCacheBudget> budget,
-         bool createBudget,
-         std::optional<AdaptiveDownloadState> initialAdaptiveState)
-        : decodedByteCapacity(capacity)
-        , decodedByteBudget(std::move(budget))
-        , initialAdaptiveDownloadState(std::move(initialAdaptiveState))
+    explicit Impl(Options options)
+        : decodedByteCapacity(options.decodedByteCapacity)
+        , decodedByteBudget(std::move(options.decodedByteBudget))
+        , initialAdaptiveDownloadState(
+              std::move(options.initialAdaptiveDownloadState))
+        , activeFetchWorkers(options.fetchConcurrency.maxConcurrentReads)
+        , activeFetchAdaptive(options.fetchConcurrency.adaptive)
     {
-        if (!decodedByteBudget && createBudget)
-            decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(capacity);
+        const std::size_t workerCapacity =
+            options.fetchConcurrency.workerCapacity;
+        if (workerCapacity == 0 || activeFetchWorkers == 0 ||
+            activeFetchWorkers > workerCapacity) {
+            throw std::invalid_argument(
+                "ChunkCacheService fetch concurrency must be within worker capacity");
+        }
+        if (!decodedByteBudget) {
+            decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(
+                decodedByteCapacity);
+        }
+
+        std::optional<ChunkRequestScheduler::AdaptiveConcurrency> adaptiveOptions;
+        std::optional<ChunkRequestScheduler::AdaptiveState> initialState;
+        if (activeFetchAdaptive) {
+            adaptiveOptions.emplace();
+            adaptiveOptions->minimum = std::min<std::size_t>(
+                2, activeFetchWorkers);
+            adaptiveOptions->maximum = activeFetchWorkers;
+            if (initialAdaptiveDownloadState) {
+                initialState = ChunkRequestScheduler::AdaptiveState{
+                    initialAdaptiveDownloadState->settledAdmissionLimit,
+                    initialAdaptiveDownloadState->longTermBytesPerSecond,
+                    initialAdaptiveDownloadState->maximumSaturatedParallelism,
+                    initialAdaptiveDownloadState
+                        ->saturatedBytesPerSecondPerWorker};
+            }
+        }
+        fetchScheduler = std::make_shared<ChunkRequestScheduler>(
+            workerCapacity, 7, schedulerSelectionGate,
+            adaptiveOptions, initialState);
+        if (!activeFetchAdaptive) {
+            fetchScheduler->configureConcurrency(activeFetchWorkers);
+        }
     }
 
     std::size_t decodedByteCapacity = 0;
@@ -137,64 +163,18 @@ struct ChunkCacheService::Impl {
     std::shared_ptr<ChunkRequestScheduler> decodeScheduler =
         std::make_shared<ChunkRequestScheduler>(
             kDecodeWorkers, 7, schedulerSelectionGate);
-    using FetchConfiguration = std::pair<std::size_t, bool>;
-    std::map<FetchConfiguration, std::shared_ptr<ChunkRequestScheduler>> fetchSchedulers;
-    std::shared_ptr<ChunkRequestScheduler> activeFetchScheduler;
-    std::shared_ptr<ChunkRequestScheduler> lastAdaptiveFetchScheduler;
+    std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
     std::size_t activeFetchWorkers = 0;
     bool activeFetchAdaptive = false;
-    std::uint64_t fetchConfigurationGeneration = 0;
-
-    std::shared_ptr<ChunkRequestScheduler> schedulerFor(
-        std::size_t workers, bool adaptive)
-    {
-        workers = normalizedWorkerCount(workers);
-        auto& scheduler = fetchSchedulers[{workers, adaptive}];
-        if (!scheduler) {
-            std::optional<ChunkRequestScheduler::AdaptiveConcurrency> adaptiveOptions;
-            std::optional<ChunkRequestScheduler::AdaptiveState> initialState;
-            if (adaptive) {
-                adaptiveOptions.emplace();
-                adaptiveOptions->maximum = workers;
-                if (lastAdaptiveFetchScheduler) {
-                    initialState = lastAdaptiveFetchScheduler->adaptiveState();
-                } else if (initialAdaptiveDownloadState) {
-                    initialState = ChunkRequestScheduler::AdaptiveState{
-                        initialAdaptiveDownloadState->settledAdmissionLimit,
-                        initialAdaptiveDownloadState->longTermBytesPerSecond,
-                        initialAdaptiveDownloadState->maximumSaturatedParallelism,
-                        initialAdaptiveDownloadState
-                            ->saturatedBytesPerSecondPerWorker};
-                }
-            }
-            scheduler = std::make_shared<ChunkRequestScheduler>(
-                workers, 7, schedulerSelectionGate, adaptiveOptions, initialState);
-        }
-        if (adaptive)
-            lastAdaptiveFetchScheduler = scheduler;
-        return scheduler;
-    }
 };
 
-ChunkCacheService::ChunkCacheService(
-    std::size_t decodedByteCapacity,
-    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
-    std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState)
-    : impl_(std::make_shared<Impl>(decodedByteCapacity,
-                                  std::move(decodedByteBudget), true,
-                                  std::move(initialAdaptiveDownloadState)))
+ChunkCacheService::ChunkCacheService()
+    : ChunkCacheService(Options{})
 {
 }
 
-ChunkCacheService::ChunkCacheService(
-    std::size_t decodedByteCapacity,
-    std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
-    bool createDecodedByteBudget,
-    std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState)
-    : impl_(std::make_shared<Impl>(decodedByteCapacity,
-                                  std::move(decodedByteBudget),
-                                  createDecodedByteBudget,
-                                  std::move(initialAdaptiveDownloadState)))
+ChunkCacheService::ChunkCacheService(Options options)
+    : impl_(std::make_shared<Impl>(std::move(options)))
 {
 }
 
@@ -219,10 +199,7 @@ ChunkCacheService::~ChunkCacheService()
     // returning from its callback. Drain every stage while Impl still owns the
     // schedulers so their worker threads are joined by this thread.
     impl_->probeScheduler->waitIdle();
-    for (const auto& [configuration, scheduler] : impl_->fetchSchedulers) {
-        (void)configuration;
-        scheduler->waitIdle();
-    }
+    impl_->fetchScheduler->waitIdle();
     impl_->decodeScheduler->waitIdle();
 }
 
@@ -235,18 +212,9 @@ ChunkCacheService::decodedByteBudget() const
 std::optional<ChunkCacheService::AdaptiveDownloadState>
 ChunkCacheService::adaptiveDownloadState() const
 {
-    std::shared_ptr<ChunkRequestScheduler> scheduler;
-    std::optional<AdaptiveDownloadState> initialState;
-    {
-        std::lock_guard lock(impl_->mutex);
-        scheduler = impl_->lastAdaptiveFetchScheduler;
-        initialState = impl_->initialAdaptiveDownloadState;
-    }
-    if (!scheduler)
-        return initialState;
-    const auto state = scheduler->adaptiveState();
+    const auto state = impl_->fetchScheduler->adaptiveState();
     if (!state)
-        return std::nullopt;
+        return impl_->initialAdaptiveDownloadState;
     return AdaptiveDownloadState{
         state->settledAdmissionLimit,
         state->longTermBytesPerSecond,
@@ -254,7 +222,7 @@ ChunkCacheService::adaptiveDownloadState() const
         state->saturatedBytesPerSecondPerWorker};
 }
 
-std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
+std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     std::string sourceIdentity,
     std::vector<ChunkCacheLevelInfo> levels,
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
@@ -266,8 +234,6 @@ std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
         throw std::invalid_argument(
             "ChunkCache requires a non-empty source identity");
     }
-    options.decodedByteCapacity = impl_->decodedByteCapacity;
-    options.decodedByteBudget = impl_->decodedByteBudget;
     options.compressPersistentCache =
         options.compressPersistentCache || ChunkCache::persistentCompressionDefault();
     options.cacheQuantBinWidth = std::max(
@@ -275,29 +241,7 @@ std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
         ChunkCache::persistentQuantizationDefault());
     ChunkCache::validateSourceDefinition(levels, fetchers);
 
-    // Invalid attempts to reopen a source must not change the service-wide
-    // scheduler. Perform the immutable and fetcher checks before applying the
-    // caller's last-writer-wins concurrency configuration.
-    {
-        std::lock_guard serviceLock(impl_->mutex);
-        const auto existing = impl_->sources.find(sourceIdentity);
-        if (existing != impl_->sources.end()) {
-            const auto state =
-                std::static_pointer_cast<ChunkCache::State>(existing->second);
-            if (!ChunkCache::metadataCompatible(
-                    *state, levels, fillValue, dtype, options)) {
-                throw std::invalid_argument(
-                    "ChunkCache source was registered with incompatible metadata: " +
-                    sourceIdentity);
-            }
-            ChunkCache::validateRefreshedFetchers(*state, fetchers);
-        }
-    }
-
     auto service = shared_from_this();
-    ChunkCache::configureServiceFetchScheduler(
-        service, options.maxConcurrentReads, options.adaptiveConcurrentReads);
-
     std::unique_lock serviceLock(impl_->mutex);
     auto existing = impl_->sources.find(sourceIdentity);
     if (existing != impl_->sources.end()) {
@@ -319,18 +263,14 @@ std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
     const VolumeSourceId sourceId{impl_->nextSourceId++};
     auto state = std::make_shared<ChunkCache::State>(
         std::move(levels), std::move(fetchers), fillValue, dtype,
-        std::move(options), sourceId, sourceIdentity);
+        std::move(options), impl_->decodedByteCapacity,
+        impl_->decodedByteBudget, sourceId, sourceIdentity);
     state->probeScheduler_ = impl_->probeScheduler;
-    state->fetchScheduler_ = impl_->activeFetchScheduler;
-    state->fetchConfigurationGeneration_ = impl_->fetchConfigurationGeneration;
+    state->fetchScheduler_ = impl_->fetchScheduler;
     state->decodeScheduler_ = impl_->decodeScheduler;
     state->schedulerSelectionGate_ = impl_->schedulerSelectionGate;
     state->activeViewId_ = impl_->activeViewId;
     state->nextTaskId_ = impl_->nextTaskId;
-    if (!state->options_.decodedByteBudget) {
-        state->options_.decodedByteBudget =
-            ChunkCache::decodedByteBudgetDefault();
-    }
     if (state->options_.persistentCacheBudgetRoot &&
         state->options_.persistentCachePath) {
         state->persistentBudget_ = PersistentZarrCacheBudget::findForPath(
@@ -347,14 +287,26 @@ std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
 void ChunkCacheService::configureFetchConcurrency(
     std::size_t maxConcurrentReads, bool adaptive)
 {
-    ChunkCache::configureServiceFetchScheduler(
-        shared_from_this(), maxConcurrentReads, adaptive);
+    std::optional<ChunkRequestScheduler::AdaptiveConcurrency> adaptiveOptions;
+    if (adaptive) {
+        adaptiveOptions.emplace();
+        adaptiveOptions->minimum = std::min<std::size_t>(
+            2, maxConcurrentReads);
+        adaptiveOptions->maximum = maxConcurrentReads;
+    }
+    std::lock_guard lock(impl_->mutex);
+    impl_->fetchScheduler->configureConcurrency(
+        maxConcurrentReads, adaptiveOptions);
+    impl_->activeFetchWorkers = maxConcurrentReads;
+    impl_->activeFetchAdaptive = adaptive;
 }
 
 ChunkCacheService::FetchConcurrency ChunkCacheService::fetchConcurrency() const
 {
     std::lock_guard lock(impl_->mutex);
-    return {impl_->activeFetchWorkers, impl_->activeFetchAdaptive};
+    return {impl_->fetchScheduler->workerCapacity(),
+            impl_->activeFetchWorkers,
+            impl_->activeFetchAdaptive};
 }
 
 std::size_t ChunkCacheService::sourceCount() const
@@ -396,11 +348,22 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                        double fillValue,
                        ChunkDtype dtype,
                        Options options)
-    : service_(std::shared_ptr<ChunkCacheService>(new ChunkCacheService(
-          options.decodedByteCapacity, options.decodedByteBudget, false,
-          std::nullopt)))
+    : ChunkCache(std::move(levels), std::move(fetchers), fillValue, dtype,
+                 std::move(options), ChunkCacheService::Options{})
 {
-    auto handle = service_->openSource(
+}
+
+ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
+                       std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
+                       double fillValue,
+                       ChunkDtype dtype,
+                       Options options,
+                       ChunkCacheService::Options serviceOptions)
+{
+    if (!serviceOptions.decodedByteBudget)
+        serviceOptions.decodedByteBudget = decodedByteBudgetDefault();
+    service_ = std::make_shared<ChunkCacheService>(std::move(serviceOptions));
+    auto handle = service_->acquireSource(
         "private:" + std::to_string(nextSchedulerGroup()), std::move(levels),
         std::move(fetchers), fillValue, dtype, std::move(options));
     state_ = std::move(handle->state_);
@@ -451,11 +414,11 @@ void ChunkCache::validateSourceDefinition(
 
 void ChunkCache::registerStateBudget(const std::shared_ptr<State>& state)
 {
-    if (!state || !state->options_.decodedByteBudget)
+    if (!state || !state->decodedByteBudget_)
         return;
     std::weak_ptr<State> weakState = state;
     state->decodedBudgetRegistration_ =
-        state->options_.decodedByteBudget->registerCache({
+        state->decodedByteBudget_->registerCache({
             [weakState]() -> std::optional<std::uint64_t> {
                 auto locked = weakState.lock();
                 return locked ? oldestDecodedTouch(locked) : std::nullopt;
@@ -492,81 +455,6 @@ void ChunkCache::validateRefreshedFetchers(
                 "ChunkCache refreshed fetcher changed persistent encoding");
         }
     }
-}
-
-void ChunkCache::configureServiceFetchScheduler(
-    const std::shared_ptr<ChunkCacheService>& service,
-    std::size_t maxConcurrentReads,
-    bool adaptive)
-{
-    maxConcurrentReads = normalizedWorkerCount(maxConcurrentReads);
-    std::shared_ptr<ChunkRequestScheduler> scheduler;
-    std::vector<std::shared_ptr<State>> states;
-    std::uint64_t configurationGeneration = 0;
-    {
-        std::lock_guard serviceLock(service->impl_->mutex);
-        if (service->impl_->activeFetchScheduler &&
-            service->impl_->activeFetchWorkers == maxConcurrentReads &&
-            service->impl_->activeFetchAdaptive == adaptive) {
-            return;
-        }
-        scheduler = service->impl_->schedulerFor(maxConcurrentReads, adaptive);
-        service->impl_->activeFetchScheduler = scheduler;
-        service->impl_->activeFetchWorkers = maxConcurrentReads;
-        service->impl_->activeFetchAdaptive = adaptive;
-        configurationGeneration =
-            ++service->impl_->fetchConfigurationGeneration;
-        states.reserve(service->impl_->sources.size());
-        for (const auto& [identity, source] : service->impl_->sources) {
-            (void)identity;
-            states.push_back(std::static_pointer_cast<State>(source));
-        }
-    }
-
-    service->impl_->schedulerSelectionGate->publish([&] {
-        {
-            std::lock_guard serviceLock(service->impl_->mutex);
-            if (service->impl_->fetchConfigurationGeneration !=
-                configurationGeneration) {
-                return;
-            }
-        }
-        for (const auto& state : states)
-            migrateFetchScheduler(
-                state, scheduler, maxConcurrentReads, adaptive,
-                configurationGeneration);
-    });
-}
-
-void ChunkCache::migrateFetchScheduler(
-    const std::shared_ptr<State>& state,
-    const std::shared_ptr<ChunkRequestScheduler>& scheduler,
-    std::size_t maxConcurrentReads,
-    bool adaptive,
-    std::uint64_t configurationGeneration)
-{
-    {
-        std::lock_guard lock(state->mutex_);
-        if (state->fetchConfigurationGeneration_ >= configurationGeneration)
-            return;
-        const auto oldScheduler = state->fetchScheduler_.lock();
-        const std::uint64_t schedulerEpoch = ++state->schedulerEpoch_;
-        if (oldScheduler)
-            oldScheduler->cancelGroupBefore(
-                state->schedulerGroup_, schedulerEpoch);
-        if (auto probeScheduler = state->probeScheduler_.lock())
-            probeScheduler->cancelGroupBefore(
-                state->schedulerGroup_, schedulerEpoch);
-        if (auto decodeScheduler = state->decodeScheduler_.lock())
-            decodeScheduler->cancelGroupBefore(
-                state->schedulerGroup_, schedulerEpoch);
-        state->fetchScheduler_ = scheduler;
-        state->options_.maxConcurrentReads = maxConcurrentReads;
-        state->options_.adaptiveConcurrentReads = adaptive;
-        state->fetchConfigurationGeneration_ = configurationGeneration;
-        restartUnresolvedLocked(state);
-    }
-    state->cv_.notify_all();
 }
 
 void ChunkCache::refreshFetchers(
@@ -1018,13 +906,13 @@ ChunkCache::Stats ChunkCache::stats() const
     Stats result;
     {
         std::lock_guard lock(state->mutex_);
-        if (state->options_.decodedByteBudget) {
-            const auto budget = state->options_.decodedByteBudget->stats();
+        if (state->decodedByteBudget_) {
+            const auto budget = state->decodedByteBudget_->stats();
             result.decodedBytes = budget.decodedBytes;
             result.decodedByteCapacity = budget.maximumBytes;
         } else {
             result.decodedBytes = state->decodedBytes_;
-            result.decodedByteCapacity = state->options_.decodedByteCapacity;
+            result.decodedByteCapacity = state->decodedByteCapacity_;
         }
         result.remoteFetchesInFlight = state->remoteFetchesInFlight_;
         if (auto scheduler = state->fetchScheduler_.lock()) {
@@ -1288,9 +1176,9 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
 
 void ChunkCache::unregisterStateBudget(State& state)
 {
-    if (state.options_.decodedByteBudget &&
+    if (state.decodedByteBudget_ &&
         state.decodedBudgetRegistration_ != 0) {
-        state.options_.decodedByteBudget->unregisterCache(
+        state.decodedByteBudget_->unregisterCache(
             state.decodedBudgetRegistration_);
         state.decodedBudgetRegistration_ = 0;
     }
@@ -2434,14 +2322,14 @@ void ChunkCache::touchLocked(State& state, const ChunkKey& key, Entry& entry)
     state.lru_.push_front(key);
     entry.lruIt = state.lru_.begin();
     entry.inLru = true;
-    if (state.options_.decodedByteBudget)
-        entry.budgetTouch = state.options_.decodedByteBudget->nextTouch();
+    if (state.decodedByteBudget_)
+        entry.budgetTouch = state.decodedByteBudget_->nextTouch();
 }
 
 void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
 {
     auto overBudget = [&] {
-        return state->decodedBytes_ > state->options_.decodedByteCapacity ||
+        return state->decodedBytes_ > state->decodedByteCapacity_ ||
                state->entries_.size() > state->options_.metadataEntryCapacity;
     };
     if (!overBudget())
@@ -2517,20 +2405,20 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
 
 void ChunkCache::addDecodedBytesLocked(State& state, std::size_t bytes)
 {
-    if (bytes > 0 && state.options_.decodedByteBudget)
-        state.options_.decodedByteBudget->addBytes(bytes);
+    if (bytes > 0 && state.decodedByteBudget_)
+        state.decodedByteBudget_->addBytes(bytes);
 }
 
 void ChunkCache::removeDecodedBytesLocked(State& state, std::size_t bytes)
 {
-    if (bytes > 0 && state.options_.decodedByteBudget)
-        state.options_.decodedByteBudget->removeBytes(bytes);
+    if (bytes > 0 && state.decodedByteBudget_)
+        state.decodedByteBudget_->removeBytes(bytes);
 }
 
 void ChunkCache::enforceSharedBudget(const std::shared_ptr<State>& state)
 {
-    if (state->options_.decodedByteBudget)
-        state->options_.decodedByteBudget->enforce();
+    if (state->decodedByteBudget_)
+        state->decodedByteBudget_->enforce();
 }
 
 bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)

@@ -883,7 +883,6 @@ NB_MODULE(volume, m)
                  volume.setCacheBudget(bytes);
              },
              "bytes"_a)
-        .def("set_io_threads", &Volume::setIOThreads, "count"_a)
         .def("invalidate_cache", &Volume::invalidateCache)
         .def("read_zyx", &readZYX,
             "offset"_a,
