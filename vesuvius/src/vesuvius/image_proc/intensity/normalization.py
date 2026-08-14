@@ -22,15 +22,7 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 def _prepare_image(image: np.ndarray, target_dtype: np.dtype | type = DEFAULT_TARGET_DTYPE) -> np.ndarray:
-    """Return a private float array to normalise into.
-
-    The normalisers below rescale with in-place arithmetic, so this must not
-    alias the caller's buffer. ``copy=False`` returned the input itself whenever
-    it already had the target dtype, which made the aliasing silent and
-    dtype-dependent: float32 input was normalised in place, anything else was
-    copied first. Callers that hand over a view -- neural_tracing's crop cache
-    slices its cached supercrops -- had the cache rewritten underneath them.
-    """
+    # copy: the normalisers rescale in place, so this must not alias the caller's array
     arr = np.asarray(image)
     if target_dtype is not None:
         return arr.astype(target_dtype, copy=True)
