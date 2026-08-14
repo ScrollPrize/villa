@@ -897,7 +897,6 @@ class FitContext:
             'loading', 'Preparing patch sampling',
             step=0, total_steps=len(patches), unit='patches')
         native_sampling_available = load_native_spiral_sampling() is not None
-        patch_areas = np.empty(len(patches), dtype=np.float32)
         for patch_idx, patch in enumerate(patches):
             # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
             # is well-defined for di, dj in [0, 1).
@@ -959,11 +958,14 @@ class FitContext:
                     in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
                 )
 
-            patch_areas[patch_idx] = float(patch.area)
             progress.update(patch_idx + 1)
 
-        inv_weights = patch_areas ** self.config['patch_sampling_area_exponent']
-        return inv_weights / inv_weights.sum()
+        return self._patch_sampling_probabilities(patches)
+
+    def _patch_sampling_probabilities(self, patches):
+        areas = np.asarray([float(patch.area) for patch in patches], dtype=np.float32)
+        weights = areas ** self.config['patch_sampling_area_exponent']
+        return weights / weights.sum()
 
     def _rebuild_pcl_sampling_strata(self):
         """Rebuild the per-family sampling strata in place.
@@ -2973,10 +2975,8 @@ class FitContext:
                     self._prepare_patch_sampling_cache([patch])
                 self.verified_patches.update(new_patches)
                 self.verified_patches_list.extend(new_patches.values())
-                areas = np.array([float(p.area) for p in self.verified_patches_list],
-                                 dtype=np.float32)
-                inv_weights = areas ** self.config['patch_sampling_area_exponent']
-                self.patch_sampling_probabilities = inv_weights / inv_weights.sum()
+                self.patch_sampling_probabilities = self._patch_sampling_probabilities(
+                    self.verified_patches_list)
                 self.patch_atlas.append_patches(new_patches)
                 if self.config['dt_target_mode'] == 'whole_object_quantile':
                     prepare_patch_dt_target_samples(
@@ -3199,6 +3199,12 @@ class FitContext:
                     self.unverified_patch_sampling_probabilities = \
                         self._prepare_patch_sampling_cache(
                             self.unverified_patches_list)
+            elif 'patch_sampling_area_exponent' in changed:
+                self.patch_sampling_probabilities = self._patch_sampling_probabilities(
+                    self.verified_patches_list)
+                if self.unverified_patches_list:
+                    self.unverified_patch_sampling_probabilities = \
+                        self._patch_sampling_probabilities(self.unverified_patches_list)
             if 'patch_unverified_patch_exclusion_radius' in changed:
                 (rebuilt_unverified, rebuilt_unverified_list,
                  rebuilt_unverified_probabilities,
