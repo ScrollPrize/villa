@@ -274,17 +274,9 @@ def _solve_phase_overlap_graph(
     huber=0.25, prior_weight=0.02, prior_huber=0.5,
     max_correction=4.0,
 ):
-    """Robust matrix-free IRLS solve of ``offset[v]-offset[u]=delta``."""
-    from scipy.sparse.linalg import LinearOperator, cg
-
+    """Robust solve of ``offset[v] - offset[u] = delta``."""
     prior = np.asarray(prior, dtype=np.float64)
-    edge_u = np.asarray(edge_u, dtype=np.int64)
-    edge_v = np.asarray(edge_v, dtype=np.int64)
-    edge_delta = np.asarray(edge_delta, dtype=np.float64)
-    base_weight = np.asarray(edge_weight, dtype=np.float64)
-    nodes = len(prior)
-    edges = len(edge_u)
-    if not edges:
+    if not len(edge_u):
         return prior.copy(), {
             "edges": 0,
             "supported_nodes": 0,
@@ -292,83 +284,34 @@ def _solve_phase_overlap_graph(
             "edge_residual_p95_abs": None,
         }
 
-    finite = (
-        np.isfinite(edge_delta) & np.isfinite(base_weight) & (base_weight > 0)
-        & (edge_u >= 0) & (edge_u < nodes)
-        & (edge_v >= 0) & (edge_v < nodes) & (edge_u != edge_v)
+    from vesuvius.neural_tracing.winding_models._robust_graph_solver import (
+        solve_robust_graph_offsets,
     )
-    edge_u, edge_v, edge_delta, base_weight = (
-        value[finite] for value in
-        (edge_u, edge_v, edge_delta, base_weight))
-    edges = len(edge_u)
-    if not edges:
-        return prior.copy(), {
+
+    solved, correction, residual, degree = solve_robust_graph_offsets(
+        prior,
+        edge_u,
+        edge_v,
+        edge_delta,
+        edge_weight,
+        iterations=iterations,
+        huber=huber,
+        prior_weight=prior_weight,
+        prior_huber=prior_huber,
+        max_correction=max_correction,
+        error_context="phase overlap graph",
+    )
+    if not len(residual):
+        return solved, {
             "edges": 0,
             "supported_nodes": 0,
             "edge_residual_median_abs": None,
             "edge_residual_p95_abs": None,
         }
 
-    target = edge_delta - (prior[edge_v] - prior[edge_u])
-    correction = np.zeros(nodes, dtype=np.float64)
-    robust_edge_weight = base_weight.copy()
-    robust_prior_weight = np.full(nodes, float(prior_weight), dtype=np.float64)
-
-    for _ in range(max(1, int(iterations))):
-        def matvec(values):
-            return (
-                np.bincount(
-                    edge_u,
-                    robust_edge_weight * (values[edge_u] - values[edge_v]),
-                    minlength=nodes)
-                + np.bincount(
-                    edge_v,
-                    robust_edge_weight * (values[edge_v] - values[edge_u]),
-                    minlength=nodes)
-                + robust_prior_weight * values
-            )
-
-        operator = LinearOperator(
-            (nodes, nodes), matvec=matvec, dtype=np.float64)
-        diagonal = (
-            np.bincount(edge_u, robust_edge_weight, minlength=nodes)
-            + np.bincount(edge_v, robust_edge_weight, minlength=nodes)
-            + robust_prior_weight)
-        preconditioner = LinearOperator(
-            (nodes, nodes),
-            matvec=lambda values: values / np.maximum(diagonal, 1e-12),
-            dtype=np.float64)
-        weighted_target = robust_edge_weight * target
-        rhs = (
-            np.bincount(edge_v, weighted_target, minlength=nodes)
-            - np.bincount(edge_u, weighted_target, minlength=nodes))
-        correction, info = cg(
-            operator, rhs, x0=correction, M=preconditioner,
-            rtol=1e-5, atol=1e-8, maxiter=200)
-        if info < 0:  # pragma: no cover - scipy input/internal failure
-            raise RuntimeError(f"phase overlap graph solve failed: cg={info}")
-        np.clip(
-            correction, -float(max_correction), float(max_correction),
-            out=correction)
-        residual = (
-            correction[edge_v] - correction[edge_u] - target)
-        robust_edge_weight = base_weight * np.minimum(
-            1.0, float(huber) / np.maximum(np.abs(residual), 1e-12))
-        robust_prior_weight = float(prior_weight) * np.minimum(
-            1.0,
-            float(prior_huber) / np.maximum(np.abs(correction), 1e-12))
-
-    # Edge equations do not set the additive gauge; the weak robust prior in
-    # the augmented solve fixes it independently in each connected component.
-    residual = (
-        (prior[edge_v] + correction[edge_v])
-        - (prior[edge_u] + correction[edge_u]) - edge_delta)
-    degree = (
-        np.bincount(edge_u, minlength=nodes)
-        + np.bincount(edge_v, minlength=nodes))
     absolute = np.abs(residual)
     stats = {
-        "edges": int(edges),
+        "edges": int(len(residual)),
         "supported_nodes": int(np.count_nonzero(degree)),
         "edge_residual_median_abs": float(np.median(absolute)),
         "edge_residual_p95_abs": float(np.quantile(absolute, 0.95)),
@@ -376,7 +319,7 @@ def _solve_phase_overlap_graph(
         "correction_p95_abs": float(np.quantile(np.abs(correction), 0.95)),
         "correction_max_abs": float(np.max(np.abs(correction))),
     }
-    return prior + correction, stats
+    return solved, stats
 
 
 def _sync_fingerprint(rays, options):

@@ -33,100 +33,6 @@ import torch.nn.functional as F
 _CROSSING_SUPPORT = 0.05
 
 
-def render_column_targets(
-    crossing_t: np.ndarray,
-    winding_indices: np.ndarray,
-    *,
-    ray_length: int,
-    spacing: float,
-    crossing_sigma_wv: float,
-) -> dict[str, np.ndarray]:
-    """Densify one column's ordered crossing labels along the ray axis.
-
-    ``crossing_t`` must be strictly increasing and ``winding_indices``
-    nondecreasing (the slab-global winding sign is applied by the caller);
-    both need at least two entries.
-    """
-    crossing_t = np.asarray(crossing_t, dtype=np.float64)
-    indices = np.asarray(winding_indices, dtype=np.float64)
-    sample_ts = np.arange(ray_length, dtype=np.float64) * spacing
-
-    phase = np.interp(sample_ts, crossing_t, indices)
-
-    # Density supervision compares the model's per-segment phase increment to
-    # the diff of the interp target — the exact integral of the
-    # piecewise-constant 1/gap label density over segment (i-1, i] — so a
-    # perfect prediction scores exactly zero. Each segment also carries the
-    # narrowest labeled gap it touches so the loss can abstain where the
-    # dataset's crossing merge distance makes tight-gap labels unreliable.
-    density_target = np.zeros(ray_length, dtype=np.float64)
-    density_target[1:] = np.diff(phase)
-    gaps = np.diff(crossing_t)
-    gap_index = np.searchsorted(crossing_t, sample_ts, side="right") - 1
-    in_gap = (gap_index >= 0) & (gap_index < len(crossing_t) - 1)
-    gap_at_sample = np.where(
-        in_gap, gaps[np.clip(gap_index, 0, max(len(gaps) - 1, 0))], 0.0
-    )
-    density_gap = np.zeros(ray_length, dtype=np.float64)
-    density_gap[1:] = np.minimum(gap_at_sample[1:], gap_at_sample[:-1])
-
-    deviation = np.abs(sample_ts[:, None] - crossing_t[None, :]).min(axis=1)
-    heatmap = np.exp(-0.5 * (deviation / crossing_sigma_wv) ** 2)
-    nearest = np.clip(np.rint(crossing_t / spacing).astype(int), 0, ray_length - 1)
-    heatmap[nearest] = 1.0
-
-    # Winding labels are trustworthy between the column's first and last
-    # crossing, except across gaps whose winding indices differ by more than
-    # one: those spans may contain unlabeled wraps.
-    winding_valid = (sample_ts >= crossing_t[0]) & (sample_ts <= crossing_t[-1])
-    for gap in np.nonzero(np.abs(np.diff(indices)) > 1)[0]:
-        winding_valid &= (sample_ts <= crossing_t[gap]) | (
-            sample_ts >= crossing_t[gap + 1]
-        )
-
-    return {
-        "phase_target": phase.astype(np.float32),
-        "phase_valid": winding_valid,
-        "crossing_target": heatmap.astype(np.float32),
-        "crossing_valid": winding_valid | (heatmap > _CROSSING_SUPPORT),
-        "density_target": density_target.astype(np.float32),
-        "density_gap_wv": density_gap.astype(np.float32),
-    }
-
-
-def render_crossing_only_targets(
-    crossing_t: np.ndarray,
-    *,
-    ray_length: int,
-    spacing: float,
-    crossing_sigma_wv: float,
-) -> dict[str, np.ndarray]:
-    """Densify position-only crossing labels along the ray axis.
-
-    For crossings with unknown winding indices (e.g. auto-grown single-sheet
-    patches), only the crossing head can be supervised: positives at the
-    labeled positions plus the negatives inside each rendered kernel's
-    support. Spans between labeled crossings may hide unlabeled wraps, so
-    ``crossing_valid`` holds nowhere else and the phase and density targets
-    stay fully unsupervised.
-    """
-    crossing_t = np.asarray(crossing_t, dtype=np.float64)
-    sample_ts = np.arange(ray_length, dtype=np.float64) * spacing
-    deviation = np.abs(sample_ts[:, None] - crossing_t[None, :]).min(axis=1)
-    heatmap = np.exp(-0.5 * (deviation / crossing_sigma_wv) ** 2)
-    nearest = np.clip(np.rint(crossing_t / spacing).astype(int), 0, ray_length - 1)
-    heatmap[nearest] = 1.0
-    zeros = np.zeros(ray_length, dtype=np.float32)
-    return {
-        "phase_target": zeros,
-        "phase_valid": np.zeros(ray_length, dtype=bool),
-        "crossing_target": heatmap.astype(np.float32),
-        "crossing_valid": heatmap > _CROSSING_SUPPORT,
-        "density_target": zeros,
-        "density_gap_wv": zeros,
-    }
-
-
 def render_column_targets_batched(
     crossing_t: np.ndarray,
     crossing_indices: np.ndarray,
@@ -913,24 +819,6 @@ def phase_passages(phase: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     strict = phase + np.arange(len(phase)) * 1e-9
     positions = np.interp(levels, strict, np.arange(len(phase), dtype=np.float64))
     return positions, levels
-
-
-def increment_window_mass(increments: np.ndarray, *, window: int) -> np.ndarray:
-    """Rolling phase-increment mass over +-``window`` samples, clipped to 1.
-
-    A crossing-probability surrogate for models without a crossing head:
-    one full winding of increment mass concentrated near a sample drives
-    the value toward 1, empty spans toward 0. Operates on the last axis.
-    """
-    cumulative = np.cumsum(np.asarray(increments, dtype=np.float64), axis=-1)
-    length = cumulative.shape[-1]
-    positions = np.arange(length)
-    upper = np.minimum(positions + window, length - 1)
-    lower = positions - window
-    mass = cumulative[..., upper] - np.where(
-        lower > 0, cumulative[..., np.maximum(lower - 1, 0)], 0.0
-    )
-    return np.clip(mass, 0.0, 1.0)
 
 
 def extract_peaks(

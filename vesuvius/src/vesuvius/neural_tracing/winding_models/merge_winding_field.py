@@ -610,81 +610,34 @@ def build_patch_edges(keys, stats, num_patches, cfg):
 def solve_slab_offsets(num_slabs, edge_u, edge_v, edge_delta, edge_weight, *,
                        iterations=5, huber=0.25, prior_weight=0.05,
                        prior_huber=0.5, max_correction=4.0):
-    """Robust matrix-free IRLS solve of ``offset[v] - offset[u] = delta``.
+    """Robust solve of ``offset[v] - offset[u] = delta`` with a zero prior."""
+    from vesuvius.neural_tracing.winding_models._robust_graph_solver import (
+        solve_robust_graph_offsets,
+    )
 
-    Adapted from phase_overlap_sync._solve_phase_overlap_graph with a zero
-    prior: the model's absolute labels are presumed correct on average, and
-    the weak prior both fixes the gauge per connected component and keeps
-    holonomy-frustrated corrections bounded.
-    """
-    from scipy.sparse.linalg import LinearOperator, cg
+    correction, _, residual, degree = solve_robust_graph_offsets(
+        np.zeros(num_slabs, dtype=np.float64),
+        edge_u,
+        edge_v,
+        edge_delta,
+        edge_weight,
+        iterations=iterations,
+        huber=huber,
+        prior_weight=prior_weight,
+        prior_huber=prior_huber,
+        max_correction=max_correction,
+        error_context="slab offset",
+    )
+    if not len(residual):
+        return correction, {"edges": 0, "supported_nodes": 0}
 
-    prior = np.zeros(num_slabs, dtype=np.float64)
-    edge_u = np.asarray(edge_u, dtype=np.int64)
-    edge_v = np.asarray(edge_v, dtype=np.int64)
-    edge_delta = np.asarray(edge_delta, dtype=np.float64)
-    base_weight = np.asarray(edge_weight, dtype=np.float64)
-    finite = (
-        np.isfinite(edge_delta) & np.isfinite(base_weight) & (base_weight > 0)
-        & (edge_u >= 0) & (edge_u < num_slabs)
-        & (edge_v >= 0) & (edge_v < num_slabs) & (edge_u != edge_v))
-    edge_u, edge_v, edge_delta, base_weight = (
-        value[finite] for value in (edge_u, edge_v, edge_delta, base_weight))
-    if not len(edge_u):
-        return prior, {"edges": 0, "supported_nodes": 0}
-
-    correction = np.zeros(num_slabs, dtype=np.float64)
-    robust_edge_weight = base_weight.copy()
-    robust_prior_weight = np.full(num_slabs, float(prior_weight))
-    for _ in range(max(1, int(iterations))):
-        def matvec(values):
-            return (
-                np.bincount(
-                    edge_u,
-                    robust_edge_weight * (values[edge_u] - values[edge_v]),
-                    minlength=num_slabs)
-                + np.bincount(
-                    edge_v,
-                    robust_edge_weight * (values[edge_v] - values[edge_u]),
-                    minlength=num_slabs)
-                + robust_prior_weight * values)
-
-        operator = LinearOperator(
-            (num_slabs, num_slabs), matvec=matvec, dtype=np.float64)
-        diagonal = (
-            np.bincount(edge_u, robust_edge_weight, minlength=num_slabs)
-            + np.bincount(edge_v, robust_edge_weight, minlength=num_slabs)
-            + robust_prior_weight)
-        preconditioner = LinearOperator(
-            (num_slabs, num_slabs),
-            matvec=lambda values: values / np.maximum(diagonal, 1e-12),
-            dtype=np.float64)
-        weighted = robust_edge_weight * edge_delta
-        rhs = (
-            np.bincount(edge_v, weighted, minlength=num_slabs)
-            - np.bincount(edge_u, weighted, minlength=num_slabs))
-        correction, info = cg(
-            operator, rhs, x0=correction, M=preconditioner,
-            rtol=1e-5, atol=1e-8, maxiter=200)
-        if info < 0:  # pragma: no cover - scipy internal failure
-            raise RuntimeError(f"slab offset solve failed: cg={info}")
-        np.clip(correction, -max_correction, max_correction, out=correction)
-        residual = correction[edge_v] - correction[edge_u] - edge_delta
-        robust_edge_weight = base_weight * np.minimum(
-            1.0, huber / np.maximum(np.abs(residual), 1e-12))
-        robust_prior_weight = float(prior_weight) * np.minimum(
-            1.0, prior_huber / np.maximum(np.abs(correction), 1e-12))
-
-    residual = correction[edge_v] - correction[edge_u] - edge_delta
-    degree = (
-        np.bincount(edge_u, minlength=num_slabs)
-        + np.bincount(edge_v, minlength=num_slabs))
     fractional = np.abs(correction - np.round(correction))
+    absolute = np.abs(residual)
     stats = {
-        "edges": int(len(edge_u)),
+        "edges": int(len(residual)),
         "supported_nodes": int(np.count_nonzero(degree)),
-        "edge_residual_median_abs": float(np.median(np.abs(residual))),
-        "edge_residual_p95_abs": float(np.quantile(np.abs(residual), 0.95)),
+        "edge_residual_median_abs": float(np.median(absolute)),
+        "edge_residual_p95_abs": float(np.quantile(absolute, 0.95)),
         "correction_p95_abs": float(np.quantile(np.abs(correction), 0.95)),
         "correction_max_abs": float(np.max(np.abs(correction))),
         "nonzero_offset_fraction": float(
@@ -894,7 +847,6 @@ def _subsampled_quantile(values, q):
 
 
 def dilate_mask(mask, iterations):
-    import torch
     import torch.nn.functional as F
 
     result = mask
@@ -1101,8 +1053,6 @@ def solve_ds8(accumulator, targets, cfg, device, scratch):
 
 
 def solve_metrics(field_tensor, targets):
-    import torch
-
     residual = (field_tensor - targets.mu).abs()[targets.support]
     if not len(residual):
         return {}
@@ -1286,7 +1236,6 @@ class OmeZarrPyramidWriter:
         chunks; all-zero chunks are skipped (fill).  Chunks straddling the
         block edge are zero-padded — the band is this array's only content,
         so no read-modify-write is ever needed."""
-        shape = self.level_shapes[level]
         for cz in range(origin[0] // CHUNK,
                         -(-(origin[0] + values.shape[0]) // CHUNK)):
             for cy in range(origin[1] // CHUNK,
@@ -1347,7 +1296,6 @@ def masked_mean_pool(field_tensor, mask):
 
 
 def write_pyramid(field4, support8, band, writer, cfg, device):
-    import torch
     import torch.nn.functional as F
 
     mask8 = dilate_mask(support8, cfg.mask_dilate)

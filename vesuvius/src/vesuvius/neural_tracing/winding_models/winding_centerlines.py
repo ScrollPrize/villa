@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Extract one ordered winding centerline per label and Z plane.
 
 The input is a local 3-D integer Zarr array in Z,Y,X order.  Value ``-1`` is
@@ -676,7 +675,7 @@ def _fit_label_run(
         points = np.concatenate(parts, axis=0)
         try:
             curve = _extract_curve(points, previous, z, parameters)
-        except Exception as error:  # noqa: BLE001 - isolate one bad label/plane
+        except Exception as error:
             results.append((z, None, str(error)))
             continue
         if curve is not None:

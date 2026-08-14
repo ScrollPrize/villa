@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Cast winding-model rays from a fitted Spiral checkpoint and store the
 decoded absolute-winding predictions.
 
@@ -80,14 +79,6 @@ _PHASE_LABEL_AGG_RECORD = np.dtype([
     ("key", "<u8"), ("cosine", "<f4"), ("sine", "<f4"),
     ("density", "<f4"), ("weight", "<f4"), ("weight_sq", "<f4"),
     ("count", "<u4"),
-])
-# One decoded observation assigned to an output chunk for winding voting.
-# ``order`` is its deterministic global point order; the rasterizer uses it
-# with the source chunk encoded in ``key`` to reproduce the legacy stable-sort
-# accumulation order exactly.
-_WINDING_RECORD = np.dtype([
-    ("key", "<u8"), ("order", "<u8"), ("winding", "<i2"),
-    ("prob", "u1"), ("level", "u1"),
 ])
 # Inference-time reduction of source-voxel votes. ``key`` packs the linear
 # output voxel and signed winding candidate; neighborhood expansion happens
@@ -196,36 +187,6 @@ def _iter_phase_label_aggregates(path):
                     f"truncated labeled-phase spill block: {path}")
             yield np.frombuffer(
                 codec.decode(encoded), dtype=_PHASE_LABEL_AGG_RECORD)
-
-
-def _append_winding_records(path, records):
-    """Append one independently compressed winding-observation block."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    encoded = codec.encode(np.ascontiguousarray(records))
-    with open(path, "ab") as handle:
-        handle.write(struct.pack("<Q", len(encoded)))
-        handle.write(encoded)
-
-
-def _iter_winding_records(path):
-    """Yield winding observations from concatenated compressed blocks."""
-    from numcodecs import Blosc
-
-    codec = Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
-    with open(path, "rb") as handle:
-        while True:
-            header = handle.read(8)
-            if not header:
-                return
-            if len(header) != 8:
-                raise RuntimeError(f"truncated winding spill header: {path}")
-            size = struct.unpack("<Q", header)[0]
-            encoded = handle.read(size)
-            if len(encoded) != size:
-                raise RuntimeError(f"truncated winding spill block: {path}")
-            yield np.frombuffer(codec.decode(encoded), dtype=_WINDING_RECORD)
 
 
 def _append_winding_aggregates(path, records):
@@ -416,9 +377,6 @@ def parse_args():
                         help="processes folding spilled prob-volume records "
                              "into the output zarr; each holds one output "
                              "chunk. Default min(32, cpus)")
-    parser.add_argument("--raster-workers", type=int, default=None,
-                        help="deprecated compatibility option; reduced "
-                             "winding chunks are rasterized on --gpus")
     parser.add_argument("--prob-column-step", type=int, default=None,
                         help="column stride for the crossing_prob sampling "
                              "only (default: --column-step). 1 samples every "
@@ -567,7 +525,7 @@ def parse_args():
             "--min-distance", "--min-prob-keep", "--max-level",
             "--prob-volume", "--archive-workers", "--prob-volume-floor",
             "--prob-combine", "--prob-ray-margin", "--prob-column-margin",
-            "--merge-workers", "--raster-workers", "--prob-column-step",
+            "--merge-workers", "--prob-column-step",
             "--prob-phase-level-half-life", "--prob-phase-max-level",
             "--prob-phase-edge-taper", "--prob-phase-agreement-power",
             "--prob-phase-min-observations",
@@ -1574,7 +1532,7 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
 
 def _output_shape(reference, output_downsample):
     """Shape of the downsampled output arrays for a reference zarr."""
-    scale0 = VolumeSlabExtractorShape(Path(reference))
+    scale0 = _reference_shape(Path(reference))
     down = int(output_downsample)
     return tuple(int(np.ceil(s / down)) for s in scale0)
 
@@ -1727,9 +1685,9 @@ class _ProbSpillWriter:
     """Write exact partial prob-volume reductions by output chunk.
 
     Raw CPU-fallback observations are reduced at bounded intervals.  The
-    normal CUDA path calls :meth:`add_aggregates` with a much larger reduction
-    spanning adjacent batches.  Spill size therefore follows the union of
-    covered voxels per interval instead of ``samples x slabs``.
+    normal CUDA path calls :meth:`add_sorted_aggregates` with a much larger
+    reduction spanning adjacent batches. Spill size therefore follows the
+    union of covered voxels per interval instead of ``samples x slabs``.
     """
 
     def __init__(self, directory, out_shape, chunk, flush_records=1 << 22):
@@ -1773,33 +1731,6 @@ class _ProbSpillWriter:
         self.buffered += len(records)
         if self.buffered >= self.flush_records:
             self.flush()
-
-    def add_aggregates(self, keys, totals, counts, maxima, *, bucket_sorted=False):
-        """Append already-reduced partial aggregates."""
-        keys = np.asarray(keys, dtype=np.uint64)
-        if not len(keys):
-            return
-        records = np.empty(len(keys), dtype=_PROB_AGG_RECORD)
-        records["key"] = keys
-        records["total"] = np.asarray(totals, dtype=np.uint64)
-        records["count"] = np.asarray(counts, dtype=np.uint32)
-        records["maximum"] = np.asarray(maxima, dtype=np.uint8)
-        z = (keys >> 42).astype(np.int64)
-        y = ((keys >> 21) & _PROB_KEY_MASK).astype(np.int64)
-        x = (keys & _PROB_KEY_MASK).astype(np.int64)
-        buckets = (((z // self.chunk) * self.ny_chunks + y // self.chunk)
-                   * self.nx_chunks + x // self.chunk)
-        if not bucket_sorted and len(buckets) > 1:
-            order = np.argsort(buckets, kind="stable")
-            buckets, records = buckets[order], records[order]
-        starts = np.r_[0, np.flatnonzero(np.diff(buckets)) + 1]
-        for start, end in zip(starts, np.r_[starts[1:], len(buckets)]):
-            bucket = int(buckets[start])
-            zy, bx = divmod(bucket, self.nx_chunks)
-            bz, by = divmod(zy, self.ny_chunks)
-            _append_prob_aggregates(
-                self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
-                records[start:end])
 
     def add_sorted_aggregates(
         self, keys, totals, counts, maxima, bucket_ids, bucket_starts
@@ -2800,7 +2731,7 @@ def _upsample_columns(field, factor):
     """
     import torch.nn.functional as F
 
-    batch, height, width, length = field.shape
+    _, height, width, length = field.shape
     factor = int(factor)
     return F.interpolate(
         field[:, None],
@@ -2983,343 +2914,6 @@ def _merge_decoded(writer, spill, winding_accumulator,
 # observation's weight.
 _VOTE_LEVEL_HALF_LIFE = 2.0
 _VOTE_NEIGHBOR_WEIGHT = 0.5
-
-
-def _render_winding_chunk(v, winding, prob, level, lo, shape):
-    """Render one chunk from ordered nearby observations.
-
-    Both the in-memory reference rasterizer and the bounded spill rasterizer
-    use this helper, keeping candidate reduction, tie-breaking, confidence,
-    and sparse-write semantics in one implementation.
-    """
-    if not len(v):
-        return None
-    weight = prob.astype(np.float32) * np.float32(0.5) ** (
-        np.minimum(level, 64).astype(np.float32) / _VOTE_LEVEL_HALF_LIFE)
-    offsets = np.array(
-        np.meshgrid(*([(-1, 0, 1)] * 3), indexing="ij"), dtype=np.int64
-    ).reshape(3, -1).T
-    offset_weight = np.where(
-        (offsets == 0).all(-1), 1.0, _VOTE_NEIGHBOR_WEIGHT
-    ).astype(np.float32)
-
-    spread = len(offsets)
-    position = (v[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
-    vote_weight = (weight[:, None] * offset_weight[None, :]).reshape(-1)
-    vote_cand = np.repeat(winding.astype(np.int64), spread)
-    vote_prob = np.repeat(prob, spread)
-    hi = lo + shape
-    in_column = ((position >= lo) & (position < hi)).all(-1)
-    position, vote_weight, vote_cand, vote_prob = (
-        position[in_column], vote_weight[in_column],
-        vote_cand[in_column], vote_prob[in_column])
-
-    local = position - lo
-    flat = (local[:, 0] * shape[1] + local[:, 1]) * shape[2] + local[:, 2]
-    vote_key = flat * 65536 + (vote_cand + 32768)
-    srt = np.argsort(vote_key, kind="stable")
-    vote_key, vote_weight, vote_prob = (
-        vote_key[srt], vote_weight[srt], vote_prob[srt])
-    run = np.r_[0, np.flatnonzero(np.diff(vote_key)) + 1]
-    totals = np.add.reduceat(vote_weight, run)
-    best_prob = np.maximum.reduceat(vote_prob, run)
-    run_flat = vote_key[run] >> 16
-    run_cand = (vote_key[run] & 0xFFFF) - 32768
-
-    winner_order = np.lexsort((totals, run_flat))
-    run_flat, run_cand, totals, best_prob = (
-        run_flat[winner_order], run_cand[winner_order],
-        totals[winner_order], best_prob[winner_order])
-    voxel_start = np.r_[0, np.flatnonzero(np.diff(run_flat)) + 1]
-    voxel_total = np.add.reduceat(totals, voxel_start)
-    last = np.r_[run_flat[1:] != run_flat[:-1], True]
-    win_flat, win_cand = run_flat[last], run_cand[last]
-    win_weight, win_prob = totals[last], best_prob[last]
-
-    core = ((v >= lo) & (v < hi)).all(-1)
-    core_local = v[core] - lo
-    occupied = np.unique(
-        (core_local[:, 0] * shape[1] + core_local[:, 1]) * shape[2]
-        + core_local[:, 2])
-    if not len(occupied):
-        return None
-    slot = np.searchsorted(occupied, win_flat)
-    keep = (slot < len(occupied)) & (
-        occupied[np.minimum(slot, len(occupied) - 1)] == win_flat)
-    win_flat, win_cand, win_weight, win_prob, voxel_total = (
-        win_flat[keep], win_cand[keep], win_weight[keep],
-        win_prob[keep], voxel_total[keep])
-    if not len(win_flat):
-        return None
-
-    dense_winding = np.full(shape, -1, dtype=np.int16)
-    dense_confidence = np.zeros(shape, dtype=np.uint8)
-    zz = win_flat // (shape[1] * shape[2])
-    rest = win_flat % (shape[1] * shape[2])
-    yy, xx = rest // shape[2], rest % shape[2]
-    dense_winding[zz, yy, xx] = win_cand.astype(np.int16)
-    dense_confidence[zz, yy, xx] = np.clip(np.rint(
-        win_prob.astype(np.float64) * win_weight
-        / np.maximum(voxel_total, 1e-9)), 0, 255).astype(np.uint8)
-    return dense_winding, dense_confidence
-
-
-def _rasterize_winding_votes(group_path, out_shape, chunk, voxels, winding,
-                             prob, level, workers=None):
-    """Neighborhood-vote rasterization of the decoded crossings.
-
-    Every observation votes for its winding in the 3^3 voxels around it
-    (full weight on its own voxel, ``_VOTE_NEIGHBOR_WEIGHT`` on the 26
-    neighbours — observations of the same physical crossing from different
-    slabs land within a voxel of each other), weighted by its confidence
-    and halved per ``_VOTE_LEVEL_HALF_LIFE`` windings of anchor distance.
-    The old scatter kept the single highest-prob observation, which let one
-    confident far-from-anchor miscount overwrite near-anchor consensus
-    (measured: 16% of contested voxels, median anchor distance 5).
-
-    A voxel is written only where at least one observation itself lands, so
-    the raster keeps its old sparsity. ``winding`` gets the top-weighted
-    candidate; ``confidence`` becomes vote share x the winner's best
-    observation prob — cross-slab agreement scaled by peak strength, which
-    reduces to the old per-point prob where only one slab observed.
-
-    Output chunks are processed one at a time with observations gathered
-    from all 26 neighbouring chunks too, so votes pool correctly across chunk
-    borders, memory stays tightly bounded, and no chunk is written twice.
-    """
-    import zarr
-    from tqdm import tqdm
-
-    out_shape = np.asarray(out_shape, dtype=np.int64)
-    inside = ((voxels >= 0) & (voxels < out_shape)).all(-1)
-    voxels, winding, prob, level = (
-        voxels[inside], winding[inside], prob[inside], level[inside])
-    if not len(voxels):
-        return
-    nz = -(-int(out_shape[0]) // chunk)
-    ny = -(-int(out_shape[1]) // chunk)
-    nx = -(-int(out_shape[2]) // chunk)
-    column_of = (((voxels[:, 0] // chunk) * ny + voxels[:, 1] // chunk) * nx
-                 + voxels[:, 2] // chunk)
-    order = np.argsort(column_of, kind="stable")
-    voxels, winding, prob, level = (
-        voxels[order], winding[order], prob[order], level[order])
-
-    columns, starts = np.unique(column_of[order], return_index=True)
-    ends = np.r_[starts[1:], len(order)]
-    ranges = {
-        int(column): (int(start), int(end))
-        for column, start, end in zip(columns, starts, ends)
-    }
-    group = zarr.open_group(str(group_path), mode="r+")
-    winding_arr = group["winding"]
-    confidence_arr = group["confidence"]
-
-    def write_column(column):
-        zy, bx = divmod(int(column), nx)
-        bz, by = divmod(zy, ny)
-        lo = np.array([bz * chunk, by * chunk, bx * chunk])
-        hi = np.minimum(lo + chunk, out_shape)
-        shape = hi - lo
-
-        pieces = [
-            np.arange(*ranges[
-                ((bz + dz) * ny + (by + dy)) * nx + (bx + dx)])
-            for dz in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-            for dx in (-1, 0, 1)
-            if 0 <= bz + dz < nz and 0 <= by + dy < ny
-            and 0 <= bx + dx < nx
-            and ((bz + dz) * ny + (by + dy)) * nx + (bx + dx) in ranges
-        ]
-        idx = np.concatenate(pieces)
-        v = voxels[idx]
-        near = ((v >= lo - 1) & (v < hi + 1)).all(-1)
-        idx, v = idx[near], v[near]
-        if not len(idx):
-            return
-        rendered = _render_winding_chunk(
-            v, winding[idx], prob[idx], level[idx], lo, shape)
-        if rendered is None:
-            return
-        dense_winding, dense_confidence = rendered
-        winding_arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = dense_winding
-        confidence_arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = \
-            dense_confidence
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    workers = min(workers or min(8, os.cpu_count() or 1), len(columns))
-    progress = lambda it: tqdm(  # noqa: E731
-        it, total=len(columns), desc="writing winding", unit="chunk")
-    if workers <= 1:
-        for _ in progress(map(write_column, columns)):
-            pass
-    else:
-        with ThreadPoolExecutor(workers) as pool:
-            for _ in progress(pool.map(write_column, columns)):
-                pass
-
-
-class _WindingSpillWriter:
-    """Spatially partition decoded observations for bounded rasterization.
-
-    Records normally go only to their own output chunk.  An observation on a
-    chunk face/edge/corner is additionally copied to the adjacent target
-    chunks reached by its 3x3x3 neighborhood.  Consequently each raster task
-    reads one file rather than rereading all 26 neighboring files.
-    """
-
-    def __init__(self, directory, out_shape, chunk):
-        self.directory = Path(directory)
-        if self.directory.exists():
-            shutil.rmtree(self.directory)
-        self.directory.mkdir(parents=True)
-        self.out_shape = np.asarray(out_shape, dtype=np.int64)
-        self.chunk = int(chunk)
-        self.grid_shape = np.array([
-            -(-int(size) // self.chunk) for size in out_shape
-        ], dtype=np.int64)
-
-    def add(self, voxels, winding, prob, level, point_order):
-        voxels = np.asarray(voxels, dtype=np.int64)
-        winding = np.asarray(winding, dtype=np.int16)
-        prob = np.asarray(prob, dtype=np.uint8)
-        level = np.asarray(level, dtype=np.uint8)
-        point_order = np.asarray(point_order, dtype=np.uint64)
-        inside = ((voxels >= 0) & (voxels < self.out_shape)).all(-1)
-        if not inside.all():
-            voxels, winding, prob, level, point_order = (
-                value[inside]
-                for value in (voxels, winding, prob, level, point_order)
-            )
-        if not len(voxels):
-            return
-
-        own = voxels // self.chunk
-        local = voxels - own * self.chunk
-        all_records = np.ones(len(voxels), dtype=bool)
-        choices = []
-        for axis in range(3):
-            choices.append([
-                (0, all_records),
-                (-1, (own[:, axis] > 0) & (local[:, axis] == 0)),
-                (1, (own[:, axis] + 1 < self.grid_shape[axis])
-                 & (local[:, axis] == self.chunk - 1)),
-            ])
-
-        from itertools import product
-
-        ny, nx = int(self.grid_shape[1]), int(self.grid_shape[2])
-        for z_choice, y_choice, x_choice in product(*choices):
-            dz, mz = z_choice
-            dy, my = y_choice
-            dx, mx = x_choice
-            mask = mz & my & mx
-            if not mask.any():
-                continue
-            target = own[mask] + np.array([dz, dy, dx], dtype=np.int64)
-            buckets = (target[:, 0] * ny + target[:, 1]) * nx + target[:, 2]
-            order = np.argsort(buckets, kind="stable")
-            buckets = buckets[order]
-            selected = np.flatnonzero(mask)[order]
-            starts = np.r_[0, np.flatnonzero(np.diff(buckets)) + 1]
-            for start, end in zip(starts, np.r_[starts[1:], len(buckets)]):
-                idx = selected[start:end]
-                records = np.empty(len(idx), dtype=_WINDING_RECORD)
-                records["key"] = (
-                    (voxels[idx, 0].astype(np.uint64) << np.uint64(42))
-                    + (voxels[idx, 1].astype(np.uint64) << np.uint64(21))
-                    + voxels[idx, 2].astype(np.uint64)
-                )
-                records["order"] = point_order[idx]
-                records["winding"] = winding[idx]
-                records["prob"] = prob[idx]
-                records["level"] = level[idx]
-                bucket = int(buckets[start])
-                zy, bx = divmod(bucket, nx)
-                bz, by = divmod(zy, ny)
-                _append_winding_records(
-                    self.directory / f"{bz:05d}_{by:05d}_{bx:05d}.rec",
-                    records,
-                )
-
-
-def _write_winding_bucket(task):
-    """Rasterize one output chunk from its spatial observation spill."""
-    import zarr
-
-    group_path, out_shape, chunk, bz, by, bx, path = task
-    records = np.concatenate(list(_iter_winding_records(path)))
-    key = records["key"]
-    voxels = np.stack([
-        key >> np.uint64(42),
-        (key >> np.uint64(21)) & np.uint64(_PROB_KEY_MASK),
-        key & np.uint64(_PROB_KEY_MASK),
-    ], axis=-1).astype(np.int64)
-
-    # Match _rasterize_winding_votes exactly: source chunks are visited in
-    # z/y/x order, and observations retain their original global point order
-    # within each source chunk before the stable candidate reduction.
-    out_shape = np.asarray(out_shape, dtype=np.int64)
-    ny = -(-int(out_shape[1]) // chunk)
-    nx = -(-int(out_shape[2]) // chunk)
-    source = (((voxels[:, 0] // chunk) * ny + voxels[:, 1] // chunk) * nx
-              + voxels[:, 2] // chunk)
-    order = np.lexsort((records["order"], source))
-    voxels, records = voxels[order], records[order]
-
-    lo = np.array([bz * chunk, by * chunk, bx * chunk], dtype=np.int64)
-    hi = np.minimum(lo + chunk, out_shape)
-    shape = hi - lo
-    near = ((voxels >= lo - 1) & (voxels < hi + 1)).all(-1)
-    v = voxels[near]
-    winding = records["winding"][near]
-    prob = records["prob"][near]
-    level = records["level"][near]
-    if not len(v):
-        return 0
-    rendered = _render_winding_chunk(
-        v, winding, prob, level, lo, shape)
-    if rendered is None:
-        return 0
-    dense_winding, dense_confidence = rendered
-    group = zarr.open_group(group_path, mode="r+")
-    group["winding"][
-        lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]
-    ] = dense_winding
-    group["confidence"][
-        lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]
-    ] = dense_confidence
-    return int((dense_winding >= 0).sum())
-
-
-def _rasterize_winding_spill(group_path, directory, out_shape, chunk,
-                              workers=None):
-    """Rasterize spatial spills independently, one bounded chunk per task."""
-    import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
-    from tqdm import tqdm
-
-    tasks = []
-    for path in sorted(Path(directory).glob("*.rec")):
-        bz, by, bx = (int(part) for part in path.stem.split("_"))
-        tasks.append((str(group_path), tuple(out_shape), int(chunk),
-                      bz, by, bx, str(path)))
-    if not tasks:
-        return
-    workers = min(workers or min(8, os.cpu_count() or 1), len(tasks))
-    progress = lambda it: tqdm(  # noqa: E731
-        it, total=len(tasks), desc="writing winding", unit="chunk")
-    if workers <= 1:
-        for _ in progress(map(_write_winding_bucket, tasks)):
-            pass
-    else:
-        with ProcessPoolExecutor(
-                workers, mp_context=mp.get_context("spawn")) as pool:
-            for _ in progress(pool.map(_write_winding_bucket, tasks,
-                                        chunksize=1)):
-                pass
 
 
 def _render_winding_aggregates_cuda(
@@ -3789,7 +3383,7 @@ def _merge_prob_spill(group_path, name, spill_dirs, out_shape, chunk,
     if not tasks:
         return
     workers = min(workers or min(32, os.cpu_count() or 1), len(tasks))
-    progress = lambda it: tqdm(  # noqa: E731
+    progress = lambda it: tqdm(
         it, total=len(tasks), desc=f"writing {name}", unit="bucket")
     if workers <= 1:
         for _ in progress(map(_write_prob_bucket, tasks)):
@@ -3824,7 +3418,7 @@ def _merge_phase_spill(group_path, name, spill_dirs, out_shape, chunk,
     if not tasks:
         return
     workers = min(workers or min(32, os.cpu_count() or 1), len(tasks))
-    progress = lambda it: tqdm(  # noqa: E731
+    progress = lambda it: tqdm(
         it, total=len(tasks), desc=f"writing {name}", unit="bucket")
     if workers <= 1:
         for _ in progress(map(_write_phase_bucket, tasks)):
@@ -3863,7 +3457,7 @@ def _merge_phase_label_spill(
     if not tasks:
         return
     workers = min(workers or min(32, os.cpu_count() or 1), len(tasks))
-    progress = lambda it: tqdm(  # noqa: E731
+    progress = lambda it: tqdm(
         it, total=len(tasks), desc=f"writing {name}", unit="bucket")
     if workers <= 1:
         for _ in progress(map(_write_phase_label_bucket, tasks)):
@@ -3874,13 +3468,6 @@ def _merge_phase_label_spill(
             for _ in progress(pool.map(
                     _write_phase_label_bucket, tasks, chunksize=1)):
                 pass
-
-
-def _memmap_decoded(path, dtype, shape):
-    """Map a raw decoded stream, including the valid empty-array case."""
-    if not int(np.prod(shape, dtype=np.int64)):
-        return np.empty(shape, dtype=dtype)
-    return np.memmap(path, mode="r", dtype=dtype, shape=shape)
 
 
 _ARCHIVE_WORKER_CONTEXT = None
@@ -4232,7 +3819,6 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
             "volume_cache_bytes_per_gpu": (
                 None if args.volume_cache_bytes is None
                 else int(args.volume_cache_bytes)),
-            "raster_workers": getattr(args, "raster_workers", None),
             "archive_workers": getattr(args, "archive_workers", None),
             "merge_workers": args.merge_workers,
         },
@@ -4255,7 +3841,7 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     return num_points
 
 
-def VolumeSlabExtractorShape(reference: Path):
+def _reference_shape(reference: Path):
     import zarr
     node = zarr.open(str(reference), mode="r")
     if hasattr(node, "shape"):
@@ -4384,9 +3970,6 @@ def main():
     ):
         for stale in scratch.glob(pattern):
             shutil.rmtree(stale)
-    legacy_winding_spill = scratch / "winding_spill"
-    if legacy_winding_spill.exists():
-        shutil.rmtree(legacy_winding_spill)
     for stale in scratch.glob("result_*.bin"):
         stale.unlink()
 

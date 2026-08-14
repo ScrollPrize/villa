@@ -18,7 +18,7 @@ import torch
 from skimage.restoration import unwrap_phase
 from vc.grid_raycast import GridRaycaster
 
-import vesuvius.tifxyz as tifxyz  # noqa: PLR0402
+import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
     SlabFrame,
     VolumeSlabExtractor,

@@ -287,7 +287,7 @@ def accumulate_winding_metrics(sums, output, batch, config):
     )
 
     batch_size, length = phase_pred.shape[0], phase_pred.shape[-1]
-    flat = lambda values: values.reshape(-1, values.shape[-1])  # noqa: E731
+    flat = lambda values: values.reshape(-1, values.shape[-1])
     prob_flat = flat(prob) if prob is not None else None
     phase_pred_flat = flat(phase_pred)
     phase_target_flat = flat(phase_target)
