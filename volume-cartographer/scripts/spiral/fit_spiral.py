@@ -12,6 +12,7 @@ import copy
 import gc
 import json
 import glob
+import re
 from collections.abc import Mapping
 import zarr
 import torch
@@ -865,6 +866,12 @@ class FitContext:
         progress = progress_or_null(self.progress)
         patches = {}
         entries = sorted(os.listdir(path))
+        filter_regex = self.config['input_patch_filter_regex']
+        if filter_regex is not None:
+            filtered = [e for e in entries if re.search(filter_regex, e)]
+            print(f'patch filter regex {filter_regex!r} kept '
+                  f'{len(filtered)}/{len(entries)} {label} entries')
+            entries = filtered
         progress.begin(
             'loading', f'Loading {label}',
             step=0, total_steps=len(entries), unit='patches')

@@ -25,6 +25,7 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
+    "input_patch_filter_regex": "string",
 }
 
 _PREPARED_INPUT_FIELDS = {
@@ -280,6 +281,9 @@ class Config:
         self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
         self.input_disable_patches = False
+        # When set, only patch directory entries (uuid-named) whose name
+        # matches this regex (re.search) are loaded; None loads everything.
+        self.input_patch_filter_regex = None
         self.patch_unverified_patch_radius_loss_margin = 0.025
         self.patch_unverified_patch_radius_loss_inv = False
         self.patch_unverified_patch_radius_within_norm_p = 3.0
