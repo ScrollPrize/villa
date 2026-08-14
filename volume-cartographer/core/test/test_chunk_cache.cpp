@@ -1847,7 +1847,7 @@ TEST_CASE("ChunkCache preserves pending work owned by another view or background
 TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
 {
     auto fetcher = std::make_shared<BlockingOrderFetcher>();
-    std::vector<ChunkCache::LevelInfo> levels(3);
+    std::vector<ChunkCache::LevelInfo> levels(4);
     for (auto& level : levels) {
         level.shape = {4, 4, 12};
         level.chunkShape = {4, 4, 4};
@@ -1857,7 +1857,7 @@ TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
     options.detectAllFillChunks = false;
     auto cache = std::make_shared<ChunkCache>(
         std::move(levels),
-        std::vector<std::shared_ptr<IChunkFetcher>>(3, fetcher),
+        std::vector<std::shared_ptr<IChunkFetcher>>(4, fetcher),
         0.0, ChunkDtype::UInt8, options);
 
     (void)cache->tryGetChunk(0, 0, 0, 0);
@@ -1885,6 +1885,48 @@ TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
     CHECK(order[0] == ChunkKey{0, 0, 0, 0});
     CHECK(order[1] == ChunkKey{2, 0, 0, 1});
     CHECK(order[2] == ChunkKey{2, 0, 0, 0});
+}
+
+TEST_CASE("ChunkCache selects the terminal source level before ordinary fallbacks")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels(4);
+    for (auto& level : levels) {
+        level.shape = {4, 4, 12};
+        level.chunkShape = {4, 4, 4};
+    }
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>(4, fetcher),
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+
+    cache->replaceViewDemand({74, 1}, {0.0f, 0.0f}, {
+        {{3, 0, 0, 0}, {0.0f, 0.0f}, 0},
+    });
+    cache->updateViewFocus(74, {0.0f, 0.0f}, true);
+    cache->replaceViewDemand({75, 1}, {0.0f, 0.0f}, {
+        {{3, 0, 0, 1}, {0.0f, 0.0f}, 3},
+    });
+    cache->replaceViewDemand({76, 1}, {0.0f, 0.0f}, {
+        {{2, 0, 0, 2}, {0.0f, 0.0f}, 5},
+    });
+
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 3, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 3, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 2, 0, 0, 2).status == ChunkStatus::Data);
+    const auto order = fetcher->order();
+    REQUIRE(order.size() == 4);
+    CHECK(order[0] == ChunkKey{0, 0, 0, 0});
+    CHECK(order[1] == ChunkKey{3, 0, 0, 1});
+    CHECK(order[2] == ChunkKey{3, 0, 0, 0});
+    CHECK(order[3] == ChunkKey{2, 0, 0, 2});
 }
 
 TEST_CASE("ChunkCache rejects stale asynchronous GUI misses")

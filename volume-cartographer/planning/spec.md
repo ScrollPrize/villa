@@ -93,7 +93,11 @@
   nearest retained occurrence to that view's focus, then FIFO. A GUI miss not
   observed by the sparse pre-pass has no location and sorts after located work
   at the same view and relative level. It cannot outrank a located coarser
-  fallback because relative level is the primary ordering key. Dependency
+  fallback because relative level is the primary ordering key. The terminal
+  source-pyramid level adds 100 to its relative priority, so reaching the best
+  available whole-view fallback always outranks ordinary relative levels even
+  for a view that starts near the end of a shallow pyramid, while relative
+  ordering remains meaningful between terminal-level demands. Dependency
   publication is coarse-to-fine so
   workers cannot admit fine work before its coarse entries are visible.
 - Mouse interaction marks that view active and updates distances against its

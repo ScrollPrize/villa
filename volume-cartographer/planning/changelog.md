@@ -2,6 +2,9 @@
 
 ## 2026-08-14
 
+- Added 100 to interactive priority for each source's terminal pyramid level,
+  ensuring the best available whole-view fallback loads before ordinary
+  relative levels while retaining relative ordering between terminal demands.
 - Corrected generated-view scale declarations: line ribbons now arclength-
   resample to a uniform 50-base-voxel target, declare exact along/cross grid
   density, and retain original line semantics through a bidirectional strip

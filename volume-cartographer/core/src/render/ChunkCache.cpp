@@ -27,6 +27,7 @@ namespace {
 constexpr std::size_t kPersistentWriteBacklogBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kPersistentProbeWorkers = 32;
 constexpr std::size_t kDecodeWorkers = 8;
+constexpr int kTerminalLevelPriorityBonus = 100;
 std::atomic_size_t g_persistentWriteBacklogBytes{0};
 
 bool reservePersistentWriteBytes(std::size_t bytes)
@@ -1112,13 +1113,20 @@ ChunkWorkPriority ChunkCache::workPriorityLocked(const State& state,
         const bool demandIsActive = active != 0 && viewId == active;
         const float distance = demand.distanceSquared.value_or(
             std::numeric_limits<float>::infinity());
-        if (demand.relativeLevel > priority.levelPriority ||
-            (demand.relativeLevel == priority.levelPriority &&
+        // The source's terminal level is the best possible whole-view fallback,
+        // even when a view starts near the end of a shallow pyramid and its
+        // ordinary relative offset is small.
+        const int levelPriority = demand.relativeLevel +
+            (key.level + 1 == static_cast<int>(state.levels_.size())
+                 ? kTerminalLevelPriorityBonus
+                 : 0);
+        if (levelPriority > priority.levelPriority ||
+            (levelPriority == priority.levelPriority &&
              demandIsActive && !priority.activeView) ||
-            (demand.relativeLevel == priority.levelPriority &&
+            (levelPriority == priority.levelPriority &&
              demandIsActive == priority.activeView &&
              distance < priority.distanceSquared)) {
-            priority.levelPriority = demand.relativeLevel;
+            priority.levelPriority = levelPriority;
             priority.activeView = demandIsActive;
             priority.distanceSquared = distance;
         }

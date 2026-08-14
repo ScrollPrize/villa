@@ -32,6 +32,7 @@ struct ChunkWorkPriority {
     bool interactive = false;
     bool activeView = false;
     // Interactive work uses view-relative level offsets; larger is coarser.
+    // ChunkCache adds 100 for a source's terminal pyramid level.
     int levelPriority = 0;
     float distanceSquared = 0.0f;
     int backgroundPriority = 0;
