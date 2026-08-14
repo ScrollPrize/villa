@@ -97,6 +97,15 @@ chunk count once. Cache diagnostics and Z-scroll sensitivity are composed into
 one permanent status label so growing queue text cannot overlap a neighboring
 status widget.
 
+The MiB/s field is not derived from completed-chunk wall spans. Scoped remote
+Zarr reads report encoded HTTP response-body increments from the common curl
+callback. The shared source scheduler aggregates those bytes across concurrent
+requests over the last five active transfer seconds; intervals with no measured
+transfer active do not dilute the result. The adaptive controller consumes this
+same measurement. A fetcher that cannot report progress uses a compatibility
+fallback of mean individual request bandwidth multiplied by the admission
+represented by its completion samples.
+
 For render-order debugging, start VC3D with
 `--debug-download-queue`. Every shared slice viewer, including plane, segment,
 strip, generated annotation, and Spiral views, then overlays pixels belonging
@@ -223,6 +232,12 @@ at that limit instead of two. Only reusable capacity data is restored: epoch
 samples, probe phase, direction history, and the stability window are reset, so
 the controller performs frequent initial up/down probes around the prior limit
 before returning to its normal stability-dependent cadence.
+
+Each saturated controller epoch requires at least five active transfer seconds
+and one successful completion per admitted worker. Request completion supplies
+p90 latency and saturation/failure information; it is not the primary payload
+bandwidth clock. Failed, missing, or underfilled-tail requests reset the current
+capacity epoch so later work cannot inherit idle time.
 
 All three schedulers are work-conserving and admit one background item after at
 most seven consecutive GUI items while both lanes are nonempty. Existing

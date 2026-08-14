@@ -1,54 +1,42 @@
 # Task log
 
-## Planning findings
+## Findings
 
-- `ChunkCacheService::openSource()` currently applies
-  `ChunkCacheOptions.maxConcurrentReads` and `adaptiveConcurrentReads` to the
-  entire service before registering or reacquiring a source.
-- `ChunkCacheOptions` mixes service-owned decoded budget/concurrency with
-  source-owned metadata and persistent-cache policy.
-- `Volume::setIOThreads()` is a volume-scoped API that changes its attached
-  shared service, so the apparent ownership and actual effect disagree.
-- Scheduler reconfiguration currently creates/selects another scheduler,
-  cancels pending old-epoch tasks, and requeues all demanded `InFlight`
-  entries. Already-running requests continue, causing duplicate fetches whose
-  first result is discarded by fetch-serial checks.
-- The failing `test_chunk_cache` migration case explicitly expects this
-  duplicate and underflows `BlockingFetcher`'s one-shot latch on the second
-  call. The planned fix changes the production invariant and replaces the test;
-  it will not make the latch accept duplicate same-key work.
+- The status estimator and adaptive epoch both divide aggregate completed bytes
+  by `latest completion - earliest request start`.
+- Unsaturated samples are skipped without necessarily ending the old window,
+  so later activity can include a long idle gap in that denominator.
+- The common curl write callback already receives exact response-body byte
+  increments and is shared by ordinary and range GETs.
+- `ZarrChunkFetcher` can scope an observer around one encoded read, avoiding
+  metadata traffic and preserving the shared Zarr implementation.
 
 ## Implementation
 
-- Split source-local `ChunkCacheOptions` from service-owned decoded-budget and
-  fetch-concurrency options.
-- Replaced `openSource()` with source-only `acquireSource()` and removed
-  `Volume::setIOThreads()` plus its Python binding.
-- Replaced scheduler migration with synchronized in-place admission updates.
-  Increasing admission wakes existing workers; decreasing it lets running work
-  drain without admitting another task early.
-- Configured the normal VC3D service explicitly for adaptive operation and kept
-  prefill, redownload, batch, local-volume, and standalone caches isolated.
-- Replaced the duplicate-fetch migration test with exact-once increase and
-  non-cancelling decrease coverage, plus fixed/adaptive transition and source
-  acquisition ownership checks.
+- Added a thread-local `HttpClient::ScopedDownloadObserver`; the common curl
+  body callback reports response bytes and restores nested observers safely.
+- Added progress-aware encoded chunk fetching. HTTP Zarr reads report bytes;
+  existing local and custom fetchers remain unchanged.
+- Added transfer handles to the shared scheduler. Concurrent body bytes are
+  measured on an active-time axis with a five-second rolling window. The first
+  callback is timestamped immediately and later callbacks are batched to at
+  most one scheduler update per 256 KiB or 100 ms.
+- Adaptive epochs use the same aggregate bytes, require five active seconds and
+  one completion per admitted worker, and reset on failure or underfilled work.
+- Non-streaming fetchers use mean individual request rate multiplied by the
+  represented admission; they no longer divide by a multi-request wall span.
+- Routed both `ChunkCache` and `vc_zarr_download_bench` through the shared
+  streamed transfer lifecycle.
 
 ## Deviations
 
-- The known Valgrind trace-role attribution failure remains deferred to its
-  separate task as requested.
+- None.
 
 ## Validation
 
-- `cmake --build build/ci-fast-core --target vc_core --parallel 4`
-- `cmake --build build/ci-fast-core --target vc_test_core --parallel 4`
-- `build/ci-fast-core/bin/test_chunk_cache`: 72 cases passed in three
-  consecutive runs.
-- `test_volume_local`: 15 cases passed.
-- `test_volume_extras`: 12 cases passed.
-- `test_chunk_cache_persist`: 17 cases passed.
-- `test_zarr_chunk_fetcher`: 16 cases passed.
-- `cmake --build build --target VC3D --parallel 4` passed.
-- The complete 131-test `vc-core` shard passed, including both synthetic render
-  fixtures and the live remote-volume tests.
-- `git diff --check` passed.
+- `cmake --build volume-cartographer/build --target test_chunk_cache test_http_fetch_errors vc_zarr_download_bench -j2` - passed.
+- `volume-cartographer/build/bin/test_chunk_cache` - 74 test cases passed.
+- `volume-cartographer/build/bin/test_http_fetch_errors` - 6 test cases passed.
+- `cmake --build volume-cartographer/build --target VC3D -j2` - passed.
+- `cmake --build volume-cartographer/build -j2` - passed.
+- `ctest --test-dir volume-cartographer/build --output-on-failure -L vc-core -j2` - 132/132 tests passed.

@@ -194,9 +194,13 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
             }
 
             const auto started = Clock::now();
+            auto transfer = scheduler.beginTransfer(started);
+            auto observeProgress = [&](std::size_t bytes) {
+                transfer.recordBytes(bytes);
+            };
             ChunkFetchResult fetch;
             try {
-                fetch = fetcher->fetchEncoded(key);
+                fetch = fetcher->fetchEncoded(key, observeProgress);
             } catch (const std::exception& e) {
                 fetch.status = ChunkFetchStatus::IoError;
                 fetch.message = e.what();
@@ -205,6 +209,10 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
                 fetch.message = "unknown chunk fetch exception";
             }
             const auto completed = Clock::now();
+            transfer.finish(
+                fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty(),
+                fetch.bytes.size(),
+                completed);
             active.fetch_sub(1, std::memory_order_relaxed);
 
             const double latency = std::chrono::duration<double, std::milli>(
@@ -219,8 +227,6 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
                     // the reported admission history. Concurrent fetches can
                     // otherwise observe and publish stale intermediate stats.
                     std::lock_guard lock(samplesMutex);
-                    if (bytes != 0)
-                        scheduler.recordSuccessfulTransfer(bytes, started, completed);
                     ++accountedCompletedChunks;
                     accountedEncodedBytes += bytes;
                     const auto stats = scheduler.transferStats();

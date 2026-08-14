@@ -1783,14 +1783,74 @@ TEST_CASE("ChunkRequestScheduler estimates bandwidth before its admission window
     ChunkRequestScheduler::AdaptiveConcurrency adaptive;
     ChunkRequestScheduler scheduler(64, 7, {}, adaptive);
 
-    const auto start = Clock::time_point{};
+    const auto start = Clock::now();
     scheduler.recordSuccessfulTransfer(
         chunkBytes, start, start + std::chrono::seconds(1));
     const auto stats = scheduler.transferStats();
     CHECK(stats.sampleCount == 1);
-    CHECK(stats.bytesPerSecond == doctest::Approx(2.0 * 1024.0 * 1024.0));
+    CHECK(stats.bytesPerSecond == doctest::Approx(4.0 * 1024.0 * 1024.0));
     CHECK(stats.averageChunkBytes == doctest::Approx(double(chunkBytes)));
     CHECK(stats.admissionLimit == 2);
+}
+
+TEST_CASE("ChunkRequestScheduler aggregates streamed bytes without idle time")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    ChunkRequestScheduler scheduler(2);
+    const auto start = Clock::now();
+
+    auto streamPair = [&](Clock::time_point pairStart) {
+        auto first = scheduler.beginTransfer(pairStart);
+        auto second = scheduler.beginTransfer(pairStart);
+        first.recordBytes(mib, pairStart);
+        second.recordBytes(mib, pairStart);
+        first.recordBytes(mib, pairStart + std::chrono::seconds(1));
+        second.recordBytes(mib, pairStart + std::chrono::seconds(1));
+        first.finish(true, 2 * mib, pairStart + std::chrono::seconds(1));
+        second.finish(true, 2 * mib, pairStart + std::chrono::seconds(1));
+    };
+
+    streamPair(start);
+    CHECK(scheduler.transferStats().bytesPerSecond ==
+          doctest::Approx(4.0 * double(mib)));
+
+    // The hundred-second wall-clock gap is absent from the active-time axis.
+    streamPair(start + std::chrono::seconds(101));
+    CHECK(scheduler.transferStats().bytesPerSecond ==
+          doctest::Approx(4.0 * double(mib)));
+}
+
+TEST_CASE("ChunkRequestScheduler streamed adaptive epochs require time and admission")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.maximum = 4;
+    adaptive.minimumEpochSeconds = 5.0;
+    adaptive.maximumEpochSeconds = 5.0;
+    adaptive.initialProbeMultiplier = 2;
+    ChunkRequestScheduler scheduler(4, 7, {}, adaptive);
+    const auto start = Clock::now();
+
+    auto first = scheduler.beginTransfer(start);
+    auto second = scheduler.beginTransfer(start);
+    first.recordBytes(mib, start);
+    second.recordBytes(mib, start);
+    first.finish(true, mib, start + std::chrono::seconds(4));
+    second.finish(true, mib, start + std::chrono::seconds(4));
+    CHECK(scheduler.transferStats().admissionLimit == 2);
+    CHECK_FALSE(scheduler.transferStats().probing);
+
+    auto third = scheduler.beginTransfer(start + std::chrono::seconds(100));
+    auto fourth = scheduler.beginTransfer(start + std::chrono::seconds(100));
+    third.recordBytes(mib, start + std::chrono::seconds(100));
+    fourth.recordBytes(mib, start + std::chrono::seconds(100));
+    third.finish(true, mib, start + std::chrono::seconds(102));
+    CHECK(scheduler.transferStats().admissionLimit == 3);
+    CHECK(scheduler.transferStats().targetAdmissionLimit == 4);
+    CHECK(scheduler.transferStats().probing);
+    fourth.finish(true, mib, start + std::chrono::seconds(102));
 }
 
 TEST_CASE("ChunkRequestScheduler restores capacity but restarts frequent probing")
@@ -1843,28 +1903,22 @@ TEST_CASE("ChunkRequestScheduler probes upward with completion-paced admission")
         const auto stats = scheduler.transferStats();
         REQUIRE(stats.admissionLimit == concurrency);
         REQUIRE(stats.targetAdmissionLimit == concurrency);
-        const std::size_t count = std::max<std::size_t>(4, concurrency);
-        const double windowSeconds =
-            static_cast<double>(count * chunkBytes) /
+        const std::size_t count = concurrency;
+        const double requestSeconds =
+            static_cast<double>(chunkBytes * concurrency) /
             (throughputMiB * 1024.0 * 1024.0);
-        REQUIRE(windowSeconds >= latencySeconds);
         const auto base = cursor + std::chrono::seconds(1);
         for (std::size_t sample = 0; sample < count; ++sample) {
-            const double offset = count == 1
-                ? 0.0
-                : (windowSeconds - latencySeconds) *
-                    static_cast<double>(sample) /
-                    static_cast<double>(count - 1);
-            const auto started = base + std::chrono::duration_cast<Clock::duration>(
-                std::chrono::duration<double>(offset));
+            const auto started = base;
             scheduler.recordSuccessfulTransfer(
                 chunkBytes,
                 started,
                 started + std::chrono::duration_cast<Clock::duration>(
-                    std::chrono::duration<double>(latencySeconds)));
+                    std::chrono::duration<double>(requestSeconds)));
         }
         cursor = base + std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double>(windowSeconds));
+            std::chrono::duration<double>(
+                std::max(requestSeconds, latencySeconds)));
     };
     auto finishRamp = [&] {
         while (scheduler.transferStats().admissionLimit <
@@ -1918,25 +1972,22 @@ TEST_CASE("ChunkRequestScheduler exploration cadence follows bandwidth stability
     auto recordEpoch = [&](std::size_t concurrency,
                            double throughputMiB,
                            double latencySeconds) {
-        const std::size_t count = std::max<std::size_t>(4, concurrency);
-        const double windowSeconds =
-            static_cast<double>(count * chunkBytes) /
+        const std::size_t count = concurrency;
+        const double requestSeconds =
+            static_cast<double>(chunkBytes * concurrency) /
             (throughputMiB * 1024.0 * 1024.0);
-        REQUIRE(windowSeconds >= latencySeconds);
         const auto base = cursor + std::chrono::seconds(1);
         for (std::size_t sample = 0; sample < count; ++sample) {
-            const double offset = (windowSeconds - latencySeconds) *
-                static_cast<double>(sample) / static_cast<double>(count - 1);
-            const auto started = base + std::chrono::duration_cast<Clock::duration>(
-                std::chrono::duration<double>(offset));
+            const auto started = base;
             scheduler.recordSuccessfulTransfer(
                 chunkBytes,
                 started,
                 started + std::chrono::duration_cast<Clock::duration>(
-                    std::chrono::duration<double>(latencySeconds)));
+                    std::chrono::duration<double>(requestSeconds)));
         }
         cursor = base + std::chrono::duration_cast<Clock::duration>(
-            std::chrono::duration<double>(windowSeconds));
+            std::chrono::duration<double>(
+                std::max(requestSeconds, latencySeconds)));
     };
 
     // The 4-worker probe has more throughput but excessive p90 latency, so C=2
@@ -1948,7 +1999,7 @@ TEST_CASE("ChunkRequestScheduler exploration cadence follows bandwidth stability
     scheduler.recordSuccessfulTransfer(
         chunkBytes, rampStarted, rampStarted + std::chrono::milliseconds(10));
     cursor = rampStarted + std::chrono::milliseconds(10);
-    recordEpoch(4, 12.0, 0.20);
+    recordEpoch(4, 11.0, 0.20);
     recordEpoch(2, 10.0, 0.10);
     auto stats = scheduler.transferStats();
     CHECK(stats.admissionLimit == 2);
@@ -1979,7 +2030,7 @@ TEST_CASE("ChunkRequestScheduler requires saturated observation time for stabili
     adaptive.continuousSearchTurns = 1;
     ChunkRequestScheduler scheduler(2, 7, {}, adaptive);
     const auto start = Clock::time_point{};
-    for (int sample = 0; sample < 4; ++sample) {
+    for (int sample = 0; sample < 2; ++sample) {
         scheduler.recordSuccessfulTransfer(
             chunkBytes,
             start + std::chrono::milliseconds(sample * 200),
@@ -2001,7 +2052,7 @@ TEST_CASE("ChunkRequestScheduler retains saturated capacity when work drains")
     adaptive.continuousSearchTurns = 1;
     ChunkRequestScheduler scheduler(2, 7, {}, adaptive);
     const auto start = Clock::time_point{};
-    for (int sample = 0; sample < 4; ++sample) {
+    for (int sample = 0; sample < 2; ++sample) {
         scheduler.recordSuccessfulTransfer(
             chunkBytes,
             start + std::chrono::milliseconds(sample * 200),
@@ -2035,7 +2086,7 @@ TEST_CASE("ChunkRequestScheduler starts continuous search with a fourfold probe"
     adaptive.maximumEpochSeconds = 60.0;
     ChunkRequestScheduler scheduler(16, 7, {}, adaptive);
     const auto start = Clock::time_point{};
-    for (int sample = 0; sample < 4; ++sample) {
+    for (int sample = 0; sample < 2; ++sample) {
         scheduler.recordSuccessfulTransfer(
             chunkBytes,
             start + std::chrono::milliseconds(sample * 200),
@@ -2091,7 +2142,7 @@ TEST_CASE("ChunkRequestScheduler fixed concurrency ignores transfer samples")
     CHECK(stats.admissionLimit == 4);
     CHECK(stats.sampleCount == 16);
     CHECK(stats.bytesPerSecond ==
-          doctest::Approx(100.0 * 1024.0 * 1024.0));
+          doctest::Approx(25.0 * 1024.0 * 1024.0));
 }
 
 TEST_CASE("ChunkRequestScheduler decreases admission without cancelling work")

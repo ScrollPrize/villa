@@ -46,6 +46,8 @@ void ChunkRequestSelectionGate::publish(const std::function<void()>& update)
 }
 
 struct ChunkRequestScheduler::Impl {
+    using Clock = std::chrono::steady_clock;
+
     struct Item {
         TaskId id = 0;
         ChunkWorkPriority priority;
@@ -100,6 +102,20 @@ struct ChunkRequestScheduler::Impl {
         std::chrono::steady_clock::time_point completed;
         std::size_t admission = 1;
         bool saturated = true;
+    };
+
+    struct ActiveTransfer {
+        std::chrono::steady_clock::time_point started;
+        std::size_t admission = 1;
+        std::uint64_t epochGeneration = 0;
+        std::size_t streamedBytes = 0;
+        bool streaming = false;
+        bool epochStreaming = false;
+    };
+
+    struct StreamByteSample {
+        double activeSeconds = 0.0;
+        std::size_t bytes = 0;
     };
 
     struct EpochMeasurement {
@@ -346,8 +362,10 @@ struct ChunkRequestScheduler::Impl {
             return;
         if (!transferSamples.back().saturated &&
             maximumSaturatedParallelism != 0) {
-            estimatedBytesPerSecond = saturatedBytesPerSecondPerWorker *
-                static_cast<double>(targetAdmissionLimit);
+            if (!streamEstimateAvailable) {
+                estimatedBytesPerSecond = saturatedBytesPerSecondPerWorker *
+                    static_cast<double>(targetAdmissionLimit);
+            }
             return;
         }
 
@@ -364,29 +382,129 @@ struct ChunkRequestScheduler::Impl {
 
         const auto first = transferSamples.end() -
             static_cast<std::ptrdiff_t>(available);
-        auto earliestStart = first->started;
-        auto latestCompletion = first->completed;
         std::size_t totalBytes = 0;
+        double totalRequestRate = 0.0;
         for (auto sample = first; sample != transferSamples.end(); ++sample) {
-            earliestStart = std::min(earliestStart, sample->started);
-            latestCompletion = std::max(latestCompletion, sample->completed);
+            const double elapsed = std::chrono::duration<double>(
+                sample->completed - sample->started).count();
+            if (elapsed <= 0.0)
+                continue;
             totalBytes += sample->bytes;
+            totalRequestRate += static_cast<double>(sample->bytes) / elapsed;
         }
-        const double elapsed = std::chrono::duration<double>(
-            latestCompletion - earliestStart).count();
-        if (elapsed <= 0.0 || totalBytes == 0)
+        if (totalRequestRate <= 0.0 || totalBytes == 0)
             return;
 
-        estimatedBytesPerSecond = static_cast<double>(totalBytes) / elapsed;
         averageChunkBytes = static_cast<double>(totalBytes) /
             static_cast<double>(available);
         estimateSampleCount = available;
+        if (streamEstimateAvailable)
+            return;
+        estimatedBytesPerSecond = totalRequestRate /
+            static_cast<double>(available) * static_cast<double>(admissionLimit);
+    }
+
+    double streamedActiveTimeLocked(Clock::time_point now) const
+    {
+        if (streamActiveCount == 0)
+            return streamActiveSeconds;
+        return streamActiveSeconds + std::chrono::duration<double>(
+            now - streamActiveStarted).count();
+    }
+
+    void beginStreamingLocked(ActiveTransfer& transfer, Clock::time_point now)
+    {
+        if (transfer.streaming)
+            return;
+        transfer.streaming = true;
+        if (streamActiveCount++ == 0)
+            streamActiveStarted = now;
+
+        if (adaptive && transfer.epochGeneration == epochGeneration &&
+            transfer.admission == targetAdmissionLimit &&
+            transfer.started >= epochNotBefore) {
+            transfer.epochStreaming = true;
+            if (epochStreamActiveCount++ == 0)
+                epochStreamActiveStarted = now;
+            if (!epochUsesStreaming)
+                epochUsesStreaming = true;
+        }
+    }
+
+    void recordStreamBytesLocked(ActiveTransfer& transfer,
+                                 std::size_t bytes,
+                                 Clock::time_point now)
+    {
+        if (bytes == 0)
+            return;
+        beginStreamingLocked(transfer, now);
+        transfer.streamedBytes += bytes;
+
+        const double activeNow = streamedActiveTimeLocked(now);
+        if (streamByteSamples.empty() && !streamMeasurementStarted)
+            streamMeasurementStartedActiveSeconds = activeNow;
+        streamMeasurementStarted = true;
+        streamByteSamples.push_back({activeNow, bytes});
+        streamWindowBytes += bytes;
+        updateStreamEstimateLocked(now);
+
+        if (transfer.epochStreaming &&
+            transfer.epochGeneration == epochGeneration) {
+            epochStreamBytes += bytes;
+        }
+    }
+
+    void updateStreamEstimateLocked(Clock::time_point now)
+    {
+        if (!streamMeasurementStarted)
+            return;
+        const double activeNow = streamedActiveTimeLocked(now);
+        constexpr double kWindowSeconds = 5.0;
+        while (!streamByteSamples.empty() &&
+               streamByteSamples.front().activeSeconds <
+                   activeNow - kWindowSeconds) {
+            streamWindowBytes -= streamByteSamples.front().bytes;
+            streamByteSamples.pop_front();
+        }
+        const double elapsed = std::min(
+            kWindowSeconds,
+            std::max(0.0, activeNow - streamMeasurementStartedActiveSeconds));
+        if (elapsed > 0.0) {
+            estimatedBytesPerSecond =
+                static_cast<double>(streamWindowBytes) / elapsed;
+            streamEstimateAvailable = true;
+        }
+    }
+
+    void finishStreamingLocked(ActiveTransfer& transfer, Clock::time_point now)
+    {
+        if (transfer.streaming) {
+            if (streamActiveCount > 0 && --streamActiveCount == 0) {
+                streamActiveSeconds += std::chrono::duration<double>(
+                    now - streamActiveStarted).count();
+            }
+            transfer.streaming = false;
+        }
+        if (transfer.epochStreaming &&
+            transfer.epochGeneration == epochGeneration) {
+            if (epochStreamActiveCount > 0 && --epochStreamActiveCount == 0) {
+                epochStreamActiveSeconds += std::chrono::duration<double>(
+                    now - epochStreamActiveStarted).count();
+            }
+            transfer.epochStreaming = false;
+        }
     }
 
     void resetEpochLocked(std::chrono::steady_clock::time_point notBefore)
     {
         epochSamples.clear();
         epochNotBefore = notBefore;
+        ++epochGeneration;
+        epochStreamBytes = 0;
+        epochStreamActiveSeconds = 0.0;
+        epochStreamActiveCount = 0;
+        epochStreamActiveStarted = {};
+        epochUsesStreaming.reset();
     }
 
     void setAdmissionTargetLocked(
@@ -413,21 +531,48 @@ struct ChunkRequestScheduler::Impl {
     {
         if (epochSamples.empty())
             return std::nullopt;
-        auto earliestStart = epochSamples.front().started;
         auto latestCompletion = epochSamples.front().completed;
         std::size_t totalBytes = 0;
+        double totalRequestRate = 0.0;
+        double totalRequestSeconds = 0.0;
         std::vector<double> latencies;
         latencies.reserve(epochSamples.size());
         for (const auto& sample : epochSamples) {
-            earliestStart = std::min(earliestStart, sample.started);
             latestCompletion = std::max(latestCompletion, sample.completed);
             totalBytes += sample.bytes;
-            latencies.push_back(std::chrono::duration<double>(
-                sample.completed - sample.started).count());
+            const double latency = std::chrono::duration<double>(
+                sample.completed - sample.started).count();
+            latencies.push_back(latency);
+            if (latency > 0.0) {
+                totalRequestSeconds += latency;
+                totalRequestRate += static_cast<double>(sample.bytes) / latency;
+            }
         }
-        const double elapsed = std::chrono::duration<double>(
-            latestCompletion - earliestStart).count();
-        if (elapsed <= 0.0 || totalBytes == 0)
+        if (totalBytes == 0)
+            return std::nullopt;
+
+        double elapsed = 0.0;
+        double bytesPerSecond = 0.0;
+        if (epochUsesStreaming.value_or(false)) {
+            elapsed = epochStreamActiveSeconds;
+            if (epochStreamActiveCount != 0) {
+                elapsed += std::chrono::duration<double>(
+                    latestCompletion - epochStreamActiveStarted).count();
+            }
+            if (elapsed > 0.0 && epochStreamBytes != 0) {
+                bytesPerSecond =
+                    static_cast<double>(epochStreamBytes) / elapsed;
+            }
+        } else {
+            elapsed = totalRequestSeconds /
+                static_cast<double>(targetAdmissionLimit);
+            if (totalRequestRate > 0.0) {
+                bytesPerSecond = totalRequestRate /
+                    static_cast<double>(epochSamples.size()) *
+                    static_cast<double>(targetAdmissionLimit);
+            }
+        }
+        if (elapsed <= 0.0 || bytesPerSecond <= 0.0)
             return std::nullopt;
 
         const auto p90 = latencies.begin() + static_cast<std::ptrdiff_t>(
@@ -436,7 +581,7 @@ struct ChunkRequestScheduler::Impl {
                          0.9 * static_cast<double>(latencies.size()))) - 1));
         std::nth_element(latencies.begin(), p90, latencies.end());
         return EpochMeasurement{
-            static_cast<double>(totalBytes) / elapsed,
+            bytesPerSecond,
             *p90,
             elapsed,
             latestCompletion};
@@ -446,19 +591,23 @@ struct ChunkRequestScheduler::Impl {
     {
         if (epochSamples.empty())
             return false;
-        auto earliest = epochSamples.front().started;
-        auto latest = epochSamples.front().completed;
-        for (const auto& sample : epochSamples) {
-            earliest = std::min(earliest, sample.started);
-            latest = std::max(latest, sample.completed);
+        double elapsed = 0.0;
+        if (epochUsesStreaming.value_or(false)) {
+            elapsed = epochStreamActiveSeconds;
+            if (epochStreamActiveCount != 0) {
+                elapsed += std::chrono::duration<double>(
+                    epochSamples.back().completed -
+                    epochStreamActiveStarted).count();
+            }
+        } else {
+            for (const auto& sample : epochSamples) {
+                elapsed += std::chrono::duration<double>(
+                    sample.completed - sample.started).count();
+            }
+            elapsed /= static_cast<double>(targetAdmissionLimit);
         }
-        const double elapsed = std::chrono::duration<double>(
-            latest - earliest).count();
-        const std::size_t minimumSamples = std::max<std::size_t>(
-            4, targetAdmissionLimit);
-        return (elapsed >= adaptiveOptions.minimumEpochSeconds &&
-                epochSamples.size() >= minimumSamples) ||
-               elapsed >= adaptiveOptions.maximumEpochSeconds;
+        return elapsed >= adaptiveOptions.minimumEpochSeconds &&
+               epochSamples.size() >= targetAdmissionLimit;
     }
 
     void observeSettledBandwidthLocked(const EpochMeasurement& measurement)
@@ -692,7 +841,9 @@ struct ChunkRequestScheduler::Impl {
         }
     }
 
-    void updateAdaptiveControlLocked(const TransferSample& sample)
+    void updateAdaptiveControlLocked(const TransferSample& sample,
+                                     bool streamed,
+                                     std::uint64_t sampleEpochGeneration)
     {
         if (!adaptive)
             return;
@@ -707,19 +858,46 @@ struct ChunkRequestScheduler::Impl {
             }
             return;
         }
+        if (sampleEpochGeneration != epochGeneration)
+            return;
         if (sample.started < epochNotBefore)
             return;
-        // Queue-drain samples describe demand, not connection capacity. Keep
-        // the last fully occupied estimate and resume this epoch when enough
-        // work is available again.
-        if (!sample.saturated)
+        // Queue-drain samples describe demand, not connection capacity. End
+        // the epoch so later saturated work cannot inherit an idle gap or an
+        // underfilled byte interval.
+        if (!sample.saturated) {
+            resetEpochLocked(sample.completed);
             return;
+        }
+        if (epochUsesStreaming && *epochUsesStreaming != streamed) {
+            resetEpochLocked(sample.completed);
+            return;
+        }
+        if (!epochUsesStreaming)
+            epochUsesStreaming = streamed;
         epochSamples.push_back(sample);
         if (!epochCompleteLocked())
             return;
         const auto measurement = epochMeasurementLocked();
         if (measurement)
             completeEpochLocked(*measurement);
+    }
+
+    void recordSuccessfulCompletionLocked(
+        const TransferSample& sample,
+        bool streamed,
+        std::uint64_t sampleEpochGeneration)
+    {
+        if (!streamed && streamActiveCount == 0)
+            streamEstimateAvailable = false;
+        transferSamples.push_back(sample);
+        const std::size_t maximumSamples = adaptiveOptions.maximum *
+            adaptiveOptions.successfulSamplesPerWorker;
+        while (transferSamples.size() > maximumSamples)
+            transferSamples.pop_front();
+        updateTransferEstimateLocked();
+        updateAdaptiveControlLocked(
+            transferSamples.back(), streamed, sampleEpochGeneration);
     }
 
     void workerLoop(std::stop_token stop)
@@ -790,10 +968,25 @@ struct ChunkRequestScheduler::Impl {
     std::size_t targetAdmissionLimit = 1;
     std::size_t settledAdmissionLimit = 1;
     bool rampingAdmission = false;
+    std::unordered_map<TransferId, ActiveTransfer> activeTransfers;
+    TransferId nextTransferId = 1;
     std::deque<TransferSample> transferSamples;
     std::vector<TransferSample> epochSamples;
-    using Clock = std::chrono::steady_clock;
+    std::deque<StreamByteSample> streamByteSamples;
+    std::size_t streamWindowBytes = 0;
+    std::size_t streamActiveCount = 0;
+    Clock::time_point streamActiveStarted{};
+    double streamActiveSeconds = 0.0;
+    double streamMeasurementStartedActiveSeconds = 0.0;
+    bool streamMeasurementStarted = false;
+    bool streamEstimateAvailable = false;
     Clock::time_point epochNotBefore = Clock::time_point::min();
+    std::uint64_t epochGeneration = 1;
+    std::optional<bool> epochUsesStreaming;
+    std::size_t epochStreamBytes = 0;
+    std::size_t epochStreamActiveCount = 0;
+    Clock::time_point epochStreamActiveStarted{};
+    double epochStreamActiveSeconds = 0.0;
     Clock::time_point nextProbe = Clock::time_point::min();
     ProbePhase phase = ProbePhase::Monitor;
     bool continuousSearch = true;
@@ -937,6 +1130,148 @@ std::size_t ChunkRequestScheduler::active() const noexcept
     return impl_->activeCount.load(std::memory_order_relaxed);
 }
 
+ChunkRequestScheduler::TransferMeasurement::TransferMeasurement(
+    ChunkRequestScheduler* scheduler,
+    TransferId id,
+    std::chrono::steady_clock::time_point started)
+    : scheduler_(scheduler)
+    , id_(id)
+    , lastFlush_(started)
+{
+}
+
+ChunkRequestScheduler::TransferMeasurement::~TransferMeasurement()
+{
+    if (scheduler_)
+        finish(false, 0);
+}
+
+ChunkRequestScheduler::TransferMeasurement::TransferMeasurement(
+    TransferMeasurement&& other) noexcept
+    : scheduler_(std::exchange(other.scheduler_, nullptr))
+    , id_(std::exchange(other.id_, 0))
+    , pendingBytes_(std::exchange(other.pendingBytes_, 0))
+    , observedBytes_(std::exchange(other.observedBytes_, false))
+    , lastFlush_(other.lastFlush_)
+{
+}
+
+void ChunkRequestScheduler::TransferMeasurement::flush(
+    std::chrono::steady_clock::time_point observed)
+{
+    if (!scheduler_ || pendingBytes_ == 0)
+        return;
+    scheduler_->recordTransferBytes(id_, pendingBytes_, observed);
+    pendingBytes_ = 0;
+    lastFlush_ = observed;
+}
+
+void ChunkRequestScheduler::TransferMeasurement::recordBytes(
+    std::size_t encodedBytes,
+    std::chrono::steady_clock::time_point observed)
+{
+    if (!scheduler_ || encodedBytes == 0)
+        return;
+    if (!observedBytes_) {
+        observedBytes_ = true;
+        scheduler_->recordTransferBytes(id_, encodedBytes, observed);
+        lastFlush_ = observed;
+        return;
+    }
+    pendingBytes_ += encodedBytes;
+    constexpr std::size_t kProgressBatchBytes = 256 * 1024;
+    constexpr auto kProgressBatchTime = std::chrono::milliseconds{100};
+    if (pendingBytes_ >= kProgressBatchBytes ||
+        observed - lastFlush_ >= kProgressBatchTime) {
+        flush(observed);
+    }
+}
+
+void ChunkRequestScheduler::TransferMeasurement::finish(
+    bool successful,
+    std::size_t encodedBytes,
+    std::chrono::steady_clock::time_point completed)
+{
+    if (!scheduler_)
+        return;
+    flush(completed);
+    auto* scheduler = std::exchange(scheduler_, nullptr);
+    scheduler->finishTransfer(id_, successful, encodedBytes, completed);
+    id_ = 0;
+}
+
+ChunkRequestScheduler::TransferMeasurement ChunkRequestScheduler::beginTransfer(
+    std::chrono::steady_clock::time_point started)
+{
+    return TransferMeasurement(this, beginTransferId(started), started);
+}
+
+ChunkRequestScheduler::TransferId ChunkRequestScheduler::beginTransferId(
+    std::chrono::steady_clock::time_point started)
+{
+    std::lock_guard lock(impl_->mutex);
+    const TransferId id = impl_->nextTransferId++;
+    impl_->activeTransfers.emplace(id, Impl::ActiveTransfer{
+        started,
+        impl_->admissionLimit,
+        impl_->epochGeneration});
+    return id;
+}
+
+void ChunkRequestScheduler::recordTransferBytes(
+    TransferId transfer,
+    std::size_t encodedBytes,
+    std::chrono::steady_clock::time_point observed)
+{
+    if (transfer == 0 || encodedBytes == 0)
+        return;
+    std::lock_guard lock(impl_->mutex);
+    const auto found = impl_->activeTransfers.find(transfer);
+    if (found == impl_->activeTransfers.end())
+        return;
+    impl_->recordStreamBytesLocked(found->second, encodedBytes, observed);
+}
+
+void ChunkRequestScheduler::finishTransfer(
+    TransferId transfer,
+    bool successful,
+    std::size_t encodedBytes,
+    std::chrono::steady_clock::time_point completed)
+{
+    if (transfer == 0)
+        return;
+    std::lock_guard lock(impl_->mutex);
+    const auto found = impl_->activeTransfers.find(transfer);
+    if (found == impl_->activeTransfers.end())
+        return;
+
+    auto measured = found->second;
+    impl_->finishStreamingLocked(measured, completed);
+    impl_->activeTransfers.erase(found);
+
+    const std::size_t availableWork =
+        impl_->activeCount.load(std::memory_order_acquire) +
+        impl_->locations.size();
+    const bool occupancyKnown = availableWork != 0;
+    const bool saturated = !occupancyKnown ||
+        availableWork >= measured.admission;
+
+    if (!successful || encodedBytes == 0 || completed <= measured.started) {
+        if (impl_->adaptive && measured.epochGeneration == impl_->epochGeneration)
+            impl_->resetEpochLocked(completed);
+        return;
+    }
+
+    const auto previousLimit = impl_->admissionLimit;
+    impl_->recordSuccessfulCompletionLocked(
+        {encodedBytes, measured.started, completed,
+         measured.admission, saturated},
+        measured.streamedBytes != 0,
+        measured.epochGeneration);
+    if (impl_->admissionLimit > previousLimit)
+        impl_->cv.notify_all();
+}
+
 void ChunkRequestScheduler::recordSuccessfulTransfer(
     std::size_t encodedBytes,
     std::chrono::steady_clock::time_point started,
@@ -953,15 +1288,11 @@ void ChunkRequestScheduler::recordSuccessfulTransfer(
     const bool occupancyKnown = availableWork != 0;
     const bool saturated = !occupancyKnown ||
         availableWork >= impl_->targetAdmissionLimit;
-    impl_->transferSamples.push_back(
-        {encodedBytes, started, completed, impl_->admissionLimit, saturated});
-    const std::size_t maximumSamples = impl_->adaptiveOptions.maximum *
-        impl_->adaptiveOptions.successfulSamplesPerWorker;
-    while (impl_->transferSamples.size() > maximumSamples)
-        impl_->transferSamples.pop_front();
     const auto previousLimit = impl_->admissionLimit;
-    impl_->updateTransferEstimateLocked();
-    impl_->updateAdaptiveControlLocked(impl_->transferSamples.back());
+    impl_->recordSuccessfulCompletionLocked(
+        {encodedBytes, started, completed, impl_->admissionLimit, saturated},
+        false,
+        impl_->epochGeneration);
     if (impl_->admissionLimit > previousLimit)
         impl_->cv.notify_all();
 }
@@ -969,6 +1300,7 @@ void ChunkRequestScheduler::recordSuccessfulTransfer(
 ChunkRequestScheduler::TransferStats ChunkRequestScheduler::transferStats() const
 {
     std::lock_guard lock(impl_->mutex);
+    impl_->updateStreamEstimateLocked(std::chrono::steady_clock::now());
     return {
         impl_->admissionLimit,
         impl_->estimatedBytesPerSecond,

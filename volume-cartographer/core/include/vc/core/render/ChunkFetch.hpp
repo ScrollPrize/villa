@@ -61,6 +61,8 @@ struct ChunkFetchResult {
 
 class IChunkFetcher {
 public:
+    using DownloadProgressCallback = std::function<void(std::size_t)>;
+
     virtual ~IChunkFetcher() = default;
     virtual ChunkFetchResult fetch(const ChunkKey& key) = 0;
 
@@ -70,6 +72,16 @@ public:
     virtual ChunkFetchResult fetchEncoded(const ChunkKey& key)
     {
         return fetch(key);
+    }
+
+    // Remote fetchers may report encoded response-body bytes while they are
+    // received. The default intentionally emits no synthetic progress; the
+    // scheduler can fall back to completion-based request rates.
+    virtual ChunkFetchResult fetchEncoded(
+        const ChunkKey& key,
+        const DownloadProgressCallback&)
+    {
+        return fetchEncoded(key);
     }
 
     virtual ChunkFetchResult decodeFetched(

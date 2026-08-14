@@ -54,7 +54,7 @@ int main(int argc, char** argv)
     std::size_t workers = 64;
     std::size_t minimumWorkers = 2;
     std::size_t samplesPerWorker = 4;
-    double minimumEpochSeconds = 2.0;
+    double minimumEpochSeconds = 5.0;
     double maximumEpochSeconds = 5.0;
     double unstableProbeSeconds = 60.0;
     double stableProbeSeconds = 300.0;
@@ -81,11 +81,11 @@ int main(int argc, char** argv)
         ("min-workers", po::value<std::size_t>(&minimumWorkers)->default_value(2),
          "Initial/minimum workers in auto mode")
         ("samples-per-worker", po::value<std::size_t>(&samplesPerWorker)->default_value(4),
-         "Successful chunks per admitted worker in the displayed bandwidth window")
-        ("epoch-min-seconds", po::value<double>(&minimumEpochSeconds)->default_value(2.0),
-         "Minimum auto-probe measurement duration")
+         "Successful chunks per admitted worker in the non-streaming fallback window")
+        ("epoch-min-seconds", po::value<double>(&minimumEpochSeconds)->default_value(5.0),
+         "Minimum active auto-probe measurement duration")
         ("epoch-max-seconds", po::value<double>(&maximumEpochSeconds)->default_value(5.0),
-         "Maximum auto-probe measurement duration")
+         "Compatibility upper bound; never bypasses auto-probe requirements")
         ("unstable-probe-seconds", po::value<double>(&unstableProbeSeconds)->default_value(60.0),
          "Exploration interval after a 2x bandwidth change")
         ("stable-probe-seconds", po::value<double>(&stableProbeSeconds)->default_value(300.0),

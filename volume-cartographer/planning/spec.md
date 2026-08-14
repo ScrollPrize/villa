@@ -152,13 +152,19 @@
   queue; misses enter the remote source-read queue. Successful source reads
   then enter the decode queue.
 - Normal interactive remote source reads use 64 available workers with an
-  adaptive admission limit in `[2,64]`. Saturated epochs measure aggregate
-  encoded goodput and p90 request latency. Bracketed probes compare the settled
-  limit with higher and lower limits; initial discovery uses a 4x step and
-  subsequent refinement uses 2x steps. Stable bandwidth stretches periodic
-  exploration toward five minutes, while a roughly 2x bandwidth change brings
-  it back toward one minute. Failed, missing, and underfilled-tail reads do not
-  establish capacity.
+  adaptive admission limit in `[2,64]`. The common HTTP response callback
+  reports encoded body bytes for scoped Zarr chunk reads. A service-global
+  five-active-second window aggregates concurrent payload bytes while excluding
+  intervals with no measured transfer active. Saturated adaptive epochs use the same
+  aggregate measurement plus p90 request latency and require both five active
+  seconds and at least one successful completion per admitted worker. Fetchers
+  without byte progress fall back to mean individual request rate multiplied by
+  their common admission. Bracketed probes compare the settled limit with higher
+  and lower limits; initial discovery uses a 4x step and subsequent refinement
+  uses 2x steps. Stable bandwidth stretches periodic exploration toward five
+  minutes, while a roughly 2x bandwidth change brings it back toward one minute.
+  Failed, missing, and underfilled-tail reads reset rather than establish an
+  adaptive capacity epoch.
 - VC3D persists the settled admission limit, long-term bandwidth EMA, and
   saturated per-worker capacity model in its versioned per-user settings. A
   later run restores and uses the settled limit immediately. Epoch samples,
@@ -202,10 +208,11 @@ During active remote downloads, the existing cache status bar appends:
 - The queue item is shown only for remote volumes while remote fetches are in
   flight. Remote volumes otherwise show `net idle`; local volumes have no
   network field.
-- The displayed MiB/s is the adaptive controller's aggregate successful-chunk
-  estimate over its current `parallelism * 4` sample window, not a fixed-time
-  status polling window. The `Nx` value remains the actual current number of
-  source fetches in flight.
+- The displayed MiB/s and adaptive controller use the same aggregate encoded
+  HTTP body-byte estimator over the last five active transfer seconds. It is
+  updated independently of chunk completion and excludes intervals with no
+  measured transfer active.
+  The `Nx` value remains the actual current number of source fetches in flight.
 - The full active status is
   `RAM X/Y disk X/Y GiB net Nx XMiB/s qK X/Y/Z Z sens: N.N`.
 

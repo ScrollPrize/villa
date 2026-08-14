@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1621,6 +1622,13 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
     ChunkFetchResult fetch;
     bool trackedRemoteFetch = false;
     const auto fetchStarted = std::chrono::steady_clock::now();
+    std::optional<ChunkRequestScheduler::TransferMeasurement> transfer;
+    if (context.fetchScheduler)
+        transfer.emplace(context.fetchScheduler->beginTransfer(fetchStarted));
+    auto observeProgress = [&](std::size_t bytes) {
+        if (transfer)
+            transfer->recordBytes(bytes);
+    };
     try {
         if (state->options_.persistentCachePath) {
             trackedRemoteFetch = true;
@@ -1631,7 +1639,7 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
             }
             notifyRemoteFetchListeners(state, key, true);
         }
-        fetch = context.fetcher->fetchEncoded(fetcherKey(key));
+        fetch = context.fetcher->fetchEncoded(fetcherKey(key), observeProgress);
     } catch (const std::exception& e) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = e.what();
@@ -1653,6 +1661,14 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
             key.ix);
     }
 
+    const auto fetchCompleted = std::chrono::steady_clock::now();
+    if (transfer) {
+        transfer->finish(
+            fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty(),
+            fetch.bytes.size(),
+            fetchCompleted);
+    }
+
     bool remoteActivityEnded = false;
     if (trackedRemoteFetch) {
         std::lock_guard lock(state->mutex_);
@@ -1665,13 +1681,6 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
                 state->activeRemoteFetches_.erase(active);
                 remoteActivityEnded = true;
             }
-        }
-    }
-    if (fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty()) {
-        if (context.fetchScheduler) {
-            context.fetchScheduler->recordSuccessfulTransfer(
-                fetch.bytes.size(), fetchStarted,
-                std::chrono::steady_clock::now());
         }
     }
     if (remoteActivityEnded)

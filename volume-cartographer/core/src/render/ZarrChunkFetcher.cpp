@@ -187,6 +187,20 @@ public:
 
     ChunkFetchResult fetchEncoded(const ChunkKey& key) override
     {
+        return fetchEncodedImpl(key);
+    }
+
+    ChunkFetchResult fetchEncoded(
+        const ChunkKey& key,
+        const DownloadProgressCallback& progress) override
+    {
+        utils::HttpClient::ScopedDownloadObserver observer(progress);
+        return fetchEncodedImpl(key);
+    }
+
+private:
+    ChunkFetchResult fetchEncodedImpl(const ChunkKey& key)
+    {
         ChunkFetchResult result;
         const std::array<std::size_t, 3> indices{
             static_cast<std::size_t>(key.iz),
@@ -215,6 +229,8 @@ public:
         }
         return result;
     }
+
+public:
 
     ChunkFetchResult decodeFetched(
         const ChunkKey&,

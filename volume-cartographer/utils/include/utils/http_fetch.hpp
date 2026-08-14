@@ -14,6 +14,7 @@
 #include <span>
 #include <atomic>
 #include <filesystem>
+#include <functional>
 
 // NOTE: <curl/curl.h> is intentionally NOT included here. All curl-typed
 // code lives in http_fetch.cpp so the ~88 TUs that pull this header in
@@ -113,6 +114,25 @@ struct AwsAuth {
 // ---------------------------------------------------------------------------
 class HttpClient final {
 public:
+    using DownloadObserver = std::function<void(std::size_t)>;
+
+    // Observes response-body bytes received by HttpClient calls on the current
+    // thread. Scoping keeps unrelated HTTP and metadata traffic out of callers'
+    // transfer measurements.
+    class ScopedDownloadObserver final {
+    public:
+        explicit ScopedDownloadObserver(DownloadObserver observer);
+        ~ScopedDownloadObserver();
+
+        ScopedDownloadObserver(const ScopedDownloadObserver&) = delete;
+        ScopedDownloadObserver& operator=(const ScopedDownloadObserver&) = delete;
+        ScopedDownloadObserver(ScopedDownloadObserver&&) = delete;
+        ScopedDownloadObserver& operator=(ScopedDownloadObserver&&) = delete;
+
+    private:
+        DownloadObserver previous_;
+    };
+
     struct Config {
         HttpAuth auth{};
         AwsAuth aws_auth{};  // AWS SigV4 authentication (takes precedence over auth if non-empty)

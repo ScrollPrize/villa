@@ -2,6 +2,10 @@
 
 ## 2026-08-14
 
+- Replaced completion-span remote bandwidth estimates with service-wide
+  streamed HTTP payload measurement. VC3D status, the Zarr download benchmark,
+  and adaptive admission now share a five-active-second estimator; custom
+  fetchers retain a per-request-rate fallback.
 - Made `ChunkCacheService` the sole source factory and scheduler owner. Source
   acquisition can no longer change global I/O policy, and runtime concurrency
   updates modify admission on the existing scheduler without cancelling,

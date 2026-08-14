@@ -45,13 +45,50 @@ class ChunkRequestScheduler final {
 public:
     using TaskId = std::uint64_t;
     using TaskGroup = std::uint64_t;
+    using TransferId = std::uint64_t;
+
+    class TransferMeasurement final {
+    public:
+        ~TransferMeasurement();
+        TransferMeasurement(TransferMeasurement&& other) noexcept;
+        TransferMeasurement& operator=(TransferMeasurement&&) = delete;
+        TransferMeasurement(const TransferMeasurement&) = delete;
+        TransferMeasurement& operator=(const TransferMeasurement&) = delete;
+
+        void recordBytes(
+            std::size_t encodedBytes,
+            std::chrono::steady_clock::time_point observed =
+                std::chrono::steady_clock::now());
+        void finish(
+            bool successful,
+            std::size_t encodedBytes,
+            std::chrono::steady_clock::time_point completed =
+                std::chrono::steady_clock::now());
+
+    private:
+        friend class ChunkRequestScheduler;
+        TransferMeasurement(ChunkRequestScheduler* scheduler,
+                            TransferId id,
+                            std::chrono::steady_clock::time_point started);
+        void flush(std::chrono::steady_clock::time_point observed);
+
+        ChunkRequestScheduler* scheduler_ = nullptr;
+        TransferId id_ = 0;
+        std::size_t pendingBytes_ = 0;
+        bool observedBytes_ = false;
+        std::chrono::steady_clock::time_point lastFlush_;
+    };
 
     struct AdaptiveConcurrency {
         std::size_t minimum = 2;
         std::size_t maximum = 64;
-        // Rolling successful-transfer window used for displayed bandwidth.
+        // Completion window used only by fetchers without byte progress.
         std::size_t successfulSamplesPerWorker = 4;
-        double minimumEpochSeconds = 2.0;
+        // Adaptive epochs require both this much active transfer time and at
+        // least one successful completion per admitted worker.
+        double minimumEpochSeconds = 5.0;
+        // Retained for configuration compatibility. It never bypasses either
+        // minimum adaptive-epoch requirement.
         double maximumEpochSeconds = 5.0;
         double unstableProbeIntervalSeconds = 60.0;
         double stableProbeIntervalSeconds = 300.0;
@@ -118,6 +155,16 @@ public:
 
     [[nodiscard]] std::size_t pending() const;
     [[nodiscard]] std::size_t active() const noexcept;
+
+    // Measure one source request. Stream-capable fetchers report response-body
+    // increments between begin/finish; those aggregate bytes are authoritative
+    // for both displayed bandwidth and adaptive admission. Callers without
+    // progress support still receive the per-request completion fallback.
+    [[nodiscard]] TransferMeasurement beginTransfer(
+        std::chrono::steady_clock::time_point started);
+
+    // Compatibility and deterministic-test entry point for fetchers without
+    // streamed-byte observations.
     void recordSuccessfulTransfer(
         std::size_t encodedBytes,
         std::chrono::steady_clock::time_point started,
@@ -127,6 +174,18 @@ public:
     void waitIdle();
 
 private:
+    [[nodiscard]] TransferId beginTransferId(
+        std::chrono::steady_clock::time_point started);
+    void recordTransferBytes(
+        TransferId transfer,
+        std::size_t encodedBytes,
+        std::chrono::steady_clock::time_point observed);
+    void finishTransfer(
+        TransferId transfer,
+        bool successful,
+        std::size_t encodedBytes,
+        std::chrono::steady_clock::time_point completed);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
