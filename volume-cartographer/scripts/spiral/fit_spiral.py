@@ -77,6 +77,7 @@ from sample_spiral import (
 import strip_path_pools
 from losses import (
     build_pcl_sampling_strata,
+    build_serpentine_quad_path,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -910,6 +911,16 @@ class FitContext:
                 # entirely outside the z-ROI are dropped earlier.
                 in_roi_quad_mask_np = valid_quad_mask_np
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
+            # Patches below the 2D-sampling area threshold get a serpentine
+            # walk over their in-ROI valid quads; the loss samplers draw sparse
+            # whole-patch 2D samples along it instead of 1D strips (see
+            # _build_patch_ijs / _sample_patch_batch in losses.py).
+            max_area_2d = self.config['patch_2d_sampling_max_area']
+            patch._sampling_2d_path = (
+                build_serpentine_quad_path(in_roi_quad_mask_np)
+                if max_area_2d is not None and float(patch.area) < max_area_2d
+                else None
+            )
             if not native_sampling_available:
                 patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
                 patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
