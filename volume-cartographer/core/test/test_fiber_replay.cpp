@@ -36,6 +36,9 @@ TEST_CASE("fiber replay tube uses exact endpoint caps and sorted explicit cells"
 
     CHECK(tube.beginArcBase == doctest::Approx(2.0));
     CHECK(tube.endArcBase == doctest::Approx(6.0));
+    REQUIRE(tube.referenceIntervalBase.size() == 2);
+    CHECK(tube.referenceIntervalBase.front()[0] == doctest::Approx(4.0));
+    CHECK(tube.referenceIntervalBase.back()[0] == doctest::Approx(8.0));
     CHECK(tube.containsBasePoint({4.0, 6.0, 4.0}));
     CHECK_FALSE(tube.containsBasePoint({1.9, 6.1, 4.0}));
     CHECK(std::is_sorted(tube.cellsZYX.begin(), tube.cellsZYX.end()));
@@ -73,10 +76,46 @@ TEST_CASE("forward replay matching uses caller supplied variable advance")
     CHECK(longStep.projection.distance == doctest::Approx(1.0));
 }
 
+TEST_CASE("forward polyline interval defaults to the complete remaining reference")
+{
+    const auto reference = vc::fiber_tracer::makePolylineArcGeometry({
+        {0.0, 0.0, 0.0},
+        {3.0, 0.0, 0.0},
+        {7.0, 0.0, 0.0},
+        {12.0, 0.0, 0.0},
+    });
+
+    const auto complete =
+        vc::fiber_tracer::selectForwardPolylineArcInterval(reference, 1);
+    CHECK(complete.beginArc == doctest::Approx(3.0));
+    CHECK(complete.endArc == doctest::Approx(12.0));
+
+    const auto limited = vc::fiber_tracer::selectForwardPolylineArcInterval(
+        reference, 1, 4.0);
+    CHECK(limited.beginArc == doctest::Approx(3.0));
+    CHECK(limited.endArc == doctest::Approx(7.0));
+
+    const auto clamped = vc::fiber_tracer::selectForwardPolylineArcInterval(
+        reference, 1, 100.0);
+    CHECK(clamped.endArc == doctest::Approx(12.0));
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::selectForwardPolylineArcInterval(reference, 3),
+        doctest::Contains("no forward extent"), std::invalid_argument);
+}
+
 TEST_CASE("dual replay publication is deterministic and no-vis has only full traces")
 {
     const auto directory = temporaryDirectory();
     vc::fiber_tracer::FiberReplayBundleInput input;
+    input.request.fiber.linePointsXyzBase = {
+        {0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}, {8.0, 0.0, 0.0}};
+    input.request.fiber.controlPointsXyzBase = {
+        input.request.fiber.linePointsXyzBase.front(),
+        input.request.fiber.linePointsXyzBase.back()};
+    input.request.fiber.controlPointLineIndices = {0, 2};
+    input.request.referenceEndArcBase = 4.0;
+    input.requestedLengthBaseVoxels = 4.0;
     input.greedyReplay.referenceEndArcBase = 4.0;
     input.greedyReplay.completedReferenceArcBase = 4.0;
     vc::fiber_tracer::FiberReplayTraceSegment greedyFirst;
@@ -99,6 +138,7 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     fiberlet.terminationReason = "reference_end";
     fiberlet.routePointsBaseXYZ = {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
     input.fiberletReplay.segments = {fiberlet};
+    input.fiberletReplayConfig.referenceEndArcBase = 4.0;
     input.referenceGeometryBase = {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
     input.sources = nlohmann::json::object();
     input.traceBinding = nlohmann::json::object();
@@ -112,6 +152,11 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
 
     const auto bundle = vc::fiber_tracer::writeFiberReplayBundle(directory, input);
     CHECK(bundle.at("version") == 2);
+    CHECK(bundle.at("requested_length_base_voxels") == 4.0);
+    CHECK(bundle.at("reference_begin_arc_base") == 0.0);
+    CHECK(bundle.at("reference_end_arc_base") == 4.0);
+    CHECK(bundle.at("reference_length_base_voxels") == 4.0);
+    CHECK(bundle.at("reference_points_base_xyz").size() == 2);
     CHECK(bundle.at("visualizations").empty());
     REQUIRE(bundle.at("artifacts").size() == 5);
     CHECK(bundle.at("artifacts").contains("replay/reference.obj"));

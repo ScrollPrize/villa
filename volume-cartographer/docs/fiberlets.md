@@ -193,22 +193,25 @@ paths.
 
 Candidate generation finishes before any path search. A fixed worker pool then
 prepares every searchable candidate exactly once: one Hermite domain, its
-corridor-filtered local keys, mapped floating-point node positions, and compact
-trilinear interpolation stencils. Worker-local native-corner sets are sorted and
+corridor-filtered checked 32-bit local keys, and mapped `float32` interior-node
+positions. Worker-local native-corner sets are derived directly from those
+positions, sorted, and
 merged into one deterministic stored-ZYX ordered global union. Required corners
 remain included even when a replay tube excludes the corner itself.
 
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
 prediction calls, then all normal calls, materializes every prepared endpoint
-and node score, releases sampling/stencil storage, and finally runs every DP
+and node score by deriving corners and weights from its position again,
+releases sampling storage, and finally runs every DP
 candidate in parallel from its retained geometry. Increasing `--batch` changes
 sampler call count only; it cannot decrease the unique request population or
 change path/graph artifacts. Each volume call and each parallel stage may use
 `--threads`; candidate results remain in their canonical slots.
 
 Runtime reports unique sampled voxels, coordinate batch/call counts, peak call
-size, an owned-payload peak-memory estimate, evaluated DP nodes, and separate
+size, prepared-geometry bytes, worst concurrent DP state/hash scratch, an
+owned-payload peak-memory estimate, evaluated DP nodes, and separate
 candidate-generation, preparation, corner-merge, prediction-read, normal-read,
 materialization, and DP wall/CPU times. Effective cores are process CPU seconds
 divided by wall seconds. Progress is phase-labelled and operational only.
@@ -232,6 +235,14 @@ one. Their directions and lengths are computed from the resulting floating XYZ
 positions, so they are not restricted to world axes or 26 quantized directions.
 The layered graph is acyclic. DP state retains the incoming transition because
 alignment and curvature depend on the previous physical step.
+
+Each interior node occupies 24 bytes: one checked row-major `uint32` key,
+three `float32` prediction coordinates, compact two-byte fiber and normal axes,
+one byte of presence, and validity flags. Fiber/normal axes use the same +Z
+hemisphere `nx/ny` encoding as Lasagna and presence uses the native byte scale.
+No per-node reason string or interpolation-address object is retained. This
+re-quantization is intentional for the experimental fiberlet objective; exact
+anchor endpoints remain double precision.
 
 Presence is trilinearly interpolated. Fiber directions are unoriented: the
 positive-weight native corner axes are normalized and accumulated as weighted
@@ -373,9 +384,11 @@ compatibility path. Obsolete `mtllib` or `usemtl` records are rejected.
 ## Dense-fiber failure replay
 
 `fiberlet-replay` builds anchors and one canonical fiberlet graph in a tube
-around the complete reference interval, starting at the first control point.
-It then runs two independent whole-reference evaluators: the regular native 3D
-greedy tracer and the fiberlet graph tracer.
+around the selected reference interval, starting at the first control point.
+It then runs two independent evaluators over exactly that interval: the regular
+native 3D greedy tracer and the fiberlet graph tracer. The interval reaches the
+reference end by default; `--length N` limits it to `N` base voxels and clamps
+an oversized request at the reference end.
 
 ```bash
 volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
@@ -384,18 +397,20 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   /tmp/fiberlet-replay \
   --normal-manifest /path/to/lasagna.lasagna.json \
   --beam 16 \
-  --lookahead 3
+  --lookahead 3 \
+  --length 4096
 ```
 
 Both evaluators use the same monotone exact reference matcher and the same
 `--fail 20` base-voxel threshold. A failure ends only that evaluator's current
 segment. It restarts from the authoritative reference point and fitted forward
-tangent at a strictly advanced arc, then continues to reference end. Native
+tangent at a strictly advanced arc, then continues to the selected end. Native
 termination, graph exhaustion, and absence of an admissible graph seed are
 typed failures rather than silent completion. Fiberlet failures complete the
-containing graph edge before reseeding so every stored graph segment still
-terminates at an anchor. Reset jumps are stored as separate segments and are
-never drawn as trace geometry.
+containing graph edge before reseeding. If the selected end lies inside an edge,
+only samples through that bound are retained and the segment is explicitly
+marked `terminal_partial_edge`, with no terminal anchor. Reset jumps are stored
+as separate segments and are never drawn as trace geometry.
 
 After graph construction, greedy and graph evaluation run concurrently over
 immutable shared reference/graph state. Each command-line failure record
@@ -404,7 +419,7 @@ optional error, and both current failure counts. Console arrival order is
 diagnostic only. Publication sorts visualization identity by reference arc,
 tracer, and tracer-local index.
 
-The graph retains every successful fiberlet over the complete reference tube;
+The graph retains every successful fiberlet over the selected reference tube;
 failure-local graphs are not used for evaluation. Fiberlet curve volume samples
 use the complete globally deduplicated coordinate union and `--batch` only
 limits coordinates per sampler call, as described above. The final summary
@@ -415,14 +430,15 @@ By default the command publishes only the strict version-2 whole-run bundle.
 `--vis` additionally extracts a local tube for every failure. `--along 128`
 then selects the reference arclength before and after that failure and
 `--radius 64` selects the Euclidean tube radius. These controls affect only
-visualization extraction; the evaluators always traverse the complete
-reference interval. Every local visualization contains its own anchors,
+visualization extraction; the evaluators always traverse the selected
+comparison interval. Every local visualization contains its own anchors,
 anchor stages, fiberlets, graph, cropped evaluator segments, reference, and
 failure marker. No central textured slice OBJ is produced.
 
 Each run is published under `runs/<content-hash>/`; only after all requested
 generations exist is `fiber_replay.json` atomically replaced. The root stores
 the two scale bindings, requested and forced-effective trace configuration,
+requested/effective interval metadata, the exact selected reference geometry,
 complete segmented greedy and fiberlet results, failure arrays/counts, and an
 ordered visualization index with contained relative paths and hashes. It does
 not store the external presence-Zarr path. The experimental earlier replay
@@ -458,7 +474,8 @@ assignment.
 
 The benchmark runs the same local tube anchor and on-demand fiberlet extraction
 used by replay, without writing artifacts. The interval starts at the first
-control point and extends by `--along` base voxels (512 by default):
+control point and extends to the end of the reference by default. An explicit
+`--along` limits the interval to that many base voxels:
 
 ```bash
 volume-cartographer/build/bin/vc_fiberlets benchmark \

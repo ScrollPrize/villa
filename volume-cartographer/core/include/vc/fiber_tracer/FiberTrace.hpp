@@ -449,6 +449,7 @@ struct FiberReplayTraceRequest {
     double traceToBaseScale = 1.0;
     double errorThresholdBaseVoxels = 20.0;
     double matchRefineSteps = 1.0;
+    std::optional<double> referenceEndArcBase;
     FiberTraceConfig config;
 };
 

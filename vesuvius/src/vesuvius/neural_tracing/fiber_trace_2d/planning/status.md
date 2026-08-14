@@ -1,14 +1,11 @@
-# Status: stage-parallel fiberlet extraction
+# Status: bounded fiberlet replay comparison
 
 - [x] Record the task.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Implement one-time parallel candidate preparation.
-- [x] Implement global deterministic unique-corner merging.
-- [x] Batch only globally unique volume coordinates.
-- [x] Reuse prepared geometry in parallel DP.
-- [x] Update stage metrics and regression tests.
-- [x] Update specification and code documentation.
-- [x] Build and run focused validation with `-j32`.
-- [x] Run the fixed Paris4 batch-invariance benchmark.
-- [x] Run final repeated benchmark and finish task log/changelog.
+- [x] Implement bounded greedy and graph replay.
+- [x] Add CLI option and shared extraction interval.
+- [x] Add focused regression tests.
+- [x] Update specification and documentation.
+- [x] Build and run focused validation.
+- [x] Finish task log and changelog.

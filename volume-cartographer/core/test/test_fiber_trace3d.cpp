@@ -1351,6 +1351,39 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
     }
 }
 
+TEST_CASE("greedy replay stops at the selected reference end")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {
+        {0.0, 0.0, 0.0}, {40.0, 0.0, 0.0}};
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.referenceEndArcBase = 10.0;
+    request.errorThresholdBaseVoxels = 10.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberReplay(predictions, request);
+    CHECK(result.referenceEndArcBase == doctest::Approx(10.0));
+    CHECK(result.completedReferenceArcBase == doctest::Approx(10.0));
+    CHECK(result.failures.empty());
+    REQUIRE(result.segments.size() == 1);
+    CHECK(result.segments.front().terminationReason == "reference_end");
+    for (const auto& match : result.segments.front().matches) {
+        CHECK(match.predictedReferenceArcBase <= 10.0);
+        CHECK(match.searchEndArcBase <= 10.0);
+        CHECK(match.matchedReferenceArcBase <= 10.0);
+    }
+}
+
 TEST_CASE("replay resets after an invalid initial prediction without throwing")
 {
     InvalidStartPrediction predictions;

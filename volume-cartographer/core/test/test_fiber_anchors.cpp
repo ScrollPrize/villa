@@ -728,7 +728,7 @@ TEST_CASE("fiber anchor extraction halo encloses every oblique peak kernel")
     std::array<size_t, 3> selectedMinimum{};
     std::array<size_t, 3> selectedMaximum{};
     size_t calls = 0;
-    const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
+    const auto report = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
         {{80, 80, 80}, 1.0}, options,
         [&](const auto& indices, int, auto& samples) {
             if (calls++ == 0) {
@@ -757,7 +757,7 @@ TEST_CASE("fiber anchor extraction halo encloses every oblique peak kernel")
 
     options.peakGradientWeight = 0.0;
     calls = 0;
-    const auto noGradientReport = vc::fiber_tracer::extractFiberAnchorsForCells(
+    const auto noGradientReport = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
         {{80, 80, 80}, 1.0}, options,
         [&](const auto& indices, int, auto& samples) {
             if (calls++ == 0) {
@@ -1064,7 +1064,7 @@ TEST_CASE("fiber anchor artifacts are deterministic across outer worker counts")
     const auto first = vc::fiber_tracer::extractFiberAnchors(grid, one, sampler);
     const auto second = vc::fiber_tracer::extractFiberAnchors(grid, two, sampler);
     CHECK(allSamplerCallsSingleThreaded.load());
-    CHECK(samplerCalls.load() >= 16);
+    CHECK(samplerCalls.load() == 2);
     vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
     artifact.sourceLocator = "/tmp/fiber.lasagna.json";
     artifact.manifestContentHash = "fnv1a64:0123456789abcdef";
@@ -1097,6 +1097,32 @@ TEST_CASE("fiber anchor artifacts are deterministic across outer worker counts")
         CHECK(read(firstDirectory / name) == read(secondDirectory / name));
     std::filesystem::remove_all(firstDirectory);
     std::filesystem::remove_all(secondDirectory);
+}
+
+TEST_CASE("adjacent anchor cells share one dense tile sample")
+{
+    auto options = config();
+    options.parallelThreads = 8;
+    std::atomic<size_t> samplerCalls{0};
+    std::atomic<size_t> submittedSamples{0};
+    const auto report =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            {{64, 64, 64}, 1.0}, options,
+            [&](const auto& indices, int threads, auto& samples) {
+                CHECK(threads == 1);
+                ++samplerCalls;
+                submittedSamples.fetch_add(indices.size());
+                CHECK(std::is_sorted(indices.begin(), indices.end()));
+                CHECK(std::adjacent_find(indices.begin(), indices.end()) ==
+                    indices.end());
+                samples.assign(indices.size(), {
+                    cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+            },
+            {{8, 8, 8}, {8, 8, 9}, {8, 9, 8}, {9, 8, 8}});
+
+    CHECK(report.diagnostics.totalCells == 4);
+    CHECK(samplerCalls.load() == 1);
+    CHECK(submittedSamples.load() < 4 * 46 * 46 * 46);
 }
 
 TEST_CASE("fiber anchor extraction enforces its concurrent sample budget")
@@ -1495,16 +1521,12 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(outside->transition.threshold == 4.0);
     for (const auto& cell : report.nonEmptyCells)
         CHECK(cell.cellZYX == std::array<size_t, 3>{0, 0, 0});
-    REQUIRE(progress.size() >= 3);
-    CHECK(progress.front().phase == "selected_cells");
+    REQUIRE(progress.size() >= 2);
+    CHECK(progress.front().phase == "anchor_cells");
     CHECK(progress.front().completed == 0);
-    CHECK(progress.front().total == 2);
-    CHECK(std::any_of(progress.begin(), progress.end(), [](const auto& event) {
-        return event.phase == "selected_cells" && event.completed == 2 &&
-            event.total == 2;
-    }));
-    CHECK(progress.back().phase == "nms_context");
-    CHECK(progress.back().completed <= progress.back().total);
+    CHECK(progress.front().total >= 2);
+    CHECK(progress.back().phase == "anchor_cells");
+    CHECK(progress.back().completed == progress.back().total);
     const std::string cellObj =
         vc::fiber_tracer::fiberAnchorCellReportObj(report);
     CHECK(occurrenceCount(cellObj, "\np ") == 2);

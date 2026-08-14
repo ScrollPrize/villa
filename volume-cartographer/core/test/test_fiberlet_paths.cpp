@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -280,6 +281,21 @@ TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")
     score *= x.dot(diagonal);
     score *= diagonal.dot(diagonal);
     CHECK(fiberLocalAlignmentLoss(0.5f, x, diagonal, x, diagonal) == 1.0f - score);
+}
+
+TEST_CASE("compact fiber axes preserve unoriented directions")
+{
+    for (const cv::Vec3d axis : {
+             cv::Vec3d{1.0, 0.0, 0.0},
+             cv::normalize(cv::Vec3d{1.0, 2.0, 3.0}),
+             cv::normalize(cv::Vec3d{-2.0, 1.0, -4.0})}) {
+        const auto encoded = vc::lasagna::encodeCompactNormalToRaw(axis);
+        REQUIRE(encoded.has_value());
+        const cv::Vec3d decoded = vc::lasagna::decodeCompactNormalFromRaw(
+            (*encoded)[0], (*encoded)[1]);
+        CHECK(decoded[2] >= 0.0);
+        CHECK(std::abs(axis.dot(decoded)) > 0.999);
+    }
 }
 
 TEST_CASE("fiberlet radius-four neighborhood includes all shorter offsets")
@@ -577,6 +593,55 @@ TEST_CASE("fiberlet graph replay completes a failure edge then records an uncove
     const auto obj = vc::fiber_tracer::fiberletGraphReplayObj(replay);
     CHECK(occurrenceCount(obj, "\nv ") == 3);
     CHECK(obj.find("\nl 1 2 3\n") != std::string::npos);
+}
+
+TEST_CASE("fiberlet graph replay completes on a partial terminal edge")
+{
+    auto report = graphPathReport();
+    addGraphPath(
+        report, 0, 1,
+        {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {3, 0, 0}}, 3.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 10.0;
+    config.referenceEndArcBase = 1.5;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, config);
+
+    REQUIRE(replay.segments.size() == 1);
+    const auto& segment = replay.segments.front();
+    CHECK(segment.terminationReason == "reference_end");
+    CHECK(segment.terminalPartialEdge);
+    CHECK_FALSE(segment.stopNodeIndex.has_value());
+    CHECK(segment.routePointsBaseXYZ.size() == 3);
+    CHECK(segment.candidateIndices == std::vector<size_t>{0});
+    CHECK(segment.endReferenceArcBase == doctest::Approx(1.5));
+    CHECK(replay.completedReferenceArcBase == doctest::Approx(1.5));
+    CHECK(replay.failures.empty());
+    const auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
+    CHECK(json.at("segments").at(0).at("terminal_partial_edge") == true);
+}
+
+TEST_CASE("fiberlet graph replay reports a boundary failure before completion")
+{
+    auto report = graphPathReport();
+    addGraphPath(
+        report, 0, 1,
+        {{0, 0, 0}, {1, 0, 0}, {2, 2, 0}, {3, 2, 0}}, 3.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 0.5;
+    config.referenceEndArcBase = 1.5;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, config);
+
+    REQUIRE_FALSE(replay.failures.empty());
+    CHECK(replay.failures.front().reason == "distance_above_threshold");
+    CHECK(replay.failures.front().referenceArcBase == doctest::Approx(1.5));
+    CHECK(replay.failures.front().referenceArcFraction == doctest::Approx(1.0));
+    REQUIRE_FALSE(replay.segments.empty());
+    CHECK(replay.segments.front().routePointsBaseXYZ.size() == 3);
+    CHECK(replay.segments.front().terminalPartialEdge);
 }
 
 TEST_CASE("fiberlet graph replay reseeds independently after multiple failures")
@@ -900,8 +965,9 @@ TEST_CASE("fiberlet DP uses multiplicative presence and unoriented predictions")
 
     REQUIRE_MESSAGE(report.diagnostics.successfulPaths == 1, report.candidates[0].reason);
     CHECK(report.candidates[0].cost.invalidPrediction == 0.0);
-    CHECK(report.candidates[0].cost.alignment == doctest::Approx(3.0));
-    CHECK(report.candidates[0].cost.total() == doctest::Approx(3.0));
+    const double quantizedCost = 6.0 * (1.0 - 128.0 / 255.0);
+    CHECK(report.candidates[0].cost.alignment == doctest::Approx(quantizedCost));
+    CHECK(report.candidates[0].cost.total() == doctest::Approx(quantizedCost));
 }
 
 TEST_CASE("fiberlet multiplicative alignment changes the selected route")
@@ -943,6 +1009,19 @@ TEST_CASE("fiberlet local grid follows a narrow subvoxel corridor")
     REQUIRE(report.diagnostics.searchedPairs == 1);
     CHECK(report.diagnostics.successfulPaths == 1);
     CHECK(report.diagnostics.noPathPairs == 0);
+}
+
+TEST_CASE("fiberlet packed node keys reject an unrepresentable transverse grid")
+{
+    const auto anchors = twoAnchorArtifact();
+    auto config = pathConfig();
+    config.transverseStepPredictionVoxels = 1.0e-20;
+    const ConstantNormalSampler normals;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::traceFiberletPaths(
+            anchors, anchors.report.grid, config,
+            constantPredictions(), normals),
+        doctest::Contains("packed-key limits"), std::overflow_error);
 }
 
 TEST_CASE("fiberlet path JSON and OBJ are deterministic and scaled")

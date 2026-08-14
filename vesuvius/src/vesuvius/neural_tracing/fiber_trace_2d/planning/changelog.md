@@ -511,3 +511,16 @@
   deduplicated independent of sampler batch size, and materialized nodes are
   reused by parallel DP. Added actual per-stage process-CPU utilization and
   coordinate-call diagnostics.
+- Compacted retained fiberlet DP nodes to 24 bytes with checked 32-bit local
+  keys and Lasagna-style axis/presence bytes, removed retained interpolation
+  stencils, and separated prepared-geometry from transient-search memory
+  reporting.
+- Replaced overlapping per-cell anchor reads and the second NMS-context pass
+  with deterministic shared dense tiles over a conservative context population;
+  on the fixed 4096-base-voxel Paris4 workload this reduced anchor time by 42%,
+  total time by 22%, and peak RSS by about 75%.
+- Defaulted `vc_fiberlets benchmark` to the complete reference interval after
+  the first control point; explicit `--along` still requests a shorter interval.
+- Added replay-only `--length` in base voxels so extraction, both evaluators,
+  failure reporting, persisted geometry, and visualizations share one bounded
+  interval; omission retains complete-reference replay.

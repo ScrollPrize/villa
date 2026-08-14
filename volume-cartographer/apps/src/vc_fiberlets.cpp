@@ -65,11 +65,13 @@ struct CliOptions {
     std::optional<double> peakStepBaseVoxels;
     std::optional<double> localWindowBaseVoxels;
     std::optional<double> baseVoxelSizeUm;
+    std::optional<double> replayLengthBaseVoxels;
     double glyphLengthBaseVoxels = 16.0;
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool printStats = false;
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
+    bool alongSpecified = false;
     int inferenceScaledownPower = 2;
     double failureThresholdBaseVoxels = 20.0;
     double alongBaseVoxels = 128.0;
@@ -149,8 +151,9 @@ void usage(const char* executable)
               << "  --no-slices                   skip central presence-slice outputs\n";
     std::cerr << "\nReplay options:\n"
               << "  --fail N                      dense-reference failure distance in base voxels [20]\n"
+              << "  --length N                    compared reference length in base voxels [full]\n"
               << "  --vis                         write indexed local failure visualizations\n"
-              << "  --along N                     visualization distance before/after failure [128]\n"
+              << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
               << "  --radius N                    extraction tube radius in base voxels [64]\n"
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
               << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
@@ -242,7 +245,6 @@ CliOptions parseArgs(int argc, char** argv)
         options.command = Command::Benchmark;
         options.manifestLocation = argv[2];
         options.fiberJson = argv[3];
-        options.alongBaseVoxels = 512.0;
         firstOption = 4;
     } else if (command == "fiberlet-replay") {
         if (argc < 5) {
@@ -285,10 +287,14 @@ CliOptions parseArgs(int argc, char** argv)
             options.normalManifestLocation = valueAfter(index, argc, argv, "normal-manifest");
         } else if (argument == "--fail" && isReplayCommand(options.command)) {
             options.failureThresholdBaseVoxels = parseDouble(valueAfter(index, argc, argv, "fail"), "fail");
+        } else if (argument == "--length" && isReplayCommand(options.command)) {
+            options.replayLengthBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "length"), "length");
         } else if (argument == "--vis" && isReplayCommand(options.command)) {
             options.writeReplayVisualizations = true;
         } else if (argument == "--along" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
             options.alongBaseVoxels = parseDouble(valueAfter(index, argc, argv, "along"), "along");
+            options.alongSpecified = true;
         } else if (argument == "--radius" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
             options.radiusBaseVoxels = parseDouble(valueAfter(index, argc, argv, "radius"), "radius");
         } else if (argument == "--match-refine" && isReplayCommand(options.command)) {
@@ -407,7 +413,11 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (isReplayCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0) ||
-            !(options.matchRefineSteps >= 0.0) || options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30) {
+            !(options.matchRefineSteps >= 0.0) ||
+            (options.replayLengthBaseVoxels.has_value() &&
+             (!(*options.replayLengthBaseVoxels > 0.0) ||
+              !std::isfinite(*options.replayLengthBaseVoxels))) ||
+            options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30) {
             fail("fiber-replay options are outside their valid range");
         }
         vc::fiber_tracer::cli::validateTraceOptions(options.trace);
@@ -416,7 +426,9 @@ CliOptions parseArgs(int argc, char** argv)
             fail("fiber-replay only supports --beam-width 1 and --beam-lookahead-steps 1");
         }
     }
-    if (options.command == Command::Benchmark && (!(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0)))
+    if (options.command == Command::Benchmark &&
+        ((options.alongSpecified && !(options.alongBaseVoxels > 0.0)) ||
+         !(options.radiusBaseVoxels > 0.0)))
         fail("benchmark --along and --radius must be positive");
     const bool needsNormals = needsPathExtraction(options.command);
     const bool remote = vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
@@ -667,10 +679,14 @@ int main(int argc, char** argv)
             if (fiber.controlPointLineIndices.empty() || fiber.controlPointLineIndices.front() >= fiber.linePointsXyzBase.size())
                 fail("benchmark fiber has no valid first control point");
             const auto reference = vc::fiber_tracer::makePolylineArcGeometry(fiber.linePointsXyzBase);
-            const double beginArc = reference.vertexArcs.at(fiber.controlPointLineIndices.front());
-            const double endArc = std::min(reference.length(), beginArc + options.alongBaseVoxels);
-            if (!(endArc > beginArc))
-                fail("benchmark reference interval has no forward extent");
+            const auto interval = vc::fiber_tracer::selectForwardPolylineArcInterval(
+                reference,
+                fiber.controlPointLineIndices.front(),
+                options.alongSpecified
+                    ? std::optional<double>{options.alongBaseVoxels}
+                    : std::nullopt);
+            const double beginArc = interval.beginArc;
+            const double endArc = interval.endArc;
 
             vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
             normalOptions.workingToBaseScale = grid.predictionToBaseScale;
@@ -708,6 +724,8 @@ int main(int argc, char** argv)
                       << " searched_per_second=" << candidateRate << " sampling_coordinate_batches=" << extraction.paths.samplingCoordinateBatches
                       << " sampling_batch_coordinates=" << options.paths.samplingBatchCoordinates << " sampled_voxels=" << extraction.paths.sampledVoxels
                       << " mean_batch_voxels=" << meanBatchVoxels << " peak_batch_voxels=" << extraction.paths.peakCoordinateBatchVoxels
+                      << " prepared_geometry_bytes=" << extraction.paths.preparedGeometryBytes
+                      << " peak_search_transient_bytes=" << extraction.paths.peakSearchTransientBytes
                       << " estimated_peak_owned_bytes=" << extraction.paths.estimatedPeakOwnedBytes
                       << " evaluated_dp_nodes=" << extraction.paths.evaluatedDpNodes << " dp_nodes_per_second=" << nodeRate
                       << " candidate_generation_seconds=" << extraction.paths.candidateGenerationSeconds
@@ -751,6 +769,20 @@ int main(int argc, char** argv)
             const vc::lasagna::LasagnaNormalSampler traceNormalSampler(traceNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
 
             const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
+            if (fiber.controlPointLineIndices.empty() ||
+                fiber.controlPointLineIndices.front() >=
+                    fiber.linePointsXyzBase.size()) {
+                fail("fiber replay fiber has no valid first control point");
+            }
+            const auto reference = vc::fiber_tracer::makePolylineArcGeometry(
+                fiber.linePointsXyzBase);
+            const auto interval =
+                vc::fiber_tracer::selectForwardPolylineArcInterval(
+                    reference,
+                    fiber.controlPointLineIndices.front(),
+                    options.replayLengthBaseVoxels);
+            const double startArc = interval.beginArc;
+            const double endArc = interval.endArc;
             const auto requestedTrace = options.trace;
             auto effectiveTrace = requestedTrace;
             effectiveTrace.beamWidth = 1;
@@ -761,14 +793,12 @@ int main(int argc, char** argv)
             replayRequest.traceToBaseScale = scales.traceToBaseScale;
             replayRequest.errorThresholdBaseVoxels = options.failureThresholdBaseVoxels;
             replayRequest.matchRefineSteps = options.matchRefineSteps;
+            replayRequest.referenceEndArcBase = endArc;
             const double nominalStepBaseVoxels = effectiveTrace.stepVoxels * scales.traceToBaseScale;
             replayRequest.config = effectiveTrace;
 
             std::cerr << "fiber_replay_stage stage=trace_setup status=completed"
                       << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - traceSetupStart).count() << '\n';
-            const auto reference = vc::fiber_tracer::makePolylineArcGeometry(fiber.linePointsXyzBase);
-            const double startArc = reference.vertexArcs.at(fiber.controlPointLineIndices.front());
-            const double endArc = reference.length();
             const auto referenceGeometry = vc::fiber_tracer::slicePolylineArc(reference, startArc, endArc);
             resolveAnchorConfig(options, grid);
 
@@ -809,6 +839,7 @@ int main(int argc, char** argv)
             options.graphReplay.matchRefineSteps = options.matchRefineSteps;
             options.graphReplay.minimumResetAdvanceBaseVoxels = nominalStepBaseVoxels;
             options.graphReplay.referenceBeginArcBase = startArc;
+            options.graphReplay.referenceEndArcBase = endArc;
 
             std::mutex outputMutex;
             size_t greedyFailureCount = 0;
@@ -873,6 +904,8 @@ int main(int argc, char** argv)
             bundle.greedyReplay = std::move(*greedyReplay);
             bundle.fiberletReplay = std::move(*fiberletReplay);
             bundle.fiberletReplayConfig = options.graphReplay;
+            bundle.requestedLengthBaseVoxels =
+                options.replayLengthBaseVoxels;
             bundle.referenceGeometryBase = referenceGeometry;
             bundle.sources = {
                 {"fiber_manifest", datasetLocator(dataset)},
@@ -1042,7 +1075,10 @@ int main(int argc, char** argv)
                   << " searched=" << report.diagnostics.searchedPairs << " successful=" << report.diagnostics.successfulPaths
                   << " no_path=" << report.diagnostics.noPathPairs << " sampling_batches=" << report.samplingCoordinateBatches
                   << " sampled_voxels=" << report.sampledVoxels << " peak_batch_voxels=" << report.peakCoordinateBatchVoxels
-                  << " evaluated_dp_nodes=" << report.evaluatedDpNodes << " estimated_peak_owned_bytes=" << report.estimatedPeakOwnedBytes
+                  << " evaluated_dp_nodes=" << report.evaluatedDpNodes
+                  << " prepared_geometry_bytes=" << report.preparedGeometryBytes
+                  << " peak_search_transient_bytes=" << report.peakSearchTransientBytes
+                  << " estimated_peak_owned_bytes=" << report.estimatedPeakOwnedBytes
                   << " candidate_workers=" << report.candidateWorkers << " candidate_seconds=" << report.candidateGenerationSeconds
                   << " preparation_seconds=" << report.preparationSeconds << " search_seconds=" << report.searchSeconds
                   << " elapsed_seconds=" << report.elapsedSeconds << '\n';

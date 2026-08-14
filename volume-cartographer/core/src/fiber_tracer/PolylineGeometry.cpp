@@ -77,6 +77,30 @@ PolylineArcGeometry makePolylineArcGeometry(const std::vector<cv::Vec3d>& points
     return geometry;
 }
 
+ForwardPolylineArcInterval selectForwardPolylineArcInterval(
+    const PolylineArcGeometry& geometry,
+    size_t beginVertexIndex,
+    std::optional<double> maximumLength)
+{
+    if (geometry.points.size() < 2 ||
+        geometry.vertexArcs.size() != geometry.points.size() ||
+        beginVertexIndex >= geometry.vertexArcs.size()) {
+        throw std::invalid_argument("forward polyline interval start is invalid");
+    }
+    if (maximumLength.has_value() &&
+        (!std::isfinite(*maximumLength) || !(*maximumLength > 0.0))) {
+        throw std::invalid_argument(
+            "forward polyline interval maximum length must be positive");
+    }
+    const double beginArc = geometry.vertexArcs[beginVertexIndex];
+    const double endArc = maximumLength.has_value()
+        ? std::min(geometry.length(), beginArc + *maximumLength)
+        : geometry.length();
+    if (!(endArc > beginArc))
+        throw std::invalid_argument("forward polyline interval has no forward extent");
+    return {beginArc, endArc};
+}
+
 PolylineArcSample samplePolylineArc(
     const PolylineArcGeometry& geometry,
     double inputArc)
@@ -193,18 +217,23 @@ ForwardPolylineMatch matchForwardPolylinePoint(
     const cv::Vec3d& point,
     double previousArc,
     double expectedAdvance,
-    double refineAdvanceFactor)
+    double refineAdvanceFactor,
+    std::optional<double> maximumArc)
 {
     if (!std::isfinite(previousArc) || !(expectedAdvance > 0.0) ||
         !std::isfinite(expectedAdvance) || !(refineAdvanceFactor >= 0.0) ||
-        !std::isfinite(refineAdvanceFactor)) {
+        !std::isfinite(refineAdvanceFactor) ||
+        (maximumArc.has_value() && !std::isfinite(*maximumArc))) {
         throw std::invalid_argument("forward polyline match input is invalid");
     }
-    const double begin = std::clamp(previousArc, 0.0, geometry.length());
+    const double limit = maximumArc.has_value()
+        ? std::clamp(*maximumArc, 0.0, geometry.length())
+        : geometry.length();
+    const double begin = std::clamp(previousArc, 0.0, limit);
     const double predicted = std::min(
-        geometry.length(), begin + expectedAdvance);
+        limit, begin + expectedAdvance);
     const double end = std::min(
-        geometry.length(), predicted + refineAdvanceFactor * expectedAdvance);
+        limit, predicted + refineAdvanceFactor * expectedAdvance);
     return {
         predicted,
         begin,

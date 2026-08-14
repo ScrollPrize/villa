@@ -164,6 +164,8 @@ struct FiberletPathReport {
     size_t normalSamplingCalls = 0;
     size_t evaluatedDpNodes = 0;
     size_t preparedCandidates = 0;
+    size_t preparedGeometryBytes = 0;
+    size_t peakSearchTransientBytes = 0;
     size_t estimatedPeakOwnedBytes = 0;
     size_t candidateWorkers = 0;
     double candidateGenerationSeconds = 0.0;

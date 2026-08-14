@@ -57,6 +57,7 @@ struct FiberletGraphReplayConfig {
     double matchRefineSteps = 1.0;
     double minimumResetAdvanceBaseVoxels = 1.0;
     double referenceBeginArcBase = 0.0;
+    std::optional<double> referenceEndArcBase;
 };
 
 struct FiberletGraphReplayMatch {
@@ -78,6 +79,7 @@ struct FiberletGraphReplaySegment {
     std::vector<size_t> arcIndices;
     std::vector<size_t> transitionIndices;
     std::optional<size_t> stopNodeIndex;
+    bool terminalPartialEdge = false;
     std::vector<FiberletGraphReplayMatch> matches;
     double totalLoss = 0.0;
     FiberletPathCost edgeCost;

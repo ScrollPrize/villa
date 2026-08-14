@@ -248,6 +248,8 @@ sharedLasagnaChannelChunkCache(size_t capacityBytes);
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
+[[nodiscard]] std::optional<std::array<uint8_t, 2>>
+encodeCompactNormalToRaw(const cv::Vec3d& normal);
 [[nodiscard]] cv::Vec3d principalCompactTensorAxis(
     const cv::Matx33d& tensor,
     const cv::Vec3d& hint);

@@ -2640,15 +2640,19 @@
   candidate set, not only surviving candidates. Crossing directions and
   sequential anchors along a fiber therefore remain distinct. Cropped runs fit
   the exact external pivot cells that can directly compete with a selected
-  anchor, conservatively including the full refinement displacement before the
-  NMS reach, but serialize and count only selected cells.
+  anchor, conservatively including the full refinement displacement of both
+  anchors before the NMS reach, but serialize and count only selected cells.
 - Reductions, seeds, assignment ties, convergence, component ordering, and
   serialization sign are deterministic. Parallel work cannot change a
-  within-cell reduction. After serial cell selection, extraction schedules one
-  canonical outer job per cell. Each job samples exactly that cell's bounded
-  halo and performs all lower-level sampling/chunk reads with one thread; jobs
-  may run concurrently up to the configured worker count and aggregate sample
-  memory budget. The decoded chunk cache deduplicates overlapping chunk loads.
+  within-cell reduction. After serial cell selection, extraction forms the
+  selected cells plus every conservative direct-NMS-context cell, partitions
+  them into deterministic four-cell-per-axis spatial tiles, and samples one
+  dense ZYX box per tile with the complete fitting/peak/gradient halo. Cell
+  fits traverse indexed tile storage in the same canonical ZYX order as an
+  independent halo. Tile halos may overlap, but the decoded chunk cache avoids
+  repeated source-chunk reads. Deterministic tile splitting and the worker
+  count keep coordinate vectors, decoded samples, and cell scratch under the
+  aggregate sample-memory budget; lower-level sampling uses one thread.
   Results and worker failures are stored by canonical cell index, retain
   predicates and diagnostic aggregation run serially, and progress callbacks
   are serialized. The lowest-index cell failure is reported after all workers
@@ -2727,9 +2731,9 @@
   degrees. This stage does not impose degree, mutual-best, or overlap limits.
 - Candidate generation completes before scoring. A fixed worker pool prepares
   each searchable candidate exactly once into its canonical slot: one Hermite
-  domain, one corridor enumeration, local keys, mapped positions, and compact
-  immutable interpolation stencils. DP reuses this representation and never
-  reconstructs the domain, corridor, local nodes, or interpolation coordinates.
+  domain, one corridor enumeration, checked packed local keys, and mapped
+  positions. DP reuses this representation and never reconstructs the domain,
+  corridor, or local nodes.
 - Preparation accumulates positive-weight native corners in worker-local sets.
   Sorted worker vectors are reduced by deterministic pairwise unique merges to
   one complete stored-ZYX ordered global union. Its exact contents and size are
@@ -2737,8 +2741,9 @@
   selection-boundary corners.
 - `--batch`, initially 65536, limits consecutive global unique coordinates per
   sampler call. All prediction ranges complete before any normal range. After
-  all reads, prepared endpoint/node scores are materialized from their retained
-  stencils and sampling temporaries are released before parallel DP. Prediction
+  all reads, endpoint/node corners and weights are re-derived directly from
+  their canonical stored positions and sampling temporaries are released before
+  parallel DP. Prediction
   and normal samplers each receive every global coordinate exactly once; only
   their call count changes with `--batch`.
 - Every parallel stage writes canonical slots. Workers continue after
@@ -2767,7 +2772,12 @@
   transport followed by re-orthogonalization. A local key `(layer,u,v)` maps to
   `center + 0.5*u*U + 0.5*v*V` in prediction XYZ. Finite transverse bounds are
   derived from corridor radius, then mapped points are filtered by inclusive
-  volume bounds, exact corridor membership, and any replay tube predicate.
+  volume bounds, exact corridor membership, and any replay tube predicate. An
+  interior mapped point is narrowed once to three `float32` coordinates before
+  any of those admission tests; that stored position is authoritative for
+  sampling, DP geometry, and output. Exact endpoint anchors remain doubles.
+  `(layer,u,v)` is checked row-major packed into one `uint32_t` using the
+  per-candidate transverse width; non-finite or overflowing lattices fail.
 - The exact start `(s=0,u=v=0)` and target `(s=L,u=v=0)` are source and sink.
   Interior edges advance exactly one layer and change each transverse index by
   at most one. Their actual mapped XYZ vectors and Euclidean lengths drive all
@@ -2784,7 +2794,13 @@
   a unique principal eigenvalue. Antipodal axes therefore interpolate without
   cancellation, while an equal orthogonal mixture is invalid. Normals use the
   same sign-invariant interpolation, but an invalid corner or ambiguous tensor
-  produces an invalid normal and retains isotropic curvature fallback. The
+  produces an invalid normal and retains isotropic curvature fallback.
+  Materialized interior prediction and normal axes are re-encoded in the
+  Lasagna +Z compact `nx/ny` byte convention; presence is a clamped rounded
+  byte and validity uses independent bits. This intentional second
+  quantization is part of the experimental DP objective. The 24-byte node
+  stores only key, float position, compact axes, presence, and flags; no normal
+  reason or interpolation stencil is retained. The
   global sparse union includes all required native corners even when a corner
   lies outside the floating-node tube predicate. Evaluated nodes retain integer
   candidate and local keys rather than floating-point hash identity.
@@ -2908,12 +2924,16 @@
   voxels. Defaults are `--fail 20`, `--radius 64`, `--match-refine 1`,
   `--beam 16`, `--lookahead 3`, and `--batch 65536` native coordinates.
 - The evaluated interval begins at the first control point's dense-line arc and
-  ends at the final dense reference point. Anchor extraction is local to cells
-  intersecting the exact radius tube around that complete interval. One
+  ends at the final dense reference point by default. Replay-only `--length N`
+  selects at most `N` positive finite base voxels from that point and clamps an
+  oversized request at the reference end. One shared effective begin/end pair
+  bounds anchor/path extraction, both evaluators, failure fractions, artifacts,
+  and visualizations. Anchor extraction is local to cells intersecting the
+  exact radius tube around that selected interval. One
   canonical fiberlet graph is built before evaluation; it is never partitioned
   into reference windows, so spatially close but arclength-distant candidates
   remain eligible.
-- Full-reference replay uses the same global staged path extraction contract:
+- Replay uses the same global staged path extraction contract:
   prepare every curve once in parallel, merge one global unique corner union,
   batch only consecutive coordinate ranges, materialize all scores, then solve
   all curves in parallel. Required corners remain present outside the tube
@@ -2923,7 +2943,7 @@
   prediction loss, Lasagna-normal curvature, and validity rules, forcing beam
   width/lookahead to one. Graph replay uses deterministic receding-horizon beam
   search over the complete immutable graph with the shared edge/join objective.
-  After preprocessing, the two whole-reference evaluators run concurrently;
+  After preprocessing, the two selected-interval evaluators run concurrently;
   neither evaluator changes the other one's state.
 - Dense-reference matching is monotone and local. Greedy supplies its nominal
   step and graph replay each actual dense fiberlet edge length. Failure is the
@@ -2934,10 +2954,13 @@
   at least its nominal step, samples the exact authoritative reference point and
   fitted forward nonzero-edge tangent, clears graph incoming-join history, and
   starts the next segment. Reset count is bounded by reference length. Graph
-  replay finishes a failure-containing fiberlet before reseeding, so every
-  graph segment ends at an anchor, while the immutable first failing dense point
-  remains the event location. Reset jumps are distinct segments and must never
-  be emitted as connecting line geometry.
+  replay finishes a failure-containing fiberlet before reseeding, while the
+  immutable first failing dense point remains the event location. At the
+  selected end, threshold failure takes precedence over completion and later
+  samples are not evaluated. An end inside a fiberlet retains the selected
+  edge's full identity/cost accounting but only route samples through the bound;
+  it has no stop anchor and is marked `terminal_partial_edge`. Reset jumps are
+  distinct segments and must never be emitted as connecting line geometry.
 - Failure records contain tracer-local index, typed reason, matched reference
   arc and evaluated-interval fraction, optional evaluator point/index and error,
   segment index, and segment-local point index. Missing-seed or termination
@@ -2947,7 +2970,8 @@
   tracer enum, and tracer-local index. Both async evaluations are joined before
   either exception is propagated.
 - The authoritative strict version-2 root stores source/scale/config bindings,
-  complete reference geometry, complete segmented evaluator results and
+  requested/effective interval metadata, exact selected reference geometry,
+  complete segmented evaluator results and
   matches, failure arrays/counts, trace OBJ/JSON descriptors, and an ordered
   visualization index. Runs publish an immutable `runs/<content-hash>`
   generation before atomically replacing `fiber_replay.json`. Experimental
@@ -2966,7 +2990,11 @@
   possibly changed global index and does not reload the external presence Zarr.
 - `vc_fiberlets benchmark` runs the exact shared local tube anchor/path
   extraction without artifacts. Its interval starts at the first control point
-  and extends by `--along` base voxels (512 by default). The final row reports
+  and, when `--along` is omitted, extends through the reference end. An explicit
+  positive `--along` limits the interval to that many base voxels and remains
+  clamped at the reference end. Replay's separate visualization `--along`
+  remains a 128-base-voxel arclength half-window around each failure. The final
+  row reports
   exact interval/radius, populations and rates, coordinate-call/unique-voxel/
   owned-memory counts, DP nodes/rate, and per-stage wall/CPU/effective-core
   timings.

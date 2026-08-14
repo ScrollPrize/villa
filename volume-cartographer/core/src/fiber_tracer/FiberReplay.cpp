@@ -138,6 +138,36 @@ bool nearlyEqual(double left, double right)
     return std::abs(left - right) <= 1.0e-10 * scale;
 }
 
+bool nearlyEqual(const cv::Vec3d& left, const cv::Vec3d& right)
+{
+    return nearlyEqual(left[0], right[0]) &&
+        nearlyEqual(left[1], right[1]) && nearlyEqual(left[2], right[2]);
+}
+
+template <typename Replay>
+void validateReplayFailures(
+    const Replay& replay, const char* tracer)
+{
+    const double length =
+        replay.referenceEndArcBase - replay.referenceBeginArcBase;
+    for (size_t index = 0; index < replay.failures.size(); ++index) {
+        const auto& failure = replay.failures[index];
+        if (failure.index != index ||
+            failure.referenceArcBase < replay.referenceBeginArcBase - kEpsilon ||
+            failure.referenceArcBase > replay.referenceEndArcBase + kEpsilon ||
+            failure.referenceArcFraction < -kEpsilon ||
+            failure.referenceArcFraction > 1.0 + kEpsilon ||
+            !nearlyEqual(
+                failure.referenceArcFraction,
+                (failure.referenceArcBase - replay.referenceBeginArcBase) /
+                    length)) {
+            throw std::invalid_argument(
+                std::string(tracer) +
+                " replay failure lies outside the selected interval");
+        }
+    }
+}
+
 std::vector<std::vector<cv::Vec3d>> greedySegments(const FiberReplayTraceResult& replay)
 {
     std::vector<std::vector<cv::Vec3d>> result;
@@ -356,11 +386,60 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         !nearlyEqual(input.fiberletReplay.completedReferenceArcBase, input.fiberletReplay.referenceEndArcBase)) {
         throw std::invalid_argument("dual replay reference intervals are inconsistent or incomplete");
     }
+    const double beginArc = input.greedyReplay.referenceBeginArcBase;
+    const double endArc = input.greedyReplay.referenceEndArcBase;
+    if (!(endArc > beginArc + kEpsilon) ||
+        input.request.startControlPointIndex >=
+            input.request.fiber.controlPointLineIndices.size()) {
+        throw std::invalid_argument("fiber replay selected interval is invalid");
+    }
+    const auto fullReference =
+        makePolylineArcGeometry(input.request.fiber.linePointsXyzBase);
+    const size_t startLineIndex = input.request.fiber.controlPointLineIndices[
+        input.request.startControlPointIndex];
+    if (startLineIndex >= fullReference.vertexArcs.size() ||
+        !nearlyEqual(fullReference.vertexArcs[startLineIndex], beginArc) ||
+        endArc > fullReference.length() + kEpsilon) {
+        throw std::invalid_argument(
+            "fiber replay selected interval differs from its request");
+    }
+    const auto expectedReference =
+        slicePolylineArc(fullReference, beginArc, endArc);
+    if (expectedReference.size() != input.referenceGeometryBase.size() ||
+        !std::equal(
+            expectedReference.begin(), expectedReference.end(),
+            input.referenceGeometryBase.begin(),
+            [](const auto& left, const auto& right) {
+                return nearlyEqual(left, right);
+            })) {
+        throw std::invalid_argument(
+            "fiber replay reference geometry differs from the selected interval");
+    }
+    if (!nearlyEqual(input.fiberletReplayConfig.referenceBeginArcBase, beginArc) ||
+        !input.fiberletReplayConfig.referenceEndArcBase.has_value() ||
+        !nearlyEqual(*input.fiberletReplayConfig.referenceEndArcBase, endArc) ||
+        !input.request.referenceEndArcBase.has_value() ||
+        !nearlyEqual(*input.request.referenceEndArcBase, endArc)) {
+        throw std::invalid_argument(
+            "fiber replay engine configurations differ from the selected interval");
+    }
+    validateReplayFailures(input.greedyReplay, "greedy");
+    validateReplayFailures(input.fiberletReplay, "fiberlet");
 
     std::vector<const FiberReplayVisualizationInput*> visualizations;
     visualizations.reserve(input.visualizations.size());
     for (const auto& visualization : input.visualizations)
+    {
+        const auto& failure = visualizationFailure(input, visualization);
+        if (visualization.tube.beginArcBase < beginArc - kEpsilon ||
+            visualization.tube.endArcBase > endArc + kEpsilon ||
+            failure.referenceArcBase < visualization.tube.beginArcBase - kEpsilon ||
+            failure.referenceArcBase > visualization.tube.endArcBase + kEpsilon) {
+            throw std::invalid_argument(
+                "fiber replay visualization exceeds the selected interval");
+        }
         visualizations.push_back(&visualization);
+    }
     std::sort(visualizations.begin(), visualizations.end(), [&](const auto* left, const auto* right) {
         const auto& leftFailure = visualizationFailure(input, *left);
         const auto& rightFailure = visualizationFailure(input, *right);
@@ -496,6 +575,12 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         {"bindings", {{"trace", input.traceBinding}, {"prediction", input.predictionBinding}}},
         {"trace_config", {{"requested", input.requestedTraceConfig}, {"effective", input.effectiveTraceConfig}}},
         {"fiberlet_config", fiberletJson.at("config")},
+        {"requested_length_base_voxels", input.requestedLengthBaseVoxels.has_value()
+             ? nlohmann::json(*input.requestedLengthBaseVoxels)
+             : nlohmann::json(nullptr)},
+        {"reference_begin_arc_base", beginArc},
+        {"reference_end_arc_base", endArc},
+        {"reference_length_base_voxels", endArc - beginArc},
         {"reference_points_base_xyz", pointsJson(input.referenceGeometryBase)},
         {"greedy", greedyJson},
         {"fiberlet", fiberletJson},

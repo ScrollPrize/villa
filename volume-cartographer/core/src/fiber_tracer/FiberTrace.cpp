@@ -4074,7 +4074,16 @@ FiberReplayTraceResult traceFiberReplay(
 
     const auto reference = makePolylineArcGeometry(request.fiber.linePointsXyzBase);
     const double startArcBase = reference.vertexArcs[startLineIndex];
-    const double remainingArcBase = reference.length() - startArcBase;
+    if (request.referenceEndArcBase.has_value() &&
+        (!std::isfinite(*request.referenceEndArcBase) ||
+         *request.referenceEndArcBase > reference.length() + kEpsilon)) {
+        throw std::invalid_argument(
+            "fiber replay reference end must be finite and within the reference");
+    }
+    const double endArcBase = request.referenceEndArcBase.has_value()
+        ? *request.referenceEndArcBase
+        : reference.length();
+    const double remainingArcBase = endArcBase - startArcBase;
     if (!(remainingArcBase > kEpsilon))
         throw std::invalid_argument("fiber replay reference has no usable forward extent");
     const FiberTraceCoordinateAdapter coordinates(request.traceToBaseScale);
@@ -4084,12 +4093,13 @@ FiberReplayTraceResult traceFiberReplay(
 
     FiberReplayTraceResult result;
     result.referenceBeginArcBase = startArcBase;
-    result.referenceEndArcBase = reference.length();
+    result.referenceEndArcBase = endArcBase;
     result.completedReferenceArcBase = startArcBase;
     const size_t maximumSegments = static_cast<size_t>(std::ceil(remainingArcBase / nominalStepBase)) + 1;
 
     double segmentStartArc = startArcBase;
-    for (size_t iteration = 0; iteration < maximumSegments && segmentStartArc < reference.length() - kEpsilon; ++iteration) {
+    for (size_t iteration = 0; iteration < maximumSegments &&
+         segmentStartArc < endArcBase - kEpsilon; ++iteration) {
         FiberReplayTraceSegment segment;
         segment.startReferenceArcBase = segmentStartArc;
         segment.endReferenceArcBase = segmentStartArc;
@@ -4101,12 +4111,14 @@ FiberReplayTraceResult traceFiberReplay(
         bool referenceExhausted = false;
         bool distanceFailed = false;
         const auto observe = [&](const cv::Vec3d& pointTrace, double cumulativeLoss, int /*step*/) {
-            if (previousArcBase >= reference.length() - kEpsilon) {
+            if (previousArcBase >= endArcBase - kEpsilon) {
                 referenceExhausted = true;
                 return false;
             }
             const cv::Vec3d pointBase = coordinates.traceToBase(pointTrace);
-            const auto forwardMatch = matchForwardPolylinePoint(reference, pointBase, previousArcBase, nominalStepBase, request.matchRefineSteps);
+            const auto forwardMatch = matchForwardPolylinePoint(
+                reference, pointBase, previousArcBase, nominalStepBase,
+                request.matchRefineSteps, endArcBase);
             if (!(forwardMatch.searchEndArc > previousArcBase + kEpsilon)) {
                 referenceExhausted = true;
                 return false;
@@ -4128,7 +4140,7 @@ FiberReplayTraceResult traceFiberReplay(
             previousArcBase = match.arc;
             segment.endReferenceArcBase = match.arc;
             distanceFailed = match.distance > request.errorThresholdBaseVoxels;
-            if (previousArcBase >= reference.length() - kEpsilon)
+            if (previousArcBase >= endArcBase - kEpsilon)
                 referenceExhausted = true;
             return !distanceFailed && !referenceExhausted;
         };
@@ -4136,11 +4148,15 @@ FiberReplayTraceResult traceFiberReplay(
         FiberTraceOneWayRequest oneWay;
         oneWay.startPoint = coordinates.baseToTrace(start.point);
         oneWay.initialDirection = start.tangent;
-        oneWay.targetPoint = coordinates.baseToTrace(reference.points.back());
-        oneWay.budgetSpanVoxels = (reference.length() - segmentStartArc) / request.traceToBaseScale;
+        oneWay.targetPoint = coordinates.baseToTrace(
+            samplePolylineArc(reference, endArcBase).point);
+        oneWay.budgetSpanVoxels =
+            (endArcBase - segmentStartArc) / request.traceToBaseScale;
         oneWay.config = request.config;
         const int maximumSteps =
-            std::max(1, static_cast<int>(std::ceil(request.config.maxStepFactor * (reference.length() - segmentStartArc) / nominalStepBase)) + 1);
+            std::max(1, static_cast<int>(std::ceil(
+                request.config.maxStepFactor *
+                (endArcBase - segmentStartArc) / nominalStepBase)) + 1);
 
         std::string terminationReason;
         try {
@@ -4155,10 +4171,10 @@ FiberReplayTraceResult traceFiberReplay(
         }
 
         if (referenceExhausted && !distanceFailed) {
-            segment.endReferenceArcBase = reference.length();
+            segment.endReferenceArcBase = endArcBase;
             segment.terminationReason = "reference_end";
             result.segments.push_back(std::move(segment));
-            result.completedReferenceArcBase = reference.length();
+            result.completedReferenceArcBase = endArcBase;
             break;
         }
 
@@ -4167,7 +4183,8 @@ FiberReplayTraceResult traceFiberReplay(
         replayFailure.segmentIndex = result.segments.size();
         replayFailure.reason = distanceFailed ? "distance_above_threshold" : terminationReason;
         replayFailure.referenceArcBase = previousArcBase;
-        replayFailure.referenceArcFraction = (previousArcBase - startArcBase) / remainingArcBase;
+        replayFailure.referenceArcFraction = std::clamp(
+            (previousArcBase - startArcBase) / remainingArcBase, 0.0, 1.0);
         replayFailure.referencePointBase = samplePolylineArc(reference, previousArcBase).point;
         if (distanceFailed) {
             const auto& match = segment.matches.back();
@@ -4182,13 +4199,15 @@ FiberReplayTraceResult traceFiberReplay(
         if (failureCallback)
             failureCallback(result.failures.back());
 
-        const double resetArc = std::min(reference.length(), std::max(previousArcBase, segmentStartArc + nominalStepBase));
+        const double resetArc = std::min(
+            endArcBase,
+            std::max(previousArcBase, segmentStartArc + nominalStepBase));
         if (!(resetArc > segmentStartArc + kEpsilon))
             throw std::logic_error("fiber replay reset did not advance");
         segmentStartArc = resetArc;
         result.completedReferenceArcBase = resetArc;
     }
-    if (result.completedReferenceArcBase < reference.length() - kEpsilon)
+    if (result.completedReferenceArcBase < endArcBase - kEpsilon)
         throw std::logic_error("fiber replay exceeded its deterministic reset bound");
     return result;
 }

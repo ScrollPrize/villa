@@ -61,6 +61,7 @@ struct FiberReplayBundleInput {
     FiberReplayTraceResult greedyReplay;
     FiberletGraphReplayResult fiberletReplay;
     FiberletGraphReplayConfig fiberletReplayConfig;
+    std::optional<double> requestedLengthBaseVoxels;
     std::vector<cv::Vec3d> referenceGeometryBase;
     nlohmann::json sources;
     nlohmann::json traceBinding;

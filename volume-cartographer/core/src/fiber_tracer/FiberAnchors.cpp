@@ -1818,10 +1818,75 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     };
 
     const auto start = std::chrono::steady_clock::now();
+    using CellIndex = std::array<size_t, 3>;
+    std::vector<CellIndex> selectedCells = explicitCells;
+    if (!usesExplicitCells) {
+        for (size_t cz = report.selectedCellBeginZYX[0];
+             cz < report.selectedCellEndZYX[0]; ++cz) {
+            for (size_t cy = report.selectedCellBeginZYX[1];
+                 cy < report.selectedCellEndZYX[1]; ++cy) {
+                for (size_t cx = report.selectedCellBeginZYX[2];
+                     cx < report.selectedCellEndZYX[2]; ++cx) {
+                    selectedCells.push_back({cz, cy, cx});
+                }
+            }
+        }
+    }
+    std::set<CellIndex> workCellSet(selectedCells.begin(), selectedCells.end());
+    if (!refinedOnly) {
+        const double nmsDistance = std::hypot(
+            config.nmsTransverseRadiusPredictionVoxels,
+            config.nmsLongitudinalRadiusPredictionVoxels);
+        const double pivotReach =
+            2.0 * config.localWindowRadiusPredictionVoxels + nmsDistance;
+        const size_t cellRadius = static_cast<size_t>(std::ceil(
+            pivotReach / static_cast<double>(cellSize))) + 1;
+        const auto cellPivot = [&](const CellIndex& cell) {
+            cv::Vec3d pivot;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const size_t begin = cell[axis] * cellSize;
+                const size_t end = std::min(
+                    begin + cellSize, grid.shapeZYX[axis]);
+                pivot[static_cast<int>(2 - axis)] =
+                    (static_cast<double>(begin) +
+                     static_cast<double>(end) - 1.0) * 0.5;
+            }
+            return pivot;
+        };
+        for (const auto& selected : selectedCells) {
+            const cv::Vec3d selectedPivot = cellPivot(selected);
+            CellIndex begin{};
+            CellIndex end{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                begin[axis] = selected[axis] > cellRadius
+                    ? selected[axis] - cellRadius : 0;
+                end[axis] = std::min(
+                    totalCellsZYX[axis],
+                    selected[axis] + std::min(
+                        cellRadius + 1,
+                        totalCellsZYX[axis] - selected[axis]));
+            }
+            for (size_t cz = begin[0]; cz < end[0]; ++cz) {
+                for (size_t cy = begin[1]; cy < end[1]; ++cy) {
+                    for (size_t cx = begin[2]; cx < end[2]; ++cx) {
+                        const CellIndex candidate{cz, cy, cx};
+                        const cv::Vec3d delta =
+                            cellPivot(candidate) - selectedPivot;
+                        if (delta.dot(delta) <=
+                            pivotReach * pivotReach + 1.0e-12) {
+                            workCellSet.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const std::vector<CellIndex> workCells(
+        workCellSet.begin(), workCellSet.end());
+
     const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells,
                                   bool tallySelectedDiagnostics,
                                   const char* phase) {
-        using CellIndex = std::array<size_t, 3>;
         const auto phaseStart = std::chrono::steady_clock::now();
         if (progressCallback)
             progressCallback({phase, 0, requestedCells.size(), 0.0});
@@ -1852,58 +1917,137 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             return std::pair{sampleBegin, sampleEnd};
         };
 
-        constexpr size_t bytesPerSample =
-            sizeof(std::array<size_t, 3>) +
-            sizeof(FiberStoredPredictionSample) +
-            sizeof(FiberAnchorObservation);
-        size_t maximumJobBytes = 0;
-        for (const auto& cell : requestedCells) {
-            const auto [sampleBegin, sampleEnd] = sampleBounds(cell);
-            const std::array<size_t, 3> sampleShape{
-                sampleEnd[0] - sampleBegin[0],
-                sampleEnd[1] - sampleBegin[1],
-                sampleEnd[2] - sampleBegin[2],
-            };
-            const size_t sampleCount =
-                checkedProduct(sampleShape, "fiber anchor cell sample");
-            if (sampleCount >
-                config.maximumConcurrentSampleBytes / bytesPerSample) {
-                throw std::runtime_error(
-                    "fiber anchor cell sample exceeds the concurrent byte limit");
-            }
-            maximumJobBytes = std::max(
-                maximumJobBytes, sampleCount * bytesPerSample);
+        struct Tile {
+            std::vector<size_t> cells;
+            CellIndex sampleBegin{};
+            CellIndex sampleEnd{};
+            size_t estimatedBytes = 0;
+        };
+        constexpr size_t kTileCellsPerAxis = 4;
+        std::map<CellIndex, std::vector<size_t>> tileCells;
+        for (size_t index = 0; index < requestedCells.size(); ++index) {
+            const auto& cell = requestedCells[index];
+            tileCells[{cell[0] / kTileCellsPerAxis,
+                       cell[1] / kTileCellsPerAxis,
+                       cell[2] / kTileCellsPerAxis}].push_back(index);
         }
+        const auto makeTile = [&](std::vector<size_t> cells) {
+            Tile tile;
+            tile.cells = std::move(cells);
+            tile.sampleBegin = grid.shapeZYX;
+            tile.sampleEnd = {0, 0, 0};
+            size_t maximumCellSamples = 0;
+            for (const size_t index : tile.cells) {
+                const auto [begin, end] = sampleBounds(requestedCells[index]);
+                std::array<size_t, 3> shape{};
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    tile.sampleBegin[axis] =
+                        std::min(tile.sampleBegin[axis], begin[axis]);
+                    tile.sampleEnd[axis] =
+                        std::max(tile.sampleEnd[axis], end[axis]);
+                    shape[axis] = end[axis] - begin[axis];
+                }
+                maximumCellSamples = std::max(
+                    maximumCellSamples,
+                    checkedProduct(shape, "fiber anchor cell sample"));
+            }
+            const std::array<size_t, 3> tileShape{
+                tile.sampleEnd[0] - tile.sampleBegin[0],
+                tile.sampleEnd[1] - tile.sampleBegin[1],
+                tile.sampleEnd[2] - tile.sampleBegin[2],
+            };
+            const size_t tileSamples =
+                checkedProduct(tileShape, "fiber anchor tile sample");
+            constexpr size_t denseBytes =
+                sizeof(CellIndex) + sizeof(FiberStoredPredictionSample);
+            tile.estimatedBytes = tileSamples >
+                    std::numeric_limits<size_t>::max() / denseBytes
+                ? std::numeric_limits<size_t>::max()
+                : tileSamples * denseBytes;
+            const size_t scratchBytes = maximumCellSamples >
+                    std::numeric_limits<size_t>::max() /
+                        sizeof(FiberAnchorObservation)
+                ? std::numeric_limits<size_t>::max()
+                : maximumCellSamples * sizeof(FiberAnchorObservation);
+            if (tile.estimatedBytes >
+                    std::numeric_limits<size_t>::max() - scratchBytes) {
+                tile.estimatedBytes = std::numeric_limits<size_t>::max();
+            } else {
+                tile.estimatedBytes += scratchBytes;
+            }
+            return tile;
+        };
+        std::vector<Tile> tiles;
+        for (auto& [key, cells] : tileCells) {
+            (void)key;
+            std::vector<std::vector<size_t>> pending;
+            pending.push_back(std::move(cells));
+            while (!pending.empty()) {
+                auto current = std::move(pending.back());
+                pending.pop_back();
+                Tile tile = makeTile(std::move(current));
+                if (tile.estimatedBytes <=
+                    config.maximumConcurrentSampleBytes) {
+                    tiles.push_back(std::move(tile));
+                    continue;
+                }
+                if (tile.cells.size() == 1) {
+                    throw std::runtime_error(
+                        "fiber anchor cell sample exceeds the concurrent byte limit");
+                }
+                size_t splitAxis = 0;
+                size_t largestSpan = 0;
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const auto [minimum, maximum] = std::minmax_element(
+                        tile.cells.begin(), tile.cells.end(),
+                        [&](size_t left, size_t right) {
+                            return requestedCells[left][axis] <
+                                requestedCells[right][axis];
+                        });
+                    const size_t span = requestedCells[*maximum][axis] -
+                        requestedCells[*minimum][axis];
+                    if (span > largestSpan) {
+                        largestSpan = span;
+                        splitAxis = axis;
+                    }
+                }
+                std::stable_sort(tile.cells.begin(), tile.cells.end(),
+                    [&](size_t left, size_t right) {
+                        return requestedCells[left][splitAxis] <
+                            requestedCells[right][splitAxis];
+                    });
+                const size_t middle = tile.cells.size() / 2;
+                std::vector<size_t> left(
+                    tile.cells.begin(), tile.cells.begin() + middle);
+                std::vector<size_t> right(
+                    tile.cells.begin() + middle, tile.cells.end());
+                pending.push_back(std::move(right));
+                pending.push_back(std::move(left));
+            }
+        }
+        std::sort(tiles.begin(), tiles.end(),
+            [](const Tile& left, const Tile& right) {
+                return left.cells.front() < right.cells.front();
+            });
+        size_t maximumTileBytes = 0;
+        for (const auto& tile : tiles)
+            maximumTileBytes = std::max(maximumTileBytes, tile.estimatedBytes);
         const size_t memoryWorkers = std::max<size_t>(
-            1, config.maximumConcurrentSampleBytes / maximumJobBytes);
+            1, config.maximumConcurrentSampleBytes / maximumTileBytes);
         const size_t workerCount = std::min({
-            requestedCells.size(),
+            tiles.size(),
             static_cast<size_t>(config.parallelThreads),
             memoryWorkers,
         });
 
-        const auto processCell = [&](const CellIndex& cellZYX) {
-            const auto [sampleBegin, sampleEnd] = sampleBounds(cellZYX);
-            const std::array<size_t, 3> sampleShape{
-                sampleEnd[0] - sampleBegin[0],
-                sampleEnd[1] - sampleBegin[1],
-                sampleEnd[2] - sampleBegin[2],
-            };
-            const size_t sampleCount =
-                checkedProduct(sampleShape, "fiber anchor cell sample");
-            std::vector<std::array<size_t, 3>> indices;
-            indices.reserve(sampleCount);
-            for (size_t z = sampleBegin[0]; z < sampleEnd[0]; ++z) {
-                for (size_t y = sampleBegin[1]; y < sampleEnd[1]; ++y) {
-                    for (size_t x = sampleBegin[2]; x < sampleEnd[2]; ++x)
-                        indices.push_back({z, y, x});
-                }
-            }
-            std::vector<FiberStoredPredictionSample> samples;
-            sampler(indices, 1, samples);
-            if (samples.size() != indices.size()) {
-                throw std::runtime_error("fiber stored prediction sampler returned the wrong sample count");
-            }
+        std::vector<std::optional<FiberCellAnchorResult>> jobResults(
+            requestedCells.size());
+        std::vector<std::exception_ptr> jobErrors(requestedCells.size());
+        const auto processCell = [&]
+            (const CellIndex& cellZYX,
+             const Tile& tile,
+             const std::vector<FiberStoredPredictionSample>& samples,
+             const std::array<size_t, 3>& sampleShape) {
             const std::array<size_t, 3> begin{
                 cellZYX[0] * cellSize,
                 cellZYX[1] * cellSize,
@@ -1925,15 +2069,17 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                  1.0) *
                     0.5,
             };
-            const auto presenceGradient = [&](size_t index) {
-                const size_t plane = sampleShape[1] * sampleShape[2];
-                const size_t relativeZ = index / plane;
-                const size_t remainder = index % plane;
-                const size_t relativeY = remainder / sampleShape[2];
-                const size_t relativeX = remainder % sampleShape[2];
-                if (relativeZ == 0 || relativeZ + 1 >= sampleShape[0] ||
-                    relativeY == 0 || relativeY + 1 >= sampleShape[1] ||
-                    relativeX == 0 || relativeX + 1 >= sampleShape[2]) {
+            const auto [cellSampleBegin, cellSampleEnd] = sampleBounds(cellZYX);
+            const size_t plane = sampleShape[1] * sampleShape[2];
+            const auto tileIndex = [&](size_t z, size_t y, size_t x) {
+                return (z - tile.sampleBegin[0]) * plane +
+                    (y - tile.sampleBegin[1]) * sampleShape[2] +
+                    (x - tile.sampleBegin[2]);
+            };
+            const auto presenceGradient = [&](size_t z, size_t y, size_t x) {
+                if (z == cellSampleBegin[0] || z + 1 >= cellSampleEnd[0] ||
+                    y == cellSampleBegin[1] || y + 1 >= cellSampleEnd[1] ||
+                    x == cellSampleBegin[2] || x + 1 >= cellSampleEnd[2]) {
                     return std::optional<cv::Vec3d>{};
                 }
                 constexpr std::array<double, 3> smooth{0.25, 0.5, 0.25};
@@ -1942,6 +2088,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 for (int dz = -1; dz <= 1; ++dz) {
                     for (int dy = -1; dy <= 1; ++dy) {
                         for (int dx = -1; dx <= 1; ++dx) {
+                            const size_t index = tileIndex(z, y, x);
                             const size_t neighbor = static_cast<size_t>(
                                 static_cast<std::ptrdiff_t>(index) +
                                 static_cast<std::ptrdiff_t>(dz) *
@@ -1967,50 +2114,59 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 return std::optional<cv::Vec3d>{gradient};
             };
             std::vector<FiberAnchorObservation> cellObservations;
-            cellObservations.reserve(samples.size());
-            for (size_t index = 0; index < samples.size(); ++index) {
-                FiberAnchorObservation observation{
-                    cv::Vec3d{
-                        static_cast<double>(indices[index][2]),
-                        static_cast<double>(indices[index][1]),
-                        static_cast<double>(indices[index][0]),
-                    },
-                    samples[index].direction,
-                    samples[index].presence,
-                    samples[index].valid,
-                };
-                const cv::Vec3d delta =
-                    observation.positionPredictionXYZ - pivot;
-                const auto& position = observation.positionPredictionXYZ;
-                const bool owned =
-                    position[0] >= static_cast<double>(begin[2]) &&
-                    position[0] < static_cast<double>(end[2]) &&
-                    position[1] >= static_cast<double>(begin[1]) &&
-                    position[1] < static_cast<double>(end[1]) &&
-                    position[2] >= static_cast<double>(begin[0]) &&
-                    position[2] < static_cast<double>(end[0]);
-                if (owned ||
-                    delta.dot(delta) <=
-                        maximumSupportRadius * maximumSupportRadius +
-                            1.0e-12) {
-                    if (config.peakGradientWeight > 0.0) {
-                        const auto gradient = presenceGradient(index);
-                        if (gradient.has_value()) {
-                            observation.presenceGradientPredictionXYZ =
-                                *gradient;
-                            observation.presenceGradientValid = true;
+            const std::array<size_t, 3> cellSampleShape{
+                cellSampleEnd[0] - cellSampleBegin[0],
+                cellSampleEnd[1] - cellSampleBegin[1],
+                cellSampleEnd[2] - cellSampleBegin[2],
+            };
+            cellObservations.reserve(checkedProduct(
+                cellSampleShape, "fiber anchor observation"));
+            for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
+                for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
+                    for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
+                        const size_t index = tileIndex(z, y, x);
+                        FiberAnchorObservation observation{
+                            cv::Vec3d{
+                                static_cast<double>(x),
+                                static_cast<double>(y),
+                                static_cast<double>(z),
+                            },
+                            samples[index].direction,
+                            samples[index].presence,
+                            samples[index].valid,
+                        };
+                        const cv::Vec3d delta =
+                            observation.positionPredictionXYZ - pivot;
+                        const auto& position =
+                            observation.positionPredictionXYZ;
+                        const bool owned =
+                            position[0] >= static_cast<double>(begin[2]) &&
+                            position[0] < static_cast<double>(end[2]) &&
+                            position[1] >= static_cast<double>(begin[1]) &&
+                            position[1] < static_cast<double>(end[1]) &&
+                            position[2] >= static_cast<double>(begin[0]) &&
+                            position[2] < static_cast<double>(end[0]);
+                        if (owned ||
+                            delta.dot(delta) <=
+                                maximumSupportRadius * maximumSupportRadius +
+                                    1.0e-12) {
+                            if (config.peakGradientWeight > 0.0) {
+                                const auto gradient = presenceGradient(z, y, x);
+                                if (gradient.has_value()) {
+                                    observation.presenceGradientPredictionXYZ =
+                                        *gradient;
+                                    observation.presenceGradientValid = true;
+                                }
+                            }
+                            cellObservations.push_back(observation);
                         }
                     }
-                    cellObservations.push_back(observation);
                 }
             }
             return fitFiberCellAnchors(
                 cellZYX, begin, end, cellObservations, config);
         };
 
-        std::vector<std::optional<FiberCellAnchorResult>> jobResults(
-            requestedCells.size());
-        std::vector<std::exception_ptr> jobErrors(requestedCells.size());
         std::atomic<size_t> nextJob{0};
         std::atomic<size_t> completedJobs{0};
         std::mutex progressMutex;
@@ -2019,33 +2175,61 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         const auto worker = [&]() {
             while (true) {
                 const size_t job = nextJob.fetch_add(1);
-                if (job >= requestedCells.size())
+                if (job >= tiles.size())
                     break;
                 try {
-                    jobResults[job] = processCell(requestedCells[job]);
-                } catch (...) {
-                    jobErrors[job] = std::current_exception();
-                }
-                completedJobs.fetch_add(1);
-                if (progressCallback) {
-                    const auto now = std::chrono::steady_clock::now();
-                    std::lock_guard lock(progressMutex);
-                    if (!progressError &&
-                        now - lastProgressTime >= std::chrono::seconds(1) &&
-                        completedJobs.load() < requestedCells.size()) {
-                        try {
-                            progressCallback({
-                                phase,
-                                completedJobs.load(),
-                                requestedCells.size(),
-                                std::chrono::duration<double>(
-                                    now - phaseStart).count(),
-                            });
-                            lastProgressTime = now;
-                        } catch (...) {
-                            progressError = std::current_exception();
+                    const Tile& tile = tiles[job];
+                    const std::array<size_t, 3> sampleShape{
+                        tile.sampleEnd[0] - tile.sampleBegin[0],
+                        tile.sampleEnd[1] - tile.sampleBegin[1],
+                        tile.sampleEnd[2] - tile.sampleBegin[2],
+                    };
+                    const size_t sampleCount = checkedProduct(
+                        sampleShape, "fiber anchor tile sample");
+                    std::vector<CellIndex> indices;
+                    indices.reserve(sampleCount);
+                    for (size_t z = tile.sampleBegin[0]; z < tile.sampleEnd[0]; ++z) {
+                        for (size_t y = tile.sampleBegin[1]; y < tile.sampleEnd[1]; ++y) {
+                            for (size_t x = tile.sampleBegin[2]; x < tile.sampleEnd[2]; ++x)
+                                indices.push_back({z, y, x});
                         }
                     }
+                    std::vector<FiberStoredPredictionSample> samples;
+                    sampler(indices, 1, samples);
+                    if (samples.size() != indices.size()) {
+                        throw std::runtime_error(
+                            "fiber stored prediction sampler returned the wrong sample count");
+                    }
+                    indices.clear();
+                    indices.shrink_to_fit();
+                    for (const size_t cellIndex : tile.cells) {
+                        jobResults[cellIndex] = processCell(
+                            requestedCells[cellIndex], tile, samples, sampleShape);
+                        const size_t completed = completedJobs.fetch_add(1) + 1;
+                        if (progressCallback) {
+                            const auto now = std::chrono::steady_clock::now();
+                            std::lock_guard lock(progressMutex);
+                            if (!progressError &&
+                                now - lastProgressTime >= std::chrono::seconds(1) &&
+                                completed < requestedCells.size()) {
+                                try {
+                                    progressCallback({
+                                        phase,
+                                        completed,
+                                        requestedCells.size(),
+                                        std::chrono::duration<double>(
+                                            now - phaseStart).count(),
+                                    });
+                                    lastProgressTime = now;
+                                } catch (...) {
+                                    progressError = std::current_exception();
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {
+                    for (const size_t cellIndex : tiles[job].cells)
+                        jobErrors[cellIndex] = std::current_exception();
                 }
             }
         };
@@ -2076,7 +2260,9 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         results.reserve(requestedCells.size());
         for (auto& result : jobResults) {
             FiberCellAnchorResult cell = std::move(*result);
-            if (tallySelectedDiagnostics && retainPredicate) {
+            const bool tallyCell =
+                tallySelectedDiagnostics && selectedCell(cell.cellZYX);
+            if (tallyCell && retainPredicate) {
                 for (auto& component : cell.components) {
                     if (!component.retained)
                         continue;
@@ -2098,7 +2284,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                 }
             }
-            if (tallySelectedDiagnostics) {
+            if (tallyCell) {
                 for (auto& component : cell.components)
                     component.retainedAfterSelection = component.retained;
                 if (cell.mergeEvaluation.has_value() &&
@@ -2114,24 +2300,14 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                         ++report.diagnostics.belowSupportComponents;
                 }
             }
-            if (cell.retainedAnchorCount > 0 || tallySelectedDiagnostics)
+            if (cell.retainedAnchorCount > 0 || tallyCell)
                 results.push_back(std::move(cell));
         }
         return results;
     };
 
-    std::vector<std::array<size_t, 3>> selectedCells = explicitCells;
-    if (!usesExplicitCells) {
-        for (size_t cz = report.selectedCellBeginZYX[0]; cz < report.selectedCellEndZYX[0]; ++cz) {
-            for (size_t cy = report.selectedCellBeginZYX[1]; cy < report.selectedCellEndZYX[1]; ++cy) {
-                for (size_t cx = report.selectedCellBeginZYX[2]; cx < report.selectedCellEndZYX[2]; ++cx) {
-                    selectedCells.push_back({cz, cy, cx});
-                }
-            }
-        }
-    }
     std::vector<FiberCellAnchorResult> contextResults = processCells(
-        selectedCells, true, "selected_cells");
+        workCells, true, refinedOnly ? "selected_cells" : "anchor_cells");
 
     report.diagnostics.totalCells = usesExplicitCells
         ? explicitCells.size()
@@ -2164,6 +2340,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         return record;
     };
     for (const auto& cell : contextResults) {
+        if (!selectedCell(cell.cellZYX))
+            continue;
         for (const auto& initialized : cell.initializedDiagnostics) {
             report.diagnosticStages[static_cast<size_t>(
                 FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
@@ -2201,62 +2379,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         return report;
     }
 
-    const double nmsDistance = std::hypot(config.nmsTransverseRadiusPredictionVoxels, config.nmsLongitudinalRadiusPredictionVoxels);
-    const double contextPivotDistance = config.localWindowRadiusPredictionVoxels + nmsDistance;
-    const size_t contextCellRadius = static_cast<size_t>(std::ceil(contextPivotDistance / static_cast<double>(cellSize))) + 1;
-    std::set<std::array<size_t, 3>> externalContextCells;
-    for (const auto& cell : contextResults) {
-        for (const auto& component : cell.components) {
-            if (!component.retained)
-                continue;
-            const auto& position = component.anchor.positionPredictionXYZ;
-            const std::array<double, 3> positionZYX{position[2], position[1], position[0]};
-            std::array<size_t, 3> centerCell{};
-            std::array<size_t, 3> beginCell{};
-            std::array<size_t, 3> endCell{};
-            for (size_t axis = 0; axis < 3; ++axis) {
-                centerCell[axis] = std::min(totalCellsZYX[axis] - 1, static_cast<size_t>(positionZYX[axis]) / cellSize);
-                beginCell[axis] = centerCell[axis] > contextCellRadius ? centerCell[axis] - contextCellRadius : 0;
-                endCell[axis] =
-                    std::min(totalCellsZYX[axis], centerCell[axis] + std::min(contextCellRadius + 1, totalCellsZYX[axis] - centerCell[axis]));
-            }
-            for (size_t cz = beginCell[0]; cz < endCell[0]; ++cz) {
-                for (size_t cy = beginCell[1]; cy < endCell[1]; ++cy) {
-                    for (size_t cx = beginCell[2]; cx < endCell[2]; ++cx) {
-                        const std::array<size_t, 3> candidate{cz, cy, cx};
-                        if (selectedCell(candidate))
-                            continue;
-                        const std::array<size_t, 3> candidateBegin{cz * cellSize, cy * cellSize, cx * cellSize};
-                        const std::array<size_t, 3> candidateEnd{
-                            std::min(candidateBegin[0] + cellSize, grid.shapeZYX[0]),
-                            std::min(candidateBegin[1] + cellSize, grid.shapeZYX[1]),
-                            std::min(candidateBegin[2] + cellSize, grid.shapeZYX[2]),
-                        };
-                        const cv::Vec3d pivot{
-                            (static_cast<double>(candidateBegin[2]) + static_cast<double>(candidateEnd[2]) - 1.0) * 0.5,
-                            (static_cast<double>(candidateBegin[1]) + static_cast<double>(candidateEnd[1]) - 1.0) * 0.5,
-                            (static_cast<double>(candidateBegin[0]) + static_cast<double>(candidateEnd[0]) - 1.0) * 0.5,
-                        };
-                        const cv::Vec3d delta = pivot - position;
-                        if (delta.dot(delta) <= contextPivotDistance * contextPivotDistance + 1.0e-12) {
-                            externalContextCells.insert(candidate);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    const std::vector<std::array<size_t, 3>> externalCells(
-        externalContextCells.begin(), externalContextCells.end());
-    auto externalResults = processCells(externalCells, false, "nms_context");
-    contextResults.insert(
-        contextResults.end(),
-        std::make_move_iterator(externalResults.begin()),
-        std::make_move_iterator(externalResults.end()));
-    std::sort(contextResults.begin(), contextResults.end(),
-        [](const auto& left, const auto& right) {
-            return left.cellZYX < right.cellZYX;
-    });
     suppressFiberAnchorDuplicates(contextResults, config);
     for (auto& cell : contextResults) {
         if (!selectedCell(cell.cellZYX))

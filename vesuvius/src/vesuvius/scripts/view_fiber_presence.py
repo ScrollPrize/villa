@@ -846,6 +846,10 @@ def load_fiber_replay_bundle(
         "bindings",
         "trace_config",
         "fiberlet_config",
+        "requested_length_base_voxels",
+        "reference_begin_arc_base",
+        "reference_end_arc_base",
+        "reference_length_base_voxels",
         "reference_points_base_xyz",
         "greedy",
         "fiberlet",
@@ -867,6 +871,40 @@ def load_fiber_replay_bundle(
     }
     if root["coordinates"] != coordinates:
         raise ValueError("replay bundle coordinate contract is unsupported")
+    begin_arc = root["reference_begin_arc_base"]
+    end_arc = root["reference_end_arc_base"]
+    interval_length = root["reference_length_base_voxels"]
+    requested_length = root["requested_length_base_voxels"]
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (begin_arc, end_arc, interval_length)
+        )
+        or begin_arc < 0
+        or end_arc <= begin_arc
+        or not math.isclose(interval_length, end_arc - begin_arc)
+        or (
+            requested_length is not None
+            and (
+                isinstance(requested_length, bool)
+                or not isinstance(requested_length, (int, float))
+                or not math.isfinite(requested_length)
+                or requested_length <= 0
+            )
+        )
+    ):
+        raise ValueError("replay bundle selected interval is invalid")
+    for name in ("greedy", "fiberlet"):
+        replay = root[name]
+        if (
+            not isinstance(replay, dict)
+            or not math.isclose(replay.get("reference_begin_arc_base", math.nan), begin_arc)
+            or not math.isclose(replay.get("reference_end_arc_base", math.nan), end_arc)
+            or not math.isclose(replay.get("completed_reference_arc_base", math.nan), end_arc)
+        ):
+            raise ValueError(f"{name} replay interval differs from the root bundle")
     _resolve_replay_artifacts(
         bundle_path.parent,
         root["artifacts"],

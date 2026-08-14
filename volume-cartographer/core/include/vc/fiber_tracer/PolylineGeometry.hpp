@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
@@ -36,8 +37,18 @@ struct ForwardPolylineMatch {
     PolylineArcProjection projection;
 };
 
+struct ForwardPolylineArcInterval {
+    double beginArc = 0.0;
+    double endArc = 0.0;
+};
+
 [[nodiscard]] PolylineArcGeometry makePolylineArcGeometry(
     const std::vector<cv::Vec3d>& points);
+
+[[nodiscard]] ForwardPolylineArcInterval selectForwardPolylineArcInterval(
+    const PolylineArcGeometry& geometry,
+    size_t beginVertexIndex,
+    std::optional<double> maximumLength = std::nullopt);
 
 [[nodiscard]] PolylineArcSample samplePolylineArc(
     const PolylineArcGeometry& geometry,
@@ -65,6 +76,7 @@ struct ForwardPolylineMatch {
     const cv::Vec3d& point,
     double previousArc,
     double expectedAdvance,
-    double refineAdvanceFactor);
+    double refineAdvanceFactor,
+    std::optional<double> maximumArc = std::nullopt);
 
 } // namespace vc::fiber_tracer

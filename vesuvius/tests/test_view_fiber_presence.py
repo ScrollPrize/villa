@@ -199,9 +199,21 @@ def _write_visual_replay(tmp_path):
             "effective": {"beam_width": 1, "beam_lookahead_steps": 1},
         },
         "fiberlet_config": {},
+        "requested_length_base_voxels": None,
+        "reference_begin_arc_base": 0.0,
+        "reference_end_arc_base": 8.0,
+        "reference_length_base_voxels": 8.0,
         "reference_points_base_xyz": [[0, 0, 0], [8, 0, 0]],
-        "greedy": {},
-        "fiberlet": {},
+        "greedy": {
+            "reference_begin_arc_base": 0.0,
+            "reference_end_arc_base": 8.0,
+            "completed_reference_arc_base": 8.0,
+        },
+        "fiberlet": {
+            "reference_begin_arc_base": 0.0,
+            "reference_end_arc_base": 8.0,
+            "completed_reference_arc_base": 8.0,
+        },
         "failure_counts": {"greedy": 1, "fiberlet": 0},
         "visualizations": [{
             "global_index": 0,

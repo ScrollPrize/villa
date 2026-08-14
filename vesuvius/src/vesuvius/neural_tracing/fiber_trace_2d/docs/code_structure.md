@@ -2560,13 +2560,15 @@ plane. Their response already integrates an anisotropic 3D support volume, so
 calling the distinction 2D versus 3D would be incorrect; a true 3D positional
 fit would introduce forbidden forward/backward motion along the fiber.
 
-Anchor extraction performs reference/crop cell selection serially, then runs a
-bounded outer worker pool with one canonical job per cell. A job samples only
-its cell's required halo and always calls the prediction sampler with one inner
-thread, preventing nested chunk-read parallelism. Concurrent jobs share the
-decoded prediction cache, while an aggregate byte budget caps simultaneous
-halo buffers. Indexed result slots, followed by serial retain-predicate and
-diagnostic handling, keep artifacts deterministic across worker counts.
+Anchor extraction performs reference/crop selection serially, expands it by a
+conservative direct-NMS context that includes possible displacement of both
+anchors, and partitions the union into deterministic spatial cell tiles. Each
+tile samples one dense ZYX box with the complete fit/peak/gradient halo and
+fits its owned cells through shared strides while preserving each cell's prior
+ZYX observation order. Deterministic splitting and worker selection cap
+coordinate, decoded-sample, and scratch storage under the aggregate byte
+budget. Tile halos may overlap, but shared decoded Zarr chunks avoid repeated
+source reads. Lower-level sampling remains single-threaded per tile.
 
 Anchor duplicate suppression uses radii independent of peak refinement:
 2 stored prediction voxels transverse to the sign-aligned average anchor axis
@@ -2603,13 +2605,15 @@ radii without using the extraction-tube radius as a display default.
 `FiberPaths.cpp` first generates all candidates in canonical order from every
 nonzero integer cell offset inside the configured outer radius plus margin, so
 shorter anchor pairs and the old outer-radius pairs are searched together. It unions
-their clipped Hermite-corridor and virtual-attachment bounds into one enclosing
-ZYX box, then batch-loads an immutable dense scoring volume containing exact
-fiber predictions and Lasagna normal vector/validity. A fixed worker pool solves
-candidate indices concurrently and writes results only to the corresponding
-preallocated slots. Sampling completes before workers start, so DP has no
-nested decoder or normal-sampler parallelism; a final serial pass derives
-diagnostics and preserves deterministic artifact order.
+their positive-weight native interpolation corners into one deterministic
+global sparse union, samples predictions and normals in coordinate ranges, and
+materializes compact nodes before DP. An interior node stores a checked 32-bit
+row-major local key, authoritative `float32` position, compact two-byte fiber
+and normal axes, byte presence, and validity flags: 24 bytes total. Corner
+addresses and weights are derived from positions during collection and
+materialization rather than retained. Exact endpoint anchors remain doubles.
+A fixed worker pool solves canonical candidate slots; a final serial pass
+derives diagnostics and preserves deterministic artifact order.
 Each nonzero DP transition is first gated against the destination-side dense
 fiber prediction and must have an unoriented angle strictly below 25 degrees to
 that axis. Lasagna normals remain separate and affect only the existing local
