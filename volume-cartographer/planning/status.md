@@ -1,10 +1,11 @@
 # Status
 
-- [x] Trace the status, adaptive epoch, HTTP, Zarr, and benchmark paths.
-- [x] Write and independently review the implementation plan.
-- [x] Add scoped HTTP byte observation and progress-aware chunk fetching.
-- [x] Implement streamed aggregate and non-streaming fallback estimators.
-- [x] Apply the estimator to adaptive decisions and the download benchmark.
-- [x] Add regression tests.
+- [x] Audit the incomplete streamed estimator and reproduce the control-path mismatch in code.
+- [x] Write and independently review the correction plan.
+- [x] Classify remote HTTP fetchers before request issue.
+- [x] Make request-inclusive streamed bytes the sole network estimator.
+- [x] Remove completion-window controls, fallback, and diagnostics.
+- [x] Isolate local/custom fetches from remote adaptive state.
+- [x] Update scheduler, benchmark, and fetcher regression tests.
 - [x] Update specification, documentation, task log, and changelog.
 - [x] Build VC3D and run focused plus complete core validation.

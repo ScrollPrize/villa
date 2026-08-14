@@ -82,14 +82,9 @@ public:
     struct AdaptiveConcurrency {
         std::size_t minimum = 2;
         std::size_t maximum = 64;
-        // Completion window used only by fetchers without byte progress.
-        std::size_t successfulSamplesPerWorker = 4;
         // Adaptive epochs require both this much active transfer time and at
         // least one successful completion per admitted worker.
         double minimumEpochSeconds = 5.0;
-        // Retained for configuration compatibility. It never bypasses either
-        // minimum adaptive-epoch requirement.
-        double maximumEpochSeconds = 5.0;
         double unstableProbeIntervalSeconds = 60.0;
         double stableProbeIntervalSeconds = 300.0;
         double minimumStabilityObservationSeconds = 300.0;
@@ -115,8 +110,6 @@ public:
     struct TransferStats {
         std::size_t admissionLimit = 0;
         double bytesPerSecond = 0.0;
-        double averageChunkBytes = 0.0;
-        std::size_t sampleCount = 0;
         bool adaptive = false;
         std::size_t targetAdmissionLimit = 0;
         double longTermBytesPerSecond = 0.0;
@@ -156,19 +149,11 @@ public:
     [[nodiscard]] std::size_t pending() const;
     [[nodiscard]] std::size_t active() const noexcept;
 
-    // Measure one source request. Stream-capable fetchers report response-body
-    // increments between begin/finish; those aggregate bytes are authoritative
-    // for both displayed bandwidth and adaptive admission. Callers without
-    // progress support still receive the per-request completion fallback.
+    // Measure one remote source request from issue through completion.
+    // Response-body increments between begin/finish provide the aggregate byte
+    // numerator; the union of measured in-flight intervals is the denominator.
     [[nodiscard]] TransferMeasurement beginTransfer(
         std::chrono::steady_clock::time_point started);
-
-    // Compatibility and deterministic-test entry point for fetchers without
-    // streamed-byte observations.
-    void recordSuccessfulTransfer(
-        std::size_t encodedBytes,
-        std::chrono::steady_clock::time_point started,
-        std::chrono::steady_clock::time_point completed);
     [[nodiscard]] TransferStats transferStats() const;
     [[nodiscard]] std::optional<AdaptiveState> adaptiveState() const;
     void waitIdle();

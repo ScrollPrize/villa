@@ -1,13 +1,16 @@
-# Task: measure remote bandwidth from received HTTP bytes
+# Task: finish remote byte-stream bandwidth adaptation
 
-Replace the completion-span bandwidth estimate used by VC3D and adaptive
-download admission. HTTP Zarr downloads must report response-body bytes while
-they arrive, producing one service-wide aggregate bandwidth measurement.
+Correct the incomplete streamed-bandwidth implementation.
 
-- The status bar and adaptive controller must use the same estimator.
-- Idle gaps between download bursts must not enter the denominator.
-- Adaptive epochs require at least five active seconds and at least the current
-  admission count of successful completions.
-- Chunk completion remains the source of latency and success/failure data.
-- Non-streaming/custom fetchers may fall back to mean individual transfer rate
-  multiplied by the admission used for those samples.
+- Remote measurement starts when the HTTP chunk request is issued, so request
+  latency and time to first byte are included.
+- Received response-body bytes are the sole remote bandwidth numerator.
+- Intervals with no remote request in flight remain excluded.
+- The HTTP path must not use the old `admission * 4` completion window.
+- Remove obsolete completion-window benchmark controls and diagnostics.
+- Keep successful completions only for latency, failure, and the requirement
+  that an adaptive epoch observe at least one completion per admitted worker.
+- Local and custom fetches must not update displayed remote bandwidth, adaptive
+  admission history, or persisted remote state.
+- Preserve the requested fourfold initial concurrency probe and twofold
+  refinement probes.

@@ -162,13 +162,16 @@ private:
 
 class ZarrChunkFetcher final : public IChunkFetcher {
 public:
-    explicit ZarrChunkFetcher(utils::ZarrArray array)
-        : ZarrChunkFetcher(std::make_shared<utils::ZarrArray>(std::move(array)))
+    explicit ZarrChunkFetcher(utils::ZarrArray array, bool remoteHttp = false)
+        : ZarrChunkFetcher(
+              std::make_shared<utils::ZarrArray>(std::move(array)), remoteHttp)
     {
     }
 
-    explicit ZarrChunkFetcher(std::shared_ptr<utils::ZarrArray> array)
+    explicit ZarrChunkFetcher(std::shared_ptr<utils::ZarrArray> array,
+                              bool remoteHttp = false)
         : array_(std::move(array))
+        , remoteHttp_(remoteHttp)
     {
         if (!array_)
             throw std::invalid_argument("streaming zarr fetcher requires an array");
@@ -185,6 +188,11 @@ public:
         return decodeFetched(key, fetchEncoded(key));
     }
 
+    [[nodiscard]] bool measuresRemoteTransfer() const noexcept override
+    {
+        return remoteHttp_;
+    }
+
     ChunkFetchResult fetchEncoded(const ChunkKey& key) override
     {
         return fetchEncodedImpl(key);
@@ -194,6 +202,8 @@ public:
         const ChunkKey& key,
         const DownloadProgressCallback& progress) override
     {
+        if (!remoteHttp_)
+            return fetchEncodedImpl(key);
         utils::HttpClient::ScopedDownloadObserver observer(progress);
         return fetchEncodedImpl(key);
     }
@@ -301,6 +311,7 @@ public:
 private:
     std::shared_ptr<utils::ZarrArray> array_;
     std::string persistEncodedExtension_;
+    bool remoteHttp_ = false;
 };
 
 std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* name)
@@ -313,7 +324,9 @@ std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* 
         static_cast<int>(values[2])};
 }
 
-void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
+void addLevel(OpenedChunkedZarr& opened,
+              utils::ZarrArray array,
+              bool remoteHttp = false)
 {
     const auto& meta = array.metadata();
     ChunkDtype dtype = ChunkDtype::UInt8;
@@ -339,11 +352,15 @@ void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
     opened.transforms.push_back(transform);
     opened.fillValue = meta.fill_value.value_or(0.0);
     opened.dtype = dtype;
-    opened.fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    opened.fetchers.push_back(
+        std::make_shared<ZarrChunkFetcher>(std::move(array), remoteHttp));
     opened.fillValues.push_back(meta.fill_value.value_or(0.0));
 }
 
-void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrArray array)
+void addPhysicalLevel(OpenedChunkedZarr& opened,
+                      int physicalLevel,
+                      utils::ZarrArray array,
+                      bool remoteHttp = false)
 {
     if (physicalLevel < 0)
         throw std::runtime_error("zarr physical level must be non-negative");
@@ -362,7 +379,7 @@ void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrA
         throw std::runtime_error("duplicate zarr physical level " + std::to_string(physicalLevel));
 
     OpenedChunkedZarr single;
-    addLevel(single, std::move(array));
+    addLevel(single, std::move(array), remoteHttp);
     const bool hasExistingLevel = std::any_of(
         opened.fetchers.begin(),
         opened.fetchers.end(),
@@ -600,7 +617,7 @@ void addRemoteLevelFromKey(
     auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
     if (array.metadata().dtype == utils::ZarrDtype::uint16)
         array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
-    addPhysicalLevel(opened, physicalLevel, std::move(array));
+    addPhysicalLevel(opened, physicalLevel, std::move(array), true);
 }
 
 } // namespace
@@ -844,7 +861,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
         auto array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1));
         if (array.metadata().dtype == utils::ZarrDtype::uint16)
             array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(2));
-        addPhysicalLevel(opened, 0, std::move(array));
+        addPhysicalLevel(opened, 0, std::move(array), true);
     }
     return opened;
 }

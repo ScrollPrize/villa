@@ -97,14 +97,15 @@ chunk count once. Cache diagnostics and Z-scroll sensitivity are composed into
 one permanent status label so growing queue text cannot overlap a neighboring
 status widget.
 
-The MiB/s field is not derived from completed-chunk wall spans. Scoped remote
-Zarr reads report encoded HTTP response-body increments from the common curl
-callback. The shared source scheduler aggregates those bytes across concurrent
-requests over the last five active transfer seconds; intervals with no measured
-transfer active do not dilute the result. The adaptive controller consumes this
-same measurement. A fetcher that cannot report progress uses a compatibility
-fallback of mean individual request bandwidth multiplied by the admission
-represented by its completion samples.
+The MiB/s field is not derived from completed chunks. A remote Zarr fetcher
+declares its HTTP capability before a request starts, and the common curl
+callback reports its encoded response-body byte increments. The shared source
+scheduler aggregates those bytes across concurrent requests over the last five
+remote-request-active seconds. Request issue through completion is active, so
+connection and TTFB latency are included; intervals with no remote request in
+flight are excluded. The adaptive controller consumes this same measurement.
+Local and custom fetchers do not contribute network bandwidth or adaptive
+history.
 
 For render-order debugging, start VC3D with
 `--debug-download-queue`. Every shared slice viewer, including plane, segment,
@@ -233,11 +234,14 @@ samples, probe phase, direction history, and the stability window are reset, so
 the controller performs frequent initial up/down probes around the prior limit
 before returning to its normal stability-dependent cadence.
 
-Each saturated controller epoch requires at least five active transfer seconds
-and one successful completion per admitted worker. Request completion supplies
-p90 latency and saturation/failure information; it is not the primary payload
-bandwidth clock. Failed, missing, or underfilled-tail requests reset the current
-capacity epoch so later work cannot inherit idle time.
+Each saturated controller epoch requires at least five remote-request-active
+seconds and one successful completion per admitted worker. Request completion
+supplies p90 latency and saturation/failure information; it does not estimate
+bandwidth. Failed and missing sparse-chunk requests end only their own
+measurements, so they cannot erase concurrent successful observations; they
+may pace an already-selected admission ramp but do not count as successful
+payload samples. Underfilled-tail requests reset the current capacity epoch so
+later work cannot establish capacity from a drained queue.
 
 All three schedulers are work-conserving and admit one background item after at
 most seven consecutive GUI items while both lanes are nonempty. Existing

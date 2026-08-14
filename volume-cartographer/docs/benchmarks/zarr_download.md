@@ -14,20 +14,20 @@ volume-cartographer/build/bin/vc_zarr_download_bench \
 ```
 
 The automatic defaults are the rendering defaults: 2 initial workers, 64
-maximum workers, a 2--5 second measurement epoch, and a rolling displayed
-bandwidth window of 4 successful samples per admitted worker. Initial discovery
+maximum workers, and a five-remote-request-active-second measurement epoch.
+Initial discovery
 probes `4C` and `C/4` to cover the range quickly. After the first overshoot,
 direction reversal, or retained-center bracket, refinement compares `2C` and
 `C/2`. Search remains continuous until five direction reversals or retained
 centers confirm a local operating point. Increasing concurrency admits one
-additional worker per completed transfer instead of starting a burst. Each
-setting can be overridden for experiments:
+additional worker per completed transfer instead of starting a burst. Missing
+sparse chunks can pace that ramp but never contribute payload bandwidth or a
+successful epoch sample. Each setting can be overridden for experiments:
 
 ```bash
 volume-cartographer/build/bin/vc_zarr_download_bench \
   s3://bucket/path/to/volume.zarr --chunks 512 \
-  --min-workers 4 --workers 32 --samples-per-worker 8 \
-  --epoch-min-seconds 1.5 --epoch-max-seconds 4 \
+  --min-workers 4 --workers 32 --epoch-min-seconds 1.5 \
   --initial-probe-multiplier 4 --search-turns 5
 ```
 
@@ -51,12 +51,10 @@ payload under a generated system temporary directory and removes it on exit;
 use `--keep-temp` or `--temp-dir PATH` to retain the files. Use `--anonymous`
 for unsigned requests to public S3 data.
 
-The output reports one bandwidth metric: encoded bytes over the time covered by
-up to the most recent `current admission x 4` successful, fully occupied chunk
-downloads at the current admission. Before that window fills, every available
-sample in that contiguous admission period is used. When the queue underfills,
-the metric retains the capacity implied by the per-worker bandwidth at the
-greatest fully occupied concurrency. While a benchmark is running, it prints
-this bandwidth, queued chunks, active downloads, admission limit, and sample
-count once per second and once more when the queue drains. Missing sparse chunks
-are reported but are not counted as downloaded bytes.
+The output reports one bandwidth metric: aggregate encoded HTTP response-body
+bytes over up to the latest five seconds during which at least one remote
+request was in flight. The interval starts when a request is issued, includes
+connection and TTFB latency, and excludes only periods with no remote request.
+While running, the benchmark prints bandwidth, queued chunks, active downloads,
+and admission once per second and once more when the queue drains. Missing
+sparse chunks are reported but are not counted as downloaded bytes.

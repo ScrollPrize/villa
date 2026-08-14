@@ -2,72 +2,83 @@
 
 ## Problem
 
-The current status and adaptive estimates sum recently completed chunk bytes
-and divide by the span from the earliest request start to the latest completion.
-That span includes idle gaps and can report a tiny bandwidth while many chunks
-are completing. Adaptive admission uses the same flawed measurement.
+The first streamed-byte implementation starts its active-time denominator at
+the first response byte. High-latency requests therefore omit connection and
+TTFB time, can fail to accumulate a five-second epoch, and overstate bandwidth.
+It also retains the old four-completions-per-worker fallback and benchmark
+display, allowing local work to affect the shared remote adaptive model.
 
 ## Implementation
 
-1. Add a thread-local scoped HTTP response-body observer around Zarr chunk
-   fetches. The common curl write callback reports received body bytes; metadata
-   opens and unrelated HTTP work remain unobserved.
-2. Extend `IChunkFetcher::fetchEncoded()` with an optional progress-aware path.
-   Existing fetchers remain source-compatible and simply provide no streaming
-   observations. `ZarrChunkFetcher` installs the HTTP observer only for the
-   duration of one encoded chunk read, including range reads for sharded data.
-3. Add measured-transfer lifecycle and byte-report APIs to
-   `ChunkRequestScheduler`. Batch callback traffic before entering the
-   scheduler to avoid a lock for every small curl write.
-4. Maintain a five-second rolling aggregate payload-byte window. Starting the
-   first streaming transfer after idle creates a fresh window; overlapping
-   transfers share it; idle time never enters its denominator.
-5. Use streamed aggregate bytes for adaptive epochs. Reset an epoch after idle,
-   admission changes, failures, or underfilled demand. Complete an epoch only
-   after both five active seconds and at least one successful completion per
-   target admission slot.
-6. Preserve a non-streaming fallback: average each successful request's
-   `bytes / duration`, then multiply by the common admission represented by the
-   sample window. Do not use earliest-to-latest wall span.
-7. Route the standalone Zarr download benchmark through the same streaming
-   observer and scheduler lifecycle as VC3D.
+1. Add an explicit fetcher capability identifying remote HTTP payload
+   transfers. Remote Zarr construction sets it; local arrays and compatibility
+   fetchers default to false.
+2. Start a scheduler transfer measurement immediately before invoking a
+   remote fetcher. The active interval begins at request issue, while the curl
+   observer continues to provide exact response-body byte increments.
+3. Measure aggregate bytes over the union of intervals with at least one
+   remote request in flight. This includes DNS/connection/request/TTFB time and
+   excludes only true idle gaps.
+4. Make streamed bytes and remote-active time the only bandwidth inputs.
+   Remove the completion-rate fallback, its four-samples-per-worker option,
+   maximum-epoch compatibility option, sample-count statistics, and benchmark
+   output.
+5. Retain completion records only inside the current adaptive epoch for p90
+   request latency, success/failure handling, and the one-completion-per-current
+   admission gate. Initial 4x and refinement 2x concurrency probes remain.
+   Missing or failed sparse-array requests end their own measurements without
+   discarding successful observations from other requests in the epoch.
+   Once a probe has selected a higher admission target, every terminal request
+   may pace the next permit; only successful payloads contribute measurements.
+6. Do not create transfer measurements for local/custom fetchers. Adaptive
+   benchmark mode fails clearly if its fetcher lacks remote-byte measurement;
+   fixed local benchmark tests remain valid but report no network bandwidth.
+7. Keep one shared measurement implementation for VC3D and
+   `vc_zarr_download_bench`.
 
 ## Tests
 
-- Verify the HTTP write callback reports incremental body bytes.
-- Verify overlapping streamed transfers produce aggregate bandwidth.
-- Verify idle time between bursts is excluded.
-- Verify the fallback computes mean individual rate times admission.
-- Verify adaptive epochs require both five active seconds and the admission
-  sample count, and that underfilled work resets the epoch.
-- Run `vc_test_core`, focused chunk-cache/Zarr/HTTP tests, the complete
-  `vc-core` shard, the download benchmark unit/smoke coverage, and build VC3D.
+- Verify active-time measurement includes TTFB before the first byte.
+- Verify concurrent transfers use aggregate bytes over union wall time.
+- Verify idle gaps do not enter the denominator.
+- Verify a five-second remote epoch scales admission after one completion per
+  admitted worker, without an `admission * 4` gate.
+- Verify local/custom fetches cannot change adaptive state or network stats.
+- Verify interleaved missing chunks cannot prevent a clean-start initial probe.
+- Verify adaptive benchmark mode rejects a non-remote fetcher.
+- Update deterministic adaptive-controller fixtures to use measured remote
+  transfers rather than the removed completion-rate API.
+- Build focused scheduler/Zarr/HTTP tests and VC3D, then run the complete
+  `vc-core` test label.
 
 ## Spec update
 
-Update `planning/spec.md` to replace completion-span bandwidth with streamed
-HTTP payload measurement, document the five-second/admission epoch gate, and
-retain the non-streaming fallback.
+Update `planning/spec.md` to define request-issue through completion as the
+remote active interval, remove the non-streaming fallback, and state that local
+and custom fetches never affect remote adaptation or persisted state.
 
 ## Documentation updates
 
-Update `docs/remote_file_cache.md` and scheduler API comments with measurement
-scope, active-window behavior, and payload-byte semantics.
+Update `docs/remote_file_cache.md` and the download benchmark documentation to
+describe request-inclusive measurement and remove obsolete sample-window
+options.
 
 ## Changelog
 
-Record that VC3D status and adaptive admission now measure aggregate streamed
-HTTP payload bandwidth without idle-gap dilution.
+Record the corrected request-inclusive HTTP bandwidth/adaptation model and
+local-transfer isolation.
 
 ## Independent review
 
-- The shared curl callback is the lowest reusable transport boundary and avoids
-  duplicating Zarr reads.
-- A scoped observer prevents metadata and unrelated HTTP requests from
-  contaminating the chunk metric.
-- Streaming bytes naturally account for actual concurrency; no parallelism
-  multiplier is applied to that path.
-- The multiplier exists only for fetchers that cannot provide byte progress.
-- Render values, chunk contents, queue priority, and cache policy are unchanged.
-- Byte callbacks must be batched because serializing every curl write on the
-  scheduler mutex would create avoidable contention at high concurrency.
+- The remote capability is known before the fetch begins, which is necessary
+  to include TTFB and impossible to infer safely from a later byte callback.
+- Defaulting the capability to false preserves custom fetcher compatibility
+  without misclassifying local work as network traffic.
+- Aggregate bytes divided by the union of remote in-flight intervals already
+  includes concurrency; applying a parallelism multiplier would double count.
+- Completion latency remains useful for comparing probe candidates but does
+  not estimate bandwidth.
+- Keeping the 4x initial probe is intentional and distinct from the removed
+  `admission * 4` completion window.
+- No rendering, cache-content, queue-priority, or numeric sampling behavior is
+  changed.

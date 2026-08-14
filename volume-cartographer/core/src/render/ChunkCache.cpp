@@ -1623,7 +1623,7 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
     bool trackedRemoteFetch = false;
     const auto fetchStarted = std::chrono::steady_clock::now();
     std::optional<ChunkRequestScheduler::TransferMeasurement> transfer;
-    if (context.fetchScheduler)
+    if (context.fetchScheduler && context.fetcher->measuresRemoteTransfer())
         transfer.emplace(context.fetchScheduler->beginTransfer(fetchStarted));
     auto observeProgress = [&](std::size_t bytes) {
         if (transfer)

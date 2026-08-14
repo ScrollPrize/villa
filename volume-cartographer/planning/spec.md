@@ -153,18 +153,24 @@
   then enter the decode queue.
 - Normal interactive remote source reads use 64 available workers with an
   adaptive admission limit in `[2,64]`. The common HTTP response callback
-  reports encoded body bytes for scoped Zarr chunk reads. A service-global
-  five-active-second window aggregates concurrent payload bytes while excluding
-  intervals with no measured transfer active. Saturated adaptive epochs use the same
-  aggregate measurement plus p90 request latency and require both five active
-  seconds and at least one successful completion per admitted worker. Fetchers
-  without byte progress fall back to mean individual request rate multiplied by
-  their common admission. Bracketed probes compare the settled limit with higher
+  reports encoded body bytes for scoped Zarr chunk reads. Remote fetchers
+  declare this capability before invocation, and a service-global
+  five-second window aggregates concurrent payload bytes over the union of
+  remote request-issue-through-completion intervals. Connection and TTFB time
+  are included; intervals with no remote request in flight are excluded.
+  Saturated adaptive epochs use the same aggregate measurement plus p90 request
+  latency and require both five remote-active seconds and at least one
+  successful completion per admitted worker. Local and custom fetchers do not
+  update displayed network bandwidth, adaptive history, or persisted remote
+  state. Bracketed probes compare the settled limit with higher
   and lower limits; initial discovery uses a 4x step and subsequent refinement
   uses 2x steps. Stable bandwidth stretches periodic exploration toward five
   minutes, while a roughly 2x bandwidth change brings it back toward one minute.
-  Failed, missing, and underfilled-tail reads reset rather than establish an
-  adaptive capacity epoch.
+  Failed and missing reads end their own request measurements without erasing
+  successful observations from concurrent requests. They may pace an
+  already-selected admission ramp but do not create successful payload
+  samples. Underfilled-tail reads reset rather than establish a capacity
+  epoch.
 - VC3D persists the settled admission limit, long-term bandwidth EMA, and
   saturated per-worker capacity model in its versioned per-user settings. A
   later run restores and uses the settled limit immediately. Epoch samples,
@@ -209,9 +215,10 @@ During active remote downloads, the existing cache status bar appends:
   flight. Remote volumes otherwise show `net idle`; local volumes have no
   network field.
 - The displayed MiB/s and adaptive controller use the same aggregate encoded
-  HTTP body-byte estimator over the last five active transfer seconds. It is
-  updated independently of chunk completion and excludes intervals with no
-  measured transfer active.
+  HTTP body-byte estimator over the last five seconds with a remote request in
+  flight. Measurement begins at request issue, includes connection and TTFB
+  latency, is updated independently of chunk completion, and excludes only
+  intervals with no remote request active.
   The `Nx` value remains the actual current number of source fetches in flight.
 - The full active status is
   `RAM X/Y disk X/Y GiB net Nx XMiB/s qK X/Y/Z Z sens: N.N`.

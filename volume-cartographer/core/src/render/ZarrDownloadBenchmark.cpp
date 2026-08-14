@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -160,6 +161,12 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
     std::string firstError;
 
     const auto fetcher = opened.fetchers.at(static_cast<std::size_t>(options.level));
+    const bool measureRemoteTransfer = fetcher->measuresRemoteTransfer();
+    if (options.schedule == ZarrDownloadSchedule::Adaptive &&
+        !measureRemoteTransfer) {
+        throw std::invalid_argument(
+            "adaptive zarr download benchmark requires a remote HTTP fetcher");
+    }
     const auto wallStarted = Clock::now();
     std::mutex progressMutex;
     std::condition_variable progressCv;
@@ -194,9 +201,12 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
             }
 
             const auto started = Clock::now();
-            auto transfer = scheduler.beginTransfer(started);
+            std::optional<ChunkRequestScheduler::TransferMeasurement> transfer;
+            if (measureRemoteTransfer)
+                transfer.emplace(scheduler.beginTransfer(started));
             auto observeProgress = [&](std::size_t bytes) {
-                transfer.recordBytes(bytes);
+                if (transfer)
+                    transfer->recordBytes(bytes);
             };
             ChunkFetchResult fetch;
             try {
@@ -209,10 +219,12 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
                 fetch.message = "unknown chunk fetch exception";
             }
             const auto completed = Clock::now();
-            transfer.finish(
-                fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty(),
-                fetch.bytes.size(),
-                completed);
+            if (transfer) {
+                transfer->finish(
+                    fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty(),
+                    fetch.bytes.size(),
+                    completed);
+            }
             active.fetch_sub(1, std::memory_order_relaxed);
 
             const double latency = std::chrono::duration<double, std::milli>(

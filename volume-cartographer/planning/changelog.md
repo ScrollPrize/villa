@@ -1,11 +1,21 @@
 # Changelog
 
+## 2026-08-15
+
+- Corrected remote bandwidth and adaptive admission to measure received HTTP
+  payload bytes from request issue through completion, including connection and
+  TTFB latency. Removed the obsolete four-completions-per-worker fallback and
+  isolated local/custom fetches from remote statistics and persisted state.
+- Missing and failed sparse-array requests now end only their own measurements
+  instead of repeatedly resetting clean-start adaptive probing.
+- Completion-paced admission ramps use every terminal request to release the
+  next permit while retaining payload-only bandwidth evidence.
+
 ## 2026-08-14
 
 - Replaced completion-span remote bandwidth estimates with service-wide
   streamed HTTP payload measurement. VC3D status, the Zarr download benchmark,
-  and adaptive admission now share a five-active-second estimator; custom
-  fetchers retain a per-request-rate fallback.
+  and adaptive admission now share a five-active-second estimator.
 - Made `ChunkCacheService` the sole source factory and scheduler owner. Source
   acquisition can no longer change global I/O policy, and runtime concurrency
   updates modify admission on the existing scheduler without cancelling,

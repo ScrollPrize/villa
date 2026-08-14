@@ -66,6 +66,15 @@ public:
     virtual ~IChunkFetcher() = default;
     virtual ChunkFetchResult fetch(const ChunkKey& key) = 0;
 
+    // True only when fetchEncoded() issues a remote HTTP payload request and
+    // reports its response-body bytes through DownloadProgressCallback.
+    // The scheduler uses this before the call so connection and TTFB time are
+    // part of the measured network interval.
+    [[nodiscard]] virtual bool measuresRemoteTransfer() const noexcept
+    {
+        return false;
+    }
+
     // Split transfer from CPU decoding for schedulers which provide a
     // dedicated decode stage. The compatibility default preserves existing
     // fetchers whose fetch() already returns decoded bytes.
@@ -74,9 +83,8 @@ public:
         return fetch(key);
     }
 
-    // Remote fetchers may report encoded response-body bytes while they are
-    // received. The default intentionally emits no synthetic progress; the
-    // scheduler can fall back to completion-based request rates.
+    // Remote fetchers report encoded response-body bytes while they are
+    // received. The default intentionally emits no synthetic progress.
     virtual ChunkFetchResult fetchEncoded(
         const ChunkKey& key,
         const DownloadProgressCallback&)

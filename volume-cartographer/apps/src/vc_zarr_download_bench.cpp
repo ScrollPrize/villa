@@ -53,9 +53,7 @@ int main(int argc, char** argv)
     std::size_t chunks = 256;
     std::size_t workers = 64;
     std::size_t minimumWorkers = 2;
-    std::size_t samplesPerWorker = 4;
     double minimumEpochSeconds = 5.0;
-    double maximumEpochSeconds = 5.0;
     double unstableProbeSeconds = 60.0;
     double stableProbeSeconds = 300.0;
     double minimumStabilitySeconds = 300.0;
@@ -80,12 +78,8 @@ int main(int argc, char** argv)
          "Maximum workers in auto mode; exact workers in fixed mode")
         ("min-workers", po::value<std::size_t>(&minimumWorkers)->default_value(2),
          "Initial/minimum workers in auto mode")
-        ("samples-per-worker", po::value<std::size_t>(&samplesPerWorker)->default_value(4),
-         "Successful chunks per admitted worker in the non-streaming fallback window")
         ("epoch-min-seconds", po::value<double>(&minimumEpochSeconds)->default_value(5.0),
-         "Minimum active auto-probe measurement duration")
-        ("epoch-max-seconds", po::value<double>(&maximumEpochSeconds)->default_value(5.0),
-         "Compatibility upper bound; never bypasses auto-probe requirements")
+         "Minimum remote-request-active auto-probe measurement duration")
         ("unstable-probe-seconds", po::value<double>(&unstableProbeSeconds)->default_value(60.0),
          "Exploration interval after a 2x bandwidth change")
         ("stable-probe-seconds", po::value<double>(&stableProbeSeconds)->default_value(300.0),
@@ -124,14 +118,13 @@ int main(int argc, char** argv)
         po::notify(parsed);
 
         const auto schedule = parseSchedule(mode);
-        if (workers == 0 || minimumWorkers == 0 || samplesPerWorker == 0)
-            throw std::invalid_argument("worker and sample counts must be positive");
+        if (workers == 0 || minimumWorkers == 0)
+            throw std::invalid_argument("worker counts must be positive");
         if (schedule == vc::render::ZarrDownloadSchedule::Adaptive &&
             minimumWorkers > workers)
             throw std::invalid_argument("--min-workers cannot exceed --workers");
-        if (minimumEpochSeconds < 0.0 || maximumEpochSeconds < minimumEpochSeconds)
-            throw std::invalid_argument(
-                "epoch durations must satisfy 0 <= minimum <= maximum");
+        if (minimumEpochSeconds < 0.0)
+            throw std::invalid_argument("epoch duration must be non-negative");
         if (unstableProbeSeconds < 0.0 || stableProbeSeconds < unstableProbeSeconds)
             throw std::invalid_argument(
                 "probe intervals must satisfy 0 <= unstable <= stable");
@@ -171,9 +164,7 @@ int main(int argc, char** argv)
         benchmark.schedule = schedule;
         benchmark.adaptive.minimum = minimumWorkers;
         benchmark.adaptive.maximum = workers;
-        benchmark.adaptive.successfulSamplesPerWorker = samplesPerWorker;
         benchmark.adaptive.minimumEpochSeconds = minimumEpochSeconds;
-        benchmark.adaptive.maximumEpochSeconds = maximumEpochSeconds;
         benchmark.adaptive.unstableProbeIntervalSeconds = unstableProbeSeconds;
         benchmark.adaptive.stableProbeIntervalSeconds = stableProbeSeconds;
         benchmark.adaptive.minimumStabilityObservationSeconds =
@@ -181,7 +172,7 @@ int main(int argc, char** argv)
         benchmark.adaptive.initialProbeMultiplier = initialProbeMultiplier;
         benchmark.adaptive.continuousSearchTurns = continuousSearchTurns;
         benchmark.progressInterval = std::chrono::seconds(1);
-        benchmark.progressCallback = [samplesPerWorker](
+        benchmark.progressCallback = [](
                                          const vc::render::ZarrDownloadProgress& progress) {
             std::cout << "progress elapsed=" << std::fixed << std::setprecision(1)
                       << progress.elapsedSeconds << "s"
@@ -190,8 +181,6 @@ int main(int argc, char** argv)
                       << " bandwidth=" << std::setprecision(2)
                       << progress.transferStats.bytesPerSecond / kMiB << "MiB/s"
                       << " admission=" << progress.transferStats.admissionLimit
-                      << " samples=" << progress.transferStats.sampleCount << '/'
-                      << progress.transferStats.admissionLimit * samplesPerWorker
                       << "\n";
         };
         if (sink == "temp") {
@@ -243,7 +232,7 @@ int main(int argc, char** argv)
                   << " max=" << result.latencyMaximumMilliseconds
                   << " peak_active=" << result.peakActive
                   << " final_admission=" << result.finalTransferStats.admissionLimit
-                  << " samples=" << result.finalTransferStats.sampleCount << "\n";
+                  << "\n";
         std::cout << "admission";
         for (const auto& sample : result.concurrencySamples) {
             std::cout << " [chunks=" << sample.completedChunks

@@ -62,6 +62,7 @@ TEST_CASE("openLocalZarrPyramid: opens a multi-level local zarr")
     makeLocalVolume(d, /*numLevels=*/3);
     auto opened = openLocalZarrPyramid(d);
     CHECK(opened.fetchers.size() >= 1);
+    CHECK_FALSE(opened.fetchers[0]->measuresRemoteTransfer());
     CHECK_FALSE(opened.shapes.empty());
     CHECK(opened.shapes[0][0] == 64);
     fs::remove_all(d);
@@ -340,11 +341,36 @@ TEST_CASE("Zarr download benchmark uses encoded fetches and fixed admission")
     CHECK(result.peakActive == 1);
     CHECK(result.finalTransferStats.admissionLimit == 1);
     CHECK_FALSE(result.finalTransferStats.adaptive);
+    CHECK(result.finalTransferStats.bytesPerSecond == 0.0);
     REQUIRE(progress.size() == 1);
     CHECK(progress[0].queuedChunks == 0);
     CHECK(progress[0].downloadingChunks == 0);
     CHECK(progress[0].completedChunks == 12);
     CHECK(progress[0].encodedBytes == 12 * 1024);
+}
+
+TEST_CASE("Zarr download benchmark rejects adaptive mode without remote measurement")
+{
+    class LocalFetcher final : public vc::render::IChunkFetcher {
+    public:
+        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
+        {
+            return {};
+        }
+    };
+
+    OpenedChunkedZarr opened;
+    opened.shapes = {{32, 32, 32}};
+    opened.chunkShapes = {{16, 16, 16}};
+    opened.fetchers = {std::make_shared<LocalFetcher>()};
+
+    vc::render::ZarrDownloadBenchmarkOptions options;
+    options.chunkCount = 1;
+    options.workers = 2;
+    options.schedule = vc::render::ZarrDownloadSchedule::Adaptive;
+    CHECK_THROWS_AS(
+        vc::render::runZarrDownloadBenchmark(opened, options),
+        std::invalid_argument);
 }
 
 TEST_CASE("Zarr download benchmark can write encoded payloads to a temporary sink")
