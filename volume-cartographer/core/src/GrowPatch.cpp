@@ -756,6 +756,7 @@ struct TraceData {
     std::unique_ptr<PatchNormalContext> patch_normals;
 
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
+    Chunked3d<uint8_t, passTroughComputor>* support_volume = nullptr;
     std::unique_ptr<lineLossDistance> space_line_compute;
     std::unique_ptr<Chunked3d<uint8_t, lineLossDistance>> space_line_volume;
 };
@@ -3117,11 +3118,16 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
-    // Optional support test: reject grown points that land where the volume holds no
-    // material. Off by default; point --volume at a masked volume (or raise the
-    // threshold on a raw one) to stop growth from continuing past the data.
+    // Optional support test: reject grown points that land where there is no
+    // material to support them. Off by default. "support_volume" names the volume
+    // that decides support -- typically the masked CT the predictions were inferred
+    // from; when empty the traced volume decides.
     const bool require_volume_support = params.value("require_volume_support", false);
     const int volume_support_threshold = params.value("volume_support_threshold", 0);
+    const std::string support_volume_path = params.value("support_volume", std::string());
+    // Masks are not perfect: allow a point to count as supported when material sits
+    // within this many voxels of it. 0 keeps the strict test.
+    const int volume_support_dilation = std::max(0, params.value("volume_support_dilation", 0));
 
     const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
     const int growth_scale_factor = 1 << growth_scale_level;
@@ -3560,9 +3566,36 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, volume_shape_zyx, cache, level);
     trace_data.raw_volume = &dbg_tensor;
-    if (require_volume_support)
+
+    std::shared_ptr<Volume> support_volume;
+    std::unique_ptr<Chunked3d<uint8_t, passTroughComputor>> support_tensor;
+    passTroughComputor support_pass;
+    const Chunked3d<uint8_t, passTroughComputor>* support_source = nullptr;
+    if (require_volume_support) {
+        support_source = &dbg_tensor;
+        if (!support_volume_path.empty()) {
+            const bool support_is_remote =
+                support_volume_path.rfind("http://", 0) == 0 ||
+                support_volume_path.rfind("https://", 0) == 0 ||
+                support_volume_path.rfind("s3://", 0) == 0;
+            support_volume = support_is_remote
+                ? Volume::NewFromUrl(support_volume_path)
+                : Volume::New(support_volume_path);
+            support_volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
+            const std::array<int, 3> support_shape_zyx = support_volume->shape(level);
+            if (support_shape_zyx != volume_shape_zyx)
+                throw std::runtime_error("support_volume shape " +
+                    std::to_string(support_shape_zyx[0]) + "x" + std::to_string(support_shape_zyx[1]) +
+                    "x" + std::to_string(support_shape_zyx[2]) + " does not match the traced volume");
+            support_tensor = std::make_unique<Chunked3d<uint8_t, passTroughComputor>>(
+                support_pass, support_shape_zyx, support_volume->chunkedCache(), level);
+            support_source = support_tensor.get();
+        }
         std::cout << "volume support test enabled (threshold=" << volume_support_threshold
+                  << ", source=" << (support_volume_path.empty() ? "traced volume" : support_volume_path)
                   << "): candidates landing on unsupported voxels are rejected" << std::endl;
+    }
+    trace_data.support_volume = const_cast<Chunked3d<uint8_t, passTroughComputor>*>(support_source);
     std::cout << "seed val " << origin << " " <<
     (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;
 
@@ -4701,7 +4734,8 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         auto append_candidate = [&](const cv::Vec2i& p) {
             if (!bounds.contains(cv::Point(p[1], p[0])) ||
                 (trace_params.state(p) & STATE_PROCESSING) != 0 ||
-                (trace_params.state(p) & STATE_LOC_VALID) != 0) {
+                (trace_params.state(p) & STATE_LOC_VALID) != 0 ||
+                (trace_params.state(p) & STATE_FAIL) != 0) {
                 return;
             }
             if (!trace_data.allowed_growth_mask.empty() &&
@@ -4717,9 +4751,24 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         bool used_area_fully_valid = true;
         for (int j = used_area.y; j < used_area.br().y && used_area_fully_valid; ++j) {
             for (int i = used_area.x; i < used_area.br().x; ++i) {
-                if ((trace_params.state(j, i) & STATE_LOC_VALID) == 0) {
-                    used_area_fully_valid = false;
-                    break;
+                const uint8_t cell_state = trace_params.state(j, i);
+                if ((cell_state & STATE_LOC_VALID) == 0 && (cell_state & STATE_FAIL) == 0) {
+                    // A gap only counts as a hole while the patch can still reach it.
+                    // Locations sealed off by refused ones never can, and treating them
+                    // as holes would keep the tracer in fill mode with nothing to fill.
+                    bool reachable = false;
+                    for (const auto& n : neighs) {
+                        const cv::Vec2i q{j + n[0], i + n[1]};
+                        if (bounds.contains(cv::Point(q[1], q[0])) &&
+                            (trace_params.state(q) & STATE_LOC_VALID) != 0) {
+                            reachable = true;
+                            break;
+                        }
+                    }
+                    if (reachable) {
+                        used_area_fully_valid = false;
+                        break;
+                    }
                 }
             }
         }
@@ -4896,7 +4945,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
                     // Support test on the optimized position: growth may not continue into
                     // voxels the volume does not cover.
-                    if (require_volume_support && trace_data.raw_volume) {
+                    if (require_volume_support && trace_data.support_volume) {
                         const cv::Vec3d& fitted = trace_params.dpoints(p);
                         const cv::Vec3i voxel{(int)std::lround(fitted[2]),
                                               (int)std::lround(fitted[1]),
@@ -4905,9 +4954,24 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                                             voxel[0] < volume_shape_zyx[0] &&
                                             voxel[1] < volume_shape_zyx[1] &&
                                             voxel[2] < volume_shape_zyx[2];
-                        if (!inside ||
-                            (int)trace_data.raw_volume->safe_at(voxel) <= volume_support_threshold) {
-                            trace_params.state(p) = 0;
+                        bool supported = false;
+                        if (inside) {
+                            const int r = volume_support_dilation;
+                            for (int dz = -r; dz <= r && !supported; ++dz)
+                                for (int dy = -r; dy <= r && !supported; ++dy)
+                                    for (int dx = -r; dx <= r && !supported; ++dx) {
+                                        const cv::Vec3i q{voxel[0] + dz, voxel[1] + dy, voxel[2] + dx};
+                                        if (q[0] < 0 || q[1] < 0 || q[2] < 0 ||
+                                            q[0] >= volume_shape_zyx[0] ||
+                                            q[1] >= volume_shape_zyx[1] ||
+                                            q[2] >= volume_shape_zyx[2])
+                                            continue;
+                                        if ((int)trace_data.support_volume->safe_at(q) > volume_support_threshold)
+                                            supported = true;
+                                    }
+                        }
+                        if (!supported) {
+                            trace_params.state(p) = STATE_FAIL;
                             trace_params.dpoints(p) = {-1, -1, -1};
                             #pragma omp atomic
                             support_rejects_gen++;
