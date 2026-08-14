@@ -1798,7 +1798,8 @@ void MenuActionController::attachUmbilicus()
             std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("Not a valid umbilicus file:\n\n%1").arg(QString::fromUtf8(e.what())));
+            QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
+                .arg(file, QString::fromUtf8(e.what())));
         return;
     }
 
