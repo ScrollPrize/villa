@@ -116,7 +116,7 @@ public:
 
     ChunkFetchResult fetchEncoded(const ChunkKey&) override
     {
-        started_.count_down();
+        std::call_once(startedOnce_, [this] { started_.count_down(); });
         {
             std::unique_lock lock(mutex_);
             cv_.wait(lock, [&] { return released_; });
@@ -153,6 +153,7 @@ public:
 private:
     std::mutex mutex_;
     std::condition_variable cv_;
+    std::once_flag startedOnce_;
     std::latch started_{1};
     bool released_ = false;
 };
@@ -495,7 +496,8 @@ TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
     for (int ix : {0, 1}) {
         ChunkFetchResult result;
         result.status = ChunkFetchStatus::Found;
-        result.bytes = makeBytes(64, std::byte{31 + ix});
+        result.bytes = makeBytes(
+            64, std::byte{static_cast<unsigned char>(31 + ix)});
         fetcherA->setCanned({0, 0, 0, ix}, result);
         fetcherB->setCanned({0, 0, 0, ix}, result);
     }

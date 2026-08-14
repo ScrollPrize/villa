@@ -203,6 +203,18 @@ ChunkCacheService::~ChunkCacheService()
         ChunkCache::invalidateState(state);
         ChunkCache::unregisterStateBudget(*state);
     }
+
+    // Invalidation cancels pending work, but a running stage may still be
+    // returning from its callback. Drain every stage while Impl still owns the
+    // schedulers so their worker threads are joined by this thread.
+    impl_->probeScheduler->waitIdle();
+    for (const auto& [workers, scheduler] : impl_->fetchSchedulers) {
+        (void)workers;
+        scheduler->waitIdle();
+    }
+    if (impl_->adaptiveFetchScheduler)
+        impl_->adaptiveFetchScheduler->waitIdle();
+    impl_->decodeScheduler->waitIdle();
 }
 
 std::shared_ptr<DecodedChunkCacheBudget>
