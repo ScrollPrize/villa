@@ -1972,14 +1972,8 @@ TEST_CASE("ChunkRequestScheduler probes upward with completion-paced admission")
         CHECK(probing.probing);
         finishRamp();
         recordEpoch(2 * concurrency, 9.0 * concurrency, 0.12);
-        recordEpoch(concurrency, 5.0 * concurrency, 0.10);
-        if (concurrency > adaptive.minimum) {
-            recordEpoch(concurrency / 2, 3.0 * concurrency, 0.08);
-            finishRamp();
-            recordEpoch(concurrency, 5.0 * concurrency, 0.10);
-        }
-        finishRamp();
         CHECK(scheduler.transferStats().admissionLimit == 2 * concurrency);
+        CHECK(scheduler.transferStats().targetAdmissionLimit == 2 * concurrency);
     };
 
     selectDouble(2);
@@ -2084,14 +2078,57 @@ TEST_CASE("ChunkRequestScheduler does not veto throughput on request latency")
     // about 82%. That latency increase is a normal consequence of concurrency
     // and must not veto the useful aggregate-bandwidth gain.
     recordEpoch(4, 11.0);
-    recordEpoch(2, 10.0);
-    REQUIRE(scheduler.transferStats().targetAdmissionLimit == 4);
-    const auto selectedRampStarted = cursor + std::chrono::seconds(1);
-    recordMeasuredTransfers(
-        scheduler, 1, chunkBytes, selectedRampStarted,
-        std::chrono::milliseconds(10));
     CHECK(scheduler.transferStats().admissionLimit == 4);
     CHECK(scheduler.transferStats().targetAdmissionLimit == 4);
+}
+
+TEST_CASE("ChunkRequestScheduler delays downward probe after upward gain")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.maximum = 32;
+    adaptive.minimumEpochSeconds = 0.0;
+    adaptive.initialProbeMultiplier = 4;
+    ChunkRequestScheduler scheduler(32, 7, {}, adaptive);
+    auto cursor = Clock::time_point{};
+
+    auto recordEpoch = [&](std::size_t concurrency, double throughputMiB) {
+        REQUIRE(scheduler.transferStats().admissionLimit == concurrency);
+        REQUIRE(scheduler.transferStats().targetAdmissionLimit == concurrency);
+        const double requestSeconds =
+            static_cast<double>(chunkBytes * concurrency) /
+            (throughputMiB * 1024.0 * 1024.0);
+        const auto started = cursor + std::chrono::seconds(1);
+        const auto duration = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(requestSeconds));
+        recordMeasuredTransfers(
+            scheduler, concurrency, chunkBytes, started, duration);
+        cursor = started + duration;
+    };
+    auto finishRamp = [&] {
+        while (scheduler.transferStats().admissionLimit <
+               scheduler.transferStats().targetAdmissionLimit) {
+            const auto started = cursor + std::chrono::seconds(1);
+            recordMeasuredTransfers(
+                scheduler, 1, chunkBytes, started,
+                std::chrono::milliseconds(10));
+            cursor = started + std::chrono::milliseconds(10);
+        }
+    };
+
+    recordEpoch(2, 2.0);
+    REQUIRE(scheduler.transferStats().targetAdmissionLimit == 8);
+    finishRamp();
+    recordEpoch(8, 8.0);
+
+    // The accepted C=8 probe remains installed. Its next settled epoch starts
+    // another upward probe at C=32 rather than replaying C=2.
+    CHECK(scheduler.transferStats().admissionLimit == 8);
+    CHECK(scheduler.transferStats().targetAdmissionLimit == 8);
+    recordEpoch(8, 8.0);
+    CHECK(scheduler.transferStats().admissionLimit == 9);
+    CHECK(scheduler.transferStats().targetAdmissionLimit == 32);
 }
 
 TEST_CASE("ChunkRequestScheduler requires saturated observation time for stability")

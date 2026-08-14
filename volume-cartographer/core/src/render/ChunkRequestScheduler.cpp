@@ -581,6 +581,59 @@ struct ChunkRequestScheduler::Impl {
         return candidate.bytesPerSecond / baseline.bytesPerSecond;
     }
 
+    void applyProbeSelectionLocked(
+        std::size_t selected,
+        const EpochMeasurement& selectedMeasurement,
+        const EpochMeasurement& completedMeasurement)
+    {
+        const std::size_t previousSettled = settledAdmissionLimit;
+        const bool changed = selected != previousSettled;
+        const int direction = selected > previousSettled
+            ? 1
+            : (selected < previousSettled ? -1 : 0);
+        if (continuousSearch) {
+            if (direction == 0 ||
+                (lastSearchDirection != 0 && direction != lastSearchDirection)) {
+                ++searchTurns;
+                probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
+            }
+            if (direction != 0)
+                lastSearchDirection = direction;
+            if (searchTurns >= adaptiveOptions.continuousSearchTurns)
+                continuousSearch = false;
+        } else if (changed) {
+            // A periodic probe found a new operating point. Refine around it
+            // continuously until the local choice is confirmed again.
+            continuousSearch = true;
+            searchTurns = 0;
+            lastSearchDirection = direction;
+            probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
+        }
+        settledAdmissionLimit = selected;
+        phase = ProbePhase::Monitor;
+        baselineBeforeUp.reset();
+        baselineAfterUp.reset();
+        upMeasurement.reset();
+        downMeasurement.reset();
+        if (changed) {
+            // Continue initial/local discovery immediately around a newly
+            // selected point. Stability timing begins once a probe retains C.
+            longTermBytesPerSecond = selectedMeasurement.bytesPerSecond;
+            bandwidthInstability = 0.0;
+            lastBandwidthDeviation = 0.0;
+            stabilityObservedSeconds = selectedMeasurement.observationSeconds;
+        }
+        if (!continuousSearch) {
+            if (!changed)
+                observeSettledBandwidthLocked(completedMeasurement);
+            currentProbeIntervalSeconds = explorationIntervalLocked();
+            nextProbe = completedMeasurement.completed + std::chrono::duration_cast<
+                std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(currentProbeIntervalSeconds));
+        }
+        setAdmissionTargetLocked(selected, completedMeasurement.completed);
+    }
+
     void finishProbeCycleLocked(const EpochMeasurement& finalBaseline)
     {
         const std::size_t previousSettled = settledAdmissionLimit;
@@ -623,51 +676,8 @@ struct ChunkRequestScheduler::Impl {
             }
         }
 
-        const bool changed = selected != previousSettled;
-        const int direction = selected > previousSettled
-            ? 1
-            : (selected < previousSettled ? -1 : 0);
-        if (continuousSearch) {
-            if (direction == 0 ||
-                (lastSearchDirection != 0 && direction != lastSearchDirection)) {
-                ++searchTurns;
-                probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
-            }
-            if (direction != 0)
-                lastSearchDirection = direction;
-            if (searchTurns >= adaptiveOptions.continuousSearchTurns)
-                continuousSearch = false;
-        } else if (changed) {
-            // A periodic probe found a new operating point. Refine around it
-            // continuously until the local choice is confirmed again.
-            continuousSearch = true;
-            searchTurns = 0;
-            lastSearchDirection = direction;
-            probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
-        }
-        settledAdmissionLimit = selected;
-        phase = ProbePhase::Monitor;
-        baselineBeforeUp.reset();
-        baselineAfterUp.reset();
-        upMeasurement.reset();
-        downMeasurement.reset();
-        if (changed) {
-            // Continue initial/local discovery immediately around a newly
-            // selected point. Stability timing begins once a probe retains C.
-            longTermBytesPerSecond = selectedMeasurement.bytesPerSecond;
-            bandwidthInstability = 0.0;
-            lastBandwidthDeviation = 0.0;
-            stabilityObservedSeconds = selectedMeasurement.observationSeconds;
-        }
-        if (!continuousSearch) {
-            if (!changed)
-                observeSettledBandwidthLocked(finalBaseline);
-            currentProbeIntervalSeconds = explorationIntervalLocked();
-            nextProbe = finalBaseline.completed + std::chrono::duration_cast<
-                std::chrono::steady_clock::duration>(
-                    std::chrono::duration<double>(currentProbeIntervalSeconds));
-        }
-        setAdmissionTargetLocked(selected, finalBaseline.completed);
+        applyProbeSelectionLocked(
+            selected, selectedMeasurement, finalBaseline);
     }
 
     void beginProbeLocked(const EpochMeasurement& baseline)
@@ -719,6 +729,16 @@ struct ChunkRequestScheduler::Impl {
             break;
         case ProbePhase::Up:
             upMeasurement = measurement;
+            if (baselineBeforeUp &&
+                throughputRatio(measurement, *baselineBeforeUp) >=
+                    adaptiveOptions.throughputGainRatio) {
+                // During discovery, a clear aggregate-goodput gain becomes the
+                // next operating point immediately. Replaying the old baseline
+                // and probing downward would only delay the continued climb.
+                applyProbeSelectionLocked(
+                    upAdmissionLimit, measurement, measurement);
+                break;
+            }
             phase = ProbePhase::BaselineAfterUp;
             setAdmissionTargetLocked(settledAdmissionLimit,
                                      measurement.completed);

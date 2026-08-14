@@ -234,6 +234,11 @@ samples, probe phase, direction history, and the stability window are reset, so
 the controller performs frequent initial up/down probes around the prior limit
 before returning to its normal stability-dependent cadence.
 
+During continuous discovery, a clear upward aggregate-goodput gain is installed
+immediately and the next saturated epoch continues the upward search. The
+controller replays the prior baseline and considers lower concurrency only
+after an upward probe fails or reaches the configured worker ceiling.
+
 Each saturated controller epoch requires at least five remote-request-active
 seconds and one successful completion per admitted worker. Aggregate goodput is
 the primary probe-selection metric; increased per-request latency does not veto

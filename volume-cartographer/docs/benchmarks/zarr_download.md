@@ -19,12 +19,15 @@ before reaching higher concurrency. `--chunks` controls the number of unique
 candidate keys and queued request slots; `--duration-seconds` controls runtime.
 The automatic policy defaults are the rendering defaults: 2 initial workers,
 64 maximum workers, and a five-remote-request-active-second measurement epoch.
-Initial discovery
-probes `4C` and `C/4` to cover the range quickly. After the first overshoot,
-direction reversal, or retained-center bracket, refinement compares `2C` and
-`C/2`. Search remains continuous until five direction reversals or retained
-centers confirm a local operating point. Increasing concurrency admits one
-additional worker per completed transfer instead of starting a burst. Missing
+Initial discovery probes `4C` and immediately installs that candidate when it
+provides a clear aggregate-goodput gain, then continues climbing from the new
+operating point. It does not replay `C` or probe `C/4` after a successful upward
+probe. Baseline replay and downward comparison begin only when the upward probe
+fails or no higher worker count is available. After the first overshoot,
+direction reversal, or retained-center bracket, refinement uses a `2x` step.
+Search remains continuous until five direction reversals or retained centers
+confirm a local operating point. Increasing concurrency admits one additional
+worker per completed transfer instead of starting a burst. Missing
 sparse chunks can pace that ramp but never contribute payload bandwidth or a
 successful epoch sample. Each setting can be overridden for experiments:
 
