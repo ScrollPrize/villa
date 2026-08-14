@@ -872,7 +872,7 @@ class FitContext:
         progress = progress_or_null(self.progress)
         patches = {}
         entries = sorted(os.listdir(path))
-        filter_regex = self.config['input_patch_filter_regex']
+        filter_regex = self.config['patch_uuid_filter_regex']
         if filter_regex is not None:
             filtered = [e for e in entries if re.search(filter_regex, e)]
             print(f'patch filter regex {filter_regex!r} kept '
