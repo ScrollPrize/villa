@@ -46,6 +46,7 @@ public:
 signals:
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
+    void windingTransitionsChanged(bool visible);
     void lossMapChanged(const QString& name, qreal opacity);
     // Whether the next preview export should compute the loss overlays.
     void previewDiagnosticsChanged(bool enabled);

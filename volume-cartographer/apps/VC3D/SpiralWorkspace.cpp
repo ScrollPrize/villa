@@ -339,6 +339,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _overlay->publishRunDiff({}, {});
         }
     });
+    connect(_panel, &SpiralPanel::windingTransitionsChanged, this, [this](bool shown) {
+        _windingTransitionsVisible = shown;
+        updateWindingTransitionOverlay();
+    });
     connect(_panel, &SpiralPanel::lossMapChanged, this,
             [this](const QString& name, qreal opacity) {
                 _selectedLossMap = name;
@@ -1447,6 +1451,97 @@ void SpiralWorkspace::updateLossMapOverlay()
         _lossMapOpacity);
 }
 
+namespace
+{
+
+// Trace the boundaries between winding regions of the displayed preview crop
+// as row-ordered polylines, one curve per winding pair. Each row is walked
+// left to right over the winding-id map; wherever the winding changes between
+// two valid pixels no more than kMaxGapColumns apart, the midpoint between
+// them is a boundary point. Per pair, points chain into segments that break
+// when the boundary vanishes for more than kMaxRowGap rows or jumps by more
+// than kMaxGapColumns columns, so curves never bridge holes in the surface.
+// Windings outside the displayed range count as invalid: their vertices were
+// masked off the surface, so a boundary against them would float in a void.
+std::vector<SpiralOverlayController::WindingTransitionCurve>
+traceWindingTransitions(const cv::Mat_<int32_t>& windings,
+                        int minimumWinding, int maximumWinding)
+{
+    constexpr int kMaxGapColumns = 8;
+    constexpr float kMaxRowGap = 4.0f;
+    constexpr float kMaxRowStep = 16.0f;
+    constexpr float kColumnTolerance = 0.5f;
+    std::map<std::pair<int, int>, std::vector<cv::Vec2f>> pointsByPair;
+    for (int row = 0; row < windings.rows; ++row) {
+        int previousColumn = -1;
+        int previousWinding = -1;
+        for (int column = 0; column < windings.cols; ++column) {
+            const int winding = windings(row, column);
+            if (winding < minimumWinding
+                || (maximumWinding >= 0 && winding > maximumWinding))
+                continue;
+            if (previousColumn >= 0 && winding != previousWinding
+                && column - previousColumn <= kMaxGapColumns) {
+                pointsByPair[{previousWinding, winding}].emplace_back(
+                    static_cast<float>(previousColumn + column) / 2.0f,
+                    static_cast<float>(row));
+            }
+            previousColumn = column;
+            previousWinding = winding;
+        }
+    }
+    std::vector<SpiralOverlayController::WindingTransitionCurve> curves;
+    for (auto& [pair, points] : pointsByPair) {
+        SpiralOverlayController::WindingTransitionCurve curve;
+        curve.fromWinding = pair.first;
+        curve.toWinding = pair.second;
+        std::vector<std::vector<cv::Vec2f>> segments(1);
+        for (const cv::Vec2f& point : points) {
+            if (!segments.back().empty()
+                && (point[1] - segments.back().back()[1] > kMaxRowGap
+                    || std::abs(point[0] - segments.back().back()[0])
+                        > static_cast<float>(kMaxGapColumns)))
+                segments.emplace_back();
+            segments.back().push_back(point);
+        }
+        for (std::vector<cv::Vec2f>& segment : segments) {
+            if (segment.size() < 2) continue;
+            // Decimate near-vertical runs: keep both endpoints plus any point
+            // that moved in column or is kMaxRowStep rows past the last kept.
+            std::vector<cv::Vec2f> kept{segment.front()};
+            for (std::size_t index = 1; index + 1 < segment.size(); ++index) {
+                if (std::abs(segment[index][0] - kept.back()[0])
+                        >= kColumnTolerance
+                    || segment[index][1] - kept.back()[1] >= kMaxRowStep)
+                    kept.push_back(segment[index]);
+            }
+            kept.push_back(segment.back());
+            curve.segments.push_back(std::move(kept));
+        }
+        if (!curve.segments.empty()) curves.push_back(std::move(curve));
+    }
+    return curves;
+}
+
+} // namespace
+
+void SpiralWorkspace::updateWindingTransitionOverlay()
+{
+    const auto selection = displayedPreviewSelection();
+    if (!_windingTransitionsVisible || !selection || !_currentPreview
+        || _previewWindingIds.empty()) {
+        _overlay->publishWindingTransitions({}, {});
+        return;
+    }
+    // Tracing on the winding-range crop keeps the curves in the displayed
+    // surface's own grid coordinates.
+    _overlay->publishWindingTransitions(
+        _currentPreview,
+        traceWindingTransitions(_previewWindingIds(selection->region),
+                                selection->minimumWinding,
+                                selection->maximumWinding));
+}
+
 std::optional<SpiralWorkspace::PreviewDisplaySelection>
 SpiralWorkspace::displayedPreviewSelection() const
 {
@@ -1489,6 +1584,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
     _previewRunDiffImage = {};
     _overlay->publishRunDiff({}, {});
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
+    _overlay->publishWindingTransitions({}, {});
 
     const auto selection = displayedPreviewSelection();
     if (!selection) {
@@ -1605,6 +1701,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     else
         updateRunDiffOverlay();
     updateLossMapOverlay();
+    updateWindingTransitionOverlay();
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();

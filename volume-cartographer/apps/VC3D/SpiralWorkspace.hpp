@@ -131,6 +131,7 @@ private:
     void loadRunDiff();
     void updateRunDiffOverlay();
     void updateLossMapOverlay();
+    void updateWindingTransitionOverlay();
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
@@ -199,6 +200,7 @@ private:
     bool _showSurfaceOverlap = true;
     bool _pendingPatchesOnly = false;
     bool _runDiffVisible = false;
+    bool _windingTransitionsVisible = true;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;

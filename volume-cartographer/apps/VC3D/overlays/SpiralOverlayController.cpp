@@ -26,6 +26,15 @@ void SpiralOverlayController::publishLossMap(std::shared_ptr<QuadSurface> surfac
     refreshAll();
 }
 
+void SpiralOverlayController::publishWindingTransitions(
+    std::shared_ptr<QuadSurface> surface,
+    std::vector<WindingTransitionCurve> curves)
+{
+    _transitionSurface = std::move(surface);
+    _transitionCurves = std::move(curves);
+    refreshAll();
+}
+
 void SpiralOverlayController::setRunDiffVisible(bool visible)
 {
     if (_runDiffVisible == visible) return;
@@ -39,6 +48,8 @@ void SpiralOverlayController::reset()
     _runDiffImage = {};
     _lossMapSurface.reset();
     _lossMapImage = {};
+    _transitionSurface.reset();
+    _transitionCurves.clear();
     refreshAll();
 }
 
@@ -46,7 +57,13 @@ bool SpiralOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) cons
 {
     const bool lossMapVisible = viewer && _lossMapSurface && !_lossMapImage.isNull()
         && viewer->currentSurface() == _lossMapSurface.get();
-    return hasRunDiffFor(viewer) || lossMapVisible;
+    return hasRunDiffFor(viewer) || lossMapVisible || hasTransitionsFor(viewer);
+}
+
+bool SpiralOverlayController::hasTransitionsFor(VolumeViewerBase* viewer) const
+{
+    return viewer && _transitionSurface && !_transitionCurves.empty()
+        && viewer->currentSurface() == _transitionSurface.get();
 }
 
 bool SpiralOverlayController::hasRunDiffFor(VolumeViewerBase* viewer) const
@@ -96,6 +113,53 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
             if (scaleX > 1e-6 && scaleY > 1e-6)
                 builder.addImage(_lossMapImage, origin, scaleX, scaleY,
                                  _lossMapOpacity, 66.0);
+        }
+    }
+
+    if (hasTransitionsFor(viewer)) {
+        const cv::Vec2f scale = _transitionSurface->scale();
+        const cv::Vec3f center = _transitionSurface->center();
+        if (std::abs(scale[0]) > 1e-6f && std::abs(scale[1]) > 1e-6f) {
+            auto gridToSurface = [scale, center](const cv::Vec2f& gridColumnRow) {
+                return cv::Vec2f(gridColumnRow[0] / scale[0] - center[0],
+                                 gridColumnRow[1] / scale[1] - center[1]);
+            };
+            for (const WindingTransitionCurve& curve : _transitionCurves) {
+                // A jump straight to a non-adjacent winding is a mapping
+                // anomaly worth spotting, so it gets the warning color.
+                const bool adjacent =
+                    curve.toWinding == curve.fromWinding + 1
+                    || curve.fromWinding == curve.toWinding + 1;
+                OverlayStyle style;
+                style.penColor = adjacent ? QColor(255, 200, 40, 220)
+                                          : QColor(255, 60, 60, 230);
+                style.penWidth = 2.0;
+                style.z = 67.0;
+                bool labeled = false;
+                for (const std::vector<cv::Vec2f>& segment : curve.segments) {
+                    if (segment.size() < 2) continue;
+                    std::vector<cv::Vec2f> surfacePoints;
+                    surfacePoints.reserve(segment.size());
+                    for (const cv::Vec2f& point : segment)
+                        surfacePoints.push_back(gridToSurface(point));
+                    builder.addSurfaceLineStrip(surfacePoints, false, style);
+                    if (!labeled) {
+                        const cv::Vec2f anchor =
+                            surfacePoints[surfacePoints.size() / 2];
+                        OverlayStyle textStyle;
+                        textStyle.penColor = style.penColor;
+                        textStyle.z = 68.0;
+                        builder.addText(
+                            viewer->surfaceCoordsToScene(anchor[0], anchor[1])
+                                + QPointF(4.0, -4.0),
+                            QStringLiteral("%1 | %2")
+                                .arg(curve.fromWinding)
+                                .arg(curve.toWinding),
+                            QFont(), textStyle, true);
+                        labeled = true;
+                    }
+                }
+            }
         }
     }
 

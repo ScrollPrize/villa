@@ -520,6 +520,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
     displayDialogLayout->addWidget(runDiff);
 
+    auto* windingTransitions = new QCheckBox(tr("Winding transitions"), _displayDialog);
+    windingTransitions->setObjectName(QStringLiteral("spiralWindingTransitions"));
+    windingTransitions->setChecked(true);
+    windingTransitions->setToolTip(
+        tr("Draw the boundaries between adjacent windings on the flattened "
+           "output, labeled with the winding numbers on either side. A red "
+           "boundary joins non-adjacent windings and usually indicates a "
+           "mapping problem."));
+    connect(windingTransitions, &QCheckBox::toggled,
+            this, &SpiralPanel::windingTransitionsChanged);
+    displayDialogLayout->addWidget(windingTransitions);
+
     auto* lossMapRow = new QWidget(_displayDialog);
     auto* lossMapLayout = new QHBoxLayout(lossMapRow);
     lossMapLayout->setContentsMargins(0, 0, 0, 0);
