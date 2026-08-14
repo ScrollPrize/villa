@@ -25,11 +25,7 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     return utils::HttpClient(std::move(cfg));
 }
 
-// httpGetBytes fetches arbitrary binary payloads -- tifxyz mesh bands and
-// similar can be 100+ MB, well past what a 30s transfer timeout allows at
-// normal bandwidth. makeTextClient's timeout is sized for small JSON/text
-// responses; reusing it here caused large-but-otherwise-fine downloads to
-// time out and be reported as "missing or empty" rather than as a timeout.
+// Binary payloads (100+ MB mesh bands) need longer than makeTextClient's 30s.
 utils::HttpClient makeBinaryClient(const HttpAuth& auth)
 {
     utils::HttpClient::Config cfg;
