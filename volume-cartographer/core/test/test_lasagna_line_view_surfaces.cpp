@@ -94,19 +94,27 @@ TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
     checkVec(surfacePoints(10, 2), {20.0, 0.0, 0.0});
 }
 
-TEST_CASE("LineViewBuilder default strip spacing is a 50 base voxel target")
+TEST_CASE("LineViewBuilder keeps legacy strip height with 50 voxel along target")
 {
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
     const auto surfacePoints = views.lineSurface->rawPoints();
+    const auto sideSlicePoints = views.lineSideSlice->rawPoints();
 
     REQUIRE(surfacePoints.rows == 21);
     REQUIRE(surfacePoints.cols == 2);
+    REQUIRE(sideSlicePoints.rows == 21);
+    REQUIRE(sideSlicePoints.cols == 2);
 
-    checkVec(surfacePoints(9, 0), {0.0, -50.0, 0.0});
+    checkVec(surfacePoints(9, 0), {0.0, -10.0, 0.0});
     checkVec(surfacePoints(10, 0), {0.0, 0.0, 0.0});
-    checkVec(surfacePoints(11, 0), {0.0, 50.0, 0.0});
+    checkVec(surfacePoints(11, 0), {0.0, 10.0, 0.0});
+    checkVec(sideSlicePoints(9, 0), {0.0, 0.0, -10.0});
+    checkVec(sideSlicePoints(10, 0), {0.0, 0.0, 0.0});
+    checkVec(sideSlicePoints(11, 0), {0.0, 0.0, 10.0});
     CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 20.0));
-    CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 50.0));
+    CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 20.0));
+    CHECK(views.lineSideSlice->scale()[1] == doctest::Approx(1.0 / 10.0));
 }
 
 TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along normal")

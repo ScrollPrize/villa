@@ -89,14 +89,31 @@ std::vector<double> crossOffsets(double halfWidth, int samples)
     return offsets;
 }
 
+double typicalStepSize(const std::vector<SegmentNormalSample>& samples)
+{
+    std::vector<double> steps;
+    steps.reserve(samples.size());
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        const double step = norm(samples[i + 1].position - samples[i].position);
+        if (std::isfinite(step) && step > kEpsilon) {
+            steps.push_back(step);
+        }
+    }
+    if (steps.empty()) {
+        return 1.0;
+    }
+    std::sort(steps.begin(), steps.end());
+    return steps[steps.size() / 2];
+}
+
 double resolvedHalfExtent(double configuredHalfExtent,
-                          double targetSpacingBaseVoxels,
+                          const std::vector<SegmentNormalSample>& samples,
                           int crossSamples)
 {
     if (configuredHalfExtent > 0.0) {
         return configuredHalfExtent;
     }
-    return targetSpacingBaseVoxels * static_cast<double>(crossSamples - 1) * 0.5;
+    return typicalStepSize(samples) * static_cast<double>(crossSamples - 1) * 0.5;
 }
 
 std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
@@ -825,10 +842,10 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
     }
 
     const double surfaceHalfWidth = resolvedHalfExtent(config.surfaceHalfWidth,
-                                                       config.targetSpacingBaseVoxels,
+                                                       frameData.samples,
                                                        config.crossSamples);
     const double sideSliceHalfDepth = resolvedHalfExtent(config.sideSliceHalfDepth,
-                                                        config.targetSpacingBaseVoxels,
+                                                        frameData.samples,
                                                         config.crossSamples);
     const double surfaceCrossSpacing =
         2.0 * surfaceHalfWidth / static_cast<double>(config.crossSamples - 1);

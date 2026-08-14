@@ -56,7 +56,9 @@ total length is not divisible by 50. An explicit bidirectional mapping keeps
 control points, span labels, hover positions, cut planes, and saved line
 positions in the original fractional point-index coordinate. The strip grid's
 along- and cross-line scales are declared in base-volume voxel units, so input
-line points may have arbitrary spacing without changing render LOD.
+line points may have arbitrary spacing without changing render LOD. Automatic
+strip height retains the legacy behavior: its cross-row spacing is the median
+optimized control-point step, independent of the 50-voxel along-line target.
 
 The current cut view draws its solid yellow control-point marker only while the
 control point is inside the cut plane's thin slab, so fast panning would

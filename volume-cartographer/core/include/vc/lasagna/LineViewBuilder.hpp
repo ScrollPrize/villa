@@ -16,8 +16,8 @@ struct LineViewConfig {
     // parameter in level-0/base-volume voxels, independent of stored point or
     // optimizer spacing.
     double targetSpacingBaseVoxels = 50.0;
-    // Non-positive values auto-size so cross-strip spacing matches the target
-    // along-strip spacing.
+    // Non-positive values retain the legacy automatic strip height: cross-row
+    // spacing matches the median optimized control-point step.
     double surfaceHalfWidth = 0.0;
     double sideSliceHalfDepth = 0.0;
     int crossSamples = 21;
