@@ -143,6 +143,6 @@ A compatible reader should:
 
 ## 8. Reference implementation pointers
 
-- Writer populates `meta.json.format = "tifxyz"` & `meta.json.scale = [sx, sy]`: [`core/src/QuadSurface.cpp:729`](core/src/QuadSurface.cpp:729)
-- Reader loads `x/y/z.tif`, invalidates `Z <= 0`, then applies optional `mask.tif`: [`core/src/QuadSurface.cpp:848`](core/src/QuadSurface.cpp:848)
+- Writer populates `meta.json.format = "tifxyz"` & `meta.json.scale = [sx, sy]`: `QuadSurface::save` in [`volume-cartographer/core/src/QuadSurface.cpp`](../volume-cartographer/core/src/QuadSurface.cpp)
+- Reader loads `x/y/z.tif`, invalidates `Z <= 0`, then applies optional `mask.tif`: `load_quad_from_tifxyz` in the same file
 
