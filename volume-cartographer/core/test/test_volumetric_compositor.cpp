@@ -3,6 +3,7 @@
 
 #include "volume_viewers/VolumetricCompositor.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace vc3d::volumetric;
@@ -359,4 +360,72 @@ TEST_CASE("compositeVolumetric treats uncovered texels as transparent")
     // The far layer shows through instead of a black halo.
     CHECK(cov(3, 3) == 1);
     CHECK(int(color(3, 3)[0]) == 150);
+}
+
+
+TEST_CASE("slab point mapping matches the orthographic render and round-trips")
+{
+    CameraParams cam;
+    cam.tiltDeg = 35.0f;
+    cam.azimuthDeg = 25.0f;
+
+    const int numLayers = 9;
+    const int zStart = -4;
+    const float outputScale = 2.0f;
+    const float halfSpan = 128.0f;  // unused at perspective == 0
+
+    // View center at the origin so raw coords are center-relative.
+    const auto proj = slabProjection(cam, numLayers, zStart, outputScale, 0.0f, 0.0f);
+    const float screen[2] = {37.0f, -12.0f};
+    for (int i = 0; i < numLayers; i += 4) {
+        const float wPx = float(zStart + i) * outputScale;
+        const float qu = proj.m00 * screen[0] + proj.m01 * screen[1] +
+                         proj.layerOffsets[std::size_t(i)][0];
+        const float qv = proj.m10 * screen[0] + proj.m11 * screen[1] +
+                         proj.layerOffsets[std::size_t(i)][1];
+
+        const auto s = slabPointToScreen(cam, halfSpan, {qu, qv}, wPx);
+        CHECK(s[0] == doctest::Approx(screen[0]).epsilon(1e-3));
+        CHECK(s[1] == doctest::Approx(screen[1]).epsilon(1e-3));
+
+        const auto q = screenToSlabPoint(cam, halfSpan, {screen[0], screen[1]}, wPx);
+        CHECK(q[0] == doctest::Approx(qu).epsilon(1e-3));
+        CHECK(q[1] == doctest::Approx(qv).epsilon(1e-3));
+    }
+}
+
+TEST_CASE("slab point mapping matches the pinhole render and round-trips")
+{
+    CameraParams cam;
+    cam.tiltDeg = 40.0f;
+    cam.azimuthDeg = -60.0f;
+    cam.perspective = 0.7f;
+
+    const int numLayers = 11;
+    const int zStart = -5;
+    const float outputScale = 1.5f;
+    const float screenW = 300.0f, screenH = 200.0f;
+    const float halfSpan = 0.5f * std::max(screenW, screenH);
+
+    const auto pc = perspectiveCamera(cam, numLayers, zStart, outputScale,
+                                      0.0f, 0.0f, screenW, screenH);
+    const float screen[2] = {-42.0f, 31.0f};
+    const float rayU = pc.rayBase[0] + screen[0] * pc.e1OverF[0] + screen[1] * pc.e2OverF[0];
+    const float rayV = pc.rayBase[1] + screen[0] * pc.e1OverF[1] + screen[1] * pc.e2OverF[1];
+    const float rayW = pc.rayBase[2] + screen[0] * pc.e1OverF[2] + screen[1] * pc.e2OverF[2];
+    REQUIRE(rayW < 0.0f);
+    for (int i = 0; i < numLayers; i += 5) {
+        const float wPx = float(zStart + i) * outputScale;
+        const float t = pc.layerNum[std::size_t(i)] / rayW;
+        const float qu = pc.pos[0] + t * rayU;
+        const float qv = pc.pos[1] + t * rayV;
+
+        const auto s = slabPointToScreen(cam, halfSpan, {qu, qv}, wPx);
+        CHECK(s[0] == doctest::Approx(screen[0]).epsilon(1e-3));
+        CHECK(s[1] == doctest::Approx(screen[1]).epsilon(1e-3));
+
+        const auto q = screenToSlabPoint(cam, halfSpan, {screen[0], screen[1]}, wPx);
+        CHECK(q[0] == doctest::Approx(qu).epsilon(1e-3));
+        CHECK(q[1] == doctest::Approx(qv).epsilon(1e-3));
+    }
 }

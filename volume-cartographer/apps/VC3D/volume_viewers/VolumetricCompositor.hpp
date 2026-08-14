@@ -88,6 +88,24 @@ PerspectiveCamera perspectiveCamera(const CameraParams& cam,
                                     float screenW,
                                     float screenH);
 
+// Point mapping between screen and the slab plane at height wPx, for overlay
+// positioning (crosshair, focus marker). All coordinates are relative to the
+// view center; in-plane slab coords and wPx are in output pixels
+// (wPx = w * outputScale, matching SlabProjection/PerspectiveCamera).
+// halfSpan sets the pinhole camera distance exactly as perspectiveCamera():
+// 0.5 * max(screenW, screenH); ignored for orthographic (cam.perspective==0).
+// Exact for both render modes; the two functions are inverses. Degenerate
+// denominators (past the horizon / behind the camera) clamp to far-but-finite
+// values, matching the render's convention.
+std::array<float, 2> slabPointToScreen(const CameraParams& cam,
+                                       float halfSpan,
+                                       const std::array<float, 2>& slabUV,
+                                       float wPx);
+std::array<float, 2> screenToSlabPoint(const CameraParams& cam,
+                                       float halfSpan,
+                                       const std::array<float, 2>& screenUV,
+                                       float wPx);
+
 // Extra slab-space sampling border (in output pixels) around the on-screen
 // window. Tilted/perspective rays read the layer stack outside the screen
 // rect near the edges; sampling only the screen-sized window silently clips

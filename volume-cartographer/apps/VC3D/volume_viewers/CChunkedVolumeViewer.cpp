@@ -1990,65 +1990,41 @@ cv::Matx22f CChunkedVolumeViewer::volumetricScreenToSurface() const
             -sa, ca * invCt};
 }
 
-namespace {
-
-struct VolumetricW0Map {
-    float ca = 1.0f, sa = 0.0f;  // azimuth rotation
-    float ct = 1.0f;             // cos(tilt)
-    float k = 0.0f;              // sin(tilt) / camera distance; 0 = ortho
-};
-
-VolumetricW0Map volumetricW0Map(const CompositeRenderSettings& cs,
-                                float azimuthDeg,
-                                int fbW,
-                                int fbH)
+vc3d::volumetric::CameraParams CChunkedVolumeViewer::volumetricPointMapCamera() const
 {
-    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
-    VolumetricW0Map m;
-    const float az = azimuthDeg * kDegToRad;
-    const float tilt = std::clamp(cs.params.camTiltDeg, 0.0f, 85.0f) * kDegToRad;
-    m.ca = std::cos(az);
-    m.sa = std::sin(az);
-    m.ct = std::cos(tilt);
-    const float p = cs.params.camPerspective;
-    if (p > 0.0f) {
-        // Camera distance matching VolumetricCompositor::perspectiveCamera:
-        // magnification 1 at the view center.
-        const float halfSpan = 0.5f * std::max(float(std::max(fbW, fbH)), 1.0f);
-        const float dist = halfSpan / std::tan(std::clamp(p, 0.01f, 1.0f) * 45.0f * kDegToRad);
-        m.k = std::sin(tilt) / dist;
-    }
-    return m;
+    vc3d::volumetric::CameraParams cam;
+    cam.azimuthDeg = volumetricEffectiveAzimuthDeg();
+    cam.tiltDeg = _compositeSettings.params.camTiltDeg;
+    cam.perspective = _compositeSettings.params.camPerspective;
+    return cam;
 }
 
-} // namespace
+float CChunkedVolumeViewer::volumetricHalfSpan() const
+{
+    // Camera distance matching VolumetricCompositor::perspectiveCamera:
+    // magnification 1 at the view center.
+    return 0.5f * std::max(float(std::max(_framebuffer.width(),
+                                          _framebuffer.height())), 1.0f);
+}
 
-cv::Vec2f CChunkedVolumeViewer::volumetricScreenPxToSurfacePx(const cv::Vec2f& s) const
+cv::Vec2f CChunkedVolumeViewer::volumetricScreenPxToSurfacePx(const cv::Vec2f& s,
+                                                              float wPx) const
 {
     if (!volumetricCameraActive())
         return s;
-    const auto m = volumetricW0Map(_compositeSettings, volumetricEffectiveAzimuthDeg(),
-                                   _framebuffer.width(), _framebuffer.height());
-    // Ray through the screen point hits the w=0 plane at Rz(-az)*H0*s, with H0
-    // the tilt-about-screen-x plane homography (ortho limit: diag(1, 1/ct)).
-    // Points past the horizon clamp to far-but-finite same-sign coords.
-    const float denom = std::max(m.ct + m.k * s[1], 1e-4f);
-    const float u0 = m.ct * s[0] / denom;
-    const float v0 = s[1] / denom;
-    return {m.ca * u0 + m.sa * v0, -m.sa * u0 + m.ca * v0};
+    const auto q = vc3d::volumetric::screenToSlabPoint(
+        volumetricPointMapCamera(), volumetricHalfSpan(), {s[0], s[1]}, wPx);
+    return {q[0], q[1]};
 }
 
-cv::Vec2f CChunkedVolumeViewer::volumetricSurfacePxToScreenPx(const cv::Vec2f& q) const
+cv::Vec2f CChunkedVolumeViewer::volumetricSurfacePxToScreenPx(const cv::Vec2f& q,
+                                                              float wPx) const
 {
     if (!volumetricCameraActive())
         return q;
-    const auto m = volumetricW0Map(_compositeSettings, volumetricEffectiveAzimuthDeg(),
-                                   _framebuffer.width(), _framebuffer.height());
-    const float u0 = m.ca * q[0] - m.sa * q[1];
-    const float v0 = m.sa * q[0] + m.ca * q[1];
-    const float sy = v0 * m.ct / std::max(1.0f - m.k * v0, 1e-4f);
-    const float sx = u0 * (m.ct + m.k * sy) / m.ct;
-    return {sx, sy};
+    const auto s = vc3d::volumetric::slabPointToScreen(
+        volumetricPointMapCamera(), volumetricHalfSpan(), {q[0], q[1]}, wPx);
+    return {s[0], s[1]};
 }
 
 void CChunkedVolumeViewer::updateCameraGizmo()
@@ -4288,7 +4264,7 @@ void CChunkedVolumeViewer::onKeyRelease(int key, Qt::KeyboardModifiers)
     }
 }
 
-QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
+QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY, float wPx) const
 {
     // Keep the camera arithmetic in qreal. Overlay code derives an affine
     // surface-to-scene transform from this function; doing these operations in
@@ -4302,7 +4278,7 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
     if (!volumetricCameraActive())
         return QPointF(vx + vpCx, vy + vpCy);
     const cv::Vec2f s = volumetricSurfacePxToScreenPx(
-        {static_cast<float>(vx), static_cast<float>(vy)});
+        {static_cast<float>(vx), static_cast<float>(vy)}, wPx);
     return QPointF(s[0] + vpCx, s[1] + vpCy);
 }
 
@@ -4382,16 +4358,28 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
             return {NAN, NAN};
         // Gate on the signed offset along the surface normal so only the
         // depth band the view actually displays accepts the point.
+        float w = _zOff;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
         if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
-            const float w = (volPoint - surfCoord).dot(surfNormal);
+            w = (volPoint - surfCoord).dot(surfNormal);
             if (w < depthLo - kQuadProjectTolerance ||
                 w > depthHi + kQuadProjectTolerance)
                 return {NAN, NAN};
         }
+        // Under the volumetric camera, points off the w=0 anchor plane (the
+        // offset surface) render displaced by tilt/perspective; place the
+        // marker with the render's own per-w mapping. wPx matches the render:
+        // slab w in layers (zStep folds the reverse-direction sign back in)
+        // times output scale times the wScale relief exaggeration.
+        float wPx = 0.0f;
+        if (volumetricCameraActive()) {
+            const float zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            const float wScale = std::max(_compositeSettings.params.wScale, 0.01f);
+            wPx = (w - _zOff) * zStep * _scale * wScale;
+        }
         const cv::Vec3f loc = quad->loc(ptr);
-        return surfaceToScene(loc[0], loc[1]);
+        return surfaceToScene(loc[0], loc[1], wPx);
     }
     return {};
 }

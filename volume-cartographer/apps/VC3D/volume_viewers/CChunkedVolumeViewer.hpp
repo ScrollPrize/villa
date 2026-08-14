@@ -28,6 +28,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
+#include "VolumetricCompositor.hpp"
 #include "annotation_tools/SameWrapAnnotationTool.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
@@ -363,7 +364,7 @@ private:
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();
-    QPointF surfaceToScene(float surfX, float surfY) const;
+    QPointF surfaceToScene(float surfX, float surfY, float wPx = 0.0f) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
@@ -453,8 +454,12 @@ private:
     // perspective (a plane-to-screen homography; identity when the mode is
     // inactive). Both sides are in framebuffer pixels relative to the view
     // center / the surface pointer.
-    cv::Vec2f volumetricScreenPxToSurfacePx(const cv::Vec2f& screenRel) const;
-    cv::Vec2f volumetricSurfacePxToScreenPx(const cv::Vec2f& surfRel) const;
+    // wPx = slab height above the (offset) surface, in screen pixels
+    // (w layers * scale * wScale); 0 = the anchor plane the render pivots on.
+    cv::Vec2f volumetricScreenPxToSurfacePx(const cv::Vec2f& screenRel, float wPx = 0.0f) const;
+    cv::Vec2f volumetricSurfacePxToScreenPx(const cv::Vec2f& surfRel, float wPx = 0.0f) const;
+    vc3d::volumetric::CameraParams volumetricPointMapCamera() const;
+    float volumetricHalfSpan() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void refreshCursorPositionAt(const QPointF& scenePos);
     // projected=true draws the greyed-out variant used when a linked cursor

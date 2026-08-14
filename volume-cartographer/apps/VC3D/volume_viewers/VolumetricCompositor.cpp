@@ -117,6 +117,67 @@ PerspectiveCamera perspectiveCamera(const CameraParams& cam,
     return pc;
 }
 
+namespace {
+
+// Shared coefficients for the per-point w-plane mappings. Work in the
+// azimuth-rotated frame, where the tilt is purely about screen-x and the
+// per-w shift purely vertical: for a screen point s and plane height wPx,
+//   denom = ct + k*s_y
+//   u = s_x * (ct - wPx*invD) / denom
+//   v = (s_y * (1 - wPx*ct*invD) + wPx*st) / denom
+// with ct/st = cos/sin(tilt), invD = 1/camera distance (0 = orthographic),
+// k = st*invD. At wPx = 0 this is the render's view-center homography; the
+// ortho limit reproduces slabProjection's affine exactly.
+struct PointMapCoeffs {
+    float ca, sa, ct, st, invD, k;
+};
+
+PointMapCoeffs pointMapCoeffs(const CameraParams& cam, float halfSpan)
+{
+    const float tilt = std::clamp(cam.tiltDeg, 0.0f, kMaxTiltDeg) * kDegToRad;
+    const float az = cam.azimuthDeg * kDegToRad;
+    PointMapCoeffs c{std::cos(az), std::sin(az), std::cos(tilt), std::sin(tilt), 0.0f, 0.0f};
+    if (cam.perspective > 0.0f) {
+        const float p = std::clamp(cam.perspective, 0.01f, 1.0f);
+        c.invD = std::tan(p * 45.0f * kDegToRad) / std::max(halfSpan, 1.0f);
+        c.k = c.st * c.invD;
+    }
+    return c;
+}
+
+float clampedDenom(float d)
+{
+    return std::max(d, 1e-4f);
+}
+
+} // namespace
+
+std::array<float, 2> slabPointToScreen(const CameraParams& cam,
+                                       float halfSpan,
+                                       const std::array<float, 2>& slabUV,
+                                       float wPx)
+{
+    const auto c = pointMapCoeffs(cam, halfSpan);
+    const float u = c.ca * slabUV[0] - c.sa * slabUV[1];
+    const float v = c.sa * slabUV[0] + c.ca * slabUV[1];
+    const float sy = (v * c.ct - wPx * c.st) /
+                     clampedDenom(1.0f - wPx * c.ct * c.invD - v * c.k);
+    const float sx = u * (c.ct + c.k * sy) / clampedDenom(c.ct - wPx * c.invD);
+    return {sx, sy};
+}
+
+std::array<float, 2> screenToSlabPoint(const CameraParams& cam,
+                                       float halfSpan,
+                                       const std::array<float, 2>& screenUV,
+                                       float wPx)
+{
+    const auto c = pointMapCoeffs(cam, halfSpan);
+    const float denom = clampedDenom(c.ct + c.k * screenUV[1]);
+    const float u = screenUV[0] * (c.ct - wPx * c.invD) / denom;
+    const float v = (screenUV[1] * (1.0f - wPx * c.ct * c.invD) + wPx * c.st) / denom;
+    return {c.ca * u + c.sa * v, -c.sa * u + c.ca * v};
+}
+
 SlabMargins computeSlabMargins(const CameraParams& cam,
                                int numLayers,
                                int zStart,
