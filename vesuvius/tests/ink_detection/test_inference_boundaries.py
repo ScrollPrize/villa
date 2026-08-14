@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
@@ -15,7 +14,6 @@ import zarr
 
 from vesuvius.ink_detection.models.checkpoint import (
     config_from_checkpoint,
-    resolve_pretrained_backbone_config,
     select_inference_weights,
 )
 from vesuvius.ink_detection.inference.inference_runtime import (
@@ -29,15 +27,6 @@ from vesuvius.ink_detection.volume_io import (
     open_volume_root,
     select_volume_level,
 )
-
-from .test_model_foundation import _config_mapping
-
-
-def _backbone_config(value: str) -> dict:
-    authored = _config_mapping()
-    authored["model_config"]["pretrained_backbone"] = value
-    return authored
-
 
 def test_inference_import_does_not_add_runtime_side_effects():
     source = """
@@ -98,81 +87,6 @@ def test_state_alias_precedence_and_root_tensor_acceptance():
         select_inference_weights({"state_dict": {}})
     with pytest.raises(ValueError, match="supported model state"):
         select_inference_weights({"step": 7})
-
-
-def test_recursive_backbone_resolution_is_relative_cycle_safe_and_pure(tmp_path):
-    nested_dir = tmp_path / "nested"
-    nested_dir.mkdir()
-    terminal = nested_dir / "terminal.pth"
-    middle = nested_dir / "middle.pth"
-    torch.save(
-        {"config": _backbone_config("dinov2")},
-        terminal,
-    )
-    torch.save(
-        {"config": _backbone_config(terminal.name)},
-        middle,
-    )
-    outer_path = tmp_path / "outer.pth"
-    authored = _backbone_config("nested/middle.pth")
-    authored["untouched"] = [1, 2, 3]
-    before = deepcopy(authored)
-
-    resolved = resolve_pretrained_backbone_config(
-        authored, checkpoint_path=outer_path
-    )
-
-    assert resolved["model_config"]["pretrained_backbone"] == "dinov2"
-    assert authored == before
-
-    torch.save(
-        {"config": _backbone_config("../outer.pth")},
-        middle,
-    )
-    torch.save({"config": authored}, outer_path)
-    with pytest.raises(ValueError, match="recursive pretrained_backbone"):
-        resolve_pretrained_backbone_config(authored, checkpoint_path=outer_path)
-
-    missing = _backbone_config("missing.pth")
-    with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
-        resolve_pretrained_backbone_config(missing, checkpoint_path=outer_path)
-
-
-def test_backbone_resolution_falls_back_to_current_directory(tmp_path, monkeypatch):
-    checkpoint_dir = tmp_path / "run"
-    checkpoint_dir.mkdir()
-    terminal = tmp_path / "backbone.pth"
-    torch.save(
-        {"config": _backbone_config("dinov2")},
-        terminal,
-    )
-    monkeypatch.chdir(tmp_path)
-
-    resolved = resolve_pretrained_backbone_config(
-        _backbone_config(terminal.name),
-        checkpoint_path=checkpoint_dir / "model.pth",
-    )
-
-    assert resolved["model_config"]["pretrained_backbone"] == "dinov2"
-
-
-def test_backbone_resolution_expands_home_in_checkpoint_path(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    run = home / "run"
-    run.mkdir(parents=True)
-    terminal = run / "backbone.pth"
-    torch.save(
-        {"config": _backbone_config("dinov2")},
-        terminal,
-    )
-    monkeypatch.setenv("HOME", str(home))
-
-    resolved = resolve_pretrained_backbone_config(
-        _backbone_config(terminal.name),
-        checkpoint_path="~/run/model.pth",
-    )
-
-    assert resolved["model_config"]["pretrained_backbone"] == "dinov2"
 
 
 def test_flat_inference_state_loading_is_nonstrict_and_ddp_compatible():

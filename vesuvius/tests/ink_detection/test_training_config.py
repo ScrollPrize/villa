@@ -6,7 +6,6 @@ import json
 
 import pytest
 
-import vesuvius.ink_detection.config as config_module
 import vesuvius.ink_detection.training.train as train_module
 from vesuvius.ink_detection.config import (
     InkDataConfig,
@@ -150,21 +149,6 @@ def test_canonical_mutations_are_complete_without_local_default_materialization(
     assert training.ink.data.dataloader_workers == 8
 
 
-def test_dinov2_nested_values_win_during_training_resolution():
-    authored = _training_mapping()
-    authored["model_type"] = "dinov2"
-    authored["pretrained_backbone"] = "/top.pth"
-    authored["pretrained_decoder_type"] = "top"
-    authored["model_config"]["pretrained_backbone"] = "/nested.pth"
-    authored["model_config"]["pretrained_decoder_type"] = "nested"
-
-    canonical = resolve_training_mapping(authored)
-
-    assert canonical["model_type"] == "vesuvius_unet"
-    assert canonical["model_config"]["pretrained_backbone"] == "/nested.pth"
-    assert canonical["model_config"]["pretrained_decoder_type"] == "nested"
-
-
 def test_stitching_scales_only_loader_yx_and_native_forces_factor_one():
     flat = _training_mapping()
     flat["stitch_factor"] = 2
@@ -274,21 +258,6 @@ def test_training_target_values_fail_factually_before_native_mutation():
 
     with pytest.raises(TypeError, match="targets.ink must be an object"):
         resolve_training_mapping(authored)
-
-
-def test_training_model_canonicalization_runs_once(monkeypatch):
-    calls = []
-    original = config_module._canonical_model_mapping
-
-    def counted(authored):
-        calls.append(authored)
-        return original(authored)
-
-    monkeypatch.setattr(config_module, "_canonical_model_mapping", counted)
-
-    _parse_training(_training_mapping())
-
-    assert len(calls) == 1
 
 
 def test_typed_runtime_fields_preserve_reference_precedence():

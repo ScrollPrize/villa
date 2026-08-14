@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -145,90 +144,6 @@ def select_inference_weights(
         f"Checkpoint {str(source)!r} has no supported model state; expected "
         + ", ".join(candidates)
     )
-
-
-def _backbone_is_checkpoint(value: Any) -> bool:
-    if not isinstance(value, (str, Path)):
-        return False
-    text = str(value).strip()
-    if not text:
-        return False
-    return (
-        text.startswith(("~", ".", "/"))
-        or "/" in text
-        or "\\" in text
-        or Path(text).suffix.lower() in {".pt", ".pth"}
-    )
-
-
-def _checkpoint_reference_path(
-    reference: str | Path,
-    containing_checkpoint: str | Path,
-) -> Path:
-    path = Path(os.path.expanduser(str(reference)))
-    if path.is_absolute():
-        return path.resolve(strict=False)
-    containing_path = Path(
-        os.path.abspath(os.path.expanduser(str(containing_checkpoint)))
-    )
-    containing_directory = (
-        containing_path.parent if containing_path.suffix else containing_path
-    )
-    candidates = (containing_directory / path, path)
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve(strict=False)
-
-
-def resolve_pretrained_backbone_config(
-    authored: Mapping[str, Any],
-    *,
-    checkpoint_path: str | Path,
-    seen_paths: set[Path] | None = None,
-) -> dict[str, Any]:
-    """Resolve checkpoint-backed backbone names without mutating saved config."""
-
-    resolved = deepcopy(dict(authored))
-    config = InkConfig.from_mapping(resolved)
-    backbone = config.model.pretrained_backbone
-    if not _backbone_is_checkpoint(backbone):
-        return resolved
-
-    backbone_path = _checkpoint_reference_path(backbone, checkpoint_path)
-    visited = set() if seen_paths is None else set(seen_paths)
-    containing_path = Path(os.path.abspath(str(checkpoint_path))).resolve(
-        strict=False
-    )
-    visited.add(containing_path)
-    if backbone_path in visited:
-        chain = " -> ".join(str(path) for path in (*visited, backbone_path))
-        raise ValueError(
-            f"Detected recursive pretrained_backbone checkpoint chain: {chain}"
-        )
-    payload = load_checkpoint(backbone_path)
-    if not isinstance(payload, Mapping) or not isinstance(
-        payload.get("config"), Mapping
-    ):
-        raise ValueError(
-            "Checkpoint-backed pretrained_backbone requires a checkpoint "
-            f"config mapping: {backbone_path}"
-        )
-    nested = resolve_pretrained_backbone_config(
-        payload["config"],
-        checkpoint_path=backbone_path,
-        seen_paths=visited | {backbone_path},
-    )
-    concrete = InkConfig.from_mapping(nested).model.pretrained_backbone
-    if not concrete or _backbone_is_checkpoint(concrete):
-        raise ValueError(
-            "Checkpoint-backed pretrained_backbone did not resolve to a "
-            f"concrete backbone name: {backbone_path}"
-        )
-    updated_model = config.model.model_settings_mapping()
-    updated_model["pretrained_backbone"] = concrete
-    resolved["model_config"] = updated_model
-    return resolved
 
 
 def config_from_checkpoint(

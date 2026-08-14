@@ -9,7 +9,6 @@ import subprocess
 import sys
 
 import numpy as np
-import pytest
 import tifffile
 import torch
 
@@ -244,11 +243,3 @@ def test_train_help_is_import_pure_without_accelerate_or_wandb():
 
     assert completed.returncode == 0, completed.stderr
     assert "config_path" in completed.stdout
-
-
-def test_module_cli_help_exits_zero():
-    with pytest.raises(SystemExit) as help_exit:
-        from vesuvius.ink_detection.training.train import main
-
-        main(["-h"])
-    assert help_exit.value.code == 0

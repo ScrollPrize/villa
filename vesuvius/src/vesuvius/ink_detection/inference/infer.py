@@ -24,7 +24,6 @@ import zarr
 
 from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
-    resolve_pretrained_backbone_config,
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
@@ -83,6 +82,15 @@ class ConfiguredModel:
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
     """Map training normalization settings to flat-inference preprocessing."""
 
+    if config.mode == "robust_mad":
+        percentiles = (config.percentile_lower, config.percentile_upper)
+        if percentiles != (1.0, 99.0):
+            raise ValueError(
+                "Flat inference supports robust_mad only with "
+                "percentile_lower=1 and percentile_upper=99, got "
+                f"{percentiles!r}"
+            )
+        return "tifxyz_robust"
     if config.mode == "divide":
         if config.divisor != 255.0:
             raise ValueError(
@@ -90,31 +98,10 @@ def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
                 f"got {config.divisor!r}"
             )
         return "divide_255"
-    if config.mode == "clip_divide":
-        parameters = (config.clip_min, config.clip_max, config.divisor)
-        if parameters != (0.0, 200.0, 255.0):
-            raise ValueError(
-                "Flat inference supports clip_divide only with clip_min=0, "
-                "clip_max=200, divisor=255"
-            )
-        return "legacy_uint8"
-    return "tifxyz_robust"
-
-
-def convert_volume_dtype(data: np.ndarray) -> np.ndarray:
-    """Convert legacy flat inference input to contiguous uint8 values."""
-
-    data = np.asarray(data)
-    if data.dtype == np.uint8:
-        return np.ascontiguousarray(data)
-    if data.dtype == np.uint16:
-        return np.ascontiguousarray((data >> 8).astype(np.uint8, copy=False))
-    if np.issubdtype(data.dtype, np.integer) or np.issubdtype(
-        data.dtype, np.floating
-    ):
-        clipped = np.clip(data, 0, 255)
-        return np.ascontiguousarray(clipped.astype(np.uint8, copy=False))
-    raise TypeError(f"Unsupported surface-volume dtype {data.dtype}")
+    raise ValueError(
+        "Flat inference does not support image_normalization mode "
+        f"{config.mode!r}"
+    )
 
 
 def normalize_flat_patch(
@@ -127,7 +114,7 @@ def normalize_flat_patch(
         from vesuvius.image_proc.intensity.normalization import normalize_robust
 
         return np.ascontiguousarray(normalize_robust(patch_ZYX))
-    if preprocessing in {"legacy_uint8", "divide_255"}:
+    if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0
         return normalized
@@ -481,9 +468,6 @@ class FlatPatchReader:
         block = self._read_raw(source_y0, source_y1, source_x0, source_x1)
         if self.preprocessing == "tifxyz_robust":
             block = np.asarray(block, dtype=np.float32)
-        elif self.preprocessing == "legacy_uint8":
-            block = convert_volume_dtype(block)
-            np.clip(block, 0, 200, out=block)
         elif self.preprocessing == "divide_255":
             block = np.asarray(block)
             if block.dtype != np.uint8:
@@ -917,10 +901,7 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         raise ValueError(
             f"Inference checkpoint {str(args.checkpoint)!r} requires a config mapping"
         )
-    resolved_mapping = resolve_pretrained_backbone_config(
-        payload["config"], checkpoint_path=args.checkpoint
-    )
-    config = InkConfig.from_mapping(resolved_mapping)
+    config = InkConfig.from_mapping(payload["config"])
     if config.data.mode != "flat":
         raise ValueError(
             f"Flat inference requires checkpoint mode='flat', got {config.data.mode!r}"

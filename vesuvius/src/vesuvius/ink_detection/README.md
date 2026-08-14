@@ -54,6 +54,13 @@ placeholder with a local copy of the ink_9um dataset and set `out_dir` before
 training. The fixed-prior manifest describes the same 29 representations and
 the 29/22/11/2 batch counts.
 
+DINOv2-backed ink training is supported through the shared model builder. Use
+`model_type: "vesuvius_unet"` and set
+`model_config.pretrained_backbone` to `dinov2_ps8`,
+`dinov2_ps16_crop256`, or a compatible local DINOv2/Dinovol checkpoint. The
+optional `model_config.pretrained_decoder_type`, `freeze_encoder`, and
+`encoder_lr_mult` fields control its decoder and fine-tuning policy.
+
 ## Commands
 
 Prepare a 2.399 µm surface volume as a 21-slice approximately 9.6 µm input:
@@ -86,10 +93,9 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_re
 
 The downloader always creates an explicit Zarr-v2 store and records its source,
 array schemas, exact chunk plan, and completed chunks in root attributes before
-allowing resume. `--stored-grid-pad` and `--patch-finding-workers` are accepted
-inert flags; they do not affect the plan. Prediction merging
-retains the reference `betti`/`ema`/`640` stem filter and fails when it produces
-no output. Label cleaning and composite TIFF publication are transactional.
+allowing resume. Prediction merging aggregates every non-merged prediction
+image per direction and fails when it produces no output. Label cleaning and
+composite TIFF publication are transactional.
 Every long option also accepts the opposite hyphen/underscore spelling.
 
 Train:

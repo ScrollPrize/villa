@@ -184,8 +184,8 @@ are reported and make the command exit nonzero.
 
 ## Curation operations
 
-The remaining label and prediction maintenance commands keep the reference
-arguments but run below `vesuvius.ink_detection.preprocessing`:
+The remaining label and prediction maintenance commands run below
+`vesuvius.ink_detection.preprocessing`:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.preprocessing.validate_segments ROOT
@@ -197,7 +197,7 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_re
 
 `validate_segments` checks label binary encodings and TIFF/Zarr spatial shape;
 `clean_labels` rewrites matching label images as `{0,255}` TIFFs after optional
-component and hole cleanup; `merge_predictions` aggregates matching directional
+component and hole cleanup; `merge_predictions` aggregates directional
 prediction files; and `composite_from_zarr` writes max or mean TIFF projections.
 The downloader uses tifxyz patch geometry to copy only source chunks required
 by selected label patches. Use `--dry-run` to inspect its plan before writing.
@@ -213,9 +213,8 @@ reference spelling. The commands have these persistent-state guarantees:
   into the sibling `label_backup` tree. A failed write leaves the active input
   in place, and a completed rerun is reported as skipped unless `--overwrite`
   is supplied.
-- `merge_predictions` retains the reference selection policy: eligible stems
-  contain `betti`, `ema`, or `640`, and the greatest parsed checkpoint is used
-  for each term and direction. An invocation that writes no merged output fails
+- `merge_predictions` merges every non-merged prediction image found for each
+  requested direction. An invocation that writes no merged output fails
   instead of reporting success; decoded floating predictions must be finite.
 - `composite_from_zarr` publishes each TIFF only after all projected tiles are
   written. Existing outputs fail unless `--overwrite` is supplied.
@@ -225,9 +224,7 @@ reference spelling. The commands have these persistent-state guarantees:
   completed chunk ids. Resume requires all of those plus the actual output
   schema to agree; use `--overwrite` to replace an incompatible store.
 
-The downloader accepts two inert planning flags:
-`--stored-grid-pad` and `--patch-finding-workers`. They do not change patch
-discovery or the exported chunk plan. Active planning controls are
+The downloader's planning controls are
 `--patch-size`, `--overlap-fraction`, `--patch-finding-type`, the subtiling
 tile/stride/filter options, `--patch-min-labeled-coverage`, `--patch-filter`,
 and `--label-version`. Output controls are `--download-workers`,
@@ -261,7 +258,7 @@ training run are:
 |---|---|
 | `description` | Optional human-readable metadata preserved in the checkpoint config. |
 | `mode` | `flat`, `full_3d`, or `full_3d_single_wrap`. The last mode adds a surface-mask input channel. |
-| `model_type` | `vesuvius_unet`/`unet`, either `_2p5d` form, either `_3d_stem_2d` form, or the `dinov2` compatibility form described below. |
+| `model_type` | `vesuvius_unet`/`unet`, either `_2p5d` form, or either `_3d_stem_2d` form. |
 | `model_name`, `autoconfigure` | Optional model-builder name and automatic shape configuration; `model_config.autoconfigure` takes precedence. |
 | `model_config` | Model-builder settings. The aligned hybrid uses encoder/decoder blocks, `stem_channels`, and `z_projection_mode`; `input_pad_depth_to` optionally pads model input in Z. |
 | `targets` | Must contain only `ink`, with `out_channels: 1` and `activation: "none"`; Z projection is `none`, `max`, `mean`, `logsumexp`, or `learned_mlp`. |
@@ -273,12 +270,24 @@ training run are:
 | `num_iterations`, `batch_size`, `seed` | Training length, per-worker batch size, and reproducibility seed. |
 | `out_dir` | Checkpoints, metrics, previews, and audit outputs. |
 
-With `model_type: "dinov2"`, set `pretrained_backbone` either at top level or
-inside `model_config`; the nested value wins. The config is normalized to the
-Vesuvius U-Net builder. `pretrained_decoder_type` is copied into
-`model_config` in the same way. A checkpoint path used as a pretrained
-backbone is resolved relative to the config-bearing checkpoint during
-inference.
+DINOv2-backed ink models are supported as a pretrained-encoder configuration
+of the Vesuvius U-Net builder. Keep `model_type` set to `vesuvius_unet` and put
+the backbone and decoder fields inside `model_config`:
+
+```json
+{
+  "model_type": "vesuvius_unet",
+  "model_config": {
+    "pretrained_backbone": "dinov2_ps8",
+    "pretrained_decoder_type": "primus_patch_decode"
+  }
+}
+```
+
+`pretrained_backbone` may be `dinov2_ps8`, `dinov2_ps16_crop256`, or a path to
+a compatible local DINOv2/Dinovol checkpoint. `freeze_encoder` and
+`encoder_lr_mult` remain available for frozen or reduced-rate encoder
+fine-tuning.
 
 Each `datasets` item supports:
 
@@ -322,7 +331,6 @@ modes are:
 | `robust_percentile_span` | `percentile_lower`, `percentile_upper`. |
 | `minmax` | None. |
 | `percentile_minmax` | `percentile_lower`, `percentile_upper`. |
-| `clip_divide` | `clip_min`, `clip_max`, `divisor`; defaults 0, 200, and 255. |
 | `clip_zscore` | Required `clip_min`, `clip_max`, `mean`, and positive `std`. |
 | `divide` | Positive `divisor`, default 255. |
 | `none` | Leaves values as float32. |
@@ -447,10 +455,10 @@ crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
 
-For checkpoint compatibility, flat inference has a narrower preprocessing
-adapter than training: `divide` requires `divisor: 255`, and `clip_divide`
-requires `clip_min: 0`, `clip_max: 200`, and `divisor: 255`. Other configured
-normalization names follow the robust flat-inference path.
+Flat inference has a narrower preprocessing contract than training. It accepts
+`robust_mad` only with the default 1st and 99th percentiles, and `divide` only
+with `divisor: 255`. Other normalization modes are rejected rather than being
+silently replaced with robust normalization.
 
 ## Native 3D inference
 

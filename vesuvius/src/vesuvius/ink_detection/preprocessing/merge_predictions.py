@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Merge selected directional ink-prediction rasters into one uint8 image."""
+"""Merge directional ink-prediction rasters into one uint8 image."""
 
 from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
 import os
-import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 from PIL import Image
@@ -25,11 +24,6 @@ from vesuvius.ink_detection.preprocessing.staged_write import (
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
-MATCH_TERMS = [
-    "betti",
-    "ema",
-    "640"
-]
 MERGED_FILE_PREFIX = "merged_"
 DEFAULT_MERGE_METHOD = "confidence_vote"
 MERGE_METHOD_CHOICES = ("confidence_vote", "soft_mean", "soft_median")
@@ -37,7 +31,6 @@ SUPPORTED_SUFFIXES = {".png", ".tif", ".tiff"}
 DEFAULT_MAX_WORKERS = 2
 DEFAULT_TARGET_CHUNK_MB = 96
 FOREGROUND_THRESHOLD_U8 = 128
-CKPT_PATTERN = re.compile(r"(?:^|_)ckpt_(?P<ckpt>\d+)(?:_|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -63,10 +56,9 @@ class FolderResult:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = HyphenUnderscoreParser(
         description=(
-            "Recursively find preds folders, merge matching prediction files with a "
+            "Recursively find preds folders, merge each folder's prediction files with a "
             "selected aggregation method, and write merged outputs back into each preds folder. "
-            "Selection keeps the greatest checkpoint for each of betti, ema, and 640; "
-            "the command fails when no requested output is produced."
+            "The command fails when no requested output is produced."
         )
     )
     parser.add_argument(
@@ -96,18 +88,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Merge method to use. Default: {DEFAULT_MERGE_METHOD}.",
     )
     return parser.parse_args(argv)
-
-
-def normalize_terms(terms: Iterable[str]) -> tuple[str, ...]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for term in terms:
-        cleaned = str(term).strip().lower()
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        normalized.append(cleaned)
-    return tuple(normalized)
 
 
 def find_preds_folders(root: Path) -> list[Path]:
@@ -146,52 +126,14 @@ def is_merged_output(path: Path) -> bool:
     return path.stem.lower().startswith(MERGED_FILE_PREFIX)
 
 
-def matches_prediction_terms(path: Path, normalized_terms: Sequence[str]) -> bool:
-    if is_merged_output(path):
-        return False
-    if not normalized_terms:
-        return True
-    lower_name = path.stem.lower()
-    return any(term in lower_name for term in normalized_terms)
-
-
-def extract_ckpt_number(path: Path) -> int:
-    match = CKPT_PATTERN.search(path.stem)
-    if match is None:
-        return -1
-    return int(match.group("ckpt"))
-
-
-def prediction_priority(path: Path) -> tuple[int, str]:
-    return (extract_ckpt_number(path), path.stem.lower())
-
-
-def collect_matching_prediction_files(
-    preds_dir: Path,
-    *,
-    normalized_terms: Sequence[str],
-    direction: str,
-) -> list[Path]:
-    matches: list[Path] = []
-    for candidate in sorted(preds_dir.iterdir()):
-        if not is_supported_prediction_file(candidate):
-            continue
-        if parse_prediction_direction(candidate) != direction:
-            continue
-        if not matches_prediction_terms(candidate, normalized_terms):
-            continue
-        matches.append(candidate)
-
-    if not normalized_terms:
-        return matches
-
-    selected_paths: set[Path] = set()
-    for term in normalized_terms:
-        term_matches = [path for path in matches if term in path.stem.lower()]
-        if not term_matches:
-            continue
-        selected_paths.add(max(term_matches, key=prediction_priority))
-    return sorted(selected_paths)
+def collect_prediction_files(preds_dir: Path, *, direction: str) -> list[Path]:
+    return [
+        candidate
+        for candidate in sorted(preds_dir.iterdir())
+        if is_supported_prediction_file(candidate)
+        and not is_merged_output(candidate)
+        and parse_prediction_direction(candidate) == direction
+    ]
 
 
 def choose_output_suffix(paths: Sequence[Path]) -> str:
@@ -201,20 +143,14 @@ def choose_output_suffix(paths: Sequence[Path]) -> str:
     return ".tif"
 
 
-def build_terms_slug(normalized_terms: Sequence[str]) -> str:
-    return "_".join(normalized_terms)
-
-
 def build_output_path(
     preds_dir: Path,
     *,
-    normalized_terms: Sequence[str],
     direction: str,
     merge_method: str,
     suffix: str,
 ) -> Path:
-    terms_slug = build_terms_slug(normalized_terms)
-    return preds_dir / f"{MERGED_FILE_PREFIX}{merge_method}_{terms_slug}_{direction}{suffix}"
+    return preds_dir / f"{MERGED_FILE_PREFIX}{merge_method}_{direction}{suffix}"
 
 
 def normalize_prediction_array(array: np.ndarray, *, path: Path) -> np.ndarray:
@@ -461,29 +397,13 @@ def directions_to_process(direction: str) -> tuple[str, ...]:
 def process_preds_folder(
     preds_dir: Path,
     *,
-    normalized_terms: Sequence[str],
     requested_direction: str,
     merge_method: str,
 ) -> FolderResult:
     direction_results: list[DirectionResult] = []
     for direction in directions_to_process(requested_direction):
-        directional_inputs = collect_matching_prediction_files(
-            preds_dir,
-            normalized_terms=(),
-            direction=direction,
-        )
-        matched_files = collect_matching_prediction_files(
-            preds_dir,
-            normalized_terms=normalized_terms,
-            direction=direction,
-        )
+        matched_files = collect_prediction_files(preds_dir, direction=direction)
         if not matched_files:
-            if directional_inputs:
-                raise ValueError(
-                    f"{preds_dir} contains {len(directional_inputs)} valid {direction} "
-                    "prediction file(s), but none match the selection terms: "
-                    + ", ".join(normalized_terms)
-                )
             direction_results.append(
                 DirectionResult(
                     direction=direction,
@@ -496,7 +416,6 @@ def process_preds_folder(
         output_suffix = choose_output_suffix(matched_files)
         output_path = build_output_path(
             preds_dir,
-            normalized_terms=normalized_terms,
             direction=direction,
             merge_method=merge_method,
             suffix=output_suffix,
@@ -513,11 +432,10 @@ def process_preds_folder(
     return FolderResult(preds_dir=str(preds_dir), directions=tuple(direction_results))
 
 
-def process_preds_folder_task(task: tuple[str, tuple[str, ...], str, str]) -> FolderResult:
-    preds_dir_str, normalized_terms, requested_direction, merge_method = task
+def process_preds_folder_task(task: tuple[str, str, str]) -> FolderResult:
+    preds_dir_str, requested_direction, merge_method = task
     return process_preds_folder(
         Path(preds_dir_str),
-        normalized_terms=normalized_terms,
         requested_direction=requested_direction,
         merge_method=merge_method,
     )
@@ -544,7 +462,6 @@ def summarize_results(results: Sequence[FolderResult]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    normalized_terms = normalize_terms(MATCH_TERMS)
     preds_folders = find_preds_folders(args.root)
     if not preds_folders:
         raise RuntimeError(f"No preds folders found under {args.root}")
@@ -553,7 +470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if worker_count < 1:
         raise ValueError("--workers must be at least 1")
 
-    tasks = [(str(preds_dir), normalized_terms, args.direction, args.method) for preds_dir in preds_folders]
+    tasks = [(str(preds_dir), args.direction, args.method) for preds_dir in preds_folders]
     results: list[FolderResult] = []
 
     if worker_count == 1:

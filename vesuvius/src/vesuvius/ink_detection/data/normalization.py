@@ -20,13 +20,6 @@ def normalize_image(
     if config.mode == "divide":
         image_f32 /= config.divisor
         return image_f32
-    if config.mode == "clip_divide":
-        np.clip(image_f32, config.clip_min, config.clip_max, out=image_f32)
-        image_f32 /= config.divisor
-        np.nan_to_num(
-            image_f32, copy=False, nan=0.0, posinf=0.0, neginf=0.0
-        )
-        return image_f32
     if config.mode == "clip_zscore":
         np.clip(image_f32, config.clip_min, config.clip_max, out=image_f32)
         image_f32 -= config.mean

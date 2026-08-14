@@ -96,7 +96,7 @@ def _thaw_json(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class NormalizationConfig:
-    """One of the eight image normalization modes and its constants."""
+    """One of the seven image normalization modes and its constants."""
 
     mode: str = "robust_mad"
     percentile_lower: float = 1.0
@@ -118,7 +118,6 @@ class NormalizationConfig:
             "percentile_min_max": "percentile_minmax",
             "clipped_minmax": "percentile_minmax",
             "clipped_min_max": "percentile_minmax",
-            "divide_255": "divide",
             "identity": "none",
         }
         if value is None:
@@ -139,7 +138,6 @@ class NormalizationConfig:
             "robust_percentile_span",
             "minmax",
             "percentile_minmax",
-            "clip_divide",
             "clip_zscore",
             "divide",
             "none",
@@ -168,10 +166,7 @@ class NormalizationConfig:
         clip_max = authored.get("clip_max")
         mean = authored.get("mean")
         std = authored.get("std")
-        if mode == "clip_divide":
-            clip_min = 0.0 if clip_min is None else float(clip_min)
-            clip_max = 200.0 if clip_max is None else float(clip_max)
-        elif mode == "clip_zscore":
+        if mode == "clip_zscore":
             missing = [
                 key
                 for key in ("clip_min", "clip_max", "mean", "std")
@@ -202,17 +197,8 @@ class NormalizationConfig:
             mean=None if mean is None else float(mean),
             std=None if std is None else float(std),
         )
-        if result.mode in {"divide", "clip_divide"} and result.divisor <= 0.0:
+        if result.mode == "divide" and result.divisor <= 0.0:
             raise ValueError(f"{result.mode} requires divisor > 0, got {result.divisor!r}")
-        if result.mode == "clip_divide" and not (
-            result.clip_min is not None
-            and result.clip_max is not None
-            and result.clip_min < result.clip_max
-        ):
-            raise ValueError(
-                f"{result.mode} requires clip_min < clip_max, "
-                f"got {result.clip_min!r} and {result.clip_max!r}"
-            )
         return result
 
 
@@ -971,24 +957,6 @@ def _normalize_model_config(canonical: dict[str, Any]) -> dict[str, Any]:
     return model_config
 
 
-def _canonical_model_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
-    canonical = deepcopy(dict(authored))
-    model_type = str(canonical["model_type"]).strip().lower()
-    if model_type != "dinov2":
-        return canonical
-    model_config = _normalize_model_config(canonical)
-    for key in ("pretrained_backbone", "pretrained_decoder_type"):
-        if key in canonical:
-            model_config.setdefault(key, canonical[key])
-    if not model_config.get("pretrained_backbone"):
-        raise ValueError(
-            "model_type='dinov2' requires model_config.pretrained_backbone "
-            "or a top-level pretrained_backbone entry"
-        )
-    canonical["model_type"] = "vesuvius_unet"
-    return canonical
-
-
 @dataclass(frozen=True)
 class InkConfig:
     """Canonical checkpoint mapping with typed data, model, target, and loss views."""
@@ -1004,8 +972,7 @@ class InkConfig:
     def from_mapping(cls, authored: Mapping[str, Any]) -> "InkConfig":
         if not isinstance(authored, Mapping):
             raise TypeError("ink config must be an object")
-        canonical = _canonical_model_mapping(authored)
-        return cls._from_canonical_mapping(canonical)
+        return cls._from_canonical_mapping(deepcopy(dict(authored)))
 
     @classmethod
     def _from_canonical_mapping(
@@ -1222,7 +1189,7 @@ def resolve_training_mapping(authored: Mapping[str, Any]) -> dict[str, Any]:
     for name, target in raw_targets.items():
         if not isinstance(target, Mapping):
             raise TypeError(f"targets.{name} must be an object")
-    canonical = _canonical_model_mapping(authored)
+    canonical = deepcopy(dict(authored))
 
     ema = EmaConfig.from_mapping(canonical)
     canonical["ema"] = ema.to_mapping()

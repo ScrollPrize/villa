@@ -79,7 +79,6 @@ def test_all_curation_parsers_use_required_aliases() -> None:
     assert validate.no_progress
     assert composite.input_root == "." and composite.start_z == 1
     assert download.datasets_root == "."
-    assert "HyphenUnderscoreParser" in merge_predictions.parse_args.__code__.co_names
 
 
 def test_clean_labels_exports_backup_is_rerunnable_and_preserves_source_on_failure(
@@ -201,30 +200,28 @@ def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_in
     preds = tmp_path / "preds"
     preds.mkdir()
     tifffile.imwrite(
-        preds / "betti_ckpt_1_forward_prediction.tif",
+        preds / "model_a_forward_prediction.tif",
         np.array([[0, 255], [10, 20]], dtype=np.uint8),
     )
     tifffile.imwrite(
-        preds / "ema_ckpt_2_forward_prediction.tif",
+        preds / "model_b_forward_prediction.tif",
         np.array([[255, 0], [30, 40]], dtype=np.uint8),
     )
     args = [str(preds), "--workers", "1", "--direction", "forward", "--method", "soft_mean"]
     assert merge_predictions.main(args) == 0
-    output = preds / "merged_soft_mean_betti_ema_640_forward.tif"
-    np.testing.assert_array_equal(
-        tifffile.imread(output),
-        np.array([[128, 128], [20, 30]], dtype=np.uint8),
-    )
+    output = preds / "merged_soft_mean_forward.tif"
+    expected = np.array([[128, 128], [20, 30]], dtype=np.uint8)
+    np.testing.assert_array_equal(tifffile.imread(output), expected)
+    # A rerun must ignore its own previous output: corrupt the merged file and
+    # verify the merge is recomputed from the two model predictions alone.
+    tifffile.imwrite(output, np.full((2, 2), 255, dtype=np.uint8))
     assert merge_predictions.main(args) == 0
+    np.testing.assert_array_equal(tifffile.imread(output), expected)
 
-    unmatched = tmp_path / "unmatched" / "preds"
-    unmatched.mkdir(parents=True)
-    tifffile.imwrite(
-        unmatched / "model_ckpt_1_forward_prediction.tif",
-        np.zeros((2, 2), dtype=np.uint8),
-    )
-    with pytest.raises(ValueError, match="none match the selection terms"):
-        merge_predictions.main([str(unmatched), "--workers", "1", "--direction", "forward"])
+    empty = tmp_path / "empty" / "preds"
+    empty.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="No matching prediction files"):
+        merge_predictions.main([str(empty), "--workers", "1", "--direction", "forward"])
     with pytest.raises(ValueError, match="non-finite"):
         merge_predictions.normalize_prediction_array(
             np.array([[np.nan, 0.0], [0.0, 0.0]], dtype=np.float32),
@@ -233,7 +230,7 @@ def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_in
     nonfinite = tmp_path / "nonfinite" / "preds"
     nonfinite.mkdir(parents=True)
     tifffile.imwrite(
-        nonfinite / "betti_ckpt_1_forward_prediction.tif",
+        nonfinite / "model_a_forward_prediction.tif",
         np.array([[np.nan, 0.0], [0.0, 0.0]], dtype=np.float32),
     )
     with pytest.raises(ValueError, match="non-finite"):

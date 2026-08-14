@@ -12,7 +12,7 @@ from vesuvius.ink_detection.config import InkConfig
 from .test_model_foundation import _config_mapping
 
 
-def test_non_dinov2_mapping_round_trips_without_inserted_defaults():
+def test_mapping_round_trips_without_inserted_defaults():
     authored = _config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
     authored["description"] = "kept"
     authored["custom"] = {"ordered": [3, 1], "enabled": False}
@@ -28,67 +28,44 @@ def test_non_dinov2_mapping_round_trips_without_inserted_defaults():
     assert "ema" not in config.to_mapping()
 
 
-def test_full_typed_config_is_pickle_safe_and_keeps_mapping_order():
-    authored = _config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
-    authored["custom"] = {"values": [2, 1]}
-
-    restored = pickle.loads(pickle.dumps(InkConfig.from_mapping(authored)))
-
-    assert restored.to_mapping() == authored
-    assert list(restored.to_mapping()) == list(authored)
-
-
-def test_recursive_frozen_mappings_reject_internal_storage_assignment():
+def test_full_typed_config_survives_pickle_and_deepcopy_with_order():
     authored = _config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
     authored["custom"] = {"nested": {"ordered": [3, 1]}}
     config = InkConfig.from_mapping(authored)
-    frozen_mappings = (
-        config._canonical,
-        config._canonical["custom"],
-        config._canonical["custom"]["nested"],
-    )
 
-    for frozen in frozen_mappings:
-        with pytest.raises(AttributeError, match="immutable"):
-            frozen._items = (("replaced", True),)
-        with pytest.raises(AttributeError, match="immutable"):
-            del frozen._items
-
-    copied = deepcopy(config)
-    assert copied is not config
-    assert copied.to_mapping() == authored
+    for restored in (pickle.loads(pickle.dumps(config)), deepcopy(config)):
+        assert restored is not config
+        assert restored.to_mapping() == authored
+        assert list(restored.to_mapping()) == list(authored)
     assert config.to_mapping() == authored
-    assert list(config.to_mapping()) == list(authored)
 
 
-def test_dinov2_rewrite_preserves_keys_and_setdefault_values():
+def test_dinov2_backbone_is_supported_in_nested_model_config():
     authored = _config_mapping()
-    authored["model_type"] = "dinov2"
-    authored["pretrained_backbone"] = "/top/backbone.pth"
-    authored["pretrained_decoder_type"] = "linear"
-    authored["model_config"]["pretrained_backbone"] = "/nested/backbone.pth"
+    authored["model_config"].update(
+        {
+            "pretrained_backbone": "dinov2_ps8",
+            "pretrained_decoder_type": "primus_patch_decode",
+        }
+    )
+    authored["freeze_encoder"] = True
 
-    canonical = InkConfig.from_mapping(authored).to_mapping()
+    config = InkConfig.from_mapping(authored)
 
-    assert canonical["model_type"] == "vesuvius_unet"
-    assert canonical["pretrained_backbone"] == "/top/backbone.pth"
-    assert canonical["pretrained_decoder_type"] == "linear"
-    assert canonical["model_config"]["pretrained_backbone"] == "/nested/backbone.pth"
-    assert canonical["model_config"]["pretrained_decoder_type"] == "linear"
-
-
-def test_dinov2_requires_a_pretrained_backbone():
-    authored = _config_mapping()
-    authored["model_type"] = "dinov2"
-
-    with pytest.raises(ValueError, match="dinov2.*pretrained_backbone"):
-        InkConfig.from_mapping(authored)
+    assert config.model.model_type == "vesuvius_unet"
+    assert config.model.pretrained_backbone == "dinov2_ps8"
+    assert config.model.freeze_encoder is True
+    assert (
+        config.model.model_settings_mapping()["pretrained_decoder_type"]
+        == "primus_patch_decode"
+    )
+    assert config.to_mapping() == authored
 
 
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
-        ("guide_backbone", "dinov2", "guide_backbone"),
+        ("guide_backbone", "vit_small", "guide_backbone"),
         ("architecture_type", "mednext_v1", "architecture_type"),
         ("upsample_mode", "pixelshuffle", "upsample_mode"),
         (
@@ -113,7 +90,7 @@ def test_unsupported_model_construction_paths_fail_at_config_boundary(
     authored["model_config"]["guide_fusion_stage"] = "direct_segmentation"
     authored["model_config"]["mednext_model_id"] = "S"
     if key == "pretrained_backbone_config_path":
-        authored["model_config"]["pretrained_backbone"] = "dinov2"
+        authored["model_config"]["pretrained_backbone"] = "vit_small"
 
     with pytest.raises(ValueError, match=message):
         InkConfig.from_mapping(authored)

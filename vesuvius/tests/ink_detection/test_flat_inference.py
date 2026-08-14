@@ -22,7 +22,6 @@ from vesuvius.ink_detection.inference.infer import (
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
     compute_importance_map_2d,
-    convert_volume_dtype,
     flat_preprocessing_from_config,
     infer_folder,
     iter_blocks,
@@ -80,56 +79,44 @@ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog
     assert "Mask shape (2, 3) did not match Zarr shape (3, 2)" in caplog.text
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "robust_mad",
-        "robust_percentile_span",
-        "minmax",
-        "percentile_minmax",
-        "clip_zscore",
-        "none",
-    ],
-)
-def test_flat_legacy_normalization_routes_nondivide_modes_to_robust(name):
-    value: object = name
-    if name == "clip_zscore":
-        value = {
-            "mode": name,
-            "clip_min": 0,
-            "clip_max": 1,
-            "mean": 0,
-            "std": 1,
-        }
-    assert (
-        flat_preprocessing_from_config(NormalizationConfig.from_value(value))
-        == "tifxyz_robust"
-    )
-
-
-def test_flat_legacy_divide_restrictions_and_uint16_quantization():
+def test_flat_preprocessing_accepts_exact_training_contracts():
+    assert flat_preprocessing_from_config(
+        NormalizationConfig.from_value("robust_mad")
+    ) == "tifxyz_robust"
     assert flat_preprocessing_from_config(
         NormalizationConfig.from_value({"mode": "divide", "divisor": 255})
     ) == "divide_255"
-    assert flat_preprocessing_from_config(
-        NormalizationConfig.from_value(
-            {"mode": "clip_divide", "clip_min": 0, "clip_max": 200, "divisor": 255}
-        )
-    ) == "legacy_uint8"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "robust_percentile_span",
+        "minmax",
+        "percentile_minmax",
+        {"mode": "clip_zscore", "clip_min": 0, "clip_max": 1, "mean": 0, "std": 1},
+        "none",
+    ],
+)
+def test_flat_preprocessing_rejects_unsupported_training_modes(value):
+    config = NormalizationConfig.from_value(value)
+    with pytest.raises(ValueError, match=rf"mode '{config.mode}'"):
+        flat_preprocessing_from_config(config)
+
+
+def test_flat_preprocessing_rejects_nondefault_robust_percentiles():
+    config = NormalizationConfig.from_value(
+        {"mode": "robust_mad", "percentile_lower": 2, "percentile_upper": 98}
+    )
+    with pytest.raises(ValueError, match="percentile_lower=1"):
+        flat_preprocessing_from_config(config)
+
+
+def test_flat_divide_restriction_and_robust_normalization():
     with pytest.raises(ValueError, match="divisor=255"):
         flat_preprocessing_from_config(
             NormalizationConfig.from_value({"mode": "divide", "divisor": 256})
         )
-    with pytest.raises(ValueError, match="clip_min=0"):
-        flat_preprocessing_from_config(
-            NormalizationConfig.from_value(
-                {"mode": "clip_divide", "clip_min": 1, "clip_max": 200, "divisor": 255}
-            )
-        )
-    np.testing.assert_array_equal(
-        convert_volume_dtype(np.array([0, 255, 256, 511, 65535], dtype=np.uint16)),
-        np.array([0, 0, 1, 1, 255], dtype=np.uint8),
-    )
     np.testing.assert_allclose(
         normalize_flat_patch(
             np.array([0, 0, 0, 0, 10], dtype=np.float32),
@@ -138,12 +125,6 @@ def test_flat_legacy_divide_restrictions_and_uint16_quantization():
         np.array([0, 0, 0, 0, 2.4], dtype=np.float32),
         rtol=1e-6,
         atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        normalize_flat_patch(
-            np.array([0, 200], dtype=np.uint8), "legacy_uint8"
-        ),
-        np.array([0.0, 200.0 / 255.0], dtype=np.float32),
     )
 
 

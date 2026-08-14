@@ -30,7 +30,6 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
 DEFAULT_OVERLAP_FRACTION = 0.25
-DEFAULT_STORED_GRID_PAD = 40
 DEFAULT_RECOMPRESS_PRESET = "balanced"
 DEFAULT_PATCH_FILTER = "supervision"
 DOWNLOAD_PLAN_ATTR = "vesuvius_ink_download_plan"
@@ -1033,18 +1032,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_OVERLAP_FRACTION,
         help="Patch overlap fraction used by tifxyz patchfinding.",
-    )
-    parser.add_argument(
-        "--stored-grid-pad",
-        type=int,
-        default=DEFAULT_STORED_GRID_PAD,
-        help="Accepted but does not affect patch discovery or the chunk plan.",
-    )
-    parser.add_argument(
-        "--patch-finding-workers",
-        type=int,
-        default=4,
-        help="Accepted but does not affect patch discovery or the chunk plan.",
     )
     parser.add_argument(
         "--patch-finding-type",

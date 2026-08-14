@@ -76,8 +76,7 @@ def test_negative_resolution_fails_before_native_volume_open(monkeypatch):
         )
 
 
-def test_cli_uses_hyphen_underscore_parser_and_explicit_workers_alias(tmp_path):
-    assert "HyphenUnderscoreParser" in native.parse_args.__code__.co_names
+def test_cli_accepts_both_flag_spellings_and_explicit_workers_alias(tmp_path):
     common = [str(tmp_path), str(tmp_path / "model.ckpt"), str(tmp_path / "out")]
     hyphen = native.parse_args(
         [

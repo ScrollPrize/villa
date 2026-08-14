@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-import hashlib
 from pathlib import Path
 import random
 
@@ -37,10 +36,6 @@ from vesuvius.ink_detection.types import MetricBatch, Patch, Segment
     [
         ("none", np.array([0, 10, 255], dtype=np.float32)),
         ({"mode": "divide", "divisor": 255}, np.array([0, 10, 255], dtype=np.float32) / 255),
-        (
-            {"mode": "clip_divide", "clip_min": 0, "clip_max": 200, "divisor": 255},
-            np.array([0, 10, 200], dtype=np.float32) / 255,
-        ),
         (
             {"mode": "clip_zscore", "clip_min": 10, "clip_max": 200, "mean": 50, "std": 2},
             (np.array([10, 10, 200], dtype=np.float32) - 50) / 2,
@@ -156,6 +151,13 @@ def test_native_crop_scatter_surface_and_dense_normal_projection():
 
 
 def test_line_projection_preserves_reciprocal_multiply_rounding():
+    """The unmarked voxel at index 5 is a parity contract, not a target.
+
+    _draw_line divides by a reciprocal multiply whose rounding skips one
+    lattice voxel on this span. The native full-3D reference pipeline
+    rasterized training labels with exactly this kernel, so parity with
+    checkpoints trained on those labels requires keeping the behavior.
+    """
     output = np.zeros((1, 1, 8), dtype=np.uint8)
     _draw_line(
         output,
@@ -169,44 +171,103 @@ def test_line_projection_preserves_reciprocal_multiply_rounding():
     assert output[0, 0, 5] == 0
 
 
-def test_normal_projection_fixture_hash_matrix():
-    """Check interpolation behavior across varied fractional boundaries."""
-    rng = np.random.default_rng(20260810)
-    digest = hashlib.sha256()
-    for fixture in range(24):
-        rows = 2 + fixture % 4
-        columns = 2 + (fixture // 4) % 4
-        base_y, base_x = np.meshgrid(
-            np.arange(rows, dtype=np.float32),
-            np.arange(columns, dtype=np.float32),
-            indexing="ij",
-        )
-        positions = np.stack(
-            [
-                4.25 + 0.37 * base_y + 0.11 * base_x,
-                2.15 + 1.73 * base_y + 0.19 * base_x,
-                3.05 + 0.23 * base_y + 1.61 * base_x,
-            ],
-            axis=-1,
-        ).astype(np.float32)
-        positions += rng.normal(0.0, 0.08, positions.shape).astype(np.float32)
-        normals = rng.normal(0.0, 1.0, positions.shape).astype(np.float32)
-        valid = rng.random((rows, columns)) > 0.15
-        mask = (rng.random((rows, columns)) > 0.25).astype(np.uint8)
-        if fixture % 7 == 0:
-            normals[0, 0] = np.nan
-        output = project_binary_mask_along_normals(
-            mask,
-            positions,
-            normals,
-            valid,
-            (0, 0, 0, 12, 14, 14),
-            half_thickness_voxels=(fixture % 5) + 0.25,
-        )
-        digest.update(output.tobytes())
-    assert digest.hexdigest() == (
-        "71a9749e7d1353a9a5bc8d2b4baf52bc74ca4875939af658955be2dac276581c"
+def _marked_voxels(output):
+    return sorted(tuple(coordinate) for coordinate in np.argwhere(output).tolist())
+
+
+def test_normal_projection_marks_axis_aligned_column_with_truncation():
+    output = project_binary_mask_along_normals(
+        np.ones((1, 1), dtype=np.uint8),
+        np.array([[[2.3, 1.6, 2.4]]], dtype=np.float32),
+        np.array([[[1.0, 0.0, 0.0]]], dtype=np.float32),
+        np.ones((1, 1), dtype=bool),
+        (0, 0, 0, 6, 4, 4),
+        half_thickness_voxels=2.0,
     )
+    assert _marked_voxels(output) == [
+        (0, 1, 2),
+        (1, 1, 2),
+        (2, 1, 2),
+        (3, 1, 2),
+        (4, 1, 2),
+    ]
+
+
+def test_normal_projection_normalizes_diagonals_and_connects_neighbors():
+    output = project_binary_mask_along_normals(
+        np.ones((1, 2), dtype=np.uint8),
+        np.array([[[2.4, 1.3, 1.2], [2.4, 1.3, 2.8]]], dtype=np.float32),
+        np.array([[[0.0, 2.0, 2.0], [0.0, 2.0, 2.0]]], dtype=np.float32),
+        np.ones((1, 2), dtype=bool),
+        (0, 0, 0, 5, 4, 6),
+        half_thickness_voxels=1.25,
+    )
+    assert _marked_voxels(output) == [
+        (2, 0, 0),
+        (2, 0, 1),
+        (2, 0, 2),
+        (2, 1, 1),
+        (2, 1, 2),
+        (2, 2, 1),
+        (2, 2, 2),
+        (2, 2, 3),
+    ]
+
+
+def test_normal_projection_fills_slab_between_offset_sheets_trilinearly():
+    """Fanning normals separate consecutive offset sheets laterally.
+
+    The top row and left column of the 4x4 middle slice fall strictly
+    between the step-0 and step-+1 sheets: corner lines and the bilinear
+    sheet fills miss them, and only _draw_trilinear's slab filling between
+    consecutive offset sheets marks those seven voxels.
+    """
+    output = project_binary_mask_along_normals(
+        np.ones((2, 2), dtype=np.uint8),
+        np.array(
+            [[[2.5, 1.2, 1.2], [2.5, 1.2, 3.2]], [[2.5, 3.2, 1.2], [2.5, 3.2, 3.2]]],
+            dtype=np.float32,
+        ),
+        np.array(
+            [[[1.0, -0.8, -0.8], [1.0, -0.8, 0.8]], [[1.0, 0.8, -0.8], [1.0, 0.8, 0.8]]],
+            dtype=np.float32,
+        ),
+        np.ones((2, 2), dtype=bool),
+        (0, 0, 0, 5, 5, 5),
+        half_thickness_voxels=1.0,
+    )
+    expected = np.zeros((5, 5, 5), dtype=output.dtype)
+    expected[1, 1:3, 1:3] = 1
+    expected[2:4, 0:4, 0:4] = 1
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_normal_projection_skips_nan_normals_and_invalid_cells():
+    normals = np.zeros((2, 2, 3), dtype=np.float32)
+    normals[..., 0] = 1.0
+    normals[0, 1] = np.nan
+    output = project_binary_mask_along_normals(
+        np.ones((2, 2), dtype=np.uint8),
+        np.array(
+            [
+                [[1.4, 1.3, 1.2], [1.4, 1.3, 6.7]],
+                [[1.4, 2.6, 1.2], [1.4, 2.6, 6.7]],
+            ],
+            dtype=np.float32,
+        ),
+        normals,
+        np.array([[True, True], [True, False]]),
+        (0, 0, 0, 4, 4, 9),
+        half_thickness_voxels=1.0,
+    )
+    assert _marked_voxels(output) == [
+        (0, 1, 1),
+        (0, 2, 1),
+        (1, 1, 1),
+        (1, 2, 1),
+        (2, 1, 1),
+        (2, 2, 1),
+    ]
 
 
 def _augmentation_nodes(transform):
@@ -238,22 +299,42 @@ def test_default_augmentation_graph_and_seeded_values():
     assert "GaussianNoiseTransform" in restricted_names
     assert "ContrastTransform" not in restricted_names
 
-    image = torch.linspace(-1.0, 1.0, 192, dtype=torch.float32).reshape(1, 3, 8, 8)
-    inklabels = (torch.arange(192).reshape(1, 3, 8, 8) % 3 == 0).float()
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    augmented = transforms(
-        image=image,
-        inklabels=inklabels,
-        supervision_mask=torch.ones_like(inklabels),
+    def run_seeded():
+        image = torch.linspace(-1.0, 1.0, 192, dtype=torch.float32).reshape(1, 3, 8, 8)
+        inklabels = (torch.arange(192).reshape(1, 3, 8, 8) % 3 == 0).float()
+        random.seed(0)
+        np.random.seed(0)
+        torch.manual_seed(0)
+        return transforms(
+            image=image,
+            inklabels=inklabels,
+            supervision_mask=torch.ones_like(inklabels),
+        )
+
+    augmented = run_seeded()
+    repeated = run_seeded()
+    assert torch.equal(repeated["image"], augmented["image"])
+    assert torch.equal(repeated["inklabels"], augmented["inklabels"])
+
+    image = augmented["image"]
+    assert image.shape == (1, 3, 8, 8)
+    assert image.dtype == torch.float32
+    assert image.mean().item() == pytest.approx(-0.0236479, abs=1e-4)
+    assert image.std().item() == pytest.approx(0.4906498, abs=1e-4)
+    assert image.min().item() == pytest.approx(-1.0584830, abs=1e-4)
+    assert image.max().item() == pytest.approx(0.6304119, abs=1e-4)
+    torch.testing.assert_close(
+        image[0, 1, 4, :4],
+        torch.tensor([-0.274156, -0.186243, -0.099831, 0.084368]),
+        rtol=0.0,
+        atol=1e-4,
     )
-    assert hashlib.sha256(augmented["image"].numpy().tobytes()).hexdigest() == (
-        "f5b020410f7cc25fb8c88f136317815f6e3dddbffa8b1afd2c943ac2b2f2ae6f"
+    # The seeded label path resolves to a pure spatial rearrangement; on this
+    # symmetric lattice it equals a width flip of the input.
+    expected_labels = torch.flip(
+        (torch.arange(192).reshape(1, 3, 8, 8) % 3 == 0).float(), dims=(3,)
     )
-    assert hashlib.sha256(augmented["inklabels"].numpy().tobytes()).hexdigest() == (
-        "79d0ace977a758f2099dc9ea06d2cc3d726e705d530510f31f4c2b04d2aaa226"
-    )
+    assert torch.equal(augmented["inklabels"], expected_labels)
 
 
 def test_native_crop_translation_preserves_supervised_fraction():

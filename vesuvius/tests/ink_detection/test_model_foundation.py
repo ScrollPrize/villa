@@ -12,6 +12,7 @@ from torch import nn
 
 import vesuvius.models.build.build_network_from_config as network_builder
 from vesuvius.ink_detection.config import InkConfig
+import vesuvius.ink_detection.models.model as model_module
 from vesuvius.ink_detection.models.hybrid_3d2d import (
     Local3DStem2DUNet,
     LocalDepthFusionStem,
@@ -110,6 +111,37 @@ def test_unet_aliases_dispatch_to_the_same_model_families(model_type):
         assert isinstance(model, SliceChannel2DModel)
     else:
         assert isinstance(model, Local3DStem2DUNet)
+
+
+def test_dinov2_backbone_configuration_reaches_the_shared_model_builder(
+    monkeypatch,
+):
+    authored = _config_mapping("vesuvius_unet", depth=4)
+    authored["model_config"].update(
+        {
+            "pretrained_backbone": "dinov2_ps8",
+            "pretrained_decoder_type": "primus_patch_decode",
+        }
+    )
+    observed = {}
+    sentinel = nn.Identity()
+
+    def record_build(config_dict, *, op_dims):
+        observed.update(config_dict)
+        observed["op_dims"] = op_dims
+        return sentinel
+
+    monkeypatch.setattr(model_module, "_build_network", record_build)
+
+    model = make_model(InkConfig.from_mapping(authored))
+
+    assert model is sentinel
+    assert observed["op_dims"] == 3
+    assert observed["model_config"]["pretrained_backbone"] == "dinov2_ps8"
+    assert (
+        observed["model_config"]["pretrained_decoder_type"]
+        == "primus_patch_decode"
+    )
 
 
 @pytest.mark.parametrize(
