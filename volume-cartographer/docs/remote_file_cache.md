@@ -235,9 +235,12 @@ the controller performs frequent initial up/down probes around the prior limit
 before returning to its normal stability-dependent cadence.
 
 Each saturated controller epoch requires at least five remote-request-active
-seconds and one successful completion per admitted worker. Request completion
-supplies p90 latency and saturation/failure information; it does not estimate
-bandwidth. Failed and missing sparse-chunk requests end only their own
+seconds and one successful completion per admitted worker. Aggregate goodput is
+the primary probe-selection metric; increased per-request latency does not veto
+a meaningful throughput gain. Request-completion p90 latency is used only to
+prefer fewer workers when they retain nearly all baseline goodput, and supplies
+saturation/failure information rather than estimating bandwidth. Failed and
+missing sparse-chunk requests end only their own
 measurements, so they cannot erase concurrent successful observations; they
 may pace an already-selected admission ramp but do not count as successful
 payload samples. Underfilled-tail requests reset the current capacity epoch so

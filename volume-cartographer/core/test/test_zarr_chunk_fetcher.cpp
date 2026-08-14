@@ -19,6 +19,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -347,6 +348,48 @@ TEST_CASE("Zarr download benchmark uses encoded fetches and fixed admission")
     CHECK(progress[0].downloadingChunks == 0);
     CHECK(progress[0].completedChunks == 12);
     CHECK(progress[0].encodedBytes == 12 * 1024);
+}
+
+TEST_CASE("Zarr download benchmark replenishes work until its duration")
+{
+    class EncodedFetcher final : public vc::render::IChunkFetcher {
+    public:
+        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
+        {
+            return {};
+        }
+
+        vc::render::ChunkFetchResult fetchEncoded(
+            const vc::render::ChunkKey&) override
+        {
+            ++calls;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            vc::render::ChunkFetchResult result;
+            result.status = vc::render::ChunkFetchStatus::Found;
+            result.bytes.resize(1024);
+            return result;
+        }
+
+        std::atomic_size_t calls{0};
+    };
+
+    auto fetcher = std::make_shared<EncodedFetcher>();
+    OpenedChunkedZarr opened;
+    opened.shapes = {{64, 64, 64}};
+    opened.chunkShapes = {{16, 16, 16}};
+    opened.fetchers = {fetcher};
+
+    vc::render::ZarrDownloadBenchmarkOptions options;
+    options.chunkCount = 2;
+    options.runDuration = std::chrono::milliseconds(15);
+    options.workers = 2;
+    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
+    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
+
+    CHECK(result.requestedChunks == fetcher->calls.load());
+    CHECK(result.requestedChunks > options.chunkCount);
+    CHECK(result.foundChunks == result.requestedChunks);
+    CHECK(result.wallSeconds >= 0.015);
 }
 
 TEST_CASE("Zarr download benchmark rejects adaptive mode without remote measurement")

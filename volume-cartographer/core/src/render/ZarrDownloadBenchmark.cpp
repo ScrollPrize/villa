@@ -121,6 +121,10 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
     }
     if (options.workers == 0)
         throw std::invalid_argument("zarr benchmark worker count must be positive");
+    if (options.chunkCount == 0)
+        throw std::invalid_argument("zarr benchmark queue size must be positive");
+    if (options.runDuration.count() < 0.0)
+        throw std::invalid_argument("zarr benchmark duration cannot be negative");
     if (options.outputDirectory)
         std::filesystem::create_directories(*options.outputDirectory);
 
@@ -138,10 +142,10 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
     }
     ChunkRequestScheduler scheduler(options.workers, 7, {}, adaptive);
     ZarrDownloadBenchmarkResult result;
-    result.requestedChunks = keys.size();
     result.concurrencySamples.push_back(
         {0, 0, scheduler.transferStats().admissionLimit, 0.0});
 
+    std::atomic_size_t requestedChunks{0};
     std::atomic_size_t found{0};
     std::atomic_size_t missing{0};
     std::atomic_size_t httpErrors{0};
@@ -190,9 +194,16 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
             }
         });
     }
-    for (std::size_t index = 0; index < keys.size(); ++index) {
-        const auto key = keys[index];
-        scheduler.submit(index + 1, {}, 0, 0, [&, key] {
+    const bool durationMode = options.runDuration.count() > 0.0;
+    const auto deadline = wallStarted + std::chrono::duration_cast<Clock::duration>(
+        options.runDuration);
+    std::function<void(std::size_t)> submitSlot;
+    submitSlot = [&](std::size_t index) {
+        scheduler.submit(index + 1, {}, 0, 0, [&, index] {
+            if (durationMode && Clock::now() >= deadline)
+                return;
+            requestedChunks.fetch_add(1, std::memory_order_relaxed);
+            const auto key = keys[index];
             const auto activeNow = active.fetch_add(1, std::memory_order_relaxed) + 1;
             auto observedPeak = peakActive.load(std::memory_order_relaxed);
             while (activeNow > observedPeak &&
@@ -293,7 +304,12 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
                 latencyMilliseconds.push_back(latency);
             }
             completedChunks.fetch_add(1, std::memory_order_relaxed);
+            if (durationMode && Clock::now() < deadline)
+                submitSlot(index);
         });
+    };
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+        submitSlot(index);
     }
     scheduler.waitIdle();
     const auto wallCompleted = Clock::now();
@@ -312,6 +328,7 @@ ZarrDownloadBenchmarkResult runZarrDownloadBenchmark(
             scheduler.transferStats()});
     }
 
+    result.requestedChunks = requestedChunks.load();
     result.foundChunks = found.load();
     result.missingChunks = missing.load();
     result.httpErrors = httpErrors.load();

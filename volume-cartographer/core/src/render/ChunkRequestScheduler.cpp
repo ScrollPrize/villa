@@ -154,8 +154,6 @@ struct ChunkRequestScheduler::Impl {
             1.000001, options.bandwidthChangeRatio);
         options.throughputGainRatio = std::max(
             1.0, options.throughputGainRatio);
-        options.maximumLatencyInflation = std::max(
-            1.0, options.maximumLatencyInflation);
         options.initialProbeMultiplier = std::max<std::size_t>(
             2, options.initialProbeMultiplier);
         options.refinementProbeMultiplier = std::max<std::size_t>(
@@ -594,9 +592,7 @@ struct ChunkRequestScheduler::Impl {
             const auto baseline = averageMeasurements(
                 *baselineBeforeUp, *baselineAfterUp);
             const double throughput = throughputRatio(*upMeasurement, baseline);
-            const double latency = latencyRatio(*upMeasurement, baseline);
-            if (throughput >= adaptiveOptions.throughputGainRatio &&
-                latency <= adaptiveOptions.maximumLatencyInflation) {
+            if (throughput >= adaptiveOptions.throughputGainRatio) {
                 const double gain = throughput - 1.0;
                 if (gain > selectedGain) {
                     selected = upAdmissionLimit;
@@ -615,13 +611,11 @@ struct ChunkRequestScheduler::Impl {
                 throughput >= adaptiveOptions.lowerThroughputRetention &&
                 latency <= adaptiveOptions.lowerLatencyRatio;
             const bool improvesThroughput =
-                throughput >= adaptiveOptions.throughputGainRatio &&
-                latency <= adaptiveOptions.maximumLatencyInflation;
+                throughput >= adaptiveOptions.throughputGainRatio;
             if (preservesThroughputAndLatency || improvesThroughput) {
-                const double gain = improvesThroughput
-                    ? throughput - 1.0
-                    : 0.5 * (1.0 - latency);
-                if (gain > selectedGain) {
+                const double gain = throughput - 1.0;
+                if ((improvesThroughput && gain > selectedGain) ||
+                    (!improvesThroughput && selected == previousSettled)) {
                     selected = downAdmissionLimit;
                     selectedGain = gain;
                     selectedMeasurement = *downMeasurement;

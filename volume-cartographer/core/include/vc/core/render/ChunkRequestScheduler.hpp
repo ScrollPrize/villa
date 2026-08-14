@@ -90,7 +90,6 @@ public:
         double minimumStabilityObservationSeconds = 300.0;
         double bandwidthChangeRatio = 2.0;
         double throughputGainRatio = 1.08;
-        double maximumLatencyInflation = 1.75;
         std::size_t initialProbeMultiplier = 4;
         std::size_t refinementProbeMultiplier = 2;
         std::size_t continuousSearchTurns = 5;

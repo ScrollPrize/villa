@@ -2020,8 +2020,8 @@ TEST_CASE("ChunkRequestScheduler exploration cadence follows bandwidth stability
                 std::max(requestSeconds, latencySeconds)));
     };
 
-    // The 4-worker probe has more throughput but excessive p90 latency, so C=2
-    // is retained. This fixture disables the five-minute eligibility period to
+    // The 4-worker probe does not clear the required throughput gain, so C=2 is
+    // retained. This fixture disables the five-minute eligibility period to
     // exercise the stable/changed cadence calculation directly.
     recordEpoch(2, 10.0, 0.10);
     REQUIRE(scheduler.transferStats().admissionLimit == 3);
@@ -2029,7 +2029,7 @@ TEST_CASE("ChunkRequestScheduler exploration cadence follows bandwidth stability
     recordMeasuredTransfers(
         scheduler, 1, chunkBytes, rampStarted, std::chrono::milliseconds(10));
     cursor = rampStarted + std::chrono::milliseconds(10);
-    recordEpoch(4, 11.0, 0.20);
+    recordEpoch(4, 10.5, 0.20);
     recordEpoch(2, 10.0, 0.10);
     auto stats = scheduler.transferStats();
     CHECK(stats.admissionLimit == 2);
@@ -2046,6 +2046,52 @@ TEST_CASE("ChunkRequestScheduler exploration cadence follows bandwidth stability
     stats = scheduler.transferStats();
     CHECK(stats.probeIntervalSeconds == doctest::Approx(60.0));
     CHECK(stats.longTermBytesPerSecond > 5.0 * 1024.0 * 1024.0);
+}
+
+TEST_CASE("ChunkRequestScheduler does not veto throughput on request latency")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.maximum = 4;
+    adaptive.minimumEpochSeconds = 0.0;
+    adaptive.initialProbeMultiplier = 2;
+    ChunkRequestScheduler scheduler(4, 7, {}, adaptive);
+    auto cursor = Clock::time_point{};
+
+    auto recordEpoch = [&](std::size_t concurrency, double throughputMiB) {
+        REQUIRE(scheduler.transferStats().admissionLimit == concurrency);
+        REQUIRE(scheduler.transferStats().targetAdmissionLimit == concurrency);
+        const double requestSeconds =
+            static_cast<double>(chunkBytes * concurrency) /
+            (throughputMiB * 1024.0 * 1024.0);
+        const auto started = cursor + std::chrono::seconds(1);
+        const auto duration = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(requestSeconds));
+        recordMeasuredTransfers(
+            scheduler, concurrency, chunkBytes, started, duration);
+        cursor = started + duration;
+    };
+
+    recordEpoch(2, 10.0);
+    REQUIRE(scheduler.transferStats().targetAdmissionLimit == 4);
+    const auto rampStarted = cursor + std::chrono::seconds(1);
+    recordMeasuredTransfers(
+        scheduler, 1, chunkBytes, rampStarted, std::chrono::milliseconds(10));
+    cursor = rampStarted + std::chrono::milliseconds(10);
+
+    // Aggregate throughput improves by 10%, while per-request latency grows by
+    // about 82%. That latency increase is a normal consequence of concurrency
+    // and must not veto the useful aggregate-bandwidth gain.
+    recordEpoch(4, 11.0);
+    recordEpoch(2, 10.0);
+    REQUIRE(scheduler.transferStats().targetAdmissionLimit == 4);
+    const auto selectedRampStarted = cursor + std::chrono::seconds(1);
+    recordMeasuredTransfers(
+        scheduler, 1, chunkBytes, selectedRampStarted,
+        std::chrono::milliseconds(10));
+    CHECK(scheduler.transferStats().admissionLimit == 4);
+    CHECK(scheduler.transferStats().targetAdmissionLimit == 4);
 }
 
 TEST_CASE("ChunkRequestScheduler requires saturated observation time for stability")

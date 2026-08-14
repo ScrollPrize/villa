@@ -31,7 +31,11 @@ struct ZarrDownloadProgress {
 
 struct ZarrDownloadBenchmarkOptions {
     int level = 0;
+    // Number of unique candidate keys and maximum queued request slots.
     std::size_t chunkCount = 256;
+    // Positive durations continuously replenish the candidate slots until the
+    // deadline. Zero retains the finite one-request-per-candidate mode.
+    std::chrono::duration<double> runDuration{0.0};
     std::uint64_t seed = 0;
     std::size_t workers = 64;
     ZarrDownloadSchedule schedule = ZarrDownloadSchedule::Adaptive;

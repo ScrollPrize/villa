@@ -13,8 +13,12 @@ volume-cartographer/build/bin/vc_zarr_download_bench \
   s3://bucket/path/to/volume.zarr --level 0 --chunks 256
 ```
 
-The automatic defaults are the rendering defaults: 2 initial workers, 64
-maximum workers, and a five-remote-request-active-second measurement epoch.
+The CLI runs for 60 seconds by default and continuously replenishes a bounded
+256-candidate queue, so clean-start automatic probing cannot drain its workload
+before reaching higher concurrency. `--chunks` controls the number of unique
+candidate keys and queued request slots; `--duration-seconds` controls runtime.
+The automatic policy defaults are the rendering defaults: 2 initial workers,
+64 maximum workers, and a five-remote-request-active-second measurement epoch.
 Initial discovery
 probes `4C` and `C/4` to cover the range quickly. After the first overshoot,
 direction reversal, or retained-center bracket, refinement compares `2C` and
@@ -37,9 +41,12 @@ transfer time has been observed at that concurrency, so shorter runs retain the
 1-minute exploration cadence. Once eligible, stable bandwidth is probed every
 5 minutes. A bandwidth change of 2x or 0.5x relative to the long-term EMA
 shortens that toward 1 minute, with intermediate changes interpolated in
-logarithmic bandwidth space. Probe results use epoch-local goodput and p90
-request latency; the long-term EMA is retained as the network-stability baseline
-rather than used as the probe result itself.
+logarithmic bandwidth space. Probe selection is throughput-first: a candidate
+that clears the aggregate-goodput threshold is not rejected because concurrent
+requests have higher individual latency. P90 latency is used to prefer a lower
+concurrency only when it retains the configured fraction of baseline goodput.
+The long-term EMA is retained as the network-stability baseline rather than
+used as the probe result itself.
 
 An underfilled queue is not treated as reduced network capacity. Such samples
 do not update the controller or stability EMA; the capacity estimate retains

@@ -6,6 +6,7 @@
 #include <boost/program_options.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -51,6 +52,7 @@ int main(int argc, char** argv)
     std::string tempDirectory;
     int level = 0;
     std::size_t chunks = 256;
+    double durationSeconds = 60.0;
     std::size_t workers = 64;
     std::size_t minimumWorkers = 2;
     double minimumEpochSeconds = 5.0;
@@ -71,7 +73,9 @@ int main(int argc, char** argv)
         ("level,l", po::value<int>(&level)->default_value(0),
          "Logical pyramid level to benchmark")
         ("chunks,n", po::value<std::size_t>(&chunks)->default_value(256),
-         "Number of unique chunks to download")
+         "Unique candidate keys and queued request slots")
+        ("duration-seconds", po::value<double>(&durationSeconds)->default_value(60.0),
+         "Benchmark duration; continuously replenishes queued requests")
         ("mode", po::value<std::string>(&mode)->default_value("auto"),
          "Download admission mode: auto or fixed")
         ("workers,j", po::value<std::size_t>(&workers)->default_value(64),
@@ -118,8 +122,10 @@ int main(int argc, char** argv)
         po::notify(parsed);
 
         const auto schedule = parseSchedule(mode);
-        if (workers == 0 || minimumWorkers == 0)
-            throw std::invalid_argument("worker counts must be positive");
+        if (workers == 0 || minimumWorkers == 0 || chunks == 0)
+            throw std::invalid_argument("worker and queue counts must be positive");
+        if (!std::isfinite(durationSeconds) || durationSeconds <= 0.0)
+            throw std::invalid_argument("--duration-seconds must be finite and positive");
         if (schedule == vc::render::ZarrDownloadSchedule::Adaptive &&
             minimumWorkers > workers)
             throw std::invalid_argument("--min-workers cannot exceed --workers");
@@ -159,6 +165,7 @@ int main(int argc, char** argv)
         vc::render::ZarrDownloadBenchmarkOptions benchmark;
         benchmark.level = level;
         benchmark.chunkCount = chunks;
+        benchmark.runDuration = std::chrono::duration<double>(durationSeconds);
         benchmark.seed = seed;
         benchmark.workers = workers;
         benchmark.schedule = schedule;
@@ -206,7 +213,8 @@ int main(int argc, char** argv)
         }
         std::cout << " shape=" << shape[0] << 'x' << shape[1] << 'x' << shape[2]
                   << " chunk=" << chunkShape[0] << 'x' << chunkShape[1] << 'x'
-                  << chunkShape[2] << " requests=" << chunks
+                  << chunkShape[2] << " queue=" << chunks
+                  << " duration=" << durationSeconds << "s"
                   << " mode=" << mode << " workers=" << workers
                   << " sink=" << sink << "\n";
         if (benchmark.outputDirectory)
