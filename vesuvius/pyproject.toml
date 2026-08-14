@@ -122,6 +122,16 @@ blending = [
 
 tests = ["pytest>=8.4.2"]
 
+# Geometry-driven TIFXYZ label production (no torch/GUI dependency)
+label-transfer = [
+    "scipy>=1.13.1",
+    "tifffile>=2024.8.30",
+    "imagecodecs>=2024.6.1",
+    # Required by vesuvius.utils.cli's package import boundary.
+    "aiohttp>=3.12.15",
+    "nest-asyncio>=1.6.0",
+]
+
 # Convenience alias to install everything
 all = [
     # Machine-learning & training stack
@@ -217,6 +227,9 @@ where = ["src"]
 vesuvius = [
     "install/configs/*.yaml",
     "ink_detection/configs/*.json",
+    "tifxyz_label_transfer/*.cpp",
+    "tifxyz_label_transfer/*.md",
+    "tifxyz_label_transfer/docs/*.md",
 ]
 
 [tool.setuptools.cmdclass]
