@@ -1,9 +1,13 @@
 #include "SpiralOverlayController.hpp"
 
+#include "../volume_viewers/CVolumeViewerView.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QFontMetricsF>
+
 #include <algorithm>
+#include <limits>
 
 SpiralOverlayController::SpiralOverlayController(QObject* parent)
     : ViewerOverlayControllerBase("spiral_geometry", parent)
@@ -124,6 +128,16 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
                 return cv::Vec2f(gridColumnRow[0] / scale[0] - center[0],
                                  gridColumnRow[1] / scale[1] - center[1]);
             };
+            // The overlay is re-collected on every pan/zoom, so each label
+            // can chase the viewport: it sits on the boundary point closest
+            // to the viewport's vertical center and is clamped into view
+            // while any part of its curve is on screen.
+            QRectF visibleScene;
+            if (auto* view = viewer->graphicsView(); view && view->viewport())
+                visibleScene =
+                    view->mapToScene(view->viewport()->rect()).boundingRect();
+            const QFont labelFont;
+            const QFontMetricsF labelMetrics(labelFont);
             for (const WindingTransitionCurve& curve : _transitionCurves) {
                 // A jump straight to a non-adjacent winding is a mapping
                 // anomaly worth spotting, so it gets the warning color.
@@ -135,7 +149,8 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
                                           : QColor(255, 60, 60, 230);
                 style.penWidth = 2.0;
                 style.z = 67.0;
-                bool labeled = false;
+                QPointF labelAnchor;
+                qreal labelCost = std::numeric_limits<qreal>::max();
                 for (const std::vector<cv::Vec2f>& segment : curve.segments) {
                     if (segment.size() < 2) continue;
                     std::vector<cv::Vec2f> surfacePoints;
@@ -143,22 +158,41 @@ void SpiralOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
                     for (const cv::Vec2f& point : segment)
                         surfacePoints.push_back(gridToSurface(point));
                     builder.addSurfaceLineStrip(surfacePoints, false, style);
-                    if (!labeled) {
-                        const cv::Vec2f anchor =
-                            surfacePoints[surfacePoints.size() / 2];
-                        OverlayStyle textStyle;
-                        textStyle.penColor = style.penColor;
-                        textStyle.z = 68.0;
-                        builder.addText(
-                            viewer->surfaceCoordsToScene(anchor[0], anchor[1])
-                                + QPointF(4.0, -4.0),
-                            QStringLiteral("%1 | %2")
-                                .arg(curve.fromWinding)
-                                .arg(curve.toWinding),
-                            QFont(), textStyle, true);
-                        labeled = true;
+                    for (const cv::Vec2f& surfacePoint : surfacePoints) {
+                        const QPointF scene = viewer->surfaceCoordsToScene(
+                            surfacePoint[0], surfacePoint[1]);
+                        qreal cost = visibleScene.isValid()
+                            ? std::abs(scene.y() - visibleScene.center().y())
+                            : 0.0;
+                        if (visibleScene.isValid()
+                            && !visibleScene.contains(scene))
+                            cost += 1.0e6;
+                        if (cost < labelCost) {
+                            labelCost = cost;
+                            labelAnchor = scene;
+                        }
                     }
                 }
+                if (labelCost == std::numeric_limits<qreal>::max()) continue;
+                const QString label = QStringLiteral("%1 | %2")
+                                          .arg(curve.fromWinding)
+                                          .arg(curve.toWinding);
+                // COutlinedTextItem is a QGraphicsTextItem, whose document
+                // pads roughly 4 px per side; fold that into the centering.
+                const qreal labelWidth =
+                    labelMetrics.horizontalAdvance(label) + 8.0;
+                const qreal labelHeight = labelMetrics.height() + 8.0;
+                QPointF position(labelAnchor.x() - labelWidth / 2.0,
+                                 labelAnchor.y() - labelHeight / 2.0);
+                if (visibleScene.isValid()) {
+                    position.setY(std::clamp(
+                        position.y(), visibleScene.top() + 2.0,
+                        visibleScene.bottom() - labelHeight - 2.0));
+                }
+                OverlayStyle textStyle;
+                textStyle.penColor = style.penColor;
+                textStyle.z = 68.0;
+                builder.addText(position, label, labelFont, textStyle, true);
             }
         }
     }
