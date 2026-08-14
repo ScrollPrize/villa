@@ -1,5 +1,6 @@
 #include "vc/core/render/ZarrDownloadBenchmark.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <boost/program_options.hpp>
@@ -150,7 +151,9 @@ int main(int argc, char** argv)
         vc::render::RemoteZarrOpenOptions openOptions;
         openOptions.discoverAwsCredentials = !anonymous;
         std::cout << "Opening "
-                  << vc::parseRemoteVolumeSpec(source).portableLocator << "\n";
+                  << vc::core::util::redactedRemoteLocation(
+                         vc::parseRemoteVolumeSpec(source).portableLocator)
+                  << "\n";
         auto remoteOpen = vc::render::openRemoteZarrPyramid(
             source, std::move(openOptions));
         const auto& opened = remoteOpen.opened;

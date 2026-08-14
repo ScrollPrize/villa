@@ -1122,19 +1122,28 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
             // Keep overlay tile bursts bounded to one queued UI notification too.
             if (notificationQueued->exchange(true, std::memory_order_acq_rel))
                 return;
-            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
+            if (!guard) {
+                notificationQueued->store(false, std::memory_order_release);
+                return;
+            }
+            const auto generation = guard->_overlayGeneration.load(
+                std::memory_order_acquire);
+            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued, generation]() {
                 const auto source = cacheWeak.lock();
-                if (!guard || !source || guard->_overlaySurfaceCache != source) {
+                if (!guard || !source || guard->_overlaySurfaceCache != source ||
+                    guard->_overlayOpacity <= 0.0f ||
+                    guard->_overlayGeneration.load(std::memory_order_acquire) != generation) {
                     notificationQueued->store(false, std::memory_order_release);
                     return;
                 }
                 QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
-                                   [guard, cacheWeak, notificationQueued]() {
+                                   [guard, cacheWeak, notificationQueued, generation]() {
                     notificationQueued->store(false, std::memory_order_release);
                     const auto source = cacheWeak.lock();
                     if (!guard || !source || guard->_overlaySurfaceCache != source)
                         return;
-                    if (guard->_closing)
+                    if (guard->_closing || guard->_overlayOpacity <= 0.0f ||
+                        guard->_overlayGeneration.load(std::memory_order_acquire) != generation)
                         return;
                     ++guard->_chunkContentEpoch;
                     guard->submitRender("surface tile batch ready");
@@ -2332,7 +2341,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 ctx.startLevel, prepassUMin, prepassVMin, double(ctx.scale),
                 ctx.fbW, ctx.fbH, ctx.renderJob.chunkRequest);
         }
-        if (ctx.overlaySurfaceCache) {
+        if (overlayActive && ctx.overlaySurfaceCache) {
             ctx.overlaySurfaceCache->requestView(
                 ctx.overlayStartLevel, prepassUMin, prepassVMin,
                 double(ctx.scale), ctx.fbW, ctx.fbH,
