@@ -275,6 +275,9 @@ class Config:
         self.sample_count_influence_anchor_geometry_points = 100000
         self.sample_count_influence_anchor_samples_per_step = 4096
         self.patch_strip_sampling = "straight"
+        # Exponent applied to patch areas when building patch sampling
+        # probabilities: 0 = uniform, 1 = proportional to area.
+        self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
         self.input_disable_patches = False
         self.patch_unverified_patch_radius_loss_margin = 0.025

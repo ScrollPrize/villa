@@ -939,7 +939,7 @@ class FitContext:
             patch_areas[patch_idx] = float(patch.area)
             progress.update(patch_idx + 1)
 
-        inv_weights = patch_areas ** 0.5
+        inv_weights = patch_areas ** self.config['patch_sampling_area_exponent']
         return inv_weights / inv_weights.sum()
 
     def _rebuild_pcl_sampling_strata(self):
@@ -2888,7 +2888,7 @@ class FitContext:
                 self.verified_patches_list.extend(new_patches.values())
                 areas = np.array([float(p.area) for p in self.verified_patches_list],
                                  dtype=np.float32)
-                inv_weights = areas ** 0.5
+                inv_weights = areas ** self.config['patch_sampling_area_exponent']
                 self.patch_sampling_probabilities = inv_weights / inv_weights.sum()
                 self.patch_atlas.append_patches(new_patches)
                 if self.config['dt_target_mode'] == 'whole_object_quantile':
