@@ -23,9 +23,14 @@ namespace vc::core::util {
         // metadata.volume: volume store the umbilicus was annotated on.
         // Provenance only.
         std::optional<std::string> volume;
-        // metadata.zarr_level: multiscale level within that store.
-        // Provenance only.
-        std::optional<int> zarrLevel;
+        // metadata.volume_width / volume_height / volume_slices: the x, y and z
+        // voxel counts of the grid the coordinates index. Exact-integer
+        // provenance: a consumer can check that its own grid has the same
+        // dimensions, or derive a rescale precisely from the dimension ratios
+        // in cases where the µm sizes are rounded and therefore ambiguous.
+        std::optional<int> volumeWidth;
+        std::optional<int> volumeHeight;
+        std::optional<int> volumeSlices;
     };
 
     class Umbilicus {

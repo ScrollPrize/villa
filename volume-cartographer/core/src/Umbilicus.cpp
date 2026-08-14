@@ -345,12 +345,19 @@ UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
                     info.volume = value.get_string();
                 }
             }
-            if (metadata.contains("zarr_level")) {
-                const auto& value = metadata.at("zarr_level");
-                if (value.is_number_integer() && value.get_int() >= 0) {
-                    info.zarrLevel = value.get_int();
-                }
-            }
+            const auto readDimension =
+                [&metadata](const char* key, std::optional<int>& out) {
+                    if (!metadata.contains(key)) {
+                        return;
+                    }
+                    const auto& value = metadata.at(key);
+                    if (value.is_number_integer() && value.get_int() > 0) {
+                        out = value.get_int();
+                    }
+                };
+            readDimension("volume_width", info.volumeWidth);
+            readDimension("volume_height", info.volumeHeight);
+            readDimension("volume_slices", info.volumeSlices);
         }
     }
 
