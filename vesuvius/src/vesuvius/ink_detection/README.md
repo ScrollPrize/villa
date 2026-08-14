@@ -21,7 +21,7 @@ Each labeled segment is one directory holding its label zarrs beside its
 surface volume, for example:
 
 ```text
-/data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/
+/data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/
 ├── pherc0139-w016_inklabels.zarr
 ├── pherc0139-w016_supervision_mask.zarr
 ├── pherc0139-w016_validation_mask.zarr
@@ -48,9 +48,11 @@ configs/aligned21_fixed_scroll_prior.json
 ```
 
 The hybrid recipe uses a 17-of-21 Z window, robust-MAD normalization, a local
-3D stem feeding a 2D U-Net, and fixed per-batch scroll quotas. Replace its
-placeholder `out_dir` and `datasets` paths before training. The fixed-prior
-manifest describes all 29 representations and the 29/22/11/2 batch counts.
+3D stem feeding a 2D U-Net, and fixed per-batch scroll quotas. Its `datasets`
+block lists the full 29-representation corpus; replace the `/path/to/ink_9um`
+placeholder with a local copy of the ink_9um dataset and set `out_dir` before
+training. The fixed-prior manifest describes the same 29 representations and
+the 29/22/11/2 batch counts.
 
 ## Commands
 
@@ -60,7 +62,7 @@ Prepare a 2.399 µm surface volume as a 21-slice approximately 9.6 µm input:
 uv run --extra models python -m \
   vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input \
   /data/raw/pherc0139-w016.ome.zarr \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/surface-volume.zarr \
   --level 2
 ```
 
@@ -69,7 +71,7 @@ Convert edited label images into OME-Zarr pyramids:
 ```bash
 uv run --extra models python -m \
   vesuvius.ink_detection.preprocessing.create_label_zarrs \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices
 ```
 
 Curation commands use the same preprocessing module namespace:
@@ -108,7 +110,7 @@ Run flat inference:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/surface-volume.zarr \
   /data/ink_9um/checkpoints/hybrid-best.pth \
   /data/predictions/pherc0139-w016.tif
 ```
@@ -117,7 +119,7 @@ Run native inference:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
-  /data/ink_9um/labels/0139/native_9p362_level0/w035 \
+  /data/segments/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr
 ```

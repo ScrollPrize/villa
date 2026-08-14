@@ -26,29 +26,32 @@ stack.
 
 ## Data layout
 
-The published `ink_9um` label tree is scroll-first. A segment and its labels
-are colocated:
+The published `ink_9um` label tree holds one folder per source family, with
+every scroll's segments inside. A segment and its labels are colocated:
 
 ```text
 /data/ink_9um/
 ├── labels/
-│   ├── 0139/
-│   │   ├── public_2p4_level2_zmean4/
-│   │   │   └── pherc0139-w016/
-│   │   │       ├── pherc0139-w016_inklabels.zarr
-│   │   │       ├── pherc0139-w016_supervision_mask.zarr
-│   │   │       ├── pherc0139-w016_validation_mask.zarr
-│   │   │       └── surface-volume.zarr
-│   │   └── native_9p362_level0/
-│   │       └── w035/
-│   │           ├── w035_inklabels.zarr
-│   │           ├── w035_supervision_mask.zarr
-│   │           └── x.tif, y.tif, z.tif, volume_source.txt, meta.json
-│   └── phercparis4/
-│       └── public_2p4_level2_zmean4/
-│           └── phercparis4-w00/
+│   ├── aligned-scrollprizeorg-21slices/
+│   │   ├── pherc0139-w016/
+│   │   │   ├── pherc0139-w016_inklabels.zarr
+│   │   │   ├── pherc0139-w016_supervision_mask.zarr
+│   │   │   ├── pherc0139-w016_validation_mask.zarr
+│   │   │   └── surface-volume.zarr
+│   │   └── phercparis4-w00/
+│   └── native9-scrollprizeorg-21slices/
+│       └── w035/
+│           ├── w035_inklabels.zarr
+│           ├── w035_supervision_mask.zarr
+│           └── surface-volume.zarr
 └── checkpoints/
 ```
+
+The published folders hold labels only; each `surface-volume.zarr` is
+materialized beside them (natives as downloaded, aligned via the 9 µm
+preparer below). Native-3D training and inference read tifxyz segment
+directories (`x.tif`, `y.tif`, `z.tif`, `volume_source.txt`) instead of
+flat surface volumes.
 
 The code does not interpret `ink_9um`, scroll, or family directory names.
 `segments_path` and volume paths come from JSON, and labels are discovered next
@@ -104,17 +107,19 @@ src/vesuvius/ink_detection/configs/aligned21_hybrid_3d2d.json
 src/vesuvius/ink_detection/configs/aligned21_fixed_scroll_prior.json
 ```
 
-`aligned21_hybrid_3d2d.json` is a training recipe with placeholder paths. It
-uses a 17-of-21 jittered Z window, `robust_mad` normalization, the
+`aligned21_hybrid_3d2d.json` is the released training recipe. It uses a
+17-of-21 jittered Z window, `robust_mad` normalization, the
 `vesuvius_unet_3d_stem_2d` model, smoothed BCE plus Dice, and a fixed batch
-prior. Its example dataset follows the scroll-first path
-`ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/`.
+prior. Its `datasets` block lists the full released corpus under the
+placeholder root `/path/to/ink_9um`, following the published layout
+`ink_9um/labels/aligned-scrollprizeorg-21slices/<segment>/`; replace the
+root and set `out_dir` before training.
 
 `aligned21_fixed_scroll_prior.json` is the corpus manifest: 29
 representations across four scroll identifiers, with per-batch counts
 `0139=29`, `1667=22`, `Paris4=11`, and `0814=2`. These counts sum to the
-shipped batch size of 64. Copy the relevant representation rows into dataset
-entries rather than treating the manifest itself as a training config.
+shipped batch size of 64. It is the readable contract behind the recipe's
+`datasets` block, not itself a training config.
 Its `schema_version`, `description`, `strategy`, `seed`, `batch_size`, and
 `target_batch_counts` fields describe the sampling recipe. Each item in
 `representations` supplies `source_family`, `segment`, `scroll`,
@@ -132,7 +137,7 @@ and mean-pool every four planes to 21 slices:
 uv run --extra models python -m \
   vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input \
   /data/raw/pherc0139-w016.ome.zarr \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/surface-volume.zarr \
   --level 2 \
   --workers 8
 ```
@@ -158,7 +163,7 @@ After editing label TIFFs or PNGs, convert them beside their segment:
 ```bash
 uv run --extra models python -m \
   vesuvius.ink_detection.preprocessing.create_label_zarrs \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4 \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices \
   --workers 4
 ```
 
@@ -392,7 +397,7 @@ Run one surface volume:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer \
-  /data/ink_9um/labels/0139/public_2p4_level2_zmean4/pherc0139-w016/surface-volume.zarr \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/surface-volume.zarr \
   /data/ink_9um/checkpoints/hybrid-best.pth \
   /data/predictions/pherc0139-w016.tif \
   --batch-size 4 \
@@ -403,7 +408,7 @@ Run every resolvable segment below a folder:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer \
-  --folder /data/ink_9um/labels/0139/public_2p4_level2_zmean4 \
+  --folder /data/ink_9um/labels/aligned-scrollprizeorg-21slices \
   --checkpoint-path /data/ink_9um/checkpoints/hybrid-best.pth \
   --output-prefix aligned21 \
   --direction both
@@ -457,7 +462,7 @@ Inspect the occupied-chunk plan without creating output:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
-  /data/ink_9um/labels/0139/native_9p362_level0/w035 \
+  /data/segments/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr \
   --plan-only
@@ -467,7 +472,7 @@ Run inference with eight mirror variants and a bounded volume cache:
 
 ```bash
 uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
-  /data/ink_9um/labels/0139/native_9p362_level0/w035 \
+  /data/segments/w035 \
   /data/ink_9um/checkpoints/native-best.pth \
   /data/predictions/w035.ome.zarr \
   --tta \

@@ -24,9 +24,9 @@ def _load_config(name: str) -> dict:
 
 def test_aligned21_hybrid_recipe_parses_with_frozen_values_and_layout():
     authored = _load_config("aligned21_hybrid_3d2d.json")
+    prior = _load_config("aligned21_fixed_scroll_prior.json")
 
     training = TrainingConfig.from_mapping(resolve_training_mapping(authored))
-    source = authored["datasets"][0]
 
     assert training.ink.model.model_type == "vesuvius_unet_3d_stem_2d"
     assert training.ink.model.pretrained_backbone is None
@@ -45,19 +45,79 @@ def test_aligned21_hybrid_recipe_parses_with_frozen_values_and_layout():
         "Paris4": 11,
         "0814": 2,
     }
-    assert source["segments_path"] == (
-        "/path/to/ink_9um/labels/0139/public_2p4_level2_zmean4"
-    )
-    assert source["surface_volume_paths"]["pherc0139-w016"] == (
-        "/path/to/ink_9um/labels/0139/public_2p4_level2_zmean4/"
-        "pherc0139-w016/surface-volume.zarr"
-    )
-    assert source["sampling_scroll"] == "0139"
-    assert source["sampling_physical_segment_keys"] == {
-        "pherc0139-w016": "0139:w016"
+
+    sources = authored["datasets"]
+    aligned = "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices"
+    native = "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices"
+    assert [source["segments_path"] for source in sources] == [
+        aligned,
+        native,
+        aligned,
+        aligned,
+        aligned,
+    ]
+    assert [source["segments"] for source in sources] == [
+        [
+            "pherc0139-w016",
+            "pherc0139-w017",
+            "pherc0139-w028",
+            "pherc0139-w029",
+            "pherc0139-w035",
+            "pherc0139-w039",
+            "pherc0139-w040",
+            "pherc0139-w041",
+            "pherc0139-w043",
+        ],
+        ["w035", "w039", "w040", "w041", "w044"],
+        ["pherc0814-46527"],
+        [
+            "pherc1667-w013",
+            "pherc1667-w018",
+            "pherc1667-w023",
+            "pherc1667-w028",
+            "pherc1667-w029",
+            "pherc1667-w031",
+        ],
+        [
+            "phercparis4-w00",
+            "phercparis4-w01",
+            "phercparis4-w02",
+            "phercparis4-w03",
+            "phercparis4-w05",
+            "phercparis4-w06",
+            "phercparis4-w07",
+            "phercparis4-w09",
+        ],
+    ]
+    families = {aligned: "public_2p4_level2_zmean4", native: "native_9p362_level0"}
+    for source in sources:
+        family = families[source["segments_path"]]
+        assert source["volume_scale"] == 0
+        for segment in source["segments"]:
+            assert source["surface_volume_paths"][segment] == (
+                f"{source['segments_path']}/{segment}/surface-volume.zarr"
+            )
+            assert source["sampling_representation_keys"][segment] == (
+                f"{family}:{segment}"
+            )
+    authored_representations = {
+        (
+            segment,
+            source["sampling_scroll"],
+            source["sampling_physical_segment_keys"][segment],
+            source["sampling_representation_keys"][segment],
+        )
+        for source in sources
+        for segment in source["segments"]
     }
-    assert source["sampling_representation_keys"] == {
-        "pherc0139-w016": "public_2p4_level2_zmean4:pherc0139-w016"
+    assert authored_representations == {
+        (
+            item["segment"],
+            item["scroll"],
+            item["physical_segment_key"],
+            item["representation_key"],
+        )
+        for item in prior["representations"]
     }
 
 
