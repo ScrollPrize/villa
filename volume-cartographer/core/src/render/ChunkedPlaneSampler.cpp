@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <stdexcept>
@@ -108,10 +110,23 @@ constexpr int kMaxCornerBatchWorkers = 64;
 
 int renderSamplerWorkerCount()
 {
-    const unsigned hc = std::thread::hardware_concurrency();
-    if (hc <= 2)
-        return 1;
-    return std::clamp(static_cast<int>(hc) - 2, 1, kMaxRenderSamplerWorkers);
+    static const int workerCount = [] {
+        const unsigned hc = std::thread::hardware_concurrency();
+        const int automatic = hc <= 2 ? 1 : std::clamp(static_cast<int>(hc) - 2, 1, kMaxRenderSamplerWorkers);
+
+        const char* configured = std::getenv("VC_RENDER_SAMPLER_THREADS");
+        if (!configured || configured[0] == '\0')
+            return automatic;
+
+        int parsed = 0;
+        const char* end = configured + std::char_traits<char>::length(configured);
+        const auto result = std::from_chars(configured, end, parsed);
+        if (result.ec != std::errc{} || result.ptr != end || parsed < 1 || parsed > kMaxRenderSamplerWorkers) {
+            throw std::runtime_error("VC_RENDER_SAMPLER_THREADS must be an integer from 1 to " + std::to_string(kMaxRenderSamplerWorkers));
+        }
+        return parsed;
+    }();
+    return workerCount;
 }
 
 utils::ThreadPool& renderSamplerPool()

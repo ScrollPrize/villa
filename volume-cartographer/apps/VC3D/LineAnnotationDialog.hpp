@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QElapsedTimer>
 #include <QList>
 #include <QMetaObject>
 #include <QPointer>
@@ -32,13 +33,11 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QProgressBar;
-class QPushButton;
 class QCloseEvent;
 class QHBoxLayout;
 class QMenu;
 class QResizeEvent;
 class QTimer;
-class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -93,6 +92,8 @@ public:
         QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
         QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
         QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
+        QGraphicsPathItem* ghostControlPointPrev = nullptr;
+        QGraphicsPathItem* ghostControlPointNext = nullptr;
     };
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
@@ -238,6 +239,10 @@ signals:
 protected:
     void closeEvent(QCloseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    void keyReleaseEvent(QKeyEvent* event) override;
+    void changeEvent(QEvent* event) override;
+    bool event(QEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -270,8 +275,41 @@ private:
     // per event. Discrete callers (keyboard jumps, clicks, scroll) keep calling
     // setCurrentLinePosition directly for immediate response.
     void requestCurrentLinePosition(double position);
-    void setCurrentLinePosition(double position, bool updateCurrentCutOverlay = true);
+    // forceApply bypasses the sub-1e-3 no-op shortcut so a keyboard-pan landing
+    // moves the cut planes onto the exact control-point position.
+    void setCurrentLinePosition(double position,
+                                bool updateCurrentCutOverlay = true,
+                                bool forceApply = false);
     void cancelControlPointPreviewAnimation();
+    // Left/Right arrow panning between control points. One velocity integrator
+    // (generatedArrowPanStep) drives it: a tap brakes into the first control
+    // point ahead, a hold cruises through the intermediate ones and lands on the
+    // next one after the key comes up, and the opposite arrow reverses mid-pan.
+    void startArrowPan(int direction);
+    // Control-point line positions plus (when there is room) one boundary
+    // target beyond each outer control point: Max CP distance or the
+    // extrapolated line end, whichever is shorter.
+    std::vector<double> arrowPanTargetPositions() const;
+    void releaseArrowPanKey(int direction);
+    void updateArrowPanStopTarget();
+    // Re-validates the pan against an edited control-point set: re-promises
+    // the minimum target if the edit removed it, then re-selects the stop
+    // target. Cancels when nothing remains in the travel direction.
+    void rebaseArrowPanTargets();
+    // Cancels the pan and clears the physical key flags when focus leaves the
+    // window/app (the key-up is delivered elsewhere; don't render unattended).
+    void stopArrowPanForFocusLoss();
+    void tickArrowPan();
+    void finishArrowPan(double position);
+    void cancelArrowPan();
+    // Up/Down: scale the cruise speed (persisted) and flash the badge.
+    void adjustArrowPanCruiseSpeed(double factor);
+    void updateArrowPanSpeedIndicator();
+    // Keeps the current-position line centered in the strips while the keyboard
+    // pan scrolls them underneath it. Vertical only on the initial snap. Takes
+    // the position explicitly so each tick can move the camera BEFORE the
+    // overlay rebuild bakes it into the drawn line position.
+    void centerStripsOnLinePosition(double linePosition, bool includeVertical);
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
@@ -284,6 +322,11 @@ private:
                                                 const char* renderReason);
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
+    // "B": zero every accumulated normal offset — the side cut plane's and
+    // both strips' surface offsets. The current cut cannot accumulate one
+    // (Shift-scroll steps along the line there) but is reset with the side
+    // cut for symmetry.
+    void resetGeneratedNormalOffsets();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
     cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
@@ -333,6 +376,7 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
+    bool handleKeyRelease(QKeyEvent* event);
     // Pushes line length, control dots, and the current-position marker to the
     // schematic overview bar.
     void updateOverviewBar();
@@ -361,7 +405,6 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
-    QToolButton* _datasetMenuButton = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
     std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
@@ -374,6 +417,10 @@ private:
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _extrapolationDistanceSpin = nullptr;
+    // Values committed via the menu rows' Apply buttons; the spinboxes hold
+    // uncommitted edits until then (and revert when the menu reopens).
+    int _appliedInitialCenterlineLengthVx = 0;
+    int _appliedExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
@@ -381,7 +428,7 @@ private:
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
-    QPushButton* _resetViewsButton = nullptr;
+    QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
@@ -434,6 +481,10 @@ private:
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
+    // Sign applied to the displayed line tangent so the current cut's screen
+    // left/right and the side cut's vertical do not depend on the arbitrary
+    // stored point order. Recomputed once per materialization.
+    float _displayTangentSign = 1.0f;
     bool _hasGeneratedViews = false;
     // Coalescing of the mouse-follow line-position updates onto a ~render-tick cadence.
     // requestCurrentLinePosition() stashes the latest position here and (re)arms the timer;
@@ -449,6 +500,12 @@ private:
     double _currentCutNormalOffsetVx = 0.0;
     double _sideCutNormalOffsetVx = 0.0;
     bool _generatedOverlayRefreshQueued = false;
+    // Generation-based deduplication of the coalesced overlay refresh: every
+    // overlaysUpdated bumps the generation; a landing's full rebuild records
+    // the generation it covered, and the queued callback skips only when no
+    // newer update arrived in between.
+    uint64_t _generatedOverlayRefreshGeneration = 0;
+    uint64_t _generatedOverlayRefreshCoveredGeneration = 0;
     bool _syncingStripCameras = false;
     std::vector<QPointer<CChunkedVolumeViewer>> _linkedCursorPanes;
     QPointer<CChunkedVolumeViewer> _linkedCursorSource;
@@ -459,6 +516,29 @@ private:
     QTimer* _linkedCursorMirrorTimer = nullptr;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    // Arrow-key pan integrator. _arrowPanDirection is the travel direction and
+    // stays set while a released tap coasts into its target; _arrowPanKeyHeld
+    // only tracks the key. _arrowPanMinimumTarget is the first control point the
+    // gesture promised at press time (NaN when idle), so a hold can never land
+    // short of what the same tap would have reached.
+    int _arrowPanDirection = 0;
+    bool _arrowPanKeyHeld = false;
+    // Physical key state of the two horizontal arrows, so releasing a reversal
+    // key can hand the pan back to the key that is still held down.
+    bool _arrowKeyLeftDown = false;
+    bool _arrowKeyRightDown = false;
+    // Distinguishes a pan that ended by landing from one that was cancelled
+    // (space, edits): only a landed pan may hand back to a still-held key.
+    bool _arrowPanEndedByLanding = false;
+    double _arrowPanVelocity = 0.0;
+    std::optional<double> _arrowPanStopTarget;
+    double _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    double _arrowPanCruiseSpeed =
+        vc3d::line_annotation::kGeneratedArrowPanDefaultSpeed;
+    QTimer* _arrowPanTimer = nullptr;
+    QElapsedTimer _arrowPanClock;
+    QPointer<QLabel> _arrowPanSpeedLabel;
+    QTimer* _arrowPanSpeedLabelTimer = nullptr;
     bool _restoredWindowGeometry = false;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;

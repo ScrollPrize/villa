@@ -8,6 +8,9 @@ The repo contains multiple subprojects with different languages, runtimes, and c
 2. Follow the **Monorepo-wide rules** below.
 3. Then apply the matching **Subproject playbook** (e.g., `volume-cartographer/`, `vesuvius/`) only if the prompt targets it.
 
+
+**If you are working on a PR or issue for this repository, refer to CONTRIBUTING.md for guidelines**  
+
 ---
 
 ## 1) Monorepo-wide rules

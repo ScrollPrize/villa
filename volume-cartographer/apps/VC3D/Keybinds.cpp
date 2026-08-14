@@ -18,6 +18,11 @@ constexpr const char* kSectionPushPull = "Push/Pull";
 constexpr const char* kSectionPointCollection = "Point Collection";
 constexpr const char* kSectionMouseControls = "Mouse Controls";
 constexpr const char* kSectionSliceStep = "Z-Scroll Sensitivity";
+// The line annotation workspace owns its panes' keyboard handling, so these
+// keys shadow the global bindings above while that workspace has focus. They
+// are listed as literals because the dialog binds them directly rather than
+// through the ShortcutDef/KeyPressDef registry.
+constexpr const char* kSectionLineAnnotation = "Line Annotation Workspace (overrides global keys)";
 
 enum class HelpKeyType {
     Shortcut,
@@ -561,6 +566,18 @@ QString buildKeybindsHelpText()
 
         { kSectionSliceStep, keypress::SliceStepDecrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepDecrease, nullptr },
         { kSectionSliceStep, keypress::SliceStepIncrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepIncrease, nullptr },
+
+        { kSectionLineAnnotation, "Rotate the current cut about the horizontal axis", HelpKeyType::Literal, nullptr, nullptr, "W / S" },
+        { kSectionLineAnnotation, "Rotate the current cut about the vertical axis", HelpKeyType::Literal, nullptr, nullptr, "A / D" },
+        { kSectionLineAnnotation, "Jump to the previous control point", HelpKeyType::Literal, nullptr, nullptr, "E" },
+        { kSectionLineAnnotation, "Jump to the next control point", HelpKeyType::Literal, nullptr, nullptr, "T" },
+        { kSectionLineAnnotation, "Pan to the previous/next control point (hold to cruise through)", HelpKeyType::Literal, nullptr, nullptr, "Left / Right" },
+        { kSectionLineAnnotation, "Adjust the arrow-pan cruise speed", HelpKeyType::Literal, nullptr, nullptr, "Up / Down" },
+        { kSectionLineAnnotation, "Snap the panes to the overview-bar cursor", HelpKeyType::Literal, nullptr, nullptr, "R" },
+        { kSectionLineAnnotation, "Reset the side cut and strip normal offsets", HelpKeyType::Literal, nullptr, nullptr, "B" },
+        { kSectionLineAnnotation, "Toggle the current cut following the strip mouse", HelpKeyType::Literal, nullptr, nullptr, "Space" },
+        { kSectionLineAnnotation, "Close the workspace", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
+        { kSectionLineAnnotation, "Step along the line (current cut) or the normal offset (side cut, strips)", HelpKeyType::Literal, nullptr, nullptr, "Shift+Scroll Wheel" },
     };
 
     QString result;

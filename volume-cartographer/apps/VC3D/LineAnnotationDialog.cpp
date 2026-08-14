@@ -10,7 +10,9 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QAbstractItemView>
+#include <QAbstractSpinBox>
 #include <QAction>
+#include <QApplication>
 #include <QBrush>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -25,15 +27,16 @@
 #include <QGraphicsRectItem>
 #include <QGraphicsSimpleTextItem>
 #include <QInputDialog>
+#include <QHideEvent>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPainterPath>
 #include <QPen>
 #include <QProgressBar>
-#include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
 #include <QSignalBlocker>
@@ -41,7 +44,9 @@
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
+#include <QPushButton>
 #include <QSpinBox>
+#include <QWidgetAction>
 #include <QVariant>
 #include <QTimer>
 #include <QToolButton>
@@ -55,6 +60,7 @@
 #include <limits>
 #include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -68,6 +74,35 @@ constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
 constexpr double kNormalOffsetEpsilon = 1.0e-6;
+// Slide range of the current-cut parallax ghost markers, in line-position units
+// (one unit is one index step in the generated line points, not one voxel). A
+// control point further away than this parks at the full offset.
+constexpr double kGeneratedGhostSlideRangeLinePositions = 8.0;
+// Full-offset distance of a ghost from its true landing spot, as a fraction of
+// the visible scene width of the current cut viewer.
+constexpr double kGeneratedGhostMaxOffsetViewportFraction = 0.35;
+constexpr qreal kGeneratedGhostRadius = 8.0;
+// Ghosts only show while the control point is within this multiple of the
+// solid-marker window (lineRadius), so distant ones don't linger on screen.
+constexpr double kGeneratedGhostVisibilityRadiusMultiplier = 10.0;
+// Arrow-pan integrator tick (~60 Hz) and the dt cap that keeps a stalled event
+// loop from teleporting the current position.
+constexpr int kArrowPanTickMs = 16;
+constexpr double kArrowPanMaximumStepSeconds = 0.1;
+constexpr int kArrowPanSpeedIndicatorHideMs = 1200;
+
+// Native Up/Down (and text editing) must keep working in the toolbar widgets,
+// so the arrow handling stands down while one of them has the keyboard.
+bool keyboardFocusIsTextEntry()
+{
+    QWidget* focus = QApplication::focusWidget();
+    // QAbstractItemView covers a combo box's open popup, which takes focus and
+    // navigates with Up/Down itself.
+    return qobject_cast<QAbstractSpinBox*>(focus) != nullptr ||
+           qobject_cast<QLineEdit*>(focus) != nullptr ||
+           qobject_cast<QComboBox*>(focus) != nullptr ||
+           qobject_cast<QAbstractItemView*>(focus) != nullptr;
+}
 
 bool normalOffsetActive(double offsetVx)
 {
@@ -509,7 +544,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // the main window's.
     auto* annotationMenuButton = new QToolButton(buttonRow);
     annotationMenuButton->setObjectName(QStringLiteral("lineAnnotationMenuButton"));
-    annotationMenuButton->setText(tr("Annotation"));
+    // Classic hamburger glyph; the arrow-style menu indicator would be
+    // redundant next to it.
+    annotationMenuButton->setText(QStringLiteral("☰"));
+    annotationMenuButton->setToolTip(tr("Menu"));
+    annotationMenuButton->setStyleSheet(
+        QStringLiteral("QToolButton::menu-indicator { image: none; }"));
     annotationMenuButton->setPopupMode(QToolButton::InstantPopup);
     annotationMenuButton->installEventFilter(this);
     auto* annotationMenu = new QMenu(annotationMenuButton);
@@ -535,8 +575,126 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_showAsMeshAction, &QAction::triggered, this, [this]() {
         emit showAsMeshRequested();
     });
+    annotationMenu->addSeparator();
+    _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
+    _lasagnaDatasetMenu->setToolTipsVisible(true);
+    _lasagnaDatasetMenu->menuAction()->setToolTip(
+        tr("Select the Lasagna dataset used for line annotation."));
+    _fiberInferenceDatasetMenu = annotationMenu->addMenu(tr("Fiber dataset"));
+    _fiberInferenceDatasetMenu->setToolTipsVisible(true);
+    _fiberInferenceDatasetMenu->menuAction()->setToolTip(
+        tr("Select the fiber inference dataset used for line annotation."));
+    annotationMenu->addSeparator();
+    // Length / Extrapolation live in the menu as embedded label+spinbox rows
+    // (QWidgetAction); editing them does not close the menu. Spinbox edits are
+    // uncommitted until the row's Apply button: the getters return the applied
+    // values, and reopening the menu reverts any abandoned edit.
+    const auto addSpinBoxMenuRow = [annotationMenu](const QString& label,
+                                                    QSpinBox* spin) -> QPushButton* {
+        auto* row = new QWidget(annotationMenu);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(28, 3, 12, 3);
+        rowLayout->setSpacing(8);
+        rowLayout->addWidget(new QLabel(label, row));
+        rowLayout->addStretch(1);
+        spin->setParent(row);
+        rowLayout->addWidget(spin);
+        auto* apply = new QPushButton(QObject::tr("Apply"), row);
+        apply->setEnabled(false);
+        rowLayout->addWidget(apply);
+        auto* action = new QWidgetAction(annotationMenu);
+        action->setDefaultWidget(row);
+        annotationMenu->addAction(action);
+        return apply;
+    };
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _appliedInitialCenterlineLengthVx =
+            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
+                .toInt();
+        _appliedExtrapolationDistanceVx =
+            settings.value(
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
+                .toInt();
+    }
+    _initialCenterlineLengthSpin = new QSpinBox;
+    _initialCenterlineLengthSpin->setObjectName(
+        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
+    _initialCenterlineLengthSpin->setRange(100, 1000000);
+    _initialCenterlineLengthSpin->setSingleStep(100);
+    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
+    _initialCenterlineLengthSpin->setToolTip(
+        tr("Total length of a newly generated centerline, split equally around the seed."));
+    _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
+    // Read back rather than trusting the setting: a stale or hand-edited value
+    // outside the spinbox range would otherwise reach the optimizer unclamped
+    // while the row displayed the clamped one.
+    _appliedInitialCenterlineLengthVx = _initialCenterlineLengthSpin->value();
+    auto* lengthApply = addSpinBoxMenuRow(tr("Length"), _initialCenterlineLengthSpin);
+    connect(_initialCenterlineLengthSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this, lengthApply](int value) {
+                lengthApply->setEnabled(value != _appliedInitialCenterlineLengthVx);
+            });
+    connect(lengthApply, &QPushButton::clicked, this, [this, lengthApply]() {
+        _appliedInitialCenterlineLengthVx = _initialCenterlineLengthSpin->value();
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                          _appliedInitialCenterlineLengthVx);
+        lengthApply->setEnabled(false);
+    });
+    _extrapolationDistanceSpin = new QSpinBox;
+    _extrapolationDistanceSpin->setObjectName(
+        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
+    _extrapolationDistanceSpin->setRange(0, 1000000);
+    _extrapolationDistanceSpin->setSingleStep(100);
+    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
+    _extrapolationDistanceSpin->setToolTip(
+        tr("Distance generated beyond each outer control point."));
+    _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+    _appliedExtrapolationDistanceVx = _extrapolationDistanceSpin->value();
+    auto* extrapolationApply =
+        addSpinBoxMenuRow(tr("Extrapolation"), _extrapolationDistanceSpin);
+    connect(_extrapolationDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this, extrapolationApply](int value) {
+                extrapolationApply->setEnabled(value != _appliedExtrapolationDistanceVx);
+            });
+    connect(extrapolationApply, &QPushButton::clicked, this, [this, extrapolationApply]() {
+        _appliedExtrapolationDistanceVx = _extrapolationDistanceSpin->value();
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                          _appliedExtrapolationDistanceVx);
+        extrapolationApply->setEnabled(false);
+        emit extrapolationDistanceChanged(_appliedExtrapolationDistanceVx);
+    });
+    // Reopening the menu discards uncommitted edits (setValue back to the
+    // applied values also re-disables the Apply buttons via valueChanged).
+    connect(annotationMenu, &QMenu::aboutToShow, this, [this, lengthApply, extrapolationApply]() {
+        _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
+        _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+        lengthApply->setEnabled(false);
+        extrapolationApply->setEnabled(false);
+    });
+    annotationMenu->addSeparator();
+    _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
+    _resetViewsAction->setEnabled(false);
+    connect(_resetViewsAction, &QAction::triggered, this, [this]() {
+        resetGeneratedViews();
+    });
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
+
+    if (volumeSelectorFactory) {
+        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
+            volumeSelector->installEventFilter(this);
+            buttonLayout->addWidget(volumeSelector);
+        }
+    }
 
     _fiberOptimizationCombo = new QComboBox(buttonRow);
     _fiberOptimizationCombo->setObjectName(
@@ -556,78 +714,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 emit fiberOptimizationModeChanged(fiberOptimizationMode());
             });
 
-    _datasetMenuButton = new QToolButton(buttonRow);
-    _datasetMenuButton->setObjectName(QStringLiteral("lineAnnotationDatasetMenuButton"));
-    _datasetMenuButton->setText(tr("Datasets"));
-    _datasetMenuButton->setPopupMode(QToolButton::InstantPopup);
-    _datasetMenuButton->setToolTip(tr("Select the Lasagna and fiber inference datasets used for line annotation."));
-    _datasetMenuButton->installEventFilter(this);
-    auto* datasetMenu = new QMenu(_datasetMenuButton);
-    datasetMenu->setToolTipsVisible(true);
-    _lasagnaDatasetMenu = datasetMenu->addMenu(tr("Lasagna dataset"));
-    _fiberInferenceDatasetMenu = datasetMenu->addMenu(tr("Fiber dataset"));
-    _datasetMenuButton->setMenu(datasetMenu);
-    buttonLayout->addWidget(_datasetMenuButton);
     rebuildDatasetMenus();
 
-    auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
-    centerlineLengthLabel->installEventFilter(this);
-    buttonLayout->addWidget(centerlineLengthLabel);
-    _initialCenterlineLengthSpin = new QSpinBox(buttonRow);
-    _initialCenterlineLengthSpin->setObjectName(
-        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
-    _initialCenterlineLengthSpin->setRange(100, 1000000);
-    _initialCenterlineLengthSpin->setSingleStep(100);
-    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
-    _initialCenterlineLengthSpin->setToolTip(
-        tr("Total length of a newly generated centerline, split equally around the seed."));
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        _initialCenterlineLengthSpin->setValue(
-            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
-                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
-                .toInt());
-    }
-    _initialCenterlineLengthSpin->installEventFilter(this);
-    buttonLayout->addWidget(_initialCenterlineLengthSpin);
-    connect(_initialCenterlineLengthSpin,
-            qOverload<int>(&QSpinBox::valueChanged),
-            this,
-            [](int value) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(
-                    vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
-            });
-    _extrapolationDistanceSpin = new QSpinBox(buttonRow);
-    _extrapolationDistanceSpin->setObjectName(
-        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
-    _extrapolationDistanceSpin->setRange(0, 1000000);
-    _extrapolationDistanceSpin->setSingleStep(100);
-    _extrapolationDistanceSpin->setKeyboardTracking(false);
-    _extrapolationDistanceSpin->setPrefix(tr("Extrapolation "));
-    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
-    _extrapolationDistanceSpin->setToolTip(
-        tr("Distance generated beyond each outer control point."));
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        _extrapolationDistanceSpin->setValue(
-            settings.value(
-                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
-                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
-                .toInt());
-    }
-    _extrapolationDistanceSpin->installEventFilter(this);
-    buttonLayout->addWidget(_extrapolationDistanceSpin);
-    connect(_extrapolationDistanceSpin,
-            qOverload<int>(&QSpinBox::valueChanged),
-            this,
-            [this](int value) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                settings.setValue(
-                    vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
-                    value);
-                emit extrapolationDistanceChanged(value);
-            });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
     buttonLayout->addWidget(maxDistanceLabel);
@@ -653,14 +741,35 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(vc3d::settings::line_annotation::MAX_CONTROL_POINT_DISTANCE_VX,
                                   value);
+                // The allowance also positions the keyboard pan's synthetic
+                // boundary targets; rebase a running pan onto the new ones.
+                rebaseArrowPanTargets();
                 updateGeneratedDynamicOverlaysFast(false, false);
             });
-    if (volumeSelectorFactory) {
-        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
-            volumeSelector->installEventFilter(this);
-            buttonLayout->addWidget(volumeSelector);
-        }
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const double savedArrowPanSpeed =
+            settings.value(vc3d::settings::line_annotation::ARROW_PAN_SPEED,
+                           vc3d::settings::line_annotation::ARROW_PAN_SPEED_DEFAULT)
+                .toDouble();
+        _arrowPanCruiseSpeed =
+            (std::isfinite(savedArrowPanSpeed) && savedArrowPanSpeed > 0.0)
+                ? std::clamp(savedArrowPanSpeed,
+                             vc3d::line_annotation::kGeneratedArrowPanMinimumSpeed,
+                             vc3d::line_annotation::kGeneratedArrowPanMaximumSpeed)
+                : vc3d::line_annotation::kGeneratedArrowPanDefaultSpeed;
     }
+    // Belt and braces for focus loss: ActivationChange delivery varies by
+    // window manager, so the application-state signal (which fires whenever the
+    // whole app loses focus, e.g. Alt-Tab to another program) backs it up.
+    connect(qGuiApp,
+            &QGuiApplication::applicationStateChanged,
+            this,
+            [this](Qt::ApplicationState state) {
+                if (state != Qt::ApplicationActive) {
+                    stopArrowPanForFocusLoss();
+                }
+            });
     auto* tagsLabel = new QLabel(tr("Tags:"), buttonRow);
     tagsLabel->installEventFilter(this);
     buttonLayout->addWidget(tagsLabel);
@@ -690,15 +799,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setMinimumWidth(0);
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
-    _resetViewsButton = new QPushButton(tr("Reset views"), buttonRow);
-    _resetViewsButton->setEnabled(false);
-    _resetViewsButton->installEventFilter(this);
-    buttonLayout->addWidget(_resetViewsButton);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
-    connect(_resetViewsButton, &QPushButton::clicked, this, [this]() {
-        resetGeneratedViews();
-    });
     installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
@@ -732,16 +834,12 @@ LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMod
 
 int LineAnnotationDialog::initialCenterlineLengthVx() const
 {
-    return _initialCenterlineLengthSpin
-        ? _initialCenterlineLengthSpin->value()
-        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+    return _appliedInitialCenterlineLengthVx;
 }
 
 int LineAnnotationDialog::extrapolationDistanceVx() const
 {
-    return _extrapolationDistanceSpin
-        ? _extrapolationDistanceSpin->value()
-        : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
+    return _appliedExtrapolationDistanceVx;
 }
 
 vc3d::line_annotation::FiberOptimizationMode
@@ -825,10 +923,6 @@ void LineAnnotationDialog::rebuildDatasetMenus()
                  _fiberInferenceDatasetOptions,
                  _selectedFiberInferenceDatasetLocation,
                  true);
-    if (_datasetMenuButton) {
-        _datasetMenuButton->setEnabled(
-            !_lasagnaDatasetOptions.empty() || !_fiberInferenceDatasetOptions.empty());
-    }
 }
 
 int LineAnnotationDialog::maxControlPointDistanceVx() const
@@ -847,6 +941,10 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
+    // Rebase (not cancel) a running keyboard pan onto the new control-point
+    // set: a deleted target is re-selected from what remains, while benign
+    // refreshes leave the pan running.
+    rebaseArrowPanTargets();
     rebuildGeneratedOverlays();
 }
 
@@ -891,6 +989,10 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
+    // Same rebase as setGeneratedControlPoints: this setter also delivers
+    // asynchronous refreshes (span metrics), so cancelling here would kill
+    // healthy pans; re-selecting the targets handles deleted ones.
+    rebaseArrowPanTargets();
     rebuildGeneratedOverlays(requestSideStripIntersections);
 }
 
@@ -1057,10 +1159,6 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     const QString disabledToolTip =
         tr("Tags become editable once the fiber has been saved.");
     for (const auto& tag : knownTags) {
-        if (tag == vc3d::line_annotation::kTraceNeedsReviewTag) {
-            // Managed by the trace review workflow, not the generic pills.
-            continue;
-        }
         const QString tagText = QString::fromStdString(tag);
         const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
                             activeTags.end();
@@ -1119,6 +1217,7 @@ void LineAnnotationDialog::closeEvent(QCloseEvent* event)
         _closing = true;
         clearGeneratedOverlayRefreshConnections();
         cancelControlPointPreviewAnimation();
+        cancelArrowPan();
         if (_lineUpdateTimer) {
             _lineUpdateTimer->stop();
         }
@@ -1186,11 +1285,12 @@ bool LineAnnotationDialog::setGeneratedRows(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     clearGeneratedOverlayRefreshConnections();
+    cancelArrowPan();
     // Drop all viewer references BEFORE deleting the widgets: destruction
     // delivers events through our eventFilter, which must not dereference a
     // half-destroyed viewer (QPointers only clear once ~QObject runs).
@@ -1302,7 +1402,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
     }
     _generatedOverlayRefreshConnections.push_back(
         viewer->connectOverlaysUpdated(this, [this]() {
-            if (_closing || _generatedOverlayRefreshQueued) {
+            if (_closing) {
+                return;
+            }
+            // Every update bumps the generation, including ones coalesced into
+            // an already-queued callback, so a landing pass can record exactly
+            // which updates its full rebuild covered.
+            ++_generatedOverlayRefreshGeneration;
+            if (_generatedOverlayRefreshQueued) {
                 return;
             }
             _generatedOverlayRefreshQueued = true;
@@ -1311,6 +1418,25 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 _generatedOverlayRefreshQueued = false;
+                if (_generatedOverlayRefreshGeneration ==
+                    _generatedOverlayRefreshCoveredGeneration) {
+                    // A landing's rebuildGeneratedOverlays(true) already
+                    // covered every update this callback was queued for
+                    // (including the intersection request whose preparation is
+                    // the expensive part). Updates arriving after the landing
+                    // rebuild bump the generation, so they are never skipped.
+                    return;
+                }
+                if (_arrowPanDirection != 0) {
+                    // During a keyboard pan every tick already rebuilds the
+                    // dynamic overlays (via setCurrentLinePosition), so only
+                    // the static strip overlays need to track the scrolling
+                    // camera here. The side-strip intersection request (which
+                    // clones geometry and snapshots+hashes every fiber per
+                    // call) waits for the landing's full refresh.
+                    rebuildGeneratedStaticStripOverlays();
+                    return;
+                }
                 rebuildGeneratedOverlays();
             });
         }));
@@ -1389,6 +1515,8 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
     _linkedCursorSource.clear();
     _pendingLinkedCursorPoint.reset();
     _generatedOverlayRefreshQueued = false;
+    _generatedOverlayRefreshGeneration = 0;
+    _generatedOverlayRefreshCoveredGeneration = 0;
 }
 
 void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
@@ -1438,6 +1566,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _generatedViews.sideCutName == views.sideCutName &&
         _generatedViews.lineSurfaceName == views.lineSurfaceName &&
         _generatedViews.lineSideSliceName == views.lineSideSliceName) {
+        // The re-optimized views renumber line positions, so an in-flight
+        // keyboard pan's velocity and targets refer to the old line: stop it.
+        cancelArrowPan();
         // Snapshot the on-screen view data: each pane keeps drawing its overlays
         // from this until it adopts a rendered frame of the re-optimized
         // surfaces (hooks below), so overlays and image update together.
@@ -1450,6 +1581,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
+        _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
+            _generatedViews.linePoints,
+            _generatedViews.lineNormals);
         _generatedControlIndex =
             vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
                 _generatedViews.controlPoints);
@@ -1576,8 +1710,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         if (_fullOptimizationAction) {
             _fullOptimizationAction->setEnabled(true);
         }
-        if (_resetViewsButton) {
-            _resetViewsButton->setEnabled(true);
+        if (_resetViewsAction) {
+            _resetViewsAction->setEnabled(true);
         }
         return true;
     }
@@ -1588,8 +1722,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_fullOptimizationAction) {
         _fullOptimizationAction->setEnabled(false);
     }
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(false);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(false);
     }
 
     const bool replacingGeneratedViews = _hasGeneratedViews;
@@ -1628,6 +1762,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     clearGeneratedOverlayRefreshConnections();
+    cancelArrowPan();
     // Drop all viewer references BEFORE deleting the widgets: destroying a
     // viewer synchronously delivers events (ChildRemoved/Hide/...) through our
     // eventFilter, which must not dereference a half-destroyed viewer via
@@ -1659,6 +1794,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
+    _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
+        _generatedViews.linePoints,
+        _generatedViews.lineNormals);
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -1736,6 +1874,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
                 if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                    // Unlike a plain click this leaves follow untouched, so it
+                    // must stop a keyboard pan itself.
+                    cancelArrowPan();
                     emit generatedPredSnapPointRequested(_generatedViews.currentCutName,
                                                          volumePoint);
                 } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
@@ -1793,6 +1934,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
                 if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                    // Unlike a plain click this leaves follow untouched, so it
+                    // must stop a keyboard pan itself.
+                    cancelArrowPan();
                     emit generatedPredSnapPointRequested(_generatedViews.sideCutName,
                                                          volumePoint);
                 } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
@@ -1968,8 +2112,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _fullOptimizationAction->setEnabled(true);
     }
     captureInitialGeneratedViewState();
-    if (_resetViewsButton) {
-        _resetViewsButton->setEnabled(true);
+    if (_resetViewsAction) {
+        _resetViewsAction->setEnabled(true);
     }
     return true;
 }
@@ -2202,7 +2346,8 @@ void LineAnnotationDialog::requestCurrentLinePosition(double position)
 }
 
 void LineAnnotationDialog::setCurrentLinePosition(double position,
-                                                  bool updateCurrentCutOverlay)
+                                                  bool updateCurrentCutOverlay,
+                                                  bool forceApply)
 {
     // An immediate apply supersedes any coalesced mouse-follow update still pending in the timer,
     // so a discrete jump/click/scroll isn't clobbered by a stale flush a few ms later.
@@ -2214,7 +2359,8 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         return;
     }
     position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
-    const bool currentChanged = std::abs(position - _currentLinePosition) >= 1.0e-3;
+    const bool currentChanged =
+        forceApply || std::abs(position - _currentLinePosition) >= 1.0e-3;
     if (!currentChanged) {
         return;
     }
@@ -2260,6 +2406,9 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
         return true;
     }
+    // The scroll supersedes a running keyboard pan: stepping past its stop
+    // target would otherwise make the next tick snap the position backward.
+    cancelArrowPan();
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
@@ -2287,12 +2436,352 @@ void LineAnnotationDialog::cancelControlPointPreviewAnimation()
     animation->deleteLater();
 }
 
+void LineAnnotationDialog::startArrowPan(int direction)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || direction == 0) {
+        return;
+    }
+    // Any new press invalidates the previous gesture's landing, even when this
+    // press finds no target below: otherwise a stale landing flag paired with
+    // a physical flag whose release a popup swallowed could hand the pan to a
+    // key that is no longer held.
+    _arrowPanEndedByLanding = false;
+    if (_arrowPanDirection == direction) {
+        // Same direction while already panning: nothing to recompute, just make
+        // sure a coasting tap turns back into a hold.
+        if (!_arrowPanKeyHeld) {
+            _arrowPanKeyHeld = true;
+            updateArrowPanStopTarget();
+        }
+        return;
+    }
+
+    const auto positions = arrowPanTargetPositions();
+    // The gesture's floor: the first control point in the new direction from
+    // here. A reversal recomputes it from the position at reversal.
+    const auto firstAhead = (direction > 0)
+        ? vc3d::line_annotation::nextGeneratedControlPointLinePosition(_currentLinePosition,
+                                                                      positions)
+        : vc3d::line_annotation::previousGeneratedControlPointLinePosition(_currentLinePosition,
+                                                                          positions);
+    if (!firstAhead) {
+        // Nothing that way: a fresh press does nothing, a reversal just stops.
+        if (_arrowPanDirection != 0) {
+            cancelArrowPan();
+        }
+        return;
+    }
+
+    cancelControlPointPreviewAnimation();
+    setCurrentCutFollowsStripMouse(false);
+    const bool wasIdle = (_arrowPanDirection == 0);
+    _arrowPanDirection = direction;
+    _arrowPanKeyHeld = true;
+    _arrowPanMinimumTarget = *firstAhead;
+    if (wasIdle) {
+        _arrowPanVelocity = 0.0;
+        // Lock the strips onto the current-position line for the whole pan.
+        centerStripsOnLinePosition(_currentLinePosition, true);
+    }
+    updateArrowPanStopTarget();
+    if (!_arrowPanStopTarget) {
+        return;
+    }
+
+    if (!_arrowPanTimer) {
+        _arrowPanTimer = new QTimer(this);
+        _arrowPanTimer->setInterval(kArrowPanTickMs);
+        connect(_arrowPanTimer, &QTimer::timeout, this, &LineAnnotationDialog::tickArrowPan);
+    }
+    _arrowPanClock.start();
+    if (!_arrowPanTimer->isActive()) {
+        _arrowPanTimer->start();
+    }
+}
+
+std::vector<double> LineAnnotationDialog::arrowPanTargetPositions() const
+{
+    auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
+        _generatedViews.controlPoints);
+    if (positions.empty() || _generatedViews.linePoints.empty()) {
+        return positions;
+    }
+    // Beyond the outer control points the pan gets one more hop, out to where
+    // a control point could still be placed: the Max CP distance allowance
+    // (same line-position interpretation as the current-line marker state,
+    // <= 0 = unlimited) clamped to the line end, i.e. the extrapolation limit
+    // - whichever is shorter.
+    const double maxDistance = static_cast<double>(maxControlPointDistanceVx());
+    const double lastPosition =
+        static_cast<double>(_generatedViews.linePoints.size() - 1);
+    if (const auto left = vc3d::line_annotation::generatedArrowPanBoundaryTarget(
+            positions, -1, 0.0, maxDistance)) {
+        positions.insert(positions.begin(), *left);
+    }
+    if (const auto right = vc3d::line_annotation::generatedArrowPanBoundaryTarget(
+            positions, 1, lastPosition, maxDistance)) {
+        positions.push_back(*right);
+    }
+    return positions;
+}
+
+void LineAnnotationDialog::releaseArrowPanKey(int direction)
+{
+    // Ignore the release of the key that a reversal already superseded.
+    if (_arrowPanDirection == 0 || _arrowPanDirection != direction || !_arrowPanKeyHeld) {
+        return;
+    }
+    _arrowPanKeyHeld = false;
+    updateArrowPanStopTarget();
+}
+
+void LineAnnotationDialog::updateArrowPanStopTarget()
+{
+    if (_arrowPanDirection == 0) {
+        _arrowPanStopTarget.reset();
+        return;
+    }
+    const auto positions = arrowPanTargetPositions();
+    double minimumTarget = _arrowPanMinimumTarget;
+    if (_arrowPanKeyHeld && !positions.empty()) {
+        // Held: cruise straight through the intermediate control points by
+        // aiming at the far end, so the only braking is into the last target.
+        minimumTarget = (_arrowPanDirection > 0) ? positions.back() : positions.front();
+    }
+    _arrowPanStopTarget = vc3d::line_annotation::generatedArrowPanStopTarget(
+        positions,
+        _currentLinePosition,
+        _arrowPanDirection,
+        minimumTarget);
+    if (!_arrowPanStopTarget) {
+        cancelArrowPan();
+        return;
+    }
+    if (static_cast<double>(_arrowPanDirection) *
+            (*_arrowPanStopTarget - _currentLinePosition) < 0.0) {
+        // Only a stale fallback (a mid-pan edit shrank the target set behind
+        // us) can place the target against the travel; landing there would
+        // teleport backward, so stop in place instead.
+        cancelArrowPan();
+    }
+}
+
+void LineAnnotationDialog::rebaseArrowPanTargets()
+{
+    if (_arrowPanDirection == 0) {
+        return;
+    }
+    const auto positions = arrowPanTargetPositions();
+    // The minimum target is the press-time promise; when an edit removed it
+    // (or moved the boundary), re-promise from the current position so the
+    // selector's fallback can never resurrect a deleted position.
+    const bool minimumStillExists = std::any_of(
+        positions.begin(), positions.end(), [this](double position) {
+            return std::abs(position - _arrowPanMinimumTarget) <= 1.0e-9;
+        });
+    if (!minimumStillExists) {
+        const auto firstAhead = (_arrowPanDirection > 0)
+            ? vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+                  _currentLinePosition, positions)
+            : vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+                  _currentLinePosition, positions);
+        if (!firstAhead) {
+            cancelArrowPan();
+            return;
+        }
+        _arrowPanMinimumTarget = *firstAhead;
+    }
+    updateArrowPanStopTarget();
+}
+
+void LineAnnotationDialog::tickArrowPan()
+{
+    if (_closing || _arrowPanDirection == 0 || !_hasGeneratedViews ||
+        _generatedViews.linePoints.empty()) {
+        cancelArrowPan();
+        return;
+    }
+    if (_arrowPanKeyHeld && QApplication::activePopupWidget()) {
+        // A popup (hamburger or context menu, combo dropdown) grabs the
+        // keyboard, so the key-up will never reach us; treat the grab as the
+        // release so the hold cannot strand.
+        _arrowKeyLeftDown = false;
+        _arrowKeyRightDown = false;
+        releaseArrowPanKey(_arrowPanDirection);
+        if (_arrowPanDirection == 0) {
+            return;
+        }
+    }
+    const double dtSeconds = std::min(kArrowPanMaximumStepSeconds,
+                                      static_cast<double>(_arrowPanClock.nsecsElapsed()) * 1.0e-9);
+    _arrowPanClock.restart();
+    if (dtSeconds <= 0.0) {
+        return;
+    }
+    const double acceleration =
+        _arrowPanCruiseSpeed / vc3d::line_annotation::kGeneratedArrowPanRampSeconds;
+    const auto step = vc3d::line_annotation::generatedArrowPanStep(_currentLinePosition,
+                                                                   _arrowPanVelocity,
+                                                                   _arrowPanDirection,
+                                                                   _arrowPanCruiseSpeed,
+                                                                   acceleration,
+                                                                   dtSeconds,
+                                                                   _arrowPanStopTarget);
+    _arrowPanVelocity = step.velocity;
+    const double maxPosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
+    const double position = std::clamp(step.position, 0.0, maxPosition);
+    const bool hitLineEnd = (position != step.position);
+    if (step.landed) {
+        finishArrowPan(position);
+        return;
+    }
+    if (hitLineEnd) {
+        // Only stop at the line end while the travel still points out of it. A
+        // reversal pressed near the end is still shedding outward velocity, so
+        // pin the position to the edge and keep integrating until the velocity
+        // crosses zero and carries it back inside.
+        const bool reversingBackInside =
+            (step.position > maxPosition && _arrowPanDirection < 0) ||
+            (step.position < 0.0 && _arrowPanDirection > 0);
+        if (!reversingBackInside) {
+            finishArrowPan(position);
+            return;
+        }
+    }
+    // Camera first, overlays second: the strip overlays bake the camera into
+    // their scene coordinates (surfaceCoordsToScene subtracts surfacePtrX), so
+    // recentering after the rebuild would draw the current-position line one
+    // tick off-center and let the coalesced overlaysUpdated refresh redraw it
+    // centered right after - a ~60 Hz flicker that reads as two green lines.
+    centerStripsOnLinePosition(position, false);
+    setCurrentLinePosition(position, false);
+}
+
+void LineAnnotationDialog::finishArrowPan(double position)
+{
+    cancelArrowPan();
+    centerStripsOnLinePosition(position, false);
+    // Force the apply: the final residual is often below the setter's 1e-3
+    // no-op threshold, and the cut planes must land on the exact target too.
+    setCurrentLinePosition(position, false, /*forceApply=*/true);
+    // One full-quality pass at the landing: statics, dynamics (with the
+    // current-cut overlay and span labels), and the side-strip intersection
+    // refresh the pan ticks deferred.
+    rebuildGeneratedOverlays(true);
+    // The camera apply above queued the coalesced refresh callback; this pass
+    // just did that work, so record the covered generation and let the
+    // callback skip its (otherwise redundant) full rebuild. Any update after
+    // this line bumps the generation and the callback runs normally.
+    _generatedOverlayRefreshCoveredGeneration = _generatedOverlayRefreshGeneration;
+    _arrowPanEndedByLanding = true;
+}
+
+void LineAnnotationDialog::cancelArrowPan()
+{
+    if (_arrowPanTimer) {
+        _arrowPanTimer->stop();
+    }
+    _arrowPanDirection = 0;
+    _arrowPanKeyHeld = false;
+    _arrowPanVelocity = 0.0;
+    _arrowPanStopTarget.reset();
+    _arrowPanMinimumTarget = std::numeric_limits<double>::quiet_NaN();
+    _arrowPanEndedByLanding = false;
+}
+
+void LineAnnotationDialog::adjustArrowPanCruiseSpeed(double factor)
+{
+    if (!std::isfinite(factor) || factor <= 0.0) {
+        return;
+    }
+    const double updated = std::clamp(_arrowPanCruiseSpeed * factor,
+                                      vc3d::line_annotation::kGeneratedArrowPanMinimumSpeed,
+                                      vc3d::line_annotation::kGeneratedArrowPanMaximumSpeed);
+    if (updated != _arrowPanCruiseSpeed) {
+        _arrowPanCruiseSpeed = updated;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::ARROW_PAN_SPEED, updated);
+    }
+    // Flash the badge even when the value clamped, so the key press is answered.
+    updateArrowPanSpeedIndicator();
+    if (_arrowPanSpeedLabel) {
+        _arrowPanSpeedLabel->show();
+        _arrowPanSpeedLabel->raise();
+    }
+    if (!_arrowPanSpeedLabelTimer) {
+        _arrowPanSpeedLabelTimer = new QTimer(this);
+        _arrowPanSpeedLabelTimer->setSingleShot(true);
+        connect(_arrowPanSpeedLabelTimer, &QTimer::timeout, this, [this]() {
+            if (_arrowPanSpeedLabel) {
+                _arrowPanSpeedLabel->hide();
+            }
+        });
+    }
+    _arrowPanSpeedLabelTimer->start(kArrowPanSpeedIndicatorHideMs);
+}
+
+void LineAnnotationDialog::updateArrowPanSpeedIndicator()
+{
+    CChunkedVolumeViewer* topStrip =
+        _stripViewers.empty() ? nullptr : _stripViewers.front().data();
+    if (!topStrip) {
+        if (_arrowPanSpeedLabel) {
+            _arrowPanSpeedLabel->hide();
+        }
+        return;
+    }
+    if (!_arrowPanSpeedLabel || _arrowPanSpeedLabel->parentWidget() != topStrip) {
+        delete _arrowPanSpeedLabel;
+        auto* label = new QLabel(topStrip);
+        label->setObjectName(QStringLiteral("lineAnnotationArrowPanSpeedLabel"));
+        label->setAttribute(Qt::WA_TransparentForMouseEvents);
+        label->setStyleSheet(QStringLiteral(
+            "QLabel { color: rgb(0, 245, 255); background-color: rgba(20, 20, 20, 160); "
+            "border-radius: 4px; padding: 2px 8px; font-weight: bold; }"));
+        label->hide();
+        _arrowPanSpeedLabel = label;
+    }
+    _arrowPanSpeedLabel->setText(
+        tr("pan speed %1 /s").arg(QString::number(_arrowPanCruiseSpeed, 'g', 3)));
+    _arrowPanSpeedLabel->adjustSize();
+    // Top-center of the top strip; the pause badge sits on the bottom strip.
+    _arrowPanSpeedLabel->move(
+        std::max(0, (topStrip->width() - _arrowPanSpeedLabel->width()) / 2),
+        10);
+}
+
+void LineAnnotationDialog::centerStripsOnLinePosition(double linePosition, bool includeVertical)
+{
+    for (const auto& stripViewer : _stripViewers) {
+        if (!stripViewer) {
+            continue;
+        }
+        if (const auto center = generatedStripSurfaceCenter(stripViewer, linePosition)) {
+            CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
+            camera.surfacePtrX = (*center)[0];
+            if (includeVertical) {
+                camera.surfacePtrY = (*center)[1];
+            }
+            stripViewer->applyCameraState(camera, false);
+        }
+        if (!includeVertical) {
+            // Per-tick X recentering only touches the first strip: the linked
+            // camera echo (syncLinkedStripCamera) already copies surfacePtrX to
+            // the other strip synchronously, so applying it here too did the
+            // same update twice per tick. The initial snap (includeVertical)
+            // still visits every strip because Y is per-strip, not linked.
+            break;
+        }
+    }
+}
+
 void LineAnnotationDialog::jumpToPreviousControlPoint()
 {
     if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
         return;
     }
     cancelControlPointPreviewAnimation();
+    cancelArrowPan();
     const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
         _generatedViews.controlPoints);
     const auto previous = vc3d::line_annotation::previousGeneratedControlPointLinePosition(
@@ -2309,6 +2798,7 @@ void LineAnnotationDialog::jumpToNextControlPoint()
         return;
     }
     cancelControlPointPreviewAnimation();
+    cancelArrowPan();
     const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
         _generatedViews.controlPoints);
     const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
@@ -2325,6 +2815,7 @@ void LineAnnotationDialog::previewClosestControlPoint()
         return;
     }
     cancelControlPointPreviewAnimation();
+    cancelArrowPan();
     const double originalPosition = _currentLinePosition;
     const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
         _generatedViews.controlPoints);
@@ -2478,6 +2969,23 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
     }
 }
 
+void LineAnnotationDialog::resetGeneratedNormalOffsets()
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    resetGeneratedCutNormalOffsets(true);
+    for (const auto& strip : _stripViewers) {
+        if (!strip) {
+            continue;
+        }
+        const float offset = strip->normalOffset();
+        if (offset != 0.0f) {
+            strip->adjustSurfaceOffset(-offset);
+        }
+    }
+}
+
 void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
 {
     // Programmatic twin of the private toggle.
@@ -2488,7 +2996,19 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
     const bool wasFollowing = _currentCutFollowsStripMouse;
     _currentCutFollowsStripMouse = follows;
+    if (!follows) {
+        // A hover update queued in the last coalescing tick must not fire into
+        // a keyboard pan that pausing is about to start.
+        _lineUpdatePending = false;
+        if (_lineUpdateTimer) {
+            _lineUpdateTimer->stop();
+        }
+    }
     if (follows && !wasFollowing) {
+        // Un-pausing hands the current position back to the mouse, so it also
+        // ends a keyboard pan. Space and the strip/cut click handlers all reach
+        // the cancel through this one transition.
+        cancelArrowPan();
         resetGeneratedCutNormalOffsets(true);
     }
     updatePauseIndicator();
@@ -2636,6 +3156,7 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
     bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::snapPanesToOverviewCursor);
     bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
+    bindNavigationShortcut(Qt::Key_B, &LineAnnotationDialog::resetGeneratedNormalOffsets);
 
     auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
     spaceShortcut->setContext(Qt::WindowShortcut);
@@ -2727,6 +3248,9 @@ void LineAnnotationDialog::resetGeneratedViews()
         return;
     }
 
+    // Reset assigns position and follow state directly below, bypassing the
+    // setter that would otherwise stop a running keyboard pan.
+    cancelArrowPan();
     _currentLinePosition = std::clamp(_initialCurrentLinePosition,
                                       0.0,
                                       static_cast<double>(_generatedViews.linePoints.size() - 1));
@@ -3193,7 +3717,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
         !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
-        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
+        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors ||
+        !_fastCurrentCutOverlayItems.ghostControlPointPrev ||
+        !_fastCurrentCutOverlayItems.ghostControlPointNext) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
         _fastCurrentCutOverlayItems = {};
         _fastCurrentCutOverlayItems.viewer = viewer;
@@ -3316,6 +3842,21 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setZValue(164.0);
 
+        // Hollow dashed rings, deliberately unlike the solid control markers:
+        // they sit at a fictional, parallax-shifted spot until they land.
+        QPen ghostControlPen(QColor(255, 230, 0));
+        ghostControlPen.setWidthF(1.5);
+        ghostControlPen.setStyle(Qt::DashLine);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setPen(ghostControlPen);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.ghostControlPointPrev->setZValue(155.0);
+
+        _fastCurrentCutOverlayItems.ghostControlPointNext = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setPen(ghostControlPen);
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.ghostControlPointNext->setZValue(155.0);
+
         viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
                                 {_fastCurrentCutOverlayItems.centerPoint,
                                  _fastCurrentCutOverlayItems.controlPoints,
@@ -3330,7 +3871,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
                                  _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
                                  _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
-                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
+                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors,
+                                 _fastCurrentCutOverlayItems.ghostControlPointPrev,
+                                 _fastCurrentCutOverlayItems.ghostControlPointNext});
     }
 
     // During an in-place update, draw from the held pre-update views until this
@@ -3426,6 +3969,59 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
         sameHvPendingBranchControlPath);
+
+    // Parallax ghosts: the nearest control point behind and ahead of the cursor
+    // within the visibility distance slide in horizontally from the side they
+    // will arrive from and land on the solid marker as their delta hits 0.
+    double ghostMaxSceneOffset = 0.0;
+    if (auto* ghostView = viewer->graphicsView()) {
+        if (auto* ghostViewport = ghostView->viewport();
+            ghostViewport && ghostViewport->width() > 0 && ghostViewport->height() > 0) {
+            const QRect ghostViewportRect = ghostViewport->rect();
+            const QPointF leftScene = ghostView->mapToScene(ghostViewportRect.topLeft());
+            const QPointF rightScene = ghostView->mapToScene(ghostViewportRect.topRight());
+            if (std::isfinite(leftScene.x()) && std::isfinite(rightScene.x())) {
+                ghostMaxSceneOffset = std::abs(rightScene.x() - leftScene.x()) *
+                                      kGeneratedGhostMaxOffsetViewportFraction;
+            }
+        }
+    }
+
+    const auto ghostPathForDirection = [&](int direction) {
+        QPainterPath ghostPath;
+        const auto ghost = vc3d::line_annotation::generatedParallaxGhost(
+            cutViews.controlPoints,
+            cutIndex,
+            cutPosition,
+            direction,
+            kGeneratedGhostSlideRangeLinePositions,
+            kGeneratedGhostVisibilityRadiusMultiplier * lineRadius);
+        if (!ghost || ghost->controlIndex >= cutViews.controlPoints.size()) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        const auto& control = cutViews.controlPoints[ghost->controlIndex];
+        if (!finitePoint(control.point)) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        const QPointF landingScenePoint = viewer->volumeToScene(control.point);
+        if (!std::isfinite(landingScenePoint.x()) || !std::isfinite(landingScenePoint.y())) {
+            return std::make_pair(ghostPath, 0.0);
+        }
+        // Higher line position is to the right in the strips; keep that sense here.
+        const QPointF ghostScenePoint(
+            landingScenePoint.x() + ghost->offsetFraction * ghostMaxSceneOffset,
+            landingScenePoint.y());
+        ghostPath.addEllipse(ghostScenePoint, kGeneratedGhostRadius, kGeneratedGhostRadius);
+        return std::make_pair(ghostPath, ghost->opacity);
+    };
+
+    const auto [nextGhostPath, nextGhostOpacity] = ghostPathForDirection(1);
+    _fastCurrentCutOverlayItems.ghostControlPointNext->setPath(nextGhostPath);
+    _fastCurrentCutOverlayItems.ghostControlPointNext->setOpacity(nextGhostOpacity);
+
+    const auto [prevGhostPath, prevGhostOpacity] = ghostPathForDirection(-1);
+    _fastCurrentCutOverlayItems.ghostControlPointPrev->setPath(prevGhostPath);
+    _fastCurrentCutOverlayItems.ghostControlPointPrev->setOpacity(prevGhostOpacity);
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
@@ -3532,7 +4128,10 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineTangent(double linePosition) con
                 std::numeric_limits<float>::quiet_NaN(),
                 std::numeric_limits<float>::quiet_NaN()};
     }
-    return normalizedOrNan(tangent);
+    // One sign for the whole fiber (see generatedDisplayTangentSign): the cut
+    // planes are posed from this tangent, so the displayed left/right must not
+    // follow the stored point order.
+    return normalizedOrNan(tangent) * _displayTangentSign;
 }
 
 cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const
@@ -3724,6 +4323,52 @@ void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
     QMainWindow::keyPressEvent(event);
 }
 
+void LineAnnotationDialog::keyReleaseEvent(QKeyEvent* event)
+{
+    if (handleKeyRelease(event)) {
+        return;
+    }
+    QMainWindow::keyReleaseEvent(event);
+}
+
+void LineAnnotationDialog::changeEvent(QEvent* event)
+{
+    QMainWindow::changeEvent(event);
+    if (event && event->type() == QEvent::ActivationChange && !isActiveWindow()) {
+        stopArrowPanForFocusLoss();
+    }
+}
+
+bool LineAnnotationDialog::event(QEvent* event)
+{
+    if (event && event->type() == QEvent::WindowDeactivate) {
+        stopArrowPanForFocusLoss();
+    }
+    return QMainWindow::event(event);
+}
+
+void LineAnnotationDialog::stopArrowPanForFocusLoss()
+{
+    // The key-up goes to whichever window took focus (Alt-Tab mid-hold), and
+    // an inactive window must not keep rendering a pan at all: braking into
+    // the next target can mean minutes of four-pane rendering at low speeds
+    // with sparse control points. Cancel outright, like hideEvent.
+    _arrowKeyLeftDown = false;
+    _arrowKeyRightDown = false;
+    cancelArrowPan();
+}
+
+void LineAnnotationDialog::hideEvent(QHideEvent* event)
+{
+    QMainWindow::hideEvent(event);
+    // Hiding the workspace in place (an embedding tab switch) fires no
+    // activation change, and the key-up then goes elsewhere; a pan running in
+    // a hidden view is pure waste, so stop it outright.
+    _arrowKeyLeftDown = false;
+    _arrowKeyRightDown = false;
+    cancelArrowPan();
+}
+
 void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
@@ -3752,6 +4397,47 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
         event->accept();
         return true;
     }
+    if (event->key() == Qt::Key_B && event->modifiers() == Qt::NoModifier &&
+        !event->isAutoRepeat()) {
+        resetGeneratedNormalOffsets();
+        event->accept();
+        return true;
+    }
+    // Arrows drive the control-point pan here; accepting all four also keeps the
+    // viewers' own 64 px arrow panning out of this dialog.
+    const bool arrowKey = event->key() == Qt::Key_Left || event->key() == Qt::Key_Right ||
+                          event->key() == Qt::Key_Up || event->key() == Qt::Key_Down;
+    if (arrowKey && _hasGeneratedViews && !keyboardFocusIsTextEntry()) {
+        if (event->modifiers() == Qt::NoModifier) {
+            switch (event->key()) {
+            case Qt::Key_Left:
+            case Qt::Key_Right:
+                // Auto-repeat is the keyboard's own hold; the integrator already has one.
+                if (!event->isAutoRepeat()) {
+                    (event->key() == Qt::Key_Left ? _arrowKeyLeftDown
+                                                  : _arrowKeyRightDown) = true;
+                    startArrowPan(event->key() == Qt::Key_Left ? -1 : 1);
+                }
+                event->accept();
+                return true;
+            case Qt::Key_Up:
+            case Qt::Key_Down:
+                adjustArrowPanCruiseSpeed(
+                    event->key() == Qt::Key_Up
+                        ? vc3d::line_annotation::kGeneratedArrowPanSpeedStep
+                        : 1.0 / vc3d::line_annotation::kGeneratedArrowPanSpeedStep);
+                event->accept();
+                return true;
+            default:
+                break;
+            }
+        } else if (_arrowPanDirection != 0) {
+            // A modifier picked up mid-gesture must not leak arrow repeats to
+            // the viewers' own panning while the keyboard pan owns the keys.
+            event->accept();
+            return true;
+        }
+    }
     if (_viewerManager &&
         event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
@@ -3773,6 +4459,46 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
     return false;
 }
 
+bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
+{
+    if (!event || !_hasGeneratedViews) {
+        return false;
+    }
+    if (event->key() != Qt::Key_Left && event->key() != Qt::Key_Right) {
+        return false;
+    }
+    const int direction = (event->key() == Qt::Key_Left) ? -1 : 1;
+    if (!event->isAutoRepeat()) {
+        (direction < 0 ? _arrowKeyLeftDown : _arrowKeyRightDown) = false;
+    }
+    // The release that ends an active hold must be honored even when focus
+    // moved into a text widget mid-gesture; otherwise the hold is stranded and
+    // the pan cruises on to the boundary.
+    const bool endsActiveHold = (_arrowPanDirection == direction) && _arrowPanKeyHeld;
+    if (!endsActiveHold && keyboardFocusIsTextEntry()) {
+        return false;
+    }
+    // Auto-repeat delivers a release before every repeated press; only the real
+    // key-up ends the hold. Modifiers are not checked here: a modifier picked up
+    // mid-gesture must not strand the pan in its held state.
+    if (!event->isAutoRepeat()) {
+        releaseArrowPanKey(direction);
+        // Hand the pan back to the other horizontal key if it is still held
+        // (hold Right, tap Left to peek back, keep holding Right). Only when
+        // this release ended a live hold or the pan finished by landing - a
+        // bare physical flag must not revive a pan that space or an edit
+        // already cancelled - and never while a text widget owns the keyboard.
+        const bool otherStillDown = (direction < 0) ? _arrowKeyRightDown : _arrowKeyLeftDown;
+        const bool panEndedNaturally = (_arrowPanDirection == 0) && _arrowPanEndedByLanding;
+        if ((endsActiveHold || panEndedNaturally) && otherStillDown &&
+            !keyboardFocusIsTextEntry()) {
+            startArrowPan(-direction);
+        }
+    }
+    event->accept();
+    return true;
+}
+
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
@@ -3787,9 +4513,22 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
         event->type() == QEvent::Resize) {
         updateOptimizationStatusIndicator();
     }
+    if (_arrowPanSpeedLabel && watched == _arrowPanSpeedLabel->parentWidget() &&
+        event->type() == QEvent::Resize) {
+        updateArrowPanSpeedIndicator();
+    }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (handleKeyPress(keyEvent)) {
+            return true;
+        }
+    }
+    // The dialog is the event filter on every pane widget (viewer, graphics
+    // view, viewport, splitters), so the key-up that ends an arrow hold arrives
+    // here whichever of them holds focus.
+    if (event->type() == QEvent::KeyRelease) {
+        auto* keyEvent = static_cast<QKeyEvent*>(event);
+        if (handleKeyRelease(keyEvent)) {
             return true;
         }
     }
@@ -3888,6 +4627,9 @@ void LineAnnotationDialog::snapPanesToOverviewCursor()
     if (!position) {
         return;
     }
+    // The snap supersedes a running keyboard pan; without the cancel the next
+    // tick would drag the position straight back toward the pan's old target.
+    cancelArrowPan();
     setCurrentLinePosition(*position);
     // Recenter the bottom strip on the snapped position (keeping its zoom), so the
     // current-position marker can't end up outside a zoomed-in viewport.

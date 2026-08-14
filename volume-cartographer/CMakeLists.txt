@@ -55,6 +55,8 @@ option(VC_ENABLE_TYSAN    "TypeSanitizer (clang-only, LLVM 18+)"         OFF)
 option(VC_ENABLE_NSAN     "NumericalStabilitySanitizer (clang-only, LLVM 19+)" OFF)
 option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
+option(VC_RUN_RENDER_BENCHMARKS
+       "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no

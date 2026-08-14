@@ -108,14 +108,15 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
 
     // Cache settings
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
-    spinSpiralSurfaceCacheGB->setValue(
-        settings.value(spiral::SURFACE_CACHE_GB, spiral::SURFACE_CACHE_GB_DEFAULT).toInt());
-    spinSpiralOverlaySurfaceCacheGB->setValue(
-        settings.value(spiral::OVERLAY_SURFACE_CACHE_GB,
-                       spiral::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
-    spinSpiralPlaneChunkCacheMB->setValue(
-        settings.value(spiral::PLANE_CHUNK_CACHE_MB,
-                       spiral::PLANE_CHUNK_CACHE_MB_DEFAULT).toInt());
+    spinViewerSurfaceCacheGB->setValue(
+        settings.value(viewer_cache::SURFACE_CACHE_GB,
+                       viewer_cache::SURFACE_CACHE_GB_DEFAULT).toInt());
+    spinViewerOverlaySurfaceCacheGB->setValue(
+        settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
+                       viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
+    spinViewerPlaneChunkCacheMB->setValue(
+        settings.value(viewer_cache::PLANE_CHUNK_CACHE_MB,
+                       viewer_cache::PLANE_CHUNK_CACHE_MB_DEFAULT).toInt());
     {
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
@@ -335,10 +336,11 @@ void SettingsDialog::accept()
 
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
-    settings.setValue(spiral::SURFACE_CACHE_GB, spinSpiralSurfaceCacheGB->value());
-    settings.setValue(spiral::OVERLAY_SURFACE_CACHE_GB,
-                      spinSpiralOverlaySurfaceCacheGB->value());
-    settings.setValue(spiral::PLANE_CHUNK_CACHE_MB, spinSpiralPlaneChunkCacheMB->value());
+    settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
+    settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
+                      spinViewerOverlaySurfaceCacheGB->value());
+    settings.setValue(viewer_cache::PLANE_CHUNK_CACHE_MB,
+                      spinViewerPlaneChunkCacheMB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
     settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
     settings.setValue(perf::REMOTE_CACHE_QUANTIZATION,

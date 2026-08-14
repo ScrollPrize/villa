@@ -49,41 +49,72 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
-The Annotation popup owns Auto-reoptimize, Reinit reoptimization, and Show as
-mesh. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
-base-voxel extrapolation-distance control. Tag pills are edited directly from
-the same toolbar.
+The current cut view draws its solid yellow control-point marker only while the
+control point is inside the cut plane's thin slab, so fast panning would
+otherwise skip past control points unseen. To keep them findable, the view also
+always draws two parallax ghosts: a hollow dashed yellow ring for the nearest
+control point behind the cursor and one for the nearest ahead. Each ghost sits
+at its true in-plane landing spot shifted horizontally toward the side it will
+arrive from: the ring for a control point ahead of the cursor (higher line
+position) sits to the right, matching the strips where line position runs left
+to right. The shift is proportional to the signed line-position delta over a
+fixed 8 line-position slide range and is clamped at 35% of the visible view
+width, and the ring brightens from a faint floor at or beyond that range to
+nearly opaque as the delta closes. Ghosts only appear while the control point
+is within ten times the solid-marker window (so they don't linger far from any
+control point), fading out over the outer quarter of that distance. Because the
+shift decays continuously to zero, the ghost converges on the solid marker as a
+landing ring instead of popping into place.
+
+The Left and Right arrow keys pan the current position between control points
+with a smooth velocity ramp. A tap accelerates, brakes, and lands exactly on
+the nearest control point in that direction; holding the key cruises straight
+through the intermediate points at a constant speed and, when it is released,
+decelerates onto the next control point ahead (never short of the one a tap
+would have reached). Beyond the outermost control point the pan continues one
+more hop, to the Max CP distance allowance or the end of the extrapolated
+line, whichever is shorter. Pressing the opposite arrow
+mid-pan decelerates through zero and reverses. Up and Down scale the cruising
+speed (default 12 line positions per second, roughly 360 voxels per second),
+which is shown in a transient badge and remembered between sessions. A Left or
+Right press pauses the mouse hover-follow exactly as the space bar does, so the
+❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow
+and cancels the pan. While the keyboard is panning, the strips stay centered
+on the current-position line and scroll underneath it.
+
+The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
+Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
+the initial centerline length and the base-voxel extrapolation distance, and
+Reset views. The toolbar retains the fiber-global Lasagna/Fiber model
+selector. Tag pills are edited directly from the same toolbar.
 
 Switching the fiber-global mode asks for confirmation before it re-optimizes,
 because the switch overwrites the current line: to Fiber model it re-traces
 every global-goal span with model predictions; back to Lasagna it re-fits them.
-Suppressed (agent-driven) sessions skip the prompt.
+Suppressed (agent-driven) sessions skip the prompt. Either direction also
+strips the `reviewed` tag on the save that follows the successful
+re-optimization, because the human verdict no longer covers the new geometry.
 
-Prediction-traced geometry carries a per-fiber review workflow on one
-reserved tag (mirrored in `scripts/fiber_merge.py`): `interp_unreviewed` is
-applied automatically whenever a save contains freshly-optimized geometry
-with accepted trace spans; a traced fiber WITHOUT the tag counts as
-reviewed. A human marks the whole fiber reviewed from the fiber panel's
-context menu (Mark trace verified removes the tag; Mark as needs review
-re-adds it) after inspecting the line. Any later optimization that
-re-traces spans re-applies the tag; re-fitting the whole line without
-traces clears it. Because absence of the tag IS the review verdict, the
-tag is managed only by the review actions: the generic tag pills and
-checkboxes never offer it, and `setFiberTag` rejects it. Sync preserves
-the semantics the same way — `merge_fibers` re-adds `interp_unreviewed`
-whenever the merged result still contains trace spans but its geometry
-matches no side that lacked the tag (a review verdict covers only the
-exact geometry the reviewer saw). The fiber panel's `interp` column shows
-the interpolation provenance per fiber — `legacy` (no trace spans),
-`predictions` (trace spans, native mode), or `mixed` (trace spans under a
-lasagna-global fiber); the review state itself is visible as the ordinary
-tags. Span child rows show the stored producer marker `C`/`L`/`T`.
-Predictions provenance is the per-span `segment_to_next.fiber_manifest`
-written at trace acceptance (the selected fiber-inference manifest
-identity); the panel surfaces it as a tooltip on the `interp` cells, and
-`fiber.list` over the agent bridge exposes the same data as `traceState`,
-`traceNeedsReview`, `traceVerified` (derived: traced and unflagged), and
-per-span `interpMode` plus `fiberManifest`.
+Review state is the ordinary free-form `reviewed` tag — there is no
+specialized review mechanism. It is set and cleared through the generic tag
+UI like any other tag: the fiber panel's tag checkboxes and the Line
+Annotation toolbar's tag pills, where `reviewed` is pinned first and always
+offered even in a volpkg where no fiber carries it yet. The only
+programmatic change is the mode-switch strip described above; ordinary
+control-point edits, merges, and splits never touch it, and
+`scripts/fiber_merge.py` treats it as a plain tag under the usual
+three-way tag merge. `scripts/vc_sync.py hfsync` publishes gated on it
+(`reviewed` is its default `--tag`), so the tag doubles as the publish gate.
+
+The fiber panel's `interp` column shows the interpolation provenance per
+fiber — `legacy` (no trace spans), `predictions` (trace spans, native mode),
+or `mixed` (trace spans under a lasagna-global fiber); the review state
+itself is visible as an ordinary tag. Span child rows show the stored
+producer marker `C`/`L`/`T`. Predictions provenance is the per-span
+`segment_to_next.fiber_manifest` written at trace acceptance (the selected
+fiber-inference manifest identity); the panel surfaces it as a tooltip on
+the `interp` cells, and `fiber.list` over the agent bridge exposes the same
+data as `traceState` and per-span `interpMode` plus `fiberManifest`.
 
 
 Each direction continues until it reaches all target-local planes within the

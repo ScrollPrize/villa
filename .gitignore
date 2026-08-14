@@ -3,6 +3,7 @@
 **/.idea/*
 **/__pycache__/
 *.pyc
+*.so
 node_modules/.yarn-integrity
 **/*.egg-info*/
 
