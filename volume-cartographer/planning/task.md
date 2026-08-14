@@ -1,15 +1,24 @@
-# Task: remove obsolete interactive chunk-cache compatibility APIs
+# Task: make generated-view Zarr LOD use declared scale
 
-Remove the implicit `beginViewRequest()` frame-epoch model and other dead
-compatibility surfaces left by the retired per-workspace private decoded-cache
-architecture.
+Fix generated and parameterized VC3D views, especially line-annotation strips,
+selecting source Zarr levels from the same explicit, view-wide scale contract as
+plane views.
 
-- Keep explicit `(view ID, view version)` demand publication and cancellation
-  as the only interactive scheduling model.
-- Keep context-free chunk access as explicit background/batch work because it
-  is used by Python bindings, CLI tools, slicing, and blocking samplers.
-- Keep cache-wide scheduler group epochs used by `invalidate()`.
-- Remove dead VC3D cache-policy routing, refresh hooks, surface-view generation
-  plumbing, and private-pool footprint helpers.
-- Preserve rendering values, cache residency, background access, invalidation,
-  queue fairness, and active-view priority.
+- VC3D has exactly one rendering LOD: the source volume/Zarr pyramid level.
+- A render uses one constant scale from framebuffer pixels to level-0/base
+  volume voxels. It must not estimate or vary that scale from generated volume
+  coordinates.
+- Surface parameterization resolution is not an LOD. It only maps surface
+  parameter units to a `QuadSurface` point grid.
+- `PlaneSurface` parameter units remain one level-0/base volume voxel.
+- `QuadSurface` producers must declare their parameterization so one surface
+  parameter unit also represents one level-0/base volume voxel. A producer
+  without that information must fail rather than infer it for LOD selection.
+- Line ribbons must not rely on input points having known or uniform spacing.
+  They must arclength-resample to a uniform target spacing of 50 base voxels and
+  declare that along-strip spacing plus the exact cross-strip spacing in
+  `QuadSurface::scale()` instead of declaring `{1,1}` unconditionally.
+- The selected Zarr level must consistently drive demand publication, volume
+  sampling, coarse fallbacks, overlays, diagnostics, status, and derived
+  surface-cache fills.
+- Document the units and ownership of these concepts wherever they are used.
