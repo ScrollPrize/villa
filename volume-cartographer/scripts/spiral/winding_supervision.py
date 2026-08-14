@@ -49,7 +49,7 @@ def _load_array(root: Path, description: dict, *, verify: bool) -> np.ndarray:
 class WindingInferenceStore:
     """Flat ragged crossing rays copied once to the fitting device."""
 
-    def __init__(self, path, device, *, verify=True):
+    def __init__(self, path, device, *, verify=True, z_range=None):
         self.path = str(Path(path).resolve())
         root = Path(self.path)
         manifest_path = root / "manifest.json"
@@ -126,8 +126,27 @@ class WindingInferenceStore:
         self.crossing_level = torch.from_numpy(level_np.astype(
             np.int32, copy=False)).to(device)
         self.length = self.offset[1:] - self.offset[:-1]
+        # A pair is valid only when both crossings land in [z_begin, z_end).
+        # Crossings are stored in ascending t and z is linear in t, so a ray
+        # whose first/last-crossing z interval misses the slab can never yield
+        # a valid pair; drop it from the samplers instead of spending
+        # transform evaluations on pairs the loss mask will zero.
+        if z_range is not None and len(self.crossing_t):
+            z_begin, z_end = float(z_range[0]), float(z_range[1])
+            first_z = (self.origin[:, 0]
+                       + self.crossing_t[self.offset[:-1]] * self.step[:, 0])
+            last_z = (self.origin[:, 0]
+                      + self.crossing_t[(self.offset[1:] - 1).clamp(min=0)]
+                      * self.step[:, 0])
+            self._z_eligible = (
+                (torch.maximum(first_z, last_z) >= z_begin)
+                & (torch.minimum(first_z, last_z) < z_end))
+        else:
+            self._z_eligible = torch.ones(
+                len(self.length), dtype=torch.bool, device=device)
         self.density_rays = torch.nonzero(
-            self.length >= 2, as_tuple=False).squeeze(-1)
+            (self.length >= 2) & self._z_eligible,
+            as_tuple=False).squeeze(-1)
         self._relative_rays = {}
         self.manifest = manifest
         self.fingerprint = {
@@ -141,6 +160,10 @@ class WindingInferenceStore:
     @property
     def device(self):
         return self.origin.device
+
+    @property
+    def num_z_eligible_rays(self):
+        return int(self._z_eligible.sum().item())
 
     def _choose(self, values, count, *, generator=None):
         count = int(count)
@@ -169,7 +192,8 @@ class WindingInferenceStore:
         eligible = self._relative_rays.get(min_delta)
         if eligible is None:
             eligible = torch.nonzero(
-                self.length >= min_delta + 1, as_tuple=False).squeeze(-1)
+                (self.length >= min_delta + 1) & self._z_eligible,
+                as_tuple=False).squeeze(-1)
             self._relative_rays[min_delta] = eligible
         ray = self._choose(eligible, count, generator=generator)
         if not len(ray):
@@ -204,8 +228,8 @@ class WindingInferenceStore:
         }
 
 
-def load_winding_inference_store(path, device, *, verify=True):
-    return WindingInferenceStore(path, device, verify=verify)
+def load_winding_inference_store(path, device, *, verify=True, z_range=None):
+    return WindingInferenceStore(path, device, verify=verify, z_range=z_range)
 
 
 def _component_residual(
@@ -213,6 +237,10 @@ def _component_residual(
 ):
     theta, _radius, shifted = get_theta_and_radii(
         spiral_pairs[..., 1:], dr_per_winding)
+    # A two-point unwrap is exact even for large winding separations: the
+    # shifted radius is non-modular (it grows by dr_per_winding every
+    # winding), so the only ambiguity unwrap_shifted_radii resolves here is
+    # the single possible theta=0 wrap between the pair's two points.
     unwrapped, _adjustments = unwrap_shifted_radii(
         theta, shifted, dr_per_winding, dim=-1)
     predicted = (unwrapped[:, 1] - unwrapped[:, 0]) / dr_per_winding
@@ -251,11 +279,11 @@ def get_winding_inference_losses(
     generator=None,
 ):
     """Sample both inference components and evaluate one shared transform."""
-    relative_count = (int(cfg["sample_count_inference_relative_pairs"])
+    relative_count = (int(cfg["sample_count_winding_model_relative_pairs"])
                       if cfg["loss_weight_dense_spacing"] > 0 else 0)
-    density_count = (int(cfg["sample_count_inference_density_pairs"])
+    density_count = (int(cfg["sample_count_winding_model_density_pairs"])
                      if cfg["loss_weight_dense_spacing_density"] > 0 else 0)
-    pair_delta = cfg["inference_relative_pair_delta"]
+    pair_delta = cfg["winding_model_relative_pair_delta"]
     relative = store.sample_relative(
         relative_count, pair_delta[0], pair_delta[1], generator=generator)
     density = store.sample_adjacent(density_count, generator=generator)
@@ -265,8 +293,8 @@ def get_winding_inference_losses(
     zero = dr_per_winding.new_zeros(())
     if not len(all_targets):
         return {
-            "dense_spacing_inference_relative": zero,
-            "dense_spacing_inference_density": zero,
+            "dense_spacing_winding_model_relative": zero,
+            "dense_spacing_winding_model_density": zero,
         }, {}
 
     spiral = slice_to_spiral_transform(all_points.reshape(-1, 3)).reshape(-1, 2, 3)
@@ -274,8 +302,8 @@ def get_winding_inference_losses(
     metrics = {}
     cursor = 0
     for name, count in zip((
-        "dense_spacing_inference_relative",
-        "dense_spacing_inference_density",
+        "dense_spacing_winding_model_relative",
+        "dense_spacing_winding_model_density",
     ), counts):
         component_spiral = spiral[cursor : cursor + count]
         component_points = all_points[cursor : cursor + count]
@@ -286,7 +314,7 @@ def get_winding_inference_losses(
             dr_per_winding, z_begin, z_end)
         per_pair = F.huber_loss(
             residual, torch.zeros_like(residual), reduction="none",
-            delta=float(cfg["inference_huber_delta"]),
+            delta=float(cfg["winding_model_huber_delta"]),
         )
         valid_f = valid.to(per_pair.dtype)
         losses[name] = (per_pair * valid_f).sum() / valid_f.sum().clamp(min=1)

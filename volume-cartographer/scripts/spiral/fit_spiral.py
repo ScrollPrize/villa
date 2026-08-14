@@ -1905,10 +1905,13 @@ class FitContext:
                 torch.device('cuda'),
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
+                z_range=(self.z_begin, self.z_end),
             )
             print(
                 'loaded winding inference: '
-                f"{self.winding_inference.fingerprint['num_rays']:,} rays, "
+                f"{self.winding_inference.fingerprint['num_rays']:,} rays "
+                f"({self.winding_inference.num_z_eligible_rays:,} intersect "
+                f"z-range [{self.z_begin}, {self.z_end})), "
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
                 'crossings')
 
@@ -2727,9 +2730,9 @@ class FitContext:
                 diagnostic_weights['dense_spacing_count'] = max(
                     float(self.config['loss_weight_dense_spacing_count']), 1.0)
             if self._winding_model_mode_active():
-                diagnostic_weights['dense_spacing_inference_relative'] = max(
+                diagnostic_weights['dense_spacing_winding_model_relative'] = max(
                     float(self.config['loss_weight_dense_spacing']), 1.0)
-                diagnostic_weights['dense_spacing_inference_density'] = max(
+                diagnostic_weights['dense_spacing_winding_model_density'] = max(
                     float(self.config['loss_weight_dense_spacing_density']), 1.0)
             transform = self.spiral_and_transform.get_slice_to_spiral_transform()
             dr = self.spiral_and_transform.get_dr_per_winding()
@@ -3486,11 +3489,11 @@ class FitContext:
                 self.z_end,
             )
             backward_family({
-                'dense_spacing_inference_relative': (
-                    inference_losses['dense_spacing_inference_relative']
+                'dense_spacing_winding_model_relative': (
+                    inference_losses['dense_spacing_winding_model_relative']
                     * self.config['loss_weight_dense_spacing']),
-                'dense_spacing_inference_density': (
-                    inference_losses['dense_spacing_inference_density']
+                'dense_spacing_winding_model_density': (
+                    inference_losses['dense_spacing_winding_model_density']
                     * self.config['loss_weight_dense_spacing_density']),
             })
             log_metrics.update(inference_metrics)
@@ -3922,8 +3925,8 @@ if __name__ == '__main__':
             'sample_count_dense_normal_points',
             'sample_count_dense_spacing_pairs',
             'sample_count_dense_spacing_density_extra_pairs',
-            'sample_count_inference_relative_pairs',
-            'sample_count_inference_density_pairs',
+            'sample_count_winding_model_relative_pairs',
+            'sample_count_winding_model_density_pairs',
             'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',

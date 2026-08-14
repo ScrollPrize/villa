@@ -8,12 +8,22 @@ the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
 Set `dense_spacing_mode` to `winding_model` and provide the compact exported
 crossing directory at the conventional `<dataset>/winding_inference` path or
-override `paths.winding_inference` in `spiral-scroll.json`. The store is
-checksum-verified and copied to each fitting GPU at startup; optimisation then
-does no inference-store filesystem I/O. The default 24,000 samples per step are
-split evenly between long relative-winding pairs and adjacent-passage density
-pairs. In this mode surf-SDT is neither loaded nor required, while the
-independent Lasagna normal and native minimum-spacing losses remain available.
+override `paths.winding_inference` in `spiral-scroll.json`. Two vocabularies
+deliberately coexist: `winding_model` names the fitting mode and its tunables
+(`sample_count_winding_model_*`, `winding_model_relative_pair_delta`,
+`winding_model_huber_delta`, the `dense_spacing_winding_model_*` losses),
+while `winding_inference` names the exported artifact and everything tied to
+its on-disk identity (the input path, the `winding_inference_crossings`
+artifact type, and the checkpoint fingerprint field). The store is
+checksum-verified and copied to each fitting GPU at startup; rays whose
+crossings cannot intersect the configured z-range are excluded from sampling,
+and optimisation then does no inference-store filesystem I/O. The default
+24,000 samples per step are split evenly between long relative-winding pairs
+(`sample_count_winding_model_relative_pairs`, index separation drawn from
+`winding_model_relative_pair_delta`) and adjacent-passage density pairs
+(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
+neither loaded nor required, while the independent Lasagna normal and native
+minimum-spacing losses remain available.
 
 The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
