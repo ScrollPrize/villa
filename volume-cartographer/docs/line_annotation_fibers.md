@@ -49,6 +49,15 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
+The rendered strips are derived views, not stored line geometry. Their columns
+uniformly resample centerline arclength with a target interval of 50 base
+voxels, retaining both endpoints and using a shorter exact interval when the
+total length is not divisible by 50. An explicit bidirectional mapping keeps
+control points, span labels, hover positions, cut planes, and saved line
+positions in the original fractional point-index coordinate. The strip grid's
+along- and cross-line scales are declared in base-volume voxel units, so input
+line points may have arbitrary spacing without changing render LOD.
+
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
 the initial centerline length and the base-voxel extrapolation distance, and

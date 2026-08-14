@@ -69,8 +69,38 @@
 
 ## Implementation
 
-- Pending plan approval.
+- Added endpoint-preserving uniform arclength resampling of authoritative line
+  control points with a 50-base-voxel default target and exact reciprocal
+  `QuadSurface` scales in both ribbon directions.
+- Added `LineStripPositionMap`, including canonical duplicate-run inversion,
+  and propagated it through current/held annotation views, static/dynamic
+  overlays, controls, span labels, initial framing, overview recentering,
+  hover/context-menu inversion, and intersection-inspection strips.
+- Kept original-point frames/up vectors for cut planes and constructed separate
+  resampled ribbon frames pinned to the original frame orientation.
+- Changed initial generated-strip framing to use declared surface extents rather
+  than point-grid dimensions.
+- Added analytic source-level selection from each source pyramid's declared
+  transforms. Base and overlay now select independently; generated and plane
+  views both provide explicit pixels-per-base-voxel scale to fallback bounds.
+- Audited production `QuadSurface` constructors. The line ribbon was the only
+  affected transient VC3D producer declaring an incorrect hardcoded scale;
+  other production paths load serialized metadata or explicitly preserve or
+  derive scale.
 
 ## Validation
 
-- Pending.
+- Built `VC3D`, the line-view/generated-view tests, both chunked sampler test
+  targets, and the synthetic rendering fixture in the existing developer build.
+- All seven focused CTest cases passed:
+  `test_lasagna_line_view_surfaces`,
+  `test_line_annotation_generated_views`,
+  `test_chunked_plane_sampler_fallback`,
+  `test_chunked_plane_sampler`,
+  `test_chunked_plane_sampler_more`,
+  `test_render_synthetic_fixture`, and
+  `test_render_synthetic_fallback_1`.
+- The documented GCC 15 Release Valgrind rendering gate passed all eight
+  serial/parallel scenarios. Observed modeled-runtime ratios were 0.968x to
+  1.062x of reference, and all four parallel DRD graphs were complete.
+- `git diff --check` passed.

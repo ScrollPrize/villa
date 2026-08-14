@@ -1571,15 +1571,23 @@ void CChunkedVolumeViewer::updateContentBounds()
 
 void CChunkedVolumeViewer::recalcPyramidLevel()
 {
-    const int n = _chunkArray ? _chunkArray->numLevels() : (_volume ? static_cast<int>(_volume->numScales()) : 1);
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
-    _dsScaleIdx = std::clamp(
-        static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
-        0, std::max(0, n - 1));
-    _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
+    if (_chunkArray) {
+        _dsScaleIdx = vc::render::ChunkedPlaneSampler::sourceLevelForView(
+            *_chunkArray, _scale, lodZoomBias);
+        const double extent = vc::render::ChunkedPlaneSampler::maximumBaseVoxelExtent(
+            *_chunkArray, _dsScaleIdx);
+        _dsScale = std::isfinite(extent) ? static_cast<float>(extent) : 1.0f;
+    } else {
+        const int n = _volume ? static_cast<int>(_volume->numScales()) : 1;
+        const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
+        _dsScaleIdx = std::clamp(
+            static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
+            0, std::max(0, n - 1));
+        _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
+    }
     updateScalebarScale();
 }
 
@@ -1710,10 +1718,11 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
         ? std::min(_surfaceCache->levels(), _chunkArray->numLevels())
         : _chunkArray->numLevels();
 
-    // `_dsScaleIdx` intentionally waits for about 2x more zoom before moving
-    // to a finer level. Surface-resolution views keep their target level to
-    // avoid panning blur.
-    int level = _dsScaleIdx;
+    const float lodZoomBias = _surfName == "segmentation"
+        ? kSegmentationResolutionLodZoomBias
+        : kResolutionLodZoomBias;
+    int level = vc::render::ChunkedPlaneSampler::sourceLevelForView(
+        *_chunkArray, _scale, lodZoomBias);
     // The direct surface renderer benefits from one finer source level because
     // it resamples volume chunks straight into the framebuffer. SurfaceCache
     // levels already match their screen-space footprint; applying the same
@@ -1730,7 +1739,11 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
         return 0;
     }
 
-    int level = _dsScaleIdx;
+    const float lodZoomBias = _surfName == "segmentation"
+        ? kSegmentationResolutionLodZoomBias
+        : kResolutionLodZoomBias;
+    int level = vc::render::ChunkedPlaneSampler::sourceLevelForView(
+        *_overlayChunkArray, _scale, lodZoomBias);
     if (preferSurfaceResolution && !_overlaySurfaceCache &&
         level < _overlayChunkArray->numLevels() - 1) {
         level -= kSurfaceResolutionLevelBias;
@@ -1923,19 +1936,17 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         ctx.prevResult && !ctx.genCacheDirty &&
         renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob);
     const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
-    // ctx.scale is pixels per level-0 volume voxel only for PlaneSurface.
-    // Generated surfaces use their own parameterization, so their scale cannot
-    // participate in a volume-chunk coverage comparison.
-    const std::optional<float> pixelsPerLevel0VolumeVoxel =
-        planeView ? std::optional<float>(ctx.scale) : std::nullopt;
+    // Every renderable surface declares parameter coordinates in level-0/base
+    // voxels, so camera scale has one view-wide meaning for planes and generated
+    // surfaces alike.
+    const std::optional<float> pixelsPerLevel0VolumeVoxel = ctx.scale;
     vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
     vc::render::ChunkedPlaneSampler::Options overlayOptions(
         ctx.overlaySamplingMethod, options.tileSize);
     options.request = ctx.renderJob.chunkRequest;
     overlayOptions.request = ctx.renderJob.chunkRequest;
-    // Keep enough coarse demand for a useful whole-view preview. Affine plane
-    // views can stop when a chunk spans the viewport in volume space;
-    // parameterized surfaces queue the bounded full five-level range.
+    // Keep enough coarse demand for a useful whole-view preview, stopping once
+    // a source chunk spans the viewport in declared base-voxel units.
     options.queuedFallbackLevels =
         vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
             *ctx.chunkArray, ctx.startLevel, ctx.fbW, ctx.fbH,

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-14
+
+- Corrected generated-view scale declarations: line ribbons now arclength-
+  resample to a uniform 50-base-voxel target, declare exact along/cross grid
+  density, and retain original line semantics through a bidirectional strip
+  mapping. Plane and generated views now share analytic source-level and
+  fallback selection in base-volume units.
+
 ## 2026-08-13
 
 - Removed the obsolete implicit `beginViewRequest()` epoch API, dead private
@@ -14,10 +22,8 @@
 - Added service-wide adaptive remote download admission from two to 64 fetches,
   based on recent successful encoded-chunk bandwidth and chunk size; the status
   bar now uses the same bandwidth estimate.
-- Corrected interactive fallback-range selection for generated surfaces by
-  preventing their parameter-space camera scale from being compared with
-  volume-voxel chunk extents; these views now request the bounded five-level
-  fallback range.
+- Corrected interactive fallback-range selection after generated surfaces were
+  given explicit base-volume parameter units.
 - Split regular chunk loading into independent 32-worker persistent-cache
   classification, source download/read, and CPU decode queues so cached decode
   work no longer delays discovery and admission of remote misses.

@@ -136,12 +136,19 @@ public:
         vc::Sampling sampling = vc::Sampling::Nearest,
         bool zeroIsSentinel = true);
 
-    // Selects how far a GUI viewport should queue coarse fallback data. When
-    // pixelsPerLevel0VolumeVoxel is available, stops early once one average
-    // chunk edge spans the larger viewport edge in level-0 volume voxels.
-    // Parameterized surfaces must pass nullopt: their screen scale is pixels
-    // per surface unit, not pixels per volume voxel, so the bounded full range
-    // is required unless they provide an explicit volume-space conversion.
+    // Select one source Zarr level for a complete view. `pixelsPerBaseVoxel`
+    // is framebuffer pixels per level-0/base-volume voxel for every renderable
+    // surface. The coarsest level whose largest source-voxel extent satisfies
+    // the quality threshold is selected; no generated coordinates are probed.
+    static int sourceLevelForView(IChunkedArray& array,
+                                  float pixelsPerBaseVoxel,
+                                  float qualityBias = 0.5f);
+    static double maximumBaseVoxelExtent(IChunkedArray& array, int level);
+
+    // Selects how far a GUI viewport should queue coarse fallback data. Stops
+    // once one average source chunk spans the larger viewport edge in declared
+    // level-0/base-volume units. Plane and parameterized surfaces use the same
+    // explicit pixels-per-base-voxel contract.
     static int fallbackLevelCountForViewport(
         IChunkedArray& array,
         int startLevel,

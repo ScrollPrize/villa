@@ -12,8 +12,12 @@ class QuadSurface;
 namespace vc::lasagna {
 
 struct LineViewConfig {
-    // Non-positive values auto-size from the optimized control-point step and
-    // crossSamples, so cross-strip spacing matches the line step.
+    // Derived ribbons are uniformly resampled in arclength. This is a view
+    // parameter in level-0/base-volume voxels, independent of stored point or
+    // optimizer spacing.
+    double targetSpacingBaseVoxels = 50.0;
+    // Non-positive values auto-size so cross-strip spacing matches the target
+    // along-strip spacing.
     double surfaceHalfWidth = 0.0;
     double sideSliceHalfDepth = 0.0;
     int crossSamples = 21;
@@ -25,11 +29,27 @@ struct LineViewConfig {
     std::vector<cv::Vec3f> orientedPointNormals;
 };
 
+// Maps the original LineModel point-index coordinate to the uniformly sampled
+// ribbon grid and back. Fractional original positions interpolate within an
+// original segment. Consecutive duplicate points share one arclength; inversion
+// at that arclength returns the first point in the duplicate run.
+struct LineStripPositionMap {
+    std::vector<double> originalArclengths;
+    double totalArclength = 0.0;
+    double stripGridSpacingBaseVoxels = 0.0;
+    size_t stripGridColumnCount = 0;
+
+    [[nodiscard]] bool valid() const;
+    [[nodiscard]] double originalPositionToStripGridColumn(double originalPosition) const;
+    [[nodiscard]] double stripGridColumnToOriginalPosition(double stripGridColumn) const;
+};
+
 struct LineViewSurfaces {
     std::shared_ptr<QuadSurface> lineSurface;
     std::shared_ptr<QuadSurface> lineSideSlice;
     std::vector<std::shared_ptr<PlaneSurface>> lineZSlices;
     std::vector<cv::Vec3f> lineUpVectors;
+    LineStripPositionMap stripPositionMap;
 };
 
 struct LineViewFrameIssue {

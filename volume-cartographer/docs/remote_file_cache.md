@@ -152,6 +152,14 @@ pointer position (or viewport center before pointer activity). Chunks missed by
 the probe still enter the GUI lane, without a location, and sort last within
 their view and level.
 
+Plane and generated surface coordinates are declared in level-0/base-volume
+voxel units, so camera scale is framebuffer pixels per base voxel in every
+slice viewer. Each base or overlay source analytically selects one source Zarr
+level for the complete render from that scale and its own level transforms.
+Fallback bounds use the same declared scale; they never estimate scale from
+generated coordinates or cache contents. `QuadSurface::scale()` only maps its
+point grid to base-voxel surface coordinates and is not a second LOD.
+
 GUI and non-GUI callers use separate pending lanes in three shared scheduler
 stages:
 
@@ -183,6 +191,10 @@ probe and pixel sampling. Fully SurfaceCache-backed rendering probes the shared
 `SurfaceGeometryTileCache`; the following tile fills consume the same geometry
 tiles. This keeps the probe from introducing a competing surface-coordinate
 cache.
+
+`SurfaceCache` level keys name the selected source Zarr level. Its surface-grid
+sampling stride is derived cache detail, not an independently selected surface
+LOD.
 
 Persistent Zarr cache directory selection and file naming are unchanged and
 remain separate from in-memory source identity. Surface image and geometry

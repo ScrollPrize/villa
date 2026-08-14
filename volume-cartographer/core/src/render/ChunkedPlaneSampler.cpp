@@ -1374,6 +1374,41 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
     return lastLevel - startLevel;
 }
 
+double ChunkedPlaneSampler::maximumBaseVoxelExtent(IChunkedArray& array, int level)
+{
+    if (level < 0 || level >= array.numLevels())
+        return std::numeric_limits<double>::quiet_NaN();
+    const auto transform = array.levelTransform(level);
+    double maximumExtent = 0.0;
+    for (double scale : transform.scaleFromLevel0) {
+        scale = std::abs(scale);
+        if (!std::isfinite(scale) || scale <= 0.0)
+            return std::numeric_limits<double>::quiet_NaN();
+        maximumExtent = std::max(maximumExtent, 1.0 / scale);
+    }
+    return maximumExtent;
+}
+
+int ChunkedPlaneSampler::sourceLevelForView(IChunkedArray& array,
+                                            float pixelsPerBaseVoxel,
+                                            float qualityBias)
+{
+    if (array.numLevels() <= 0 || !std::isfinite(pixelsPerBaseVoxel) ||
+        !std::isfinite(qualityBias) || pixelsPerBaseVoxel <= 0.0f ||
+        qualityBias <= 0.0f) {
+        return 0;
+    }
+    const double maximumExtent =
+        1.0 / (static_cast<double>(pixelsPerBaseVoxel) * qualityBias);
+    int selected = 0;
+    for (int level = 0; level < array.numLevels(); ++level) {
+        const double extent = maximumBaseVoxelExtent(array, level);
+        if (std::isfinite(extent) && extent <= maximumExtent)
+            selected = level;
+    }
+    return selected;
+}
+
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
     IChunkedArray& array,
     int level,

@@ -62,16 +62,29 @@
 - Before an accepted interactive render samples the volume, it probes the
   viewport on a deterministic stratified 8-pixel grid. Each probe records the
   2-D viewport occurrence of every required requested-level and permitted
-  fallback chunk. It queues at most five coarser levels. Affine plane views may
-  stop earlier when one average chunk edge spans the larger viewport extent,
-  with both quantities measured in level-0 volume voxels. Generated,
-  parameterized, and flattened surfaces instead queue the full bounded range
-  unless they provide an explicit surface-to-volume scale. Their camera scale
-  is pixels per surface parameter unit and must never be compared with volume
-  chunk extents. This fallback demand remains present on refinement renders
-  until it resolves.
+  fallback chunk. It queues at most five coarser levels and may stop earlier
+  when one average chunk edge spans the larger viewport extent, with both
+  quantities measured in level-0/base-volume voxels. Plane and renderable
+  `QuadSurface` parameter coordinates use those same units; camera scale is
+  framebuffer pixels per base voxel for both. This fallback demand remains
+  present on refinement renders until it resolves.
   Nearby occurrences of the same chunk are deduplicated, but distant
   occurrences on folded surfaces are retained.
+- The source volume/Zarr pyramid level is VC3D's only render LOD. One constant
+  source level is selected analytically for each source over a complete render
+  from camera scale and declared level transforms. Base and overlay sources may
+  select different numeric levels. Generated volume coordinates, finite
+  differences, cache residency, and per-pixel geometry never select LOD.
+- `QuadSurface::scale()` is grid samples per level-0/base-volume voxel in each
+  parameter direction. It declares the point-grid parameterization and is not
+  another LOD. A transient renderable producer must provide a finite positive
+  scale; serialized surfaces use their stored declaration.
+- Line-annotation ribbons are derived views of the authoritative stored line.
+  They uniformly arclength-resample with a default maximum interval of 50 base
+  voxels, retain both endpoints, and carry an explicit bidirectional mapping
+  between original fractional point positions and ribbon grid columns. Input
+  line spacing may be arbitrary; control points, cuts, and persistence remain
+  in original line-position coordinates.
 - A completed pre-pass atomically replaces that source's previous snapshot for
   the view. Snapshot construction and surface-coordinate generation occur
   without the chunk-cache state lock. Older view versions cannot replace a

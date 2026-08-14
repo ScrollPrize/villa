@@ -21,9 +21,8 @@ namespace vc::render {
 // chunks of ChunkCache. A tile is `kTileSize x kTileSize x wCount` samples in
 // (u, v, w) where:
 //
-//   u, v  nominal surface coordinates -- the same space as the flattened
-//         viewer's surface pointer, one unit ~ one voxel of arclength along
-//         the sheet. Signed.
+//   u, v  declared level-0/base-volume voxel surface coordinates -- the same
+//         space as the flattened viewer's surface pointer. Signed.
 //   w     signed offset in level-0 voxels along the unit surface normal at
 //         (u, v).
 //
@@ -32,10 +31,10 @@ namespace vc::render {
 // memoization of the sampling function the flattened renderer already
 // evaluates per frame -- not a new one.
 //
-// Tile (level, tu, tv) samples volume level `level` and steps 2^level nominal
-// units per sample in u and v, so a tile always covers the same screen area at
-// its matching zoom. `w` steps one level-0 voxel at every level: the band is
-// always physically [wMin, wMin + wCount - 1] and is never widened.
+// Tile `level` is the source Zarr level requested by the renderer. Its
+// parameter-grid stride is a derived cache implementation detail, not another
+// independently selected LOD. `w` steps one level-0 voxel at every level: the
+// band is always physically [wMin, wMin + wCount - 1] and is never widened.
 class SurfaceGeometryTileCache;
 
 class SurfaceCache {
