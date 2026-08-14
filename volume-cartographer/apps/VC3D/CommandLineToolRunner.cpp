@@ -9,12 +9,17 @@
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
+#include <QPointer>
+#include <QTimer>
 
 #include <cmath>
 #include <utility>
 
 
 namespace {
+
+// Grace period between terminate() and the kill() fallback in cancel().
+constexpr int kCancelGracePeriodMs = 1000;
 
 QString quoteArg(const QString& arg)
 {
@@ -457,9 +462,28 @@ bool CommandLineToolRunner::executeCustomCommand(const QString& command,
 
 void CommandLineToolRunner::cancel()
 {
-    if (_process && _process->state() != QProcess::NotRunning) {
-        _process->terminate();
+    if (!_process || _process->state() == QProcess::NotRunning) {
+        return;
     }
+
+    _process->terminate();
+
+    // On Windows terminate() posts WM_CLOSE, which the console-mode vc_* tools have
+    // no message loop to receive: the process keeps running and cancelling silently
+    // does nothing at all. Fall back to kill(), the same way LasagnaServiceManager
+    // and the other service managers already do. Deferred rather than a blocking
+    // waitForFinished() because cancel() runs on the GUI thread.
+    // The QProcess object is created once and reused across runs, so the pid is what
+    // identifies *this* run: without it a cancel followed by a quick relaunch would
+    // let the timer kill the new process instead.
+    QPointer<QProcess> process(_process);
+    const qint64 cancelledPid = _process->processId();
+    QTimer::singleShot(kCancelGracePeriodMs, this, [process, cancelledPid]() {
+        if (process && process->state() != QProcess::NotRunning
+            && process->processId() == cancelledPid) {
+            process->kill();
+        }
+    });
 }
 
 bool CommandLineToolRunner::isRunning() const

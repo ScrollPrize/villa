@@ -88,25 +88,29 @@ TEST_CASE("repeated queries hit the seglist cache (read-only store)")
         gs.save(p.string());
     }
 
-    GridStore loaded(p.string());
-    auto stats0 = loaded.cacheStats();
+    // Nested scope: the mmap-backed GridStore must be destroyed before the file
+    // can be deleted. Windows refuses to remove a file that is still mapped.
+    {
+        GridStore loaded(p.string());
+        auto stats0 = loaded.cacheStats();
 
-    // First query: pure cache misses
-    auto r1 = loaded.get(cv::Rect(0, 0, 50, 50));
-    CHECK_FALSE(r1.empty());
+        // First query: pure cache misses
+        auto r1 = loaded.get(cv::Rect(0, 0, 50, 50));
+        CHECK_FALSE(r1.empty());
 
-    auto stats1 = loaded.cacheStats();
-    CHECK(stats1.decodedPathMisses >= stats0.decodedPathMisses);
+        auto stats1 = loaded.cacheStats();
+        CHECK(stats1.decodedPathMisses >= stats0.decodedPathMisses);
 
-    // Second identical query: should produce cache hits
-    auto r2 = loaded.get(cv::Rect(0, 0, 50, 50));
-    auto stats2 = loaded.cacheStats();
-    CHECK(stats2.decodedPathHits > stats1.decodedPathHits);
+        // Second identical query: should produce cache hits
+        auto r2 = loaded.get(cv::Rect(0, 0, 50, 50));
+        auto stats2 = loaded.cacheStats();
+        CHECK(stats2.decodedPathHits > stats1.decodedPathHits);
 
-    loaded.resetCacheStats();
-    auto stats3 = loaded.cacheStats();
-    CHECK(stats3.decodedPathHits == 0);
-    CHECK(stats3.decodedPathMisses == 0);
+        loaded.resetCacheStats();
+        auto stats3 = loaded.cacheStats();
+        CHECK(stats3.decodedPathHits == 0);
+        CHECK(stats3.decodedPathMisses == 0);
+    }
 
     fs::remove(p);
 }
@@ -137,15 +141,17 @@ TEST_CASE("forEach with read-only (mmap-loaded) store")
         gs.add(diagonal(4, cv::Point(50, 50)));
         gs.save(p.string());
     }
-    GridStore loaded(p.string());
-    GridStore::QueryScratch scratch;
-    int count = 0;
-    loaded.forEach(cv::Rect(0, 0, 100, 100), scratch,
-                   [&](const std::shared_ptr<std::vector<cv::Point>>& path) {
-                       CHECK(path);
-                       ++count;
-                   });
-    CHECK(count == 2);
+    {
+        GridStore loaded(p.string());
+        GridStore::QueryScratch scratch;
+        int count = 0;
+        loaded.forEach(cv::Rect(0, 0, 100, 100), scratch,
+                       [&](const std::shared_ptr<std::vector<cv::Point>>& path) {
+                           CHECK(path);
+                           ++count;
+                       });
+        CHECK(count == 2);
+    }
     fs::remove(p);
 }
 
@@ -157,9 +163,11 @@ TEST_CASE("get(center, radius) with read-only store")
         gs.add(diagonal(5));
         gs.save(p.string());
     }
-    GridStore loaded(p.string());
-    auto hits = loaded.get(cv::Point2f(2.f, 2.f), 5.f);
-    CHECK(hits.size() == 1);
+    {
+        GridStore loaded(p.string());
+        auto hits = loaded.get(cv::Point2f(2.f, 2.f), 5.f);
+        CHECK(hits.size() == 1);
+    }
     fs::remove(p);
 }
 
