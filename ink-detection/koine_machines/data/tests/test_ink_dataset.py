@@ -9,13 +9,18 @@ from koine_machines.augmentation.translation import (
     count_points_within_crop,
     maybe_translate_normal_pooled_crop_bbox,
 )
+from koine_machines.augmentation.default_augmentations import (
+    create_spatial_intensity_no_clip_transforms,
+)
 from koine_machines.data.normal_pooled_sample import read_tifxyz_on_flat_grid
 import koine_machines.data.ink_dataset as ink_dataset_module
 from koine_machines.data.ink_dataset import (
     InkDataset,
+    _flat_z_window_bbox,
     _is_native_3d_mode,
     _maybe_select_flat_pixels_for_native_crop_via_stored_resolution,
     _normalize_image_crop,
+    _exclude_validation_voxels_from_training_supervision,
     _project_flat_labels_and_supervision_to_native_crop,
     _project_flat_patch_to_native_crop,
     _project_valid_surface_mask_to_native_crop,
@@ -24,6 +29,152 @@ from koine_machines.data.ink_dataset import (
     _select_flat_pixels_for_native_crop_via_stored_resolution,
     _uses_surface_mask_channel,
 )
+
+
+def test_flat_z_window_jitter_uses_only_real_offsets(monkeypatch):
+    monkeypatch.setattr(ink_dataset_module.random, "random", lambda: 0.0)
+    monkeypatch.setattr(ink_dataset_module.random, "randint", lambda low, high: high)
+    bbox, offset = _flat_z_window_bbox(
+        (2, 10, 20, 23, 138, 148),
+        config={
+            "flat_z_window_jitter": {
+                "enabled": True,
+                "max_offset": 2,
+                "window_depth": 17,
+                "probability": 1.0,
+                "padding": "forbidden",
+            }
+        },
+        do_augmentations=True,
+        is_validation=False,
+    )
+    assert offset == 2
+    assert bbox == (6, 10, 20, 23, 138, 148)
+
+
+def test_flat_z_window_jitter_is_disabled_for_validation():
+    original = (2, 10, 20, 23, 138, 148)
+    bbox, offset = _flat_z_window_bbox(
+        original,
+        config={
+            "flat_z_window_jitter": {
+                "enabled": True,
+                "max_offset": 2,
+                "window_depth": 17,
+                "probability": 1.0,
+                "padding": "forbidden",
+            }
+        },
+        do_augmentations=True,
+        is_validation=True,
+    )
+    assert offset == 0
+    assert bbox == (4, 10, 20, 21, 138, 148)
+
+
+def test_pre_subtracted_supervision_remains_unchanged_by_loader_guard():
+    validation = np.zeros((3, 5, 5), dtype=np.uint8)
+    validation[:, 1:3, 1:3] = 1
+    prepared_supervision = np.ones((3, 5, 5), dtype=np.uint8)
+    prepared_supervision[validation > 0] = 0
+
+    consumed = _exclude_validation_voxels_from_training_supervision(
+        prepared_supervision,
+        validation,
+        is_validation_patch=False,
+    )
+
+    np.testing.assert_array_equal(consumed, prepared_supervision)
+    assert not np.any(consumed[validation > 0])
+
+
+def test_no_clip_augmentation_recipe_contains_only_requested_intensity_edits():
+    pipeline = create_spatial_intensity_no_clip_transforms((21, 256, 256), [0])
+    names = [
+        type(getattr(transform, "transform", transform)).__name__
+        for transform in pipeline.transforms
+    ]
+
+    assert names == [
+        "MirrorTransform",
+        "Rot90Transform",
+        "InvertImageTransform",
+        "BrightnessAdditiveTransform",
+        "GaussianNoiseTransform",
+    ]
+
+
+def test_spatial_only_augmentation_preset_avoids_default_intensity_pipeline(
+    monkeypatch,
+):
+    from koine_machines.data import ink_dataset as ink_dataset_module
+
+    spatial = object()
+    monkeypatch.setattr(
+        ink_dataset_module,
+        "create_spatial_only_transforms",
+        lambda patch_size, allowed_rotation_axes=None: spatial,
+    )
+    monkeypatch.setattr(
+        ink_dataset_module,
+        "create_training_transforms",
+        lambda _patch_size: pytest.fail("default augmentation pipeline was called"),
+    )
+
+    dataset = ink_dataset_module.InkDataset(
+        {
+            "patch_size": [21, 256, 256],
+            "datasets": [],
+            "augmentation_preset": "spatial_only",
+        },
+        do_augmentations=True,
+        patches=[],
+    )
+
+    assert dataset.augmentations is spatial
+
+
+def test_no_clip_intensity_augmentation_preset_avoids_default_pipeline(
+    monkeypatch,
+):
+    intensity = object()
+    monkeypatch.setattr(
+        ink_dataset_module,
+        "create_spatial_intensity_no_clip_transforms",
+        lambda patch_size, allowed_rotation_axes=None: intensity,
+    )
+    monkeypatch.setattr(
+        ink_dataset_module,
+        "create_training_transforms",
+        lambda _patch_size: pytest.fail("default augmentation pipeline was called"),
+    )
+
+    dataset = ink_dataset_module.InkDataset(
+        {
+            "patch_size": [21, 256, 256],
+            "datasets": [],
+            "augmentation_preset": "spatial_intensity_no_clip",
+        },
+        do_augmentations=True,
+        patches=[],
+    )
+
+    assert dataset.augmentations is intensity
+
+
+def test_unknown_augmentation_preset_is_rejected():
+    from koine_machines.data.ink_dataset import InkDataset
+
+    with pytest.raises(ValueError, match="augmentation_preset"):
+        InkDataset(
+            {
+                "patch_size": [21, 256, 256],
+                "datasets": [],
+                "augmentation_preset": "mystery",
+            },
+            do_augmentations=True,
+            patches=[],
+        )
 
 
 class StubRng:
@@ -114,6 +265,59 @@ def test_normalize_image_crop_rejects_invalid_mode():
     with pytest.raises(ValueError, match="Unsupported image_normalization mode"):
         _normalize_image_crop(np.array([1, 2, 3], dtype=np.uint8), {"image_normalization": "wat"})
 
+
+def test_normalize_image_crop_clip_divide_matches_hires9um_preprocessing():
+    image = np.array([0, 100, 200, 255], dtype=np.uint8)
+
+    normalized = _normalize_image_crop(
+        image,
+        {
+            "image_normalization": {
+                "mode": "clip_divide",
+                "clip_min": 0,
+                "clip_max": 200,
+                "divisor": 255,
+            }
+        },
+    )
+
+    np.testing.assert_allclose(
+        normalized,
+        np.array([0, 100, 200, 200], dtype=np.float32) / 255.0,
+    )
+
+
+def test_normalize_image_crop_divide_preserves_full_uint8_range():
+    image = np.array([0, 100, 200, 201, 254, 255], dtype=np.uint8)
+
+    normalized = _normalize_image_crop(
+        image,
+        {"image_normalization": {"mode": "divide", "divisor": 255}},
+    )
+
+    np.testing.assert_array_equal(normalized, image.astype(np.float32) / 255.0)
+
+
+def test_normalize_image_crop_clip_zscore_clips_then_standardizes():
+    image = np.array([0, 21, 88, 234, 255], dtype=np.uint8)
+
+    normalized = _normalize_image_crop(
+        image,
+        {
+            "image_normalization": {
+                "mode": "clip_zscore",
+                "clip_min": 21,
+                "clip_max": 234,
+                "mean": 88,
+                "std": 2,
+            }
+        },
+    )
+
+    np.testing.assert_allclose(
+        normalized,
+        (np.array([21, 21, 88, 234, 234], dtype=np.float32) - 88) / 2,
+    )
 
 def test_read_flat_surface_patch_uses_middle_slice_with_padding():
     volume = np.zeros((5, 4, 4), dtype=np.uint8)
@@ -334,6 +538,33 @@ def test_gather_segments_preserves_remote_native_volume_path(tmp_path):
         }
     ]
     dataset.mode = "full_3d"
+    dataset.discovery_mode = "labeled"
+    dataset.debug = False
+
+    segments = list(dataset._gather_segments())
+
+    assert len(segments) == 1
+    assert segments[0].image_volume == volume_path
+
+
+def test_gather_segments_uses_explicit_surface_volume_without_tifxyz(tmp_path):
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    (segment_dir / "segment-a_inklabels.zarr").mkdir()
+    (segment_dir / "segment-a_supervision_mask.zarr").mkdir()
+    volume_path = "s3://vesuvius-challenge-open-data/surface-a.zarr/"
+
+    dataset = object.__new__(InkDataset)
+    dataset.config = {"patch_size": [31, 256, 256]}
+    dataset.datasets = [
+        {
+            "surface_volume_paths": {"segment-a": volume_path},
+            "volume_scale": 0,
+            "segments_path": str(tmp_path),
+            "segments": ["segment-a"],
+        }
+    ]
+    dataset.mode = "flat"
     dataset.discovery_mode = "labeled"
     dataset.debug = False
 

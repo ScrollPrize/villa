@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 import wandb
@@ -8,7 +9,7 @@ import random
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import accelerate
 from accelerate.utils import (
     DistributedDataParallelKwargs,
@@ -40,6 +41,14 @@ from koine_machines.training.deep_supervision import (
 from koine_machines.training.visualization import PreviewAccumulator, build_validation_preview_log
 from koine_machines.training.loss.losses import create_loss_from_config
 from koine_machines.training.stitching import resolve_model_and_loader_patch_sizes, run_model_forward
+from koine_machines.training.samplers import (
+    FixedScrollPriorStratifiedBatchSampler,
+    hierarchical_scroll_segment_weights,
+)
+from koine_machines.models.input_padding import (
+    center_pad_input_depth,
+    configured_input_pad_depth,
+)
 
 
 @dataclass
@@ -162,12 +171,52 @@ def _distributed_mean_scalar(accelerator, value):
     return accelerator.reduce(tensor, reduction='mean')
 
 
+def _masked_unsmoothed_bce_with_logits(logits, targets, ignore_mask):
+    """Plain BCE over valid pixels, independent of configured loss smoothing."""
+    valid_mask = (ignore_mask <= 0).to(dtype=torch.float32)
+    elements = F.binary_cross_entropy_with_logits(
+        logits.detach().float(),
+        targets.detach().float(),
+        reduction='none',
+    )
+    return (elements * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+
+
 def _distributed_mean_metrics(accelerator, metrics):
     if not isinstance(metrics, dict):
         return {}
     return {
         str(name): float(_distributed_mean_scalar(accelerator, metric_value).item())
         for name, metric_value in metrics.items()
+    }
+
+
+def _append_jsonl(path, record):
+    with open(path, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _benchmark_summary(*, elapsed_seconds, measured_steps, batch_size,
+                       world_size, data_wait_seconds, peak_allocated_bytes,
+                       peak_reserved_bytes):
+    """Build the machine-readable summary used by short production benchmarks."""
+    elapsed_seconds = float(elapsed_seconds)
+    measured_steps = int(measured_steps)
+    if elapsed_seconds <= 0 or measured_steps <= 0:
+        raise ValueError("benchmark duration and measured steps must be positive")
+    examples = measured_steps * int(batch_size) * int(world_size)
+    return {
+        'elapsed_seconds': elapsed_seconds,
+        'measured_steps': measured_steps,
+        'batch_size_per_process': int(batch_size),
+        'world_size': int(world_size),
+        'examples': examples,
+        'steps_per_second': measured_steps / elapsed_seconds,
+        'examples_per_second': examples / elapsed_seconds,
+        'data_wait_seconds': float(data_wait_seconds),
+        'data_wait_seconds_per_step': float(data_wait_seconds) / measured_steps,
+        'peak_allocated_bytes': int(peak_allocated_bytes),
+        'peak_reserved_bytes': int(peak_reserved_bytes),
     }
 
 
@@ -192,6 +241,12 @@ def _forward_model(
 def train(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
+
+    benchmark_config = dict(config.get('benchmark') or {})
+    benchmark_enabled = bool(benchmark_config.get('enabled', False))
+    benchmark_warmup_steps = int(benchmark_config.get('warmup_steps', 0))
+    if benchmark_enabled and not 0 <= benchmark_warmup_steps < int(config['num_iterations']):
+        raise ValueError("benchmark warmup_steps must be in [0, num_iterations)")
 
     checkpoint_path, checkpoint, weights_only = load_training_checkpoint_from_config(config, config_path)
     resume_full_state = checkpoint is not None and not weights_only
@@ -233,7 +288,8 @@ def train(config_path):
     pooling_config = config.get('normal_pooling') or {}
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
-    
+    input_pad_depth_to = configured_input_pad_depth(config)
+
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if native_3d_mode:
@@ -266,6 +322,13 @@ def train(config_path):
     save_every = int(config.get('save_every', val_every))
     log_every = config.get('log_every', 50)
     val_preview_batches = config.get('val_preview_batches', 3)
+    best_checkpoint_metric = config.get('best_checkpoint_metric')
+    if best_checkpoint_metric not in (None, 'val_loss', 'val_balanced_accuracy'):
+        raise ValueError(
+            "best_checkpoint_metric must be one of "
+            "{null, 'val_loss', 'val_balanced_accuracy'}"
+        )
+    best_checkpoint_value = None
 
     dataloader_config = accelerate.DataLoaderConfiguration(non_blocking = True)
     ddp_kwargs = DistributedDataParallelKwargs(
@@ -347,14 +410,68 @@ def train(config_path):
     if normal_pooled_mode:
         dataloader_kwargs['collate_fn'] = collate_normal_pooled_batch
 
-    train_dl = DataLoader(
-        train_subset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        generator=torch.Generator().manual_seed(config['seed']),
-        num_workers=dataloader_workers,
-        **dataloader_kwargs,
-    )
+    sampling_strategy = str(config.get('sampling_strategy', 'uniform')).strip().lower()
+    train_generator = torch.Generator().manual_seed(config['seed'])
+    train_sampler = None
+    fixed_batch_sampler = None
+    if sampling_strategy == 'uniform':
+        train_shuffle = True
+        sampling_audit = {
+            'strategy': 'uniform',
+            'patches': len(train_subset),
+        }
+    elif sampling_strategy == 'scroll_segment_balanced':
+        sample_weights, sampling_audit = hierarchical_scroll_segment_weights(
+            shared_ds.training_patches,
+            config['datasets'],
+        )
+        train_sampler = WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(train_subset),
+            replacement=True,
+            generator=train_generator,
+        )
+        train_shuffle = False
+    elif sampling_strategy == 'fixed_scroll_prior_stratified':
+        fixed_prior = dict(config.get('fixed_scroll_prior') or {})
+        if int(fixed_prior.get('seed', -1)) != int(config['seed']):
+            raise ValueError(
+                "fixed_scroll_prior.seed must match the training seed: "
+                f"{fixed_prior.get('seed')!r} vs {config['seed']!r}"
+            )
+        fixed_batch_sampler = FixedScrollPriorStratifiedBatchSampler(
+            shared_ds.training_patches,
+            config['datasets'],
+            batch_quotas=fixed_prior.get('target_batch_counts') or {},
+            batch_size=config['batch_size'],
+            seed=config['seed'],
+        )
+        sampling_audit = fixed_batch_sampler.definition_audit()
+        train_shuffle = False
+    else:
+        raise ValueError(
+            "sampling_strategy must be 'uniform', 'scroll_segment_balanced', "
+            "or 'fixed_scroll_prior_stratified', got "
+            f"{sampling_strategy!r}"
+        )
+    accelerator.print('sampling_audit=' + json.dumps(sampling_audit, sort_keys=True), flush=True)
+    if fixed_batch_sampler is not None:
+        train_dl = DataLoader(
+            train_subset,
+            batch_sampler=fixed_batch_sampler,
+            num_workers=dataloader_workers,
+            **dataloader_kwargs,
+        )
+    else:
+        train_dl = DataLoader(
+            train_subset,
+            batch_size=config['batch_size'],
+            shuffle=train_shuffle,
+            sampler=train_sampler,
+            generator=train_generator,
+            num_workers=dataloader_workers,
+            **dataloader_kwargs,
+        )
     # Validation only consumes a capped number of batches (`val_steps`), so
     # shuffle to sample a different deterministic subset on each pass.
     val_dl = DataLoader(
@@ -403,15 +520,44 @@ def train(config_path):
                 'name': config.get('optimizer', 'sgd'),
                 'learning_rate': learning_rate,
                 'weight_decay': config.get('weight_decay', 3e-5),
+                'betas': config.get('optimizer_betas', (0.9, 0.999)),
+                'momentum': config.get('optimizer_momentum', 0.99),
+                'nesterov': config.get('optimizer_nesterov', True),
                 }, OptimizerParamGroupTarget(optimizer_target) if isinstance(optimizer_target, list) else optimizer_target)
 
-    lr_scheduler = get_scheduler(
-        'diffusers_cosine_warmup',
-        optimizer,
-        initial_lr=learning_rate,
-        max_steps=max_steps,
-        warmup_steps=config.get('warmup_steps', 1000),
-    )
+    scheduler_config = dict(config.get('scheduler') or {})
+    scheduler_name = str(
+        scheduler_config.get('name', 'diffusers_cosine_warmup')
+    ).strip().lower()
+    if scheduler_name == 'cosine_annealing':
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(scheduler_config.get('t_max', max_steps)),
+            eta_min=float(scheduler_config.get('eta_min', 0.0)),
+        )
+    elif scheduler_name == 'one_cycle':
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(scheduler_config['max_lr']),
+            total_steps=int(scheduler_config.get('total_steps', max_steps)),
+            pct_start=float(scheduler_config.get('pct_start', 0.3)),
+            final_div_factor=float(
+                scheduler_config.get('final_div_factor', 1e4)
+            ),
+        )
+    elif scheduler_name == 'diffusers_cosine_warmup':
+        lr_scheduler = get_scheduler(
+            'diffusers_cosine_warmup',
+            optimizer,
+            initial_lr=learning_rate,
+            max_steps=max_steps,
+            warmup_steps=config.get('warmup_steps', 1000),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported scheduler.name={scheduler_name!r}; expected "
+            "'diffusers_cosine_warmup', 'cosine_annealing', or 'one_cycle'"
+        )
 
     if not (config.get('model_config') or {}).get('pretrained_backbone'):
         model.apply(InitWeights_He(neg_slope=0.2))
@@ -464,6 +610,50 @@ def train(config_path):
         accelerator.print(f"Loaded checkpoint '{checkpoint_path}'"+ (f" and resuming from step {start_step}" if resume_full_state else " (weights only)"))
         
     train_iterator = iter(train_dl)
+    sampling_audit_every = int(config.get('sampling_audit_every', save_every))
+    if sampling_audit_every <= 0:
+        raise ValueError("sampling_audit_every must be positive")
+    verify_finite_gradients_steps = int(
+        config.get('verify_finite_gradients_steps', 0)
+    )
+    if verify_finite_gradients_steps < 0:
+        raise ValueError("verify_finite_gradients_steps cannot be negative")
+    max_amp_overflow_events = int(config.get('max_amp_overflow_events', 0))
+    if max_amp_overflow_events < 0:
+        raise ValueError("max_amp_overflow_events cannot be negative")
+    gradient_health = {
+        'checked_steps': 0,
+        'nonfinite_events': [],
+        'max_amp_overflow_events': max_amp_overflow_events,
+    }
+
+    def write_gradient_health() -> None:
+        if not accelerator.is_main_process or verify_finite_gradients_steps <= 0:
+            return
+        output_path = os.path.join(out_dir, 'gradient_health.json')
+        temporary_path = output_path + '.partial'
+        with open(temporary_path, 'w', encoding='utf-8') as stream:
+            json.dump(gradient_health, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+        os.replace(temporary_path, output_path)
+
+    write_gradient_health()
+
+    def write_fixed_sampling_audit(training_step: int) -> None:
+        if fixed_batch_sampler is None or not accelerator.is_main_process:
+            return
+        observed = fixed_batch_sampler.observed_audit()
+        observed['training_step_completed'] = int(training_step)
+        observed['target'] = sampling_audit
+        output_path = os.path.join(out_dir, 'sampling_observed.json')
+        temporary_path = output_path + '.partial'
+        with open(temporary_path, 'w', encoding='utf-8') as stream:
+            json.dump(observed, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+        os.replace(temporary_path, output_path)
+        accelerator.print('sampling_observed=' + json.dumps(observed, sort_keys=True))
+
+    write_fixed_sampling_audit(start_step)
     latest_val_loss = None
     latest_ema_val_loss = None
     validation_confusion_metric = Confusion()
@@ -476,13 +666,21 @@ def train(config_path):
         disable=not accelerator.is_main_process,
         dynamic_ncols=True,
     )
+    benchmark_started_at = None
+    benchmark_data_wait_seconds = 0.0
+    benchmark_measured_steps = 0
+    if benchmark_enabled and benchmark_warmup_steps == 0:
+        if accelerator.device.type == 'cuda':
+            torch.cuda.synchronize(accelerator.device)
+            torch.cuda.reset_peak_memory_stats(accelerator.device)
+        benchmark_started_at = time.perf_counter()
 
     def get_model_input(batch):
         image = batch['image'].float()
         if surface_mask_channel:
             surface_mask = batch['surface_mask'].float()
-            return torch.cat([image, surface_mask], dim=1)
-        return image
+            image = torch.cat([image, surface_mask], dim=1)
+        return center_pad_input_depth(image, input_pad_depth_to)
 
     def prepare_loss_inputs(preds, batch):
         if isinstance(preds, (list, tuple)):
@@ -542,6 +740,14 @@ def train(config_path):
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
         supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
         ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
+        output_size = tuple(int(value) for value in preds.shape[-2:])
+        if tuple(int(value) for value in targets.shape[-2:]) != output_size:
+            targets = F.interpolate(
+                targets.float(), size=output_size, mode='nearest'
+            ).to(dtype=batch['inklabels'].dtype)
+            ignore_mask = F.interpolate(
+                ignore_mask.float(), size=output_size, mode='nearest'
+            ).to(dtype=targets.dtype)
         return preds, targets, ignore_mask
 
     def refresh_progress_bar(current_train_loss):
@@ -557,8 +763,10 @@ def train(config_path):
         progress_bar.set_postfix(postfix, refresh=False)
         progress_bar.update(0)
 
-    def save_checkpoint(step):
-        if not accelerator.is_main_process or (step + 1) % save_every != 0:
+    def save_checkpoint(step, *, force=False, filename=None, validation_metrics=None):
+        if not accelerator.is_main_process or (
+            not force and (step + 1) % save_every != 0
+        ):
             return
         checkpoint = {
             'model': accelerator.get_state_dict(model),
@@ -568,20 +776,25 @@ def train(config_path):
             'step': step,
             'wandb_run_id': wandb.run.id if wandb.run is not None else config.get('wandb_run_id'),
         }
+        if validation_metrics is not None:
+            checkpoint['validation_metrics'] = dict(validation_metrics)
         if ema_model is not None and ema_save_in_checkpoint:
             checkpoint['ema_model'] = ema_model.state_dict()
             checkpoint['ema_optimizer_step'] = optimizer_step
-        torch.save(checkpoint, f'{out_dir}/ckpt_{step + 1:06}.pth')
+        checkpoint_name = filename or f'ckpt_{step + 1:06}.pth'
+        torch.save(checkpoint, os.path.join(out_dir, checkpoint_name))
 
     for step in progress_bar:
         model.train()
         if frozen_encoder is not None:
             frozen_encoder.eval()
+        batch_fetch_started_at = time.perf_counter()
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_dl)
             batch = next(train_iterator)
+        batch_fetch_seconds = time.perf_counter() - batch_fetch_started_at
         if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
             _apply_cucim_label_dilation(batch, full_3d_label_dilation, full_3d_supervision_dilation)
 
@@ -622,7 +835,39 @@ def train(config_path):
             accelerator.backward(l)
             if grad_clip is not None and grad_clip > 0 and accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), grad_clip)
+            gradient_event = None
+            if step < verify_finite_gradients_steps and accelerator.sync_gradients:
+                gradient_health['checked_steps'] += 1
+                non_finite_gradients = [
+                    name
+                    for name, parameter in model.named_parameters()
+                    if parameter.grad is not None
+                    and not bool(torch.isfinite(parameter.grad).all().item())
+                ]
+                if non_finite_gradients:
+                    gradient_event = {
+                        'step': int(step),
+                        'parameters': non_finite_gradients[:10],
+                    }
+                    gradient_health['nonfinite_events'].append(gradient_event)
+                    accelerator.print(
+                        f"AMP gradient overflow at step {step}: "
+                        + ', '.join(non_finite_gradients[:10])
+                    )
+                    if len(gradient_health['nonfinite_events']) > max_amp_overflow_events:
+                        write_gradient_health()
+                        raise RuntimeError(
+                            "Exceeded permitted AMP gradient overflow events: "
+                            f"{len(gradient_health['nonfinite_events'])} > "
+                            f"{max_amp_overflow_events}"
+                        )
             optimizer.step()
+            if gradient_event is not None:
+                gradient_event['optimizer_step_was_skipped'] = bool(
+                    accelerator.optimizer_step_was_skipped
+                )
+            if step < verify_finite_gradients_steps and accelerator.sync_gradients:
+                write_gradient_health()
             optimizer.zero_grad(set_to_none=True)
             if accelerator.sync_gradients:
                 lr_scheduler.step()
@@ -637,6 +882,16 @@ def train(config_path):
                                 ema_value.lerp_(model_value.to(dtype=ema_value.dtype), 1.0 - ema_decay)
                             else:
                                 ema_value.copy_(model_value)
+
+        if benchmark_enabled:
+            if step >= benchmark_warmup_steps:
+                benchmark_data_wait_seconds += batch_fetch_seconds
+                benchmark_measured_steps += 1
+            if step + 1 == benchmark_warmup_steps:
+                if accelerator.device.type == 'cuda':
+                    torch.cuda.synchronize(accelerator.device)
+                    torch.cuda.reset_peak_memory_stats(accelerator.device)
+                benchmark_started_at = time.perf_counter()
 
         # Distributed reductions are collective ops — all ranks must participate.
         should_log = step % log_every == 0
@@ -686,6 +941,7 @@ def train(config_path):
             model.eval()
             val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+            val_bce_unsmoothed_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             ema_val_loss_total = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             ema_val_loss_batches = torch.zeros((), device=accelerator.device, dtype=torch.float32)
             validation_counts = Confusion.zero_counts(device=accelerator.device)
@@ -742,6 +998,17 @@ def train(config_path):
                     )
                     val_loss_total = val_loss_total + _distributed_mean_scalar(accelerator, val_l)
                     val_loss_batches = val_loss_batches + 1.0
+                    # The configured loss may smooth its BCE targets, which charges
+                    # confident correct predictions too; track plain BCE separately
+                    # so calibration drift is not read as a generalization failure.
+                    val_bce_unsmoothed_total = val_bce_unsmoothed_total + _distributed_mean_scalar(
+                        accelerator,
+                        _masked_unsmoothed_bce_with_logits(
+                            primary_val_loss_preds,
+                            val_targets,
+                            val_ignore_mask,
+                        ),
+                    )
                     batch_counts = validation_confusion_metric.compute_batch(
                         ValidationMetricBatch(
                             logits=primary_val_loss_preds.detach(),
@@ -823,6 +1090,9 @@ def train(config_path):
                         )
 
             mean_val_loss = float((val_loss_total / val_loss_batches.clamp_min(1.0)).item())
+            mean_val_bce_unsmoothed = float(
+                (val_bce_unsmoothed_total / val_loss_batches.clamp_min(1.0)).item()
+            )
             mean_ema_val_loss = None
             if float(ema_val_loss_batches.item()) > 0.0:
                 mean_ema_val_loss = float(
@@ -847,6 +1117,7 @@ def train(config_path):
                 )
                 log_dict.update(
                     {
+                        'val/bce_unsmoothed': mean_val_bce_unsmoothed,
                         'val/balanced_accuracy': balanced_accuracy,
                         'val/tp': float(validation_counts.tp.item()),
                         'val/fp': float(validation_counts.fp.item()),
@@ -854,12 +1125,104 @@ def train(config_path):
                         'val/tn': float(validation_counts.tn.item()),
                     }
                 )
+                validation_record = {
+                    'step': int(step),
+                    'val_loss': float(mean_val_loss),
+                    'val_bce_unsmoothed': float(mean_val_bce_unsmoothed),
+                    'val_balanced_accuracy': float(balanced_accuracy),
+                    'val_tp': float(validation_counts.tp.item()),
+                    'val_fp': float(validation_counts.fp.item()),
+                    'val_fn': float(validation_counts.fn.item()),
+                    'val_tn': float(validation_counts.tn.item()),
+                    'val_batches': int(num_val_batches),
+                    'learning_rate': float(optimizer.param_groups[0]['lr']),
+                }
+                _append_jsonl(
+                    os.path.join(out_dir, 'validation_metrics.jsonl'),
+                    validation_record,
+                )
+                if best_checkpoint_metric is not None:
+                    candidate = validation_record[best_checkpoint_metric]
+                    improved = (
+                        best_checkpoint_value is None
+                        or (
+                            best_checkpoint_metric == 'val_loss'
+                            and candidate < best_checkpoint_value
+                        )
+                        or (
+                            best_checkpoint_metric == 'val_balanced_accuracy'
+                            and candidate > best_checkpoint_value
+                        )
+                    )
+                    if improved:
+                        best_checkpoint_value = float(candidate)
+                        best_name = f'best_{best_checkpoint_metric}.pth'
+                        save_checkpoint(
+                            step,
+                            force=True,
+                            filename=best_name,
+                            validation_metrics=validation_record,
+                        )
+                        with open(
+                            os.path.join(out_dir, 'best_checkpoint.json'),
+                            'w',
+                            encoding='utf-8',
+                        ) as stream:
+                            json.dump(
+                                {
+                                    'checkpoint': best_name,
+                                    'metric': best_checkpoint_metric,
+                                    'value': best_checkpoint_value,
+                                    'step': int(step),
+                                },
+                                stream,
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            stream.write('\n')
                 if wandb.run is not None:
                     wandb.log(log_dict, step=step)
 
         save_checkpoint(step)
+        if fixed_batch_sampler is not None and (
+            (step + 1) % sampling_audit_every == 0
+            or step + 1 == config['num_iterations']
+        ):
+            write_fixed_sampling_audit(step + 1)
 
     accelerator.wait_for_everyone()
+    if benchmark_enabled:
+        if accelerator.device.type == 'cuda':
+            torch.cuda.synchronize(accelerator.device)
+        if benchmark_started_at is None:
+            raise RuntimeError("benchmark timer never started")
+        summary = _benchmark_summary(
+            elapsed_seconds=time.perf_counter() - benchmark_started_at,
+            measured_steps=benchmark_measured_steps,
+            batch_size=config['batch_size'],
+            world_size=accelerator.num_processes,
+            data_wait_seconds=benchmark_data_wait_seconds,
+            peak_allocated_bytes=(
+                torch.cuda.max_memory_allocated(accelerator.device)
+                if accelerator.device.type == 'cuda' else 0
+            ),
+            peak_reserved_bytes=(
+                torch.cuda.max_memory_reserved(accelerator.device)
+                if accelerator.device.type == 'cuda' else 0
+            ),
+        )
+        summary.update({
+            'warmup_steps': benchmark_warmup_steps,
+            'device': str(accelerator.device),
+        })
+        if accelerator.is_main_process:
+            output_path = benchmark_config.get(
+                'output_path', os.path.join(out_dir, 'benchmark_summary.json')
+            )
+            with open(output_path, 'w', encoding='utf-8') as stream:
+                json.dump(summary, stream, indent=2, sort_keys=True)
+                stream.write('\n')
+            accelerator.print(f"benchmark_summary={output_path}")
 
 if __name__ == '__main__':
     train()

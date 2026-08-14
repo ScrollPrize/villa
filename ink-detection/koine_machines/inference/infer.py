@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 LOGGER = logging.getLogger("inference_ome_zarr")
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
-DEFAULT_OVERLAP = 0.25
+DEFAULT_OVERLAP = 0.5
 DEFAULT_SW_BATCH_SIZE = 4
 DEFAULT_PREFETCH_FACTOR = 2
 
@@ -60,12 +60,22 @@ class ChunkKey:
 
 
 class TargetHeadWrapper(nn.Module):
-    def __init__(self, model: torch.nn.Module, *, target_name: str):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        target_name: str,
+        input_pad_depth_to: int | None = None,
+    ):
         super().__init__()
         self.model = model
         self.target_name = str(target_name)
+        self.input_pad_depth_to = input_pad_depth_to
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from koine_machines.models.input_padding import center_pad_input_depth
+
+        x = center_pad_input_depth(x, self.input_pad_depth_to)
         outputs = self.model(x)
         if not isinstance(outputs, dict):
             raise TypeError(
@@ -170,9 +180,45 @@ def normalize_training_config_for_inference(config: dict[str, Any]) -> dict[str,
 
 def supported_repo_model_type(model_type: str) -> bool:
     normalized = str(model_type).strip().lower()
-    return normalized in {"unet", "vesuvius_unet", "dinov2", "resnet3d"} or normalized.startswith(
-        "resnet3d-"
-    )
+    return normalized in {
+        "unet",
+        "vesuvius_unet",
+        "vesuvius_unet_2p5d",
+        "unet_2p5d",
+        "vesuvius_unet_3d_stem_2d",
+        "unet_3d_stem_2d",
+        "dinov2",
+        "resnet3d",
+    } or normalized.startswith("resnet3d-")
+
+
+def inference_preprocessing_from_config(config: dict[str, Any]) -> str:
+    normalization = config.get("image_normalization", "robust_mad")
+    if isinstance(normalization, dict):
+        mode = str(normalization.get("mode", "robust_mad")).strip().lower()
+        options = normalization
+    else:
+        mode = str(normalization).strip().lower()
+        options = {}
+    if mode in {"divide", "divide_255"}:
+        divisor = float(options.get("divisor", 255.0))
+        if divisor != 255.0:
+            raise ValueError(
+                "infer.py divide_255 preprocessing requires divisor=255, "
+                f"got {divisor!r}"
+            )
+        return "divide_255"
+    if mode == "clip_divide":
+        clip_min = float(options.get("clip_min", 0.0))
+        clip_max = float(options.get("clip_max", 200.0))
+        divisor = float(options.get("divisor", 255.0))
+        if (clip_min, clip_max, divisor) != (0.0, 200.0, 255.0):
+            raise ValueError(
+                "infer.py legacy_uint8 currently supports only clip_divide "
+                "with clip_min=0, clip_max=200, divisor=255"
+            )
+        return "legacy_uint8"
+    return "tifxyz_robust"
 
 
 def checkpoint_looks_like_repo_training(payload: Any) -> bool:
@@ -262,6 +308,17 @@ def compute_importance_map_2d(
     normalized_mode = str(mode).strip().lower()
     if normalized_mode == "constant":
         return torch.ones((patch_h, patch_w), dtype=torch.float32)
+    if normalized_mode == "hann":
+        window_y = torch.hann_window(patch_h, periodic=False, dtype=torch.float32)
+        window_x = torch.hann_window(patch_w, periodic=False, dtype=torch.float32)
+        weight_map = torch.outer(window_y, window_x)
+        weight_map /= torch.clamp(
+            weight_map.max(), min=torch.finfo(weight_map.dtype).eps
+        )
+        # A mathematically exact Hann window is zero on the outermost pixels.
+        # Keep a small positive floor so a volume boundary covered by only one
+        # patch is still normalized correctly when the TIFF is written.
+        return torch.clamp(weight_map, min=1e-3)
     if normalized_mode != "gaussian":
         raise ValueError(f"Unsupported importance map mode: {mode!r}")
 
@@ -277,6 +334,49 @@ def compute_importance_map_2d(
     return torch.clamp(weight_map, min=torch.finfo(weight_map.dtype).eps)
 
 
+def resolve_patch_stride(
+    *,
+    patch_size: int,
+    overlap: float,
+    explicit_stride: int | None,
+) -> int:
+    patch_size = int(patch_size)
+    if explicit_stride is not None:
+        stride = int(explicit_stride)
+        if stride <= 0:
+            raise ValueError(f"--stride must be positive, got {stride}")
+        if stride > patch_size:
+            raise ValueError(
+                f"--stride must not exceed patch size {patch_size}, got {stride}"
+            )
+        return stride
+
+    overlap = float(overlap)
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError(f"--overlap must be in [0, 1), got {overlap}")
+    return max(1, int(round(float(patch_size) * (1.0 - overlap))))
+
+
+def center_crop_layer_indices(
+    layer_indices: np.ndarray,
+    *,
+    output_depth: int,
+) -> np.ndarray:
+    """Match the training loader's ``surface - patch_depth // 2`` crop."""
+    indices = np.asarray(layer_indices, dtype=np.int64)
+    output_depth = int(output_depth)
+    if output_depth <= 0:
+        raise ValueError(f"output_depth must be positive, got {output_depth}")
+    if indices.size <= output_depth:
+        return indices
+
+    # For an even-sized source and odd-sized crop, subtracting half the crop
+    # from source_shape // 2 chooses the upper of the two central source
+    # planes, matching the training loader.
+    start_offset = (indices.size // 2) - (output_depth // 2)
+    return indices[start_offset:start_offset + output_depth]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Simple MONAI sliding-window inference for OME-Zarr volumes."
@@ -286,7 +386,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("output_tiff", type=Path, nargs="?", help="Output uint8 tiled TIFF path.")
     parser.add_argument(
         "--model-type",
-        choices=("auto", "resnet3d", "residual_unet", "tifxyz_unet"),
+        choices=(
+            "auto",
+            "resnet3d",
+            "residual_unet",
+            "tifxyz_unet",
+        ),
         default="auto",
     )
     parser.add_argument(
@@ -316,7 +421,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_PREFETCH_FACTOR,
         help="Number of batches prefetched per worker when --num-workers > 0.",
     )
-    parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=DEFAULT_OVERLAP,
+        help="Sliding-window overlap fraction. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help=(
+            "Explicit spatial inference stride in pixels. This takes precedence "
+            "over --overlap and avoids ambiguity with training patch_overlap."
+        ),
+    )
+    parser.add_argument(
+        "--blend-mode",
+        choices=("auto", "constant", "gaussian", "hann"),
+        default="auto",
+        help=(
+            "Overlap-add importance window. 'auto' selects constant without "
+            "overlap, Hann otherwise."
+        ),
+    )
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -606,6 +734,7 @@ class OmeZarrPatchReader:
         height: int,
         width: int,
         layer_indices: np.ndarray,
+        output_depth: int | None = None,
         preprocessing: str = "legacy_uint8",
     ):
         self.input_path = input_path if is_url_like_path(input_path) else Path(input_path)
@@ -614,6 +743,18 @@ class OmeZarrPatchReader:
         self.height = int(height)
         self.width = int(width)
         self.layer_indices = np.asarray(layer_indices, dtype=np.int64)
+        self.output_depth = (
+            int(output_depth)
+            if output_depth is not None
+            else int(self.layer_indices.size)
+        )
+        if self.output_depth < int(self.layer_indices.size):
+            raise ValueError(
+                f"output_depth={self.output_depth} cannot contain "
+                f"{self.layer_indices.size} selected layers"
+            )
+        depth_padding = self.output_depth - int(self.layer_indices.size)
+        self.output_depth_start = depth_padding // 2
         self.preprocessing = str(preprocessing)
         self._array = None
         self._read_mode = "fancy"
@@ -670,19 +811,35 @@ class OmeZarrPatchReader:
         xx1 = min(self.width, x1)
 
         if self.preprocessing == "tifxyz_robust":
-            out = np.zeros((out_h, out_w, self.layer_indices.size), dtype=np.float32)
+            out = np.zeros((out_h, out_w, self.output_depth), dtype=np.float32)
         else:
-            out = np.zeros((out_h, out_w, self.layer_indices.size), dtype=np.uint8)
+            out = np.zeros((out_h, out_w, self.output_depth), dtype=np.uint8)
         if yy1 <= yy0 or xx1 <= xx0:
             return out
 
         block = self._read_raw(yy0, yy1, xx0, xx1)
         if self.preprocessing == "tifxyz_robust":
             block = np.asarray(block, dtype=np.float32)
-        else:
+        elif self.preprocessing == "legacy_uint8":
             block = convert_volume_dtype(block)
             np.clip(block, 0, 200, out=block)
-        out[yy0 - y0:yy1 - y0, xx0 - x0:xx1 - x0] = block
+        elif self.preprocessing == "divide_255":
+            block = np.asarray(block)
+            if block.dtype != np.uint8:
+                raise TypeError(
+                    "divide_255 input must be uint8 so raw intensities can be "
+                    f"preserved exactly, got {block.dtype}"
+                )
+            block = np.ascontiguousarray(block)
+        else:
+            raise ValueError(f"Unsupported inference preprocessing {self.preprocessing!r}")
+        depth_start = self.output_depth_start
+        depth_end = depth_start + int(self.layer_indices.size)
+        out[
+            yy0 - y0:yy1 - y0,
+            xx0 - x0:xx1 - x0,
+            depth_start:depth_end,
+        ] = block
         return out
 
 
@@ -711,6 +868,16 @@ def choose_pyramid_array(
         return "0", root
 
     available_keys = [str(key) for key in root.array_keys()]
+    if preferred_key not in available_keys:
+        # HTTP-backed Zarr stores may support direct key access without
+        # implementing directory listing. Probe the requested level before
+        # concluding that the group is empty.
+        try:
+            requested = root[preferred_key]
+        except (KeyError, FileNotFoundError):
+            requested = None
+        if isinstance(requested, zarr.Array):
+            return preferred_key, requested
     if not available_keys:
         raise ValueError(f"No arrays found in zarr group for {purpose}.")
     if preferred_key in available_keys:
@@ -913,6 +1080,9 @@ class OmeZarrBlockDataset(Dataset):
     def __getitem__(self, index: int):
         block = self.blocks[index]
         patch = self.reader.read(block.y0, block.x0, self.patch_h, self.patch_w)
+        # Test occupancy on the raw uint8 patch.  Robust preprocessing may map
+        # an all-zero patch to non-zero values, which would defeat the skip.
+        nonempty = int(patch.any())
         patch = np.moveaxis(patch, -1, 0)
         if self.preprocessing == "tifxyz_robust":
             from vesuvius.image_proc.intensity.normalization import normalize_robust
@@ -923,7 +1093,10 @@ class OmeZarrBlockDataset(Dataset):
             patch *= 1.0 / 255.0
         # Models trained in this repo consume channel-first 3D volumes: [C, Z, Y, X].
         image = torch.from_numpy(patch).unsqueeze(0)
-        meta = torch.tensor([block.y0, block.x0, block.valid_h, block.valid_w], dtype=torch.int64)
+        meta = torch.tensor(
+            [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
+            dtype=torch.int64,
+        )
         return image, meta
 
 
@@ -1157,6 +1330,7 @@ def resolve_amp_dtype(
 
 def build_repo_training_model_bundle(payload: dict[str, Any], checkpoint_path: Path | str) -> ConfiguredModel:
     from koine_machines.models.make_model import make_model
+    from koine_machines.models.input_padding import configured_input_pad_depth
 
     config = normalize_training_config_for_inference(payload["config"])
     config = resolve_tifxyz_pretrained_backbone_config(config, checkpoint_path=checkpoint_path)
@@ -1175,13 +1349,17 @@ def build_repo_training_model_bundle(payload: dict[str, Any], checkpoint_path: P
         len(incompat.unexpected_keys),
     )
 
-    model = TargetHeadWrapper(base_model, target_name=infer_target_name_from_config(config))
+    model = TargetHeadWrapper(
+        base_model,
+        target_name=infer_target_name_from_config(config),
+        input_pad_depth_to=configured_input_pad_depth(config),
+    )
     model.eval()
     return ConfiguredModel(
         model=model,
         roi_size=roi_size_from_config(config),
         in_chans=inference_depth_from_config(config),
-        preprocessing="tifxyz_robust",
+        preprocessing=inference_preprocessing_from_config(config),
         source="koine_machines.training.train",
         amp_dtype=None,
     )
@@ -1209,8 +1387,8 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         configured_model.amp_dtype = resolved_amp_dtype
         return configured_model
     raise ValueError(
-        "Unsupported checkpoint format for infer.py after the refactor. "
-        "Expected checkpoint['config'] and checkpoint['model'] for a koine_machines training checkpoint."
+        "Unsupported checkpoint format for infer.py. Expected checkpoint['config'] "
+        "and checkpoint['model'] for a koine_machines training checkpoint."
     )
 
 
@@ -1326,6 +1504,14 @@ def run_block_inference(
     )
     with torch.inference_mode(), amp_context:
         for images, meta in tqdm(loader, desc="Infer", unit="block"):
+            # Array-level inputs (for example ``surface-volume.zarr/0``) cannot
+            # use the group-level occupancy pre-scan.  Drop empty raw patches
+            # here so they never reach the GPU model forward.
+            keep = meta[:, 4] > 0
+            if not bool(keep.any()):
+                continue
+            images = images[keep]
+            meta = meta[keep]
             images = images.to(device, non_blocking=True)
             if tta_axes:
                 probs_t, logged_resize = predict_with_mirror_tta(
@@ -1345,7 +1531,7 @@ def run_block_inference(
             probs = probs_t.cpu().numpy()[:, 0]
             meta_np = meta.cpu().numpy()
             for i in range(probs.shape[0]):
-                y0, x0, valid_h, valid_w = [int(v) for v in meta_np[i]]
+                y0, x0, valid_h, valid_w = [int(v) for v in meta_np[i, :4]]
                 tile = probs[i, :valid_h, :valid_w]
                 if valid_h == patch_h and valid_w == patch_w:
                     tile_weights = weight_map
@@ -1451,7 +1637,14 @@ def infer_single_zarr(
 
     roi_size = int(configured_model.roi_size)
     patch_size = roi_size
-    patch_stride = max(1, int(round(float(patch_size) * (1.0 - float(args.overlap)))))
+    patch_stride = resolve_patch_stride(
+        patch_size=patch_size,
+        overlap=float(args.overlap),
+        explicit_stride=args.stride,
+    )
+    weight_mode = str(args.blend_mode)
+    if weight_mode == "auto":
+        weight_mode = "constant" if patch_stride >= patch_size else "hann"
 
     tiff_tile_shape = (patch_size, patch_size)
     if tiff_tile_shape[0] % 16 != 0 or tiff_tile_shape[1] % 16 != 0:
@@ -1470,11 +1663,13 @@ def infer_single_zarr(
     if layer_end <= layer_start:
         layer_start, layer_end = 0, depth
     layer_indices = np.arange(layer_start, layer_end, dtype=np.int64)
-    if layer_indices.size > in_chans:
-        start_offset = (layer_indices.size - in_chans) // 2
-        layer_indices = layer_indices[start_offset:start_offset + in_chans]
+    layer_indices = center_crop_layer_indices(
+        layer_indices,
+        output_depth=in_chans,
+    )
     if str(layer_direction) == "reverse":
         layer_indices = layer_indices[::-1]
+    LOGGER.info("Selected source layer indices=%s", layer_indices.tolist())
     reader = OmeZarrPatchReader(
         input_path=input_zarr,
         resolution=resolution,
@@ -1482,12 +1677,13 @@ def infer_single_zarr(
         height=height,
         width=width,
         layer_indices=layer_indices,
+        output_depth=in_chans,
         preprocessing=configured_model.preprocessing,
     )
 
     layer_order = str(layer_direction)
     LOGGER.info(
-        "Input level=%s shape=(depth=%d, height=%d, width=%d) chunks=(%d, %d) patch=%d stride=%d blend=%.3f tiff_tile=%s in_chans=%d layer_order=%s tta_axes=%s",
+        "Input level=%s shape=(depth=%d, height=%d, width=%d) chunks=(%d, %d) patch=%d stride=%d requested_overlap=%.3f blend_mode=%s tiff_tile=%s in_chans=%d layer_order=%s tta_axes=%s",
         resolution,
         depth,
         height,
@@ -1497,8 +1693,9 @@ def infer_single_zarr(
         patch_size,
         patch_stride,
         float(args.overlap),
+        weight_mode,
         tiff_tile_shape,
-        layer_indices.size,
+        in_chans,
         layer_order,
         tta_axes,
     )
@@ -1567,7 +1764,6 @@ def infer_single_zarr(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
     loader = DataLoader(**loader_kwargs)
-    weight_mode = "constant" if float(args.overlap) == 0.0 else "gaussian"
     weight_map = compute_importance_map_2d(
         patch_size=(patch_size, patch_size),
         mode=weight_mode,
