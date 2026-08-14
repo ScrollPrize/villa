@@ -1168,13 +1168,14 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
 
     struct PointBins {
         std::vector<std::array<float, 2>> points;
-        std::unordered_map<std::int64_t, std::vector<std::size_t>> cells;
+        std::unordered_map<std::uint64_t, std::vector<std::size_t>> cells;
     };
     std::unordered_map<ChunkKey, PointBins, ChunkKeyHash> byChunk;
     std::vector<ChunkKey> required;
     required.reserve(8);
-    auto cellKey = [](int x, int y) {
-        return (std::int64_t(x) << 32) ^ std::uint32_t(y);
+    auto cellKey = [](int x, int y) -> std::uint64_t {
+        return (std::uint64_t(std::uint32_t(x)) << 32) |
+               std::uint32_t(y);
     };
 
     for (int level = firstLevel; level <= lastLevel; ++level) {
