@@ -2,6 +2,11 @@
 from __future__ import annotations
 import numpy as np
 import zarr
+
+# zarr 3 removed create_dataset/write_empty_chunks and defaults new groups to v3;
+# this writer keeps producing the v2 layout zarr 2 wrote, on either generation.
+_ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+_V2_GROUP_KWARGS = {"zarr_format": 2} if _ZARR_V3 else {}
 from numcodecs import Blosc
 from typing import Optional, Tuple
 
@@ -63,7 +68,7 @@ class OMEU8VectorWriter:
         Xds = (X + self.ds - 1) // self.ds
         self.shape_ds = (Zds, Yds, Xds)
 
-        root = zarr.open_group(output_path, mode="a")
+        root = zarr.open_group(output_path, mode="a", **_V2_GROUP_KWARGS)
         grp = root.require_group(group_name)
         self.ds_z = self._require_scale(grp.require_group("z"), chunks_zyx, compressor)
         self.ds_y = self._require_scale(grp.require_group("y"), chunks_zyx, compressor)
@@ -83,6 +88,17 @@ class OMEU8VectorWriter:
                     f"expected {self.shape_ds}"
                 )
             return ds
+        if _ZARR_V3:
+            # zarr 3 dropped create_dataset/write_empty_chunks; a v2 array keeps the
+            # on-disk layout identical to what zarr 2 writes here.
+            return g.create_array(
+                self.scale_name,
+                shape=self.shape_ds,
+                chunks=chunks,
+                dtype=np.uint8,
+                compressors=compressor,
+                config={"write_empty_chunks": False},
+            )
         return g.create_dataset(
             self.scale_name,
             shape=self.shape_ds,
@@ -93,8 +109,21 @@ class OMEU8VectorWriter:
         )
 
     def _down_bounds(self, z0, z1, y0, y1, x0, x1):
+        """Destination slice for a block, on the *global* downsample grid.
+
+        The kept samples are the multiples of ``ds`` inside ``[a, b)``, and there
+        are ``ceil(b/ds) - ceil(a/ds)`` of them. Flooring instead counted the
+        multiples of ``ds`` in ``[0, b)`` minus those in ``[0, a)`` measured from
+        each block's own origin, which only matches when every block boundary is
+        itself a multiple of ``ds``.
+        """
         s = self.ds
-        return (z0 // s, z1 // s, y0 // s, y1 // s, x0 // s, x1 // s)
+        return tuple(-(-v // s) for v in (z0, z1, y0, y1, x0, x1))
+
+    def _stride_offsets(self, z0, y0, x0):
+        """Offsets into a block that put its first kept sample on the global grid."""
+        s = self.ds
+        return tuple((-(-v // s)) * s - v for v in (z0, y0, x0))
 
     def write_block(
         self,
@@ -108,8 +137,10 @@ class OMEU8VectorWriter:
         Dz, Dy, Dx, _ = directions_block_zyx.shape
         assert Dz == (z1 - z0) and Dy == (y1 - y0) and Dx == (x1 - x0)
 
-        # nearest-neighbour DS for now (consistent with // indexing)
-        dsub = directions_block_zyx[::self.ds, ::self.ds, ::self.ds, :] if self.ds > 1 else directions_block_zyx
+        # nearest-neighbour DS, sampled on the global grid so blocks tile exactly
+        s = self.ds
+        oz, oy, ox = self._stride_offsets(z0, y0, x0)
+        dsub = directions_block_zyx[oz::s, oy::s, ox::s, :] if s > 1 else directions_block_zyx
         z_u8 = encode_dir_to_u8(dsub[..., 0])
         y_u8 = encode_dir_to_u8(dsub[..., 1])
         x_u8 = encode_dir_to_u8(dsub[..., 2])
@@ -122,7 +153,7 @@ class OMEU8VectorWriter:
         if self.ds_conf is not None:
             if confidence_block is None:
                 raise ValueError("make_confidence=True but confidence_block=None")
-            csub = confidence_block[::self.ds, ::self.ds, ::self.ds] if self.ds > 1 else confidence_block
+            csub = confidence_block[oz::s, oy::s, ox::s] if s > 1 else confidence_block
             self.ds_conf[z0d:z1d, y0d:y1d, x0d:x1d] = encode_conf_to_u8(csub)
 
     def close(self):
