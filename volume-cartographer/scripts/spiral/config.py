@@ -25,10 +25,14 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
+    "patch_uuid_filter_regex": "string",
+    "patch_2d_sampling_max_area": "number",
 }
 
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
+    "patch_uuid_filter_regex",
+    "patch_2d_sampling_max_area",
     "track_crossing_precompute_max",
     "track_crossing_mode",
     "track_exclusion_radius",
@@ -279,8 +283,22 @@ class Config:
         self.sample_count_influence_anchor_geometry_points = 100000
         self.sample_count_influence_anchor_samples_per_step = 4096
         self.patch_strip_sampling = "straight"
+        # Patches whose area (vx^2, see tifxyz Patch.area) is below this use a
+        # sparse whole-patch 2D sample for the patch losses instead of 1D
+        # strips; the sample is ordered along a serpentine walk over the valid
+        # quads so the sequential theta=0 unwrap still applies (safe because
+        # small patches span well under half a winding between consecutive
+        # samples). None disables 2D sampling; larger patches always keep the
+        # patch_strip_sampling behaviour.
+        self.patch_2d_sampling_max_area = None
+        # Exponent applied to patch areas when building patch sampling
+        # probabilities: 0 = uniform, 1 = proportional to area.
+        self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
         self.input_disable_patches = False
+        # When set, only patch directory entries (uuid-named) whose name
+        # matches this regex (re.search) are loaded; None loads everything.
+        self.patch_uuid_filter_regex = None
         self.patch_unverified_patch_radius_loss_margin = 0.025
         self.patch_unverified_patch_radius_loss_inv = False
         self.patch_unverified_patch_radius_within_norm_p = 3.0
