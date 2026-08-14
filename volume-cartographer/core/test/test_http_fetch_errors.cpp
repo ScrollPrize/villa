@@ -5,6 +5,8 @@
 
 #include "vc/core/util/HttpFetch.hpp"
 
+#include <utils/http_fetch.hpp>
+
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -70,4 +72,13 @@ TEST_CASE("httpGetString: empty URL handled gracefully")
     } catch (const std::exception&) {
         CHECK(true);
     }
+}
+
+TEST_CASE("HttpClient preserves libcurl transport errors")
+{
+    utils::HttpClient::Config config;
+    config.max_retries = 0;
+    const auto response = utils::HttpClient(config).get("not://a/real/scheme");
+    CHECK(response.status_code == 0);
+    CHECK_FALSE(response.error_message.empty());
 }

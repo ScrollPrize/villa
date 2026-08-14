@@ -84,8 +84,8 @@ public:
         // pools.
         std::size_t maxConcurrentReads = 16;
         // Dynamically admit between two and maxConcurrentReads source fetches
-        // using recent successful encoded-transfer bandwidth and chunk size.
-        // Explicit/batch callers remain fixed unless they opt in.
+        // using bracketed throughput/latency probes. Explicit/batch callers
+        // remain fixed unless they opt in.
         bool adaptiveConcurrentReads = false;
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;

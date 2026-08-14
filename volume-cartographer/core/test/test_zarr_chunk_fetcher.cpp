@@ -5,17 +5,21 @@
 
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/ZarrDownloadBenchmark.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -258,4 +262,132 @@ TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
     auto r = opened.fetchers[0]->fetch({0, 0, 0, 0});
     CHECK(r.status == vc::render::ChunkFetchStatus::Missing);
     fs::remove_all(d);
+}
+
+TEST_CASE("Zarr download benchmark selects unique distributed logical chunks")
+{
+    const auto first = vc::render::selectZarrDownloadBenchmarkChunks(
+        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
+    const auto second = vc::render::selectZarrDownloadBenchmarkChunks(
+        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
+    REQUIRE(first.size() == 30);
+    CHECK(first == second);
+
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> unique;
+    for (const auto& key : first) {
+        CHECK(key.level == 2);
+        CHECK(key.iz >= 0);
+        CHECK(key.iz < 5);
+        CHECK(key.iy >= 0);
+        CHECK(key.iy < 3);
+        CHECK(key.ix >= 0);
+        CHECK(key.ix < 2);
+        unique.insert(key);
+    }
+    CHECK(unique.size() == first.size());
+}
+
+TEST_CASE("Zarr download benchmark uses encoded fetches and fixed admission")
+{
+    class EncodedFetcher final : public vc::render::IChunkFetcher {
+    public:
+        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
+        {
+            ++decodedCalls;
+            return {};
+        }
+
+        vc::render::ChunkFetchResult fetchEncoded(
+            const vc::render::ChunkKey&) override
+        {
+            ++calls;
+            vc::render::ChunkFetchResult result;
+            result.status = vc::render::ChunkFetchStatus::Found;
+            result.bytes.resize(1024);
+            return result;
+        }
+
+        std::atomic_size_t calls{0};
+        std::atomic_size_t decodedCalls{0};
+    };
+
+    auto fetcher = std::make_shared<EncodedFetcher>();
+    OpenedChunkedZarr opened;
+    opened.shapes = {{64, 64, 64}};
+    opened.chunkShapes = {{16, 16, 16}};
+    opened.fetchers = {fetcher};
+
+    vc::render::ZarrDownloadBenchmarkOptions options;
+    options.chunkCount = 12;
+    options.workers = 1;
+    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
+    std::vector<vc::render::ZarrDownloadProgress> progress;
+    options.progressInterval = std::chrono::hours(1);
+    options.progressCallback = [&](const auto& update) {
+        progress.push_back(update);
+    };
+    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
+
+    CHECK(fetcher->calls.load() == 12);
+    CHECK(fetcher->decodedCalls.load() == 0);
+    CHECK(result.requestedChunks == 12);
+    CHECK(result.foundChunks == 12);
+    CHECK(result.encodedBytes == 12 * 1024);
+    CHECK(result.httpErrors == 0);
+    CHECK(result.ioErrors == 0);
+    CHECK(result.decodeErrors == 0);
+    CHECK(result.sinkErrors == 0);
+    CHECK(result.peakActive == 1);
+    CHECK(result.finalTransferStats.admissionLimit == 1);
+    CHECK_FALSE(result.finalTransferStats.adaptive);
+    REQUIRE(progress.size() == 1);
+    CHECK(progress[0].queuedChunks == 0);
+    CHECK(progress[0].downloadingChunks == 0);
+    CHECK(progress[0].completedChunks == 12);
+    CHECK(progress[0].encodedBytes == 12 * 1024);
+}
+
+TEST_CASE("Zarr download benchmark can write encoded payloads to a temporary sink")
+{
+    class EncodedFetcher final : public vc::render::IChunkFetcher {
+    public:
+        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
+        {
+            return {};
+        }
+
+        vc::render::ChunkFetchResult fetchEncoded(
+            const vc::render::ChunkKey&) override
+        {
+            vc::render::ChunkFetchResult result;
+            result.status = vc::render::ChunkFetchStatus::Found;
+            result.bytes.resize(17, std::byte{0x2a});
+            return result;
+        }
+    };
+
+    const auto output = tmpDir("download_benchmark_sink");
+    OpenedChunkedZarr opened;
+    opened.shapes = {{32, 32, 32}};
+    opened.chunkShapes = {{16, 16, 16}};
+    opened.fetchers = {std::make_shared<EncodedFetcher>()};
+
+    vc::render::ZarrDownloadBenchmarkOptions options;
+    options.chunkCount = 3;
+    options.workers = 1;
+    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
+    options.outputDirectory = output;
+    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
+
+    CHECK(result.foundChunks == 3);
+    CHECK(result.encodedBytes == 51);
+    CHECK(result.sinkErrors == 0);
+    std::size_t files = 0;
+    for (const auto& entry : fs::directory_iterator(output)) {
+        CHECK(entry.is_regular_file());
+        CHECK(entry.file_size() == 17);
+        ++files;
+    }
+    CHECK(files == 3);
+    fs::remove_all(output);
 }

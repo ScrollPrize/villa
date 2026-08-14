@@ -97,6 +97,23 @@ struct ChunkRequestScheduler::Impl {
         std::size_t bytes = 0;
         std::chrono::steady_clock::time_point started;
         std::chrono::steady_clock::time_point completed;
+        std::size_t admission = 1;
+        bool saturated = true;
+    };
+
+    struct EpochMeasurement {
+        double bytesPerSecond = 0.0;
+        double latencyP90Seconds = 0.0;
+        double observationSeconds = 0.0;
+        std::chrono::steady_clock::time_point completed;
+    };
+
+    enum class ProbePhase {
+        Monitor,
+        Up,
+        BaselineAfterUp,
+        Down,
+        BaselineAfterDown,
     };
 
     explicit Impl(std::size_t workerCount,
@@ -118,14 +135,47 @@ struct ChunkRequestScheduler::Impl {
                 adaptiveConfig->maximum, adaptiveConfig->minimum, maximumWorkers);
             adaptiveConfig->successfulSamplesPerWorker = std::max<std::size_t>(
                 1, adaptiveConfig->successfulSamplesPerWorker);
-            adaptiveConfig->targetInFlightSeconds = std::max(
-                0.0, adaptiveConfig->targetInFlightSeconds);
+            adaptiveConfig->minimumEpochSeconds = std::max(
+                0.0, adaptiveConfig->minimumEpochSeconds);
+            adaptiveConfig->maximumEpochSeconds = std::max(
+                adaptiveConfig->minimumEpochSeconds,
+                adaptiveConfig->maximumEpochSeconds);
+            adaptiveConfig->unstableProbeIntervalSeconds = std::max(
+                0.0, adaptiveConfig->unstableProbeIntervalSeconds);
+            adaptiveConfig->stableProbeIntervalSeconds = std::max(
+                adaptiveConfig->unstableProbeIntervalSeconds,
+                adaptiveConfig->stableProbeIntervalSeconds);
+            adaptiveConfig->minimumStabilityObservationSeconds = std::max(
+                0.0, adaptiveConfig->minimumStabilityObservationSeconds);
+            adaptiveConfig->bandwidthChangeRatio = std::max(
+                1.000001, adaptiveConfig->bandwidthChangeRatio);
+            adaptiveConfig->throughputGainRatio = std::max(
+                1.0, adaptiveConfig->throughputGainRatio);
+            adaptiveConfig->maximumLatencyInflation = std::max(
+                1.0, adaptiveConfig->maximumLatencyInflation);
+            adaptiveConfig->initialProbeMultiplier = std::max<std::size_t>(
+                2, adaptiveConfig->initialProbeMultiplier);
+            adaptiveConfig->refinementProbeMultiplier = std::max<std::size_t>(
+                2, adaptiveConfig->refinementProbeMultiplier);
+            adaptiveConfig->continuousSearchTurns = std::max<std::size_t>(
+                1, adaptiveConfig->continuousSearchTurns);
+            adaptiveConfig->lowerThroughputRetention = std::clamp(
+                adaptiveConfig->lowerThroughputRetention, 0.0, 1.0);
+            adaptiveConfig->lowerLatencyRatio = std::clamp(
+                adaptiveConfig->lowerLatencyRatio, 0.0, 1.0);
             adaptiveOptions = *adaptiveConfig;
             admissionLimit = adaptiveOptions.minimum;
+            targetAdmissionLimit = admissionLimit;
+            settledAdmissionLimit = admissionLimit;
+            probeMultiplier = adaptiveOptions.initialProbeMultiplier;
+            currentProbeIntervalSeconds =
+                adaptiveOptions.unstableProbeIntervalSeconds;
         } else {
             admissionLimit = maximumWorkers;
             adaptiveOptions.minimum = maximumWorkers;
             adaptiveOptions.maximum = maximumWorkers;
+            targetAdmissionLimit = admissionLimit;
+            settledAdmissionLimit = admissionLimit;
         }
         workers.reserve(workerCount);
         for (std::size_t i = 0; i < workerCount; ++i) {
@@ -201,11 +251,28 @@ struct ChunkRequestScheduler::Impl {
     {
         const std::size_t required = admissionLimit *
             adaptiveOptions.successfulSamplesPerWorker;
-        if (required == 0 || transferSamples.size() < required)
+        if (transferSamples.empty())
+            return;
+        if (!transferSamples.back().saturated &&
+            maximumSaturatedParallelism != 0) {
+            estimatedBytesPerSecond = saturatedBytesPerSecondPerWorker *
+                static_cast<double>(targetAdmissionLimit);
+            return;
+        }
+
+        std::size_t available = 0;
+        for (auto sample = transferSamples.rbegin();
+             sample != transferSamples.rend() && available < required;
+             ++sample) {
+            if (!sample->saturated || sample->admission != admissionLimit)
+                break;
+            ++available;
+        }
+        if (available == 0)
             return;
 
         const auto first = transferSamples.end() -
-            static_cast<std::ptrdiff_t>(required);
+            static_cast<std::ptrdiff_t>(available);
         auto earliestStart = first->started;
         auto latestCompletion = first->completed;
         std::size_t totalBytes = 0;
@@ -221,16 +288,347 @@ struct ChunkRequestScheduler::Impl {
 
         estimatedBytesPerSecond = static_cast<double>(totalBytes) / elapsed;
         averageChunkBytes = static_cast<double>(totalBytes) /
-            static_cast<double>(required);
-        estimateSampleCount = required;
-        if (adaptive) {
-            const double rawLimit = estimatedBytesPerSecond *
-                adaptiveOptions.targetInFlightSeconds / averageChunkBytes;
-            const auto requested = static_cast<std::size_t>(
-                std::max(1.0, std::ceil(rawLimit)));
-            admissionLimit = std::clamp(
-                requested, adaptiveOptions.minimum, adaptiveOptions.maximum);
+            static_cast<double>(available);
+        estimateSampleCount = available;
+    }
+
+    void resetEpochLocked(std::chrono::steady_clock::time_point notBefore)
+    {
+        epochSamples.clear();
+        epochNotBefore = notBefore;
+    }
+
+    void setAdmissionTargetLocked(
+        std::size_t requested,
+        std::chrono::steady_clock::time_point transition)
+    {
+        requested = std::clamp(
+            requested, adaptiveOptions.minimum, adaptiveOptions.maximum);
+        targetAdmissionLimit = requested;
+        resetEpochLocked(transition);
+        if (requested > admissionLimit) {
+            // Grow by one permit now and one per subsequent completion. This
+            // avoids opening a burst of new connections at a probe boundary.
+            ++admissionLimit;
+            rampingAdmission = admissionLimit < targetAdmissionLimit;
+            cv.notify_all();
+        } else {
+            admissionLimit = requested;
+            rampingAdmission = false;
         }
+    }
+
+    std::optional<EpochMeasurement> epochMeasurementLocked() const
+    {
+        if (epochSamples.empty())
+            return std::nullopt;
+        auto earliestStart = epochSamples.front().started;
+        auto latestCompletion = epochSamples.front().completed;
+        std::size_t totalBytes = 0;
+        std::vector<double> latencies;
+        latencies.reserve(epochSamples.size());
+        for (const auto& sample : epochSamples) {
+            earliestStart = std::min(earliestStart, sample.started);
+            latestCompletion = std::max(latestCompletion, sample.completed);
+            totalBytes += sample.bytes;
+            latencies.push_back(std::chrono::duration<double>(
+                sample.completed - sample.started).count());
+        }
+        const double elapsed = std::chrono::duration<double>(
+            latestCompletion - earliestStart).count();
+        if (elapsed <= 0.0 || totalBytes == 0)
+            return std::nullopt;
+
+        const auto p90 = latencies.begin() + static_cast<std::ptrdiff_t>(
+            std::min(latencies.size() - 1,
+                     static_cast<std::size_t>(std::ceil(
+                         0.9 * static_cast<double>(latencies.size()))) - 1));
+        std::nth_element(latencies.begin(), p90, latencies.end());
+        return EpochMeasurement{
+            static_cast<double>(totalBytes) / elapsed,
+            *p90,
+            elapsed,
+            latestCompletion};
+    }
+
+    bool epochCompleteLocked() const
+    {
+        if (epochSamples.empty())
+            return false;
+        auto earliest = epochSamples.front().started;
+        auto latest = epochSamples.front().completed;
+        for (const auto& sample : epochSamples) {
+            earliest = std::min(earliest, sample.started);
+            latest = std::max(latest, sample.completed);
+        }
+        const double elapsed = std::chrono::duration<double>(
+            latest - earliest).count();
+        const std::size_t minimumSamples = std::max<std::size_t>(
+            4, targetAdmissionLimit);
+        return (elapsed >= adaptiveOptions.minimumEpochSeconds &&
+                epochSamples.size() >= minimumSamples) ||
+               elapsed >= adaptiveOptions.maximumEpochSeconds;
+    }
+
+    void observeSettledBandwidthLocked(const EpochMeasurement& measurement)
+    {
+        if (measurement.bytesPerSecond <= 0.0)
+            return;
+        if (longTermBytesPerSecond <= 0.0) {
+            longTermBytesPerSecond = measurement.bytesPerSecond;
+            bandwidthInstability = 0.0;
+            stabilityObservedSeconds = measurement.observationSeconds;
+            return;
+        }
+
+        const double logRange = std::log(adaptiveOptions.bandwidthChangeRatio);
+        const double deviation = std::clamp(
+            std::abs(std::log(measurement.bytesPerSecond /
+                              longTermBytesPerSecond)) / logRange,
+            0.0, 1.0);
+        bandwidthInstability = 0.8 * bandwidthInstability + 0.2 * deviation;
+        lastBandwidthDeviation = deviation;
+        longTermBytesPerSecond = 0.9 * longTermBytesPerSecond +
+            0.1 * measurement.bytesPerSecond;
+        stabilityObservedSeconds += measurement.observationSeconds;
+    }
+
+    double explorationIntervalLocked() const
+    {
+        if (stabilityObservedSeconds <
+                adaptiveOptions.minimumStabilityObservationSeconds) {
+            return adaptiveOptions.unstableProbeIntervalSeconds;
+        }
+        const double instability = std::clamp(
+            std::max(lastBandwidthDeviation, bandwidthInstability), 0.0, 1.0);
+        return adaptiveOptions.stableProbeIntervalSeconds - instability *
+            (adaptiveOptions.stableProbeIntervalSeconds -
+             adaptiveOptions.unstableProbeIntervalSeconds);
+    }
+
+    static EpochMeasurement averageMeasurements(
+        const EpochMeasurement& lhs,
+        const EpochMeasurement& rhs)
+    {
+        return {
+            0.5 * (lhs.bytesPerSecond + rhs.bytesPerSecond),
+            0.5 * (lhs.latencyP90Seconds + rhs.latencyP90Seconds),
+            lhs.observationSeconds + rhs.observationSeconds,
+            std::max(lhs.completed, rhs.completed)};
+    }
+
+    static double latencyRatio(const EpochMeasurement& candidate,
+                               const EpochMeasurement& baseline)
+    {
+        if (baseline.latencyP90Seconds <= 0.0)
+            return 1.0;
+        return candidate.latencyP90Seconds / baseline.latencyP90Seconds;
+    }
+
+    static double throughputRatio(const EpochMeasurement& candidate,
+                                  const EpochMeasurement& baseline)
+    {
+        if (baseline.bytesPerSecond <= 0.0)
+            return 0.0;
+        return candidate.bytesPerSecond / baseline.bytesPerSecond;
+    }
+
+    void finishProbeCycleLocked(const EpochMeasurement& finalBaseline)
+    {
+        const std::size_t previousSettled = settledAdmissionLimit;
+        std::size_t selected = settledAdmissionLimit;
+        double selectedGain = 0.0;
+        EpochMeasurement selectedMeasurement = finalBaseline;
+
+        if (upMeasurement && baselineBeforeUp && baselineAfterUp) {
+            const auto baseline = averageMeasurements(
+                *baselineBeforeUp, *baselineAfterUp);
+            const double throughput = throughputRatio(*upMeasurement, baseline);
+            const double latency = latencyRatio(*upMeasurement, baseline);
+            if (throughput >= adaptiveOptions.throughputGainRatio &&
+                latency <= adaptiveOptions.maximumLatencyInflation) {
+                const double gain = throughput - 1.0;
+                if (gain > selectedGain) {
+                    selected = upAdmissionLimit;
+                    selectedGain = gain;
+                    selectedMeasurement = *upMeasurement;
+                }
+            }
+        }
+
+        if (downMeasurement && baselineAfterUp) {
+            const auto baseline = averageMeasurements(
+                *baselineAfterUp, finalBaseline);
+            const double throughput = throughputRatio(*downMeasurement, baseline);
+            const double latency = latencyRatio(*downMeasurement, baseline);
+            const bool preservesThroughputAndLatency =
+                throughput >= adaptiveOptions.lowerThroughputRetention &&
+                latency <= adaptiveOptions.lowerLatencyRatio;
+            const bool improvesThroughput =
+                throughput >= adaptiveOptions.throughputGainRatio &&
+                latency <= adaptiveOptions.maximumLatencyInflation;
+            if (preservesThroughputAndLatency || improvesThroughput) {
+                const double gain = improvesThroughput
+                    ? throughput - 1.0
+                    : 0.5 * (1.0 - latency);
+                if (gain > selectedGain) {
+                    selected = downAdmissionLimit;
+                    selectedGain = gain;
+                    selectedMeasurement = *downMeasurement;
+                }
+            }
+        }
+
+        const bool changed = selected != previousSettled;
+        const int direction = selected > previousSettled
+            ? 1
+            : (selected < previousSettled ? -1 : 0);
+        if (continuousSearch) {
+            if (direction == 0 ||
+                (lastSearchDirection != 0 && direction != lastSearchDirection)) {
+                ++searchTurns;
+                probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
+            }
+            if (direction != 0)
+                lastSearchDirection = direction;
+            if (searchTurns >= adaptiveOptions.continuousSearchTurns)
+                continuousSearch = false;
+        } else if (changed) {
+            // A periodic probe found a new operating point. Refine around it
+            // continuously until the local choice is confirmed again.
+            continuousSearch = true;
+            searchTurns = 0;
+            lastSearchDirection = direction;
+            probeMultiplier = adaptiveOptions.refinementProbeMultiplier;
+        }
+        settledAdmissionLimit = selected;
+        phase = ProbePhase::Monitor;
+        baselineBeforeUp.reset();
+        baselineAfterUp.reset();
+        upMeasurement.reset();
+        downMeasurement.reset();
+        if (changed) {
+            // Continue initial/local discovery immediately around a newly
+            // selected point. Stability timing begins once a probe retains C.
+            longTermBytesPerSecond = selectedMeasurement.bytesPerSecond;
+            bandwidthInstability = 0.0;
+            lastBandwidthDeviation = 0.0;
+            stabilityObservedSeconds = selectedMeasurement.observationSeconds;
+        }
+        if (!continuousSearch) {
+            if (!changed)
+                observeSettledBandwidthLocked(finalBaseline);
+            currentProbeIntervalSeconds = explorationIntervalLocked();
+            nextProbe = finalBaseline.completed + std::chrono::duration_cast<
+                std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(currentProbeIntervalSeconds));
+        }
+        setAdmissionTargetLocked(selected, finalBaseline.completed);
+    }
+
+    void beginProbeLocked(const EpochMeasurement& baseline)
+    {
+        baselineBeforeUp = baseline;
+        upAdmissionLimit = settledAdmissionLimit >
+                adaptiveOptions.maximum / probeMultiplier
+            ? adaptiveOptions.maximum
+            : std::min(adaptiveOptions.maximum,
+                       settledAdmissionLimit * probeMultiplier);
+        downAdmissionLimit = std::max(
+            adaptiveOptions.minimum, settledAdmissionLimit / probeMultiplier);
+        if (upAdmissionLimit > settledAdmissionLimit) {
+            phase = ProbePhase::Up;
+            setAdmissionTargetLocked(upAdmissionLimit, baseline.completed);
+        } else if (downAdmissionLimit < settledAdmissionLimit) {
+            baselineAfterUp = baseline;
+            phase = ProbePhase::Down;
+            setAdmissionTargetLocked(downAdmissionLimit, baseline.completed);
+        } else {
+            finishProbeCycleLocked(baseline);
+        }
+    }
+
+    void completeEpochLocked(const EpochMeasurement& measurement)
+    {
+        if (targetAdmissionLimit >= maximumSaturatedParallelism) {
+            maximumSaturatedParallelism = targetAdmissionLimit;
+            saturatedBytesPerSecondPerWorker = measurement.bytesPerSecond /
+                static_cast<double>(targetAdmissionLimit);
+        }
+        switch (phase) {
+        case ProbePhase::Monitor:
+            observeSettledBandwidthLocked(measurement);
+            if (!continuousSearch && nextProbe != Clock::time_point::min()) {
+                currentProbeIntervalSeconds = explorationIntervalLocked();
+                const auto instabilityDeadline = measurement.completed +
+                    std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(
+                            currentProbeIntervalSeconds));
+                nextProbe = std::min(nextProbe, instabilityDeadline);
+            }
+            if (continuousSearch || nextProbe == Clock::time_point::min() ||
+                measurement.completed >= nextProbe) {
+                beginProbeLocked(measurement);
+            } else {
+                resetEpochLocked(measurement.completed);
+            }
+            break;
+        case ProbePhase::Up:
+            upMeasurement = measurement;
+            phase = ProbePhase::BaselineAfterUp;
+            setAdmissionTargetLocked(settledAdmissionLimit,
+                                     measurement.completed);
+            break;
+        case ProbePhase::BaselineAfterUp:
+            baselineAfterUp = measurement;
+            if (downAdmissionLimit < settledAdmissionLimit) {
+                phase = ProbePhase::Down;
+                setAdmissionTargetLocked(downAdmissionLimit,
+                                         measurement.completed);
+            } else {
+                finishProbeCycleLocked(measurement);
+            }
+            break;
+        case ProbePhase::Down:
+            downMeasurement = measurement;
+            phase = ProbePhase::BaselineAfterDown;
+            setAdmissionTargetLocked(settledAdmissionLimit,
+                                     measurement.completed);
+            break;
+        case ProbePhase::BaselineAfterDown:
+            finishProbeCycleLocked(measurement);
+            break;
+        }
+    }
+
+    void updateAdaptiveControlLocked(const TransferSample& sample)
+    {
+        if (!adaptive)
+            return;
+        if (rampingAdmission) {
+            if (admissionLimit < targetAdmissionLimit) {
+                ++admissionLimit;
+                cv.notify_all();
+            }
+            if (admissionLimit >= targetAdmissionLimit) {
+                rampingAdmission = false;
+                resetEpochLocked(sample.completed);
+            }
+            return;
+        }
+        if (sample.started < epochNotBefore)
+            return;
+        // Queue-drain samples describe demand, not connection capacity. Keep
+        // the last fully occupied estimate and resume this epoch when enough
+        // work is available again.
+        if (!sample.saturated)
+            return;
+        epochSamples.push_back(sample);
+        if (!epochCompleteLocked())
+            return;
+        const auto measurement = epochMeasurementLocked();
+        if (measurement)
+            completeEpochLocked(*measurement);
     }
 
     void workerLoop(std::stop_token stop)
@@ -296,10 +694,35 @@ struct ChunkRequestScheduler::Impl {
     bool adaptive = false;
     AdaptiveConcurrency adaptiveOptions;
     std::size_t admissionLimit = 1;
+    std::size_t targetAdmissionLimit = 1;
+    std::size_t settledAdmissionLimit = 1;
+    bool rampingAdmission = false;
     std::deque<TransferSample> transferSamples;
+    std::vector<TransferSample> epochSamples;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point epochNotBefore = Clock::time_point::min();
+    Clock::time_point nextProbe = Clock::time_point::min();
+    ProbePhase phase = ProbePhase::Monitor;
+    bool continuousSearch = true;
+    std::size_t probeMultiplier = adaptiveOptions.initialProbeMultiplier;
+    std::size_t searchTurns = 0;
+    int lastSearchDirection = 0;
+    std::size_t upAdmissionLimit = 1;
+    std::size_t downAdmissionLimit = 1;
+    std::optional<EpochMeasurement> baselineBeforeUp;
+    std::optional<EpochMeasurement> baselineAfterUp;
+    std::optional<EpochMeasurement> upMeasurement;
+    std::optional<EpochMeasurement> downMeasurement;
     double estimatedBytesPerSecond = 0.0;
     double averageChunkBytes = 0.0;
     std::size_t estimateSampleCount = 0;
+    double longTermBytesPerSecond = 0.0;
+    double bandwidthInstability = 0.0;
+    double lastBandwidthDeviation = 0.0;
+    double currentProbeIntervalSeconds = 0.0;
+    double stabilityObservedSeconds = 0.0;
+    std::size_t maximumSaturatedParallelism = 0;
+    double saturatedBytesPerSecondPerWorker = 0.0;
 };
 
 ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
@@ -413,13 +836,23 @@ void ChunkRequestScheduler::recordSuccessfulTransfer(
     if (encodedBytes == 0 || completed <= started)
         return;
     std::lock_guard lock(impl_->mutex);
-    impl_->transferSamples.push_back({encodedBytes, started, completed});
+    const std::size_t availableWork =
+        impl_->activeCount.load(std::memory_order_acquire) +
+        impl_->locations.size();
+    // Direct callers used by tests and non-worker integrations cannot expose
+    // queue occupancy; treat those samples as capacity observations.
+    const bool occupancyKnown = availableWork != 0;
+    const bool saturated = !occupancyKnown ||
+        availableWork >= impl_->targetAdmissionLimit;
+    impl_->transferSamples.push_back(
+        {encodedBytes, started, completed, impl_->admissionLimit, saturated});
     const std::size_t maximumSamples = impl_->adaptiveOptions.maximum *
         impl_->adaptiveOptions.successfulSamplesPerWorker;
     while (impl_->transferSamples.size() > maximumSamples)
         impl_->transferSamples.pop_front();
     const auto previousLimit = impl_->admissionLimit;
     impl_->updateTransferEstimateLocked();
+    impl_->updateAdaptiveControlLocked(impl_->transferSamples.back());
     if (impl_->admissionLimit > previousLimit)
         impl_->cv.notify_all();
 }
@@ -432,7 +865,11 @@ ChunkRequestScheduler::TransferStats ChunkRequestScheduler::transferStats() cons
         impl_->estimatedBytesPerSecond,
         impl_->averageChunkBytes,
         impl_->estimateSampleCount,
-        impl_->adaptive};
+        impl_->adaptive,
+        impl_->targetAdmissionLimit,
+        impl_->longTermBytesPerSecond,
+        impl_->currentProbeIntervalSeconds,
+        impl_->phase != Impl::ProbePhase::Monitor || impl_->rampingAdmission};
 }
 
 void ChunkRequestScheduler::waitIdle()

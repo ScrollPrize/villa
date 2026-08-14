@@ -4,6 +4,7 @@
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -34,12 +35,32 @@ struct OpenedChunkedZarr {
     bool physicalLevelZeroTransformIsIdentity = true;
 };
 
+struct RemoteZarrOpenOptions {
+    vc::HttpAuth auth;
+    // Match Volume::NewFromUrl by discovering AWS credentials for S3 when no
+    // explicit credentials were supplied. Disable for forced anonymous reads.
+    bool discoverAwsCredentials = true;
+};
+
+struct OpenedRemoteChunkedZarr {
+    OpenedChunkedZarr opened;
+    vc::HttpAuth auth;
+    vc::RemoteVolumeSpec spec;
+};
+
 OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root);
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url);
 OpenedChunkedZarr openHttpZarrPyramid(
     const std::string& url,
     const vc::HttpAuth& auth,
     std::optional<int> baseScaleLevel = std::nullopt);
+
+// Production remote-volume open policy shared by VC3D and standalone tools:
+// resolve the locator, discover credentials when requested, and retry public
+// S3 data anonymously when stale credentials cause an authentication error.
+OpenedRemoteChunkedZarr openRemoteZarrPyramid(
+    const std::string& url,
+    RemoteZarrOpenOptions options = {});
 
 // Enforce the supported contiguous dyadic VC pyramid contract and make
 // physical level baseScaleLevel logical level zero. Exposed for deterministic

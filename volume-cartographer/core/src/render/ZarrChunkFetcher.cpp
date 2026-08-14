@@ -33,8 +33,10 @@ namespace {
 
 class HttpStatusError final : public std::runtime_error {
 public:
-    HttpStatusError(long status, const std::string& key)
-        : std::runtime_error("HTTP " + std::to_string(status) + " fetching " + key)
+    HttpStatusError(long status, const std::string& key, std::string detail = {})
+        : std::runtime_error(
+              "HTTP " + std::to_string(status) + " fetching " + key +
+              (detail.empty() ? std::string{} : ": " + std::move(detail)))
         , status_(status)
     {
     }
@@ -57,6 +59,21 @@ bool isOptionalMetadataProbe(const std::string& key)
            hasSuffix(key, "/zarr.json") || hasSuffix(key, "/.zattrs");
 }
 
+bool isRemoteAuthError(const std::exception& error)
+{
+    const std::string message = error.what();
+    return message.find("AWS credentials") != std::string::npos ||
+           message.find("Access denied") != std::string::npos ||
+           message.find("ExpiredToken") != std::string::npos ||
+           message.find("InvalidToken") != std::string::npos ||
+           message.find("TokenRefreshRequired") != std::string::npos ||
+           message.find("InvalidAccessKeyId") != std::string::npos ||
+           message.find("SignatureDoesNotMatch") != std::string::npos ||
+           message.find("HTTP 400") != std::string::npos ||
+           message.find("HTTP 401") != std::string::npos ||
+           message.find("HTTP 403") != std::string::npos;
+}
+
 class ClassifyingHttpStore final : public utils::Store {
 public:
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
@@ -74,7 +91,7 @@ public:
             return false;
         if (response.status_code == 403 && isOptionalMetadataProbe(key))
             return false;
-        throw HttpStatusError(response.status_code, key);
+        throw HttpStatusError(response.status_code, key, response.error_message);
     }
 
     std::vector<std::byte> get(const std::string& key) const override
@@ -94,7 +111,7 @@ public:
             return std::nullopt;
         if (response.status_code == 403 && isOptionalMetadataProbe(key))
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key);
+        throw HttpStatusError(response.status_code, key, response.error_message);
     }
 
     std::optional<std::vector<std::byte>>
@@ -105,7 +122,7 @@ public:
             return std::move(response.body);
         if (response.not_found())
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key);
+        throw HttpStatusError(response.status_code, key, response.error_message);
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -819,6 +836,34 @@ OpenedChunkedZarr openHttpZarrPyramid(
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url)
 {
     return openHttpZarrPyramid(url, vc::HttpAuth{}, std::nullopt);
+}
+
+OpenedRemoteChunkedZarr openRemoteZarrPyramid(
+    const std::string& url,
+    RemoteZarrOpenOptions options)
+{
+    auto spec = vc::parseRemoteVolumeSpec(url);
+    auto auth = std::move(options.auth);
+    if (spec.useAwsSigv4 && auth.empty() && options.discoverAwsCredentials) {
+        auth = vc::loadAwsCredentials();
+        if (auth.region.empty())
+            auth.region = spec.awsRegion;
+        if (auth.access_key.empty() || auth.secret_key.empty())
+            auth = {};
+    } else if (spec.useAwsSigv4 && !auth.empty() && auth.region.empty()) {
+        auth.region = spec.awsRegion;
+    }
+
+    OpenedChunkedZarr opened;
+    try {
+        opened = openHttpZarrPyramid(spec.portableLocator, auth);
+    } catch (const std::exception& error) {
+        if (!spec.useAwsSigv4 || auth.empty() || !isRemoteAuthError(error))
+            throw;
+        auth = {};
+        opened = openHttpZarrPyramid(spec.portableLocator, auth);
+    }
+    return {std::move(opened), std::move(auth), std::move(spec)};
 }
 
 std::unique_ptr<ChunkCache> createChunkCache(

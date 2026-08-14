@@ -22,9 +22,14 @@
   explicit background requests are retained.
 - Prevented stale running probes and downloads from entering another queue
   stage, and reject late asynchronous requests from a cleared view generation.
-- Added service-wide adaptive remote download admission from two to 64 fetches,
-  based on recent successful encoded-chunk bandwidth and chunk size; the status
-  bar now uses the same bandwidth estimate.
+- Added service-wide adaptive remote download admission from two to 64 fetches.
+  Completion-paced bracketed probes compare doubled and halved concurrency by
+  encoded goodput and p90 latency. Stability requires five minutes of saturated
+  observations; a 2x bandwidth change shortens exploration toward one minute,
+  and underfilled queue tails retain the last saturated capacity estimate. The
+  initial search uses 4x probes, then continuously refines at 2x until five
+  direction reversals or retained-center brackets confirm a local optimum. The
+  status bar uses the same rolling encoded-bandwidth samples.
 - Corrected interactive fallback-range selection after generated surfaces were
   given explicit base-volume parameter units.
 - Split regular chunk loading into independent 32-worker persistent-cache

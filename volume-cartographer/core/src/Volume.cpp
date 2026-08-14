@@ -42,21 +42,6 @@ static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 namespace
 {
 
-bool isRemoteAuthError(const std::exception& e)
-{
-    const std::string msg = e.what();
-    return msg.find("AWS credentials") != std::string::npos ||
-           msg.find("Access denied") != std::string::npos ||
-           msg.find("ExpiredToken") != std::string::npos ||
-           msg.find("InvalidToken") != std::string::npos ||
-           msg.find("TokenRefreshRequired") != std::string::npos ||
-           msg.find("InvalidAccessKeyId") != std::string::npos ||
-           msg.find("SignatureDoesNotMatch") != std::string::npos ||
-           msg.find("HTTP 400") != std::string::npos ||
-           msg.find("HTTP 401") != std::string::npos ||
-           msg.find("HTTP 403") != std::string::npos;
-}
-
 std::string normalizeRemoteVolumeUrl(std::string url)
 {
     while (!url.empty() && url.back() == '/')
@@ -1342,41 +1327,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const vc::HttpAuth& authIn,
     const utils::Json& metadata)
 {
-    // Parse the client-side view selector before resolving S3 or constructing
-    // any network URL.
-    const auto spec = vc::parseRemoteVolumeSpec(url);
-    vc::HttpAuth auth = authIn;
-    if (spec.useAwsSigv4 && auth.empty()) {
-        auth = vc::loadAwsCredentials();
-        if (auth.region.empty())
-            auth.region = spec.awsRegion;
-        // SigV4 is implicitly enabled when access_key is non-empty.
-        // If credentials are missing, clear them so the request proceeds
-        // unsigned (anonymous access for public buckets).
-        if (auth.access_key.empty() || auth.secret_key.empty())
-            auth = {};  // anonymous — no SigV4
-    } else if (spec.useAwsSigv4 && auth.region.empty()) {
-        auth.region = spec.awsRegion;
-    }
-
+    vc::render::RemoteZarrOpenOptions openOptions;
+    openOptions.auth = authIn;
+    auto remoteOpen = vc::render::openRemoteZarrPyramid(url, std::move(openOptions));
+    auto opened = std::move(remoteOpen.opened);
+    auto auth = std::move(remoteOpen.auth);
+    const auto& spec = remoteOpen.spec;
     const std::string& remoteUrl = spec.sourceUrl;
-
-    vc::render::OpenedChunkedZarr opened;
-    // Open the zarr metadata in memory. This performs the normal zarr metadata
-    // reads, but does not stage .zarray/meta.json files on disk.
-    // If stale AWS credentials are present, public buckets may reject the
-    // signed request even though the same object is readable anonymously.
-    try {
-        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, auth);
-    } catch (const std::exception& e) {
-        if (!spec.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
-            throw;
-        }
-
-        vc::HttpAuth anonymousAuth;
-        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, anonymousAuth);
-        auth = std::move(anonymousAuth);
-    }
 
     if (opened.shapes.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);

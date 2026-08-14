@@ -49,8 +49,21 @@ public:
     struct AdaptiveConcurrency {
         std::size_t minimum = 2;
         std::size_t maximum = 64;
+        // Rolling successful-transfer window used for displayed bandwidth.
         std::size_t successfulSamplesPerWorker = 4;
-        double targetInFlightSeconds = 0.25;
+        double minimumEpochSeconds = 2.0;
+        double maximumEpochSeconds = 5.0;
+        double unstableProbeIntervalSeconds = 60.0;
+        double stableProbeIntervalSeconds = 300.0;
+        double minimumStabilityObservationSeconds = 300.0;
+        double bandwidthChangeRatio = 2.0;
+        double throughputGainRatio = 1.08;
+        double maximumLatencyInflation = 1.75;
+        std::size_t initialProbeMultiplier = 4;
+        std::size_t refinementProbeMultiplier = 2;
+        std::size_t continuousSearchTurns = 5;
+        double lowerThroughputRetention = 0.95;
+        double lowerLatencyRatio = 0.85;
     };
 
     struct TransferStats {
@@ -59,6 +72,10 @@ public:
         double averageChunkBytes = 0.0;
         std::size_t sampleCount = 0;
         bool adaptive = false;
+        std::size_t targetAdmissionLimit = 0;
+        double longTermBytesPerSecond = 0.0;
+        double probeIntervalSeconds = 0.0;
+        bool probing = false;
     };
 
     explicit ChunkRequestScheduler(std::size_t workers,

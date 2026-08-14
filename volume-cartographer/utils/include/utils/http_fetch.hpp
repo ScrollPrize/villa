@@ -29,6 +29,8 @@ struct HttpResponse {
     std::vector<std::byte> body;
     std::string content_type;
     std::size_t content_length = 0;
+    // Populated when libcurl fails before an HTTP response is received.
+    std::string error_message;
 
     [[nodiscard]] bool ok() const noexcept { return status_code >= 200 && status_code < 300; }
     [[nodiscard]] bool not_found() const noexcept { return status_code == 404; }
