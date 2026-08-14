@@ -1,106 +1,131 @@
 # Task log
 
-## Audit findings
+## Planning audit
 
-- `CChunkedVolumeViewer::recalcPyramidLevel()` treats camera scale as
-  framebuffer pixels per level-0/base-volume voxel. That is the intended
-  view-wide contract, not a value to replace with local geometry estimates.
-- `PlaneSurface` already satisfies the contract: one surface parameter unit is
-  one level-0/base-volume voxel.
-- `QuadSurface` represents point-grid density with `scale`, in grid samples per
-  surface parameter unit. Correct producers can satisfy the same contract
-  without inspecting rendered volume coordinates.
-- Line ribbons violate the contract in `LineViewBuilder::buildRibbon()` by
-  always constructing `QuadSurface(points, {1,1})`. Existing tests use points
-  and cross offsets ten base voxels apart, for which `{0.1,0.1}` is the truthful
-  declaration.
-- Input line points are not guaranteed to have known or uniform spacing,
-  especially after mixed native/Lasagna reconstruction. Optimizer or tracer
-  step settings therefore cannot be reused as the strip's declared scale.
-- The derived strip can declare an exact scale by arclength-resampling the
-  current line. The chosen policy is a 50-base-voxel target maximum, with
-  `ceil(totalLength / 50)` uniform intervals and exact endpoint retention.
-- Cross-strip spacing is exactly known from half extent and `crossSamples`.
-  Auto-sized strips use the same 50-base-voxel target.
-- Resampling breaks the old implicit equivalence between original line index
-  and ribbon column. Generated-view controls, hover/focus, framing, linked cuts,
-  branches, and intersection views need an explicit bidirectional mapping.
-- Duplicate consecutive source points collapse to one arclength, so their
-  inverse mapping is necessarily canonical rather than one-to-one. A fully
-  zero-length line cannot define a ribbon scale and must fail.
-- Original-point up/frame arrays are consumed by cut planes and must remain
-  indexed like the model. Ribbon frames therefore form a separate resampled
-  data set; only ribbon consumers use the strip-position map.
-- Several UI paths directly interpret line positions as ribbon columns,
-  including held pre-update overlays and intersection inspection. The mapping
-  must be versioned with the generated surfaces and propagated through all of
-  those consumers.
-- Other transient `QuadSurface` producers also need an audit. Serialized
-  surfaces already carry a `scale` declaration; transient producers must supply
-  a valid declaration or fail at the render boundary.
-- `SurfaceCache` currently uses the same integer to select a source volume level
-  and derive its surface parameter-grid step. The source Zarr level is the only
-  LOD; the latter is an implementation detail that must remain derived.
-- The line-ribbon `{1,1}` declaration was introduced by `226fb35546` on
-  2026-05-26. Viewport demand publication in `e9416cc21` on 2026-08-12 exposed
-  the latent scale error by eagerly publishing the incorrectly fine working
-  set. The later fallback-range fix addressed a separate unit mismatch.
-- The generated-view scalebar shares the visible symptom only because the line
-  ribbon violates the declared parameter-unit contract. Once producers are
-  correct, the analytic camera/voxel calculation applies to every view.
+- PR #1453 has three current unresolved comments: synchronous full demand-point
+  scans on cursor movement, discarded refreshed fetchers for reused remote
+  source identities, and retained different-source overlay demand after opacity
+  becomes zero.
+- `ChunkCache::updateViewFocus()` currently enters the scheduler publication
+  gate, enumerates every shared source state, clears installed distances, scans
+  `PointIndex::nearestPerCollection()`, and reprioritizes demanded entries.
+- `CChunkedVolumeViewer` already owns the latest focus in `_lastScenePos` and
+  captures it in `PendingRenderJob::renderFocus`. No other component reads a
+  cache-service focus value, so adding a service-level focus map would duplicate
+  existing state.
+- `collectViewportDependencies()` samples on an 8-pixel stratified grid and
+  also uses a fixed 8-pixel per-chunk dedup radius. Those are separate concepts;
+  the latter should be the declared projected chunk footprint for that level.
+- The incorrect design was introduced in `e9416cc21a` (`Prioritize VC3D chunk
+  work by view focus`) on 2026-08-12. Its committed task plan explicitly chose
+  both the fixed 8-pixel dedup radius and mouse-time point-index recalculation.
+  No later commit lost a previously correct implementation.
+- Existing source registration validates metadata and returns the retained
+  source state without adopting newly opened fetchers. Canonical identity
+  intentionally excludes authentication, so temporary credential rotation
+  requires an explicit fetcher refresh lifecycle rather than a new identity.
+- Fetch/decode tasks currently dereference the source state's fetcher vector
+  outside its mutex. Refresh therefore requires tasks to retain an immutable
+  per-level fetcher `shared_ptr` captured with a generation under lock; directly
+  swapping the vector alone would introduce a data race and mixed-generation
+  decode behavior.
+- `ChunkCache::clearViewDemand()` currently traverses all source states in the
+  service. Disabling one different-source overlay therefore needs a distinct
+  source-scoped removal operation; calling the existing method after base
+  publication could also remove base demand.
+- Same-source overlays merge into base demand and should be removed by the next
+  base snapshot, not by clearing the shared source.
 
 ## Constraints confirmed
 
-- No finite differences over generated framebuffer coordinates.
-- No local or per-pixel LOD selection on warped surfaces.
-- No geometry-derived estimate for render LOD.
-- No reliance on input line points being evenly spaced.
-- No second surface or parameterization LOD.
-- One selected source Zarr level for the complete render.
-
-## Deviations
-
-- None.
-
-## Independent review
-
-- Completed after the uniform-resampling correction. All actionable findings
-  are reflected in `task_plan.md`.
+- Mouse and Agent Bridge pointer updates retain focus in the viewer and change
+  only the cache service's atomic active-view ID.
+- Accepted render publication owns occurrence-distance calculation and queue
+  reprioritization.
+- The 8-pixel value remains only the randomized sparse sampling interval.
+- Deduplication uses declared level transforms, chunk shape, and view scale; it
+  does not inspect generated-coordinate finite differences.
+- Refreshed credentials preserve decoded chunks and source identity while stale
+  source work cannot publish.
+- Overlay cleanup is source scoped and does not disturb base, other-view, or
+  background ownership.
+- Rendering numerics, LOD selection, and cache formats remain unchanged.
 
 ## Implementation
 
-- Added endpoint-preserving uniform arclength resampling of authoritative line
-  control points with a 50-base-voxel default target and exact reciprocal
-  `QuadSurface` scales in both ribbon directions.
-- Added `LineStripPositionMap`, including canonical duplicate-run inversion,
-  and propagated it through current/held annotation views, static/dynamic
-  overlays, controls, span labels, initial framing, overview recentering,
-  hover/context-menu inversion, and intersection-inspection strips.
-- Kept original-point frames/up vectors for cut planes and constructed separate
-  resampled ribbon frames pinned to the original frame orientation.
-- Changed initial generated-strip framing to use declared surface extents rather
-  than point-grid dimensions.
-- Added analytic source-level selection from each source pyramid's declared
-  transforms. Base and overlay now select independently; generated and plane
-  views both provide explicit pixels-per-base-voxel scale to fallback bounds.
-- Audited production `QuadSurface` constructors. The line ribbon was the only
-  affected transient VC3D producer declaring an incorrect hardcoded scale;
-  other production paths load serialized metadata or explicitly preserve or
-  derive scale.
+- Replaced `updateViewFocus()` with O(1) `markViewActive()`. The viewer retains
+  focus and accepted render jobs publish nearest per-chunk distances from their
+  local occurrence lists. Persistent cache snapshots no longer retain a
+  `PointIndex`; the now-unused `nearestPerCollection()` API and test were
+  removed.
+- Split sparse prepass spacing from occurrence deduplication. Each source level
+  now derives its dedup radius from the shared representative chunk-extent
+  helper and the render's declared pixels per base voxel. The same helper is
+  used by fallback-range selection.
+- Compatible source reuse now adopts new fetchers. A non-destructive fetcher
+  generation and immutable per-task fetcher context reject old probe/fetch/
+  decode results while retaining decoded chunks, listeners, source ID, LRU,
+  accounting, and persistent-cache state. Retained in-flight/error demand is
+  deterministically requeued; unowned stale in-flight entries are removed.
+- Added source-bound view-demand cleanup. Different-source overlay disable and
+  replacement close only that source's current view version, while same-source
+  overlays are replaced by the next base-only render. Overlay callbacks carry
+  an atomic attachment/opacity generation and verify current identity, opacity,
+  and close state on the UI thread.
+- Remote activity now tracks individual fetch serials per chunk so overlapping
+  old/new credential-generation reads cannot clear one another's activity.
+
+## Deviations
+
+- No functional requirements were deferred. The plan's proposed explicit
+  viewer/Agent Bridge overlay integration test was covered at the shared cache
+  lifecycle boundary because the existing offscreen bridge harness does not
+  expose pending source-demand internals; callback guards remain covered by the
+  VC3D compile path and code-level generation contract.
 
 ## Validation
 
-- Built `VC3D`, the line-view/generated-view tests, both chunked sampler test
-  targets, and the synthetic rendering fixture in the existing developer build.
-- All seven focused CTest cases passed:
-  `test_lasagna_line_view_surfaces`,
-  `test_line_annotation_generated_views`,
-  `test_chunked_plane_sampler_fallback`,
-  `test_chunked_plane_sampler`,
-  `test_chunked_plane_sampler_more`,
-  `test_render_synthetic_fixture`, and
-  `test_render_synthetic_fallback_1`.
-- The documented GCC 15 Release Valgrind rendering gate passed all eight
-  serial/parallel scenarios. Observed modeled-runtime ratios were 0.968x to
-  1.062x of reference, and all four parallel DRD graphs were complete.
-- `git diff --check` passed.
+- `cmake --build volume-cartographer/build --target test_chunk_cache test_chunked_plane_sampler test_point_index VC3D --parallel 4`
+- `volume-cartographer/build/bin/test_chunk_cache` (66 cases passed)
+- `volume-cartographer/build/bin/test_chunked_plane_sampler` (19 cases passed)
+- `volume-cartographer/build/bin/test_point_index` (26 cases passed)
+- `cmake --build volume-cartographer/build/ci-fast-core --target vc_test_core --parallel 4`
+- `ctest --test-dir volume-cartographer/build/ci-fast-core --output-on-failure --parallel 4 -L '^vc-core$'`
+  passed 130 of 131 tests. The unrelated `test_ink_detection_overlay`
+  attempted to write `/home/hendrik/.VC3D/current_project.json.tmp`, which is
+  outside the writable test sandbox. The three affected Clang-built tests were
+  rerun directly and all passed.
+- `ctest --test-dir volume-cartographer/build/ci-fast-core --output-on-failure -R '^(test_chunk_cache|test_chunked_plane_sampler|test_point_index)$'`
+- `ctest --test-dir volume-cartographer/build/ci-render-benchmark --output-on-failure -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'`
+- `cmake --build volume-cartographer/build/ci-render-benchmark --target render_valgrind_ci --parallel 4`
+  passed all serial and parallel scenarios. Modeled cost ranged from `0.967x`
+  to `1.048x` of the frozen reference.
+- `git diff --check`
+
+## Independent review
+
+- Completed against task, specification, overarching plan, current code, and
+  all PR #1453 comments.
+- The review proposed separate requested and scheduler-installed active-view
+  IDs. This was rejected after user review because no component needs a
+  separately installed value. There is one active view: mouse input changes it
+  in O(1), render publication performs explicit queue re-sorting, and normal
+  stage handoffs may consult the latest value when computing their own priority.
+- Follow-up code audit confirmed that scheduler code receives only a materialized
+  `ChunkWorkPriority::activeView` boolean and no other cache consumer reads the
+  active view ID. It also confirmed that focus is already viewer-owned and
+  captured per render job, eliminating the proposed service focus state.
+- It required `fetcherGeneration_` to remain separate from destructive cache
+  invalidation, immutable fetcher handles for persistent and fetched decode,
+  and guaranteed replacement of retained stale work.
+- It required removing the fixed-radius dependency API rather than merely
+  changing its default.
+- Its source-ID cleanup recommendation is represented as a source-bound facade
+  operation; an explicit source-ID argument would be redundant and could permit
+  a facade/source mismatch.
+- It added overlay callback generation checks and explicit same-source
+  opacity-zero behavior. All findings are incorporated in `task_plan.md`.
+- Final review found no rendering-numeric changes: sparse dependency discovery
+  changes only scheduler demand metadata, while sampling and compositing paths
+  are unchanged. The new state uses standard mutexes, atomics, containers, and
+  `shared_ptr` ownership without platform-specific assumptions.

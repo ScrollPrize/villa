@@ -28,8 +28,12 @@
   `VolumeSourceId`. Render-time `ChunkKey` construction, equality, and hashing
   use this fixed-width numeric ID and must not process or retain source strings.
 - Re-registering a source reuses its source state and validates immutable level,
-  transform, dtype, fill, and persistent-path metadata. Incompatible duplicate
-  registrations fail loudly.
+  transform, dtype, fill, persistent encoding, and persistent-path metadata.
+  Compatible registration atomically adopts the newly opened fetchers so
+  refreshed temporary credentials take effect without changing source ID or
+  evicting decoded chunks. Fetch/decode work retains its captured fetcher and
+  may publish only while both cache and fetcher generations match. Incompatible
+  duplicate registrations fail loudly.
 - Decoded data is heap-backed and globally constrained by the service's shared
   decoded-byte budget. Source state and resident entries survive A -> B -> A
   volume switches until global eviction or explicit source invalidation.
@@ -68,8 +72,12 @@
   `QuadSurface` parameter coordinates use those same units; camera scale is
   framebuffer pixels per base voxel for both. This fallback demand remains
   present on refinement renders until it resolves.
-  Nearby occurrences of the same chunk are deduplicated, but distant
-  occurrences on folded surfaces are retained.
+  Eight pixels is only the sparse probe-cell spacing. Nearby occurrences of the
+  same chunk are deduplicated using that level's projected representative chunk
+  footprint, computed analytically from chunk shape, declared level transform,
+  and framebuffer pixels per base voxel. Distant occurrences on folded
+  surfaces are retained. Invalid scale or transform metadata fails dependency
+  publication rather than silently reverting to the probe spacing.
 - The source volume/Zarr pyramid level is VC3D's only render LOD. One constant
   source level is selected analytically for each source over a complete render
   from camera scale and declared level transforms. Base and overlay sources may
@@ -86,10 +94,14 @@
   line spacing may be arbitrary; control points, cuts, and persistence remain
   in original line-position coordinates.
 - A completed pre-pass atomically replaces that source's previous snapshot for
-  the view. Snapshot construction and surface-coordinate generation occur
-  without the chunk-cache state lock. Older view versions cannot replace a
+  the view. The accepted render's captured focus is used locally to reduce each
+  chunk's retained occurrences to its nearest squared distance. Snapshot
+  construction, distance calculation, and surface-coordinate generation occur
+  without the chunk-cache state lock. Publication installs the complete demand
+  and re-sorts pending work atomically; older view versions cannot replace a
   newer snapshot.
-- Pending interactive work is ordered by active view, coarser pyramid level,
+- Pending interactive work is ordered by coarser view-relative pyramid level,
+  active view,
   nearest retained occurrence to that view's focus, then FIFO. A GUI miss not
   observed by the sparse pre-pass has no location and sorts after located work
   at the same view and relative level. It cannot outrank a located coarser
@@ -100,12 +112,19 @@
   ordering remains meaningful between terminal-level demands. Dependency
   publication is coarse-to-fine so
   workers cannot admit fine work before its coarse entries are visible.
-- Mouse interaction marks that view active and updates distances against its
-  retained point index. Before any pointer has been observed, viewport center
-  is the focus.
+- Mouse and Agent Bridge canvas interaction store focus in the viewer and mark
+  the service's active view with one atomic O(1) update. They do not scan demand,
+  query a retained point index, traverse sources, or explicitly re-sort queues.
+  Normal stage handoffs may consult the current active view; full pending-queue
+  re-sorting occurs when a completed render demand snapshot is published.
+  Before any pointer has been observed, viewport center is the captured focus.
 - One unresolved source/chunk entry may contain demand from several views.
   New snapshots promote already queued work in place instead of submitting a
-  duplicate task. Clearing a view removes only that view's demand.
+  duplicate task. Whole-view closure removes that view's demand from every
+  source. Disabling or replacing a different-source overlay closes only that
+  source's current view version, preserving base and other-view demand; a newer
+  overlay render version reopens it. Same-source overlay demand remains merged
+  with base demand and is removed by the next base-only snapshot.
 - Regular chunk work passes through three shared pending queues. A 32-worker
   local probe queue classifies persistent data, empty markers, and misses using
   filesystem metadata only. Cache hits enter an eight-worker CPU read/decode

@@ -2,6 +2,12 @@
 
 ## 2026-08-14
 
+- Restored render-owned chunk priority: mouse input now marks only the active
+  view, accepted renders publish captured-focus distances, and viewport
+  occurrences deduplicate by declared projected chunk footprint. Compatible
+  source reopen now adopts refreshed fetchers without evicting decoded chunks,
+  while inactive different-source overlays clear only their own demand and
+  reject obsolete queued callbacks.
 - Added 100 to interactive priority for each source's terminal pyramid level,
   ensuring the best available whole-view fallback loads before ordinary
   relative levels while retaining relative ordering between terminal demands.

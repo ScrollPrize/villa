@@ -125,7 +125,13 @@ the service interns it to a monotonic `VolumeSourceId`. Hot `ChunkKey` values
 contain only that integer plus level and chunk coordinates; paths, URIs,
 credentials, and disk-cache directories are absent from render-time hashes.
 Registering an existing identity validates immutable source metadata and fails
-if it is incompatible.
+if it is incompatible. A compatible registration adopts the newly opened
+per-level fetchers, which allows refreshed temporary credentials to recover an
+existing source without changing its numeric ID or dropping decoded chunks.
+Probe, source-read, persistent-decode, and fetched-decode tasks carry an
+immutable fetcher handle plus a separate fetcher generation. Work from an older
+fetcher may drain, but cannot advance stages or publish after refresh. Source
+identity, cache paths, and logs remain independent of credential material.
 
 The service retains one source-local entry map, LRU, request state, listeners,
 and diagnostics record per interned source. All source states use one aggregate
@@ -146,11 +152,29 @@ ownership is canceled, while already-running work may drain.
 
 Interactive VC3D renders publish versioned per-view demand before normal
 sampling starts. A sparse, stratified viewport probe associates missing chunks
-with all of their retained screen-space occurrences. Pending GUI work is then
-ordered by active view, coarse pyramid level, and distance to that view's last
-pointer position (or viewport center before pointer activity). Chunks missed by
-the probe still enter the GUI lane, without a location, and sort last within
-their view and level.
+with retained screen-space occurrences. The randomized 8-pixel probe interval
+controls coverage only. Occurrences are deduplicated per chunk and level by the
+chunk's projected representative footprint, derived from chunk shape, declared
+level transform, and the render's explicit pixels-per-base-voxel scale. This
+collapses planar duplicates while retaining spatially separate appearances of
+one chunk on folded surfaces.
+
+The viewer owns the latest pointer focus and captures it in each accepted render
+job. The render worker computes nearest per-chunk distances from its local
+occurrence list, then atomically publishes the complete demand snapshot and
+re-sorts pending work. Mouse and Agent Bridge canvas movement only atomically
+marks the active view; it never walks demand or scheduler entries. Pending GUI
+work is ordered by relative coarse level, active view, captured pointer distance
+(or viewport center before pointer activity), then FIFO. Chunks missed by the
+probe still enter the GUI lane without a location and sort last within their
+view and level.
+
+Whole-view closure clears that view across the shared service. Different-source
+overlay disable/replacement instead clears only the overlay facade's bound
+source and current render version, preserving base and other-view ownership.
+Queued overlay callbacks verify attachment/opacity generation before requesting
+another render. Same-source base and overlay demand remains merged and a
+base-only render replaces it normally.
 
 Plane and generated surface coordinates are declared in level-0/base-volume
 voxel units, so camera scale is framebuffer pixels per base voxel in every
