@@ -496,3 +496,18 @@
 - Halved anchor-to-anchor fiberlet DP spacing to 0.5 stored prediction voxels,
   with cached sign-invariant prediction/normal interpolation and unchanged
   base-coordinate artifacts.
+
+# 2026-08-14: full-reference dual fiber replay
+
+- Added independent reset-capable greedy and fiberlet whole-reference replay,
+  strict version-2 segmented artifacts, optional indexed failure
+  visualizations, and strict napari selection/reload.
+- Replaced whole-graph scoring preloads with deterministic on-demand curve
+  batches through the existing volume samplers and added a reproducible local
+  anchor/fiberlet extraction benchmark with sampling, DP, and peak-memory
+  diagnostics.
+- Replaced curve-batched fiberlet preparation with a global stage-parallel
+  pipeline: each candidate geometry is built once, native corners are globally
+  deduplicated independent of sampler batch size, and materialized nodes are
+  reused by parallel DP. Added actual per-stage process-CPU utilization and
+  coordinate-call diagnostics.

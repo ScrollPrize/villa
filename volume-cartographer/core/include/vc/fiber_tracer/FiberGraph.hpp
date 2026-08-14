@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include <cstddef>
 #include <optional>
@@ -49,20 +50,13 @@ struct FiberletGraph {
     std::vector<FiberletGraphTransition> transitions;
 };
 
-enum class FiberletGraphReplayStatus {
-    FailureWithPostroll,
-    FailureTruncated,
-    ReferenceEnd,
-    GraphExhausted,
-    NoUsableStart,
-};
-
 struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
     size_t lookaheadEdges = 3;
     double errorThresholdBaseVoxels = 20.0;
     double matchRefineSteps = 1.0;
-    double postrollDistanceBaseVoxels = 0.0;
+    double minimumResetAdvanceBaseVoxels = 1.0;
+    double referenceBeginArcBase = 0.0;
 };
 
 struct FiberletGraphReplayMatch {
@@ -75,34 +69,37 @@ struct FiberletGraphReplayMatch {
     double errorBaseVoxels = 0.0;
 };
 
-struct FiberletGraphReplayResult {
-    FiberletGraphReplayStatus status = FiberletGraphReplayStatus::NoUsableStart;
-    std::string reason;
+struct FiberletGraphReplaySegment {
+    double startReferenceArcBase = 0.0;
+    double endReferenceArcBase = 0.0;
+    std::string terminationReason;
     std::vector<cv::Vec3d> routePointsBaseXYZ;
     std::vector<size_t> candidateIndices;
     std::vector<size_t> arcIndices;
     std::vector<size_t> transitionIndices;
-    std::optional<size_t> failureCandidateIndex;
-    std::optional<size_t> failureCandidatePathPointIndex;
-    std::optional<size_t> failureArcIndex;
     std::optional<size_t> stopNodeIndex;
     std::vector<FiberletGraphReplayMatch> matches;
-    std::optional<size_t> failureRoutePointIndex;
-    std::optional<double> failureReferenceArcBase;
-    double requestedPostrollDistanceBaseVoxels = 0.0;
-    double completedPostrollDistanceBaseVoxels = 0.0;
     double totalLoss = 0.0;
     FiberletPathCost edgeCost;
     FiberletPathCost transitionCost;
     double pathLengthPredictionVoxels = 0.0;
 };
 
+struct FiberletGraphReplayResult {
+    double referenceBeginArcBase = 0.0;
+    double referenceEndArcBase = 0.0;
+    double completedReferenceArcBase = 0.0;
+    std::vector<FiberletGraphReplaySegment> segments;
+    std::vector<FiberReplayFailure> failures;
+};
+
 [[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximumJoinAngleDegrees = 45.0);
 
 [[nodiscard]] FiberletGraphReplayResult traceFiberletGraphReplay(
-    const FiberletGraph& graph, const std::vector<cv::Vec3d>& referencePointsBaseXYZ, const FiberletGraphReplayConfig& config);
-
-[[nodiscard]] const char* fiberletGraphReplayStatusName(FiberletGraphReplayStatus status) noexcept;
+    const FiberletGraph& graph,
+    const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const FiberletGraphReplayConfig& config,
+    const FiberReplayFailureCallback& failure = {});
 
 [[nodiscard]] nlohmann::json fiberletGraphJson(const FiberletGraph& graph);
 

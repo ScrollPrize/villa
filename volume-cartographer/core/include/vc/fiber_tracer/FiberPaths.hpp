@@ -43,6 +43,7 @@ struct FiberletPathConfig {
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
     double smoothnessFreeAngleDegrees = 0.0;
+    int samplingBatchCoordinates = 65536;
     int parallelThreads = 1;
 };
 
@@ -156,14 +157,31 @@ struct FiberletPathReport {
     FiberletPathConfig config;
     FiberletPathDiagnostics diagnostics;
     std::vector<FiberletCandidateResult> candidates;
-    size_t preloadedVoxels = 0;
+    size_t sampledVoxels = 0;
+    size_t peakCoordinateBatchVoxels = 0;
+    size_t samplingCoordinateBatches = 0;
+    size_t predictionSamplingCalls = 0;
+    size_t normalSamplingCalls = 0;
     size_t evaluatedDpNodes = 0;
-    size_t estimatedPreloadBytes = 0;
+    size_t preparedCandidates = 0;
+    size_t estimatedPeakOwnedBytes = 0;
     size_t candidateWorkers = 0;
     double candidateGenerationSeconds = 0.0;
-    double preloadSeconds = 0.0;
+    double candidateGenerationCpuSeconds = 0.0;
+    double preparationSeconds = 0.0;
+    double preparationCpuSeconds = 0.0;
+    double cornerMergeSeconds = 0.0;
+    double cornerMergeCpuSeconds = 0.0;
+    double predictionSamplingSeconds = 0.0;
+    double predictionSamplingCpuSeconds = 0.0;
+    double normalSamplingSeconds = 0.0;
+    double normalSamplingCpuSeconds = 0.0;
+    double samplingMaterializationSeconds = 0.0;
+    double samplingMaterializationCpuSeconds = 0.0;
     double searchSeconds = 0.0;
+    double searchCpuSeconds = 0.0;
     double elapsedSeconds = 0.0;
+    double elapsedCpuSeconds = 0.0;
 };
 
 struct FiberletArtifactInfo {
@@ -177,6 +195,7 @@ struct FiberletArtifactInfo {
 };
 
 struct FiberletPathProgress {
+    std::string phase;
     size_t completed = 0;
     size_t total = 0;
     double elapsedSeconds = 0.0;

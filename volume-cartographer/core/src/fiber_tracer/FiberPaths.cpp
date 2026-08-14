@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <opencv2/imgcodecs.hpp>
@@ -39,6 +41,12 @@ using Voxel = std::array<int64_t, 3>;  // XYZ
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kPi = 3.141592653589793238462643383279502884;
+
+double processCpuSeconds()
+{
+    const std::clock_t ticks = std::clock();
+    return ticks == static_cast<std::clock_t>(-1) ? 0.0 : static_cast<double>(ticks) / static_cast<double>(CLOCKS_PER_SEC);
+}
 
 struct VoxelHash {
     size_t operator()(const Voxel& voxel) const noexcept
@@ -108,34 +116,19 @@ struct ScoringVoxel {
     bool normalValid = false;
 };
 
-struct ScoringVolume {
-    Voxel begin{0, 0, 0};
-    std::array<size_t, 3> sizeXYZ{0, 0, 0};
-    std::vector<ScoringVoxel> voxels;
-    std::unordered_map<Voxel, ScoringVoxel, VoxelHash> sparseVoxels;
+struct InterpolationStencil {
+    Voxel lower{0, 0, 0};
+    std::array<double, 3> fraction{0.0, 0.0, 0.0};
+};
 
-    [[nodiscard]] size_t size() const noexcept { return voxels.empty() ? sparseVoxels.size() : voxels.size(); }
-
-    [[nodiscard]] const ScoringVoxel& at(const Voxel& voxel) const
-    {
-        if (voxels.empty()) {
-            const auto found = sparseVoxels.find(voxel);
-            if (found == sparseVoxels.end())
-                throw std::out_of_range("fiberlet scoring voxel is outside the sparse preload");
-            return found->second;
-        }
-        std::array<size_t, 3> local{};
-        for (size_t axis = 0; axis < 3; ++axis) {
-            if (voxel[axis] < begin[axis])
-                throw std::out_of_range("fiberlet scoring voxel is below the preloaded region");
-            const uint64_t delta = static_cast<uint64_t>(voxel[axis] - begin[axis]);
-            if (delta >= sizeXYZ[axis])
-                throw std::out_of_range("fiberlet scoring voxel is above the preloaded region");
-            local[axis] = static_cast<size_t>(delta);
-        }
-        const size_t index = (local[2] * sizeXYZ[1] + local[1]) * sizeXYZ[0] + local[0];
-        return voxels[index];
-    }
+struct PreparedCandidate {
+    CurvedDomain domain;
+    std::vector<SearchNode> nodes;
+    InterpolationStencil startStencil;
+    InterpolationStencil targetStencil;
+    std::vector<InterpolationStencil> nodeStencils;
+    ScoringVoxel startScoring;
+    ScoringVoxel targetScoring;
 };
 
 struct BackPointer {
@@ -369,12 +362,12 @@ cv::Vec3d localNodePoint(const CurvedDomain& domain, const LocalNodeKey& key, co
            layer.transverseV * (static_cast<double>(key.transverseV) * config.transverseStepPredictionVoxels);
 }
 
-SearchCorridor makeSearchCorridor(const FiberletCandidateResult& candidate, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config)
+SearchCorridor makeSearchCorridor(const CurvedDomain& domain, const FiberPredictionGridInfo& grid, int cellSize, const FiberletPathConfig& config)
 {
     SearchCorridor corridor;
     const double radius = config.corridorRadiusPredictionVoxels > 0.0 ? config.corridorRadiusPredictionVoxels : static_cast<double>(cellSize);
     corridor.radiusSquared = radius * radius;
-    corridor.reference = domainCenterline(makeCurvedDomain(candidate, config));
+    corridor.reference = domainCenterline(domain);
     cv::Vec3d minimum = corridor.reference.front();
     cv::Vec3d maximum = corridor.reference.front();
     for (const auto& point : corridor.reference) {
@@ -383,7 +376,7 @@ SearchCorridor makeSearchCorridor(const FiberletCandidateResult& candidate, cons
             maximum[axis] = std::max(maximum[axis], point[axis]);
         }
     }
-    for (const cv::Vec3d* endpoint : {&candidate.startPositionPredictionXYZ, &candidate.targetPositionPredictionXYZ}) {
+    for (const cv::Vec3d* endpoint : {&domain.layers.front().center, &domain.layers.back().center}) {
         for (int axis = 0; axis < 3; ++axis) {
             minimum[axis] = std::min(minimum[axis], std::floor((*endpoint)[axis]) - 1.0);
             maximum[axis] = std::max(maximum[axis], std::ceil((*endpoint)[axis]) + 1.0);
@@ -449,42 +442,45 @@ std::vector<LocalNodeKey> enumerateLocalNodes(
     return nodes;
 }
 
-std::vector<std::pair<Voxel, double>> interpolationCorners(const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
+InterpolationStencil makeInterpolationStencil(const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
 {
     if (!insidePredictionGrid(point, grid))
         throw std::out_of_range("fiberlet sample point is outside the prediction volume");
-    Voxel lower{};
-    Voxel upper{};
-    std::array<double, 3> fraction{};
-    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
+    InterpolationStencil stencil;
     for (size_t axis = 0; axis < 3; ++axis) {
-        lower[axis] = static_cast<int64_t>(std::floor(point[axis]));
-        upper[axis] = std::min<int64_t>(lower[axis] + 1, static_cast<int64_t>(shapeXYZ[axis] - 1));
-        fraction[axis] = point[axis] - static_cast<double>(lower[axis]);
+        stencil.lower[axis] = static_cast<int64_t>(std::floor(point[axis]));
+        stencil.fraction[axis] = point[axis] - static_cast<double>(stencil.lower[axis]);
     }
-    std::vector<std::pair<Voxel, double>> corners;
-    corners.reserve(8);
+    return stencil;
+}
+
+template <typename Callback>
+void forEachInterpolationCorner(const InterpolationStencil& stencil, const FiberPredictionGridInfo& grid, Callback&& callback)
+{
+    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
+    Voxel upper{};
+    for (size_t axis = 0; axis < 3; ++axis)
+        upper[axis] = std::min<int64_t>(stencil.lower[axis] + 1, static_cast<int64_t>(shapeXYZ[axis] - 1));
     for (int z = 0; z <= 1; ++z) {
-        const double wz = z == 0 ? 1.0 - fraction[2] : fraction[2];
+        const double wz = z == 0 ? 1.0 - stencil.fraction[2] : stencil.fraction[2];
         if (!(wz > 0.0))
             continue;
         for (int y = 0; y <= 1; ++y) {
-            const double wy = y == 0 ? 1.0 - fraction[1] : fraction[1];
+            const double wy = y == 0 ? 1.0 - stencil.fraction[1] : stencil.fraction[1];
             if (!(wy > 0.0))
                 continue;
             for (int x = 0; x <= 1; ++x) {
-                const double wx = x == 0 ? 1.0 - fraction[0] : fraction[0];
+                const double wx = x == 0 ? 1.0 - stencil.fraction[0] : stencil.fraction[0];
                 const double weight = wx * wy * wz;
-                if (weight > 0.0) {
-                    corners.push_back({{x == 0 ? lower[0] : upper[0], y == 0 ? lower[1] : upper[1], z == 0 ? lower[2] : upper[2]}, weight});
-                }
+                if (weight > 0.0)
+                    callback(Voxel{x == 0 ? stencil.lower[0] : upper[0], y == 0 ? stencil.lower[1] : upper[1], z == 0 ? stencil.lower[2] : upper[2]}, weight);
             }
         }
     }
-    return corners;
 }
 
-ScoringVoxel interpolateScoringVoxel(const ScoringVolume& volume, const cv::Vec3d& point, const FiberPredictionGridInfo& grid)
+template <typename Lookup>
+ScoringVoxel interpolateScoringStencil(const InterpolationStencil& stencil, const FiberPredictionGridInfo& grid, Lookup&& lookup)
 {
     ScoringVoxel output;
     cv::Matx33d predictionTensor = cv::Matx33d::zeros();
@@ -496,8 +492,8 @@ ScoringVoxel interpolateScoringVoxel(const ScoringVolume& volume, const cv::Vec3
     std::optional<cv::Vec3d> firstPredictionAxis;
     std::optional<cv::Vec3d> firstNormalAxis;
     double presence = 0.0;
-    for (const auto& [corner, weight] : interpolationCorners(point, grid)) {
-        const auto& sample = volume.at(corner);
+    forEachInterpolationCorner(stencil, grid, [&](const Voxel& corner, double weight) {
+        const auto& sample = lookup(corner);
         const double directionNorm2 = sample.prediction.direction.dot(sample.prediction.direction);
         if (!sample.prediction.valid || !finiteVector(sample.prediction.direction) || !std::isfinite(sample.prediction.presence) ||
             !(directionNorm2 > kEpsilon) || !std::isfinite(directionNorm2)) {
@@ -523,7 +519,7 @@ ScoringVoxel interpolateScoringVoxel(const ScoringVolume& volume, const cv::Vec3
                 normalAxesIdentical = false;
             normalTensor += fiberAxisTensor(axis, weight);
         }
-    }
+    });
     if (predictionValid && std::isfinite(presence)) {
         const auto principal = principalFiberAxis(predictionTensor);
         if (predictionAxesIdentical && firstPredictionAxis.has_value()) {
@@ -565,140 +561,68 @@ size_t checkedSum(size_t left, size_t right, const char* description)
     return left + right;
 }
 
-ScoringVolume preloadScoringVolume(
-    const std::vector<FiberletCandidateResult>& candidates,
-    const std::vector<size_t>& searchCandidateIndices,
+bool storedVoxelLess(const Voxel& left, const Voxel& right)
+{
+    return storedIndex(left) < storedIndex(right);
+}
+
+void addStencilCorners(const InterpolationStencil& stencil, const FiberPredictionGridInfo& grid, std::unordered_set<Voxel, VoxelHash>& corners)
+{
+    forEachInterpolationCorner(stencil, grid, [&](const Voxel& corner, double) { corners.insert(corner); });
+}
+
+PreparedCandidate prepareCandidate(
+    const FiberletCandidateResult& candidate,
     const FiberPredictionGridInfo& grid,
     int cellSize,
     const FiberletPathConfig& config,
-    const FiberStoredPredictionBatchSampler& predictionSampler,
-    const vc::lasagna::NormalSampler& normalSampler,
-    size_t& estimatedPreloadBytes,
-    size_t& evaluatedNodeCount,
-    const FiberletPointPredicate& pointPredicate)
+    const FiberletPointPredicate& pointPredicate,
+    std::unordered_set<Voxel, VoxelHash>& corners)
 {
-    ScoringVolume volume;
-    estimatedPreloadBytes = 0;
-    evaluatedNodeCount = 0;
-    if (searchCandidateIndices.empty())
-        return volume;
+    PreparedCandidate prepared;
+    prepared.domain = makeCurvedDomain(candidate, config);
+    const SearchCorridor corridor = makeSearchCorridor(prepared.domain, grid, cellSize, config);
+    const auto localKeys = enumerateLocalNodes(prepared.domain, corridor, config, grid, pointPredicate);
+    prepared.nodes.reserve(localKeys.size());
+    prepared.nodeStencils.reserve(localKeys.size());
+    prepared.startStencil = makeInterpolationStencil(candidate.startPositionPredictionXYZ, grid);
+    prepared.targetStencil = makeInterpolationStencil(candidate.targetPositionPredictionXYZ, grid);
+    addStencilCorners(prepared.startStencil, grid, corners);
+    addStencilCorners(prepared.targetStencil, grid, corners);
+    for (const auto& key : localKeys) {
+        const cv::Vec3d point = localNodePoint(prepared.domain, key, config);
+        prepared.nodes.push_back({key, point, {}, {}});
+        prepared.nodeStencils.push_back(makeInterpolationStencil(point, grid));
+        addStencilCorners(prepared.nodeStencils.back(), grid, corners);
+    }
+    return prepared;
+}
 
-    bool initialized = false;
-    Voxel unionBegin{};
-    Voxel unionEnd{};
-    for (const size_t candidateIndex : searchCandidateIndices) {
-        const SearchCorridor corridor = makeSearchCorridor(candidates.at(candidateIndex), grid, cellSize, config);
-        if (!initialized) {
-            unionBegin = corridor.begin;
-            unionEnd = corridor.end;
-            initialized = true;
-            continue;
-        }
-        for (size_t axis = 0; axis < 3; ++axis) {
-            unionBegin[axis] = std::min(unionBegin[axis], corridor.begin[axis]);
-            unionEnd[axis] = std::max(unionEnd[axis], corridor.end[axis]);
-        }
-    }
-    volume.begin = unionBegin;
-    for (size_t axis = 0; axis < 3; ++axis) {
-        if (unionEnd[axis] < unionBegin[axis])
-            throw std::logic_error("fiberlet preload produced an empty scoring bound");
-        const uint64_t extent = static_cast<uint64_t>(unionEnd[axis] - unionBegin[axis]) + 1;
-        if (extent > std::numeric_limits<size_t>::max())
-            throw std::overflow_error("fiberlet preload extent exceeds size_t");
-        volume.sizeXYZ[axis] = static_cast<size_t>(extent);
-    }
-    const size_t xy = checkedProduct(volume.sizeXYZ[0], volume.sizeXYZ[1], "fiberlet preload XY extent");
-    const size_t denseCount = checkedProduct(xy, volume.sizeXYZ[2], "fiberlet preload voxel count");
-    std::set<Voxel> sparseKeys;
-    for (const size_t candidateIndex : searchCandidateIndices) {
-        const auto& candidate = candidates.at(candidateIndex);
-        const CurvedDomain domain = makeCurvedDomain(candidate, config);
-        const SearchCorridor corridor = makeSearchCorridor(candidate, grid, cellSize, config);
-        const auto localNodes = enumerateLocalNodes(domain, corridor, config, grid, pointPredicate);
-        evaluatedNodeCount = checkedSum(
-            evaluatedNodeCount, checkedSum(localNodes.size(), 2, "fiberlet evaluated node count"), "fiberlet evaluated node count");
-        if (pointPredicate) {
-            const auto addPoint = [&](const cv::Vec3d& point) {
-                for (const auto& [corner, weight] : interpolationCorners(point, grid)) {
-                    (void)weight;
-                    sparseKeys.insert(corner);
-                }
-            };
-            addPoint(candidate.startPositionPredictionXYZ);
-            addPoint(candidate.targetPositionPredictionXYZ);
-            for (const auto& key : localNodes) {
-                addPoint(localNodePoint(domain, key, config));
-            }
-        }
-    }
-    const size_t count = pointPredicate ? sparseKeys.size() : denseCount;
-    if (count > static_cast<size_t>(std::numeric_limits<std::ptrdiff_t>::max()))
-        throw std::length_error("fiberlet preload exceeds sampler index range");
+std::vector<Voxel> mergeSortedUnique(const std::vector<Voxel>& left, const std::vector<Voxel>& right)
+{
+    std::vector<Voxel> merged;
+    merged.reserve(checkedSum(left.size(), right.size(), "fiberlet corner merge size"));
+    std::merge(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(merged), storedVoxelLess);
+    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    return merged;
+}
 
-    std::vector<std::array<size_t, 3>> indices;
-    std::vector<cv::Vec3d> normalPoints;
-    std::vector<FiberStoredPredictionSample> predictions;
-    std::vector<vc::lasagna::NormalSampleWithDerivative> normals;
-    if (count > volume.voxels.max_size() || count > indices.max_size() || count > normalPoints.max_size() ||
-        count > predictions.max_size() || count > normals.max_size()) {
-        throw std::length_error("fiberlet preload exceeds a working vector capacity");
+size_t preparedPayloadBytes(const std::vector<PreparedCandidate>& prepared)
+{
+    size_t bytes = checkedProduct(prepared.capacity(), sizeof(PreparedCandidate), "fiberlet prepared byte estimate");
+    for (const auto& item : prepared) {
+        bytes = checkedSum(
+            bytes,
+            checkedSum(
+                checkedSum(
+                    checkedProduct(item.domain.layers.capacity(), sizeof(CurvedLayer), "fiberlet prepared byte estimate"),
+                    checkedProduct(item.nodes.capacity(), sizeof(SearchNode), "fiberlet prepared byte estimate"),
+                    "fiberlet prepared byte estimate"),
+                checkedProduct(item.nodeStencils.capacity(), sizeof(InterpolationStencil), "fiberlet prepared byte estimate"),
+                "fiberlet prepared byte estimate"),
+            "fiberlet prepared byte estimate");
     }
-    const size_t bytesPerVoxel = checkedSum(
-        checkedSum(
-            checkedSum(sizeof(ScoringVoxel), sizeof(std::array<size_t, 3>), "fiberlet preload byte estimate"),
-            sizeof(cv::Vec3d),
-            "fiberlet preload byte estimate"),
-        checkedSum(sizeof(FiberStoredPredictionSample), sizeof(vc::lasagna::NormalSampleWithDerivative), "fiberlet preload byte estimate"),
-        "fiberlet preload byte estimate");
-    estimatedPreloadBytes = checkedProduct(count, bytesPerVoxel, "fiberlet preload byte estimate");
-
-    indices.reserve(count);
-    normalPoints.reserve(count);
-    std::vector<Voxel> orderedVoxels;
-    orderedVoxels.reserve(count);
-    if (pointPredicate) {
-        for (const auto& voxel : sparseKeys) {
-            orderedVoxels.push_back(voxel);
-            indices.push_back(storedIndex(voxel));
-            normalPoints.push_back(nativeVoxelPoint(voxel));
-        }
-    } else {
-        for (int64_t z = unionBegin[2]; z <= unionEnd[2]; ++z) {
-            for (int64_t y = unionBegin[1]; y <= unionEnd[1]; ++y) {
-                for (int64_t x = unionBegin[0]; x <= unionEnd[0]; ++x) {
-                    const Voxel voxel{x, y, z};
-                    orderedVoxels.push_back(voxel);
-                    indices.push_back(storedIndex(voxel));
-                    normalPoints.push_back(nativeVoxelPoint(voxel));
-                }
-            }
-        }
-    }
-    if (indices.size() != count || normalPoints.size() != count)
-        throw std::logic_error("fiberlet preload enumeration is incomplete");
-    predictionSampler(indices, config.parallelThreads, predictions);
-    if (predictions.size() != count)
-        throw std::runtime_error("fiberlet prediction sampler returned the wrong preload sample count");
-    (void)normalSampler.sampleNormalBatch(normalPoints, false, config.parallelThreads, normals);
-    if (normals.size() != count)
-        throw std::runtime_error("fiberlet normal sampler returned the wrong preload sample count");
-
-    if (pointPredicate) {
-        volume.sparseVoxels.reserve(count * 2);
-        for (size_t index = 0; index < count; ++index) {
-            volume.sparseVoxels
-                .emplace(orderedVoxels[index], ScoringVoxel{predictions[index], normals[index].sample.normal, normals[index].sample.valid});
-        }
-    } else {
-        volume.voxels.resize(count);
-        for (size_t index = 0; index < count; ++index) {
-            volume.voxels[index].prediction = predictions[index];
-            volume.voxels[index].normal = normals[index].sample.normal;
-            volume.voxels[index].normalValid = normals[index].sample.valid;
-        }
-    }
-    return volume;
+    return bytes;
 }
 
 bool usablePrediction(const FiberStoredPredictionSample& prediction)
@@ -779,13 +703,7 @@ bool betterCost(double candidate, double current)
     return candidate < current;
 }
 
-FiberletCandidateResult solveCandidate(
-    FiberletCandidateResult candidate,
-    const FiberPredictionGridInfo& grid,
-    int cellSize,
-    const FiberletPathConfig& config,
-    const ScoringVolume& scoringVolume,
-    const FiberletPointPredicate& pointPredicate)
+FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const FiberletPathConfig& config, const PreparedCandidate& prepared)
 {
     candidate.searched = true;
     const cv::Vec3d chordVector = candidate.targetPositionPredictionXYZ - candidate.startPositionPredictionXYZ;
@@ -796,11 +714,10 @@ FiberletCandidateResult solveCandidate(
     }
     const double maximumAngle = config.maximumEndpointAngleDegrees * kPi / 180.0;
     const double maximumPredictionDeviation = config.maximumPredictionDeviationDegrees * kPi / 180.0;
-    const CurvedDomain domain = makeCurvedDomain(candidate, config);
-    const SearchCorridor corridor = makeSearchCorridor(candidate, grid, cellSize, config);
-    const auto localKeys = enumerateLocalNodes(domain, corridor, config, grid, pointPredicate);
-    const ScoringVoxel startScoring = interpolateScoringVoxel(scoringVolume, candidate.startPositionPredictionXYZ, grid);
-    const ScoringVoxel targetScoring = interpolateScoringVoxel(scoringVolume, candidate.targetPositionPredictionXYZ, grid);
+    const auto& domain = prepared.domain;
+    const auto& nodes = prepared.nodes;
+    const auto& startScoring = prepared.startScoring;
+    const auto& targetScoring = prepared.targetScoring;
     candidate.startPrediction = startScoring.prediction;
     candidate.targetPrediction = targetScoring.prediction;
     candidate.startNormalXYZ = startScoring.normal;
@@ -833,16 +750,9 @@ FiberletCandidateResult solveCandidate(
         candidate.reason = "success";
         return candidate;
     }
-    if (localKeys.empty()) {
+    if (nodes.empty()) {
         candidate.reason = "empty_corridor";
         return candidate;
-    }
-    std::vector<SearchNode> nodes;
-    nodes.reserve(localKeys.size());
-    for (const auto& key : localKeys) {
-        const cv::Vec3d point = localNodePoint(domain, key, config);
-        const ScoringVoxel scoring = interpolateScoringVoxel(scoringVolume, point, grid);
-        nodes.push_back({key, point, scoring.prediction, {scoring.normal, scoring.normalValid, scoring.normalValid ? std::string{} : "invalid preloaded normal"}});
     }
     std::unordered_map<LocalNodeKey, size_t, LocalNodeKeyHash> nodeIndex;
     nodeIndex.reserve(checkedProduct(nodes.size(), 2, "fiberlet DP node hash capacity"));
@@ -1323,6 +1233,8 @@ void validateFiberletPathConfig(const FiberletPathConfig& config)
         !finiteNonnegative(config.smoothnessFreeAngleDegrees)) {
         throw std::invalid_argument("fiberlet objective weights and angles must be finite and non-negative");
     }
+    if (config.samplingBatchCoordinates < 1)
+        throw std::invalid_argument("fiberlet sampling batch size must be positive");
     if (config.parallelThreads < 1)
         throw std::invalid_argument("fiberlet thread count must be positive");
 }
@@ -1694,6 +1606,7 @@ FiberletPathReport traceFiberletPaths(
         report.config.corridorRadiusPredictionVoxels = static_cast<double>(report.anchorCellSizePredictionVoxels);
     }
     const auto startTime = Clock::now();
+    const double startCpuSeconds = processCpuSeconds();
     const auto flat = flattenAnchors(anchors.report);
     report.diagnostics.occupiedAnchors = flat.size();
     const auto offsets = fiberletCellNeighborhoodOffsets(report.config.cellRadius, report.config.neighborhoodMarginCells);
@@ -1767,55 +1680,41 @@ FiberletPathReport traceFiberletPaths(
     }
     const auto candidateGenerationEnd = Clock::now();
     report.candidateGenerationSeconds = std::chrono::duration<double>(candidateGenerationEnd - startTime).count();
+    report.candidateGenerationCpuSeconds = processCpuSeconds() - startCpuSeconds;
 
-    ScoringVolume scoringVolume;
-    if (!searchCandidateIndices.empty()) {
-        scoringVolume = preloadScoringVolume(
-            report.candidates,
-            searchCandidateIndices,
-            grid,
-            report.anchorCellSizePredictionVoxels,
-            report.config,
-            predictionSampler,
-            normalSampler,
-            report.estimatedPreloadBytes,
-            report.evaluatedDpNodes,
-            pointPredicate);
-        report.preloadedVoxels = scoringVolume.size();
-    }
-    const auto preloadEnd = Clock::now();
-    report.preloadSeconds = std::chrono::duration<double>(preloadEnd - candidateGenerationEnd).count();
-
-    std::vector<std::exception_ptr> errors(searchCandidateIndices.size());
-    std::atomic<size_t> nextSearch{0};
-    std::atomic<size_t> completedSearches{0};
-    const size_t workerCount = std::min(searchCandidateIndices.size(), static_cast<size_t>(report.config.parallelThreads));
-    report.candidateWorkers = workerCount;
     std::mutex progressMutex;
-    size_t lastReportedCompleted = 0;
-    auto lastProgressTime = preloadEnd;
     std::exception_ptr progressError;
-    const auto reportProgress = [&](bool terminal) noexcept {
+    std::string progressPhase;
+    size_t lastReportedCompleted = 0;
+    auto lastProgressTime = candidateGenerationEnd;
+    const auto reportProgress = [&](const char* phase, size_t completed, size_t total, const Clock::time_point& phaseStart, bool terminal) noexcept {
         if (!progressCallback)
             return;
         std::lock_guard lock(progressMutex);
         if (progressError)
             return;
-        const size_t completed = completedSearches.load(std::memory_order_relaxed);
-        const size_t total = searchCandidateIndices.size();
         const auto now = Clock::now();
-        if (!terminal) {
-            if (completed <= lastReportedCompleted || completed >= total || now - lastProgressTime < std::chrono::seconds(1)) {
+        const bool phaseChanged = progressPhase != phase;
+        if (phaseChanged) {
+            progressPhase = phase;
+            lastReportedCompleted = 0;
+            lastProgressTime = phaseStart;
+        }
+        if (!phaseChanged) {
+            if (!terminal) {
+                if (completed <= lastReportedCompleted || completed >= total || now - lastProgressTime < std::chrono::seconds(1)) {
+                    return;
+                }
+            } else if (total > 0 && completed == lastReportedCompleted) {
                 return;
             }
-        } else if (total > 0 && lastReportedCompleted >= total) {
-            return;
         }
         try {
             progressCallback({
+                phase,
                 completed,
                 total,
-                std::chrono::duration<double>(now - preloadEnd).count(),
+                std::chrono::duration<double>(now - phaseStart).count(),
             });
             lastReportedCompleted = completed;
             lastProgressTime = now;
@@ -1823,33 +1722,295 @@ FiberletPathReport traceFiberletPaths(
             progressError = std::current_exception();
         }
     };
-    const auto worker = [&]() {
+    const size_t workerCount = std::min(searchCandidateIndices.size(), static_cast<size_t>(report.config.parallelThreads));
+    report.candidateWorkers = workerCount;
+    std::vector<PreparedCandidate> prepared(searchCandidateIndices.size());
+    std::vector<std::unordered_set<Voxel, VoxelHash>> workerCorners(workerCount);
+    std::vector<std::exception_ptr> errors(searchCandidateIndices.size());
+
+    const auto preparationStart = Clock::now();
+    const double preparationCpuStart = processCpuSeconds();
+    reportProgress("preparation", 0, searchCandidateIndices.size(), preparationStart, true);
+    std::atomic<size_t> nextPreparation{0};
+    std::atomic<size_t> completedPreparation{0};
+    const auto preparationWorker = [&](size_t workerIndex) {
+        auto& corners = workerCorners[workerIndex];
+        while (true) {
+            const size_t searchIndex = nextPreparation.fetch_add(1, std::memory_order_relaxed);
+            if (searchIndex >= searchCandidateIndices.size())
+                return;
+            try {
+                prepared[searchIndex] = prepareCandidate(
+                    report.candidates[searchCandidateIndices[searchIndex]], grid, report.anchorCellSizePredictionVoxels, report.config, pointPredicate, corners);
+            } catch (...) {
+                errors[searchIndex] = std::current_exception();
+            }
+            const size_t completed = completedPreparation.fetch_add(1, std::memory_order_relaxed) + 1;
+            reportProgress("preparation", completed, searchCandidateIndices.size(), preparationStart, false);
+        }
+    };
+    if (workerCount == 1) {
+        preparationWorker(0);
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (size_t index = 0; index < workerCount; ++index)
+            workers.emplace_back(preparationWorker, index);
+        for (auto& thread : workers)
+            thread.join();
+    }
+    reportProgress("preparation", searchCandidateIndices.size(), searchCandidateIndices.size(), preparationStart, true);
+    report.preparationSeconds = std::chrono::duration<double>(Clock::now() - preparationStart).count();
+    report.preparationCpuSeconds = processCpuSeconds() - preparationCpuStart;
+    for (const auto& error : errors) {
+        if (error)
+            std::rethrow_exception(error);
+    }
+    report.preparedCandidates = prepared.size();
+    for (const auto& item : prepared) {
+        report.evaluatedDpNodes = checkedSum(
+            report.evaluatedDpNodes, checkedSum(item.nodes.size(), 2, "fiberlet evaluated node count"), "fiberlet evaluated node count");
+    }
+    size_t preparedBytes = preparedPayloadBytes(prepared);
+    size_t workerCornerBytes = 0;
+    for (const auto& corners : workerCorners) {
+        workerCornerBytes = checkedSum(
+            workerCornerBytes,
+            checkedProduct(corners.size(), sizeof(Voxel), "fiberlet corner byte estimate"),
+            "fiberlet corner byte estimate");
+    }
+    report.estimatedPeakOwnedBytes = checkedSum(preparedBytes, workerCornerBytes, "fiberlet peak owned byte estimate");
+
+    const auto cornerMergeStart = Clock::now();
+    const double cornerMergeCpuStart = processCpuSeconds();
+    reportProgress("corner_merge", 0, workerCorners.size(), cornerMergeStart, true);
+    std::vector<std::vector<Voxel>> cornerVectors(workerCorners.size());
+    for (size_t index = 0; index < workerCorners.size(); ++index) {
+        cornerVectors[index].assign(workerCorners[index].begin(), workerCorners[index].end());
+        std::sort(cornerVectors[index].begin(), cornerVectors[index].end(), storedVoxelLess);
+    }
+    size_t sortedCornerBytes = 0;
+    for (const auto& corners : cornerVectors) {
+        sortedCornerBytes = checkedSum(
+            sortedCornerBytes,
+            checkedProduct(corners.capacity(), sizeof(Voxel), "fiberlet sorted corner byte estimate"),
+            "fiberlet sorted corner byte estimate");
+    }
+    report.estimatedPeakOwnedBytes = std::
+        max(report.estimatedPeakOwnedBytes,
+            checkedSum(
+                checkedSum(preparedBytes, workerCornerBytes, "fiberlet peak owned byte estimate"),
+                sortedCornerBytes,
+                "fiberlet peak owned byte estimate"));
+    workerCorners.clear();
+    workerCorners.shrink_to_fit();
+    while (cornerVectors.size() > 1) {
+        const size_t pairCount = cornerVectors.size() / 2;
+        std::vector<std::vector<Voxel>> next((cornerVectors.size() + 1) / 2);
+        std::atomic<size_t> nextPair{0};
+        std::vector<std::exception_ptr> mergeErrors(pairCount);
+        const auto mergeWorker = [&]() {
+            while (true) {
+                const size_t pair = nextPair.fetch_add(1, std::memory_order_relaxed);
+                if (pair >= pairCount)
+                    return;
+                try {
+                    next[pair] = mergeSortedUnique(cornerVectors[pair * 2], cornerVectors[pair * 2 + 1]);
+                } catch (...) {
+                    mergeErrors[pair] = std::current_exception();
+                }
+            }
+        };
+        const size_t mergeWorkers = std::min(pairCount, static_cast<size_t>(report.config.parallelThreads));
+        if (mergeWorkers == 1) {
+            mergeWorker();
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(mergeWorkers);
+            for (size_t index = 0; index < mergeWorkers; ++index)
+                workers.emplace_back(mergeWorker);
+            for (auto& thread : workers)
+                thread.join();
+        }
+        for (const auto& error : mergeErrors) {
+            if (error)
+                std::rethrow_exception(error);
+        }
+        if (cornerVectors.size() % 2 != 0)
+            next.back() = std::move(cornerVectors.back());
+        cornerVectors = std::move(next);
+    }
+    std::vector<Voxel> orderedVoxels;
+    if (!cornerVectors.empty())
+        orderedVoxels = std::move(cornerVectors.front());
+    reportProgress("corner_merge", workerCount, workerCount, cornerMergeStart, true);
+    report.cornerMergeSeconds = std::chrono::duration<double>(Clock::now() - cornerMergeStart).count();
+    report.cornerMergeCpuSeconds = processCpuSeconds() - cornerMergeCpuStart;
+    report.sampledVoxels = orderedVoxels.size();
+
+    const size_t coordinateBatchSize = static_cast<size_t>(report.config.samplingBatchCoordinates);
+    report.peakCoordinateBatchVoxels = std::min(coordinateBatchSize, orderedVoxels.size());
+    report.samplingCoordinateBatches = orderedVoxels.empty() ? 0 : (orderedVoxels.size() - 1) / coordinateBatchSize + 1;
+    std::vector<ScoringVoxel> scoringVoxels(orderedVoxels.size());
+    const size_t sampledArrayBytes = checkedSum(
+        checkedProduct(orderedVoxels.capacity(), sizeof(Voxel), "fiberlet sampled byte estimate"),
+        checkedProduct(scoringVoxels.capacity(), sizeof(ScoringVoxel), "fiberlet sampled byte estimate"),
+        "fiberlet sampled byte estimate");
+    report.estimatedPeakOwnedBytes =
+        std::max(report.estimatedPeakOwnedBytes, checkedSum(preparedBytes, sampledArrayBytes, "fiberlet peak owned byte estimate"));
+    const auto predictionStart = Clock::now();
+    const double predictionCpuStart = processCpuSeconds();
+    reportProgress("prediction_sampling", 0, orderedVoxels.size(), predictionStart, true);
+    for (size_t begin = 0; begin < orderedVoxels.size(); begin += coordinateBatchSize) {
+        const size_t end = std::min(orderedVoxels.size(), begin + coordinateBatchSize);
+        std::vector<std::array<size_t, 3>> indices;
+        indices.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index)
+            indices.push_back(storedIndex(orderedVoxels[index]));
+        std::vector<FiberStoredPredictionSample> samples;
+        predictionSampler(indices, report.config.parallelThreads, samples);
+        if (samples.size() != indices.size())
+            throw std::runtime_error("fiberlet prediction sampler returned the wrong coordinate batch sample count");
+        for (size_t index = 0; index < samples.size(); ++index)
+            scoringVoxels[begin + index].prediction = samples[index];
+        ++report.predictionSamplingCalls;
+        reportProgress("prediction_sampling", end, orderedVoxels.size(), predictionStart, false);
+    }
+    reportProgress("prediction_sampling", orderedVoxels.size(), orderedVoxels.size(), predictionStart, true);
+    report.predictionSamplingSeconds = std::chrono::duration<double>(Clock::now() - predictionStart).count();
+    report.predictionSamplingCpuSeconds = processCpuSeconds() - predictionCpuStart;
+
+    const auto normalStart = Clock::now();
+    const double normalCpuStart = processCpuSeconds();
+    reportProgress("normal_sampling", 0, orderedVoxels.size(), normalStart, true);
+    for (size_t begin = 0; begin < orderedVoxels.size(); begin += coordinateBatchSize) {
+        const size_t end = std::min(orderedVoxels.size(), begin + coordinateBatchSize);
+        std::vector<cv::Vec3d> points;
+        points.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index)
+            points.push_back(nativeVoxelPoint(orderedVoxels[index]));
+        std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+        (void)normalSampler.sampleNormalBatch(points, false, report.config.parallelThreads, samples);
+        if (samples.size() != points.size())
+            throw std::runtime_error("fiberlet normal sampler returned the wrong coordinate batch sample count");
+        for (size_t index = 0; index < samples.size(); ++index) {
+            scoringVoxels[begin + index].normal = samples[index].sample.normal;
+            scoringVoxels[begin + index].normalValid = samples[index].sample.valid;
+        }
+        ++report.normalSamplingCalls;
+        reportProgress("normal_sampling", end, orderedVoxels.size(), normalStart, false);
+    }
+    reportProgress("normal_sampling", orderedVoxels.size(), orderedVoxels.size(), normalStart, true);
+    report.normalSamplingSeconds = std::chrono::duration<double>(Clock::now() - normalStart).count();
+    report.normalSamplingCpuSeconds = processCpuSeconds() - normalCpuStart;
+
+    const auto materializationStart = Clock::now();
+    const double materializationCpuStart = processCpuSeconds();
+    reportProgress("materialization", 0, prepared.size(), materializationStart, true);
+    std::unordered_map<Voxel, size_t, VoxelHash> voxelIndices;
+    voxelIndices.reserve(checkedProduct(orderedVoxels.size(), 2, "fiberlet scoring index capacity"));
+    for (size_t index = 0; index < orderedVoxels.size(); ++index)
+        voxelIndices.emplace(orderedVoxels[index], index);
+    const size_t scoringIndexPayloadBytes = checkedProduct(
+        voxelIndices.size(),
+        checkedSum(sizeof(Voxel), sizeof(size_t), "fiberlet scoring index byte estimate"),
+        "fiberlet scoring index byte estimate");
+    report.estimatedPeakOwnedBytes = std::
+        max(report.estimatedPeakOwnedBytes,
+            checkedSum(
+                checkedSum(preparedBytes, sampledArrayBytes, "fiberlet peak owned byte estimate"),
+                scoringIndexPayloadBytes,
+                "fiberlet peak owned byte estimate"));
+    errors.assign(prepared.size(), {});
+    std::atomic<size_t> nextMaterialization{0};
+    std::atomic<size_t> completedMaterialization{0};
+    const auto materializationWorker = [&]() {
+        while (true) {
+            const size_t searchIndex = nextMaterialization.fetch_add(1, std::memory_order_relaxed);
+            if (searchIndex >= prepared.size())
+                return;
+            try {
+                auto& item = prepared[searchIndex];
+                const auto lookup = [&](const Voxel& voxel) -> const ScoringVoxel& {
+                    const auto found = voxelIndices.find(voxel);
+                    if (found == voxelIndices.end())
+                        throw std::logic_error("prepared fiberlet stencil references an unsampled voxel");
+                    return scoringVoxels[found->second];
+                };
+                item.startScoring = interpolateScoringStencil(item.startStencil, grid, lookup);
+                item.targetScoring = interpolateScoringStencil(item.targetStencil, grid, lookup);
+                for (size_t node = 0; node < item.nodes.size(); ++node) {
+                    const ScoringVoxel scoring = interpolateScoringStencil(item.nodeStencils[node], grid, lookup);
+                    item.nodes[node].prediction = scoring.prediction;
+                    item.nodes[node].normal = {scoring.normal, scoring.normalValid, scoring.normalValid ? std::string{} : "invalid sampled normal"};
+                }
+                item.nodeStencils.clear();
+                item.nodeStencils.shrink_to_fit();
+            } catch (...) {
+                errors[searchIndex] = std::current_exception();
+            }
+            const size_t completed = completedMaterialization.fetch_add(1, std::memory_order_relaxed) + 1;
+            reportProgress("materialization", completed, prepared.size(), materializationStart, false);
+        }
+    };
+    if (workerCount == 1) {
+        materializationWorker();
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (size_t index = 0; index < workerCount; ++index)
+            workers.emplace_back(materializationWorker);
+        for (auto& thread : workers)
+            thread.join();
+    }
+    reportProgress("materialization", prepared.size(), prepared.size(), materializationStart, true);
+    report.samplingMaterializationSeconds = std::chrono::duration<double>(Clock::now() - materializationStart).count();
+    report.samplingMaterializationCpuSeconds = processCpuSeconds() - materializationCpuStart;
+    for (const auto& error : errors) {
+        if (error)
+            std::rethrow_exception(error);
+    }
+    voxelIndices.clear();
+    voxelIndices.rehash(0);
+    orderedVoxels.clear();
+    orderedVoxels.shrink_to_fit();
+    scoringVoxels.clear();
+    scoringVoxels.shrink_to_fit();
+
+    const auto searchStart = Clock::now();
+    const double searchCpuStart = processCpuSeconds();
+    reportProgress("search", 0, searchCandidateIndices.size(), searchStart, true);
+    errors.assign(searchCandidateIndices.size(), {});
+    std::atomic<size_t> nextSearch{0};
+    std::atomic<size_t> completedSearches{0};
+    const auto searchWorker = [&]() {
         while (true) {
             const size_t searchIndex = nextSearch.fetch_add(1, std::memory_order_relaxed);
             if (searchIndex >= searchCandidateIndices.size())
                 return;
             const size_t candidateIndex = searchCandidateIndices[searchIndex];
             try {
-                report.candidates[candidateIndex] =
-                    solveCandidate(report.candidates[candidateIndex], grid, report.anchorCellSizePredictionVoxels, report.config, scoringVolume, pointPredicate);
+                report.candidates[candidateIndex] = solveCandidate(report.candidates[candidateIndex], report.config, prepared[searchIndex]);
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
-            completedSearches.fetch_add(1, std::memory_order_relaxed);
-            reportProgress(false);
+            const size_t completed = completedSearches.fetch_add(1, std::memory_order_relaxed) + 1;
+            reportProgress("search", completed, searchCandidateIndices.size(), searchStart, false);
         }
     };
     if (workerCount == 1) {
-        worker();
-    } else if (workerCount > 1) {
+        searchWorker();
+    } else {
         std::vector<std::thread> workers;
         workers.reserve(workerCount);
         for (size_t index = 0; index < workerCount; ++index)
-            workers.emplace_back(worker);
+            workers.emplace_back(searchWorker);
         for (auto& thread : workers)
             thread.join();
     }
-    reportProgress(true);
+    reportProgress("search", searchCandidateIndices.size(), searchCandidateIndices.size(), searchStart, true);
+    report.searchSeconds = std::chrono::duration<double>(Clock::now() - searchStart).count();
+    report.searchCpuSeconds = processCpuSeconds() - searchCpuStart;
     for (const auto& error : errors) {
         if (error)
             std::rethrow_exception(error);
@@ -1865,8 +2026,8 @@ FiberletPathReport traceFiberletPaths(
             ++report.diagnostics.noPathPairs;
     }
     const auto searchEnd = Clock::now();
-    report.searchSeconds = std::chrono::duration<double>(searchEnd - preloadEnd).count();
     report.elapsedSeconds = std::chrono::duration<double>(searchEnd - startTime).count();
+    report.elapsedCpuSeconds = processCpuSeconds() - startCpuSeconds;
     return report;
 }
 

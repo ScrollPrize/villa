@@ -28,9 +28,7 @@ struct FiberReplayTube {
 
     [[nodiscard]] bool containsBasePoint(const cv::Vec3d& point) const;
     [[nodiscard]] double distanceToBasePoint(const cv::Vec3d& point) const;
-    [[nodiscard]] bool containsPredictionPoint(
-        const cv::Vec3d& pointPredictionXYZ,
-        double predictionToBaseScale) const;
+    [[nodiscard]] bool containsPredictionPoint(const cv::Vec3d& pointPredictionXYZ, double predictionToBaseScale) const;
 };
 
 [[nodiscard]] FiberReplayTube makeFiberReplayTube(
@@ -41,45 +39,37 @@ struct FiberReplayTube {
     const FiberPredictionGridInfo& grid,
     int anchorCellSizePredictionVoxels);
 
-struct FiberReplayComparisonWindow {
-    double requestedHalfExtentBaseVoxels = 0.0;
-    double effectiveHalfExtentBaseVoxels = 0.0;
-    double referenceBeginArcBase = 0.0;
-    double referenceEndArcBase = 0.0;
-    double traceBeginArcBase = 0.0;
-    double traceFailureArcBase = 0.0;
-    double traceEndArcBase = 0.0;
+enum class FiberReplayTracer {
+    Greedy,
+    Fiberlet,
 };
 
-[[nodiscard]] FiberReplayComparisonWindow makeFiberReplayComparisonWindow(
-    const PolylineArcGeometry& reference,
-    double failureReferenceArcBase,
-    const PolylineArcGeometry& trace,
-    size_t failureTracePointIndex,
-    double requestedHalfExtentBaseVoxels);
+[[nodiscard]] const char* fiberReplayTracerName(FiberReplayTracer tracer) noexcept;
+
+struct FiberReplayVisualizationInput {
+    FiberReplayTracer tracer = FiberReplayTracer::Greedy;
+    size_t tracerFailureIndex = 0;
+    FiberReplayTube tube;
+    FiberAnchorExtractionReport anchors;
+    FiberAnchorArtifactInfo anchorArtifact;
+    FiberletPathReport paths;
+    FiberletArtifactInfo pathArtifact;
+};
 
 struct FiberReplayBundleInput {
     FiberReplayTraceRequest request;
-    FiberReplayTraceResult replay;
+    FiberReplayTraceResult greedyReplay;
+    FiberletGraphReplayResult fiberletReplay;
+    FiberletGraphReplayConfig fiberletReplayConfig;
     std::vector<cv::Vec3d> referenceGeometryBase;
-    std::optional<FiberReplayComparisonWindow> comparison;
-    std::optional<FiberReplayTube> tube;
     nlohmann::json sources;
     nlohmann::json traceBinding;
     nlohmann::json predictionBinding;
     nlohmann::json requestedTraceConfig;
     nlohmann::json effectiveTraceConfig;
-    std::optional<FiberAnchorExtractionReport> anchors;
-    std::optional<FiberAnchorArtifactInfo> anchorArtifact;
-    std::optional<FiberletPathReport> paths;
-    std::optional<FiberletArtifactInfo> pathArtifact;
-    std::optional<FiberletGraphReplayResult> graphReplay;
-    std::optional<FiberletGraphReplayConfig> graphReplayConfig;
-    bool graphReplayRequested = false;
+    std::vector<FiberReplayVisualizationInput> visualizations;
 };
 
-[[nodiscard]] nlohmann::json writeFiberReplayBundle(
-    const std::filesystem::path& outputDirectory,
-    const FiberReplayBundleInput& input);
+[[nodiscard]] nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirectory, const FiberReplayBundleInput& input);
 
-} // namespace vc::fiber_tracer
+}  // namespace vc::fiber_tracer

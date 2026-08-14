@@ -1,19 +1,18 @@
-# Task: straightened fiberlet DP and scored graph joins
+# Task: stage-parallel fiberlet extraction
 
-Replace the experimental world-axis half-voxel fiberlet DP with a directed
-candidate-local search in the straightened anchor-to-anchor domain.
+Remove duplicated fiberlet preparation and fix preprocessing parallelization.
 
-- Use deterministic planes normal to a curved cubic-Hermite centerline fitted
-  from both anchor positions and directions. Space ordinary planes by 2 stored
-  prediction voxels of centerline arclength and allow transverse movement on a
-  0.5-prediction-voxel grid.
-- Evaluate prediction presence, prediction direction, and Lasagna normals at
-  the resulting floating-point XYZ positions through native-volume
-  interpolation. Do not quantize the positions back to world voxel axes.
-- Preserve exact floating-point anchor endpoints and deterministic acyclic DP.
-- Keep base-volume coordinates at the CLI and artifact boundaries.
-- Apply the same local fiberlet alignment and Lasagna-normal tangent/normal
-  smoothness metric to graph joins. The existing strict 45-degree join bound
-  remains a feasibility constraint, not the complete join objective.
-- Benchmark the supplied Paris4 `fiberlet-replay --along 512` workload against
-  the current world-axis half-grid result.
+- Execute extraction as explicit global stages over the complete candidate set.
+- Prepare each candidate's curved domain, mapped local nodes, and native
+  interpolation corners exactly once, in parallel.
+- Deterministically merge candidate corner sets into one global unique sample
+  request set before any volume sampling.
+- Batch only that unique coordinate set through the existing prediction and
+  normal volume readers. Changing batch size may change sampler call count and
+  temporary memory, but must never change total sample requests.
+- Retain the prepared candidate geometry and reuse it directly during parallel
+  DP instead of rebuilding domains/nodes.
+- Preserve candidate ordering, admissibility, objective, paths, graph, and
+  serialized artifact bytes across worker and batch counts.
+- Benchmark wall time, process CPU use/effective cores, sample counts, and peak
+  memory for every stage on the fixed Paris4 reference interval.
