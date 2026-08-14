@@ -36,6 +36,9 @@
   initial search uses 4x probes, then continuously refines at 2x until five
   direction reversals or retained-center brackets confirm a local optimum. The
   status bar uses the same rolling encoded-bandwidth samples.
+- Persisted the adaptive remote-download operating point across clean VC3D
+  restarts. Startup immediately uses the previous admission limit and capacity
+  model while resetting stability history for frequent initial re-probing.
 - Corrected interactive fallback-range selection after generated surfaces were
   given explicit base-volume parameter units.
 - Split regular chunk loading into independent 32-worker persistent-cache

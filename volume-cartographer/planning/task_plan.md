@@ -216,6 +216,17 @@ Update `planning/spec.md` during implementation:
 
 ## Testing
 
+### Adaptive download restart state
+
+1. Expose a small core snapshot containing only settled admission, long-term
+   bandwidth, and saturated per-worker capacity.
+2. Seed the shared adaptive scheduler from that snapshot, clamped to its current
+   worker bounds. Do not restore epochs, phase, turn count, or stability time.
+3. Load and save a versioned snapshot through VC3D's existing per-user INI;
+   explicitly sync it before the application's `_Exit` path.
+4. Test that restoration starts at the saved admission limit and that the first
+   completed baseline immediately begins the normal initial probe search.
+
 ### Interactive priority and deduplication
 
 - Add a cache/scheduler regression proving the narrowed active-view operation

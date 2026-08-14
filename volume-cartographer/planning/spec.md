@@ -130,17 +130,20 @@
   filesystem metadata only. Cache hits enter an eight-worker CPU read/decode
   queue; misses enter the remote source-read queue. Successful source reads
   then enter the decode queue.
-- Normal interactive remote source reads use 64 available workers with a
-  dynamic admission limit initially set to two. After the latest
-  `current_limit * 4` successful encoded chunk transfers are available, the
-  controller measures aggregate bandwidth as their total encoded bytes divided
-  by the interval from their earliest start to latest completion. It computes
-  average encoded chunk size from the same samples and selects
-  `ceil(bandwidth * 0.25 seconds / average_chunk_bytes)`, clamped to `[2,64]`.
-  Failed and missing reads are excluded. A new larger limit is held until its
-  larger sample window is complete. The controller intentionally performs no
-  exploratory increases, so a low current limit may underestimate latent
-  bandwidth.
+- Normal interactive remote source reads use 64 available workers with an
+  adaptive admission limit in `[2,64]`. Saturated epochs measure aggregate
+  encoded goodput and p90 request latency. Bracketed probes compare the settled
+  limit with higher and lower limits; initial discovery uses a 4x step and
+  subsequent refinement uses 2x steps. Stable bandwidth stretches periodic
+  exploration toward five minutes, while a roughly 2x bandwidth change brings
+  it back toward one minute. Failed, missing, and underfilled-tail reads do not
+  establish capacity.
+- VC3D persists the settled admission limit, long-term bandwidth EMA, and
+  saturated per-worker capacity model in its versioned per-user settings. A
+  later run restores and uses the settled limit immediately. Epoch samples,
+  probe phase, direction-turn history, instability, and accumulated stability
+  time are never persisted: startup resets those values and immediately resumes
+  the frequent initial 4x/2x search around the restored operating point.
 - Adaptive admission is service-wide for normal remote rendering and changes
   only how many source tasks may start; it does not alter pending-task priority.
   A decrease does not cancel running work. Explicit `maxConcurrentReads`

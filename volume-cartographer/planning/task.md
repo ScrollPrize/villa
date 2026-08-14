@@ -3,6 +3,12 @@
 Address the three unresolved review findings on PR #1453 without changing
 rendered values, interpolation, source-level selection, or cache identity.
 
+## Follow-up: adaptive download restart state
+
+Persist VC3D's reusable adaptive download operating point across clean runs.
+Restore the settled queue limit immediately, but reset the stability window and
+probe-phase history so startup explores frequently around the restored value.
+
 ## Interactive demand and focus
 
 - Mouse movement stores the latest viewport pointer in the viewer and updates

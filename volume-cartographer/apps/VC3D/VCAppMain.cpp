@@ -26,6 +26,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <thread>
@@ -33,6 +35,8 @@
 #include <blosc.h>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <optional>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -92,6 +96,67 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
             return true;
     }
     return false;
+}
+
+static std::optional<vc::render::ChunkCacheService::AdaptiveDownloadState>
+loadAdaptiveDownloadState()
+{
+    using namespace vc3d::settings::perf;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    if (settings.value(REMOTE_DOWNLOAD_STATE_VERSION, 0).toInt() !=
+        REMOTE_DOWNLOAD_STATE_VERSION_CURRENT) {
+        return std::nullopt;
+    }
+
+    bool admissionOk = false;
+    const auto admission = settings.value(REMOTE_DOWNLOAD_SETTLED_ADMISSION)
+        .toULongLong(&admissionOk);
+    if (!admissionOk || admission == 0 ||
+        admission > std::numeric_limits<std::size_t>::max())
+        return std::nullopt;
+
+    vc::render::ChunkCacheService::AdaptiveDownloadState state;
+    state.settledAdmissionLimit = static_cast<std::size_t>(admission);
+    state.longTermBytesPerSecond = settings.value(
+        REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND, 0.0).toDouble();
+    const auto maximumSaturated = settings.value(
+        REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM, 0).toULongLong();
+    state.maximumSaturatedParallelism = static_cast<std::size_t>(std::min(
+        maximumSaturated,
+        static_cast<qulonglong>(std::numeric_limits<std::size_t>::max())));
+    state.saturatedBytesPerSecondPerWorker = settings.value(
+        REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER, 0.0).toDouble();
+    if (!std::isfinite(state.longTermBytesPerSecond) ||
+        state.longTermBytesPerSecond < 0.0) {
+        state.longTermBytesPerSecond = 0.0;
+    }
+    if (!std::isfinite(state.saturatedBytesPerSecondPerWorker) ||
+        state.saturatedBytesPerSecondPerWorker <= 0.0) {
+        state.maximumSaturatedParallelism = 0;
+        state.saturatedBytesPerSecondPerWorker = 0.0;
+    }
+    return state;
+}
+
+static void saveAdaptiveDownloadState(
+    const std::optional<vc::render::ChunkCacheService::AdaptiveDownloadState>& state)
+{
+    if (!state || state->settledAdmissionLimit == 0)
+        return;
+    using namespace vc3d::settings::perf;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(REMOTE_DOWNLOAD_STATE_VERSION,
+                      REMOTE_DOWNLOAD_STATE_VERSION_CURRENT);
+    settings.setValue(REMOTE_DOWNLOAD_SETTLED_ADMISSION,
+                      static_cast<qulonglong>(state->settledAdmissionLimit));
+    settings.setValue(REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND,
+                      state->longTermBytesPerSecond);
+    settings.setValue(
+        REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM,
+        static_cast<qulonglong>(state->maximumSaturatedParallelism));
+    settings.setValue(REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER,
+                      state->saturatedBytesPerSecondPerWorker);
+    settings.sync();
 }
 
 class WheelFocusFilter final : public QObject
@@ -475,12 +540,15 @@ auto main(int argc, char* argv[]) -> int
     }
 
     int rc = 0;
+    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService;
     {
         const std::size_t cacheSizeBytes =
             cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-        auto chunkCacheService =
-            std::make_shared<vc::render::ChunkCacheService>(cacheSizeBytes);
-        CWindow aWin(cacheSizeGB, benchOptions, std::move(chunkCacheService));
+        chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
+            cacheSizeBytes,
+            std::shared_ptr<vc::render::DecodedChunkCacheBudget>{},
+            loadAdaptiveDownloadState());
+        CWindow aWin(cacheSizeGB, benchOptions, chunkCacheService);
 
         if (parser.isSet(volumePackageOption)) {
             QString errorMessage;
@@ -526,6 +594,8 @@ auto main(int argc, char* argv[]) -> int
         aWin.show();
         rc = QApplication::exec();
     }
+    saveAdaptiveDownloadState(chunkCacheService->adaptiveDownloadState());
+    chunkCacheService.reset();
     // Skip DSO finalizers: gnutls/libtasn1 destructors free through mimalloc after
     // its own teardown, segfaulting in _dl_fini on every otherwise-clean exit.
     // CWindow (above scope) has already run its real cleanup.

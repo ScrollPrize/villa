@@ -119,7 +119,8 @@ struct ChunkRequestScheduler::Impl {
     explicit Impl(std::size_t workerCount,
                   std::size_t burst,
                   std::shared_ptr<ChunkRequestSelectionGate> gate,
-                  std::optional<AdaptiveConcurrency> adaptiveConfig)
+                  std::optional<AdaptiveConcurrency> adaptiveConfig,
+                  std::optional<AdaptiveState> initialAdaptiveState)
         : selectionGate(std::move(gate))
         , interactiveBurst(std::max<std::size_t>(1, burst))
         , maximumWorkers(std::max<std::size_t>(1, workerCount))
@@ -170,6 +171,29 @@ struct ChunkRequestScheduler::Impl {
             probeMultiplier = adaptiveOptions.initialProbeMultiplier;
             currentProbeIntervalSeconds =
                 adaptiveOptions.unstableProbeIntervalSeconds;
+            if (initialAdaptiveState &&
+                initialAdaptiveState->settledAdmissionLimit != 0) {
+                settledAdmissionLimit = std::clamp(
+                    initialAdaptiveState->settledAdmissionLimit,
+                    adaptiveOptions.minimum, adaptiveOptions.maximum);
+                admissionLimit = settledAdmissionLimit;
+                targetAdmissionLimit = settledAdmissionLimit;
+                if (std::isfinite(initialAdaptiveState->longTermBytesPerSecond) &&
+                    initialAdaptiveState->longTermBytesPerSecond > 0.0) {
+                    longTermBytesPerSecond =
+                        initialAdaptiveState->longTermBytesPerSecond;
+                }
+                if (initialAdaptiveState->maximumSaturatedParallelism != 0 &&
+                    std::isfinite(
+                        initialAdaptiveState->saturatedBytesPerSecondPerWorker) &&
+                    initialAdaptiveState->saturatedBytesPerSecondPerWorker > 0.0) {
+                    maximumSaturatedParallelism = std::clamp(
+                        initialAdaptiveState->maximumSaturatedParallelism,
+                        adaptiveOptions.minimum, adaptiveOptions.maximum);
+                    saturatedBytesPerSecondPerWorker =
+                        initialAdaptiveState->saturatedBytesPerSecondPerWorker;
+                }
+            }
         } else {
             admissionLimit = maximumWorkers;
             adaptiveOptions.minimum = maximumWorkers;
@@ -728,10 +752,12 @@ struct ChunkRequestScheduler::Impl {
 ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
                                              std::size_t interactiveBurst,
                                              std::shared_ptr<ChunkRequestSelectionGate> selectionGate,
-                                             std::optional<AdaptiveConcurrency> adaptiveConcurrency)
+                                             std::optional<AdaptiveConcurrency> adaptiveConcurrency,
+                                             std::optional<AdaptiveState> initialAdaptiveState)
     : impl_(std::make_unique<Impl>(workers, interactiveBurst,
                                   std::move(selectionGate),
-                                  std::move(adaptiveConcurrency)))
+                                  std::move(adaptiveConcurrency),
+                                  std::move(initialAdaptiveState)))
 {
 }
 
@@ -870,6 +896,19 @@ ChunkRequestScheduler::TransferStats ChunkRequestScheduler::transferStats() cons
         impl_->longTermBytesPerSecond,
         impl_->currentProbeIntervalSeconds,
         impl_->phase != Impl::ProbePhase::Monitor || impl_->rampingAdmission};
+}
+
+std::optional<ChunkRequestScheduler::AdaptiveState>
+ChunkRequestScheduler::adaptiveState() const
+{
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->adaptive)
+        return std::nullopt;
+    return AdaptiveState{
+        impl_->settledAdmissionLimit,
+        impl_->longTermBytesPerSecond,
+        impl_->maximumSaturatedParallelism,
+        impl_->saturatedBytesPerSecondPerWorker};
 }
 
 void ChunkRequestScheduler::waitIdle()

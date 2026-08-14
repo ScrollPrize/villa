@@ -273,6 +273,20 @@ namespace perf {
     // adaptive 2-64 source fetches; local reads use two. Decode workers are
     // managed separately.
 
+    // Reusable adaptive-download capacity model. Runtime probe phase and
+    // stability timing are reset on every launch.
+    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
+        "perf/remote_download_state/version";
+    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
+    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
+        "perf/remote_download_state/settled_admission";
+    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
+        "perf/remote_download_state/long_term_bytes_per_second";
+    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
+        "perf/remote_download_state/max_saturated_parallelism";
+    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
+        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
+
 }
 
 // -----------------------------------------------------------------------------

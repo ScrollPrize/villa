@@ -66,6 +66,15 @@ public:
         double lowerLatencyRatio = 0.85;
     };
 
+    // Stable capacity data that may be carried across process runs. Probe
+    // phases, epochs, and stability timing are intentionally not included.
+    struct AdaptiveState {
+        std::size_t settledAdmissionLimit = 0;
+        double longTermBytesPerSecond = 0.0;
+        std::size_t maximumSaturatedParallelism = 0;
+        double saturatedBytesPerSecondPerWorker = 0.0;
+    };
+
     struct TransferStats {
         std::size_t admissionLimit = 0;
         double bytesPerSecond = 0.0;
@@ -81,7 +90,8 @@ public:
     explicit ChunkRequestScheduler(std::size_t workers,
                                    std::size_t interactiveBurst = 7,
                                    std::shared_ptr<ChunkRequestSelectionGate> selectionGate = {},
-                                   std::optional<AdaptiveConcurrency> adaptiveConcurrency = {});
+                                   std::optional<AdaptiveConcurrency> adaptiveConcurrency = {},
+                                   std::optional<AdaptiveState> initialAdaptiveState = {});
     ~ChunkRequestScheduler();
 
     ChunkRequestScheduler(const ChunkRequestScheduler&) = delete;
@@ -105,6 +115,7 @@ public:
         std::chrono::steady_clock::time_point started,
         std::chrono::steady_clock::time_point completed);
     [[nodiscard]] TransferStats transferStats() const;
+    [[nodiscard]] std::optional<AdaptiveState> adaptiveState() const;
     void waitIdle();
 
 private:

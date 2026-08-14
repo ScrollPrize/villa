@@ -344,13 +344,15 @@ std::shared_ptr<ChunkCache> makeServiceCache(
     const std::shared_ptr<ChunkCacheService>& service,
     std::string identity,
     const std::shared_ptr<IChunkFetcher>& fetcher,
-    std::size_t maxConcurrentReads = 4)
+    std::size_t maxConcurrentReads = 4,
+    bool adaptiveConcurrentReads = false)
 {
     std::vector<ChunkCache::LevelInfo> levels = {
         {{8, 8, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
     options.maxConcurrentReads = maxConcurrentReads;
+    options.adaptiveConcurrentReads = adaptiveConcurrentReads;
     options.detectAllFillChunks = false;
     return std::make_shared<ChunkCache>(
         service, std::move(identity), std::move(levels),
@@ -390,6 +392,27 @@ TEST_CASE("ChunkCacheService interns source identity into a numeric hot key")
     CHECK(service->sourceCount() == 2);
     CHECK(ChunkKey{0, 0, 0, 0, first->sourceId()} !=
           ChunkKey{0, 0, 0, 0, other->sourceId()});
+}
+
+TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
+{
+    const ChunkCacheService::AdaptiveDownloadState initial{
+        12, 48.0 * 1024.0 * 1024.0, 8, 6.0 * 1024.0 * 1024.0};
+    auto service = std::make_shared<ChunkCacheService>(
+        1024 * 1024, std::shared_ptr<DecodedChunkCacheBudget>{}, initial);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    auto cache = makeServiceCache(
+        service, "adaptive-restore", fetcher, 16, true);
+    REQUIRE(cache);
+
+    const auto restored = service->adaptiveDownloadState();
+    REQUIRE(restored);
+    CHECK(restored->settledAdmissionLimit == 12);
+    CHECK(restored->longTermBytesPerSecond ==
+          doctest::Approx(48.0 * 1024.0 * 1024.0));
+    CHECK(restored->maximumSaturatedParallelism == 8);
+    CHECK(restored->saturatedBytesPerSecondPerWorker ==
+          doctest::Approx(6.0 * 1024.0 * 1024.0));
 }
 
 TEST_CASE("ChunkCacheService rejects incompatible duplicate source metadata")
@@ -1661,6 +1684,39 @@ TEST_CASE("ChunkRequestScheduler estimates bandwidth before its admission window
     CHECK(stats.bytesPerSecond == doctest::Approx(2.0 * 1024.0 * 1024.0));
     CHECK(stats.averageChunkBytes == doctest::Approx(double(chunkBytes)));
     CHECK(stats.admissionLimit == 2);
+}
+
+TEST_CASE("ChunkRequestScheduler restores capacity but restarts frequent probing")
+{
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t chunkBytes = 2ULL * 1024ULL * 1024ULL;
+    ChunkRequestScheduler::AdaptiveConcurrency adaptive;
+    adaptive.maximum = 16;
+    adaptive.minimumEpochSeconds = 0.0;
+    adaptive.maximumEpochSeconds = 60.0;
+    const ChunkRequestScheduler::AdaptiveState initial{
+        12, 48.0 * 1024.0 * 1024.0, 8, 6.0 * 1024.0 * 1024.0};
+    ChunkRequestScheduler scheduler(16, 7, {}, adaptive, initial);
+
+    auto stats = scheduler.transferStats();
+    CHECK(stats.admissionLimit == 12);
+    CHECK(stats.targetAdmissionLimit == 12);
+    CHECK(stats.longTermBytesPerSecond ==
+          doctest::Approx(initial.longTermBytesPerSecond));
+    CHECK(stats.probeIntervalSeconds ==
+          doctest::Approx(adaptive.unstableProbeIntervalSeconds));
+    CHECK_FALSE(stats.probing);
+
+    const auto start = Clock::time_point{};
+    for (int sample = 0; sample < 12; ++sample) {
+        const auto sampleStart = start + std::chrono::milliseconds(sample * 100);
+        scheduler.recordSuccessfulTransfer(
+            chunkBytes, sampleStart, sampleStart + std::chrono::milliseconds(100));
+    }
+    stats = scheduler.transferStats();
+    CHECK(stats.admissionLimit == 13);
+    CHECK(stats.targetAdmissionLimit == 16);
+    CHECK(stats.probing);
 }
 
 TEST_CASE("ChunkRequestScheduler probes upward with completion-paced admission")

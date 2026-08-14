@@ -53,6 +53,12 @@
 
 ## Implementation
 
+- Added a versioned adaptive-download snapshot containing the settled admission
+  limit, long-term bandwidth EMA, and saturated per-worker capacity. VC3D loads
+  it from `VC3D.ini`, seeds the application-wide scheduler, and explicitly
+  writes it before `_Exit` on clean shutdown. Runtime epochs, probe phase,
+  direction history, and stability duration are reset, so the restored limit is
+  active immediately but startup still performs frequent 4x/2x probes.
 - Replaced `updateViewFocus()` with O(1) `markViewActive()`. The viewer retains
   focus and accepted render jobs publish nearest per-chunk distances from their
   local occurrence lists. Persistent cache snapshots no longer retain a
@@ -86,7 +92,7 @@
 ## Validation
 
 - `cmake --build volume-cartographer/build --target test_chunk_cache test_chunked_plane_sampler test_point_index VC3D --parallel 4`
-- `volume-cartographer/build/bin/test_chunk_cache` (66 cases passed)
+- `volume-cartographer/build/bin/test_chunk_cache` (68 cases passed)
 - `volume-cartographer/build/bin/test_chunked_plane_sampler` (19 cases passed)
 - `volume-cartographer/build/bin/test_point_index` (26 cases passed)
 - `cmake --build volume-cartographer/build/ci-fast-core --target vc_test_core --parallel 4`

@@ -201,6 +201,14 @@ known hits to CPU decoding without either class blocking discovery of the
 other. HTTP chunk absence is established by the chunk `GET`; the pipeline does
 not add a separate remote `HEAD` request.
 
+Normal VC3D remote reads share an adaptive 2-64 source admission limit. VC3D
+stores the controller's settled limit, long-term bandwidth EMA, and saturated
+per-worker capacity model in `VC3D.ini` on clean shutdown. The next run starts
+at that limit instead of two. Only reusable capacity data is restored: epoch
+samples, probe phase, direction history, and the stability window are reset, so
+the controller performs frequent initial up/down probes around the prior limit
+before returning to its normal stability-dependent cadence.
+
 All three schedulers are work-conserving and admit one background item after at
 most seven consecutive GUI items while both lanes are nonempty. Existing
 queued chunks are reprioritized in place when a newer view snapshot references

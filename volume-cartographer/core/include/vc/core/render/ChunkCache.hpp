@@ -33,15 +33,26 @@ struct ChunkWorkPriority;
 // VolumeSourceId stored on the facade.
 class ChunkCacheService final {
 public:
+    struct AdaptiveDownloadState {
+        std::size_t settledAdmissionLimit = 0;
+        double longTermBytesPerSecond = 0.0;
+        std::size_t maximumSaturatedParallelism = 0;
+        double saturatedBytesPerSecondPerWorker = 0.0;
+    };
+
     explicit ChunkCacheService(
         std::size_t decodedByteCapacity,
-        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget = {});
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget = {},
+        std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState = {});
     ~ChunkCacheService();
 
     ChunkCacheService(const ChunkCacheService&) = delete;
     ChunkCacheService& operator=(const ChunkCacheService&) = delete;
 
     std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget() const;
+    // Returns the reusable adaptive download model. Runtime probe phases and
+    // stability windows are deliberately excluded.
+    std::optional<AdaptiveDownloadState> adaptiveDownloadState() const;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
 
@@ -50,7 +61,8 @@ private:
     ChunkCacheService(
         std::size_t decodedByteCapacity,
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
-        bool createDecodedByteBudget);
+        bool createDecodedByteBudget,
+        std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState = {});
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };

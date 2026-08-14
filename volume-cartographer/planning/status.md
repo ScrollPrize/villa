@@ -19,3 +19,5 @@
   could not write the user autosave directory in the sandbox).
 - [x] Run and record the virtualized synthetic rendering benchmark.
 - [x] Review final diff for numeric, portability, and lifecycle regressions.
+- [x] Persist reusable adaptive download capacity while resetting startup probe
+  stability state.
