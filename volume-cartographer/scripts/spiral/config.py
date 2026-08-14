@@ -12,7 +12,7 @@ _ENUMS = {
     "patch_strip_sampling": ["straight", "dijkstra"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
-    "dense_spacing_mode": ["phase", "grad_mag", "inference"],
+    "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
     "dense_spacing_support_policy": ["product", "minimum"],
     "dt_target_mode": ["strip_median", "whole_object_quantile"],
     "dense_spacing_density_lambda": [

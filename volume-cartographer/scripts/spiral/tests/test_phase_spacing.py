@@ -521,7 +521,7 @@ class TestModeContract:
         # The three current modes pass mode validation; anything else -
         # including retired values like the old 'crossing_count' - is a
         # plain error (no migration handling).
-        for mode in ('phase', 'grad_mag', 'inference'):
+        for mode in ('phase', 'grad_mag', 'winding_model'):
             paths, run = self.base_request(tmp_path, {
                 'dense_spacing_mode': mode,
                 'loss_weight_dense_spacing': 0.0,
@@ -537,9 +537,9 @@ class TestModeContract:
                       for error in validate_session_request(paths, run)}
             assert 'dense_spacing_mode' in fields
 
-    def test_inference_mode_requires_a_valid_crossing_manifest(self, tmp_path):
+    def test_winding_model_mode_requires_a_valid_crossing_manifest(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
-            'dense_spacing_mode': 'inference',
+            'dense_spacing_mode': 'winding_model',
         })
         fields = {error['field']
                   for error in validate_session_request(paths, run)}

@@ -6,7 +6,7 @@ the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
 ## Neural winding-inference losses
 
-Set `dense_spacing_mode` to `inference` and provide the compact exported
+Set `dense_spacing_mode` to `winding_model` and provide the compact exported
 crossing directory at the conventional `<dataset>/winding_inference` path or
 override `paths.winding_inference` in `spiral-scroll.json`. The store is
 checksum-verified and copied to each fitting GPU at startup; optimisation then

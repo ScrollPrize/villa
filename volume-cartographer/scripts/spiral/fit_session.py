@@ -182,7 +182,7 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
     # mode-derived asset predicates then all read as disabled so the invalid
     # mode never masquerades as missing-file errors.
     mode = str(config.get("dense_spacing_mode", "phase"))
-    return mode if mode in ("phase", "grad_mag", "inference") else None
+    return mode if mode in ("phase", "grad_mag", "winding_model") else None
 
 
 def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
@@ -202,8 +202,8 @@ def _grad_mag_required(config: Mapping[str, Any]) -> bool:
             and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
 
 
-def _winding_inference_enabled(config: Mapping[str, Any]) -> bool:
-    return _dense_spacing_mode(config) == "inference"
+def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
+    return _dense_spacing_mode(config) == "winding_model"
 
 
 @dataclass(frozen=True)
@@ -263,8 +263,8 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  required=_phase_bundle_enabled),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
-                 enabled=_winding_inference_enabled,
-                 required=_winding_inference_enabled),
+                 enabled=_winding_model_enabled,
+                 required=_winding_model_enabled),
 )
 
 _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
@@ -1085,15 +1085,15 @@ def validate_session_request(
             check_catalog_input(spec)
 
     spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag", "inference"):
+    if spacing_mode not in ("phase", "grad_mag", "winding_model"):
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase, grad_mag, or inference"})
+                       "message": "Must be phase, grad_mag, or winding_model"})
 
     for spec in FIT_INPUT_CATALOG:
         if spec.kind == "zarr-group":
             check_catalog_input(spec)
 
-    if spacing_mode == "inference" and paths.winding_inference:
+    if spacing_mode == "winding_model" and paths.winding_inference:
         manifest = Path(paths.winding_inference) / "manifest.json"
         if not manifest.is_file():
             errors.append({"field": "winding_inference",

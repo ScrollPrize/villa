@@ -1484,12 +1484,12 @@ class FitContext:
         # Dense-spacing input contract. Checked before any asset paths so
         # an invalid mode fails as itself, not as a missing-file error.
         dense_spacing_mode = self.config['dense_spacing_mode']
-        if dense_spacing_mode not in ('phase', 'grad_mag', 'inference'):
+        if dense_spacing_mode not in ('phase', 'grad_mag', 'winding_model'):
             raise ValueError(
                 f'dense_spacing_mode={dense_spacing_mode!r} must be '
-                "'phase', 'grad_mag', or 'inference'")
+                "'phase', 'grad_mag', or 'winding_model'")
         phase_mode = dense_spacing_mode == 'phase'
-        inference_mode = dense_spacing_mode == 'inference'
+        winding_model_mode = dense_spacing_mode == 'winding_model'
         grad_mag_spacing_enabled = (
             dense_spacing_mode == 'grad_mag'
             and self.config['loss_weight_dense_spacing'] > 0
@@ -1658,7 +1658,7 @@ class FitContext:
         self.link_distance_tolerance = link_distance_tolerance
         self.dense_spacing_mode = dense_spacing_mode
         self.phase_mode = phase_mode
-        self.inference_mode = inference_mode
+        self.winding_model_mode = winding_model_mode
         self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
         self.track_sampling_config = track_sampling_config
         self.tracks = tracks
@@ -1726,8 +1726,8 @@ class FitContext:
     def _phase_mode_active(self):
         return self.phase_mode and self.sdt_volume is not None and self.lasagna_volume is not None
 
-    def _inference_mode_active(self):
-        return self.inference_mode and self.winding_inference is not None
+    def _winding_model_mode_active(self):
+        return self.winding_model_mode and self.winding_inference is not None
 
     def _warn_if_sdt_loss_inactive(self):
         # Run-mutable weights are read afresh every step, but the SDT-backed
@@ -1738,7 +1738,7 @@ class FitContext:
             return
         inactive = ['loss_weight_dense_spacing_count',
                     'loss_weight_dense_attachment']
-        if not self.inference_mode:
+        if not self.winding_model_mode:
             inactive.append('loss_weight_dense_spacing_density')
         for weight_key in inactive:
             if self.config[weight_key] > 0 and weight_key not in self._sdt_inactive_warned:
@@ -1890,11 +1890,11 @@ class FitContext:
                 self._scalar_stores.append(self.sdt_volume['store'])
 
         self.winding_inference = None
-        if self.inference_mode:
+        if self.winding_model_mode:
             if (not self.winding_inference_path
                     or not os.path.isdir(self.winding_inference_path)):
                 raise RuntimeError(
-                    "dense_spacing_mode='inference' requires the compact "
+                    "dense_spacing_mode='winding_model' requires the compact "
                     f"winding-inference store: {self.winding_inference_path!r}")
             progress.begin(
                 'loading', 'Loading winding-inference supervision',
@@ -2413,7 +2413,7 @@ class FitContext:
                     f'\n      checkpoint: {checkpoint_fingerprint}'
                     f'\n      current:    {current_fingerprint}')
 
-        if modern and self.inference_mode:
+        if modern and self.winding_model_mode:
             checkpoint_fingerprint = checkpoint.get(
                 'winding_inference_fingerprint')
             current_fingerprint = (
@@ -2726,7 +2726,7 @@ class FitContext:
                     float(self.config['loss_weight_dense_spacing']), 1.0)
                 diagnostic_weights['dense_spacing_count'] = max(
                     float(self.config['loss_weight_dense_spacing_count']), 1.0)
-            if self._inference_mode_active():
+            if self._winding_model_mode_active():
                 diagnostic_weights['dense_spacing_inference_relative'] = max(
                     float(self.config['loss_weight_dense_spacing']), 1.0)
                 diagnostic_weights['dense_spacing_inference_density'] = max(
@@ -2796,7 +2796,7 @@ class FitContext:
                             self.lasagna_volume, self.shell_outer_winding_idx, self.config,
                             self.z_begin, self.z_end, generator=preview_generator):
                         pass
-                if self._inference_mode_active():
+                if self._winding_model_mode_active():
                     preview_generator = torch.Generator(device=dr.device)
                     preview_generator.manual_seed(0x13198A2E)
                     get_winding_inference_losses(
@@ -3476,7 +3476,7 @@ class FitContext:
 
         self._warn_if_sdt_loss_inactive()
         self._warn_if_dense_losses_structurally_disabled()
-        if self._inference_mode_active():
+        if self._winding_model_mode_active():
             inference_losses, inference_metrics = get_winding_inference_losses(
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
