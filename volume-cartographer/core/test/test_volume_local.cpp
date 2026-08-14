@@ -171,7 +171,7 @@ TEST_CASE("Volume: chunkExists turns true after writeChunk")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: final cache client release drops decoded chunks")
+TEST_CASE("Volume: final cache client release retains decoded chunks")
 {
     auto d = tmpDir("cache-client");
     auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
@@ -194,12 +194,13 @@ TEST_CASE("Volume: final cache client release drops decoded chunks")
     v->releaseCacheClient();
     CHECK(budget->stats().decodedBytes == chunk.size());
     v->releaseCacheClient();
-    CHECK(budget->stats().decodedBytes == 0);
-    CHECK(cache->stats().decodedBytes == 0);
+    CHECK(budget->stats().decodedBytes == chunk.size());
+    CHECK(cache->stats().decodedBytes == chunk.size());
 
     std::weak_ptr<vc::render::ChunkCache> weakCache = cache;
     cache.reset();
-    CHECK(weakCache.expired());
+    CHECK_FALSE(weakCache.expired());
+    CHECK(v->sharedChunkCache() == weakCache.lock());
     fs::remove_all(d);
 }
 
@@ -235,7 +236,43 @@ TEST_CASE("Volume: shared cache service keeps decoded chunks across release")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: writes invalidate service state without a live facade")
+TEST_CASE("Volume: IO threads reconfigure retained service without eviction")
+{
+    auto d = tmpDir("cache-service-threads");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x4d});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    auto loaded = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(loaded.status == vc::render::ChunkStatus::Data);
+    REQUIRE(loaded.bytes);
+    auto service = v->chunkCacheService();
+    REQUIRE(service);
+
+    v->setIOThreads(3);
+    const auto concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 3);
+    CHECK_FALSE(concurrency.adaptive);
+    CHECK(v->sharedChunkCache() == cache);
+    const auto warm = cache->getChunkIfCached(0, 0, 0, 0);
+    REQUIRE(warm.status == vc::render::ChunkStatus::Data);
+    REQUIRE(warm.bytes);
+    CHECK(warm.bytes->front() == std::byte{0x4d});
+
+    vc::render::ChunkCache::Options isolatedOptions;
+    isolatedOptions.maxConcurrentReads = 7;
+    auto isolated = v->createChunkCache(std::move(isolatedOptions));
+    REQUIRE(isolated);
+    const auto afterIsolatedOpen = service->fetchConcurrency();
+    CHECK(afterIsolatedOpen.maxConcurrentReads == 3);
+    CHECK_FALSE(afterIsolatedOpen.adaptive);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: writes invalidate service state without a live handle")
 {
     auto d = tmpDir("cache-service-write");
     auto reader = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
@@ -260,7 +297,7 @@ TEST_CASE("Volume: writes invalidate service state without a live facade")
     CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
 
     std::fill(chunk.begin(), chunk.end(), std::byte{0x43});
-    // The writer shares the source identity but has never acquired a facade.
+    // The writer shares the source identity but has never acquired a handle.
     writer->writeChunk(0, {0, 0, 0}, chunk);
     CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
 

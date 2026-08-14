@@ -1700,6 +1700,11 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
         } else {
             options.maxConcurrentReads = 2;
         }
+        if (!chunkCacheService_) {
+            chunkCacheService_ =
+                std::make_shared<vc::render::ChunkCacheService>(
+                    cacheBudgetHot_, decodedCacheBudget_);
+        }
         chunkedCache_ = createChunkCacheConfigured(
             std::move(options), chunkCacheService_);
         if (!chunkedCache_) {
@@ -1717,10 +1722,9 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
         if (!options.decodedByteBudget)
             options.decodedByteBudget = decodedCacheBudget_;
     }
-    // Explicit cache creation is used by bounded prefill/redownload jobs. Keep
-    // its source scheduler private so its requested fixed concurrency cannot
-    // reuse or alter the shared interactive source scheduler. The decoded-byte
-    // budget above remains shared.
+    // Explicit cache creation is used by bounded prefill/redownload jobs. Give
+    // each one a separate service so its fixed concurrency cannot alter the
+    // interactive service. The decoded-byte budget above remains shared.
     return createChunkCacheConfigured(std::move(options), {});
 }
 
@@ -1751,15 +1755,15 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         return nullptr;
     }
 
-    if (service) {
-        return std::make_shared<vc::render::ChunkCache>(
-            std::move(service), chunkCacheSourceIdentity(),
-            makeChunkCacheLevelInfo(opened), std::move(opened.fetchers),
-            opened.fillValue, opened.dtype, std::move(options));
+    if (!service) {
+        service = std::make_shared<vc::render::ChunkCacheService>(
+            options.decodedByteCapacity, options.decodedByteBudget);
     }
-    return std::make_shared<vc::render::ChunkCache>(
-        makeChunkCacheLevelInfo(opened), std::move(opened.fetchers),
-        opened.fillValue, opened.dtype, std::move(options));
+    auto levels = makeChunkCacheLevelInfo(opened);
+    return service->openSource(
+        chunkCacheSourceIdentity(), std::move(levels),
+        std::move(opened.fetchers), opened.fillValue, opened.dtype,
+        std::move(options));
 }
 
 void Volume::setChunkCacheService(
@@ -1768,7 +1772,7 @@ void Volume::setChunkCacheService(
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (chunkCacheService_ == service)
         return;
-    // Releasing a facade does not invalidate its service-owned source state.
+    // Releasing a source handle does not invalidate service-owned source state.
     chunkedCache_.reset();
     chunkCacheService_ = std::move(service);
 }
@@ -1841,11 +1845,19 @@ void Volume::releaseCacheClient()
 
 void Volume::setIOThreads(int count)
 {
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    ioThreads_ = count;
-    if (chunkedCache_)
-        chunkedCache_->invalidate();
-    chunkedCache_.reset();
+    std::shared_ptr<vc::render::ChunkCacheService> service;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        ioThreads_ = count;
+        service = chunkCacheService_;
+    }
+    if (service) {
+        const bool adaptive = count <= 0 && isRemote_;
+        const std::size_t workers = count > 0
+            ? static_cast<std::size_t>(count)
+            : adaptive ? 64U : 2U;
+        service->configureFetchConcurrency(workers, adaptive);
+    }
 }
 
 void Volume::invalidateCache()

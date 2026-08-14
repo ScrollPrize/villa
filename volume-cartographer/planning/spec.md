@@ -19,8 +19,13 @@
 
 - VC3D constructs one `ChunkCacheService` at application startup and passes it
   through every window/workspace state. Main, Spiral, overlay, and derived
-  surface-tile input reads must acquire source facades from this service rather
+  surface-tile input reads must acquire source handles from this service rather
   than construct independent decoded regular-chunk pools.
+- `ChunkCacheService::openSource()` is the only shared-service source factory.
+  It interns or reacquires the source and returns a source-bound `ChunkCache`
+  implementing `IChunkedArray`. A standalone `ChunkCache` convenience
+  constructor creates and retains a one-source service; it never owns local
+  schedulers.
 - A source is identified once on cache registration by its canonical local
   path or normalized remote URI plus selected base level. Authentication and
   persistent-cache-directory strings are not source identity.
@@ -37,6 +42,19 @@
 - Decoded data is heap-backed and globally constrained by the service's shared
   decoded-byte budget. Source state and resident entries survive A -> B -> A
   volume switches until global eviction or explicit source invalidation.
+- Probe, source-read, and decode schedulers belong to the service. Source-read
+  concurrency is one service-global `{maximum workers, adaptive}` setting.
+  `openSource()` applies its options to that setting and
+  `configureFetchConcurrency()` changes it directly; the most recent valid
+  request wins for every source in the service.
+- Replacing source-read concurrency preserves source IDs, decoded entries,
+  demand, listeners, and accounting. Unresolved demanded entries move to the
+  replacement scheduler in stable request order. Already-running stale work
+  may drain but cannot publish or advance another stage after the scheduler
+  epoch changes.
+- Explicit bounded prefill, redownload, and batch caches use a separate
+  `ChunkCacheService`. Their fixed concurrency is isolated from the regular
+  interactive service even when both services share one decoded-byte budget.
 - Releasing a viewer/cache client does not invalidate service-owned source
   state. Writes and explicit `Volume::invalidateCache()` invalidate only that
   source; stale generation results must not publish afterward.
@@ -146,9 +164,9 @@
   the frequent initial 4x/2x search around the restored operating point.
 - Adaptive admission is service-wide for normal remote rendering and changes
   only how many source tasks may start; it does not alter pending-task priority.
-  A decrease does not cancel running work. Explicit `maxConcurrentReads`
-  callers, tests, prefill operations, and local volumes retain fixed
-  concurrency.
+  A decrease does not interrupt running work. Explicit fixed-concurrency
+  callers, tests, prefill operations, and local volumes use fixed service
+  configurations; independent operations require independent services.
 - Each queue uses the work-conserving 7:1 interactive/background admission
   policy. Current view-relative priority is recalculated at every stage handoff,
   and atomic view-demand publication reprioritizes pending work in all three

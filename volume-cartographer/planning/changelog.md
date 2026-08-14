@@ -2,6 +2,10 @@
 
 ## 2026-08-14
 
+- Made `ChunkCacheService` the sole source factory and scheduler owner. Fetch
+  concurrency is now service-global and can migrate unresolved work without
+  evicting decoded chunks; explicit batch caches remain isolated through their
+  own services.
 - Restored render-owned chunk priority: mouse input now marks only the active
   view, accepted renders publish captured-focus distances, and viewport
   occurrences deduplicate by declared projected chunk footprint. Compatible

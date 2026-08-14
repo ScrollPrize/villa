@@ -115,9 +115,14 @@ disabled by default.
 
 VC3D creates one application-lifetime `vc::render::ChunkCacheService` and
 injects it through `CWindow`/`CState` into every `Volume`. A `ChunkCache` is a
-source-bound `IChunkedArray` facade over a service-retained source state. Main
+source-bound `IChunkedArray` handle over a service-retained source state. Main
 views, Spiral views, overlays, and `SurfaceCache` fillers therefore reuse the
 same decoded source chunks and in-flight requests.
+
+Shared sources are opened only through `ChunkCacheService::openSource()`.
+Standalone `ChunkCache` construction remains a convenience for tests and batch
+callers, but internally creates and retains a separate one-source service. The
+handle never creates probe, source-read, or decode schedulers of its own.
 
 Source registration is a cold path. `Volume::chunkCacheSourceIdentity()` uses a
 canonical local path, or a normalized remote URL plus selected base scale, and
@@ -135,13 +140,21 @@ identity, cache paths, and logs remain independent of credential material.
 
 The service retains one source-local entry map, LRU, request state, listeners,
 and diagnostics record per interned source. All source states use one aggregate
-decoded-byte budget, which provides process-wide eviction and RAM reporting.
-This avoids cross-source scheduler/statistics coupling while still eliminating
-duplicate stores for the same source. Decoded payloads remain ordinary
-heap-owned byte vectors; they are not memory mapped.
+decoded-byte budget and the service's shared probe, source-read, and decode
+schedulers. Decoded payloads remain ordinary heap-owned byte vectors; they are
+not memory mapped.
+
+Source-read concurrency is global to a service. Every `openSource()` applies
+the requested fixed/adaptive policy, and `configureFetchConcurrency()` changes
+it explicitly; the latest valid request wins for all registered sources.
+Changing it replaces the active source-read scheduler without evicting decoded
+chunks or changing source IDs. Unresolved demand is requeued in request order,
+while completion from an older scheduler epoch is rejected. Explicit prefill,
+redownload, and batch caches obtain isolation by owning a separate service, not
+by attaching a private scheduler to a source handle.
 
 Changing the current volume drops viewer references but keeps the `Volume`'s
-lightweight source facade and service state, so switching A -> B -> A neither
+lightweight source handle and service state, so switching A -> B -> A neither
 reopens the source nor refetches resident chunks. Cache retention is
 capacity-bound, not guaranteed. Explicit volume invalidation clears only that
 source and rejects stale fetch completion.
@@ -170,7 +183,7 @@ probe still enter the GUI lane without a location and sort last within their
 view and level.
 
 Whole-view closure clears that view across the shared service. Different-source
-overlay disable/replacement instead clears only the overlay facade's bound
+overlay disable/replacement instead clears only the overlay handle's bound
 source and current render version, preserving base and other-view ownership.
 Queued overlay callbacks verify attachment/opacity generation before requesting
 another render. Same-source base and overlay demand remains merged and a
@@ -190,8 +203,9 @@ stages:
 1. A 32-worker local probe stage classifies persistent encoded data, persistent
    empty markers, and cache misses using filesystem metadata only.
 2. A source-read stage performs remote downloads, or direct source reads when
-   no persistent cache is configured. Its concurrency is
-   `ChunkCache::Options::maxConcurrentReads`.
+   no persistent cache is configured. Its service-global concurrency is set by
+   `ChunkCache::Options::maxConcurrentReads`/`adaptiveConcurrentReads` on the
+   latest source open, or by `ChunkCacheService::configureFetchConcurrency()`.
 3. An eight-worker CPU stage reads and decodes persistent hits or decodes
    successful source reads.
 

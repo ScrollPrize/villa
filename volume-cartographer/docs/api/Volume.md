@@ -149,9 +149,9 @@ are currently supported by this API.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `chunkedCache()` | `vc::render::IChunkedArray*` | Shared chunked cache for local or remote reads |
-| `createChunkCache(Options)` | `std::shared_ptr<ChunkCache>` | Create an independent cache |
+| `createChunkCache(Options)` | `std::shared_ptr<ChunkCache>` | Create a cache with an independent service |
 | `setCacheBudget(size_t hotBytes)` | `void` | Set decoded cache capacity and reset the shared cache |
-| `setIOThreads(int count)` | `void` | Set background chunk read concurrency and reset the shared cache |
+| `setIOThreads(int count)` | `void` | Set service-wide chunk read concurrency without evicting decoded data |
 | `invalidateCache()` | `void` | Drop decoded/read cache state |
 | `sample(Mat_<uint8_t>&, coords, params)` | `void` | Sample into an 8-bit image |
 | `sample(Mat_<uint16_t>&, coords, params)` | `void` | Sample into a 16-bit image |
@@ -390,7 +390,9 @@ volume->updateMetadata(patch);
 - Remote `s3://` URLs are resolved to HTTPS. AWS SigV4 credentials are used
   when available, with anonymous fallback for public buckets if stale
   credentials are rejected.
-- Cache settings are applied by resetting the shared cache; existing independent
-  caches created by `createChunkCache()` are not modified.
+- `setCacheBudget()` resets the Volume's source handle. `setIOThreads()` instead
+  updates its retained `ChunkCacheService`; the newest setting applies to all
+  sources sharing that service without evicting decoded data. Caches created by
+  `createChunkCache()` use separate services and are not modified.
 - Region writes and raw chunk writes are local-only and invalidate the shared
   cache after successful mutation.

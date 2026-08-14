@@ -354,8 +354,8 @@ std::shared_ptr<ChunkCache> makeServiceCache(
     options.maxConcurrentReads = maxConcurrentReads;
     options.adaptiveConcurrentReads = adaptiveConcurrentReads;
     options.detectAllFillChunks = false;
-    return std::make_shared<ChunkCache>(
-        service, std::move(identity), std::move(levels),
+    return service->openSource(
+        std::move(identity), std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
 }
@@ -424,23 +424,71 @@ TEST_CASE("ChunkCacheService rejects incompatible duplicate source metadata")
         {{16, 8, 8}, {4, 4, 4}, {}},
     };
     ChunkCache::Options options;
+    options.maxConcurrentReads = 9;
     options.detectAllFillChunks = false;
     CHECK_THROWS_AS(
-        ChunkCache(service, "same-source", std::move(incompatibleLevels),
-                   std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
-                   0.0, ChunkDtype::UInt8, std::move(options)),
+        service->openSource(
+            "same-source", std::move(incompatibleLevels),
+            std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+            0.0, ChunkDtype::UInt8, std::move(options)),
         std::invalid_argument);
+    const auto concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 4);
+    CHECK_FALSE(concurrency.adaptive);
 }
 
-TEST_CASE("ChunkCacheService reuses a source across facade policy options")
+TEST_CASE("ChunkCacheService applies the latest source concurrency globally")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
     auto fetcher = std::make_shared<CountingFetcher>();
     auto first = makeServiceCache(service, "policy-source", fetcher, 4);
-    auto second = makeServiceCache(service, "policy-source", fetcher, 1);
+    auto second = makeServiceCache(service, "policy-source", fetcher, 12, true);
 
     CHECK(first->sourceId() == second->sourceId());
     CHECK(service->sourceCount() == 1);
+    auto concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 12);
+    CHECK(concurrency.adaptive);
+
+    service->configureFetchConcurrency(3, false);
+    concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 3);
+    CHECK_FALSE(concurrency.adaptive);
+}
+
+TEST_CASE("ChunkCacheService migrates unresolved work to replacement scheduler")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    auto cache = makeServiceCache(service, "scheduler-migration", fetcher, 1);
+    std::atomic<int> callbacks{0};
+    cache->addChunkReadyListener([&] { ++callbacks; });
+
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    fetcher->waitStarted();
+    auto other = makeServiceCache(
+        service, "scheduler-migration-trigger",
+        std::make_shared<CountingFetcher>(), 4, false);
+    REQUIRE(other);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (fetcher->fetchCalls.load() < 2 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    CHECK(fetcher->fetchCalls.load() == 2);
+
+    fetcher->release();
+    const auto result = waitForResolved(*cache, 0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->front() == std::byte{17});
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    CHECK(callbacks.load() == 1);
+    const auto concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 4);
+    CHECK_FALSE(concurrency.adaptive);
 }
 
 TEST_CASE("ChunkCacheService shares results and keeps sources warm")
@@ -590,7 +638,7 @@ TEST_CASE("ChunkCache source-scoped view clear preserves other sources")
     REQUIRE(waitForResolved(*overlay, 0, 0, 0, 0).status == ChunkStatus::Data);
 }
 
-TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across facades")
+TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across handles")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
     auto fetcher = std::make_shared<BlockingFetcher>();
@@ -675,7 +723,7 @@ TEST_CASE("ChunkCacheService releases aggregate accounting on destruction")
     CHECK(budget->stats().decodedBytes == 0);
 }
 
-TEST_CASE("ChunkCacheService facade destruction removes only its listeners")
+TEST_CASE("ChunkCacheService handle destruction removes only its listeners")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
     auto fetcher = std::make_shared<CountingFetcher>();
@@ -713,8 +761,8 @@ TEST_CASE("ChunkCache reports source-qualified remote fetch start and stop")
     options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = std::make_shared<ChunkCache>(
-        service, "remote-activity", std::move(levels),
+    auto cache = service->openSource(
+        "remote-activity", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
 
@@ -766,8 +814,8 @@ TEST_CASE("ChunkCache clears remote activity after fetch exceptions and listener
     options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = std::make_shared<ChunkCache>(
-        service, "remote-activity-error", std::move(levels),
+    auto cache = service->openSource(
+        "remote-activity-error", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
 
@@ -797,8 +845,8 @@ TEST_CASE("ChunkCache invalidation ends remote activity exactly once")
     options.maxConcurrentReads = 1;
     options.detectAllFillChunks = false;
     options.persistentCachePath = dir;
-    auto cache = std::make_shared<ChunkCache>(
-        service, "remote-activity-invalidate", std::move(levels),
+    auto cache = service->openSource(
+        "remote-activity-invalidate", std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
         0.0, ChunkDtype::UInt8, std::move(options));
 

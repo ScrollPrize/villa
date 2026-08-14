@@ -171,11 +171,12 @@ public:
         std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
 
     // CState clients keep a shared Volume active across workspaces. A shared
-    // service keeps the source facade and decoded chunks warm after release.
+    // service keeps the source handle and decoded chunks warm after release.
     void retainCacheClient();
     void releaseCacheClient();
 
-    // Set the number of background IO threads for chunk fetching.
+    // Set service-wide chunk-fetch concurrency. The most recent setting on any
+    // Volume sharing the service applies to every source in that service.
     void setIOThreads(int count);
 
     // Drop decoded/read cache state. Writes call this automatically.

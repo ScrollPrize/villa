@@ -1,17 +1,17 @@
-# Task: remove cross-run worker identity from render Valgrind replay
+# Task: make chunk source handles service-owned
 
-Fix the synthetic rendering CI evaluator so independently collected Callgrind
-and DRD artifacts do not assume that raw Valgrind worker thread IDs identify
-the same worker or workload in both executions.
+Refactor regular chunk caching so every source is opened by a
+`ChunkCacheService`, every `ChunkCache` is only a lightweight source-bound
+`IChunkedArray` handle, and fetch concurrency is configured once for the whole
+service.
 
-- Keep the initial process thread as the explicit main/control role.
-- Aggregate all modeled non-main Callgrind costs into one renderer worker-pool
-  cost.
-- Let the DRD execution define the worker threads and parallel schedule.
-- Distribute worker-pool cost over non-main DRD compute windows using the
-  existing work-quantum weighting.
-- Preserve the exact complete modeled Callgrind cost.
-- Treat idle or differently participating workers as valid rather than as a
-  missing-cost error.
-- Add regressions for worker-ID relabeling, differing worker participation,
-  and cost conservation.
+- `ChunkCacheService::openSource(...)` creates or reacquires source handles.
+- A cache without an supplied service creates and retains a new service; it
+  does not construct source-local schedulers.
+- Probe, fetch, and decode schedulers and fetch concurrency belong exclusively
+  to the service.
+- Changing I/O threads updates every source in that service. The most recent
+  configuration wins globally.
+- Scheduler replacement preserves decoded chunks, source IDs, demand,
+  listeners, and cache accounting while safely moving unresolved work.
+- Explicit bounded/batch caches remain isolated by using a separate service.

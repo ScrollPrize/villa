@@ -12,6 +12,7 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -136,23 +137,28 @@ struct ChunkCacheService::Impl {
     std::shared_ptr<ChunkRequestScheduler> decodeScheduler =
         std::make_shared<ChunkRequestScheduler>(
             kDecodeWorkers, 7, schedulerSelectionGate);
-    std::unordered_map<std::size_t, std::shared_ptr<ChunkRequestScheduler>> fetchSchedulers;
+    using FetchConfiguration = std::pair<std::size_t, bool>;
+    std::map<FetchConfiguration, std::shared_ptr<ChunkRequestScheduler>> fetchSchedulers;
+    std::shared_ptr<ChunkRequestScheduler> activeFetchScheduler;
+    std::shared_ptr<ChunkRequestScheduler> lastAdaptiveFetchScheduler;
+    std::size_t activeFetchWorkers = 0;
+    bool activeFetchAdaptive = false;
+    std::uint64_t fetchConfigurationGeneration = 0;
 
-    std::shared_ptr<ChunkRequestScheduler> fetchScheduler(std::size_t workers)
-    {
-        return fetchScheduler(workers, false);
-    }
-
-    std::shared_ptr<ChunkRequestScheduler> fetchScheduler(
+    std::shared_ptr<ChunkRequestScheduler> schedulerFor(
         std::size_t workers, bool adaptive)
     {
         workers = normalizedWorkerCount(workers);
-        if (adaptive) {
-            if (!adaptiveFetchScheduler) {
-                ChunkRequestScheduler::AdaptiveConcurrency options;
-                options.maximum = workers;
-                std::optional<ChunkRequestScheduler::AdaptiveState> initialState;
-                if (initialAdaptiveDownloadState) {
+        auto& scheduler = fetchSchedulers[{workers, adaptive}];
+        if (!scheduler) {
+            std::optional<ChunkRequestScheduler::AdaptiveConcurrency> adaptiveOptions;
+            std::optional<ChunkRequestScheduler::AdaptiveState> initialState;
+            if (adaptive) {
+                adaptiveOptions.emplace();
+                adaptiveOptions->maximum = workers;
+                if (lastAdaptiveFetchScheduler) {
+                    initialState = lastAdaptiveFetchScheduler->adaptiveState();
+                } else if (initialAdaptiveDownloadState) {
                     initialState = ChunkRequestScheduler::AdaptiveState{
                         initialAdaptiveDownloadState->settledAdmissionLimit,
                         initialAdaptiveDownloadState->longTermBytesPerSecond,
@@ -160,24 +166,14 @@ struct ChunkCacheService::Impl {
                         initialAdaptiveDownloadState
                             ->saturatedBytesPerSecondPerWorker};
                 }
-                adaptiveFetchScheduler = std::make_shared<ChunkRequestScheduler>(
-                    workers, 7, schedulerSelectionGate, options, initialState);
-                adaptiveFetchWorkers = workers;
-            } else if (adaptiveFetchWorkers != workers) {
-                throw std::invalid_argument(
-                    "shared adaptive fetch scheduler worker count mismatch");
             }
-            return adaptiveFetchScheduler;
-        }
-        auto& scheduler = fetchSchedulers[workers];
-        if (!scheduler)
             scheduler = std::make_shared<ChunkRequestScheduler>(
-                workers, 7, schedulerSelectionGate);
+                workers, 7, schedulerSelectionGate, adaptiveOptions, initialState);
+        }
+        if (adaptive)
+            lastAdaptiveFetchScheduler = scheduler;
         return scheduler;
     }
-
-    std::shared_ptr<ChunkRequestScheduler> adaptiveFetchScheduler;
-    std::size_t adaptiveFetchWorkers = 0;
 };
 
 ChunkCacheService::ChunkCacheService(
@@ -223,12 +219,10 @@ ChunkCacheService::~ChunkCacheService()
     // returning from its callback. Drain every stage while Impl still owns the
     // schedulers so their worker threads are joined by this thread.
     impl_->probeScheduler->waitIdle();
-    for (const auto& [workers, scheduler] : impl_->fetchSchedulers) {
-        (void)workers;
+    for (const auto& [configuration, scheduler] : impl_->fetchSchedulers) {
+        (void)configuration;
         scheduler->waitIdle();
     }
-    if (impl_->adaptiveFetchScheduler)
-        impl_->adaptiveFetchScheduler->waitIdle();
     impl_->decodeScheduler->waitIdle();
 }
 
@@ -245,7 +239,7 @@ ChunkCacheService::adaptiveDownloadState() const
     std::optional<AdaptiveDownloadState> initialState;
     {
         std::lock_guard lock(impl_->mutex);
-        scheduler = impl_->adaptiveFetchScheduler;
+        scheduler = impl_->lastAdaptiveFetchScheduler;
         initialState = impl_->initialAdaptiveDownloadState;
     }
     if (!scheduler)
@@ -258,6 +252,109 @@ ChunkCacheService::adaptiveDownloadState() const
         state->longTermBytesPerSecond,
         state->maximumSaturatedParallelism,
         state->saturatedBytesPerSecondPerWorker};
+}
+
+std::shared_ptr<ChunkCache> ChunkCacheService::openSource(
+    std::string sourceIdentity,
+    std::vector<ChunkCacheLevelInfo> levels,
+    std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
+    double fillValue,
+    ChunkDtype dtype,
+    ChunkCacheOptions options)
+{
+    if (sourceIdentity.empty()) {
+        throw std::invalid_argument(
+            "ChunkCache requires a non-empty source identity");
+    }
+    options.decodedByteCapacity = impl_->decodedByteCapacity;
+    options.decodedByteBudget = impl_->decodedByteBudget;
+    options.compressPersistentCache =
+        options.compressPersistentCache || ChunkCache::persistentCompressionDefault();
+    options.cacheQuantBinWidth = std::max(
+        options.cacheQuantBinWidth,
+        ChunkCache::persistentQuantizationDefault());
+    ChunkCache::validateSourceDefinition(levels, fetchers);
+
+    // Invalid attempts to reopen a source must not change the service-wide
+    // scheduler. Perform the immutable and fetcher checks before applying the
+    // caller's last-writer-wins concurrency configuration.
+    {
+        std::lock_guard serviceLock(impl_->mutex);
+        const auto existing = impl_->sources.find(sourceIdentity);
+        if (existing != impl_->sources.end()) {
+            const auto state =
+                std::static_pointer_cast<ChunkCache::State>(existing->second);
+            if (!ChunkCache::metadataCompatible(
+                    *state, levels, fillValue, dtype, options)) {
+                throw std::invalid_argument(
+                    "ChunkCache source was registered with incompatible metadata: " +
+                    sourceIdentity);
+            }
+            ChunkCache::validateRefreshedFetchers(*state, fetchers);
+        }
+    }
+
+    auto service = shared_from_this();
+    ChunkCache::configureServiceFetchScheduler(
+        service, options.maxConcurrentReads, options.adaptiveConcurrentReads);
+
+    std::unique_lock serviceLock(impl_->mutex);
+    auto existing = impl_->sources.find(sourceIdentity);
+    if (existing != impl_->sources.end()) {
+        auto state =
+            std::static_pointer_cast<ChunkCache::State>(existing->second);
+        if (!ChunkCache::metadataCompatible(
+                *state, levels, fillValue, dtype, options)) {
+            throw std::invalid_argument(
+                "ChunkCache source was registered with incompatible metadata: " +
+                sourceIdentity);
+        }
+        ChunkCache::validateRefreshedFetchers(*state, fetchers);
+        serviceLock.unlock();
+        ChunkCache::refreshFetchers(state, std::move(fetchers));
+        return std::shared_ptr<ChunkCache>(
+            new ChunkCache(std::move(service), std::move(state)));
+    }
+
+    const VolumeSourceId sourceId{impl_->nextSourceId++};
+    auto state = std::make_shared<ChunkCache::State>(
+        std::move(levels), std::move(fetchers), fillValue, dtype,
+        std::move(options), sourceId, sourceIdentity);
+    state->probeScheduler_ = impl_->probeScheduler;
+    state->fetchScheduler_ = impl_->activeFetchScheduler;
+    state->fetchConfigurationGeneration_ = impl_->fetchConfigurationGeneration;
+    state->decodeScheduler_ = impl_->decodeScheduler;
+    state->schedulerSelectionGate_ = impl_->schedulerSelectionGate;
+    state->activeViewId_ = impl_->activeViewId;
+    state->nextTaskId_ = impl_->nextTaskId;
+    if (!state->options_.decodedByteBudget) {
+        state->options_.decodedByteBudget =
+            ChunkCache::decodedByteBudgetDefault();
+    }
+    if (state->options_.persistentCacheBudgetRoot &&
+        state->options_.persistentCachePath) {
+        state->persistentBudget_ = PersistentZarrCacheBudget::findForPath(
+            *state->options_.persistentCachePath);
+    }
+    if (state->options_.persistentCachePath && !state->persistentBudget_)
+        ChunkCache::startPersistentCacheSizeScan(state);
+    ChunkCache::registerStateBudget(state);
+    impl_->sources.emplace(state->sourceIdentity_, state);
+    return std::shared_ptr<ChunkCache>(
+        new ChunkCache(std::move(service), std::move(state)));
+}
+
+void ChunkCacheService::configureFetchConcurrency(
+    std::size_t maxConcurrentReads, bool adaptive)
+{
+    ChunkCache::configureServiceFetchScheduler(
+        shared_from_this(), maxConcurrentReads, adaptive);
+}
+
+ChunkCacheService::FetchConcurrency ChunkCacheService::fetchConcurrency() const
+{
+    std::lock_guard lock(impl_->mutex);
+    return {impl_->activeFetchWorkers, impl_->activeFetchAdaptive};
 }
 
 std::size_t ChunkCacheService::sourceCount() const
@@ -299,128 +396,186 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                        double fillValue,
                        ChunkDtype dtype,
                        Options options)
-    : ChunkCache(
-          std::shared_ptr<ChunkCacheService>(new ChunkCacheService(
-              options.decodedByteCapacity, options.decodedByteBudget, false,
-              std::nullopt)),
-          "private:" + std::to_string(nextSchedulerGroup()),
-          std::move(levels), std::move(fetchers), fillValue, dtype, options)
+    : service_(std::shared_ptr<ChunkCacheService>(new ChunkCacheService(
+          options.decodedByteCapacity, options.decodedByteBudget, false,
+          std::nullopt)))
 {
+    auto handle = service_->openSource(
+        "private:" + std::to_string(nextSchedulerGroup()), std::move(levels),
+        std::move(fetchers), fillValue, dtype, std::move(options));
+    state_ = std::move(handle->state_);
 }
 
 ChunkCache::ChunkCache(std::shared_ptr<ChunkCacheService> service,
-                       std::string sourceIdentity,
-                       std::vector<LevelInfo> levels,
-                       std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
-                       double fillValue,
-                       ChunkDtype dtype,
-                       Options options)
+                       std::shared_ptr<State> state)
     : service_(std::move(service))
+    , state_(std::move(state))
 {
     if (!service_)
         throw std::invalid_argument("ChunkCache requires a cache service");
-    if (sourceIdentity.empty())
-        throw std::invalid_argument("ChunkCache requires a non-empty source identity");
-    options.decodedByteCapacity = service_->impl_->decodedByteCapacity;
-    options.decodedByteBudget = service_->impl_->decodedByteBudget;
-    options.compressPersistentCache =
-        options.compressPersistentCache || persistentCompressionDefault();
-    options.cacheQuantBinWidth = std::max(
-        options.cacheQuantBinWidth, persistentQuantizationDefault());
+    if (!state_)
+        throw std::invalid_argument("ChunkCache requires registered source state");
+}
 
-    std::unique_lock serviceLock(service_->impl_->mutex);
-    auto existing = service_->impl_->sources.find(sourceIdentity);
-    if (existing != service_->impl_->sources.end()) {
-        auto state = std::static_pointer_cast<State>(existing->second);
-        if (!metadataCompatible(*state, levels, fillValue, dtype, options)) {
-            throw std::invalid_argument(
-                "ChunkCache source was registered with incompatible metadata: " +
-                sourceIdentity);
-        }
-        state_ = std::move(state);
-        serviceLock.unlock();
-        refreshFetchers(state_, std::move(fetchers));
-        return;
-    }
-
-    const VolumeSourceId sourceId{service_->impl_->nextSourceId++};
-    state_ = std::make_shared<State>(
-        std::move(levels), std::move(fetchers), fillValue, dtype,
-        std::move(options), sourceId, sourceIdentity);
-    state_->probeScheduler_ = service_->impl_->probeScheduler;
-    state_->fetchScheduler_ = service_->impl_->fetchScheduler(
-        state_->options_.maxConcurrentReads,
-        state_->options_.adaptiveConcurrentReads);
-    state_->decodeScheduler_ = service_->impl_->decodeScheduler;
-    state_->schedulerSelectionGate_ = service_->impl_->schedulerSelectionGate;
-    state_->activeViewId_ = service_->impl_->activeViewId;
-    state_->nextTaskId_ = service_->impl_->nextTaskId;
-    if (!state_->options_.decodedByteBudget)
-        state_->options_.decodedByteBudget = decodedByteBudgetDefault();
-    if (state_->levels_.empty())
+void ChunkCache::validateSourceDefinition(
+    const std::vector<LevelInfo>& levels,
+    const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers)
+{
+    if (levels.empty())
         throw std::invalid_argument("ChunkCache requires at least one level");
-    if (state_->levels_.size() != state_->fetchers_.size())
+    if (levels.size() != fetchers.size())
         throw std::invalid_argument("ChunkCache level/fetcher count mismatch");
-    for (std::size_t i = 0; i < state_->levels_.size(); ++i) {
+    for (std::size_t level = 0; level < levels.size(); ++level) {
         const bool missingLevel =
-            state_->levels_[i].shape[0] == 0 &&
-            state_->levels_[i].shape[1] == 0 &&
-            state_->levels_[i].shape[2] == 0;
-        if (!state_->fetchers_[i] && !missingLevel)
-            throw std::invalid_argument("ChunkCache fetcher must not be null for present level");
-        for (int dim : state_->levels_[i].shape) {
-            if (dim < 0)
-                throw std::invalid_argument("ChunkCache level shape must be non-negative");
+            levels[level].shape[0] == 0 &&
+            levels[level].shape[1] == 0 &&
+            levels[level].shape[2] == 0;
+        if (!fetchers[level] && !missingLevel) {
+            throw std::invalid_argument(
+                "ChunkCache fetcher must not be null for present level");
         }
-        for (int dim : state_->levels_[i].chunkShape) {
-            if (dim <= 0)
-                throw std::invalid_argument("ChunkCache chunk shape must be positive");
+        for (int dim : levels[level].shape) {
+            if (dim < 0) {
+                throw std::invalid_argument(
+                    "ChunkCache level shape must be non-negative");
+            }
+        }
+        for (int dim : levels[level].chunkShape) {
+            if (dim <= 0) {
+                throw std::invalid_argument(
+                    "ChunkCache chunk shape must be positive");
+            }
         }
     }
-    if (state_->options_.persistentCacheBudgetRoot &&
-        state_->options_.persistentCachePath)
-        state_->persistentBudget_ = PersistentZarrCacheBudget::findForPath(
-            *state_->options_.persistentCachePath);
-    if (state_->options_.persistentCachePath && !state_->persistentBudget_)
-        startPersistentCacheSizeScan(state_);
-    if (state_->options_.decodedByteBudget) {
-        std::weak_ptr<State> weakState = state_;
-        state_->decodedBudgetRegistration_ =
-            state_->options_.decodedByteBudget->registerCache({
-                [weakState]() -> std::optional<std::uint64_t> {
-                    auto state = weakState.lock();
-                    return state ? oldestDecodedTouch(state) : std::nullopt;
-                },
-                [weakState]() -> std::size_t {
-                    auto state = weakState.lock();
-                    return state ? evictOldestDecoded(state) : 0;
-                },
-            });
+}
+
+void ChunkCache::registerStateBudget(const std::shared_ptr<State>& state)
+{
+    if (!state || !state->options_.decodedByteBudget)
+        return;
+    std::weak_ptr<State> weakState = state;
+    state->decodedBudgetRegistration_ =
+        state->options_.decodedByteBudget->registerCache({
+            [weakState]() -> std::optional<std::uint64_t> {
+                auto locked = weakState.lock();
+                return locked ? oldestDecodedTouch(locked) : std::nullopt;
+            },
+            [weakState]() -> std::size_t {
+                auto locked = weakState.lock();
+                return locked ? evictOldestDecoded(locked) : 0;
+            },
+        });
+}
+
+void ChunkCache::validateRefreshedFetchers(
+    const State& state,
+    const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers)
+{
+    if (fetchers.size() != state.levels_.size()) {
+        throw std::invalid_argument(
+            "ChunkCache fetcher refresh level count mismatch");
     }
-    service_->impl_->sources.emplace(state_->sourceIdentity_, state_);
+    for (std::size_t level = 0; level < fetchers.size(); ++level) {
+        const bool missingLevel =
+            state.levels_[level].shape[0] == 0 &&
+            state.levels_[level].shape[1] == 0 &&
+            state.levels_[level].shape[2] == 0;
+        if (!fetchers[level] && !missingLevel) {
+            throw std::invalid_argument(
+                "ChunkCache refreshed fetcher is null for present level");
+        }
+        if (fetchers[level] &&
+            fetchers[level]->persistentCacheExtension(
+                ChunkKey{static_cast<int>(level), 0, 0, 0}) !=
+                state.persistentExtensions_[level]) {
+            throw std::invalid_argument(
+                "ChunkCache refreshed fetcher changed persistent encoding");
+        }
+    }
+}
+
+void ChunkCache::configureServiceFetchScheduler(
+    const std::shared_ptr<ChunkCacheService>& service,
+    std::size_t maxConcurrentReads,
+    bool adaptive)
+{
+    maxConcurrentReads = normalizedWorkerCount(maxConcurrentReads);
+    std::shared_ptr<ChunkRequestScheduler> scheduler;
+    std::vector<std::shared_ptr<State>> states;
+    std::uint64_t configurationGeneration = 0;
+    {
+        std::lock_guard serviceLock(service->impl_->mutex);
+        if (service->impl_->activeFetchScheduler &&
+            service->impl_->activeFetchWorkers == maxConcurrentReads &&
+            service->impl_->activeFetchAdaptive == adaptive) {
+            return;
+        }
+        scheduler = service->impl_->schedulerFor(maxConcurrentReads, adaptive);
+        service->impl_->activeFetchScheduler = scheduler;
+        service->impl_->activeFetchWorkers = maxConcurrentReads;
+        service->impl_->activeFetchAdaptive = adaptive;
+        configurationGeneration =
+            ++service->impl_->fetchConfigurationGeneration;
+        states.reserve(service->impl_->sources.size());
+        for (const auto& [identity, source] : service->impl_->sources) {
+            (void)identity;
+            states.push_back(std::static_pointer_cast<State>(source));
+        }
+    }
+
+    service->impl_->schedulerSelectionGate->publish([&] {
+        {
+            std::lock_guard serviceLock(service->impl_->mutex);
+            if (service->impl_->fetchConfigurationGeneration !=
+                configurationGeneration) {
+                return;
+            }
+        }
+        for (const auto& state : states)
+            migrateFetchScheduler(
+                state, scheduler, maxConcurrentReads, adaptive,
+                configurationGeneration);
+    });
+}
+
+void ChunkCache::migrateFetchScheduler(
+    const std::shared_ptr<State>& state,
+    const std::shared_ptr<ChunkRequestScheduler>& scheduler,
+    std::size_t maxConcurrentReads,
+    bool adaptive,
+    std::uint64_t configurationGeneration)
+{
+    {
+        std::lock_guard lock(state->mutex_);
+        if (state->fetchConfigurationGeneration_ >= configurationGeneration)
+            return;
+        const auto oldScheduler = state->fetchScheduler_.lock();
+        const std::uint64_t schedulerEpoch = ++state->schedulerEpoch_;
+        if (oldScheduler)
+            oldScheduler->cancelGroupBefore(
+                state->schedulerGroup_, schedulerEpoch);
+        if (auto probeScheduler = state->probeScheduler_.lock())
+            probeScheduler->cancelGroupBefore(
+                state->schedulerGroup_, schedulerEpoch);
+        if (auto decodeScheduler = state->decodeScheduler_.lock())
+            decodeScheduler->cancelGroupBefore(
+                state->schedulerGroup_, schedulerEpoch);
+        state->fetchScheduler_ = scheduler;
+        state->options_.maxConcurrentReads = maxConcurrentReads;
+        state->options_.adaptiveConcurrentReads = adaptive;
+        state->fetchConfigurationGeneration_ = configurationGeneration;
+        restartUnresolvedLocked(state);
+    }
+    state->cv_.notify_all();
 }
 
 void ChunkCache::refreshFetchers(
     const std::shared_ptr<State>& state,
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers)
 {
-    if (!state || fetchers.size() != state->levels_.size())
-        throw std::invalid_argument("ChunkCache fetcher refresh level count mismatch");
-    for (std::size_t level = 0; level < fetchers.size(); ++level) {
-        const bool missingLevel =
-            state->levels_[level].shape[0] == 0 &&
-            state->levels_[level].shape[1] == 0 &&
-            state->levels_[level].shape[2] == 0;
-        if (!fetchers[level] && !missingLevel)
-            throw std::invalid_argument("ChunkCache refreshed fetcher is null for present level");
-        if (fetchers[level] &&
-            fetchers[level]->persistentCacheExtension(
-                ChunkKey{static_cast<int>(level), 0, 0, 0}) !=
-                state->persistentExtensions_[level]) {
-            throw std::invalid_argument(
-                "ChunkCache refreshed fetcher changed persistent encoding");
-        }
-    }
+    if (!state)
+        throw std::invalid_argument("ChunkCache fetcher refresh requires state");
+    validateRefreshedFetchers(*state, fetchers);
 
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
@@ -437,49 +592,53 @@ void ChunkCache::refreshFetchers(
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
         if (auto scheduler = state->decodeScheduler_.lock())
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
-
-        std::vector<std::pair<std::uint64_t, ChunkKey>> retry;
-        retry.reserve(state->entries_.size());
-        for (auto it = state->entries_.begin(); it != state->entries_.end();) {
-            Entry& entry = it->second;
-            if (entry.status == EntryStatus::InFlight && !hasDemandLocked(entry)) {
-                if (entry.unresolvedCounted && it->first.level >= 0 &&
-                    it->first.level < static_cast<int>(
-                        state->unresolvedFetchesByLevel_.size())) {
-                    auto& unresolved = state->unresolvedFetchesByLevel_[
-                        static_cast<std::size_t>(it->first.level)];
-                    if (unresolved > 0)
-                        --unresolved;
-                }
-                it = state->entries_.erase(it);
-                continue;
-            }
-            if ((entry.status != EntryStatus::InFlight &&
-                 entry.status != EntryStatus::Error) ||
-                !hasDemandLocked(entry)) {
-                ++it;
-                continue;
-            }
-            if (entry.inLru) {
-                state->lru_.erase(entry.lruIt);
-                entry.inLru = false;
-            }
-            entry.error.clear();
-            entry.probeTaskId = 0;
-            entry.fetchTaskId = 0;
-            entry.decodeTaskId = 0;
-            retry.emplace_back(entry.fetchSerial, it->first);
-            ++it;
-        }
-        std::sort(retry.begin(), retry.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.first < rhs.first;
-        });
-        for (const auto& [serial, key] : retry) {
-            (void)serial;
-            queueFetchLocked(state, key, state->generation_, 0);
-        }
+        restartUnresolvedLocked(state);
     });
     state->cv_.notify_all();
+}
+
+void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
+{
+    std::vector<std::pair<std::uint64_t, ChunkKey>> retry;
+    retry.reserve(state->entries_.size());
+    for (auto it = state->entries_.begin(); it != state->entries_.end();) {
+        Entry& entry = it->second;
+        if (entry.status == EntryStatus::InFlight && !hasDemandLocked(entry)) {
+            if (entry.unresolvedCounted && it->first.level >= 0 &&
+                it->first.level < static_cast<int>(
+                    state->unresolvedFetchesByLevel_.size())) {
+                auto& unresolved = state->unresolvedFetchesByLevel_[
+                    static_cast<std::size_t>(it->first.level)];
+                if (unresolved > 0)
+                    --unresolved;
+            }
+            it = state->entries_.erase(it);
+            continue;
+        }
+        if ((entry.status != EntryStatus::InFlight &&
+             entry.status != EntryStatus::Error) ||
+            !hasDemandLocked(entry)) {
+            ++it;
+            continue;
+        }
+        if (entry.inLru) {
+            state->lru_.erase(entry.lruIt);
+            entry.inLru = false;
+        }
+        entry.error.clear();
+        entry.probeTaskId = 0;
+        entry.fetchTaskId = 0;
+        entry.decodeTaskId = 0;
+        retry.emplace_back(entry.fetchSerial, it->first);
+        ++it;
+    }
+    std::sort(retry.begin(), retry.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+    for (const auto& [serial, key] : retry) {
+        (void)serial;
+        queueFetchLocked(state, key, state->generation_, 0);
+    }
 }
 
 namespace {
@@ -528,7 +687,7 @@ ChunkCache::~ChunkCache()
     std::vector<ChunkReadyCallbackId> listenerIds;
     std::vector<RemoteFetchActivityCallbackId> remoteFetchListenerIds;
     {
-        std::lock_guard facadeLock(facadeMutex_);
+        std::lock_guard handleLock(handleMutex_);
         listenerIds.assign(listenerIds_.begin(), listenerIds_.end());
         listenerIds_.clear();
         remoteFetchListenerIds.assign(remoteFetchListenerIds_.begin(),
@@ -776,7 +935,7 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
 IChunkedArray::ChunkReadyCallbackId ChunkCache::addChunkReadyListener(ChunkReadyCallback cb)
 {
     auto state = state_;
-    std::scoped_lock lock(facadeMutex_, state->mutex_);
+    std::scoped_lock lock(handleMutex_, state->mutex_);
     const auto id = state->nextCallbackId_++;
     state->callbacks_.emplace(id, std::move(cb));
     listenerIds_.insert(id);
@@ -786,7 +945,7 @@ IChunkedArray::ChunkReadyCallbackId ChunkCache::addChunkReadyListener(ChunkReady
 void ChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
 {
     auto state = state_;
-    std::scoped_lock lock(facadeMutex_, state->mutex_);
+    std::scoped_lock lock(handleMutex_, state->mutex_);
     state->callbacks_.erase(id);
     listenerIds_.erase(id);
 }
@@ -795,7 +954,7 @@ ChunkCache::RemoteFetchActivityCallbackId
 ChunkCache::addRemoteFetchActivityListener(RemoteFetchActivityCallback cb)
 {
     auto state = state_;
-    std::scoped_lock lock(facadeMutex_, state->mutex_);
+    std::scoped_lock lock(handleMutex_, state->mutex_);
     const auto id = state->nextCallbackId_++;
     state->remoteFetchCallbacks_.emplace(id, std::move(cb));
     remoteFetchListenerIds_.insert(id);
@@ -806,7 +965,7 @@ void ChunkCache::removeRemoteFetchActivityListener(
     RemoteFetchActivityCallbackId id)
 {
     auto state = state_;
-    std::scoped_lock lock(facadeMutex_, state->mutex_);
+    std::scoped_lock lock(handleMutex_, state->mutex_);
     state->remoteFetchCallbacks_.erase(id);
     remoteFetchListenerIds_.erase(id);
 }
@@ -1052,7 +1211,7 @@ void ChunkCache::clearSourceViewDemand(std::uint64_t viewId,
     auto state = state_;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
-        // Close this view version only in the facade's bound source so an
+        // Close this view version only in the handle's bound source so an
         // already-running render cannot re-add the demand after overlay disable.
         // A newer render version reopens the source normally.
         clearSourceViewDemandLocked(*state, viewId, viewVersion, true);
@@ -1356,7 +1515,8 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         state->fetcherGeneration_,
         fetchSerial,
         schedulerEpoch,
-        state->fetchers_.at(static_cast<std::size_t>(key.level))};
+        state->fetchers_.at(static_cast<std::size_t>(key.level)),
+        {}};
     if (!context.fetcher)
         return;
     std::weak_ptr<State> weakState = state;
@@ -1382,6 +1542,7 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         auto scheduler = state->fetchScheduler_.lock();
         if (!scheduler)
             return;
+        context.fetchScheduler = scheduler;
         scheduler->submit(
             taskId, priority, state->schedulerGroup_, schedulerEpoch,
             [weakState, key, context] {
@@ -1457,6 +1618,7 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
         auto scheduler = state->fetchScheduler_.lock();
         if (!scheduler)
             return;
+        context.fetchScheduler = scheduler;
         const auto priority = workPriorityLocked(*state, key, it->second);
         std::weak_ptr<State> weakState = state;
         scheduler->submit(
@@ -1618,8 +1780,8 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
         }
     }
     if (fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty()) {
-        if (auto scheduler = state->fetchScheduler_.lock()) {
-            scheduler->recordSuccessfulTransfer(
+        if (context.fetchScheduler) {
+            context.fetchScheduler->recordSuccessfulTransfer(
                 fetch.bytes.size(), fetchStarted,
                 std::chrono::steady_clock::now());
         }
