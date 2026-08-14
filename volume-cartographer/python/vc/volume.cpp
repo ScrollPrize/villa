@@ -420,7 +420,8 @@ nb::tuple sampleZYXBlockTyped(Volume& volume,
     if (level < 0)
         throw std::out_of_range("level must be non-negative");
     if (!volume.hasScaleLevel(level))
-        throw std::out_of_range("requested missing zarr scale level " + std::to_string(level));
+        throw std::out_of_range(
+            "requested missing zarr scale level " + std::to_string(level));
 
     vc::render::ChunkedPlaneSampler::Stats stats;
     stats.requestedLevelOnly = true;
@@ -648,6 +649,16 @@ nb::object readChunk(Volume& volume,
 using FloatCoords = nb::ndarray<float, nb::numpy, nb::c_contig>;
 using BoolMask = nb::ndarray<bool, nb::numpy, nb::c_contig>;
 
+void validatePlaneVectors(const FloatCoords& values,
+                          size_t planeCount,
+                          const char* name)
+{
+    if (values.ndim() != 2 || values.shape(0) != planeCount || values.shape(1) != 3) {
+        throw nb::value_error(
+            (std::string(name) + " must have shape [N, 3]").c_str());
+    }
+}
+
 cv::Mat_<cv::Vec3f> coordsArrayToMat(const FloatCoords& coords)
 {
     if (coords.ndim() != 3 || coords.shape(2) != 3)
@@ -751,6 +762,82 @@ nb::tuple sampleCoords(Volume& volume,
     nb::dict statsDict = statsToDict(stats);
     statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
     return nb::make_tuple(imageArr, validArr, statsDict);
+}
+
+nb::tuple samplePlanes(Volume& volume,
+                       const FloatCoords& originsXyz,
+                       const FloatCoords& xStepsXyz,
+                       const FloatCoords& yStepsXyz,
+                       const std::array<int, 2>& shape,
+                       int level,
+                       const std::string& sampling,
+                       int tileSize)
+{
+    if (originsXyz.ndim() != 2 || originsXyz.shape(1) != 3)
+        throw nb::value_error("origins_xyz must have shape [N, 3]");
+    const size_t planeCount = originsXyz.shape(0);
+    if (planeCount == 0)
+        throw nb::value_error("at least one plane is required");
+    validatePlaneVectors(xStepsXyz, planeCount, "x_steps_xyz");
+    validatePlaneVectors(yStepsXyz, planeCount, "y_steps_xyz");
+    if (shape[0] <= 0 || shape[1] <= 0)
+        throw nb::value_error("shape must contain positive [height, width]");
+    if (level < 0)
+        throw std::out_of_range("level must be non-negative");
+    if (!volume.hasScaleLevel(level))
+        throw std::out_of_range("requested missing zarr scale level " + std::to_string(level));
+
+    const size_t height = static_cast<size_t>(shape[0]);
+    const size_t width = static_cast<size_t>(shape[1]);
+    if (planeCount > static_cast<size_t>(std::numeric_limits<int>::max()) / height)
+        throw std::overflow_error("stacked plane height exceeds OpenCV limits");
+
+    // Stack every plane into one coordinate image. The chunk sampler can then
+    // deduplicate and pin the union of dependencies once, which is substantially
+    // cheaper than one Python/native transition and one dependency walk per plane.
+    cv::Mat_<cv::Vec3f> coords(static_cast<int>(planeCount * height), shape[1]);
+    const float* origins = originsXyz.data();
+    const float* xSteps = xStepsXyz.data();
+    const float* ySteps = yStepsXyz.data();
+    for (size_t plane = 0; plane < planeCount; ++plane) {
+        const cv::Vec3f origin(
+            origins[3 * plane], origins[3 * plane + 1], origins[3 * plane + 2]);
+        const cv::Vec3f xStep(
+            xSteps[3 * plane], xSteps[3 * plane + 1], xSteps[3 * plane + 2]);
+        const cv::Vec3f yStep(
+            ySteps[3 * plane], ySteps[3 * plane + 1], ySteps[3 * plane + 2]);
+        for (size_t y = 0; y < height; ++y) {
+            auto* row = coords.ptr<cv::Vec3f>(static_cast<int>(plane * height + y));
+            const cv::Vec3f rowOrigin = origin + static_cast<float>(y) * yStep;
+            for (size_t x = 0; x < width; ++x)
+                row[x] = rowOrigin + static_cast<float>(x) * xStep;
+        }
+    }
+
+    const size_t pixelCount = planeCount * height * width;
+    std::vector<uint8_t> images(pixelCount, uint8_t{0});
+    std::vector<uint8_t> valid(pixelCount, uint8_t{0});
+    cv::Mat_<uint8_t> out(coords.rows, coords.cols, images.data());
+    cv::Mat_<uint8_t> coverage(coords.rows, coords.cols, valid.data());
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    {
+        nb::gil_scoped_release release;
+        stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            out,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = stats.requestedChunks;
+    const std::array<size_t, 3> outShape{planeCount, height, width};
+    return nb::make_tuple(
+        makeNumpyArray(std::move(images), outShape),
+        makeNumpyArray(std::move(valid), outShape),
+        statsDict);
 }
 
 std::string joinUrl(std::string base, const std::string& key)
@@ -915,6 +1002,17 @@ NB_MODULE(volume, m)
             "sampling"_a = "trilinear",
             "tile_size"_a = 32,
             "blocking"_a = true)
+        .def("sample_planes", &samplePlanes,
+            "origins_xyz"_a,
+            "x_steps_xyz"_a,
+            "y_steps_xyz"_a,
+            "shape"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32,
+            "Sample several arbitrary affine planes in one blocking, chunk-aware call. "
+            "Origins and step vectors use logical level-0 XYZ voxel coordinates; "
+            "returns (images, valid, stats) with image shape [N, H, W].")
         .def("collect_coords_dependencies", &collectCoordsDependencies,
             "coords_xyz"_a,
             "valid_mask"_a,

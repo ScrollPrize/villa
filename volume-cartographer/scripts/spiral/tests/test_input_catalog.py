@@ -55,11 +55,19 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
     assert fit_input("gradient_magnitude").required(
         {**grad, "loss_weight_dense_spacing": 0.0}) is False
 
+    winding_model = {"dense_spacing_mode": "winding_model",
+                     "loss_weight_dense_normals": 0.0}
+    assert fit_input("winding_inference").required(winding_model) is True
+    assert fit_input("winding_inference").enabled(winding_model) is True
+    assert fit_input("normal_x").required(winding_model) is False
+    assert fit_input("surf_sdt").required(winding_model) is False
+
     invalid = {"dense_spacing_mode": "crossing_count",
                "loss_weight_dense_normals": 0.0}
     assert not any(fit_input(key).required(invalid)
                    for key in ("normal_x", "normal_y",
-                               "gradient_magnitude", "surf_sdt"))
+                               "gradient_magnitude", "surf_sdt",
+                               "winding_inference"))
 
 
 def test_patch_inputs_follow_the_disable_switch():
