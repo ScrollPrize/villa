@@ -66,3 +66,25 @@ def test_create_optimizer_adamw_honors_eps_override():
 
     assert isinstance(optimizer, torch.optim.AdamW)
     assert optimizer.defaults["eps"] == 1e-4
+
+
+def test_create_optimizer_accepts_parameter_groups():
+    model = torch.nn.Linear(4, 2)
+    parameter_groups = [
+        {"params": [model.weight], "lr": 2.5e-4},
+        {"params": [model.bias]},
+    ]
+
+    optimizer = create_optimizer(
+        {"name": "adam", "learning_rate": 1e-3},
+        parameter_groups,
+    )
+
+    assert [
+        [id(parameter) for parameter in group["params"]]
+        for group in optimizer.param_groups
+    ] == [
+        [id(model.weight)],
+        [id(model.bias)],
+    ]
+    assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
