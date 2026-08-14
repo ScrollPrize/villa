@@ -115,8 +115,18 @@ private:
     };
 
     QString mapServicePath(const QString& servicePath) const;
+    // Loss-map entries of one manifest, resolved against the artifact
+    // directory holding them. Shared by the surface manifest (older services
+    // still carry the overlays there) and the diagnostics manifest.
+    static std::vector<PreviewLoadResult::LossMap> parseLossMaps(
+        const QJsonObject& manifest, const QString& artifactRoot);
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
+    // Adopt the loss overlays published for the installed preview. They are a
+    // separate artifact that lands after the surface, so this only extends
+    // what is already displayed - it never reloads the surface.
+    void installPreviewDiagnostics(const QString& manifestPath,
+                                   qint64 generation);
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();

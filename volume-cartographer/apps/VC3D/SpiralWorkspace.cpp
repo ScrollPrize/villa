@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QImageReader>
 #include <QJsonArray>
@@ -344,7 +345,13 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _lossMapOpacity = opacity;
                 updateLossMapOverlay();
             });
+    connect(_panel, &SpiralPanel::previewDiagnosticsChanged, this,
+            [this](bool enabled) {
+                if (_service) _service->setPreviewDiagnostics(enabled);
+            });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
+    connect(_service, &SpiralServiceManager::previewDiagnosticsAvailable, this,
+            &SpiralWorkspace::installPreviewDiagnostics);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
@@ -985,6 +992,48 @@ void SpiralWorkspace::synchronizeVolume(
         if (viewer) viewer->requestRender("Shared display volume changed");
 }
 
+std::vector<SpiralWorkspace::PreviewLoadResult::LossMap>
+SpiralWorkspace::parseLossMaps(const QJsonObject& manifest,
+                               const QString& artifactRoot)
+{
+    std::vector<PreviewLoadResult::LossMap> lossMaps;
+    for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        const QString name = entry.value(QStringLiteral("name")).toString();
+        const QString relativePath = QDir::cleanPath(
+            entry.value(QStringLiteral("path")).toString());
+        if (name.isEmpty() || relativePath.isEmpty()
+            || QDir::isAbsolutePath(relativePath)
+            || relativePath == QStringLiteral("..")
+            || relativePath.startsWith(QStringLiteral("../")))
+            continue;
+        PreviewLoadResult::LossMap map;
+        map.name = name;
+        map.relativePath = relativePath;
+        const QString imagePath = QDir(artifactRoot).filePath(relativePath);
+        if (QFileInfo::exists(imagePath)) map.imagePath = imagePath;
+        map.weight = entry.value(QStringLiteral("weight")).toDouble();
+        map.p50 = entry.value(QStringLiteral("p50")).toDouble();
+        map.p95 = entry.value(QStringLiteral("p95")).toDouble();
+        map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
+        map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
+        map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
+        map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
+            ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
+            : map.sampleCount;
+        map.projectedSampleCount = entry.contains(QStringLiteral("projected_sample_count"))
+            ? entry.value(QStringLiteral("projected_sample_count")).toInteger()
+            : map.sampleCount;
+        map.offSurfaceSampleCount =
+            entry.value(QStringLiteral("off_surface_sample_count")).toInteger();
+        map.omittedSampleCount =
+            entry.value(QStringLiteral("omitted_sample_count")).toInteger();
+        map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
+        lossMaps.push_back(std::move(map));
+    }
+    return lossMaps;
+}
+
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)
 {
     if (_shuttingDown || generation < _requestedPreviewGeneration) return;
@@ -1152,41 +1201,8 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     return failure(QObject::tr(
                         "Spiral winding bounds exceed the surface grid"));
             }
-            std::vector<PreviewLoadResult::LossMap> lossMaps;
-            for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
-                const QJsonObject entry = value.toObject();
-                const QString name = entry.value(QStringLiteral("name")).toString();
-                const QString relativePath = QDir::cleanPath(
-                    entry.value(QStringLiteral("path")).toString());
-                if (name.isEmpty() || relativePath.isEmpty()
-                    || QDir::isAbsolutePath(relativePath)
-                    || relativePath == QStringLiteral("..")
-                    || relativePath.startsWith(QStringLiteral("../")))
-                    continue;
-                PreviewLoadResult::LossMap map;
-                map.name = name;
-                map.relativePath = relativePath;
-                const QString imagePath = QDir(artifactRoot).filePath(relativePath);
-                if (QFileInfo::exists(imagePath)) map.imagePath = imagePath;
-                map.weight = entry.value(QStringLiteral("weight")).toDouble();
-                map.p50 = entry.value(QStringLiteral("p50")).toDouble();
-                map.p95 = entry.value(QStringLiteral("p95")).toDouble();
-                map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
-                map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
-                map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
-                map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
-                    ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
-                    : map.sampleCount;
-                map.projectedSampleCount = entry.contains(QStringLiteral("projected_sample_count"))
-                    ? entry.value(QStringLiteral("projected_sample_count")).toInteger()
-                    : map.sampleCount;
-                map.offSurfaceSampleCount =
-                    entry.value(QStringLiteral("off_surface_sample_count")).toInteger();
-                map.omittedSampleCount =
-                    entry.value(QStringLiteral("omitted_sample_count")).toInteger();
-                map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
-                lossMaps.push_back(std::move(map));
-            }
+            std::vector<PreviewLoadResult::LossMap> lossMaps =
+                parseLossMaps(manifest, artifactRoot);
             QString runDiffPath;
             const QString runDiffRelative = QDir::cleanPath(
                 manifest.value(QStringLiteral("run_diff")).toObject()
@@ -1239,6 +1255,43 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
     applyPreviewWindingRange(false);
     if (_runDiffVisible) loadRunDiff();
+}
+
+void SpiralWorkspace::installPreviewDiagnostics(const QString& manifestPath,
+                                                qint64 generation)
+{
+    // The overlays are published after the surface they were mapped through,
+    // so by the time they arrive the workspace may have moved on to a newer
+    // preview. Both the generation and the surface id are checked: drawing an
+    // overlay sampled through a different flatten would be silently wrong.
+    if (_shuttingDown || generation != _requestedPreviewGeneration
+        || !_previewSource)
+        return;
+    QFile file(manifestPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        statusBar()->showMessage(
+            tr("Could not open the Spiral preview diagnostics manifest"), 15000);
+        return;
+    }
+    const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
+    if (manifest.value(QStringLiteral("surface_id")).toString() != _previewSourceId)
+        return;
+    const std::vector<PreviewLoadResult::LossMap> lossMaps =
+        parseLossMaps(manifest, QFileInfo(manifestPath).absolutePath());
+
+    _previewLossMaps.clear();
+    _fetchingLossMaps.clear();
+    _loadedLossMap.clear();
+    _loadedLossMapImage = {};
+    QStringList lossMapNames;
+    for (const auto& map : lossMaps) {
+        _previewLossMaps.insert(map.name, map);
+        lossMapNames.push_back(map.name);
+    }
+    _panel->setLossMapOptions(lossMapNames);
+    // A selection that survived the new preview is now backed by these
+    // overlays; anything else leaves the overlay cleared.
+    updateLossMapOverlay();
 }
 
 void SpiralWorkspace::loadRunDiff()

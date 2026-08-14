@@ -537,6 +537,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     lossMapLayout->addWidget(new QLabel(tr("Opacity"), lossMapRow));
     lossMapLayout->addWidget(_lossMapOpacity);
     displayDialogLayout->addWidget(lossMapRow);
+    _lossMapDiagnostics = new QCheckBox(
+        tr("Compute loss overlays with the next preview"), _displayDialog);
+    _lossMapDiagnostics->setObjectName(
+        QStringLiteral("spiralPreviewDiagnostics"));
+    _lossMapDiagnostics->setToolTip(
+        tr("Loss overlays roughly double the cost of a preview: every enabled "
+           "loss is evaluated again and each overlay is mapped onto the "
+           "flattened output. They are published after the surface, so the "
+           "preview itself still appears as soon as it is ready."));
+    connect(_lossMapDiagnostics, &QCheckBox::toggled,
+            this, &SpiralPanel::previewDiagnosticsChanged);
+    displayDialogLayout->addWidget(_lossMapDiagnostics);
     _lossMapLegend = new QLabel(_displayDialog);
     _lossMapLegend->setWordWrap(true);
     _lossMapLegend->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -1477,7 +1489,15 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
     const int selectedIndex = _lossMap->findData(selected);
     _lossMap->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
     if (selectedIndex < 0) {
-        _lossMapLegend->clear();
+        // Say why the list is empty rather than leaving an inert combo: the
+        // overlays exist only when a preview was asked to compute them.
+        if (names.isEmpty() && _lossMapDiagnostics
+            && !_lossMapDiagnostics->isChecked())
+            _lossMapLegend->setText(
+                tr("This preview carries no loss overlays. Tick "
+                   "\"Compute loss overlays\" and export another preview."));
+        else
+            _lossMapLegend->clear();
         emit lossMapChanged({}, _lossMapOpacity->value() / 100.0);
     }
 }

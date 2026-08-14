@@ -640,6 +640,10 @@ class ServiceState:
                 }
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview.artifact
+            # Published separately from, and after, the surface: a client that
+            # never opens an overlay never waits for one.
+            response["preview_diagnostics_artifact"] = (
+                self._preview.diagnostics_artifact)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -1171,41 +1175,73 @@ class ServiceState:
             return
 
         try:
-            published_manifest = self._publish_flattened_preview(
+            publisher, published = self._publish_flattened_preview(
                 session_id, preview_generation, Path(preview_manifest))
 
-            def indexing_progress(current, total, relative):
-                self._update_preview_publish(
-                    preview_generation, state="indexing",
-                    stage_name=(
-                        f"Indexing preview files ({current}/{total}): "
-                        f"{relative}"),
-                    step=current, total_steps=total,
-                    overall_progress=(
-                        float(current) / float(total) if total else 1.0))
+            def index(kind, root, entry_point, label):
+                def indexing_progress(current, total, relative):
+                    self._update_preview_publish(
+                        preview_generation, state="indexing",
+                        stage_name=(
+                            f"{label} ({current}/{total}): {relative}"),
+                        step=current, total_steps=total,
+                        overall_progress=(
+                            float(current) / float(total) if total else 1.0))
 
-            indexing_started = time.perf_counter()
-            self._update_preview_publish(
-                preview_generation, state="indexing",
-                stage_name="Indexing preview files",
-                step=0, total_steps=0, overall_progress=0.0)
-            ref = self.artifacts.register_directory(
-                "spiral-preview", session_id, preview_generation,
-                published_manifest.parent, published_manifest.name,
-                delete_root_on_prune=True, progress=indexing_progress,
-                hash_workers=4)
-            print(
-                "SPIRAL_PREVIEW_TIMING "
-                f"generation={preview_generation} "
-                "stage='Indexing preview files' "
-                f"seconds={time.perf_counter() - indexing_started:.6f}",
-                flush=True)
+                started = time.perf_counter()
+                self._update_preview_publish(
+                    preview_generation, state="indexing", stage_name=label,
+                    step=0, total_steps=0, overall_progress=0.0)
+                ref = self.artifacts.register_directory(
+                    kind, session_id, preview_generation, root, entry_point,
+                    delete_root_on_prune=True, progress=indexing_progress,
+                    hash_workers=4)
+                print(
+                    "SPIRAL_PREVIEW_TIMING "
+                    f"generation={preview_generation} stage={label!r} "
+                    f"seconds={time.perf_counter() - started:.6f}",
+                    flush=True)
+                return ref
+
+            # The surface is complete and immutable here, so it is indexed and
+            # announced now; a client starts transferring it while the
+            # overlays below are still being mapped.
+            ref = index("spiral-preview", published.manifest_path.parent,
+                        published.manifest_path.name,
+                        "Indexing preview files")
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
                     self._preview.error = None
+                self.status_generation += 1
             self.artifacts.prune(
                 "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
+
+            # The overlays are a second, optional wave. Their failure is
+            # reported as a warning, not as a failed preview: the surface is
+            # published, announced, and very likely already downloading.
+            if bool(status.get("preview_diagnostics")):
+                try:
+                    diagnostics_manifest = publisher.publish_diagnostics(
+                        published)
+                    diagnostics_ref = index(
+                        "spiral-preview-diagnostics",
+                        diagnostics_manifest.parent,
+                        diagnostics_manifest.name,
+                        "Indexing preview diagnostics")
+                    with self.lock:
+                        if self.session_id == session_id:
+                            self._preview.diagnostics_artifact = diagnostics_ref
+                    self.artifacts.prune("spiral-preview-diagnostics",
+                                         session_id, PREVIEW_ARTIFACTS_KEPT)
+                except Exception as exc:
+                    self.events.append(
+                        "log",
+                        f"Preview loss overlays could not be published: "
+                        f"{type(exc).__name__}: {exc}",
+                        severity="warning", source="service",
+                        operation="publishing_preview")
+            published.release()
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
@@ -1363,7 +1399,7 @@ class ServiceState:
                   "message": "Not a valid checkpoint file name"}])
         return name if name.endswith(".ckpt") else f"{name}.ckpt"
 
-    def export_preview(self):
+    def export_preview(self, request=None):
         """Start one preview generation; do not wait for it.
 
         Previews are not a side effect of pausing or of resuming from a
@@ -1379,7 +1415,17 @@ class ServiceState:
         ``preview_exporting`` while this is running, ``preview_publish`` for
         publication progress, then ``preview_artifact`` for the result or
         ``preview_publish_error`` for the cause.
+
+        ``diagnostics`` asks for the loss overlays as well. They roughly
+        double the cost of a preview - a second evaluation of every enabled
+        loss in the fitter, then a per-overlay remap through the flatten - and
+        they arrive as their own artifact after the surface, so a client that
+        is not displaying them should not ask for them.
         """
+        diagnostics = (request or {}).get("diagnostics", False)
+        if not isinstance(diagnostics, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "diagnostics must be true or false")
         session = self._require_session()
         with self.lock:
             if self._preview_export_active:
@@ -1395,11 +1441,12 @@ class ServiceState:
             self.status_generation += 1
             session_id = self.session_id
         threading.Thread(
-            target=self._export_preview, args=(session, session_id),
+            target=self._export_preview,
+            args=(session, session_id, diagnostics),
             name="spiral-preview-export", daemon=True).start()
         return {**self.status(), "accepted": True}
 
-    def _export_preview(self, session, session_id):
+    def _export_preview(self, session, session_id, diagnostics=False):
         """Run one export off the HTTP thread and report it through status.
 
         Publication follows the session's preview status on the fitter
@@ -1407,7 +1454,7 @@ class ServiceState:
         nothing but this thread is waiting on it.
         """
         try:
-            session.export_preview()
+            session.export_preview(diagnostics=diagnostics)
         except BaseException as exc:
             error = _cause(exc)
             print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
@@ -1701,6 +1748,9 @@ class ServiceState:
         ``_update_preview_publish``, the subprocess handle the service kills
         on shutdown, the session-validity check, and the previous raw
         generation the run-difference overlay is built against.
+
+        Returns ``(publisher, published_surface)``: the surface is finished,
+        and the publisher is still holding what a diagnostics wave would need.
         """
         with self.lock:
             output_directory = self.session_paths.output_directory
@@ -1742,7 +1792,7 @@ class ServiceState:
             session_valid=session_valid,
             previous_raw_manifest=previous_raw_manifest,
             adopt_raw_manifest=adopt_raw_manifest)
-        return publisher.publish(
+        return publisher, publisher.publish(
             preview_manifest_path, session_id=session_id,
             generation=generation, output_directory=output_directory,
             voxel_size_um=voxel_size_um)
@@ -2169,7 +2219,7 @@ ROUTES = (
           lambda ctx: ctx.state.save_checkpoint(ctx.body),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/export-preview", "export_preview",
-          lambda ctx: ctx.state.export_preview(),
+          lambda ctx: ctx.state.export_preview(ctx.body),
           Idempotency.COMMAND_ID, reads_body=True),
     Route("POST", "/session/load-checkpoint", "load_checkpoint",
           lambda ctx: ctx.state.load_checkpoint(ctx.body),

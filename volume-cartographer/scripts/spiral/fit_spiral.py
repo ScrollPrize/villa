@@ -2633,7 +2633,15 @@ class FitContext:
         self.interactive_influence_loss_weight = 0.0
         self.interactive_influence_anchor_samples = 0
 
-    def export_preview(self, generation_path, surface_id):
+    def export_preview(self, generation_path, surface_id, *, diagnostics=False):
+        """Write one preview generation; optionally with its loss overlays.
+
+        The diagnostics pass re-evaluates every enabled loss at full preview
+        sample counts and splats each one into an overlay, which costs as much
+        as the surface itself. It is off unless the client asked for it, so the
+        ordinary "show me the surface" preview does not pay for overlays
+        nobody opened.
+        """
         progress = progress_or_null(self.progress)
         # Export has its own saved RNG envelope so pausing does not alter the
         # stochastic training sequence.
@@ -2656,6 +2664,8 @@ class FitContext:
                 surface_id=surface_id,
                 progress=progress,
             )
+            if not diagnostics:
+                return manifest
             diagnostic_weights = {
                 name: self.config.get(f'loss_weight_{name}', 0.0)
                 for name in (

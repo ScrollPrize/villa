@@ -239,6 +239,10 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _installedPreviewArtifact.clear();
     _installedPreviewSession.clear();
     _fetchingPreviewArtifact.clear();
+    _installedDiagnosticsArtifact.clear();
+    _fetchingDiagnosticsArtifact.clear();
+    _lastPreviewLocalPath.clear();
+    _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
@@ -787,9 +791,11 @@ void SpiralServiceManager::requestPreview()
     // The service accepts the export and returns; the work itself costs
     // minutes and is followed through the status snapshot this manager
     // already polls (preview_exporting, then preview_publish, then
-    // preview_artifact or preview_publish_error).
+    // preview_artifact or preview_publish_error, and for the overlays
+    // preview_diagnostics_artifact after that).
     postWithRetry(QStringLiteral("/session/export-preview"),
-                  {{QStringLiteral("command_id"), commandId()}},
+                  {{QStringLiteral("command_id"), commandId()},
+                   {QStringLiteral("diagnostics"), _previewDiagnosticsWanted}},
                   Timeout::Command, kMutationRetries,
                   [this](const QJsonObject& response) {
                       _previewRequestInFlight = false;
@@ -1360,10 +1366,48 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
+                // A newly installed surface has no overlays until its own
+                // diagnostics artifact arrives; the previous generation's
+                // must not be drawn over it.
+                _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
                     sessionId, kPreviewCacheKept,
-                    {_lastPreviewLocalPath});
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+            });
+    }
+
+    // The overlays are published as a second artifact once the surface is on
+    // its way, so they are fetched separately and only reach the workspace
+    // when they belong to the preview it has installed.
+    const QString diagnosticsId =
+        status.value(QStringLiteral("preview_diagnostics_artifact")).toObject()
+            .value(QStringLiteral("id")).toString();
+    if (!diagnosticsId.isEmpty() && diagnosticsId != _installedDiagnosticsArtifact
+        && diagnosticsId != _fetchingDiagnosticsArtifact) {
+        _fetchingDiagnosticsArtifact = diagnosticsId;
+        const qint64 sequence = _previewSequence;
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, diagnosticsId,
+            [this, diagnosticsId, sequence, sessionId, generation](
+                const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                if (_fetchingDiagnosticsArtifact == diagnosticsId)
+                    _fetchingDiagnosticsArtifact.clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone) emit errorOccurred(error);
+                    return;
+                }
+                // The surface these overlays were mapped onto has already
+                // been replaced; the next generation publishes its own.
+                if (sequence < _previewSequence) return;
+                _installedDiagnosticsArtifact = diagnosticsId;
+                _lastDiagnosticsLocalPath = entryPath;
+                emit previewDiagnosticsAvailable(entryPath, sequence);
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept,
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
             });
     }
 }
@@ -1371,11 +1415,13 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
                                             FetchPreviewFileCallback done)
 {
-    if (_installedPreviewArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
-        done({}, tr("No Spiral preview artifact is installed"));
+    // Deferred preview files are the loss overlays, and those live in the
+    // diagnostics artifact the service publishes after the surface.
+    if (_installedDiagnosticsArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
+        done({}, tr("No Spiral preview diagnostics are installed"));
         return;
     }
-    const QString artifactId = _installedPreviewArtifact;
+    const QString artifactId = _installedDiagnosticsArtifact;
     const QString sessionId = _installedPreviewSession;
     const quint64 generation = _connectionGeneration;
     _artifactCache->fetchFile(
@@ -1383,7 +1429,7 @@ void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
         [this, artifactId, generation, done = std::move(done)](
             const QString& localPath, const QString& error, bool gone) {
             if (generation != _connectionGeneration
-                || artifactId != _installedPreviewArtifact)
+                || artifactId != _installedDiagnosticsArtifact)
                 return;
             done(localPath,
                  gone ? tr("The Spiral preview was pruned before the file was downloaded")

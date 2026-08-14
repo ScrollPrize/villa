@@ -47,6 +47,8 @@ signals:
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
     void lossMapChanged(const QString& name, qreal opacity);
+    // Whether the next preview export should compute the loss overlays.
+    void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
@@ -100,6 +102,7 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     QComboBox* _lossMap = nullptr;
+    QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
