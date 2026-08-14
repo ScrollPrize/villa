@@ -230,29 +230,6 @@ TEST_CASE("kNearest with k=0 or empty index returns empty")
     CHECK(idx.kNearest(cv::Vec3f(std::nanf(""), 0, 0), 5).empty());
 }
 
-TEST_CASE("nearestPerCollection keeps the nearest occurrence of every collection")
-{
-    PointIndex idx;
-    idx.insert(1, 10, cv::Vec3f(20, 0, 0));
-    idx.insert(2, 10, cv::Vec3f(2, 0, 0));
-    idx.insert(3, 20, cv::Vec3f(5, 0, 0));
-    idx.insert(4, 30, cv::Vec3f(-2, 0, 0));
-
-    const auto all = idx.nearestPerCollection(cv::Vec3f(0, 0, 0));
-    REQUIRE(all.size() == 3);
-    CHECK(all[0].collectionId == 10);
-    CHECK(all[0].id == 2);
-    CHECK(all[1].collectionId == 30);
-    CHECK(all[1].id == 4);
-    CHECK(all[2].collectionId == 20);
-    CHECK(all[2].id == 3);
-
-    const auto bounded = idx.nearestPerCollection(cv::Vec3f(0, 0, 0), 3.0f);
-    REQUIRE(bounded.size() == 2);
-    CHECK(bounded[0].collectionId == 10);
-    CHECK(bounded[1].collectionId == 30);
-}
-
 TEST_CASE("nearestInCollection filters by collectionId")
 {
     // NOTE: the current impl does NOT guarantee returning the *closest* member

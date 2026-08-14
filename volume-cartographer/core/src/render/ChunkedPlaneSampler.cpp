@@ -1145,12 +1145,17 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
     int startLevel,
     const std::vector<cv::Vec3f>& coords,
     const std::vector<std::array<float, 2>>& viewportPositions,
-    const Options& options,
-    float dedupRadiusPixels)
+    float pixelsPerLevel0VolumeVoxel,
+    const Options& options)
 {
     std::vector<ChunkViewportSample> result;
     if (coords.size() != viewportPositions.size() || coords.empty())
         return result;
+    if (!std::isfinite(pixelsPerLevel0VolumeVoxel) ||
+        pixelsPerLevel0VolumeVoxel <= 0.0f) {
+        throw std::invalid_argument(
+            "viewport dependency collection requires a positive declared view scale");
+    }
 
     const int firstLevel = std::max(0, startLevel);
     const int fallbackCount = options.queuedFallbackLevels < 0
@@ -1168,8 +1173,6 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
     std::unordered_map<ChunkKey, PointBins, ChunkKeyHash> byChunk;
     std::vector<ChunkKey> required;
     required.reserve(8);
-    const float radius = std::max(1.0f, dedupRadiusPixels);
-    const float radiusSquared = radius * radius;
     auto cellKey = [](int x, int y) {
         return (std::int64_t(x) << 32) ^ std::uint32_t(y);
     };
@@ -1178,6 +1181,14 @@ std::vector<ChunkViewportSample> ChunkedPlaneSampler::collectViewportDependencie
         const LevelAccess access = makeLevelAccess(array, level);
         if (!hasSampleableLevel(access))
             continue;
+        const double chunkExtent = representativeChunkExtentBaseVoxels(array, level);
+        if (!std::isfinite(chunkExtent) || chunkExtent <= 0.0) {
+            throw std::invalid_argument(
+                "viewport dependency collection requires valid chunk transforms");
+        }
+        const float radius = std::max(
+            1.0f, static_cast<float>(chunkExtent) * pixelsPerLevel0VolumeVoxel);
+        const float radiusSquared = radius * radius;
         for (std::size_t i = 0; i < coords.size(); ++i) {
             if (surfaceSentinel(coords[i]))
                 continue;
@@ -1356,22 +1367,28 @@ int ChunkedPlaneSampler::fallbackLevelCountForViewport(
         const auto shape = array.shape(level);
         if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)
             continue;
-        const auto chunkShape = array.chunkShape(level);
-        const auto transform = array.levelTransform(level);
-        double averageChunkExtent = 0.0;
-        bool valid = true;
-        for (int dimension = 0; dimension < 3; ++dimension) {
-            const double scale = std::abs(transform.scaleFromLevel0[dimension]);
-            if (chunkShape[dimension] <= 0 || !std::isfinite(scale) || scale <= 0.0) {
-                valid = false;
-                break;
-            }
-            averageChunkExtent += double(chunkShape[dimension]) / scale;
-        }
-        if (valid && averageChunkExtent / 3.0 >= maximumViewportExtent)
+        const double chunkExtent = representativeChunkExtentBaseVoxels(array, level);
+        if (std::isfinite(chunkExtent) && chunkExtent >= maximumViewportExtent)
             return level - startLevel;
     }
     return lastLevel - startLevel;
+}
+
+double ChunkedPlaneSampler::representativeChunkExtentBaseVoxels(
+    IChunkedArray& array, int level)
+{
+    if (level < 0 || level >= array.numLevels())
+        return std::numeric_limits<double>::quiet_NaN();
+    const auto chunkShape = array.chunkShape(level);
+    const auto transform = array.levelTransform(level);
+    double extent = 0.0;
+    for (int dimension = 0; dimension < 3; ++dimension) {
+        const double scale = std::abs(transform.scaleFromLevel0[dimension]);
+        if (chunkShape[dimension] <= 0 || !std::isfinite(scale) || scale <= 0.0)
+            return std::numeric_limits<double>::quiet_NaN();
+        extent += double(chunkShape[dimension]) / scale;
+    }
+    return extent / 3.0;
 }
 
 double ChunkedPlaneSampler::maximumBaseVoxelExtent(IChunkedArray& array, int level)

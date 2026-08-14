@@ -119,13 +119,19 @@ public:
         (void)focus;
         (void)samples;
     }
-    virtual void updateViewFocus(std::uint64_t viewId,
-                                 const std::array<float, 2>& focus,
-                                 bool makeActive)
+    // Mark the most recently interacted view. This operation must remain O(1):
+    // focus distances are captured and published by accepted render jobs.
+    virtual void markViewActive(std::uint64_t viewId)
     {
         (void)viewId;
-        (void)focus;
-        (void)makeActive;
+    }
+    // Remove this source's demand for one view without closing that view in
+    // other sources sharing the application-wide cache service.
+    virtual void clearSourceViewDemand(std::uint64_t viewId,
+                                       std::uint64_t viewVersion = 0)
+    {
+        (void)viewId;
+        (void)viewVersion;
     }
     virtual void clearViewDemand(std::uint64_t viewId,
                                  std::uint64_t viewVersion = 0)

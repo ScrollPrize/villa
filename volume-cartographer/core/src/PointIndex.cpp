@@ -271,45 +271,6 @@ std::vector<PointIndex::QueryResult> PointIndex::kNearest(
     return results;
 }
 
-std::vector<PointIndex::QueryResult> PointIndex::nearestPerCollection(
-    const cv::Vec3f& position,
-    float maxDistance) const
-{
-    std::vector<QueryResult> result;
-    if (!isFinitePoint(position) || !std::isfinite(maxDistance))
-        return result;
-    const float maxDistanceSq = maxDistance * maxDistance;
-    std::unordered_map<uint64_t, QueryResult> nearest;
-    nearest.reserve(impl_->pointData.size());
-    for (const auto& [id, data] : impl_->pointData) {
-        const cv::Vec3f delta = data.position - position;
-        const float distanceSq = delta.dot(delta);
-        if (maxDistance < std::numeric_limits<float>::max() &&
-            distanceSq > maxDistanceSq) {
-            continue;
-        }
-        const auto found = nearest.find(data.collectionId);
-        if (found == nearest.end() || distanceSq < found->second.distanceSq) {
-            nearest[data.collectionId] = {
-                id, data.collectionId, data.position, distanceSq};
-        }
-    }
-    result.reserve(nearest.size());
-    for (const auto& [collectionId, item] : nearest) {
-        (void)collectionId;
-        result.push_back(item);
-    }
-    std::sort(result.begin(), result.end(),
-              [](const QueryResult& lhs, const QueryResult& rhs) {
-                  if (lhs.distanceSq != rhs.distanceSq)
-                      return lhs.distanceSq < rhs.distanceSq;
-                  if (lhs.collectionId != rhs.collectionId)
-                      return lhs.collectionId < rhs.collectionId;
-                  return lhs.id < rhs.id;
-              });
-    return result;
-}
-
 std::optional<PointIndex::QueryResult> PointIndex::nearestInCollection(
     const cv::Vec3f& position,
     uint64_t collectionId,

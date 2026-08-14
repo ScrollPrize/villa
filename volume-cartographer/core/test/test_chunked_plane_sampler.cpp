@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using vc::render::ChunkedPlaneSampler;
@@ -209,11 +210,56 @@ TEST_CASE("collectViewportDependencies is resident-only and keeps distant occurr
     ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
     options.queuedFallbackLevels = 0;
     const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
-        array, 0, coords, viewport, options, 8.0f);
+        array, 0, coords, viewport, 1.0f, options);
 
     CHECK(array.queuedReads == 0);
     REQUIRE(samples.size() == 2);
     CHECK(samples[0].key == samples[1].key);
+}
+
+TEST_CASE("viewport dependency dedup uses projected chunk footprint, not sample spacing")
+{
+    class LargeChunkArray final : public UniformStatusArray {
+    public:
+        LargeChunkArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+        std::array<int, 3> shape(int) const override { return {64, 64, 64}; }
+        std::array<int, 3> chunkShape(int) const override { return {32, 32, 32}; }
+    } array;
+
+    const std::vector<cv::Vec3f> coords{
+        {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};
+    const std::vector<std::array<float, 2>> viewport{
+        {0.0f, 0.0f}, {16.0f, 0.0f}, {40.0f, 0.0f}};
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 0;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, coords, viewport, 1.0f, options);
+
+    REQUIRE(samples.size() == 2);
+    CHECK(samples[0].key == samples[1].key);
+    CHECK_THROWS_AS(
+        ChunkedPlaneSampler::collectViewportDependencies(
+            array, 0, coords, viewport, 0.0f, options),
+        std::invalid_argument);
+}
+
+TEST_CASE("representative chunk extent honors anisotropic declared transforms")
+{
+    class AnisotropicArray final : public UniformStatusArray {
+    public:
+        AnisotropicArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+        std::array<int, 3> shape(int) const override { return {64, 64, 64}; }
+        std::array<int, 3> chunkShape(int) const override { return {8, 16, 32}; }
+        LevelTransform levelTransform(int) const override
+        {
+            LevelTransform transform;
+            transform.scaleFromLevel0 = {0.5, 0.25, 0.125};
+            return transform;
+        }
+    } array;
+
+    CHECK(ChunkedPlaneSampler::representativeChunkExtentBaseVoxels(array, 0) ==
+          doctest::Approx(112.0));
 }
 
 TEST_CASE("viewport fallback range stops at coverage or five levels")
@@ -246,7 +292,8 @@ TEST_CASE("viewport dependencies publish coarse levels first")
     ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
     options.queuedFallbackLevels = 3;
     const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
-        array, 0, {{64.0f, 64.0f, 64.0f}}, {{4.0f, 4.0f}}, options);
+        array, 0, {{64.0f, 64.0f, 64.0f}}, {{4.0f, 4.0f}}, 1.0f,
+        options);
     REQUIRE(samples.size() == 4);
     CHECK(samples[0].key.level == 3);
     CHECK(samples[0].relativeLevel == 3);

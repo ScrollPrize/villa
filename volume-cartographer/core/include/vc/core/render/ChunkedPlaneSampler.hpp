@@ -115,14 +115,16 @@ public:
     // samples. `viewportPositions` uses framebuffer pixel coordinates and must
     // match `coords`. No cache state is read or changed; the atomic demand
     // publisher filters chunks that resolved while this local traversal ran.
-    // Nearby occurrences of one chunk are deduplicated in 2-D.
+    // Nearby occurrences of one chunk are deduplicated using that level's
+    // declared projected chunk footprint, independently of sparse prepass
+    // sample spacing.
     static std::vector<ChunkViewportSample> collectViewportDependencies(
         IChunkedArray& array,
         int startLevel,
         const std::vector<cv::Vec3f>& coords,
         const std::vector<std::array<float, 2>>& viewportPositions,
-        const Options& options = Options(),
-        float dedupRadiusPixels = 8.0f);
+        float pixelsPerLevel0VolumeVoxel,
+        const Options& options = Options());
 
     // Build a debug/diagnostic mapping without reading or queueing cache data.
     // Each pixel names the containing chunk at every included level through a
@@ -144,6 +146,8 @@ public:
                                   float pixelsPerBaseVoxel,
                                   float qualityBias = 0.5f);
     static double maximumBaseVoxelExtent(IChunkedArray& array, int level);
+    static double representativeChunkExtentBaseVoxels(
+        IChunkedArray& array, int level);
 
     // Selects how far a GUI viewport should queue coarse fallback data. Stops
     // once one average source chunk spans the larger viewport edge in declared

@@ -20,8 +20,6 @@
 #include <unordered_set>
 #include <vector>
 
-class PointIndex;
-
 namespace vc::render {
 
 class PersistentZarrCacheBudget;
@@ -177,9 +175,9 @@ public:
     void replaceViewDemand(const ChunkRequestContext& request,
                            const std::array<float, 2>& focus,
                            std::vector<ChunkViewportSample> samples) override;
-    void updateViewFocus(std::uint64_t viewId,
-                         const std::array<float, 2>& focus,
-                         bool makeActive) override;
+    void markViewActive(std::uint64_t viewId) override;
+    void clearSourceViewDemand(std::uint64_t viewId,
+                               std::uint64_t viewVersion = 0) override;
     void clearViewDemand(std::uint64_t viewId,
                          std::uint64_t viewVersion = 0) override;
 
@@ -282,10 +280,19 @@ private:
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
         {
             unresolvedFetchesByLevel_.resize(levels_.size(), 0);
+            persistentExtensions_.resize(fetchers_.size());
+            for (std::size_t level = 0; level < fetchers_.size(); ++level) {
+                if (fetchers_[level]) {
+                    persistentExtensions_[level] =
+                        fetchers_[level]->persistentCacheExtension(
+                            ChunkKey{static_cast<int>(level), 0, 0, 0});
+                }
+            }
         }
 
         std::vector<LevelInfo> levels_;
         std::vector<std::shared_ptr<IChunkFetcher>> fetchers_;
+        std::vector<std::string> persistentExtensions_;
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
@@ -300,6 +307,7 @@ private:
         std::size_t decodedBytes_ = 0;
         std::uint64_t decodedBudgetRegistration_ = 0;
         std::uint64_t generation_ = 0;
+        std::uint64_t fetcherGeneration_ = 0;
         // Shared executor tasks carry this cache-specific group/epoch so
         // invalidation can cancel only this source's stale pending tasks.
         const std::uint64_t schedulerGroup_;
@@ -314,10 +322,7 @@ private:
         struct ViewSnapshot {
             std::uint64_t version = 0;
             bool closed = false;
-            std::array<float, 2> focus{};
-            std::vector<ChunkKey> collectionKeys;
             std::unordered_map<int, int> relativeLevels;
-            std::shared_ptr<PointIndex> pointIndex;
         };
         std::unordered_map<std::uint64_t, ViewSnapshot> viewSnapshots_;
         std::unordered_map<std::uint64_t,
@@ -326,13 +331,23 @@ private:
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
         std::unordered_map<RemoteFetchActivityCallbackId,
                            RemoteFetchActivityCallback> remoteFetchCallbacks_;
-        std::unordered_set<ChunkKey, ChunkKeyHash> activeRemoteFetches_;
+        std::unordered_map<ChunkKey,
+                           std::unordered_set<std::uint64_t>,
+                           ChunkKeyHash> activeRemoteFetches_;
         std::size_t remoteFetchesInFlight_ = 0;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
 
+    };
+
+    struct FetchContext {
+        std::uint64_t generation = 0;
+        std::uint64_t fetcherGeneration = 0;
+        std::uint64_t fetchSerial = 0;
+        std::uint64_t schedulerEpoch = 0;
+        std::shared_ptr<IChunkFetcher> fetcher;
     };
 
     static ChunkResult resultFromEntryLocked(
@@ -360,47 +375,33 @@ private:
                                  int priorityOffset);
     static void probePersistentAndDispatch(const std::shared_ptr<State>& state,
                                            ChunkKey key,
-                                           std::uint64_t generation,
-                                           std::uint64_t fetchSerial,
-                                           std::uint64_t schedulerEpoch);
+                                           FetchContext context);
     static void fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
                                        ChunkKey key,
-                                       std::uint64_t generation,
-                                       std::uint64_t fetchSerial,
-                                       std::uint64_t schedulerEpoch);
+                                       FetchContext context);
     static void decodePersistentAndStore(const std::shared_ptr<State>& state,
                                          ChunkKey key,
-                                         std::uint64_t generation,
-                                         std::uint64_t fetchSerial,
-                                         std::uint64_t schedulerEpoch,
+                                         FetchContext context,
                                          PersistentProbeResult probe);
     static void decodeFetchedAndStore(
         const std::shared_ptr<State>& state,
         ChunkKey key,
-        std::uint64_t generation,
-        std::uint64_t fetchSerial,
+        FetchContext context,
         std::shared_ptr<ChunkFetchResult> fetched);
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
-                                 std::uint64_t generation,
-                                 std::uint64_t fetchSerial,
-                                 std::uint64_t schedulerEpoch);
+                                 FetchContext context);
     static void queuePersistentDecode(const std::shared_ptr<State>& state,
                                       const ChunkKey& key,
-                                      std::uint64_t generation,
-                                      std::uint64_t fetchSerial,
-                                      std::uint64_t schedulerEpoch,
+                                      FetchContext context,
                                       PersistentProbeResult probe);
     static void queueFetchedDecode(const std::shared_ptr<State>& state,
                                    const ChunkKey& key,
-                                   std::uint64_t generation,
-                                   std::uint64_t fetchSerial,
-                                   std::uint64_t schedulerEpoch,
+                                   FetchContext context,
                                    ChunkFetchResult fetched);
     static void finishAndStore(const std::shared_ptr<State>& state,
                                const ChunkKey& key,
-                               std::uint64_t generation,
-                               std::uint64_t fetchSerial,
+                               FetchContext context,
                                ChunkFetchResult fetch,
                                bool loadedFromPersistentCache);
     static PersistentProbeResult probePersistent(const State& state,
@@ -459,6 +460,13 @@ private:
                                    double fillValue,
                                    ChunkDtype dtype,
                                    const Options& options);
+    static void refreshFetchers(
+        const std::shared_ptr<State>& state,
+        std::vector<std::shared_ptr<IChunkFetcher>> fetchers);
+    static void clearSourceViewDemandLocked(State& state,
+                                            std::uint64_t viewId,
+                                            std::uint64_t viewVersion,
+                                            bool closeView);
 
     std::shared_ptr<ChunkCacheService> service_;
     std::shared_ptr<State> state_;

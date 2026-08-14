@@ -744,8 +744,7 @@ void CChunkedVolumeViewer::quiesceForClose()
 
     if (_chunkArray)
         _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
-    if (_overlayChunkArray && (!_chunkArray ||
-        _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
+    else if (_overlayChunkArray)
         _overlayChunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
 
     if (_chunkCbId != 0 && _chunkArray) {
@@ -1758,21 +1757,12 @@ void CChunkedVolumeViewer::markInteractiveMotion(double)
     // the handler). The old interactive-preview + settle-timer fast path is gone.
 }
 
-void CChunkedVolumeViewer::updateChunkRequestFocus(const QPointF& scenePos,
-                                                   bool makeActive)
+void CChunkedVolumeViewer::markChunkRequestViewActive()
 {
-    if (!_view || !_view->viewport())
-        return;
-    const std::array<float, 2> focus{
-        std::clamp(static_cast<float>(scenePos.x()), 0.0f,
-                   float(std::max(0, _view->viewport()->width() - 1))),
-        std::clamp(static_cast<float>(scenePos.y()), 0.0f,
-                   float(std::max(0, _view->viewport()->height() - 1)))};
     if (_chunkArray)
-        _chunkArray->updateViewFocus(_chunkViewId, focus, makeActive);
-    if (_overlayChunkArray && (!_chunkArray ||
-        _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
-        _overlayChunkArray->updateViewFocus(_chunkViewId, focus, makeActive);
+        _chunkArray->markViewActive(_chunkViewId);
+    else if (_overlayChunkArray)
+        _overlayChunkArray->markViewActive(_chunkViewId);
 }
 
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
@@ -2285,7 +2275,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     auto [baseCoords, baseViewports] = expandedSamples(
         baseComposite, baseFront, baseBehind, direction);
     auto baseDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
-        *ctx.chunkArray, ctx.startLevel, baseCoords, baseViewports, options);
+        *ctx.chunkArray, ctx.startLevel, baseCoords, baseViewports,
+        ctx.scale, options);
 
     std::vector<vc::render::ChunkViewportSample> overlayDemand;
     if (overlayActive) {
@@ -2298,7 +2289,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             ctx.overlayComposite.layersBehind, direction);
         overlayDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
             *ctx.overlayChunkArray, ctx.overlayStartLevel,
-            overlayCoords, overlayViewports, overlayOptions);
+            overlayCoords, overlayViewports, ctx.scale, overlayOptions);
     }
     prepassOccurrences = baseDemand.size() + overlayDemand.size();
     {
@@ -3186,9 +3177,11 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     if (_closing) {
         return;
     }
+    _overlayGeneration.fetch_add(1, std::memory_order_acq_rel);
     if (_overlayChunkArray && (!_chunkArray ||
         _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
-        _overlayChunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
+        _overlayChunkArray->clearSourceViewDemand(
+            _chunkViewId, _renderRequestSerial);
     if (_overlayChunkCbId != 0 && _overlayChunkArray) {
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
@@ -3213,11 +3206,17 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
             QPointer<CChunkedVolumeViewer> guard(this);
             std::weak_ptr<Volume> overlayVolumeWeak = _overlayVolume;
             _overlayChunkCbId = _overlayChunkArray->addChunkReadyListener([guard, overlayVolumeWeak]() {
-                QMetaObject::invokeMethod(qApp, [guard, overlayVolumeWeak]() {
+                if (!guard)
+                    return;
+                const auto generation = guard->_overlayGeneration.load(
+                    std::memory_order_acquire);
+                QMetaObject::invokeMethod(qApp, [guard, overlayVolumeWeak, generation]() {
                     if (!guard)
                         return;
                     auto volume = overlayVolumeWeak.lock();
-                    if (!volume || guard->_overlayVolume != volume || guard->_closing)
+                    if (!volume || guard->_overlayVolume != volume || guard->_closing ||
+                        guard->_overlayOpacity <= 0.0f ||
+                        guard->_overlayGeneration.load(std::memory_order_acquire) != generation)
                         return;
                     ++guard->_chunkContentEpoch;
                     guard->submitRender("overlay chunk ready");
@@ -3228,13 +3227,19 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     _overlayChunkArray->addRemoteFetchActivityListener(
                         [guard, overlayVolumeWeak](
                             const vc::render::ChunkKey&, bool) {
+                            if (!guard)
+                                return;
+                            const auto generation = guard->_overlayGeneration.load(
+                                std::memory_order_acquire);
                             QMetaObject::invokeMethod(
-                                qApp, [guard, overlayVolumeWeak]() {
+                                qApp, [guard, overlayVolumeWeak, generation]() {
                                     if (!guard)
                                         return;
                                     auto volume = overlayVolumeWeak.lock();
                                     if (!volume || guard->_overlayVolume != volume ||
-                                        guard->_closing) {
+                                        guard->_closing || guard->_overlayOpacity <= 0.0f ||
+                                        guard->_overlayGeneration.load(
+                                            std::memory_order_acquire) != generation) {
                                         return;
                                     }
                                     guard->refreshDownloadQueueDebugOverlay();
@@ -3252,7 +3257,17 @@ void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
     if (_closing) {
         return;
     }
-    _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    const float nextOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    if (_overlayOpacity == nextOpacity)
+        return;
+    if ((_overlayOpacity > 0.0f) != (nextOpacity > 0.0f))
+        _overlayGeneration.fetch_add(1, std::memory_order_acq_rel);
+    _overlayOpacity = nextOpacity;
+    if (_overlayOpacity <= 0.0f && _overlayChunkArray &&
+        (!_chunkArray || _overlayChunkArray->sourceId() != _chunkArray->sourceId())) {
+        _overlayChunkArray->clearSourceViewDemand(
+            _chunkViewId, _renderRequestSerial);
+    }
     submitRender("overlay opacity changed");
 }
 
@@ -3661,7 +3676,7 @@ void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)
 {
     _lastScenePos = scenePos;
     _haveChunkFocus = true;
-    updateChunkRequestFocus(scenePos, true);
+    markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
@@ -3874,7 +3889,7 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
 {
     _lastScenePos = scenePos;
     _haveChunkFocus = true;
-    updateChunkRequestFocus(scenePos, true);
+    markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();

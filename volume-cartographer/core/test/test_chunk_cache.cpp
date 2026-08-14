@@ -454,6 +454,119 @@ TEST_CASE("ChunkCacheService shares results and keeps sources warm")
     CHECK(unusedFetcher->fetchCalls.load() == 0);
 }
 
+TEST_CASE("ChunkCacheService refreshes in-flight fetchers without stale publication")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto expired = std::make_shared<BlockingEncodedFetcher>();
+    auto first = makeServiceCache(service, "credential-refresh", expired, 2);
+
+    CHECK(first->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    expired->waitStarted();
+
+    auto refreshed = std::make_shared<CountingFetcher>();
+    ChunkFetchResult replacement;
+    replacement.status = ChunkFetchStatus::Found;
+    replacement.bytes = makeBytes(64, std::byte{43});
+    refreshed->setCanned({0, 0, 0, 0}, replacement);
+    auto second = makeServiceCache(
+        service, "credential-refresh", refreshed, 2);
+
+    auto resolved = waitForResolved(*second, 0, 0, 0, 0);
+    REQUIRE(resolved.status == ChunkStatus::Data);
+    REQUIRE(resolved.bytes);
+    CHECK(resolved.bytes->front() == std::byte{43});
+    CHECK(first->sourceId() == second->sourceId());
+
+    expired->release();
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    resolved = second->getChunkIfCached(0, 0, 0, 0);
+    REQUIRE(resolved.status == ChunkStatus::Data);
+    REQUIRE(resolved.bytes);
+    CHECK(resolved.bytes->front() == std::byte{43});
+    CHECK(expired->decodeCalls.load() == 0);
+}
+
+TEST_CASE("ChunkCacheService refresh preserves decoded chunks")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto original = std::make_shared<CountingFetcher>();
+    ChunkFetchResult result;
+    result.status = ChunkFetchStatus::Found;
+    result.bytes = makeBytes(64, std::byte{57});
+    original->setCanned({0, 0, 0, 0}, result);
+    auto first = makeServiceCache(service, "warm-refresh", original);
+    REQUIRE(first->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+
+    auto refreshed = std::make_shared<CountingFetcher>();
+    auto second = makeServiceCache(service, "warm-refresh", refreshed);
+    auto cached = second->getChunkIfCached(0, 0, 0, 0);
+    REQUIRE(cached.status == ChunkStatus::Data);
+    REQUIRE(cached.bytes);
+    CHECK(cached.bytes->front() == std::byte{57});
+    CHECK(refreshed->fetchCalls.load() == 0);
+}
+
+TEST_CASE("ChunkCacheService refresh retries retained source errors")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto expired = std::make_shared<CountingFetcher>();
+    ChunkFetchResult denied;
+    denied.status = ChunkFetchStatus::HttpError;
+    denied.httpStatus = 403;
+    expired->setCanned({0, 0, 0, 0}, denied);
+    auto first = makeServiceCache(service, "error-refresh", expired);
+    REQUIRE(first->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Error);
+
+    auto refreshed = std::make_shared<CountingFetcher>();
+    ChunkFetchResult recovered;
+    recovered.status = ChunkFetchStatus::Found;
+    recovered.bytes = makeBytes(64, std::byte{67});
+    refreshed->setCanned({0, 0, 0, 0}, recovered);
+    auto second = makeServiceCache(service, "error-refresh", refreshed);
+    const auto result = waitForResolved(*second, 0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->front() == std::byte{67});
+}
+
+TEST_CASE("ChunkCache source-scoped view clear preserves other sources")
+{
+    auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
+    auto blocker = std::make_shared<BlockingFetcher>();
+    auto baseFetcher = std::make_shared<CountingFetcher>();
+    auto overlayFetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult result;
+    result.status = ChunkFetchStatus::Found;
+    result.bytes = makeBytes(64, std::byte{61});
+    baseFetcher->setCanned({0, 0, 0, 0}, result);
+    overlayFetcher->setCanned({0, 0, 0, 0}, result);
+    auto blockerCache = makeServiceCache(service, "clear-blocker", blocker, 1);
+    auto base = makeServiceCache(service, "clear-base", baseFetcher, 1);
+    auto overlay = makeServiceCache(service, "clear-overlay", overlayFetcher, 1);
+
+    (void)blockerCache->tryGetChunk(0, 0, 0, 0);
+    blocker->waitStarted();
+    base->replaceViewDemand({101, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+    overlay->replaceViewDemand({101, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+
+    overlay->clearSourceViewDemand(101, 1);
+    CHECK(base->stats().unresolvedFetchesByLevel == std::vector<std::size_t>{1});
+    CHECK(overlay->stats().unresolvedFetchesByLevel == std::vector<std::size_t>{0});
+    (void)overlay->tryGetChunk(0, 0, 0, 1, {101, 1});
+    CHECK(overlay->stats().unresolvedFetchesByLevel == std::vector<std::size_t>{0});
+
+    blocker->release();
+    REQUIRE(waitForResolved(*base, 0, 0, 0, 0).status == ChunkStatus::Data);
+    overlay->replaceViewDemand({101, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+    REQUIRE(waitForResolved(*overlay, 0, 0, 0, 0).status == ChunkStatus::Data);
+}
+
 TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across facades")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
@@ -552,8 +665,10 @@ TEST_CASE("ChunkCacheService facade destruction removes only its listeners")
         auto cache = makeServiceCache(service, "listener-source", fetcher);
         cache->addChunkReadyListener([&] { ++callbacks; });
     }
+    auto refreshedFetcher = std::make_shared<CountingFetcher>();
+    refreshedFetcher->setCanned({0, 0, 0, 0}, result);
     auto reacquired = makeServiceCache(
-        service, "listener-source", std::make_shared<CountingFetcher>());
+        service, "listener-source", refreshedFetcher);
     REQUIRE(reacquired->getChunkBlocking(0, 0, 0, 0).status ==
             ChunkStatus::Data);
     CHECK(callbacks.load() == 0);
@@ -1260,6 +1375,37 @@ private:
 
 } // namespace
 
+TEST_CASE("ChunkCache active-view marking defers queue resort until render publication")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 16}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options);
+
+    (void)cache->tryGetChunk(0, 0, 0, 0);
+    fetcher->waitFirstStarted();
+    cache->replaceViewDemand({201, 1}, {100.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+    });
+    cache->replaceViewDemand({202, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 2}, {0.0f, 0.0f}},
+    });
+
+    cache->markViewActive(201);
+    fetcher->release();
+    REQUIRE(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 2}, {0, 0, 0, 1}});
+}
+
 TEST_CASE("ChunkCacheService prioritizes the active view across sources")
 {
     auto service = std::make_shared<ChunkCacheService>(1024 * 1024);
@@ -1272,10 +1418,10 @@ TEST_CASE("ChunkCacheService prioritizes the active view across sources")
     CHECK(cacheA->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     order->firstStarted.wait();
     CHECK(cacheA->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::MissQueued);
+    cacheB->markViewActive(61);
     cacheB->replaceViewDemand({61, 1}, {0.0f, 0.0f}, {
         {{0, 0, 0, 0}, {0.0f, 0.0f}},
     });
-    cacheB->updateViewFocus(61, {0.0f, 0.0f}, true);
     {
         std::lock_guard lock(order->mutex);
         order->released = true;
@@ -1866,10 +2012,10 @@ TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replac
     (void)cache->tryGetChunk(0, 0, 0, 2); // remains background
 
     vc::render::ChunkRequestContext current{41, 2};
+    cache->markViewActive(41);
     cache->replaceViewDemand(current, {10.0f, 10.0f}, {
         {{0, 0, 0, 1}, {10.0f, 10.0f}},
     });
-    cache->updateViewFocus(41, {10.0f, 10.0f}, true);
     cache->replaceViewDemand({41, 1}, {0.0f, 0.0f}, {
         {{0, 0, 0, 3}, {0.0f, 0.0f}},
     });
@@ -2046,10 +2192,10 @@ TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
     // Both chunks use absolute level 2. The active view sees the first as its
     // second fallback. Another view sees the shared second chunk as its third
     // fallback, so that chunk must be selected first despite being inactive.
+    cache->markViewActive(71);
     cache->replaceViewDemand({71, 1}, {0.0f, 0.0f}, {
         {{2, 0, 0, 0}, {0.0f, 0.0f}, 2},
     });
-    cache->updateViewFocus(71, {0.0f, 0.0f}, true);
     cache->replaceViewDemand({72, 1}, {0.0f, 0.0f}, {
         {{2, 0, 0, 1}, {0.0f, 0.0f}, 0},
     });
@@ -2086,10 +2232,10 @@ TEST_CASE("ChunkCache selects the terminal source level before ordinary fallback
     (void)cache->tryGetChunk(0, 0, 0, 0);
     fetcher->waitFirstStarted();
 
+    cache->markViewActive(74);
     cache->replaceViewDemand({74, 1}, {0.0f, 0.0f}, {
         {{3, 0, 0, 0}, {0.0f, 0.0f}, 0},
     });
-    cache->updateViewFocus(74, {0.0f, 0.0f}, true);
     cache->replaceViewDemand({75, 1}, {0.0f, 0.0f}, {
         {{3, 0, 0, 1}, {0.0f, 0.0f}, 3},
     });
@@ -2127,10 +2273,10 @@ TEST_CASE("ChunkCache rejects stale asynchronous GUI misses")
     fetcher->waitFirstStarted();
     (void)cache->tryGetChunk(0, 0, 0, 2); // background, queued first
 
+    cache->markViewActive(51);
     cache->replaceViewDemand({51, 2}, {0.0f, 0.0f}, {
         {{0, 0, 0, 1}, {0.0f, 0.0f}},
     });
-    cache->updateViewFocus(51, {0.0f, 0.0f}, true);
     (void)cache->tryGetChunk(0, 0, 0, 3, {51, 1}); // stale async fill
 
     fetcher->release();
@@ -2270,11 +2416,11 @@ TEST_CASE("ChunkCache reprioritizes pending decode work by view-relative level")
             (void)cache.tryGetChunk(0, 0, 0, ix);
         REQUIRE(fetcher->waitForPersistentDecodes(8, std::chrono::seconds{2}));
 
+        cache.markViewActive(91);
         cache.replaceViewDemand({91, 1}, {0.0f, 0.0f}, {
             {{0, 0, 0, 8}, {0.0f, 0.0f}, 0},
             {{2, 0, 0, 0}, {0.0f, 0.0f}, 2},
         });
-        cache.updateViewFocus(91, {0.0f, 0.0f}, true);
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::seconds{2};
         while (cache.stats().pendingDecodeTasks < 2 &&

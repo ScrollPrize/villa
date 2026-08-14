@@ -416,7 +416,7 @@ private:
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
-    void updateChunkRequestFocus(const QPointF& scenePos, bool makeActive);
+    void markChunkRequestViewActive();
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -536,6 +536,7 @@ private:
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     std::uint64_t _overlayRemoteFetchCbId = 0;
+    std::atomic<std::uint64_t> _overlayGeneration{1};
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
