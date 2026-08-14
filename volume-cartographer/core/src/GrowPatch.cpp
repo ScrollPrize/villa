@@ -3117,6 +3117,12 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
+    // Optional support test: reject grown points that land where the volume holds no
+    // material. Off by default; point --volume at a masked volume (or raise the
+    // threshold on a raw one) to stop growth from continuing past the data.
+    const bool require_volume_support = params.value("require_volume_support", false);
+    const int volume_support_threshold = params.value("volume_support_threshold", 0);
+
     const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
     const int growth_scale_factor = 1 << growth_scale_level;
     const bool use_growth_scale = resume_surf && growth_scale_factor > 1;
@@ -3554,6 +3560,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     passTroughComputor pass;
     Chunked3d<uint8_t,passTroughComputor> dbg_tensor(pass, volume_shape_zyx, cache, level);
     trace_data.raw_volume = &dbg_tensor;
+    if (require_volume_support)
+        std::cout << "volume support test enabled (threshold=" << volume_support_threshold
+                  << "): candidates landing on unsupported voxels are rejected" << std::endl;
     std::cout << "seed val " << origin << " " <<
     (int)dbg_tensor(origin[2],origin[1],origin[0]) << std::endl;
 
@@ -4750,6 +4759,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         std::cout << "cands " << cands.size() << std::endl;
 
         int succ_gen = 0;
+        int support_rejects_gen = 0;
         std::vector<cv::Vec2i> succ_gen_ps;
 
         if (neural_tracer && generation > pre_neural_gens) {
@@ -4884,6 +4894,27 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     if (local_opt_r > 1)
                         local_optimization(local_opt_r, p, trace_params, trace_data, loss_settings, true, false);
 
+                    // Support test on the optimized position: growth may not continue into
+                    // voxels the volume does not cover.
+                    if (require_volume_support && trace_data.raw_volume) {
+                        const cv::Vec3d& fitted = trace_params.dpoints(p);
+                        const cv::Vec3i voxel{(int)std::lround(fitted[2]),
+                                              (int)std::lround(fitted[1]),
+                                              (int)std::lround(fitted[0])};
+                        const bool inside = voxel[0] >= 0 && voxel[1] >= 0 && voxel[2] >= 0 &&
+                                            voxel[0] < volume_shape_zyx[0] &&
+                                            voxel[1] < volume_shape_zyx[1] &&
+                                            voxel[2] < volume_shape_zyx[2];
+                        if (!inside ||
+                            (int)trace_data.raw_volume->safe_at(voxel) <= volume_support_threshold) {
+                            trace_params.state(p) = 0;
+                            trace_params.dpoints(p) = {-1, -1, -1};
+                            #pragma omp atomic
+                            support_rejects_gen++;
+                            continue;
+                        }
+                    }
+
                     generations(p) = generation;
 
                     #pragma omp critical
@@ -4982,6 +5013,11 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
         last_elapsed_seconds = elapsed_seconds;
         last_succ = succ;
+
+        if (require_volume_support && support_rejects_gen)
+            std::cout << "support test rejected " << support_rejects_gen
+                      << " of " << (succ_gen + support_rejects_gen)
+                      << " grown points this generation" << std::endl;
 
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
