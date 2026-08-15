@@ -1209,6 +1209,12 @@ class FitContext:
                             del patches[patch_id]
                             continue
 
+                    # Erosion may remove the only in-range fringe while
+                    # leaving valid quads elsewhere on the patch.
+                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
+                        del patches[patch_id]
+                        continue
+
                     # Training retains the base grid and masks; discard any
                     # derived views rebuilt by erosion.
                     patch.release_derived_caches()
