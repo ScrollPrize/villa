@@ -4,7 +4,6 @@ import numpy as np
 import zarr
 from numcodecs import Blosc
 from typing import Optional, Tuple
-from vesuvius.zarr_compat import create_array
 
 def _default_compressor() -> Blosc:
     return Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
@@ -84,7 +83,7 @@ class OMEU8VectorWriter:
                     f"expected {self.shape_ds}"
                 )
             return ds
-        return create_array(g,
+        return g.create_dataset(
             self.scale_name,
             shape=self.shape_ds,
             chunks=chunks,

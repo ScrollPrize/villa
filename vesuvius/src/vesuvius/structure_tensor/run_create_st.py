@@ -18,7 +18,6 @@ import numpy as np
 
 from vesuvius.data.utils import open_zarr
 from numcodecs import Blosc
-from vesuvius.zarr_compat import create_array
 
 def get_available_gpus():
     """Returns a list of available GPU IDs."""
@@ -103,7 +102,7 @@ def create_shared_output_store(args, input_shape, patch_size):
     )
     
     # Create the structure_tensor array within the group
-    structure_tensor_arr = create_array(root_store,
+    structure_tensor_arr = root_store.create_dataset(
         'structure_tensor',
         shape=output_shape,
         chunks=output_chunks,
