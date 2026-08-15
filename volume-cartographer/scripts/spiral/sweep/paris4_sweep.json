@@ -11,7 +11,7 @@
     "z_begin": 8500,
     "z_end": 14500,
     "optimizer_num_training_steps": 30000,
-    "sample_count_winding_model_pairs": 48000
+    "sample_count_winding_model_pairs": 24000
   },
   "parameters": {
     "patch_selection": {
