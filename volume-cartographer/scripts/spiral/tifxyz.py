@@ -300,23 +300,47 @@ class Patch:
                 f.write(f"f {bl + 1} {tr + 1} {br + 1}\n")
 
 
-def load_tifxyz(path):
+def load_tifxyz(path, *, z_range=None):
+    """Load a TIFXYZ patch, optionally rejecting it before full decoding.
+
+    When ``z_range`` is supplied, only the z plane (and optional validity
+    mask) is decoded first.  Patches with no valid vertex in the half-open
+    range return ``None`` without reading x/y, winding, or overlap data.  This
+    is intentionally based on the coordinate data rather than ``meta.json``'s
+    bbox: historical producers have emitted bboxes in more than one axis
+    order.
+    """
 
     with open(f'{path}/meta.json', 'r') as meta_json:
         metadata = json.load(meta_json)
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
         erosion_cells_override = metadata.get('spiral_patch_erode_cells')
-    zyxs_np = np.stack([np.array(Image.open(f'{path}/{coord}.tif')) for coord in 'zyx'], axis=-1)
+
+    z_np = np.array(Image.open(f'{path}/z.tif'))
 
     # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
     # x/y/z, so masked-out vertices can carry real coordinates. Force those to -1 so the standard
     # validity logic (zyxs != -1) is correct. Patches without mask.tif are unaffected.
     mask_path = f'{path}/mask.tif'
+    mask = None
     if os.path.exists(mask_path):
         mask = np.array(Image.open(mask_path))
         if mask.ndim == 3:
             mask = mask[..., 0]
+
+    if z_range is not None:
+        z_begin, z_end = z_range
+        in_range = (z_np >= z_begin) & (z_np < z_end)
+        if mask is not None:
+            in_range &= mask != 0
+        if not in_range.any():
+            return None
+
+    y_np = np.array(Image.open(f'{path}/y.tif'))
+    x_np = np.array(Image.open(f'{path}/x.tif'))
+    zyxs_np = np.stack([z_np, y_np, x_np], axis=-1)
+    if mask is not None:
         zyxs_np[mask == 0] = -1.0
 
     zyxs = torch.from_numpy(zyxs_np).to(torch.float32)

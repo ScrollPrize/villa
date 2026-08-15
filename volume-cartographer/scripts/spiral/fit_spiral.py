@@ -9,6 +9,7 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
+import concurrent.futures
 import gc
 import json
 import glob
@@ -871,7 +872,6 @@ class FitContext:
 
     def _load_patches_from_dir(self, path, label='patches'):
         progress = progress_or_null(self.progress)
-        patches = {}
         entries = sorted(os.listdir(path))
         filter_regex = self.config['patch_uuid_filter_regex']
         if filter_regex is not None:
@@ -882,14 +882,63 @@ class FitContext:
         progress.begin(
             'loading', f'Loading {label}',
             step=0, total_steps=len(entries), unit='patches')
-        for entry_number, entry in enumerate(entries, start=1):
+
+        # TIFF decoding and the initial NumPy/Torch conversions release the
+        # GIL.  A small thread pool overlaps those operations without copying
+        # patch tensors between processes.  Keep the result ordering stable:
+        # atlas indices and seeded sampling must not depend on I/O completion
+        # order.
+        configured_workers = int(os.environ.get(
+            'FIT_SPIRAL_PATCH_LOAD_WORKERS', min(8, os.cpu_count() or 1)))
+        num_workers = max(1, min(configured_workers, len(entries)))
+
+        def load_entry(entry):
             segment_path = os.path.join(path, entry)
             try:
-                patches[entry] = load_tifxyz(segment_path)
+                return load_tifxyz(
+                    segment_path, z_range=(self.z_begin, self.z_end)), None
             except Exception as e:
-                print(f'Failed to load segment {entry}: {e}')
-            progress.update(
-                entry_number, detail=f'{len(patches):,} loaded')
+                return None, e
+
+        results = [None] * len(entries)
+        completed = 0
+        if num_workers == 1:
+            loaded = 0
+            for index, entry in enumerate(entries):
+                results[index] = load_entry(entry)
+                if results[index][0] is not None:
+                    loaded += 1
+                completed += 1
+                progress.update(completed, detail=f'{loaded:,} loaded')
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=num_workers,
+                    thread_name_prefix='patch-loader') as executor:
+                future_to_index = {
+                    executor.submit(load_entry, entry): index
+                    for index, entry in enumerate(entries)
+                }
+                loaded = 0
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    results[index] = future.result()
+                    if results[index][0] is not None:
+                        loaded += 1
+                    completed += 1
+                    progress.update(completed, detail=f'{loaded:,} loaded')
+
+        patches = {}
+        roi_skipped = 0
+        for entry, (patch, error) in zip(entries, results):
+            if error is not None:
+                print(f'Failed to load segment {entry}: {error}')
+            elif patch is None:
+                roi_skipped += 1
+            else:
+                patches[entry] = patch
+        if roi_skipped:
+            print(f'z ROI prefilter skipped {roi_skipped}/{len(entries)} '
+                  f'{label} entries before full TIFF decode')
         return patches
 
     def _prepare_patch_sampling_cache(self, patches):
@@ -1147,6 +1196,11 @@ class FitContext:
         for patches in (verified_patches, unverified_patches):
             for patch_id, patch in list(patches.items()):
                 try:
+                    # Reject by z before erosion. Erosion can only remove valid
+                    # vertices, so it cannot make an out-of-range patch relevant.
+                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
+                        del patches[patch_id]
+                        continue
                     # we erode cells this distance from any invalid cell to catch annotation errors
                     # which are hard to detect at the edges of patches
                     cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
@@ -1155,13 +1209,8 @@ class FitContext:
                             del patches[patch_id]
                             continue
 
-                    # remove any patches which do not intersect with the roi we are fitting
-                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                        del patches[patch_id]
-                        continue
-                    # ROI testing may materialise the compact valid-coordinate view.
-                    # Training retains the base grid and masks, so regenerate this view
-                    # lazily only for a later exporter that actually requests it.
+                    # Training retains the base grid and masks; discard any
+                    # derived views rebuilt by erosion.
                     patch.release_derived_caches()
                 finally:
                     filtered_count += 1

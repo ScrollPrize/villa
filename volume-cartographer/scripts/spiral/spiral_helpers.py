@@ -22,10 +22,13 @@ def scale_patch(patch, downsample_factor):
 
 
 def patch_intersects_z_roi(patch, z_begin, z_end):
-    zs = patch.valid_zyxs[..., 0]
-    if zs.numel() == 0:
-        return False
-    return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+    # Test the z plane in place.  ``patch.valid_zyxs`` gathers all three
+    # coordinates into a potentially very large temporary tensor, only to use
+    # one column here; with thousands of patches that allocation dominated the
+    # filtering pass.
+    zs = patch.zyxs[..., 0]
+    return bool((patch.valid_vertex_mask
+                 & (zs >= z_begin) & (zs < z_end)).any().item())
 
 
 def scale_counts_for_z_range(

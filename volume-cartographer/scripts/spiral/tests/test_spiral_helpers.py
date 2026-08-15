@@ -11,6 +11,7 @@ from spiral_helpers import (
     _resolve_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
     load_fiber_point_collection,
+    patch_intersects_z_roi,
     resolve_outer_winding_idx_and_notes,
 )
 from tifxyz import load_tifxyz
@@ -98,6 +99,47 @@ class TifxyzMetadataTests(unittest.TestCase):
             patch = load_tifxyz(root)
 
             self.assertEqual(patch.erosion_cells(7), 7)
+
+    def test_z_range_rejects_before_x_and_y_are_needed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "meta.json").write_text(json.dumps({
+                "format": "tifxyz", "scale": [1.0, 1.0],
+            }))
+            Image.fromarray(np.full((2, 2), 100, dtype=np.float32)).save(
+                root / "z.tif")
+
+            # There deliberately are no x/y planes. An out-of-range patch
+            # must return before attempting to open them.
+            self.assertIsNone(load_tifxyz(root, z_range=(0, 10)))
+
+    def test_z_range_prefilter_honours_mask_tif(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_patch(root, {
+                "format": "tifxyz", "scale": [1.0, 1.0],
+            })
+            Image.fromarray(np.full((2, 2), 5, dtype=np.float32)).save(
+                root / "z.tif")
+            Image.fromarray(np.zeros((2, 2), dtype=np.uint8)).save(
+                root / "mask.tif")
+
+            self.assertIsNone(load_tifxyz(root, z_range=(0, 10)))
+
+    def test_z_range_loads_an_intersecting_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_patch(root, {
+                "format": "tifxyz", "scale": [1.0, 1.0],
+            })
+            Image.fromarray(np.full((2, 2), 5, dtype=np.float32)).save(
+                root / "z.tif")
+
+            patch = load_tifxyz(root, z_range=(0, 10))
+
+            self.assertIsNotNone(patch)
+            self.assertTrue(patch_intersects_z_roi(patch, 0, 10))
+            self.assertIsNone(patch._valid_zyxs)
 
 
 class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
