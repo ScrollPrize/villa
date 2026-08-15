@@ -50,15 +50,17 @@ show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
 The rendered strips are derived views, not stored line geometry. Their columns
-uniformly resample centerline arclength with a target interval of 50 base
-voxels, retaining both endpoints and using a shorter exact interval when the
-total length is not divisible by 50. An explicit bidirectional mapping keeps
-control points, span labels, hover positions, cut planes, and saved line
-positions in the original fractional point-index coordinate. The strip grid's
-along- and cross-line scales are declared in base-volume voxel units, so input
-line points may have arbitrary spacing without changing render LOD. Automatic
-strip height retains the legacy behavior: its cross-row spacing is the median
-optimized control-point step, independent of the 50-voxel along-line target.
+retain every distinct control point and subdivide each control-point segment at
+the interval count whose spacing is closest to the 50-base-voxel target. This
+keeps every stored bend in the generated quad geometry. Explicit support
+arclengths provide a bidirectional mapping that keeps control points, span
+labels, hover positions, cut planes, and saved line positions in the original
+fractional point-index coordinate. The strip grid's scalar along-line scale is
+the mean support density; exact geometry and interaction use the point grid and
+support arclengths. Scales remain declared in base-volume voxel units, so input
+line spacing does not change render LOD. Automatic strip height retains the
+legacy behavior: its cross-row spacing is the median optimized control-point
+step, independent of the 50-voxel along-line target.
 
 The current cut view draws its solid yellow control-point marker only while the
 control point is inside the cut plane's thin slab, so fast panning would

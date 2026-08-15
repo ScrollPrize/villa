@@ -111,11 +111,13 @@
   another LOD. A transient renderable producer must provide a finite positive
   scale; serialized surfaces use their stored declaration.
 - Line-annotation ribbons are derived views of the authoritative stored line.
-  They uniformly arclength-resample with a default maximum interval of 50 base
-  voxels, retain both endpoints, and carry an explicit bidirectional mapping
-  between original fractional point positions and ribbon grid columns. Input
-  line spacing may be arbitrary; control points, cuts, and persistence remain
-  in original line-position coordinates.
+  Every distinct control point is an exact ribbon support so generated quads
+  cannot shortcut stored bends. Each control-point segment is independently
+  subdivided at the interval count whose spacing is closest to the default
+  50-base-voxel target. Explicit support arclengths provide the bidirectional
+  mapping between original fractional point positions and nonuniform ribbon
+  grid columns. Input line spacing may be arbitrary; control points, cuts, and
+  persistence remain in original line-position coordinates.
 - A completed pre-pass atomically replaces that source's previous snapshot for
   the view. The accepted render's captured focus is used locally to reduce each
   chunk's retained occurrences to its nearest squared distance. Snapshot

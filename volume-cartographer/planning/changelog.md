@@ -2,6 +2,9 @@
 
 ## 2026-08-15
 
+- Preserved every distinct control-point bend in generated annotation ribbons
+  and changed intermediate supports to closest-target segment-local spacing,
+  with explicit nonuniform support arclength mapping in both directions.
 - Restored view-independent background ownership for exact SurfaceCache tile
   dependencies so frame-demand replacement cannot publish false incomplete
   tiles by cancelling a fill's normal-band chunks.

@@ -2,25 +2,32 @@
 
 ## Findings
 
-- `SurfaceCache::runFill()` requests exact dependencies beyond the sparse frame
-  prepass, especially for the default 32-sample normal band.
-- Passing the viewer's `ChunkRequestContext` makes those dependencies part of
-  the replaceable view snapshot.
-- `replaceViewDemand()` erases absent per-view slots, cancels undemanded pending
-  work, erases unresolved entries, and wakes `prefetchChunks(wait=true)`.
-- The fill then treats unavailable decoded chunks as sample failures and can
-  publish an incomplete tile, consuming the three-attempt retry guard.
-- Before `e9416cc21a`, the context-free prefetch set background demand and was
-  not affected by view replacement.
+- Uniform arclength support points lie on the stored polyline individually,
+  but `QuadSurface` joins adjacent columns directly. A control-point bend that
+  is not itself sampled is therefore replaced by a chord.
+- The existing bidirectional map derives arclength from one scalar column
+  spacing, so it must change together with the support geometry.
+- `QuadSurface` exposes one scalar density per axis. With segment-local support
+  spacing, the along-axis value can only be nominal; exact geometry remains in
+  the point grid and exact interaction mapping in the support arclength array.
 
 ## Deviations
 
 - None.
 
+## Implementation
+
+- Added explicit strip support arclengths and segment-local interval selection.
+- Preserved every non-duplicate control point as a generated ribbon column.
+- Changed both mapping directions to interpolate through the explicit support
+  arclength array.
+- Retained the mean interval as nominal `QuadSurface` density metadata.
+- Added focused bend, segment-spacing, reverse-orientation, round-trip, and
+  duplicate-point checks.
+
 ## Validation
 
-- `cmake --build volume-cartographer/build --target test_chunk_cache VC3D -j8`
-  passed. Existing Qt SFINAE incomplete-type warnings were unchanged.
-- `volume-cartographer/build/bin/test_chunk_cache` passed 78 test cases,
-  including context-free prefetch survival across view replacement.
-- `git diff --check` passed.
+- `cmake --build volume-cartographer/build --target test_lasagna_line_view_surfaces -j 8`
+- `volume-cartographer/build/bin/test_lasagna_line_view_surfaces` (21 passed)
+- `cmake --build volume-cartographer/build --target VC3D -j 8`
+- `git diff --check`

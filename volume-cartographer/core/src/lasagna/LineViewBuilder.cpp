@@ -142,10 +142,40 @@ LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& sa
     if (!(map.totalArclength > kEpsilon)) {
         throw std::invalid_argument("Cannot build line annotation views for a zero-length LineModel");
     }
-    const size_t intervalCount = std::max<size_t>(
-        1, static_cast<size_t>(std::ceil(map.totalArclength / targetSpacingBaseVoxels)));
-    map.stripGridSpacingBaseVoxels = map.totalArclength / static_cast<double>(intervalCount);
-    map.stripGridColumnCount = intervalCount + 1;
+
+    map.stripGridArclengths.push_back(0.0);
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const double segmentStart = map.originalArclengths[i - 1];
+        const double segmentEnd = map.originalArclengths[i];
+        const double segmentLength = segmentEnd - segmentStart;
+        if (segmentLength <= kEpsilon) {
+            continue;
+        }
+
+        const double idealIntervals = segmentLength / targetSpacingBaseVoxels;
+        const size_t lowerIntervals = std::max<size_t>(
+            1, static_cast<size_t>(std::floor(idealIntervals)));
+        const size_t upperIntervals = lowerIntervals + 1;
+        const double lowerError = std::abs(
+            segmentLength / static_cast<double>(lowerIntervals) - targetSpacingBaseVoxels);
+        const double upperError = std::abs(
+            segmentLength / static_cast<double>(upperIntervals) - targetSpacingBaseVoxels);
+        const size_t intervalCount = upperError < lowerError
+            ? upperIntervals
+            : lowerIntervals;
+
+        for (size_t interval = 1; interval <= intervalCount; ++interval) {
+            const double arclength = interval == intervalCount
+                ? segmentEnd
+                : segmentStart + segmentLength *
+                    static_cast<double>(interval) / static_cast<double>(intervalCount);
+            map.stripGridArclengths.push_back(arclength);
+        }
+    }
+
+    map.stripGridColumnCount = map.stripGridArclengths.size();
+    map.stripGridSpacingBaseVoxels = map.totalArclength /
+        static_cast<double>(map.stripGridColumnCount - 1);
     return map;
 }
 
@@ -171,10 +201,7 @@ std::vector<SegmentNormalSample> resampleControlPoints(
 {
     std::vector<SegmentNormalSample> result;
     result.reserve(map.stripGridColumnCount);
-    for (size_t column = 0; column < map.stripGridColumnCount; ++column) {
-        const double arclength = column + 1 == map.stripGridColumnCount
-            ? map.totalArclength
-            : static_cast<double>(column) * map.stripGridSpacingBaseVoxels;
+    for (const double arclength : map.stripGridArclengths) {
         auto upper = std::upper_bound(map.originalArclengths.begin(),
                                       map.originalArclengths.end(), arclength);
         size_t second = upper == map.originalArclengths.end()
@@ -755,7 +782,8 @@ cv::Vec3d pointTangent(const LineModel& line, size_t index)
 bool LineStripPositionMap::valid() const
 {
     return originalArclengths.size() >= 2 && totalArclength > kEpsilon &&
-           stripGridSpacingBaseVoxels > kEpsilon && stripGridColumnCount >= 2;
+           stripGridSpacingBaseVoxels > kEpsilon && stripGridColumnCount >= 2 &&
+           stripGridArclengths.size() == stripGridColumnCount;
 }
 
 double LineStripPositionMap::originalPositionToStripGridColumn(double originalPosition) const
@@ -770,8 +798,20 @@ double LineStripPositionMap::originalPositionToStripGridColumn(double originalPo
     const double t = originalPosition - static_cast<double>(first);
     const double arclength = originalArclengths[first] * (1.0 - t) +
                              originalArclengths[second] * t;
-    return std::clamp(arclength / stripGridSpacingBaseVoxels,
-                      0.0, static_cast<double>(stripGridColumnCount - 1));
+    const auto exact = std::lower_bound(stripGridArclengths.begin(),
+                                        stripGridArclengths.end(), arclength);
+    if (exact == stripGridArclengths.end()) {
+        return static_cast<double>(stripGridColumnCount - 1);
+    }
+    const size_t upperColumn = static_cast<size_t>(exact - stripGridArclengths.begin());
+    if (std::abs(*exact - arclength) <= kEpsilon || upperColumn == 0) {
+        return static_cast<double>(upperColumn);
+    }
+    const size_t lowerColumn = upperColumn - 1;
+    const double span = stripGridArclengths[upperColumn] -
+                        stripGridArclengths[lowerColumn];
+    return static_cast<double>(lowerColumn) +
+           (arclength - stripGridArclengths[lowerColumn]) / span;
 }
 
 double LineStripPositionMap::stripGridColumnToOriginalPosition(double stripGridColumn) const
@@ -781,8 +821,11 @@ double LineStripPositionMap::stripGridColumnToOriginalPosition(double stripGridC
     }
     stripGridColumn = std::clamp(stripGridColumn, 0.0,
                                  static_cast<double>(stripGridColumnCount - 1));
-    const double arclength = std::min(totalArclength,
-                                     stripGridColumn * stripGridSpacingBaseVoxels);
+    const size_t lowerColumn = static_cast<size_t>(std::floor(stripGridColumn));
+    const size_t upperColumn = std::min(lowerColumn + 1, stripGridColumnCount - 1);
+    const double gridT = stripGridColumn - static_cast<double>(lowerColumn);
+    const double arclength = stripGridArclengths[lowerColumn] * (1.0 - gridT) +
+                             stripGridArclengths[upperColumn] * gridT;
     const auto exact = std::lower_bound(originalArclengths.begin(),
                                         originalArclengths.end(), arclength);
     if (exact == originalArclengths.end()) {

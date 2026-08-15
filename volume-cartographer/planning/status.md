@@ -1,9 +1,8 @@
 # Status
 
-- [x] Reproduce and trace SurfaceCache dependency cancellation.
-- [x] Write and independently review the implementation plan.
-- [x] Restore background ownership for exact tile dependencies.
-- [x] Remove unused viewer request context plumbing.
-- [x] Add background-prefetch replacement regression coverage.
-- [x] Update specification, implementation documentation, task log, and changelog.
-- [x] Build and run focused validation.
+- [x] Capture the control-point-preserving ribbon requirement.
+- [x] Review the plan against current mapping and rendering constraints.
+- [x] Implement segment-local subdivision and explicit support arclengths.
+- [x] Add regression coverage for bends, uneven segments, and mapping.
+- [x] Update specification, documentation, changelog, and task log.
+- [x] Build and run focused tests.

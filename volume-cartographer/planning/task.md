@@ -1,13 +1,12 @@
-# Task: keep SurfaceCache fill dependencies view-independent
+# Task: preserve control-point bends in generated line ribbons
 
-Restore SurfaceCache tile-fill chunk prefetches to background ownership.
+Build generated line-annotation ribbons directly through every non-duplicate
+control point. Subdivide each control-point segment independently so its
+interval length is as close as possible to the configured target spacing.
 
-- Exact tile dependencies must not be cancelled when a viewer replaces its
-  sparse per-frame demand.
-- SurfaceCache fills are non-GUI/background work and must use the context-free
-  chunk API.
-- Remove the now-unused viewer request context from SurfaceCache scheduling and
-  its callers.
-- Preserve stale-tile publication checks and the bounded incomplete-tile retry
-  guard.
-- Add regression coverage for background prefetch surviving view replacement.
+- Every geometric control-point bend must be a ribbon support column.
+- Intermediate supports must lie on their control-point segment.
+- Strip/original-position mapping must remain exact with nonuniform support
+  arclengths.
+- Consecutive duplicate points must retain canonical mapping without creating
+  zero-width ribbon quads.
