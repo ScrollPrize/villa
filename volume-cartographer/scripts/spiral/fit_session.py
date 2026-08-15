@@ -243,6 +243,8 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("unverified_patches", "directory",
                  enabled=_patches_enabled),
     FitInputSpec("fibers", "directory", conventional_relative="fibers"),
+    FitInputSpec("eval_fibers", "directory",
+                 conventional_relative="eval_fibers"),
     FitInputSpec("outer_shell", "directory",
                  conventional_relative="outer_shell",
                  required=_shell_losses_enabled),
@@ -312,6 +314,7 @@ class SpiralInputPaths:
     umbilicus: str = ""
     pcls: tuple[PclInputSpec, ...] = ()
     fibers: str = ""
+    eval_fibers: str = ""
     tracks_dbm: str = ""
     verified_patches: str = ""
     unverified_patches: str = ""
@@ -640,6 +643,7 @@ def conventional_input_paths(
         umbilicus=resolve("umbilicus"),
         pcls=pcls,
         fibers=resolve("fibers"),
+        eval_fibers=resolve("eval_fibers"),
         tracks_dbm=resolve("tracks_dbm"),
         verified_patches=resolve("verified_patches"),
         unverified_patches=spec.path_override("unverified_patches"),

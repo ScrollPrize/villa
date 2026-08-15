@@ -389,6 +389,33 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Selected manual Lasagna overrides a missing open-data cache entry")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_manual_override_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const auto manifestPath = root / "manual.lasagna.json";
+    writeFile(manifestPath, R"({"version":2,"groups":{}})");
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry(manifestPath.string()));
+    pkg->setSelectedLasagnaDataset(manifestPath.string());
+
+    const auto resolved = resolveLasagnaForCoordinateTags(
+        *pkg,
+        {"vc-open-data-sample-id:sample",
+         "vc-open-data-volume-id:vol-a",
+         "vc-open-data-source-coordinate-level:0",
+         "vc-open-data-lasagna-artifact:https://example.test/vol-a"});
+    REQUIRE(resolved.has_value());
+    CHECK_FALSE(resolved->manifestBacked);
+    CHECK(resolved->manifestPath == manifestPath);
+    CHECK(resolved->sourceManifestLocation == manifestPath.string());
+    CHECK(resolved->workingToBaseScale == doctest::Approx(1.0));
+
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")
 {
     const auto root = std::filesystem::temp_directory_path() /

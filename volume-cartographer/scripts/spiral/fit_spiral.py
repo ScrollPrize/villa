@@ -831,6 +831,7 @@ class FitContext:
         self.surf_sdt_zarr_path = paths.surf_sdt or None
         self.winding_inference_path = paths.winding_inference or None
         self.fibers_path = paths.fibers or None
+        self.eval_fibers_path = paths.eval_fibers or None
         self.verified_patches_path = paths.verified_patches or None
         self.unverified_patches_path = paths.unverified_patches or None
         self.shell_path = paths.outer_shell or None
@@ -1214,9 +1215,25 @@ class FitContext:
             pcl['sampling_group'] = 'fibers'
         point_collections.update(fiber_point_collections)
 
+        # Evaluation fibers are held out from patch linking, losses, sampling,
+        # and mesh generation. They use the ordinary fiber loader because both
+        # directories store coordinates at 4x scan scale.
+        progress.begin('loading', 'Loading evaluation fiber point collections')
+        eval_fiber_point_collections, _ = load_fiber_point_collections(
+            self.eval_fibers_path,
+            next_id,
+            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+        )
+
         for pcl in point_collections.values():
             for point in pcl['points'].values():
                 point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]], dtype=np.float32)
+        for pcl in eval_fiber_point_collections.values():
+            for point in pcl['points'].values():
+                point['zyx'] = np.array(
+                    [point['p'][2], point['p'][1], point['p'][0]],
+                    dtype=np.float32,
+                )
 
         def pcl_intersects_z_roi(pcl):
             for point in pcl['points'].values():
@@ -1390,6 +1407,7 @@ class FitContext:
 
         normalise_pcl_winding_annotations(cross_patch_point_collections)
         normalise_pcl_winding_annotations(unattached_point_collections)
+        normalise_pcl_winding_annotations(eval_fiber_point_collections)
 
         # Group each cross-patch pcl's attached points by patch, for the
         # winding-number loss. Patches are ordered by the first attached point that
@@ -1450,6 +1468,47 @@ class FitContext:
             })
             unattached_strip_sampling_groups.append(pcl['sampling_group'])
 
+        # Materialise held-out fibers in the same strip representation used by
+        # point-collection satisfaction. Keep only the longest in-range run,
+        # mirroring the training-fiber ROI treatment, but never classify or
+        # attach these fibers against input patches.
+        eval_fiber_strips = _UnattachedPclStripList()
+        z_margin = self.config['patch_loss_z_margin']
+        for pcl_id, pcl in eval_fiber_point_collections.items():
+            sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+            best_start, best_end = 0, 0
+            run_start = 0
+            for i, (_, point) in enumerate(sorted_items):
+                z = point['zyx'][0]
+                if self.z_begin - z_margin <= z < self.z_end + z_margin:
+                    if i + 1 - run_start > best_end - best_start:
+                        best_start, best_end = run_start, i + 1
+                else:
+                    run_start = i + 1
+            kept_items = sorted_items[best_start:best_end]
+            if len(kept_items) < 2:
+                continue
+            zyxs = np.stack(
+                [point['zyx'] for _, point in kept_items], axis=0,
+            ).astype(np.float32)
+            windings = np.array(
+                [point['winding_annotation'] for _, point in kept_items],
+                dtype=np.float32,
+            )
+            zyxs, keep = _decimate_ordered_points_min_spacing(
+                zyxs,
+                min_point_spacing,
+                return_indices=True,
+                force_keep={len(zyxs) - 1},
+            )
+            eval_fiber_strips.append({
+                'id': pcl_id,
+                'name': pcl.get('name'),
+                'source_file': pcl.get('source_file'),
+                'zyxs': zyxs,
+                'windings': windings[keep],
+            })
+
         cross_patch_pcls = list(cross_patch_point_collections.values())
         print(
             f'pcls: {len(cross_patch_pcls)} cross-patch, '
@@ -1481,6 +1540,7 @@ class FitContext:
         # path appends pcls (see _rebuild_pcl_sampling_strata).
         self.cross_patch_pcls = cross_patch_pcls
         self.unattached_pcl_strips = unattached_pcl_strips
+        self.eval_fiber_strips = eval_fiber_strips
         self.unattached_strip_sampling_groups = unattached_strip_sampling_groups
         self.resolved_links = resolved_links
         self.link_components = link_components
@@ -1495,7 +1555,7 @@ class FitContext:
         # The strip arrays and cross-patch list are the compact training forms.
         # Drop the JSON-shaped source containers, especially the independent deep
         # copies made for PCLs that participate in both loss families.
-        del point_collections, fiber_point_collections
+        del point_collections, fiber_point_collections, eval_fiber_point_collections
         del unattached_point_collections, cross_patch_point_collections
 
         # ==========================================================================
@@ -3836,6 +3896,7 @@ class FitContext:
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,
                 unattached_pcl_strips=self.unattached_pcl_strips,
+                eval_fiber_strips=self.eval_fiber_strips,
                 tracks=self.tracks,
                 unverified_patches_list=self.unverified_patches_list,
                 unverified_patches_dict=self.unverified_patches,

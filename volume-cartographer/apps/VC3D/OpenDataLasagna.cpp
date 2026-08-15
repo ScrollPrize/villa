@@ -262,6 +262,37 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const std::vector<std::string>& volumeTags,
     const std::optional<std::array<int, 3>>& workingShape)
 {
+    const auto manualLocation = pkg.selectedLasagnaDataset();
+    if (!manualLocation.empty()) {
+        const auto regularEntries = pkg.lasagnaDatasetEntries();
+        const auto selectedEntry = std::find_if(
+            regularEntries.begin(), regularEntries.end(),
+            [&](const vc::project::Entry& entry) {
+                return entry.location == manualLocation;
+            });
+        const bool selectedFromOpenData =
+            selectedEntry != regularEntries.end() &&
+            hasTag(selectedEntry->tags, kOpenDataLasagnaEntryTag);
+        if (!selectedFromOpenData) {
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.remoteCacheRoot = pkg.remoteCacheRootOrEmpty();
+            const auto resolvedLocation =
+                vc::project::isLocationRemote(manualLocation)
+                ? manualLocation
+                : vc::project::resolveLocalPath(
+                      manualLocation, pkg.path().parent_path()).string();
+            const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
+                resolvedLocation, options);
+            return ResolvedOpenDataLasagna{
+                dataset.manifest().manifestPath,
+                manualLocation,
+                1.0,
+                {},
+                {},
+                false};
+        }
+    }
+
     const auto sampleId = tagValue(volumeTags, kOpenDataSampleIdTagPrefix);
     const auto volumeId = tagValue(volumeTags, "vc-open-data-volume-id:");
     const auto levelText = tagValue(volumeTags, "vc-open-data-source-coordinate-level:");
@@ -355,7 +386,6 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
         }
     }
 
-    const auto manualLocation = pkg.selectedLasagnaDataset();
     if (manualLocation.empty()) return std::nullopt;
     vc::lasagna::LasagnaDatasetOpenOptions options;
     options.remoteCacheRoot = pkg.remoteCacheRootOrEmpty();

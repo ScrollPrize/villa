@@ -499,6 +499,7 @@ def save_overlay_and_print_satisfaction(
     patches_list,
     patches_dict,
     unattached_pcl_strips,
+    eval_fiber_strips,
     tracks,
     unverified_patches_list,
     unverified_patches_dict,
@@ -581,6 +582,51 @@ def save_overlay_and_print_satisfaction(
         satisfied_point_ratio = satisfied_points / max(total_points, 1)
         print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
         summary['satisfied_unattached_pcl_point_ratio'] = satisfied_point_ratio
+    eval_fiber_satisfaction_entries = []
+    if eval_fiber_strips:
+        if progress is not None:
+            progress.begin(
+                'finalizing', 'Evaluating held-out fibers',
+                detail=f'{len(eval_fiber_strips):,} fibers')
+        eval_satisfied_counts, eval_total_counts, _ = get_unattached_pcl_satisfied_counts(
+            slice_to_spiral_transform,
+            dr_per_winding,
+            eval_fiber_strips,
+            get_or_build_unattached_pcl_flat,
+        )
+        fully_satisfied_eval_fibers = int(
+            (eval_satisfied_counts == eval_total_counts).sum().item())
+        num_eval_fibers = len(eval_fiber_strips)
+        fully_satisfied_eval_fiber_ratio = (
+            fully_satisfied_eval_fibers / max(num_eval_fibers, 1))
+        print(
+            f'satisfied_eval_fibers = {fully_satisfied_eval_fibers}/'
+            f'{num_eval_fibers} ({fully_satisfied_eval_fiber_ratio * 100:.1f}%)')
+        summary['satisfied_eval_fibers'] = fully_satisfied_eval_fibers
+        summary['total_eval_fibers'] = num_eval_fibers
+        summary['satisfied_eval_fiber_ratio'] = fully_satisfied_eval_fiber_ratio
+        eval_satisfied_points = int(eval_satisfied_counts.sum().item())
+        eval_total_points = int(eval_total_counts.sum().item())
+        eval_satisfied_point_ratio = eval_satisfied_points / max(eval_total_points, 1)
+        print(
+            f'satisfied_eval_fiber_points = {eval_satisfied_points}/'
+            f'{eval_total_points} ({eval_satisfied_point_ratio * 100:.1f}%)')
+        summary['satisfied_eval_fiber_points'] = eval_satisfied_points
+        summary['total_eval_fiber_points'] = eval_total_points
+        summary['satisfied_eval_fiber_point_ratio'] = eval_satisfied_point_ratio
+        for strip, sc, tc in zip(
+                eval_fiber_strips,
+                eval_satisfied_counts.tolist(),
+                eval_total_counts.tolist()):
+            eval_fiber_satisfaction_entries.append({
+                'id': strip.get('id'),
+                'name': strip.get('name'),
+                'source_file': strip.get('source_file'),
+                'satisfied_points': int(sc),
+                'total_points': int(tc),
+                'fraction': sc / tc if tc > 0 else 0.0,
+            })
+        eval_fiber_satisfaction_entries.sort(key=lambda e: e['fraction'])
     if tracks:
         # Free the patch/pcl eval tensors before the (much larger) track eval,
         # and chunk the track eval so the full track set does not have to be
@@ -674,6 +720,7 @@ def save_overlay_and_print_satisfaction(
         json.dump({
             'patches': patch_satisfaction_entries,
             'pcls': pcl_satisfaction_entries,
+            'eval_fibers': eval_fiber_satisfaction_entries,
             'unverified_patches': unverified_patch_satisfaction_entries,
         }, f, indent=2)
     # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,

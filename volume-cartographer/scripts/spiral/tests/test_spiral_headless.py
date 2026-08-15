@@ -151,6 +151,7 @@ class DatasetResolverTests(unittest.TestCase):
             (root / "verified_patches").mkdir()
             (root / "unverified_patches").mkdir()
             (root / "fibers").mkdir()
+            (root / "eval_fibers").mkdir()
             (root / "tracks").mkdir()
             (root / "tracks" / "only.dbm.db").write_bytes(b"")
             (root / "abs_winding.json").write_text("{}")
@@ -163,6 +164,8 @@ class DatasetResolverTests(unittest.TestCase):
             self.assertEqual(result.resolved["verified_patches"],
                              str(root / "verified_patches"))
             self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
+            self.assertEqual(result.resolved["eval_fibers"],
+                             str(root / "eval_fibers"))
             self.assertNotIn("unverified_patches", result.resolved)
             self.assertEqual([item["role"] for item in result.pcl_inputs],
                              ["absolute", "relative", "same_winding",
