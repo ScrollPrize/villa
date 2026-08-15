@@ -16,6 +16,7 @@ import zarr
 from numcodecs import Blosc
 from scipy import ndimage
 from tqdm import tqdm
+from vesuvius.zarr_compat import create_array
 
 
 @dataclass(frozen=True)
@@ -262,25 +263,25 @@ def process_volume(
     mask_rep_dtype = np.uint8 if _is_binary_array(repulsive_mask) else _select_min_lossless_dtype(repulsive_mask)
 
     # Cast on write to avoid holding two copies if possible
-    root.create_dataset(
+    create_array(root,
         "affinities/attractive",
         data=attractive.astype(attr_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
-    root.create_dataset(
+    create_array(root,
         "affinities/repulsive",
         data=repulsive.astype(rep_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
-    root.create_dataset(
+    create_array(root,
         "mask/attractive",
         data=attractive_mask.astype(mask_attr_dtype, copy=False),
         compressor=compressor,
         chunks=chunk_shape,
     )
-    root.create_dataset(
+    create_array(root,
         "mask/repulsive",
         data=repulsive_mask.astype(mask_rep_dtype, copy=False),
         compressor=compressor,
@@ -290,7 +291,7 @@ def process_volume(
     if cfg.store_labels:
         max_label = int(labels.max(initial=0)) if labels.size else 0
         label_dtype = _min_uint_dtype(max_label)
-        root.create_dataset(
+        create_array(root,
             "labels",
             data=labels.astype(label_dtype, copy=False),
             compressor=compressor,

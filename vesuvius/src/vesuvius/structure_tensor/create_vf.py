@@ -5,6 +5,7 @@ import numpy as np
 from vesuvius.data.utils import open_zarr
 from typing import Dict, Tuple, Optional
 from tqdm.auto import tqdm
+from vesuvius.zarr_compat import require_array
 
 try:
     # Module execution (recommended)
@@ -55,11 +56,11 @@ class VectorFieldComputer:
         # prepare outputs
         root = zarr.open_group(output_zarr, mode='a')
         if not ome_only:
-            U_ds = root.require_dataset('U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+            U_ds = require_array(root, 'U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
                                         dtype=np.float32, compressor=compressor, overwrite=True)
-            V_ds = root.require_dataset('V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+            V_ds = require_array(root, 'V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
                                         dtype=np.float32, compressor=compressor, overwrite=True)
-            N_ds = root.require_dataset('N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
+            N_ds = require_array(root, 'N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
                                         dtype=np.float32, compressor=compressor, overwrite=True)
         # OME-ish uint8 writer (writes component groups z/y/x at scale)
         writer = None

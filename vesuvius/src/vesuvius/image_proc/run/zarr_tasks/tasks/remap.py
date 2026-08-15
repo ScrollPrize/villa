@@ -17,6 +17,7 @@ import zarr
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import get_chunk_slices
+from vesuvius.zarr_compat import create_array
 
 # Try to import fastremap for efficient remapping
 try:
@@ -206,7 +207,7 @@ class RemapTask(ZarrTask):
 
             # Create output array with same properties
             if str(level) not in output_store:
-                output_store.create_dataset(
+                create_array(output_store,
                     str(level),
                     shape=input_arr.shape,
                     chunks=input_arr.chunks,

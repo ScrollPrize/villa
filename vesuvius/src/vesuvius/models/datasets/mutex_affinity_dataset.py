@@ -26,6 +26,7 @@ from .intensity_properties import initialize_intensity_properties
 from ..training.normalization import get_normalization
 from ..augmentation.pipelines import create_training_transforms
 from ..augmentation.transforms.utils.perf import collect_augmentation_names
+from vesuvius.zarr_compat import create_array
 
 
 logger = logging.getLogger(__name__)
@@ -738,7 +739,7 @@ def _convert_store_to_uint8(payload: Tuple[str, Sequence[str]]):
             chunks = tuple(int(c) if c is not None else int(dim) for c, dim in zip(chunks, array.shape))
 
         compressor = getattr(array, "compressor", None)
-        tmp_ds = dest_group.create_dataset(
+        tmp_ds = create_array(dest_group,
             tmp_name,
             shape=array.shape,
             dtype=np.uint8,

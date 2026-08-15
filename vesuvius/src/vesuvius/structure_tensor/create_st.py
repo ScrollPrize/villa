@@ -21,6 +21,7 @@ from vesuvius.image_proc.geometry.structure_tensor import (
 )
 from numcodecs import Blosc
 from ._compile_utils import _maybe_compile_function
+from vesuvius.zarr_compat import create_array
 
 def _ceildiv(a: int, b: int) -> int:
     """Ceiling division for positives."""
@@ -203,7 +204,7 @@ class StructureTensorInferer(Inferer, nn.Module):
             )
             
             # Create the structure_tensor array within the group
-            self.output_store = root_store.create_dataset(
+            self.output_store = create_array(root_store,
                 'structure_tensor',
                 shape=output_shape,
                 chunks=output_chunks,
@@ -592,7 +593,7 @@ def _finalize_structure_tensor_torch(
         for axg in (gz, gy, gx):
             if ome_scale in axg:
                 del axg[ome_scale]
-            axg.create_dataset(
+            create_array(axg,
                 ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
                 dtype=np.uint8, compressor=compressor, write_empty_chunks=False
             )
@@ -606,7 +607,7 @@ def _finalize_structure_tensor_torch(
         conf_group = root_store.require_group("confidence")
         if ome_scale in conf_group:
             del conf_group[ome_scale]
-        conf_ds = conf_group.create_dataset(
+        conf_ds = create_array(conf_group,
             ome_scale, shape=(Zds, Yds, Xds), chunks=out_chunks_ds,
             dtype=np.uint8, compressor=compressor, write_empty_chunks=False
         )
@@ -614,7 +615,7 @@ def _finalize_structure_tensor_torch(
     # ---- Optional: keep full-precision eigen* arrays (float32) ----
     if keep_eigen:
         out_chunks = (1, cz, cy, cx)
-        eigenvectors_arr = root_store.create_dataset(
+        eigenvectors_arr = create_array(root_store,
             'eigenvectors',
             shape=(9, Z, Y, X),
             chunks=out_chunks,
@@ -623,7 +624,7 @@ def _finalize_structure_tensor_torch(
             write_empty_chunks=False,
             overwrite=True
         )
-        eigenvalues_arr = root_store.create_dataset(
+        eigenvalues_arr = create_array(root_store,
             'eigenvalues',
             shape=(3, Z, Y, X),
             chunks=out_chunks,

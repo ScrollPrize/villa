@@ -21,6 +21,7 @@ import tifffile
 import zarr
 
 from vesuvius.image_proc.run.workflow import gather_inputs, run_workflow
+from vesuvius.zarr_compat import create_array, local_store
 
 _STORAGE: np.memmap | zarr.Array | None = None
 _EXPECTED_SHAPE: tuple[int, int] | None = None
@@ -213,10 +214,10 @@ def _prepare_storage(
         store_dir = base_dir / f"stack_{uuid.uuid4().hex}.zarr"
         store_dir.mkdir(parents=False, exist_ok=False)
         sync_path = store_dir / ".sync"
-        store = zarr.DirectoryStore(str(store_dir))
+        store = local_store(str(store_dir))
         synchronizer = zarr.ProcessSynchronizer(str(sync_path))
         group = zarr.open_group(store=store, mode="w", synchronizer=synchronizer)
-        group.create_dataset(
+        create_array(group,
             "stack",
             shape=shape,
             dtype=dtype,
@@ -246,7 +247,7 @@ def _initialize_storage(spec: StorageSpec) -> None:
 
     if spec.mode == "zarr":
         assert spec.array_path is not None and spec.sync_path is not None
-        store = zarr.DirectoryStore(str(spec.path))
+        store = local_store(str(spec.path))
         synchronizer = zarr.ProcessSynchronizer(str(spec.sync_path))
         _STORAGE = zarr.open(store=store, path=spec.array_path, mode="r+", synchronizer=synchronizer)
         return
@@ -288,7 +289,7 @@ def _open_storage_for_read(spec: StorageSpec):
 
     if spec.mode == "zarr":
         assert spec.array_path is not None and spec.sync_path is not None
-        store = zarr.DirectoryStore(str(spec.path))
+        store = local_store(str(spec.path))
         synchronizer = zarr.ProcessSynchronizer(str(spec.sync_path))
         array = zarr.open(store=store, path=spec.array_path, mode="r", synchronizer=synchronizer)
 

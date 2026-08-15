@@ -24,6 +24,7 @@ from vesuvius.image_proc.mesh.affine import (
     apply_affine_to_points,
     transform_normals,
 )
+from vesuvius.zarr_compat import create_array, local_store
 
 # Determine default number of workers: half of CPU count (at least 1)
 default_workers = max(1, multiprocessing.cpu_count() // 2)
@@ -1533,7 +1534,7 @@ def main():
     label_datasets = []
     label_dataset_name = None
     if args.format == "zarr":
-        label_store = zarr.DirectoryStore(out_path)
+        label_store = local_store(out_path)
         label_root = zarr.group(store=label_store, overwrite=True)
         label_base_shape = (z_dim, h, w)
         label_axes = [
@@ -1548,7 +1549,7 @@ def main():
             level_shape = compute_level_shape(label_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = label_root.create_dataset(
+            ds = create_array(label_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1585,7 +1586,7 @@ def main():
 
     normals_datasets = []
     if args.output_normals:
-        normals_store = zarr.DirectoryStore(normals_out_path)
+        normals_store = local_store(normals_out_path)
         normals_root = zarr.group(store=normals_store, overwrite=True)
         normals_base_shape = (z_dim, h, w, 3)
         normals_axes = [
@@ -1601,7 +1602,7 @@ def main():
             level_shape = compute_level_shape(normals_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = normals_root.create_dataset(
+            ds = create_array(normals_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,
@@ -1636,7 +1637,7 @@ def main():
     surface_frame_dataset_name = None
 
     if args.output_surface_frame:
-        surface_frame_store = zarr.DirectoryStore(surface_frame_out_path)
+        surface_frame_store = local_store(surface_frame_out_path)
         surface_frame_root = zarr.group(store=surface_frame_store, overwrite=True)
         surface_frame_base_shape = (z_dim, h, w, 3, 3)
         surface_frame_axes = [
@@ -1653,7 +1654,7 @@ def main():
             level_shape = compute_level_shape(surface_frame_base_shape, level, (0, 1, 2))
             level_chunks = compute_chunks(level_shape, args.chunk_size, level)
             dataset_name = f"{level}"
-            ds = surface_frame_root.create_dataset(
+            ds = create_array(surface_frame_root,
                 dataset_name,
                 shape=level_shape,
                 chunks=level_chunks,

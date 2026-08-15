@@ -19,6 +19,7 @@ import numpy as np
 import zarr
 from numcodecs import Blosc
 from tqdm import tqdm
+from vesuvius.zarr_compat import nested_store_and_kwargs, open_array
 
 
 def get_chunk_coords(
@@ -112,8 +113,13 @@ def create_level_dataset(
     if overwrite and level_path.exists():
         shutil.rmtree(level_path)
 
-    store = zarr.NestedDirectoryStore(str(level_path))
-    return zarr.open(
+    # zarr 3 removed NestedDirectoryStore. The nested chunk layout is no longer
+    # a property of the store -- it comes from the array's key encoding -- so
+    # the store and the creation kwargs must travel together. Swapping only the
+    # store class would silently write a FLAT layout that existing readers of
+    # these pyramids cannot find, with no error raised.
+    store, nested_kwargs = nested_store_and_kwargs(str(level_path))
+    return open_array(
         store=store,
         shape=shape,
         chunks=chunks,
@@ -122,6 +128,7 @@ def create_level_dataset(
         mode="w",
         write_empty_chunks=False,
         fill_value=0,
+        **nested_kwargs,
     )
 
 

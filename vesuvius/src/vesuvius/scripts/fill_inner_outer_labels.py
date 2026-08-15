@@ -35,6 +35,7 @@ import numpy as np
 import zarr
 from numcodecs import Blosc
 from tqdm import tqdm
+from vesuvius.zarr_compat import create_array
 
 # Try to import alphashape - required for outer region detection
 try:
@@ -656,7 +657,7 @@ def create_output_zarr(
         if compressor is None:
             compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
-        output_store.create_dataset(
+        create_array(output_store,
             str(output_level),
             shape=input_arr.shape,
             chunks=input_arr.chunks,

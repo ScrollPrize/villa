@@ -15,6 +15,7 @@ from numcodecs import Blosc
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
+from vesuvius.zarr_compat import create_array
 
 # Try to import edt package for fast EDT
 try:
@@ -198,7 +199,7 @@ class EdtDilateTask(ZarrTask):
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
 
         output_store = zarr.open_group(self.config.output_zarr, mode="w")
-        output_arr = output_store.create_dataset(
+        output_arr = create_array(output_store,
             self.config.resolution,
             shape=self._shape,
             chunks=self.config.chunk_size,
