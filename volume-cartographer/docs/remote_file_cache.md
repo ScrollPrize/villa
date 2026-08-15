@@ -152,7 +152,8 @@ The service retains one source-local entry map, LRU, request state, listeners,
 and diagnostics record per interned source. All source states use one aggregate
 decoded-byte budget and the service's shared probe, source-read, and decode
 schedulers. Decoded payloads remain ordinary heap-owned byte vectors; they are
-not memory mapped.
+not memory mapped. Sources report decoded usage and expose LRU eviction
+callbacks to the aggregate budget, but do not apply independent byte ceilings.
 
 Source-read concurrency is global to a service. The service constructor fixes
 the physical worker capacity and initial fixed/adaptive admission policy.
@@ -163,6 +164,15 @@ place: queued and running work remains attached, no request is restarted, and
 completed work publishes normally. Explicit prefill, redownload, and batch
 caches obtain isolation by owning a separate service, not by attaching a
 private scheduler to a source handle.
+
+Decoded RAM capacity is also mutable service policy.
+`configureDecodedByteCapacity()` updates the existing aggregate budget without
+replacing sources, schedulers, fetchers, or handles. Increasing capacity keeps
+all resident data. Decreasing capacity evicts globally oldest decoded entries,
+but queued and running probe/read/decode work drains normally; a completion is
+accounted and then subjected to the new ceiling. `Volume::setCacheBudget()` is
+a convenience delegating to this service operation and does not invalidate the
+volume source.
 
 Changing the current volume drops viewer references but keeps the `Volume`'s
 lightweight source handle and service state, so switching A -> B -> A neither

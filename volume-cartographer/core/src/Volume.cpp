@@ -1817,18 +1817,30 @@ void Volume::setCacheBudget(
     size_t hotBytes,
     std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget)
 {
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheBudgetHot_ == hotBytes && decodedCacheBudget_ == decodedBudget) {
-        // Re-applying the same budget must not drop the warm cache; multiple
-        // workspaces share Volume instances and each applies its budget on
-        // volume selection.
-        return;
+    std::shared_ptr<vc::render::ChunkCacheService> service;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> effectiveBudget;
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        service = chunkCacheService_;
+        if (service) {
+            const auto serviceBudget = service->decodedByteBudget();
+            if (decodedBudget && decodedBudget != serviceBudget) {
+                throw std::invalid_argument(
+                    "Volume::setCacheBudget cannot replace the attached "
+                    "ChunkCacheService budget");
+            }
+            effectiveBudget = serviceBudget;
+        } else {
+            effectiveBudget = std::move(decodedBudget);
+        }
+        cacheBudgetHot_ = hotBytes;
+        decodedCacheBudget_ = effectiveBudget;
     }
-    cacheBudgetHot_ = hotBytes;
-    decodedCacheBudget_ = std::move(decodedBudget);
-    if (chunkedCache_)
-        chunkedCache_->invalidate();
-    chunkedCache_.reset();
+
+    if (service)
+        service->configureDecodedByteCapacity(hotBytes);
+    else if (effectiveBudget)
+        effectiveBudget->setMaximumBytes(hotBytes);
 }
 
 void Volume::retainCacheClient()

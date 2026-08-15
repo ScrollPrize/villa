@@ -283,6 +283,45 @@ TEST_CASE("Volume: service concurrency reconfigures without eviction")
     fs::remove_all(d);
 }
 
+TEST_CASE("Volume: cache budget reconfigures without replacing source state")
+{
+    auto d = tmpDir("cache-service-budget");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    vc::render::ChunkCacheService::Options options;
+    options.decodedByteCapacity = 64 * 1024;
+    auto service = std::make_shared<vc::render::ChunkCacheService>(
+        std::move(options));
+    v->setChunkCacheService(service);
+    v->setCacheBudget(64 * 1024, service->decodedByteBudget());
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    const auto source = cache->sourceId();
+    REQUIRE(cache->getChunkBlocking(0, 0, 0, 0).status ==
+            vc::render::ChunkStatus::Data);
+
+    v->setCacheBudget(128 * 1024, service->decodedByteBudget());
+    CHECK(v->sharedChunkCache() == cache);
+    CHECK(cache->sourceId() == source);
+    CHECK(service->sourceCount() == 1);
+    CHECK(service->decodedByteBudget()->maximumBytes() == 128 * 1024);
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+
+    v->setCacheBudget(16 * 1024, service->decodedByteBudget());
+    CHECK(v->sharedChunkCache() == cache);
+    CHECK(cache->sourceId() == source);
+    CHECK(service->sourceCount() == 1);
+    CHECK(service->decodedByteBudget()->maximumBytes() == 16 * 1024);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::MissQueued);
+    fs::remove_all(d);
+}
+
 TEST_CASE("Volume: writes invalidate service state without a live handle")
 {
     auto d = tmpDir("cache-service-write");

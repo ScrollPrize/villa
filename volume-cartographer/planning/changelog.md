@@ -2,6 +2,9 @@
 
 ## 2026-08-15
 
+- Moved decoded RAM capacity fully into the shared cache service and made
+  runtime capacity changes preserve sources, queues, and in-flight work;
+  reductions now evict only globally oldest decoded entries.
 - Preserved every distinct control-point bend in generated annotation ribbons
   and changed intermediate supports to closest-target segment-local spacing,
   with explicit nonuniform support arclength mapping in both directions.

@@ -69,6 +69,7 @@ public:
     };
 
     struct Options {
+        // Initial capacity used only when decodedByteBudget is not supplied.
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
@@ -97,6 +98,9 @@ public:
     // work is neither cancelled nor restarted.
     void configureFetchConcurrency(std::size_t maxConcurrentReads,
                                    bool adaptive);
+    // Changes the global decoded RAM ceiling in place. Sources and queued or
+    // running work are preserved; reductions evict only decoded LRU entries.
+    void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
@@ -282,7 +286,6 @@ private:
               double fillValue,
               ChunkDtype dtype,
               Options options,
-              std::size_t decodedByteCapacity,
               std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget,
               VolumeSourceId sourceId,
               std::string sourceIdentity)
@@ -291,7 +294,6 @@ private:
             , fillValue_(fillValue)
             , dtype_(dtype)
             , options_(std::move(options))
-            , decodedByteCapacity_(decodedByteCapacity)
             , decodedByteBudget_(std::move(decodedByteBudget))
             , sourceId_(sourceId)
             , sourceIdentity_(std::move(sourceIdentity))
@@ -314,7 +316,6 @@ private:
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
-        std::size_t decodedByteCapacity_ = 0;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget_;
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;

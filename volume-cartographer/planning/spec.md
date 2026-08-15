@@ -40,8 +40,10 @@
   may publish only while both cache and fetcher generations match. Incompatible
   duplicate registrations fail loudly.
 - Decoded data is heap-backed and globally constrained by the service's shared
-  decoded-byte budget. Source state and resident entries survive A -> B -> A
-  volume switches until global eviction or explicit source invalidation.
+  decoded-byte budget. Sources retain usage, LRU touches, and eviction callbacks
+  but do not own independent decoded-byte ceilings. Source state and resident
+  entries survive A -> B -> A volume switches until global eviction or explicit
+  source invalidation.
 - Probe, source-read, and decode schedulers belong to the service. Source-read
   concurrency is one service-global policy, bounded by the physical worker
   capacity fixed when the service is constructed. Source acquisition options
@@ -53,11 +55,19 @@
   invalidate running results. Increasing admission wakes existing workers;
   after a decrease, running work drains normally and no new task starts until
   activity falls below the new limit.
+- `configureDecodedByteCapacity()` changes the existing service budget in
+  place. It does not replace source handles, increment source epochs, or cancel
+  queued/running work. Increasing capacity preserves all decoded entries;
+  decreasing it evicts only globally oldest decoded entries until accounting
+  satisfies the new ceiling. Concurrent completions drain normally and are
+  accounted and enforced against the new ceiling.
 - Explicit bounded prefill, redownload, and batch caches use a separate
   `ChunkCacheService`. Their fixed concurrency is isolated from the regular
   interactive service even when both services share one decoded-byte budget.
-- `Volume` may receive a service or create a private one, but it neither owns
-  nor exposes a per-volume source-read concurrency setting.
+- `Volume` may receive a service or create a private one, but it owns neither a
+  per-volume decoded-byte ceiling nor a per-volume source-read concurrency
+  setting. `Volume::setCacheBudget()` configures the attached service in place
+  and must not invalidate or reacquire its source.
 - Releasing a viewer/cache client does not invalidate service-owned source
   state. Writes and explicit `Volume::invalidateCache()` invalidate only that
   source; stale generation results must not publish afterward.

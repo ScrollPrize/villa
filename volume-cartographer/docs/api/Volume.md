@@ -153,7 +153,7 @@ are currently supported by this API.
 | `createChunkCache(Options, ServiceOptions)` | `std::shared_ptr<ChunkCache>` | Create a cache with an independent explicitly configured service |
 | `setChunkCacheService(service)` | `void` | Attach an application-owned shared cache service |
 | `chunkCacheService()` | `std::shared_ptr<ChunkCacheService>` | Return the attached cache service |
-| `setCacheBudget(size_t hotBytes)` | `void` | Set decoded cache capacity and reset the shared cache |
+| `setCacheBudget(size_t hotBytes)` | `void` | Change the attached service's global decoded capacity in place |
 | `invalidateCache()` | `void` | Drop decoded/read cache state |
 | `sample(Mat_<uint8_t>&, coords, params)` | `void` | Sample into an 8-bit image |
 | `sample(Mat_<uint16_t>&, coords, params)` | `void` | Sample into a 16-bit image |
@@ -392,10 +392,13 @@ volume->updateMetadata(patch);
 - Remote `s3://` URLs are resolved to HTTPS. AWS SigV4 credentials are used
   when available, with anonymous fallback for public buckets if stale
   credentials are rejected.
-- `setCacheBudget()` resets the Volume's source handle. Source-read concurrency
-  belongs to `ChunkCacheService`; configure the shared service explicitly with
-  `configureFetchConcurrency()`. Acquiring a volume source never changes that
-  policy. Caches created by `createChunkCache()` use separate services and are
-  not modified.
+- `setCacheBudget()` updates the attached `ChunkCacheService` budget in place;
+  it preserves source identity, decoded data within the new limit, and all
+  queued/running work. A reduction evicts globally oldest decoded entries but
+  does not cancel fetch/decode work. Source-read concurrency likewise belongs
+  to the service and changes in place through `configureFetchConcurrency()`.
+  Acquiring a volume source never changes either policy. Caches created by
+  `createChunkCache()` use separate services, though callers may explicitly
+  give those services the same aggregate decoded budget.
 - Region writes and raw chunk writes are local-only and invalidate the shared
   cache after successful mutation.

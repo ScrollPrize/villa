@@ -167,8 +167,10 @@ public:
     chunkCacheService() const;
     [[nodiscard]] std::string chunkCacheSourceIdentity() const;
 
-    // Set the local safety ceiling and optional process-wide decoded budget
-    // for the single cache shared by volume sampling and viewers.
+    // Configure the process-wide decoded RAM ceiling in place. If this Volume
+    // is attached to a service, sources and queued/running work are preserved.
+    // The optional budget may select a shared manager before service creation;
+    // an attached service's manager cannot be replaced through a Volume.
     void setCacheBudget(
         size_t hotBytes,
         std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});

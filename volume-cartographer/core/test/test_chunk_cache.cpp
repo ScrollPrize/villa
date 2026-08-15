@@ -771,6 +771,72 @@ TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
     CHECK(cacheB->getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
 }
 
+TEST_CASE("ChunkCacheService capacity changes preserve sources and global LRU")
+{
+    auto service = makeService(128);
+    auto fetcherA = std::make_shared<CountingFetcher>();
+    auto fetcherB = std::make_shared<CountingFetcher>();
+    ChunkFetchResult result;
+    result.status = ChunkFetchStatus::Found;
+    result.bytes = makeBytes(64, std::byte{41});
+    fetcherA->setCanned({0, 0, 0, 0}, result);
+    fetcherB->setCanned({0, 0, 0, 0}, result);
+    auto cacheA = makeServiceCache(service, "resize-a", fetcherA);
+    auto cacheB = makeServiceCache(service, "resize-b", fetcherB);
+    const auto sourceA = cacheA->sourceId();
+    const auto sourceB = cacheB->sourceId();
+
+    REQUIRE(cacheA->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(cacheB->getChunkBlocking(0, 0, 0, 0).status == ChunkStatus::Data);
+    service->configureDecodedByteCapacity(64);
+
+    const auto stats = service->decodedByteBudget()->stats();
+    CHECK(stats.maximumBytes == 64);
+    CHECK(stats.decodedBytes == 64);
+    CHECK(service->sourceCount() == 2);
+    CHECK(cacheA->sourceId() == sourceA);
+    CHECK(cacheB->sourceId() == sourceB);
+    CHECK(cacheA->getChunkIfCached(0, 0, 0, 0).status ==
+          ChunkStatus::MissQueued);
+    CHECK(cacheB->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+
+    service->configureDecodedByteCapacity(256);
+    CHECK(service->decodedByteBudget()->maximumBytes() == 256);
+    CHECK(cacheB->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCacheService capacity reduction preserves running and queued work")
+{
+    auto service = makeService(128, 1);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "resize-in-flight", fetcher);
+    const auto source = cache->sourceId();
+    std::atomic<int> callbacks{0};
+    cache->addChunkReadyListener([&] { ++callbacks; });
+
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(cache->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::MissQueued);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    CHECK_FALSE(fetcher->waitForStarted(2, std::chrono::milliseconds{50}));
+
+    service->configureDecodedByteCapacity(64);
+    CHECK(cache->sourceId() == source);
+    CHECK(service->sourceCount() == 1);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{2});
+
+    fetcher->release();
+    REQUIRE(fetcher->waitForStarted(2, std::chrono::seconds{2}));
+    for (int attempt = 0; attempt < 200 && callbacks.load() < 2; ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    CHECK(callbacks.load() == 2);
+    CHECK(fetcher->calls({0, 0, 0, 0}) == 1);
+    CHECK(fetcher->calls({0, 0, 0, 1}) == 1);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 64);
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{0});
+}
+
 TEST_CASE("ChunkCacheService releases aggregate accounting on destruction")
 {
     auto budget = std::make_shared<DecodedChunkCacheBudget>(1024 * 1024);

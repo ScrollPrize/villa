@@ -1,12 +1,14 @@
-# Task: preserve control-point bends in generated line ribbons
+# Task: reconfigure global RAM cache capacity in place
 
-Build generated line-annotation ribbons directly through every non-duplicate
-control point. Subdivide each control-point segment independently so its
-interval length is as close as possible to the configured target spacing.
+Make decoded RAM capacity exclusively owned by `ChunkCacheService` and its
+shared decoded-budget manager.
 
-- Every geometric control-point bend must be a ribbon support column.
-- Intermediate supports must lie on their control-point segment.
-- Strip/original-position mapping must remain exact with nonuniform support
-  arclengths.
-- Consecutive duplicate points must retain canonical mapping without creating
-  zero-width ribbon quads.
+- Runtime cache-size changes must preserve sources, source IDs, fetchers,
+  queued work, running work, and decoded entries that remain within budget.
+- Reducing capacity may evict decoded LRU entries, but must not cancel or
+  restart probe, source-read, or decode work.
+- Remove the redundant per-source decoded-byte ceiling.
+- `Volume::setCacheBudget()` must configure the attached service in place and
+  must not invalidate or reacquire the source.
+- Existing service-wide concurrency changes must retain their current
+  queue/source-preserving behavior.
