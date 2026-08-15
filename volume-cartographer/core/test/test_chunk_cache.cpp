@@ -2449,6 +2449,47 @@ TEST_CASE("ChunkRequestScheduler publishes shared priority updates atomically")
     CHECK(selectedDuringPublication.load(std::memory_order_relaxed) == 0);
 }
 
+TEST_CASE("ChunkRequestScheduler releases completed tasks before becoming idle")
+{
+    struct BlockingDestructor {
+        std::latch& started;
+        std::latch& release;
+
+        BlockingDestructor(std::latch& startedIn, std::latch& releaseIn)
+            : started(startedIn)
+            , release(releaseIn)
+        {
+        }
+
+        ~BlockingDestructor()
+        {
+            started.count_down();
+            release.wait();
+        }
+    };
+
+    ChunkRequestScheduler scheduler(1);
+    std::latch destructorStarted{1};
+    std::latch releaseDestructor{1};
+    auto captured = std::make_shared<BlockingDestructor>(
+        destructorStarted, releaseDestructor);
+    scheduler.submit(1, {}, 1, 0, [captured] {});
+    captured.reset();
+
+    std::atomic_bool idleReturned{false};
+    std::jthread waiter([&] {
+        scheduler.waitIdle();
+        idleReturned.store(true, std::memory_order_release);
+    });
+
+    destructorStarted.wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(idleReturned.load(std::memory_order_acquire));
+    releaseDestructor.count_down();
+    waiter.join();
+    CHECK(idleReturned.load(std::memory_order_acquire));
+}
+
 TEST_CASE("ChunkCache view snapshots promote queued work and reject stale replacement")
 {
     auto fetcher = std::make_shared<BlockingOrderFetcher>();

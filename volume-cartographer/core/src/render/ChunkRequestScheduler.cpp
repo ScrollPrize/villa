@@ -228,9 +228,19 @@ struct ChunkRequestScheduler::Impl {
 
     ~Impl()
     {
-        for (auto& worker : workers)
-            worker.request_stop();
+        {
+            // Serialize the stop transition with the worker wait predicate.
+            // Otherwise notify_all() can land after a worker's predicate check
+            // but before it has entered the condition-variable wait.
+            std::lock_guard lock(mutex);
+            for (auto& worker : workers)
+                worker.request_stop();
+        }
         cv.notify_all();
+        for (auto& worker : workers) {
+            if (worker.joinable())
+                worker.join();
+        }
     }
 
     bool staleLocked(const Item& item) const
@@ -834,6 +844,11 @@ struct ChunkRequestScheduler::Impl {
                 activeCount.fetch_add(1, std::memory_order_acq_rel);
             }
             item->task();
+            // A task may retain scheduler-owned state, including a reference
+            // to this scheduler for transfer accounting. Release all task
+            // captures before publishing the worker as idle so teardown can
+            // never leave their final destruction to this worker thread.
+            item.reset();
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
             cv.notify_all();
@@ -852,8 +867,8 @@ struct ChunkRequestScheduler::Impl {
     std::unordered_map<TaskId, Location> locations;
     std::unordered_map<TaskGroup, std::uint64_t> minimumGroupEpoch;
     std::shared_ptr<ChunkRequestSelectionGate> selectionGate;
-    // Declared after the gate so jthread destruction joins every worker before
-    // the gate they may be waiting on is released.
+    // Workers are explicitly joined in ~Impl while all scheduler state remains
+    // alive. Keep the gate declared first as an additional lifetime safeguard.
     std::vector<std::jthread> workers;
     std::atomic_size_t activeCount{0};
     std::uint64_t nextSequence = 0;

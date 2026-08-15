@@ -265,21 +265,24 @@ TEST_CASE("stats: startup scan ignores files newer than its cutoff")
     const auto target = persist / "level_0" / "0" / "0";
     writeSizedFile(target / "0.bin", 31);
     writeSizedFile(target / "1.empty", 1);
-
-    auto f = std::make_shared<CountingFetcher>();
-    auto c = makeCache(f, persist);
-
     writeSizedFile(target / "post.bin", 17);
     std::error_code ec;
     fs::last_write_time(
         target / "post.bin",
         fs::file_time_type::clock::now() + std::chrono::seconds{10},
         ec);
+    REQUIRE_FALSE(ec);
+
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist);
 
     auto s = waitForStats(*c, [](const ChunkCache::Stats& s) {
         return !s.persistentCacheScanInFlight;
     });
-    CHECK(s.persistentCacheBytes == 32);
+    CHECK_MESSAGE(
+        s.persistentCacheBytes == 32,
+        "startup scan counted " + std::to_string(s.persistentCacheBytes) +
+            " bytes instead of 32");
     fs::remove_all(persist);
 }
 
