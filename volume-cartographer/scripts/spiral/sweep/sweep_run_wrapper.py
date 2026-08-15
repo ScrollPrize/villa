@@ -54,6 +54,10 @@ INK_SUMMARY_KEYS = (
     'overall_column_score',
 )
 
+# Each torchrun rank owns one GPU.  Keep its host-side Torch pools bounded so
+# concurrent sweep fits do not each consume a full machine's CPU threads.
+SWEEP_THREADS_PER_GPU = 4
+
 
 def coerce_params(params):
     """Coerce sweep-assigned values to the exact types Config validation demands.
@@ -295,6 +299,7 @@ def main():
         fit_env = os.environ.copy()
         fit_env['FIT_SPIRAL_CONFIG_OVERRIDES'] = json.dumps(seed_overrides)
         fit_env['FIT_SPIRAL_OUT_DIR'] = str(seed_out)
+        fit_env['FIT_SPIRAL_NUM_THREADS'] = str(SWEEP_THREADS_PER_GPU)
         fit_env.setdefault('WANDB_MODE', 'online')
         # Each seed fit gets its OWN wandb run (so per-iteration loss curves
         # are not concatenated across seeds): detach the fit from the

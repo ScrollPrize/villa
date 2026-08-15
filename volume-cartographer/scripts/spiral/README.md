@@ -47,7 +47,8 @@ the agent takes the next config. Each seed fit logs to its own wandb run
 (id `<sweep_run_id>-seed<s>`, grouped per config) so per-iteration loss
 curves stay separate; the agent-created sweep run receives the per-seed
 metrics, their across-seed mean/std, and the seed run ids, and the sweep
-optimizes the across-seed mean. The spec's `"objective"` section defines a
+optimizes the across-seed mean. Each GPU rank is limited to four PyTorch CPU
+threads during sweep fits. The spec's `"objective"` section defines a
 weighted linear combination of `final/*` and `ink/*` metrics logged as
 `objective` (e.g. `ink/overall_column_score` + `final/satisfied_patch_ratio`
 in `sweep/paris4_sweep.json`); without one, the default metric is the raw
