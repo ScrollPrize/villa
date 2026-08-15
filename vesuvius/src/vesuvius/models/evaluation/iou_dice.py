@@ -64,25 +64,37 @@ def compute_iou_dice(pred: torch.Tensor,
         else:
             mask_np = np.asarray(mask)
 
+    def _binarize(scores: np.ndarray) -> np.ndarray:
+        """Single-channel heads emit a score per voxel, not a class id.
+
+        Squeezing one straight into the class comparisons below tests
+        ``score == 1`` on continuous values, which is essentially never true --
+        a perfect prediction then scores 0. Threshold instead: at 0 for logits
+        (the shipped configs use ``activation: "none"``), at 0.5 once an
+        activation has been applied.
+        """
+        cutoff = 0.0 if (scores.min() < 0.0 or scores.max() > 1.0) else 0.5
+        return (scores > cutoff).astype(np.int64)
+
     # Handle different input shapes for predictions
     if pred_np.ndim == 5:  # (batch, channels, depth, height, width)
         if pred_np.shape[1] > 1:  # Multi-channel, need argmax
             pred_np = np.argmax(pred_np, axis=1)
-        else:  # Single channel, just squeeze
-            pred_np = pred_np.squeeze(1)
+        else:  # Single channel: a score volume, threshold it
+            pred_np = _binarize(pred_np.squeeze(1))
     elif pred_np.ndim == 4:  # Could be (batch, depth, height, width) or (batch, channels, height, width)
         # Check if second dimension is channels (usually small) or spatial dimension
         if pred_np.shape[1] <= 10:  # Likely channels dimension
             if pred_np.shape[1] > 1:
                 pred_np = np.argmax(pred_np, axis=1)
             else:
-                pred_np = pred_np.squeeze(1)
+                pred_np = _binarize(pred_np.squeeze(1))
         # Otherwise assume it's already (batch, depth, height, width) or (batch, height, width)
     elif pred_np.ndim == 3 and pred_np.shape[0] <= 10:  # (channels, height, width)
         if pred_np.shape[0] > 1:
             pred_np = np.argmax(pred_np, axis=0)
         else:
-            pred_np = pred_np.squeeze(0)
+            pred_np = _binarize(pred_np.squeeze(0))
     
     # Handle different input shapes for ground truth (and align mask if provided)
     if gt_np.ndim == 3:  # (depth, height, width) or (height, width)

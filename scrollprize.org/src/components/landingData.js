@@ -643,7 +643,7 @@ export const team = {
     {
       name: "Kilian Fleischer",
       title: "Research Director and Papyrologist, University of Tübingen",
-      href: "https://www.klassphil.uni-wuerzburg.de/team/pd-dr-kilian-fleischer/",
+      href: "https://uni-tuebingen.de/fakultaeten/philosophische-fakultaet/fachbereiche/altertums-und-kunstwissenschaften/philologisches-seminar/personen/uebersicht/ar-pd-dr-kilian-fleischer/",
     },
     {
       name: "Alessia Lavorante",
