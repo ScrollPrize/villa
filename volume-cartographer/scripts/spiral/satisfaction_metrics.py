@@ -716,13 +716,15 @@ def save_overlay_and_print_satisfaction(
                 'fraction': fraction,
             })
         pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
+    satisfaction_entries = {
+        'patches': patch_satisfaction_entries,
+        'pcls': pcl_satisfaction_entries,
+        'unverified_patches': unverified_patch_satisfaction_entries,
+    }
+    if eval_fiber_strips:
+        satisfaction_entries['eval_fibers'] = eval_fiber_satisfaction_entries
     with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
-        json.dump({
-            'patches': patch_satisfaction_entries,
-            'pcls': pcl_satisfaction_entries,
-            'eval_fibers': eval_fiber_satisfaction_entries,
-            'unverified_patches': unverified_patch_satisfaction_entries,
-        }, f, indent=2)
+        json.dump(satisfaction_entries, f, indent=2)
     # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
     # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
     if satisfied_quad_masks:

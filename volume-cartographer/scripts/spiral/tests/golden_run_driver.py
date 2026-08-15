@@ -136,7 +136,7 @@ def _canonicalize_satisfied(satisfied):
     deterministic run-to-run, only the set of entries is."""
     canonical = dict(satisfied)
     for key, identity in (('patches', 'id'), ('unverified_patches', 'id'),
-                          ('pcls', 'name')):
+                          ('pcls', 'name'), ('eval_fibers', 'name')):
         entries = canonical.get(key)
         if isinstance(entries, list):
             canonical[key] = sorted(
@@ -149,10 +149,15 @@ def _satisfied_aggregates(satisfied):
     areas are quantized in coarse cells), but sums over hundreds of entries
     carry a tight regression signal."""
     aggregates = {}
-    for key, satisfied_field, total_field in (
-            ('patches', 'satisfied_area', 'total_area'),
-            ('unverified_patches', 'satisfied_area', 'total_area'),
-            ('pcls', 'satisfied_points', 'total_points')):
+    metric_fields = [
+        ('patches', 'satisfied_area', 'total_area'),
+        ('unverified_patches', 'satisfied_area', 'total_area'),
+        ('pcls', 'satisfied_points', 'total_points'),
+    ]
+    if 'eval_fibers' in satisfied:
+        metric_fields.append(
+            ('eval_fibers', 'satisfied_points', 'total_points'))
+    for key, satisfied_field, total_field in metric_fields:
         entries = satisfied.get(key) or []
         total_satisfied = sum(entry[satisfied_field] for entry in entries)
         total = sum(entry[total_field] for entry in entries)

@@ -52,7 +52,11 @@ weighted linear combination of `final/*` and `ink/*` metrics logged as
 `objective` (e.g. `ink/overall_column_score` + `final/satisfied_patch_ratio`
 in `sweep/paris4_sweep.json`); without one, the default metric is the raw
 `ink/total_fg_pixels`. Final satisfaction metrics are logged as `final/*`
-and written to `satisfaction_summary.json` in each fit's run dir. Each seed
+and written to `satisfaction_summary.json` in each fit's run dir. Any held-out
+4x-coordinate fibers in `<dataset>/eval_fibers` are reported as
+`final/satisfied_eval_fiber_ratio` and
+`final/satisfied_eval_fiber_point_ratio`, with per-fiber details in
+`satisfied_<suffix>.json`; these fibers are never used by the fit. Each seed
 also gets an 8× downsampled image of its lasagna-flattened ink render,
 saved as `seed_<s>_ink_flat_8x.jpg` in the run dir and logged to the sweep
 run as `seed<s>/ink_render` (factor set by the spec's
