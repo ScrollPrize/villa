@@ -529,23 +529,35 @@ def save_overlay_and_print_satisfaction(
     satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
     )
+    # Flat scalar summary of every satisfaction metric printed below, returned
+    # to the caller so sweep/experiment runs can log it (e.g. to wandb).
+    summary = {}
     satisfied_count = satisfied_patches.sum().item()
     boundary_satisfied_count = boundary_satisfied_patches.sum().item()
     total_count = satisfied_patches.numel()
     satisfied_ratio = satisfied_count / max(total_count, 1)
     print(f'satisfied_patches = {satisfied_count}/{total_count} ({satisfied_ratio * 100:.1f}%)')
+    summary['satisfied_patches'] = satisfied_count
+    summary['total_patches'] = total_count
+    summary['satisfied_patch_ratio'] = satisfied_ratio
     # Same binary satisfied/not per patch, but weight the overall fraction by patch area
     # so a few large satisfied patches count more than many tiny ones.
     all_patches_area = float(total_areas.sum().item())
     satisfied_patches_area = float(total_areas[satisfied_patches].sum().item())
     area_weighted_satisfied_ratio = satisfied_patches_area / max(all_patches_area, 1e-9)
     print(f'satisfied_patches_area_weighted = {satisfied_patches_area:.1f}/{all_patches_area:.1f} ({area_weighted_satisfied_ratio * 100:.1f}%)')
+    summary['area_weighted_satisfied_patch_ratio'] = area_weighted_satisfied_ratio
     boundary_satisfied_ratio = boundary_satisfied_count / max(total_count, 1)
     print(f'boundary_satisfied_patches = {boundary_satisfied_count}/{total_count} ({boundary_satisfied_ratio * 100:.1f}%)')
+    summary['boundary_satisfied_patches'] = boundary_satisfied_count
+    summary['boundary_satisfied_patch_ratio'] = boundary_satisfied_ratio
     satisfied_area = float(satisfied_areas.sum().item())
     total_area = float(total_areas.sum().item())
     satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
     print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+    summary['satisfied_area'] = satisfied_area
+    summary['total_area'] = total_area
+    summary['satisfied_area_ratio'] = satisfied_area_ratio
     unattached_pcl_per_point_satisfied = []
     unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
     if unattached_pcl_strips:
@@ -561,10 +573,14 @@ def save_overlay_and_print_satisfaction(
         num_pcls = len(unattached_pcl_strips)
         fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
         print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
+        summary['satisfied_unattached_pcls'] = fully_satisfied_pcls
+        summary['total_unattached_pcls'] = num_pcls
+        summary['satisfied_unattached_pcl_ratio'] = fully_satisfied_ratio
         satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
         total_points = int(unattached_pcl_total_counts.sum().item())
         satisfied_point_ratio = satisfied_points / max(total_points, 1)
         print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
+        summary['satisfied_unattached_pcl_point_ratio'] = satisfied_point_ratio
     if tracks:
         # Free the patch/pcl eval tensors before the (much larger) track eval,
         # and chunk the track eval so the full track set does not have to be
@@ -586,10 +602,14 @@ def save_overlay_and_print_satisfaction(
             num_valid_tracks = int(track_total_counts.numel())
             fully_satisfied_track_ratio = fully_satisfied_tracks / max(num_valid_tracks, 1)
             print(f'satisfied_tracks = {fully_satisfied_tracks}/{num_valid_tracks} ({fully_satisfied_track_ratio * 100:.1f}%)')
+            summary['satisfied_tracks'] = fully_satisfied_tracks
+            summary['total_tracks'] = num_valid_tracks
+            summary['satisfied_track_ratio'] = fully_satisfied_track_ratio
             track_satisfied_points = int(track_satisfied_counts.sum().item())
             track_total_points = int(track_total_counts.sum().item())
             track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
             print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+            summary['satisfied_track_point_ratio'] = track_satisfied_point_ratio
         except torch.OutOfMemoryError:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -605,10 +625,15 @@ def save_overlay_and_print_satisfaction(
         u_total = u_satisfied.numel()
         u_ratio = u_count / max(u_total, 1)
         print(f'unverified_satisfied_patches = {u_count}/{u_total} ({u_ratio * 100:.1f}%)')
+        summary['unverified_satisfied_patches'] = u_count
+        summary['unverified_total_patches'] = u_total
+        summary['unverified_satisfied_patch_ratio'] = u_ratio
         u_sat_area = float(u_sat_areas.sum().item())
         u_tot_area = float(u_tot_areas.sum().item())
         u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
         print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
+        summary['unverified_satisfied_area'] = u_sat_area
+        summary['unverified_satisfied_area_ratio'] = u_area_ratio
         for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
             fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
             unverified_patch_satisfaction_entries.append({
@@ -712,3 +737,4 @@ def save_overlay_and_print_satisfaction(
             tracks=tracks,
             run_tag=run_tag, name=suffix, progress=progress,
         )
+    return summary

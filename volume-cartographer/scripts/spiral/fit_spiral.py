@@ -1104,7 +1104,8 @@ class FitContext:
         # Patch loading and ROI filtering
         # ==========================================================================
 
-        filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
+        use_tracks = bool(self.tracks_dbm_path) and not self.config['input_disable_tracks']
+        filter_tracks_by_shell = use_tracks and bool(self.shell_path)
         shell_patch = None
         if self.shell_losses_enabled() or filter_tracks_by_shell:
             if not self.shell_path:
@@ -1203,7 +1204,7 @@ class FitContext:
 
         progress.begin('loading', 'Loading fiber point collections')
         fiber_point_collections, next_id = load_fiber_point_collections(
-            self.fibers_path,
+            None if self.config['input_disable_fibers'] else self.fibers_path,
             next_id,
             min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
         )
@@ -1535,7 +1536,7 @@ class FitContext:
         track_reload_source = None
         track_reload_families = None
         track_reload_source_ids = None
-        if self.tracks_dbm_path is not None:
+        if use_tracks:
             progress.begin(
                 'loading', 'Resolving track store',
                 detail=os.path.basename(self.tracks_dbm_path))
@@ -1570,6 +1571,8 @@ class FitContext:
             print(f'loaded {len(tracks)} tracks within z-roi [{self.z_begin}, {self.z_end})')
         else:
             tracks = None
+            if self.config['input_disable_tracks']:
+                print('skipping all track loading')
 
         # ==========================================================================
         # patch cache / atlas construction
@@ -3825,7 +3828,7 @@ class FitContext:
                 quad_label_map = None
             progress.begin(
                 'finalizing', 'Computing satisfaction metrics and outputs')
-            save_overlay_and_print_satisfaction(
+            satisfaction_summary = save_overlay_and_print_satisfaction(
                 suffix,
                 spiral_and_transform=self.spiral_and_transform,
                 slice_to_spiral_transform=self.slice_to_spiral_transform,
@@ -3856,6 +3859,13 @@ class FitContext:
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
                 progress=progress,
             )
+            if satisfaction_summary:
+                # Also written as a file so multi-seed sweep runs can
+                # aggregate the final metrics across fits (sweep_run_wrapper).
+                with open(f'{self.out_path}/satisfaction_summary.json', 'w') as f:
+                    json.dump(satisfaction_summary, f, indent=2)
+                if wandb.run is not None:
+                    wandb.log({f'final/{k}': v for k, v in satisfaction_summary.items()})
             progress.finish()
             progress.clear()
 
@@ -3949,8 +3959,7 @@ if __name__ == '__main__':
             'sample_count_dense_normal_points',
             'sample_count_dense_spacing_pairs',
             'sample_count_dense_spacing_density_extra_pairs',
-            'sample_count_winding_model_relative_pairs',
-            'sample_count_winding_model_density_pairs',
+            'sample_count_winding_model_pairs',
             'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',
@@ -3975,7 +3984,8 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        wandb.init(project=os.environ.get('WANDB_PROJECT', 'scrolls'),
+                   config=config, mode=wandb_mode)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.
         main(

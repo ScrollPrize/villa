@@ -17,13 +17,14 @@ its on-disk identity (the input path, the `winding_inference_crossings`
 artifact type, and the checkpoint fingerprint field). The store is
 checksum-verified and copied to each fitting GPU at startup; rays whose
 crossings cannot intersect the configured z-range are excluded from sampling,
-and optimisation then does no inference-store filesystem I/O. The default
-24,000 samples per step are split evenly between long relative-winding pairs
-(`sample_count_winding_model_relative_pairs`, index separation drawn from
-`winding_model_relative_pair_delta`) and adjacent-passage density pairs
-(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
-neither loaded nor required, while the independent Lasagna normal and native
-minimum-spacing losses remain available.
+and optimisation then does no inference-store filesystem I/O. The shared
+`sample_count_winding_model_pairs` default of 12,000 is a per-component
+budget: when both losses are enabled, each step samples 12,000 long
+relative-winding pairs (with index separation drawn from
+`winding_model_relative_pair_delta`) and 12,000 adjacent-passage density
+pairs, for 24,000 pairs total. In this mode surf-SDT is neither loaded nor
+required, while the independent Lasagna normal and native minimum-spacing
+losses remain available.
 
 The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
@@ -33,6 +34,72 @@ For a headless fit, pass the dataset root with `--dataset` and select inference
 mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
 declarative input catalog determine which conventional inputs are resolved.
+
+## wandb sweeps
+
+`sweep/sweep_fit_spiral.py` runs wandb hyperparameter sweeps over `fit_spiral.py`.
+Any `Config` key can be swept (loss weights, `dense_spacing_mode`, sample
+counts, …); a loss family is disabled by sweeping its `loss_weight_*` key
+with `0.0` among the values. Every sweep-assigned config runs the full
+fit → lasagna flatten (`render_ink.py`) → ink scoring (`get_ink_metrics.py`)
+chain once per seed in the spec's `"seeds"` list (default `[1, 2, 3]`) before
+the agent takes the next config. Each seed fit logs to its own wandb run
+(id `<sweep_run_id>-seed<s>`, grouped per config) so per-iteration loss
+curves stay separate; the agent-created sweep run receives the per-seed
+metrics, their across-seed mean/std, and the seed run ids, and the sweep
+optimizes the across-seed mean. The spec's `"objective"` section defines a
+weighted linear combination of `final/*` and `ink/*` metrics logged as
+`objective` (e.g. `ink/overall_column_score` + `final/satisfied_patch_ratio`
+in `sweep/paris4_sweep.json`); without one, the default metric is the raw
+`ink/total_fg_pixels`. Final satisfaction metrics are logged as `final/*`
+and written to `satisfaction_summary.json` in each fit's run dir. Each seed
+also gets an 8× downsampled image of its lasagna-flattened ink render,
+saved as `seed_<s>_ink_flat_8x.jpg` in the run dir and logged to the sweep
+run as `seed<s>/ink_render` (factor set by the spec's
+`eval.ink_preview_downsample`).
+
+```sh
+# The full default Config as JSON (the base a sweep builds on; pass an
+# edited copy back with --base-config):
+python sweep/sweep_fit_spiral.py dump-config --out sweep/sweep_base_config.json
+
+# Register a sweep from a spec (see sweep/paris4_sweep.json)
+# and run it: 8 available GPUs, 2 GPUs per run => 4 concurrent agents, each
+# pinned via CUDA_VISIBLE_DEVICES and running one torchrun fit at a time.
+python sweep/sweep_fit_spiral.py run \
+    --spec sweep/paris4_sweep.json \
+    --dataset /path/to/spiral_dataset \
+    --gpus 0,1,2,3,4,5,6,7 --gpus-per-run 2
+```
+
+wandb sweeps have no native conditional parameters, so the runner supports
+*group parameters*: a parameter whose name is not a Config key and whose
+values are dicts of Config-key → value enumerates branches (e.g. a
+`dense_spacing_mode` together with the knobs that only matter in that mode),
+and the grid crosses branches instead of the inert full product — see the
+`"spacing"` parameter in `sweep/paris4_sweep.json`. The wrapper flattens the
+chosen branch into the run's config.
+
+A grid spec may also list `"extra_configs"`: single additional configs (each
+a dict of Config keys applied on top of `fixed`, i.e. baseline + one
+modification; `{}` is the plain baseline) that join the sweep without being
+crossed with the swept parameters. Since wandb grids can only cross,
+`create` then pre-expands the whole cross-product itself and registers all
+configs (crossed + extras) explicitly as one composite `run_config`
+parameter. A spec may even omit `"parameters"` entirely and consist only of
+`"extra_configs"` — a pure pick-and-choose enumeration: exactly the listed
+configs run, nothing is crossed.
+
+`create` and `launch` are also available separately (e.g. to add agents on
+another machine with `launch --sweep-id <id> --gpus …`). Each run stores its
+fully-resolved config at `<out-root>/<sweep_id>/<run_id>/config.json` (and
+per seed at `seed_<s>/config.json`). The spec's `"eval"` section sets the
+ink volume zarr, the `vc_render_tifxyz` binary, and the interpreter used for
+`get_ink_metrics.py` (which needs nnunetv2/huggingface_hub — by default the
+vesuvius venv). Spec parameter names and values are validated against the
+Config schema before the sweep is registered; `--dry-run` prints the exact
+sweep definition. `sweep/sweep_run_wrapper.py` is the per-run entry the agents
+execute — it can also be run standalone for smoke tests (see its docstring).
 
 ## Flattening a fitted checkpoint
 

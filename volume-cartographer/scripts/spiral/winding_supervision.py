@@ -279,9 +279,10 @@ def get_winding_inference_losses(
     generator=None,
 ):
     """Sample both inference components and evaluate one shared transform."""
-    relative_count = (int(cfg["sample_count_winding_model_relative_pairs"])
+    pair_count = int(cfg["sample_count_winding_model_pairs"])
+    relative_count = (pair_count
                       if cfg["loss_weight_dense_spacing"] > 0 else 0)
-    density_count = (int(cfg["sample_count_winding_model_density_pairs"])
+    density_count = (pair_count
                      if cfg["loss_weight_dense_spacing_density"] > 0 else 0)
     pair_delta = cfg["winding_model_relative_pair_delta"]
     relative = store.sample_relative(

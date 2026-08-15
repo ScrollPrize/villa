@@ -27,6 +27,22 @@ def test_catalog_is_complete_and_presets_are_resolved():
         assert set(preset) == set(catalog["defaults"])
 
 
+def test_winding_model_has_one_shared_pair_count():
+    defaults = Config.catalog()["defaults"]
+    assert defaults["sample_count_winding_model_pairs"] == 12000
+    assert "sample_count_winding_model_relative_pairs" not in defaults
+    assert "sample_count_winding_model_density_pairs" not in defaults
+
+
+def test_track_input_can_be_disabled_without_rewriting_loss_weights():
+    defaults = Config.catalog()["defaults"]
+    assert defaults["input_disable_tracks"] is False
+    disabled = Config({"input_disable_tracks": True}).as_dict()
+    assert disabled["input_disable_tracks"] is True
+    assert disabled["loss_weight_track_radius"] == defaults["loss_weight_track_radius"]
+    assert disabled["loss_weight_track_dt"] == defaults["loss_weight_track_dt"]
+
+
 def test_every_key_has_generated_metadata():
     catalog = Config.catalog()
     required = {"type", "nullable", "label", "runtime_impact"}

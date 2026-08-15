@@ -1,0 +1,77 @@
+{
+  "name": "paris4-sweep",
+  "method": "grid",
+  "metric": {"name": "objective", "goal": "maximize"},
+  "objective": {
+    "ink/overall_column_score": 1.0,
+    "final/satisfied_patch_ratio": 1.0
+  },
+  "seeds": [1, 2, 3],
+  "fixed": {
+    "z_begin": 8500,
+    "z_end": 14500,
+    "optimizer_num_training_steps": 30000
+  },
+  "parameters": {
+    "patch_uuid_filter_regex": {
+      "values": ["band-seed", "^(?!.*band-seed).*$"]
+    },
+    "dense_spacing_mode": {
+      "value": "winding_model"
+    },
+    "loss_weight_dense_spacing": {
+      "values": [12.0, 24.0, 36.0]
+    },
+    "patch_sampling_area_exponent": {
+      "values": [0.25, 0.75]
+    },
+    "sample_count_winding_model_pairs": {
+      "values": [48000, 96000]
+    },
+    "pcl_stratified_pcl_sampling": {
+      "values": [true, false]
+    },
+    "input_disable_tracks": {
+      "values": [false, true]
+    },
+    "fiber_usage": {
+      "values": [
+        {
+          "input_disable_fibers": false,
+          "pcl_use_fiber_links": true
+        },
+        {
+          "input_disable_fibers": false,
+          "pcl_use_fiber_links": false
+        },
+        {
+          "input_disable_fibers": true,
+          "pcl_use_fiber_links": false
+        }
+      ]
+    }
+  },
+  "extra_configs": [
+    {},
+    {
+      "dense_spacing_mode": "winding_model",
+      "pcl_stratified_pcl_sampling": true,
+      "patch_strip_sampling": "dijkstra",
+      "patch_2d_sampling_max_area": 542534.0,
+      "loss_weight_dense_spacing": 16.0,
+      "sample_count_winding_model_pairs": 48000,
+      "winding_model_relative_pair_delta": [3, 24],
+      "loss_weight_dense_spacing_density": 16.0
+    },
+    {
+      "patch_strip_sampling": "dijkstra"
+    }
+  ],
+  "eval": {
+    "ink_volume": "/ephemeral/paul/s1_ink_ds2.zarr/",
+    "vc_render_bin": "/ephemeral/sean/villa/volume-cartographer/build/bin/vc_render_tifxyz",
+    "ink_python": "/ephemeral/sean/villa/vesuvius/.venv/bin/python",
+    "render_procs": 6,
+    "flatboi_threads": 8
+  }
+}

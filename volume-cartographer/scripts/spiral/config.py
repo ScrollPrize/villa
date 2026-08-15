@@ -63,8 +63,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_regularisation_points",
     "sample_count_dense_spacing_pairs",
     "sample_count_dense_spacing_density_extra_pairs",
-    "sample_count_winding_model_relative_pairs",
-    "sample_count_winding_model_density_pairs",
+    "sample_count_winding_model_pairs",
     "sample_count_minimum_spacing_independent_samples",
     "sample_count_dense_attachment_points",
     "sample_count_shell_samples",
@@ -271,8 +270,9 @@ class Config:
         self.sample_count_dense_spacing_count_extra_pairs = 0
         self.sample_count_dense_spacing_density_extra_pairs = 24000
         self.sample_count_dense_spacing_density_chunk_pairs = 24000
-        self.sample_count_winding_model_relative_pairs = 12000
-        self.sample_count_winding_model_density_pairs = 12000
+        # Shared per-component budget: when both winding-model losses are
+        # enabled, each independently samples this many pairs.
+        self.sample_count_winding_model_pairs = 12000
         self.sample_count_minimum_spacing_independent_samples = 2000
         self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
@@ -299,6 +299,13 @@ class Config:
         # When set, only patch directory entries (uuid-named) whose name
         # matches this regex (re.search) are loaded; None loads everything.
         self.patch_uuid_filter_regex = None
+        # Skip loading the conventional fiber point collections (and with
+        # them their cross-fiber links) even when the dataset provides them.
+        self.input_disable_fibers = False
+        # Skip loading the conventional track store even when the dataset
+        # provides one. This disables both track loss families without
+        # rewriting their configured weights.
+        self.input_disable_tracks = False
         self.patch_unverified_patch_radius_loss_margin = 0.025
         self.patch_unverified_patch_radius_loss_inv = False
         self.patch_unverified_patch_radius_within_norm_p = 3.0
