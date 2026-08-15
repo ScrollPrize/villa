@@ -7,6 +7,7 @@
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
+#include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -14,6 +15,7 @@
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -130,6 +132,18 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         }
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
+    }
+    // The winding minimap docks below the flattened viewer's graphics view,
+    // inside the same pane; the viewer widget's layout only holds the view.
+    if (auto* flattenedWidget =
+            qobject_cast<QWidget*>(_flattenedViewer->asQObject());
+        flattenedWidget && flattenedWidget->layout()) {
+        _windingMinimap = new SpiralMinimap(flattenedWidget);
+        flattenedWidget->layout()->addWidget(_windingMinimap);
+        connect(_windingMinimap, &SpiralMinimap::columnClicked, this,
+                [this](float column) { panFlattenedViewerToColumn(column); });
+        _flattenedViewer->connectOverlaysUpdated(
+            this, [this]() { updateMinimapViewIndicator(); });
     }
     _grid->setPaneHidden(2, true);
     QSettings settings;
@@ -1525,6 +1539,72 @@ traceWindingTransitions(const cv::Mat_<int32_t>& windings,
 
 } // namespace
 
+void SpiralWorkspace::updateWindingMinimap()
+{
+    if (!_windingMinimap) return;
+    const auto selection = displayedPreviewSelection();
+    if (!selection || !_currentPreview) {
+        _windingMinimap->clearBands();
+        return;
+    }
+    const cv::Rect region = selection->region;
+    std::vector<SpiralMinimap::Band> bands;
+    for (const PreviewComponent& component : _previewComponents) {
+        if (component.winding < selection->minimumWinding
+            || (selection->maximumWinding >= 0
+                && component.winding > selection->maximumWinding))
+            continue;
+        bands.push_back({component.winding,
+                         static_cast<float>(component.columnBegin - region.x),
+                         static_cast<float>(component.columnEnd - region.x)});
+    }
+    _windingMinimap->setBands(std::move(bands), 0.0f,
+                              static_cast<float>(region.width));
+    updateMinimapViewIndicator();
+}
+
+void SpiralWorkspace::updateMinimapViewIndicator()
+{
+    if (!_windingMinimap || !_windingMinimap->isVisible()) return;
+    if (!_currentPreview || !_flattenedViewer
+        || _flattenedViewer->currentSurface() != _currentPreview.get()) {
+        _windingMinimap->setViewIndicator(0.0f, -1.0f);
+        return;
+    }
+    auto* view = _flattenedViewer->graphicsView();
+    if (!view || !view->viewport()) return;
+    const QRect viewport = view->viewport()->rect();
+    const cv::Vec2f scale = _currentPreview->scale();
+    const cv::Vec3f center = _currentPreview->center();
+    const auto columnAt = [&](const QPoint& viewportPoint) {
+        const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(
+            view->mapToScene(viewportPoint));
+        return (surface[0] + center[0]) * scale[0];
+    };
+    _windingMinimap->setViewIndicator(
+        columnAt(QPoint(viewport.left(), viewport.center().y())),
+        columnAt(QPoint(viewport.right(), viewport.center().y())));
+}
+
+void SpiralWorkspace::panFlattenedViewerToColumn(float column)
+{
+    if (!_currentPreview || !_flattenedViewer
+        || _flattenedViewer->currentSurface() != _currentPreview.get())
+        return;
+    const cv::Vec2f scale = _currentPreview->scale();
+    const cv::Vec3f center = _currentPreview->center();
+    if (std::abs(scale[0]) < 1e-6f) return;
+    // Pan horizontally only: keep the viewer's current vertical position,
+    // read back through the inverse of the same mapping the minimap uses.
+    auto* view = _flattenedViewer->graphicsView();
+    if (!view || !view->viewport()) return;
+    const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
+        view->mapToScene(view->viewport()->rect().center()));
+    const float surfaceX = column / scale[0] - center[0];
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
+                                           true);
+}
+
 void SpiralWorkspace::updateWindingTransitionOverlay()
 {
     const auto selection = displayedPreviewSelection();
@@ -1591,6 +1671,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         if (_outputVisible) _state->setSurface("segmentation", nullptr);
         const QString previousRegistration = _currentPreviewRegistrationId;
         _currentPreview.reset();
+        if (_windingMinimap) _windingMinimap->clearBands();
         _brush->setPaintSurface({});
         _currentPreviewRegistrationId.clear();
         updateSurfaceIntersections();
@@ -1702,6 +1783,7 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
         updateRunDiffOverlay();
     updateLossMapOverlay();
     updateWindingTransitionOverlay();
+    updateWindingMinimap();
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();

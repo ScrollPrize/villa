@@ -33,6 +33,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class Volume;
 class SpiralOverlayController;
+class SpiralMinimap;
 class SpiralBrushController;
 class SegmentationOverlayController;
 class VolumeViewerBase;
@@ -132,6 +133,9 @@ private:
     void updateRunDiffOverlay();
     void updateLossMapOverlay();
     void updateWindingTransitionOverlay();
+    void updateWindingMinimap();
+    void updateMinimapViewIndicator();
+    void panFlattenedViewerToColumn(float column);
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
@@ -166,6 +170,7 @@ private:
     QDialog* _pythonOutputDialog = nullptr;
     ViewerSplitGrid* _grid = nullptr;
     VolumeViewerBase* _flattenedViewer = nullptr;
+    SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
     QHash<QString, QStringList> _surfaceCategoryIds;
