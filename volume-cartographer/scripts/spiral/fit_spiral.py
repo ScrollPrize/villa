@@ -880,7 +880,7 @@ class FitContext:
                   f'{len(filtered)}/{len(entries)} {label} entries')
             entries = filtered
         progress.begin(
-            'loading', f'Loading {label}',
+            'loading', f'Loading and filtering {label}',
             step=0, total_steps=len(entries), unit='patches')
 
         # TIFF decoding and the initial NumPy/Torch conversions release the
@@ -895,10 +895,24 @@ class FitContext:
         def load_entry(entry):
             segment_path = os.path.join(path, entry)
             try:
-                return load_tifxyz(
-                    segment_path, z_range=(self.z_begin, self.z_end)), None
+                patch = load_tifxyz(
+                    segment_path, z_range=(self.z_begin, self.z_end))
+                if patch is None:
+                    return None, None, 'z ROI prefilter'
+                cells_to_erode = patch.erosion_cells(
+                    self.config['patch_erode_patches'])
+                if (cells_to_erode > 0
+                        and not erode_patch_valid_region(patch, cells_to_erode)):
+                    return None, None, 'erosion'
+                # Erosion may remove the only in-range fringe while leaving
+                # valid quads elsewhere on the patch.
+                if not patch_intersects_z_roi(
+                        patch, self.z_begin, self.z_end):
+                    return None, None, 'z ROI after erosion'
+                patch.release_derived_caches()
+                return patch, None, None
             except Exception as e:
-                return None, e
+                return None, e, None
 
         results = [None] * len(entries)
         completed = 0
@@ -929,16 +943,28 @@ class FitContext:
 
         patches = {}
         roi_skipped = 0
-        for entry, (patch, error) in zip(entries, results):
+        roi_dropped_after_erosion = 0
+        erosion_dropped = 0
+        for entry, (patch, error, dropped_reason) in zip(entries, results):
             if error is not None:
                 print(f'Failed to load segment {entry}: {error}')
-            elif patch is None:
+            elif dropped_reason == 'z ROI prefilter':
                 roi_skipped += 1
+            elif dropped_reason == 'z ROI after erosion':
+                roi_dropped_after_erosion += 1
+            elif dropped_reason == 'erosion':
+                erosion_dropped += 1
             else:
                 patches[entry] = patch
         if roi_skipped:
             print(f'z ROI prefilter skipped {roi_skipped}/{len(entries)} '
                   f'{label} entries before full TIFF decode')
+        if erosion_dropped:
+            print(f'erosion removed {erosion_dropped}/{len(entries)} '
+                  f'{label} entries')
+        if roi_dropped_after_erosion:
+            print(f'erosion moved {roi_dropped_after_erosion}/{len(entries)} '
+                  f'{label} entries outside the z ROI')
         return patches
 
     def _prepare_patch_sampling_cache(self, patches):
@@ -1187,40 +1213,6 @@ class FitContext:
 
         print(f" loaded {len(verified_patches)} patches")
         print(f" loaded {len(unverified_patches)} unverified patches")
-
-        patch_filter_total = len(verified_patches) + len(unverified_patches)
-        progress.begin(
-            'loading', 'Filtering patches to fit region',
-            step=0, total_steps=patch_filter_total, unit='patches')
-        filtered_count = 0
-        for patches in (verified_patches, unverified_patches):
-            for patch_id, patch in list(patches.items()):
-                try:
-                    # Reject by z before erosion. Erosion can only remove valid
-                    # vertices, so it cannot make an out-of-range patch relevant.
-                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                        del patches[patch_id]
-                        continue
-                    # we erode cells this distance from any invalid cell to catch annotation errors
-                    # which are hard to detect at the edges of patches
-                    cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
-                    if cells_to_erode > 0:
-                        if not erode_patch_valid_region(patch, cells_to_erode):
-                            del patches[patch_id]
-                            continue
-
-                    # Erosion may remove the only in-range fringe while
-                    # leaving valid quads elsewhere on the patch.
-                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                        del patches[patch_id]
-                        continue
-
-                    # Training retains the base grid and masks; discard any
-                    # derived views rebuilt by erosion.
-                    patch.release_derived_caches()
-                finally:
-                    filtered_count += 1
-                    progress.update(filtered_count)
 
         # ==========================================================================
         # Point collection loading
@@ -2749,16 +2741,6 @@ class FitContext:
         if not self.unverified_patches_path:
             return {}, [], None, None
         candidates = self._load_patches_from_dir(self.unverified_patches_path)
-        for patch_id, patch in list(candidates.items()):
-            cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
-            if (cells_to_erode > 0
-                    and not erode_patch_valid_region(patch, cells_to_erode)):
-                del candidates[patch_id]
-                continue
-            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                del candidates[patch_id]
-                continue
-            patch.release_derived_caches()
         candidates, n_masked, n_dropped = \
             _mask_unverified_patches_near_trusted_geometry(
                 candidates, self.trusted_geometry_tree, exclusion_radius)

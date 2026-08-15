@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
+import torch
 
 from spiral_helpers import (
     _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX,
@@ -140,6 +142,72 @@ class TifxyzMetadataTests(unittest.TestCase):
             self.assertIsNotNone(patch)
             self.assertTrue(patch_intersects_z_roi(patch, 0, 10))
             self.assertIsNone(patch._valid_zyxs)
+
+
+class FitPatchLoadingTests(unittest.TestCase):
+    def test_parallel_completion_keeps_sorted_patch_order(self):
+        # Import here so the lightweight helper tests above do not all pay the
+        # fit driver's import cost.
+        import fit_spiral
+        from tifxyz import Patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("c", "a", "b"):
+                (root / name).mkdir()
+
+            context = fit_spiral.FitContext.__new__(fit_spiral.FitContext)
+            context.progress = None
+            context.config = {
+                "z_begin": 0,
+                "z_end": 10,
+                "patch_uuid_filter_regex": None,
+                "patch_erode_patches": 0,
+            }
+
+            def fake_load(path, *, z_range):
+                self.assertEqual(z_range, (0, 10))
+                value = float(ord(Path(path).name) - ord("a") + 1)
+                zyxs = torch.full((2, 2, 3), value)
+                return Patch(zyxs, torch.ones(2), None, None)
+
+            with mock.patch.object(fit_spiral, "load_tifxyz", fake_load), \
+                    mock.patch.dict(
+                        "os.environ", {"FIT_SPIRAL_PATCH_LOAD_WORKERS": "3"}):
+                loaded = context._load_patches_from_dir(root)
+
+            self.assertEqual(list(loaded), ["a", "b", "c"])
+
+    def test_directory_loader_drops_prefiltered_patches(self):
+        import fit_spiral
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("keep", "outside"):
+                (root / name).mkdir()
+
+            context = fit_spiral.FitContext.__new__(fit_spiral.FitContext)
+            context.progress = None
+            context.config = {
+                "z_begin": 0,
+                "z_end": 10,
+                "patch_uuid_filter_regex": None,
+                "patch_erode_patches": 0,
+            }
+
+            def fake_load(path, *, z_range):
+                if Path(path).name == "outside":
+                    return None
+                from tifxyz import Patch
+                return Patch(
+                    torch.ones((2, 2, 3)), torch.ones(2), None, None)
+
+            with mock.patch.object(fit_spiral, "load_tifxyz", fake_load), \
+                    mock.patch.dict(
+                        "os.environ", {"FIT_SPIRAL_PATCH_LOAD_WORKERS": "2"}):
+                loaded = context._load_patches_from_dir(root)
+
+            self.assertEqual(list(loaded), ["keep"])
 
 
 class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
