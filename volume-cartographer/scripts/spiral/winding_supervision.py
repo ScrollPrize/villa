@@ -123,8 +123,11 @@ class WindingInferenceStore:
         self.step = torch.from_numpy(step_np).to(device)
         self.offset = torch.from_numpy(offset_np).to(device)
         self.crossing_t = torch.from_numpy(t_np).to(device)
-        self.crossing_level = torch.from_numpy(level_np.astype(
-            np.int32, copy=False)).to(device)
+        # Levels stay in their stored int16 encoding on the device; they are
+        # widened per gathered sample in _materialize, so the widened copy is
+        # pair-count sized instead of crossing-count sized.
+        self.crossing_level = torch.from_numpy(
+            np.ascontiguousarray(level_np)).to(device)
         self.length = self.offset[1:] - self.offset[:-1]
         # A pair is valid only when both crossings land in [z_begin, z_end).
         # Crossings are stored in ascending t and z is linear in t, so a ray
@@ -138,12 +141,40 @@ class WindingInferenceStore:
             last_z = (self.origin[:, 0]
                       + self.crossing_t[(self.offset[1:] - 1).clamp(min=0)]
                       * self.step[:, 0])
-            self._z_eligible = (
+            z_eligible = (
                 (torch.maximum(first_z, last_z) >= z_begin)
                 & (torch.minimum(first_z, last_z) < z_end))
         else:
-            self._z_eligible = torch.ones(
+            z_eligible = torch.ones(
                 len(self.length), dtype=torch.bool, device=device)
+        self._num_z_eligible_rays = int(z_eligible.sum().item())
+        # Rays the samplers can never draw (outside the z slab, or fewer than
+        # two crossings so neither an adjacent nor a relative pair exists) are
+        # dropped entirely, with their crossings. Both samplers draw from
+        # eligibility subsets of the kept rays, in the same order as before,
+        # so the sampled pairs (and the RNG stream) are unchanged; only the
+        # resident tensors shrink.
+        keep = z_eligible & (self.length >= 2)
+        kept = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        if len(kept) < len(self.length):
+            counts = self.length[kept]
+            new_offset = torch.zeros(
+                len(kept) + 1, dtype=torch.int64, device=device)
+            torch.cumsum(counts, dim=0, out=new_offset[1:])
+            row_id = torch.repeat_interleave(
+                torch.arange(len(kept), device=device), counts)
+            local = (torch.arange(int(new_offset[-1]), device=device)
+                     - new_offset[:-1][row_id])
+            source = self.offset[kept][row_id] + local
+            self.crossing_t = self.crossing_t[source]
+            self.crossing_level = self.crossing_level[source]
+            self.origin = self.origin[kept].contiguous()
+            self.step = self.step[kept].contiguous()
+            self.offset = new_offset
+            self.length = counts
+            z_eligible = torch.ones(
+                len(kept), dtype=torch.bool, device=device)
+        self._z_eligible = z_eligible
         self.density_rays = torch.nonzero(
             (self.length >= 2) & self._z_eligible,
             as_tuple=False).squeeze(-1)
@@ -163,7 +194,7 @@ class WindingInferenceStore:
 
     @property
     def num_z_eligible_rays(self):
-        return int(self._z_eligible.sum().item())
+        return self._num_z_eligible_rays
 
     def _choose(self, values, count, *, generator=None):
         count = int(count)
@@ -221,7 +252,10 @@ class WindingInferenceStore:
         flat = torch.stack([first_flat, second_flat], dim=-1)
         t = self.crossing_t[flat]
         points = self.origin[ray, None, :] + t[..., None] * self.step[ray, None, :]
-        levels = self.crossing_level[flat]
+        # Widen the gathered int16 levels before the subtraction; the values
+        # (winding indices) are far inside int16 range, so the difference is
+        # identical to the previous store-wide int32 path.
+        levels = self.crossing_level[flat].to(torch.int32)
         return {
             "points": points,
             "target": (levels[:, 1] - levels[:, 0]).to(torch.float32),

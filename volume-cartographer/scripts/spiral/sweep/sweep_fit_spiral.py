@@ -325,7 +325,20 @@ def spawn_agent(slot, sweep_id, args, env_base):
         cmd += ['--count', str(args.runs_per_agent)]
     cmd.append(sweep_id)
     print(f'[launch] agent on GPUs {",".join(slot)}: {" ".join(cmd)}', flush=True)
-    return subprocess.Popen(cmd, env=env)
+    # Own session: the agent and every descendant (run wrapper, torchrun, fit,
+    # eval chain) share one process group, so retiring the slot can kill the
+    # whole tree. Killing only the agent leaves ~10 GiB orphaned fits holding
+    # the slot's GPUs, and successive relaunches stack them until CUDA OOM.
+    return subprocess.Popen(cmd, env=env, start_new_session=True)
+
+
+def kill_agent_tree(agent, signum=signal.SIGTERM):
+    """Signal the agent's whole process group; returns False if already gone."""
+    try:
+        os.killpg(agent['proc'].pid, signum)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 def cmd_launch(args, sweep_id=None):
@@ -355,23 +368,28 @@ def cmd_launch(args, sweep_id=None):
                     print(f'[launch] agent on GPUs {",".join(agent["slot"])} exited '
                           f'with {code}; restart {agent["restarts"]}/'
                           f'{args.max_agent_restarts}', flush=True)
+                    # A crashed agent can leave its run wrapper / fit alive;
+                    # reap them before a new agent claims the same GPUs.
+                    kill_agent_tree(agent)
                     time.sleep(10)
+                    kill_agent_tree(agent, signal.SIGKILL)
                     agent['proc'] = spawn_agent(agent['slot'], sweep_id, args, env_base)
                 else:
                     print(f'[launch] agent on GPUs {",".join(agent["slot"])} exited '
                           f'with {code}; restart budget exhausted, retiring slot',
                           flush=True)
+                    kill_agent_tree(agent)
                     del agents[i]
     except KeyboardInterrupt:
         print('[launch] interrupted; stopping agents', flush=True)
         for agent in agents.values():
-            agent['proc'].send_signal(signal.SIGINT)
+            kill_agent_tree(agent, signal.SIGINT)
         deadline = time.time() + 60
         for agent in agents.values():
             try:
                 agent['proc'].wait(timeout=max(1, deadline - time.time()))
             except subprocess.TimeoutExpired:
-                agent['proc'].kill()
+                kill_agent_tree(agent, signal.SIGKILL)
         raise SystemExit(130)
     print('[launch] all agents done', flush=True)
 
