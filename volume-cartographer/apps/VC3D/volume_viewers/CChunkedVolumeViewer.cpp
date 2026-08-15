@@ -2339,13 +2339,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (ctx.surfaceCache) {
             ctx.surfaceCache->requestView(
                 ctx.startLevel, prepassUMin, prepassVMin, double(ctx.scale),
-                ctx.fbW, ctx.fbH, ctx.renderJob.chunkRequest);
+                ctx.fbW, ctx.fbH);
         }
         if (overlayActive && ctx.overlaySurfaceCache) {
             ctx.overlaySurfaceCache->requestView(
                 ctx.overlayStartLevel, prepassUMin, prepassVMin,
-                double(ctx.scale), ctx.fbW, ctx.fbH,
-                ctx.renderJob.chunkRequest);
+                double(ctx.scale), ctx.fbW, ctx.fbH);
         }
     }
     phasePrepassMs = prepassTimer.elapsed();

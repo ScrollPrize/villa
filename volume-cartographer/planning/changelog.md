@@ -2,6 +2,9 @@
 
 ## 2026-08-15
 
+- Restored view-independent background ownership for exact SurfaceCache tile
+  dependencies so frame-demand replacement cannot publish false incomplete
+  tiles by cancelling a fill's normal-band chunks.
 - Corrected remote bandwidth and adaptive admission to measure received HTTP
   payload bytes from request issue through completion, including connection and
   TTFB latency. Removed the obsolete four-completions-per-worker fallback and

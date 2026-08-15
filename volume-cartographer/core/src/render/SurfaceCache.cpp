@@ -720,8 +720,7 @@ struct SurfaceCache::State {
 
     static void runFill(const std::shared_ptr<State>& self,
                         TileKey key,
-                        std::uint64_t epoch,
-                        ChunkRequestContext request);
+                        std::uint64_t epoch);
     static void notifyTileReady(const std::shared_ptr<State>& self);
     static SampleStats sampleReduced(const State& self,
                                      int startLevel,
@@ -957,8 +956,7 @@ void SurfaceCache::State::notifyTileReady(const std::shared_ptr<State>& self)
 
 void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                                   TileKey key,
-                                  std::uint64_t epoch,
-                                  ChunkRequestContext request)
+                                  std::uint64_t epoch)
 {
 #if defined(_OPENMP)
     // QuadSurface::gen() has OpenMP loops, but runFill is already parallel at
@@ -1064,8 +1062,10 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         }
 
         if (!dependencies.keys.empty()) {
+            // A tile fill owns its exact normal-band dependencies independently
+            // of any sparse viewer snapshot that caused the fill to be admitted.
             self->volume->prefetchChunks(
-                dependencies.keys, /*wait=*/true, /*priorityOffset=*/0, request);
+                dependencies.keys, /*wait=*/true, /*priorityOffset=*/0);
         }
         if (!stillCurrent())
             return false;
@@ -1316,8 +1316,7 @@ void SurfaceCache::requestView(int startLevel,
                                double vMin,
                                double scale,
                                int fbW,
-                               int fbH,
-                               ChunkRequestContext request)
+                               int fbH)
 {
     if (!_state->volume || !_state->surface || fbW <= 0 || fbH <= 0 || !(scale > 0.0))
         return;
@@ -1405,8 +1404,8 @@ void SurfaceCache::requestView(int startLevel,
         auto state = _state;
         const TileKey key = candidate.key;
         surfaceFillPool().enqueue(
-            [state, key, epoch, request]() {
-                State::runFill(state, key, epoch, request);
+            [state, key, epoch]() {
+                State::runFill(state, key, epoch);
             });
     }
 }

@@ -82,8 +82,10 @@
 - Regular chunk work has separate interactive and background pending lanes.
   Existing context-free `IChunkedArray` calls are background work. VC3D render
   requests carry a stable numeric view ID and a monotonically increasing view
-  version through direct misses, prefetches, and asynchronous `SurfaceCache`
-  fills.
+  version through direct misses and sparse frame demand. Exact dependencies
+  admitted by asynchronous `SurfaceCache` tile fills are context-free
+  background work: they remain owned until resolved and are not cancelled when
+  a viewer replaces its frame snapshot.
 - Before an accepted interactive render samples the volume, it probes the
   viewport on a deterministic stratified 8-pixel grid. Each probe records the
   2-D viewport occurrence of every required requested-level and permitted

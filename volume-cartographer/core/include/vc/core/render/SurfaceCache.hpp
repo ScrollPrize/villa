@@ -162,8 +162,7 @@ public:
                      double vMin,
                      double scale,
                      int fbW,
-                     int fbH,
-                     ChunkRequestContext request = {});
+                     int fbH);
 
     TileReadyCallbackId addTileReadyListener(std::function<void()> callback);
     void removeTileReadyListener(TileReadyCallbackId id);

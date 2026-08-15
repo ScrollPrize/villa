@@ -266,6 +266,12 @@ probe and pixel sampling. Fully SurfaceCache-backed rendering probes the shared
 tiles. This keeps the probe from introducing a competing surface-coordinate
 cache.
 
+Exact chunk dependencies for a derived SurfaceCache image tile, including its
+normal band, are background-owned by the fill rather than by the viewer frame
+that admitted it. Replacing sparse per-view demand therefore cannot cancel a
+blocking tile fill. A view change may make the completed tile stale, but the
+SurfaceCache epoch and visible-tile checks prevent stale publication.
+
 `SurfaceCache` level keys name the selected source Zarr level. Its surface-grid
 sampling stride is derived cache detail, not an independently selected surface
 LOD.

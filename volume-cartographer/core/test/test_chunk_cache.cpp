@@ -2556,6 +2556,42 @@ TEST_CASE("ChunkCache preserves pending work owned by another view or background
         {0, 0, 0, 0}, {0, 0, 0, 2}});
 }
 
+TEST_CASE("ChunkCache view replacement preserves context-free prefetch")
+{
+    auto fetcher = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 16}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    auto cache = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, options, serviceOptions(1024 * 1024, 1));
+
+    (void)cache->tryGetChunk(0, 0, 0, 0); // running background blocker
+    fetcher->waitFirstStarted();
+    cache->replaceViewDemand({86, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 1}, {0.0f, 0.0f}},
+    });
+    cache->prefetchChunks(
+        std::vector<ChunkKey>{{0, 0, 0, 1}},
+        /*wait=*/false, /*priorityOffset=*/0);
+    cache->replaceViewDemand({86, 2}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 2}, {0.0f, 0.0f}},
+    });
+
+    // Replacing view 86 removes its old slot from chunk 1, but the context-free
+    // SurfaceCache-style prefetch remains as an independent background owner.
+    CHECK(cache->stats().unresolvedFetchesByLevel ==
+          std::vector<std::size_t>{3});
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(fetcher->order() == std::vector<ChunkKey>{
+        {0, 0, 0, 0}, {0, 0, 0, 2}, {0, 0, 0, 1}});
+}
+
 TEST_CASE("ChunkCache selects the coarsest view-relative demand first")
 {
     auto fetcher = std::make_shared<BlockingOrderFetcher>();
