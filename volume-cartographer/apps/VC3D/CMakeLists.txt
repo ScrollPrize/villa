@@ -216,6 +216,8 @@ set(srcs
     SpiralSshTunnel.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
+    SpiralMinimap.cpp
+    SpiralMinimap.hpp
     SpiralWorkspace.cpp
     SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
