@@ -1,5 +1,6 @@
 #include "utils/zarr.hpp"
 
+#include <charconv>
 #include <cmath>
 
 #if !defined(_WIN32)
