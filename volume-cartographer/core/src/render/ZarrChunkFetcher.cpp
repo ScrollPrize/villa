@@ -285,6 +285,27 @@ public:
         return persistEncodedExtension_.empty() && array_->direct_chunk_payload_is_decoded_bytes();
     }
 
+    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
+    {
+        return true;
+    }
+
+    ChunkFetchResult decodeSourcePayload(
+        const ChunkKey&,
+        std::vector<std::byte> bytes) const override
+    {
+        ChunkFetchResult result;
+        try {
+            result.status = ChunkFetchStatus::Found;
+            result.bytes = array_->decode_chunk_payload(
+                std::span<const std::byte>(bytes.data(), bytes.size()));
+        } catch (const std::exception& e) {
+            result.status = ChunkFetchStatus::DecodeError;
+            result.message = e.what();
+        }
+        return result;
+    }
+
     ChunkFetchResult decodePersistentBytes(
         const ChunkKey&,
         std::vector<std::byte> bytes) const override
@@ -964,6 +985,39 @@ std::unique_ptr<ChunkCache> createChunkCache(
         meta.fill_value.value_or(0.0),
         dtype,
         std::move(options), std::move(serviceOptions));
+}
+
+std::shared_ptr<ChunkCache> acquireProcessChunkCache(
+    std::string sourceIdentity,
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options)
+{
+    if (sourceIdentity.empty())
+        throw std::invalid_argument("process chunk-cache source identity is empty");
+    if (!array)
+        throw std::invalid_argument("cannot acquire a chunk cache for a null Zarr array");
+
+    const auto& meta = array->metadata();
+    ChunkDtype dtype = ChunkDtype::UInt8;
+    if (meta.dtype == utils::ZarrDtype::uint16) {
+        dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype != utils::ZarrDtype::uint8) {
+        throw std::runtime_error(
+            "streaming zarr cache currently supports uint8 and uint16 only");
+    }
+
+    std::vector<std::size_t> chunkShape = meta.chunks;
+    if (meta.shard_config)
+        chunkShape = meta.shard_config->sub_chunks;
+    std::vector<ChunkCache::LevelInfo> levels{
+        {toArray3(meta.shape, "shape"),
+         toArray3(chunkShape, "chunk shape"),
+         IChunkedArray::LevelTransform{}}};
+    std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
+    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    return processChunkCacheService()->acquireSource(
+        std::move(sourceIdentity), std::move(levels), std::move(fetchers),
+        meta.fill_value.value_or(0.0), dtype, std::move(options));
 }
 
 } // namespace vc::render

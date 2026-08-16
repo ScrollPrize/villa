@@ -17,10 +17,6 @@ class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
-namespace vc::render {
-class ChunkCacheService;
-class DecodedChunkCacheBudget;
-}
 
 struct POI
 {
@@ -37,12 +33,8 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(
-        size_t cacheSizeBytes,
-        QObject* parent = nullptr,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {},
-        std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService = {},
-        bool debugDownloadQueue = false);
+    explicit CState(QObject* parent = nullptr,
+                    bool debugDownloadQueue = false);
     ~CState();
 
     // --- VolumePkg ---
@@ -69,10 +61,6 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
 
-    // --- Cache budget ---
-    size_t cacheSizeBytes() const;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
-    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService() const;
     bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
     // --- Teardown ---
@@ -115,7 +103,6 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
-    void applyCacheBudget(const std::shared_ptr<Volume>& vol) const;
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
@@ -127,9 +114,6 @@ private:
 
     VCCollection* _pointCollection;
 
-    size_t _cacheSizeBytes;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
-    std::shared_ptr<vc::render::ChunkCacheService> _chunkCacheService;
     bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)

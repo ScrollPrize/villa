@@ -121,13 +121,14 @@ requested and fallback levels. This full-frame pass and its retained maps add
 CPU and memory overhead, so the flag is intended only for diagnostics and is
 disabled by default.
 
-## VC3D Regular Chunk Cache
+## Regular Chunk Cache
 
-VC3D creates one application-lifetime `vc::render::ChunkCacheService` and
-injects it through `CWindow`/`CState` into every `Volume`. A `ChunkCache` is a
-source-bound `IChunkedArray` handle over a service-retained source state. Main
-views, Spiral views, overlays, and `SurfaceCache` fillers therefore reuse the
-same decoded source chunks and in-flight requests.
+Core owns one process-lifetime `vc::render::ChunkCacheService`, returned by
+`processChunkCacheService()`. Every normal `Volume` discovers that service
+internally; applications and workspaces neither attach nor replace services.
+A `ChunkCache` is a source-bound `IChunkedArray` handle over service-retained
+source state. VC3D Main views, Spiral views, overlays, and `SurfaceCache`
+fillers therefore reuse the same decoded source chunks and in-flight requests.
 
 Shared sources are acquired only through `ChunkCacheService::acquireSource()`.
 Standalone `ChunkCache` construction remains a convenience for tests and batch
@@ -161,18 +162,31 @@ the physical worker capacity and initial fixed/adaptive admission policy.
 options, so acquiring or reacquiring a source cannot change concurrency.
 `configureFetchConcurrency()` updates admission on the existing scheduler in
 place: queued and running work remains attached, no request is restarted, and
-completed work publishes normally. Explicit prefill, redownload, and batch
-caches obtain isolation by owning a separate service, not by attaching a
-private scheduler to a source handle.
+completed work publishes normally. Normal volume users, Lasagna channel
+sampling, Open Data prefill, and Settings redownload all use this same process
+service. Standalone low-level tools and tests may intentionally own a wholly
+separate service and budget.
+
+Open Data prefill and Settings redownload submit persistence-only maintenance
+demand. Maintenance is the lowest scheduler class, below interactive and
+ordinary background work, but it uses the same worker pool, adaptive admission,
+connections, and keyed source-transfer registry. If decoded demand joins the
+same chunk, that one transfer is promoted and serves both consumers. A
+maintenance-only request writes the exact encoded source payload as `.source`
+and never decodes or enters the RAM LRU. Normal reads can decode `.source`
+entries, while legacy `.bin`, `.zst`, `.c3d`, and `.empty` entries remain valid.
+Refresh replaces alternatives only after a successful source result; missing
+data becomes `.empty`, and transport errors leave the prior disk entry intact.
 
 Decoded RAM capacity is also mutable service policy.
 `configureDecodedByteCapacity()` updates the existing aggregate budget without
 replacing sources, schedulers, fetchers, or handles. Increasing capacity keeps
 all resident data. Decreasing capacity evicts globally oldest decoded entries,
 but queued and running probe/read/decode work drains normally; a completion is
-accounted and then subjected to the new ceiling. `Volume::setCacheBudget()` is
-a convenience delegating to this service operation and does not invalidate the
-volume source.
+accounted and then subjected to the new ceiling. C++ callers configure the
+process service directly. Python callers use
+`vc.set_chunk_cache_budget(bytes)` and
+`vc.set_chunk_cache_io_threads(count)`; no per-volume cache-policy API exists.
 
 Changing the current volume drops viewer references but keeps the `Volume`'s
 lightweight source handle and service state, so switching A -> B -> A neither

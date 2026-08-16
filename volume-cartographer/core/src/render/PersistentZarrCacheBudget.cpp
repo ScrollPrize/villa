@@ -1,5 +1,7 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
+#include "vc/core/render/ChunkFetch.hpp"
+
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
@@ -52,7 +54,8 @@ bool isUnsignedNumber(const std::string& value)
 bool isVolumeChunk(const fs::path& path, const fs::path& root)
 {
     const auto ext = path.extension().string();
-    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" && ext != ".empty")
+    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" &&
+        ext != kPersistentSourcePayloadExtension && ext != ".empty")
         return false;
     auto y = path.parent_path();
     auto z = y.parent_path();

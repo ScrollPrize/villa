@@ -93,4 +93,11 @@ std::unique_ptr<ChunkCache> createChunkCache(
     ChunkCache::Options options,
     ChunkCacheService::Options serviceOptions);
 
+// Acquire an already-open scalar array from the process-wide cache service.
+// Equal source identities share decoded chunks, scheduling, and persistence.
+std::shared_ptr<ChunkCache> acquireProcessChunkCache(
+    std::string sourceIdentity,
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options = {});
+
 } // namespace vc::render

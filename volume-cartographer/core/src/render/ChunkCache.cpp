@@ -167,6 +167,31 @@ struct ChunkCacheService::Impl {
     bool activeFetchAdaptive = false;
 };
 
+namespace {
+
+struct ProcessChunkCacheServiceRegistry {
+    std::mutex mutex;
+    std::shared_ptr<ChunkCacheService> service;
+};
+
+ProcessChunkCacheServiceRegistry& processChunkCacheServiceRegistry()
+{
+    static ProcessChunkCacheServiceRegistry registry;
+    return registry;
+}
+
+ChunkCacheService::Options defaultProcessChunkCacheServiceOptions()
+{
+    ChunkCacheService::Options options;
+    options.decodedByteCapacity = 8ULL << 30;
+    options.fetchConcurrency.workerCapacity = 64;
+    options.fetchConcurrency.maxConcurrentReads = 64;
+    options.fetchConcurrency.adaptive = true;
+    return options;
+}
+
+} // namespace
+
 ChunkCacheService::ChunkCacheService()
     : ChunkCacheService(Options{})
 {
@@ -200,6 +225,45 @@ ChunkCacheService::~ChunkCacheService()
     impl_->probeScheduler->waitIdle();
     impl_->fetchScheduler->waitIdle();
     impl_->decodeScheduler->waitIdle();
+}
+
+std::shared_ptr<ChunkCacheService> processChunkCacheService()
+{
+    auto& registry = processChunkCacheServiceRegistry();
+    std::lock_guard lock(registry.mutex);
+    if (!registry.service) {
+        registry.service = std::make_shared<ChunkCacheService>(
+            defaultProcessChunkCacheServiceOptions());
+    }
+    return registry.service;
+}
+
+std::shared_ptr<ChunkCacheService> configureProcessChunkCacheService(
+    ChunkCacheService::Options options)
+{
+    auto& registry = processChunkCacheServiceRegistry();
+    std::lock_guard lock(registry.mutex);
+    if (!registry.service) {
+        registry.service = std::make_shared<ChunkCacheService>(
+            std::move(options));
+        return registry.service;
+    }
+
+    const auto current = registry.service->fetchConcurrency();
+    if (options.fetchConcurrency.workerCapacity != current.workerCapacity) {
+        throw std::invalid_argument(
+            "process ChunkCacheService worker capacity is fixed after creation");
+    }
+    if (options.initialAdaptiveDownloadState) {
+        throw std::invalid_argument(
+            "process ChunkCacheService adaptive state must be supplied before first use");
+    }
+    registry.service->configureDecodedByteCapacity(
+        options.decodedByteCapacity);
+    registry.service->configureFetchConcurrency(
+        options.fetchConcurrency.maxConcurrentReads,
+        options.fetchConcurrency.adaptive);
+    return registry.service;
 }
 
 std::shared_ptr<DecodedChunkCacheBudget>
@@ -484,7 +548,50 @@ void ChunkCache::refreshFetchers(
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
         if (auto scheduler = state->decodeScheduler_.lock())
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
+        for (auto& [key, transfer] : state->sourceTransfers_) {
+            if (auto entry = state->entries_.find(key);
+                entry != state->entries_.end() &&
+                entry->second.fetchTaskId == transfer.taskId) {
+                entry->second.fetchTaskId = 0;
+            }
+        }
+        state->sourceTransfers_.clear();
         restartUnresolvedLocked(state);
+        for (auto& [key, operation] : state->persistenceOperations_) {
+            if (operation->writeQueued.load(std::memory_order_acquire))
+                continue;
+            operation->probeTaskId = 0;
+            operation->sourceTaskId = 0;
+            FetchContext context{
+                state->generation_,
+                state->fetcherGeneration_,
+                0,
+                state->schedulerEpoch_,
+                state->fetchers_.at(static_cast<std::size_t>(key.level)),
+                {},
+            };
+            if (operation->refresh) {
+                joinSourceTransferLocked(
+                    state, key, std::move(context), false, operation);
+                continue;
+            }
+            auto scheduler = state->probeScheduler_.lock();
+            if (!scheduler)
+                continue;
+            const auto taskId = state->nextTaskId_->fetch_add(
+                1, std::memory_order_relaxed);
+            operation->probeTaskId = taskId;
+            ChunkWorkPriority priority;
+            priority.maintenance = true;
+            std::weak_ptr<State> weakState = state;
+            scheduler->submit(
+                taskId, priority, state->schedulerGroup_, state->schedulerEpoch_,
+                [weakState, key, operation] {
+                    if (auto lockedState = weakState.lock())
+                        probePersistenceAndDispatch(
+                            lockedState, key, operation);
+                });
+        }
     });
     state->cv_.notify_all();
 }
@@ -1142,6 +1249,7 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
 {
     std::uint64_t schedulerEpoch = 0;
     std::vector<ChunkKey> activeRemoteFetches;
+    std::vector<std::shared_ptr<PersistenceOperation>> cancelledPersistence;
     {
         std::lock_guard lock(state->mutex_);
         ++state->generation_;
@@ -1150,6 +1258,13 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         state->lru_.clear();
         state->viewSnapshots_.clear();
         state->viewDemandKeys_.clear();
+        state->sourceTransfers_.clear();
+        for (const auto& [key, operation] : state->persistenceOperations_) {
+            (void)key;
+            if (!operation->writeQueued.load(std::memory_order_acquire))
+                cancelledPersistence.push_back(operation);
+        }
+        state->persistenceOperations_.clear();
         removeDecodedBytesLocked(*state, state->decodedBytes_);
         state->decodedBytes_ = 0;
         activeRemoteFetches.reserve(state->activeRemoteFetches_.size());
@@ -1170,6 +1285,18 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     for (const auto& key : activeRemoteFetches)
         notifyRemoteFetchListeners(state, key, false);
+    for (const auto& operation : cancelledPersistence) {
+        {
+            std::lock_guard lock(operation->mutex);
+            if (operation->completed)
+                continue;
+            operation->result = {
+                PersistentRequestStatus::Error,
+                "persistent request was invalidated"};
+            operation->completed = true;
+        }
+        operation->cv.notify_all();
+    }
     state->cv_.notify_all();
 }
 
@@ -1190,6 +1317,183 @@ void ChunkCache::waitForPersistentWrites() const
     state->cv_.wait(lock, [&] {
         return state->persistentWritesInFlight_.load(std::memory_order_acquire) == 0;
     });
+}
+
+ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
+    int level,
+    int iz,
+    int iy,
+    int ix,
+    PersistentRequestMode mode)
+{
+    auto state = state_;
+    const ChunkKey key{level, iz, iy, ix, state->sourceId_};
+    std::shared_ptr<PersistenceOperation> operation;
+    bool created = false;
+    {
+        std::lock_guard lock(state->mutex_);
+        if (!state->options_.persistentCachePath) {
+            return {PersistentRequestStatus::Error,
+                    "persistent cache is not configured"};
+        }
+        if (!isValidKey(*state, key))
+            return {PersistentRequestStatus::Missing, {}};
+        const auto& fetcher = state->fetchers_.at(
+            static_cast<std::size_t>(level));
+        if (!fetcher ||
+            !fetcher->supportsSourcePayloadPersistence(fetcherKey(key))) {
+            return {PersistentRequestStatus::Error,
+                    "source fetcher cannot persist encoded payload without decoding"};
+        }
+
+        auto existing = state->persistenceOperations_.find(key);
+        if (existing != state->persistenceOperations_.end()) {
+            operation = existing->second;
+            if (mode == PersistentRequestMode::Refresh)
+                operation->refresh = true;
+        } else {
+            operation = std::make_shared<PersistenceOperation>();
+            operation->refresh = mode == PersistentRequestMode::Refresh;
+            state->persistenceOperations_.emplace(key, operation);
+            created = true;
+        }
+    }
+
+    if (created) {
+        state->schedulerSelectionGate_->publish([&] {
+            std::lock_guard lock(state->mutex_);
+            const auto current = state->persistenceOperations_.find(key);
+            if (current == state->persistenceOperations_.end() ||
+                current->second != operation) {
+                return;
+            }
+
+            FetchContext context{
+                state->generation_,
+                state->fetcherGeneration_,
+                0,
+                state->schedulerEpoch_,
+                state->fetchers_.at(static_cast<std::size_t>(level)),
+                {},
+            };
+            if (operation->refresh) {
+                joinSourceTransferLocked(
+                    state, key, std::move(context), false, operation);
+                return;
+            }
+
+            auto scheduler = state->probeScheduler_.lock();
+            if (!scheduler)
+                return;
+            const auto taskId = state->nextTaskId_->fetch_add(
+                1, std::memory_order_relaxed);
+            operation->probeTaskId = taskId;
+            ChunkWorkPriority priority;
+            priority.maintenance = true;
+            std::weak_ptr<State> weakState = state;
+            scheduler->submit(
+                taskId, priority, state->schedulerGroup_, state->schedulerEpoch_,
+                [weakState, key, operation] {
+                    if (auto state = weakState.lock())
+                        probePersistenceAndDispatch(state, key, operation);
+                });
+        });
+    }
+
+    std::unique_lock operationLock(operation->mutex);
+    operation->cv.wait(operationLock, [&] { return operation->completed; });
+    return operation->result;
+}
+
+void ChunkCache::probePersistenceAndDispatch(
+    const std::shared_ptr<State>& state,
+    ChunkKey key,
+    std::shared_ptr<PersistenceOperation> operation)
+{
+    bool refresh = false;
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto current = state->persistenceOperations_.find(key);
+        if (current == state->persistenceOperations_.end() ||
+            current->second != operation) {
+            return;
+        }
+        operation->probeTaskId = 0;
+        refresh = operation->refresh;
+    }
+
+    PersistentProbeResult probe;
+    if (!refresh) {
+        try {
+            probe = probePersistent(*state, key);
+        } catch (...) {
+            probe = {};
+        }
+        {
+            std::lock_guard lock(state->mutex_);
+            const auto current = state->persistenceOperations_.find(key);
+            if (current == state->persistenceOperations_.end() ||
+                current->second != operation) {
+                return;
+            }
+            refresh = operation->refresh;
+        }
+        if (!refresh && probe.hasData()) {
+            completePersistenceOperation(
+                state, key, operation,
+                {PersistentRequestStatus::Data, {}});
+            return;
+        }
+        if (!refresh && probe.empty) {
+            completePersistenceOperation(
+                state, key, operation,
+                {PersistentRequestStatus::Missing, {}});
+            return;
+        }
+    }
+
+    state->schedulerSelectionGate_->publish([&] {
+        std::lock_guard lock(state->mutex_);
+        const auto current = state->persistenceOperations_.find(key);
+        if (current == state->persistenceOperations_.end() ||
+            current->second != operation) {
+            return;
+        }
+        FetchContext context{
+            state->generation_,
+            state->fetcherGeneration_,
+            0,
+            state->schedulerEpoch_,
+            state->fetchers_.at(static_cast<std::size_t>(key.level)),
+            {},
+        };
+        joinSourceTransferLocked(
+            state, key, std::move(context), false, operation);
+    });
+}
+
+void ChunkCache::completePersistenceOperation(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    const std::shared_ptr<PersistenceOperation>& operation,
+    PersistentRequestResult result)
+{
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto current = state->persistenceOperations_.find(key);
+        if (current != state->persistenceOperations_.end() &&
+            current->second == operation) {
+            state->persistenceOperations_.erase(current);
+        }
+    }
+    {
+        std::lock_guard lock(operation->mutex);
+        if (operation->completed)
+            return;
+        operation->result = std::move(result);
+        operation->completed = true;
+    }
+    operation->cv.notify_all();
 }
 
 ChunkResult ChunkCache::resultFromEntryLocked(
@@ -1334,7 +1638,7 @@ bool ChunkCache::hasDemandLocked(const Entry& entry)
 }
 
 bool ChunkCache::cancelUndemandedEntryLocked(State& state,
-                                             const ChunkKey&,
+                                             const ChunkKey& key,
                                              Entry& entry)
 {
     if (entry.status != EntryStatus::InFlight || hasDemandLocked(entry))
@@ -1355,7 +1659,32 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
         taskId = 0;
     };
     cancel(entry.probeTaskId, state.probeScheduler_);
-    cancel(entry.fetchTaskId, state.fetchScheduler_);
+    const auto sourceTaskId = entry.fetchTaskId;
+    auto transfer = state.sourceTransfers_.find(key);
+    const bool persistenceOwnsTransfer =
+        sourceTaskId != 0 &&
+        transfer != state.sourceTransfers_.end() &&
+        transfer->second.taskId == sourceTaskId &&
+        !transfer->second.persistence.expired();
+    if (persistenceOwnsTransfer) {
+        hadPendingTask = true;
+        transfer->second.decodeRequested = false;
+        entry.fetchTaskId = 0;
+        ChunkWorkPriority priority;
+        priority.maintenance = true;
+        if (auto scheduler = state.fetchScheduler_.lock())
+            scheduler->reprioritize(sourceTaskId, priority);
+    } else {
+        cancel(entry.fetchTaskId, state.fetchScheduler_);
+    }
+    if (sourceTaskId != 0 && entry.fetchTaskId == 0) {
+        transfer = state.sourceTransfers_.find(key);
+        if (transfer != state.sourceTransfers_.end() &&
+            transfer->second.taskId == sourceTaskId &&
+            transfer->second.persistence.expired()) {
+            state.sourceTransfers_.erase(transfer);
+        }
+    }
     cancel(entry.decodeTaskId, state.decodeScheduler_);
     return hadPendingTask && !taskAlreadyRunning;
 }
@@ -1424,19 +1753,7 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
                 }
             });
     } else {
-        const auto taskId = state->nextTaskId_->fetch_add(1, std::memory_order_relaxed);
-        entry.fetchTaskId = taskId;
-        auto scheduler = state->fetchScheduler_.lock();
-        if (!scheduler)
-            return;
-        context.fetchScheduler = scheduler;
-        scheduler->submit(
-            taskId, priority, state->schedulerGroup_, schedulerEpoch,
-            [weakState, key, context] {
-                if (auto state = weakState.lock()) {
-                    fetchRemoteAndDispatch(state, key, context);
-                }
-            });
+        joinSourceTransferLocked(state, key, context, true, {});
     }
 }
 
@@ -1499,25 +1816,86 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
             pruned = true;
             return;
         }
-        const auto taskId = state->nextTaskId_->fetch_add(
-            1, std::memory_order_relaxed);
-        it->second.fetchTaskId = taskId;
-        auto scheduler = state->fetchScheduler_.lock();
-        if (!scheduler)
-            return;
-        context.fetchScheduler = scheduler;
-        const auto priority = workPriorityLocked(*state, key, it->second);
-        std::weak_ptr<State> weakState = state;
-        scheduler->submit(
-            taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
-            [weakState, key, context] {
-                if (auto state = weakState.lock()) {
-                    fetchRemoteAndDispatch(state, key, context);
-                }
-            });
+        joinSourceTransferLocked(state, key, context, true, {});
     });
     if (pruned)
         state->cv_.notify_all();
+}
+
+void ChunkCache::joinSourceTransferLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    FetchContext context,
+    bool decodeRequested,
+    const std::shared_ptr<PersistenceOperation>& persistence)
+{
+    auto scheduler = state->fetchScheduler_.lock();
+    if (!scheduler)
+        return;
+
+    auto found = state->sourceTransfers_.find(key);
+    if (found != state->sourceTransfers_.end()) {
+        SourceTransfer& transfer = found->second;
+        if (decodeRequested) {
+            transfer.decodeRequested = true;
+            if (auto entry = state->entries_.find(key);
+                entry != state->entries_.end()) {
+                entry->second.fetchSerial = transfer.serial;
+                entry->second.fetchTaskId = transfer.taskId;
+            }
+        }
+        if (persistence) {
+            transfer.persistence = persistence;
+            persistence->sourceTaskId = transfer.taskId;
+        }
+
+        ChunkWorkPriority priority;
+        if (transfer.decodeRequested) {
+            const auto entry = state->entries_.find(key);
+            if (entry != state->entries_.end())
+                priority = workPriorityLocked(*state, key, entry->second);
+        } else {
+            priority.maintenance = true;
+        }
+        scheduler->reprioritize(transfer.taskId, priority);
+        return;
+    }
+
+    SourceTransfer transfer;
+    transfer.serial = state->nextSourceTransferSerial_++;
+    transfer.taskId = state->nextTaskId_->fetch_add(
+        1, std::memory_order_relaxed);
+    transfer.generation = context.generation;
+    transfer.fetcherGeneration = context.fetcherGeneration;
+    transfer.schedulerEpoch = context.schedulerEpoch;
+    transfer.fetcher = std::move(context.fetcher);
+    transfer.decodeRequested = decodeRequested;
+    transfer.persistence = persistence;
+
+    ChunkWorkPriority priority;
+    if (decodeRequested) {
+        if (auto entry = state->entries_.find(key);
+            entry != state->entries_.end()) {
+            entry->second.fetchSerial = transfer.serial;
+            entry->second.fetchTaskId = transfer.taskId;
+            priority = workPriorityLocked(*state, key, entry->second);
+        }
+    } else {
+        priority.maintenance = true;
+    }
+    if (persistence)
+        persistence->sourceTaskId = transfer.taskId;
+
+    const auto serial = transfer.serial;
+    const auto taskId = transfer.taskId;
+    state->sourceTransfers_.emplace(key, std::move(transfer));
+    std::weak_ptr<State> weakState = state;
+    scheduler->submit(
+        taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
+        [weakState, key, serial] {
+            if (auto state = weakState.lock())
+                runSourceTransfer(state, key, serial);
+        });
 }
 
 void ChunkCache::queuePersistentDecode(const std::shared_ptr<State>& state,
@@ -1601,28 +1979,30 @@ void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
         state->cv_.notify_all();
 }
 
-void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
-                                        ChunkKey key,
-                                        FetchContext context)
+void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
+                                   ChunkKey key,
+                                   std::uint64_t transferSerial)
 {
+    SourceTransfer sourceTransfer;
     {
         std::lock_guard lock(state->mutex_);
-        auto it = state->entries_.find(key);
-        if (context.generation != state->generation_ ||
-            context.fetcherGeneration != state->fetcherGeneration_ ||
-            it == state->entries_.end() ||
-            it->second.fetchSerial != context.fetchSerial) {
+        auto transfer = state->sourceTransfers_.find(key);
+        if (transfer == state->sourceTransfers_.end() ||
+            transfer->second.serial != transferSerial ||
+            transfer->second.generation != state->generation_ ||
+            transfer->second.fetcherGeneration != state->fetcherGeneration_) {
             return;
         }
-        it->second.fetchTaskId = 0;
+        sourceTransfer = transfer->second;
     }
 
     ChunkFetchResult fetch;
     bool trackedRemoteFetch = false;
     const auto fetchStarted = std::chrono::steady_clock::now();
     std::optional<ChunkRequestScheduler::TransferMeasurement> transfer;
-    if (context.fetchScheduler && context.fetcher->measuresRemoteTransfer())
-        transfer.emplace(context.fetchScheduler->beginTransfer(fetchStarted));
+    auto scheduler = state->fetchScheduler_.lock();
+    if (scheduler && sourceTransfer.fetcher->measuresRemoteTransfer())
+        transfer.emplace(scheduler->beginTransfer(fetchStarted));
     auto observeProgress = [&](std::size_t bytes) {
         if (transfer)
             transfer->recordBytes(bytes);
@@ -1633,11 +2013,12 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
             {
                 std::lock_guard lock(state->mutex_);
                 ++state->remoteFetchesInFlight_;
-                state->activeRemoteFetches_[key].insert(context.fetchSerial);
+                state->activeRemoteFetches_[key].insert(transferSerial);
             }
             notifyRemoteFetchListeners(state, key, true);
         }
-        fetch = context.fetcher->fetchEncoded(fetcherKey(key), observeProgress);
+        fetch = sourceTransfer.fetcher->fetchEncoded(
+            fetcherKey(key), observeProgress);
     } catch (const std::exception& e) {
         fetch.status = ChunkFetchStatus::IoError;
         fetch.message = e.what();
@@ -1672,7 +2053,7 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
         std::lock_guard lock(state->mutex_);
         auto active = state->activeRemoteFetches_.find(key);
         if (active != state->activeRemoteFetches_.end() &&
-            active->second.erase(context.fetchSerial) != 0) {
+            active->second.erase(transferSerial) != 0) {
             if (state->remoteFetchesInFlight_ > 0)
                 --state->remoteFetchesInFlight_;
             if (active->second.empty()) {
@@ -1684,12 +2065,78 @@ void ChunkCache::fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
     if (remoteActivityEnded)
         notifyRemoteFetchListeners(state, key, false);
 
+    bool decodeRequested = false;
+    std::shared_ptr<PersistenceOperation> persistence;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto current = state->sourceTransfers_.find(key);
+        if (current == state->sourceTransfers_.end() ||
+            current->second.serial != transferSerial) {
+            return;
+        }
+        decodeRequested = current->second.decodeRequested;
+        persistence = current->second.persistence.lock();
+        state->sourceTransfers_.erase(current);
+        if (auto entry = state->entries_.find(key);
+            entry != state->entries_.end() &&
+            entry->second.fetchTaskId == sourceTransfer.taskId) {
+            entry->second.fetchTaskId = 0;
+        }
+    }
+
+    FetchContext context{
+        sourceTransfer.generation,
+        sourceTransfer.fetcherGeneration,
+        transferSerial,
+        sourceTransfer.schedulerEpoch,
+        sourceTransfer.fetcher,
+        scheduler,
+    };
+
+    const bool persistenceSupported = persistence &&
+        sourceTransfer.fetcher->supportsSourcePayloadPersistence(fetcherKey(key));
+    if (persistence && !persistenceSupported) {
+        completePersistenceOperation(
+            state, key, persistence,
+            {PersistentRequestStatus::Error,
+             "source fetcher cannot persist encoded payload without decoding"});
+        persistence.reset();
+    }
+
     if (fetch.status == ChunkFetchStatus::Found) {
-        queueFetchedDecode(state, key, context, std::move(fetch));
+        if (persistence) {
+            auto sourceBytes = std::make_shared<const std::vector<std::byte>>(
+                fetch.bytes);
+            if (!queuePersistentSourceWrite(
+                    state, key, std::move(sourceBytes), persistence)) {
+                completePersistenceOperation(
+                    state, key, persistence,
+                    {PersistentRequestStatus::Error,
+                     "could not queue exact-source persistent write"});
+            }
+            fetch.persistentWriteHandled = true;
+        }
+        if (decodeRequested)
+            queueFetchedDecode(state, key, context, std::move(fetch));
         return;
     }
 
-    finishAndStore(state, key, context, std::move(fetch), false);
+    if (fetch.status == ChunkFetchStatus::Missing && persistence) {
+        if (!queuePersistentSourceEmptyWrite(state, key, persistence)) {
+            completePersistenceOperation(
+                state, key, persistence,
+                {PersistentRequestStatus::Error,
+                 "could not queue persistent empty marker"});
+        }
+        fetch.persistentWriteHandled = true;
+    } else if (persistence) {
+        completePersistenceOperation(
+            state, key, persistence,
+            {PersistentRequestStatus::Error, fetchErrorMessage(fetch)});
+    }
+
+    if (decodeRequested)
+        finishAndStore(state, key, context, std::move(fetch), false);
 }
 
 void ChunkCache::decodePersistentAndStore(
@@ -1714,8 +2161,11 @@ void ChunkCache::decodePersistentAndStore(
     bool resolved = false;
     try {
         if (auto cached = readPersistent(*state, key, probe)) {
-            decoded = context.fetcher->decodePersistentBytes(
-                fetcherKey(key), std::move(*cached));
+            decoded = cached->sourcePayload
+                ? context.fetcher->decodeSourcePayload(
+                      fetcherKey(key), std::move(cached->bytes))
+                : context.fetcher->decodePersistentBytes(
+                      fetcherKey(key), std::move(cached->bytes));
             resolved = decoded.status == ChunkFetchStatus::Found &&
                        decoded.bytes.size() == expectedChunkBytes(*state, key);
         }
@@ -1750,6 +2200,7 @@ void ChunkCache::decodeFetchedAndStore(
     }
 
     ChunkFetchResult decoded;
+    const bool persistentWriteHandled = fetched->persistentWriteHandled;
     try {
         decoded = context.fetcher->decodeFetched(
             fetcherKey(key), std::move(*fetched));
@@ -1760,6 +2211,7 @@ void ChunkCache::decodeFetchedAndStore(
         decoded.status = ChunkFetchStatus::DecodeError;
         decoded.message = "unknown chunk decode exception";
     }
+    decoded.persistentWriteHandled = persistentWriteHandled;
 
     finishAndStore(state, key, context, std::move(decoded), false);
 }
@@ -1836,7 +2288,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
             // `persisted` is set by the writer's completion callback once
             // the bytes are actually on disk (same for the cases below).
             entry.persisted = loadedFromPersistentCache;
-            if (!loadedFromPersistentCache)
+            if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
                 entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
             break;
         }
@@ -1851,7 +2303,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
                 std::move(fetch.persistentBytes));
         }
         entry.persisted = loadedFromPersistentCache;
-        if (!loadedFromPersistentCache)
+        if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
             entry.persistentWriteQueued =
                 queuePersistentWrite(state, key, std::move(persistentBytes));
         break;
@@ -1859,7 +2311,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::Missing;
         entry.persisted = loadedFromPersistentCache;
-        if (!loadedFromPersistentCache)
+        if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
             entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
         break;
     case ChunkFetchStatus::HttpError:
@@ -1909,6 +2361,7 @@ ChunkCache::PersistentProbeResult ChunkCache::probePersistent(
         return std::filesystem::exists(path, ec) && !ec;
     };
 
+    result.sourceData = exists(persistentSourcePath(state, key));
     if (persistentEntryIsRaw(state, key))
         result.compressedData = exists(persistentCompressedPath(state, key));
     result.primaryData = exists(persistentPath(state, key));
@@ -1923,7 +2376,7 @@ ChunkCache::PersistentProbeResult ChunkCache::probePersistent(
     return result;
 }
 
-std::optional<std::vector<std::byte>> ChunkCache::readPersistent(
+std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
     const State& state,
     const ChunkKey& key,
     const PersistentProbeResult& probe)
@@ -1940,6 +2393,10 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(
         pin.complete(bytes.has_value());
         return bytes;
     };
+    if (probe.sourceData) {
+        if (auto source = readManaged(persistentSourcePath(state, key)))
+            return PersistentReadResult{std::move(*source), true};
+    }
     if (rawEntry && probe.compressedData) {
         // Compressed variant wins when both formats exist: compaction and
         // compressed writes leave ".zst" as the authoritative copy.
@@ -1948,7 +2405,7 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(
                 std::span<const std::byte>(compressed->data(), compressed->size()),
                 expectedChunkBytes(state, key));
             if (decompressed)
-                return decompressed;
+                return PersistentReadResult{std::move(*decompressed), false};
             // Corrupt compressed entry — fall through to ".bin"/refetch.
             Logger()->warn(
                 "ChunkCache corrupt compressed cache entry for {}/{}/{}/{} ({} bytes); "
@@ -1964,7 +2421,7 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(
         return std::nullopt;
     if (rawEntry && bytes->size() != expectedChunkBytes(state, key))
         return std::nullopt;
-    return bytes;
+    return PersistentReadResult{std::move(*bytes), false};
 }
 
 bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
@@ -2053,6 +2510,108 @@ bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
     return true;
 }
 
+bool ChunkCache::queuePersistentSourceWrite(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    std::shared_ptr<const std::vector<std::byte>> bytes,
+    std::shared_ptr<PersistenceOperation> operation)
+{
+    if (!state || !state->options_.persistentCachePath || !bytes || !operation)
+        return false;
+    operation->writeQueued.store(true, std::memory_order_release);
+    const std::size_t retainedBytes = bytes->size();
+    if (!reservePersistentWriteBytes(retainedBytes)) {
+        operation->writeQueued.store(false, std::memory_order_release);
+        return false;
+    }
+
+    state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+        persistentCacheWriterPool().enqueue(
+            [state, key, retainedBytes, bytes = std::move(bytes),
+             operation = std::move(operation)] {
+                bool written = false;
+                try {
+                    written = writePersistentSource(*state, key, *bytes);
+                } catch (...) {
+                }
+                {
+                    std::lock_guard lock(state->mutex_);
+                    if (written) {
+                        if (auto entry = state->entries_.find(key);
+                            entry != state->entries_.end()) {
+                            entry->second.persisted = true;
+                        }
+                    }
+                    state->persistentWritesInFlight_.fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+                releasePersistentWriteBytes(retainedBytes);
+                state->cv_.notify_all();
+                completePersistenceOperation(
+                    state, key, operation,
+                    written
+                        ? PersistentRequestResult{
+                              PersistentRequestStatus::Data, {}}
+                        : PersistentRequestResult{
+                              PersistentRequestStatus::Error,
+                              "exact-source persistent write failed"});
+            });
+    } catch (...) {
+        operation->writeQueued.store(false, std::memory_order_release);
+        state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+        releasePersistentWriteBytes(retainedBytes);
+        return false;
+    }
+    return true;
+}
+
+bool ChunkCache::queuePersistentSourceEmptyWrite(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    std::shared_ptr<PersistenceOperation> operation)
+{
+    if (!state || !state->options_.persistentCachePath || !operation)
+        return false;
+    operation->writeQueued.store(true, std::memory_order_release);
+    state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+        persistentCacheWriterPool().enqueue(
+            [state, key, operation = std::move(operation)] {
+                bool written = false;
+                try {
+                    written = writePersistentEmpty(*state, key);
+                } catch (...) {
+                }
+                {
+                    std::lock_guard lock(state->mutex_);
+                    if (written) {
+                        if (auto entry = state->entries_.find(key);
+                            entry != state->entries_.end()) {
+                            entry->second.persisted = true;
+                        }
+                    }
+                    state->persistentWritesInFlight_.fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+                state->cv_.notify_all();
+                completePersistenceOperation(
+                    state, key, operation,
+                    written
+                        ? PersistentRequestResult{
+                              PersistentRequestStatus::Missing, {}}
+                        : PersistentRequestResult{
+                              PersistentRequestStatus::Error,
+                              "persistent empty-marker write failed"});
+            });
+    } catch (...) {
+        operation->writeQueued.store(false, std::memory_order_release);
+        state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    return true;
+}
+
 bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes)
 {
     if (!state.options_.persistentCachePath)
@@ -2098,11 +2657,22 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     const auto counterpart = rawEntry
         ? (compress ? persistentPath(state, key) : persistentCompressedPath(state, key))
         : std::filesystem::path{};
+    std::vector<std::filesystem::path> replacements{
+        persistentSourcePath(state, key),
+        persistentEmptyPath(state, key),
+    };
+    if (!counterpart.empty())
+        replacements.push_back(counterpart);
+    replacements.erase(
+        std::remove(replacements.begin(), replacements.end(), path),
+        replacements.end());
+    std::sort(replacements.begin(), replacements.end());
+    replacements.erase(
+        std::unique(replacements.begin(), replacements.end()),
+        replacements.end());
     auto reservation = state.persistentBudget_
         ? state.persistentBudget_->reserveWrite(
-              path, payload->size(), counterpart.empty()
-                  ? std::vector<std::filesystem::path>{}
-                  : std::vector<std::filesystem::path>{counterpart})
+              path, payload->size(), replacements)
         : PersistentZarrCacheBudget::WriteReservation{};
     if (state.persistentBudget_ && !reservation)
         return false;
@@ -2142,13 +2712,11 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
         return false;
     }
     std::int64_t removedCounterpart = 0;
-    if (rawEntry) {
-        // Drop the other-format copy so the freshly written file is
-        // authoritative (reads prefer ".zst" over ".bin").
-        if (const auto size = regularFileSize(counterpart)) {
+    for (const auto& replacement : replacements) {
+        if (const auto size = regularFileSize(replacement)) {
             std::error_code removeEc;
-            if (std::filesystem::remove(counterpart, removeEc) && !removeEc)
-                removedCounterpart = static_cast<std::int64_t>(*size);
+            if (std::filesystem::remove(replacement, removeEc) && !removeEc)
+                removedCounterpart += static_cast<std::int64_t>(*size);
         }
     }
     const auto newSize = regularFileSize(path).value_or(payload->size());
@@ -2160,14 +2728,101 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     return true;
 }
 
+bool ChunkCache::writePersistentSource(
+    State& state,
+    const ChunkKey& key,
+    const std::vector<std::byte>& bytes)
+{
+    if (!state.options_.persistentCachePath)
+        return false;
+
+    const auto path = persistentSourcePath(state, key);
+    std::vector<std::filesystem::path> replacements{
+        persistentPath(state, key),
+        persistentCompressedPath(state, key),
+        persistentEmptyPath(state, key),
+    };
+    replacements.erase(
+        std::remove(replacements.begin(), replacements.end(), path),
+        replacements.end());
+    std::sort(replacements.begin(), replacements.end());
+    replacements.erase(
+        std::unique(replacements.begin(), replacements.end()),
+        replacements.end());
+
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(path, bytes.size(), replacements)
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+        return false;
+    const auto oldSize = regularFileSize(path).value_or(0);
+    const auto tmp = path.string() + uniqueTmpSuffix();
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return false;
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            file.close();
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        reservation.commit();
+        return false;
+    }
+
+    std::int64_t removedBytes = 0;
+    for (const auto& replacement : replacements) {
+        if (const auto size = regularFileSize(replacement)) {
+            std::error_code removeEc;
+            if (std::filesystem::remove(replacement, removeEc) && !removeEc)
+                removedBytes += static_cast<std::int64_t>(*size);
+        }
+    }
+    const auto newSize = regularFileSize(path).value_or(bytes.size());
+    addPersistentCacheBytesDelta(
+        state,
+        static_cast<std::int64_t>(newSize) -
+            static_cast<std::int64_t>(oldSize) - removedBytes);
+    reservation.commit();
+    return true;
+}
+
 bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
 {
     if (!state.options_.persistentCachePath)
         return false;
 
     const auto path = persistentEmptyPath(state, key);
+    std::vector<std::filesystem::path> replacements{
+        persistentSourcePath(state, key),
+        persistentPath(state, key),
+        persistentCompressedPath(state, key),
+    };
+    replacements.erase(
+        std::remove(replacements.begin(), replacements.end(), path),
+        replacements.end());
+    std::sort(replacements.begin(), replacements.end());
+    replacements.erase(
+        std::unique(replacements.begin(), replacements.end()),
+        replacements.end());
     auto reservation = state.persistentBudget_
-        ? state.persistentBudget_->reserveWrite(path, 0)
+        ? state.persistentBudget_->reserveWrite(path, 0, replacements)
         : PersistentZarrCacheBudget::WriteReservation{};
     if (state.persistentBudget_ && !reservation)
         return false;
@@ -2204,10 +2859,19 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
         reservation.commit();
         return false;
     }
+    std::int64_t removedBytes = 0;
+    for (const auto& replacement : replacements) {
+        if (const auto size = regularFileSize(replacement)) {
+            std::error_code removeEc;
+            if (std::filesystem::remove(replacement, removeEc) && !removeEc)
+                removedBytes += static_cast<std::int64_t>(*size);
+        }
+    }
     const auto newSize = regularFileSize(path).value_or(std::size_t{0});
     addPersistentCacheBytesDelta(
         state,
-        static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize));
+        static_cast<std::int64_t>(newSize) -
+            static_cast<std::int64_t>(oldSize) - removedBytes);
     reservation.commit();
     return true;
 }
@@ -2243,6 +2907,18 @@ std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const 
            std::to_string(key.iz) /
            std::to_string(key.iy) /
            (std::to_string(key.ix) + ".empty");
+}
+
+std::filesystem::path ChunkCache::persistentSourcePath(
+    const State& state,
+    const ChunkKey& key)
+{
+    return *state.options_.persistentCachePath /
+           ("level_" + std::to_string(key.level)) /
+           std::to_string(key.iz) /
+           std::to_string(key.iy) /
+           (std::to_string(key.ix) +
+            std::string(kPersistentSourcePayloadExtension));
 }
 
 void ChunkCache::startPersistentCacheSizeScan(const std::shared_ptr<State>& state)

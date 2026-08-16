@@ -1,14 +1,16 @@
-# Task: reconfigure global RAM cache capacity in place
+# Task
 
-Make decoded RAM capacity exclusively owned by `ChunkCacheService` and its
-shared decoded-budget manager.
+Separate persistent-cache population from decoded-data prefetch without
+creating a second download system.
 
-- Runtime cache-size changes must preserve sources, source IDs, fetchers,
-  queued work, running work, and decoded entries that remain within budget.
-- Reducing capacity may evict decoded LRU entries, but must not cancel or
-  restart probe, source-read, or decode work.
-- Remove the redundant per-source decoded-byte ceiling.
-- `Volume::setCacheBudget()` must configure the attached service in place and
-  must not invalidate or reacquire the source.
-- Existing service-wide concurrency changes must retain their current
-  queue/source-preserving behavior.
+- Normal prefetch and blocking sampling must always use the process-global
+  decoded chunk cache with no special per-caller cache services.
+- Open Data prefill and Settings "Redownload cache" must write exact source
+  payloads to the persistent disk cache without decoding or retaining decoded
+  chunks.
+- Persistence-only work must use the process service's existing source-read
+  scheduler, run at maintenance priority behind interactive and ordinary
+  background work, and deduplicate source reads with simultaneous decoded
+  requests for the same chunk.
+- Standalone processes and explicitly low-level batch/test construction may
+  continue to own a separate cache service.

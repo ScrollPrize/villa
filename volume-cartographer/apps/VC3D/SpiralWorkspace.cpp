@@ -80,14 +80,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Share Main's decoded chunk budget and queue service. Derived surface
-    // tiles remain local to each ViewerManager.
+    // Regular volume chunks use the process service. Derived surface tiles
+    // remain local to each ViewerManager.
     _state = new CState(
-        _mainState ? _mainState->cacheSizeBytes() : 0,
-        this,
-        _mainState ? _mainState->decodedCacheBudget() : nullptr,
-        _mainState ? _mainState->chunkCacheService() : nullptr,
-        _mainState && _mainState->debugDownloadQueueEnabled());
+        this, _mainState && _mainState->debugDownloadQueueEnabled());
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.

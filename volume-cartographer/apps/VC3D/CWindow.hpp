@@ -31,10 +31,6 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-namespace vc::render {
-class ChunkCacheService;
-class DecodedChunkCacheBudget;
-}
 #include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
@@ -186,8 +182,7 @@ public:
     };
 
     explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     RenderBenchOptions benchOptions = {},
-                     std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService = {});
+                     RenderBenchOptions benchOptions = {});
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -461,8 +456,6 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedChunkCacheBudget;
-    std::shared_ptr<vc::render::ChunkCacheService> _chunkCacheService;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

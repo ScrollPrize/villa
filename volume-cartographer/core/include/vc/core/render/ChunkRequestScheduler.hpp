@@ -30,6 +30,9 @@ private:
 
 struct ChunkWorkPriority {
     bool interactive = false;
+    // Maintenance shares this scheduler and its workers, but is selected only
+    // after both interactive and ordinary background queues are empty.
+    bool maintenance = false;
     bool activeView = false;
     // Interactive work uses view-relative level offsets; larger is coarser.
     // ChunkCache adds 100 for a source's terminal pyramid level.

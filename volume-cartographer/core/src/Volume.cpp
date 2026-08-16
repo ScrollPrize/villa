@@ -1690,20 +1690,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!chunkedCache_) {
         vc::render::ChunkCache::Options options;
-        if (!chunkCacheService_) {
-            vc::render::ChunkCacheService::Options serviceOptions;
-            serviceOptions.decodedByteCapacity = cacheBudgetHot_;
-            serviceOptions.decodedByteBudget = decodedCacheBudget_;
-            serviceOptions.fetchConcurrency.workerCapacity = isRemote_ ? 64 : 2;
-            serviceOptions.fetchConcurrency.maxConcurrentReads = isRemote_ ? 64 : 2;
-            serviceOptions.fetchConcurrency.adaptive = isRemote_;
-            chunkCacheService_ =
-                std::make_shared<vc::render::ChunkCacheService>(
-                    std::move(serviceOptions));
-        }
-        chunkedCache_ = createChunkCacheConfigured(
-            std::move(options), chunkCacheService_,
-            vc::render::ChunkCacheService::Options{});
+        chunkedCache_ = createChunkCacheConfigured(std::move(options));
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
@@ -1711,33 +1698,8 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
     return chunkedCache_;
 }
 
-std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
-    vc::render::ChunkCache::Options options) const
-{
-    return createChunkCache(
-        std::move(options), vc::render::ChunkCacheService::Options{});
-}
-
-std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
-    vc::render::ChunkCache::Options options,
-    vc::render::ChunkCacheService::Options serviceOptions) const
-{
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex_);
-        if (!serviceOptions.decodedByteBudget)
-            serviceOptions.decodedByteBudget = decodedCacheBudget_;
-    }
-    // Explicit cache creation is used by bounded prefill/redownload jobs. Give
-    // each one a separate service so its fixed concurrency cannot alter the
-    // interactive service. The decoded-byte budget above remains shared.
-    return createChunkCacheConfigured(
-        std::move(options), {}, std::move(serviceOptions));
-}
-
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
-    vc::render::ChunkCache::Options options,
-    std::shared_ptr<vc::render::ChunkCacheService> service,
-    vc::render::ChunkCacheService::Options serviceOptions) const
+    vc::render::ChunkCache::Options options) const
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
         options.persistentCachePath = remotePersistentCachePath();
@@ -1762,33 +1724,11 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         return nullptr;
     }
 
-    if (!service) {
-        service = std::make_shared<vc::render::ChunkCacheService>(
-            std::move(serviceOptions));
-    }
     auto levels = makeChunkCacheLevelInfo(opened);
-    return service->acquireSource(
+    return vc::render::processChunkCacheService()->acquireSource(
         chunkCacheSourceIdentity(), std::move(levels),
         std::move(opened.fetchers), opened.fillValue, opened.dtype,
         std::move(options));
-}
-
-void Volume::setChunkCacheService(
-    std::shared_ptr<vc::render::ChunkCacheService> service)
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (chunkCacheService_ == service)
-        return;
-    // Releasing a source handle does not invalidate service-owned source state.
-    chunkedCache_.reset();
-    chunkCacheService_ = std::move(service);
-}
-
-std::shared_ptr<vc::render::ChunkCacheService>
-Volume::chunkCacheService() const
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    return chunkCacheService_;
 }
 
 std::string Volume::chunkCacheSourceIdentity() const
@@ -1813,62 +1753,14 @@ std::string Volume::chunkCacheSourceIdentity() const
            "|base=" + std::to_string(baseScaleLevel_);
 }
 
-void Volume::setCacheBudget(
-    size_t hotBytes,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget)
-{
-    std::shared_ptr<vc::render::ChunkCacheService> service;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> effectiveBudget;
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex_);
-        service = chunkCacheService_;
-        if (service) {
-            const auto serviceBudget = service->decodedByteBudget();
-            if (decodedBudget && decodedBudget != serviceBudget) {
-                throw std::invalid_argument(
-                    "Volume::setCacheBudget cannot replace the attached "
-                    "ChunkCacheService budget");
-            }
-            effectiveBudget = serviceBudget;
-        } else {
-            effectiveBudget = std::move(decodedBudget);
-        }
-        cacheBudgetHot_ = hotBytes;
-        decodedCacheBudget_ = effectiveBudget;
-    }
-
-    if (service)
-        service->configureDecodedByteCapacity(hotBytes);
-    else if (effectiveBudget)
-        effectiveBudget->setMaximumBytes(hotBytes);
-}
-
-void Volume::retainCacheClient()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    ++cacheClientCount_;
-}
-
-void Volume::releaseCacheClient()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheClientCount_ == 0)
-        return;
-    --cacheClientCount_;
-    if (cacheClientCount_ == 0 && !chunkCacheService_) {
-        if (chunkedCache_)
-            chunkedCache_->invalidate();
-        chunkedCache_.reset();
-    }
-}
-
 void Volume::invalidateCache()
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (chunkedCache_) {
         chunkedCache_->invalidate();
-    } else if (chunkCacheService_) {
-        chunkCacheService_->invalidateSource(chunkCacheSourceIdentity());
+    } else {
+        vc::render::processChunkCacheService()->invalidateSource(
+            chunkCacheSourceIdentity());
     }
     chunkedCache_.reset();
 }

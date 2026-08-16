@@ -559,17 +559,10 @@ float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewpor
 
 std::shared_ptr<vc::render::ChunkCache> sharedOverlayChunkCacheForVolume(
     const std::shared_ptr<Volume>& volume,
-    const CState* state)
+    const CState*)
 {
     if (!volume)
         return nullptr;
-    if (state) {
-        volume->setChunkCacheService(state->chunkCacheService());
-        if (state->cacheSizeBytes() > 0) {
-            volume->setCacheBudget(state->cacheSizeBytes(),
-                                   state->decodedCacheBudget());
-        }
-    }
     return volume->sharedChunkCache();
 }
 

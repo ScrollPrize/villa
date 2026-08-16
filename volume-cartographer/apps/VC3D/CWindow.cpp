@@ -7,7 +7,7 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -2381,8 +2381,7 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions,
-                 std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService) :
+CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _cmdRunner(nullptr),
     _benchOptions(std::move(benchOptions)),
     _seedingWidget(nullptr),
@@ -2521,21 +2520,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions,
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _chunkCacheService = std::move(chunkCacheService);
-    if (!_chunkCacheService) {
-        vc::render::ChunkCacheService::Options options;
-        options.decodedByteCapacity = _cacheSizeBytes;
-        options.fetchConcurrency.workerCapacity = 64;
-        options.fetchConcurrency.maxConcurrentReads = 64;
-        options.fetchConcurrency.adaptive = true;
-        _chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
-            std::move(options));
-    }
-    _decodedChunkCacheBudget = _chunkCacheService->decodedByteBudget();
-    vc::render::ChunkCache::setDecodedByteBudgetDefault(
-        _decodedChunkCacheBudget);
-    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget,
-                        _chunkCacheService, _benchOptions.debugDownloadQueue);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        _cacheSizeBytes);
+    _state = new CState(this, _benchOptions.debugDownloadQueue);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,

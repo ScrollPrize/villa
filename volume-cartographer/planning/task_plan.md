@@ -1,75 +1,111 @@
 # Task plan
 
-## Problem
+## Design
 
-`Volume::setCacheBudget()` still follows the pre-service design: it invalidates
-the source and drops the handle because decoded capacity used to be immutable
-cache-constructor state. The shared service now retains that source, so the
-operation cancels work and clears warm data while reacquisition still uses the
-old capacity. Source state also redundantly applies a local decoded-byte
-ceiling in addition to the global decoded budget.
-
-## Implementation
-
-1. Make `DecodedChunkCacheBudget` capacity atomically mutable and provide an
-   in-place setter that enforces reductions through its existing global LRU
-   participant callbacks.
-2. Add `ChunkCacheService::configureDecodedByteCapacity()` as the sole runtime
-   RAM-capacity API. It updates the existing budget object without replacing
-   schedulers or source states.
-3. Remove the service default copied into each source and remove the
-   source-local decoded-byte capacity check. Keep per-source decoded usage,
-   touches, and eviction callbacks because entries remain physically owned by
-   their source.
-4. Keep `ChunkCache::Stats::decodedByteCapacity` as the global budget capacity
-   for status/UI compatibility.
-5. Change `Volume::setCacheBudget()` to update stored defaults and configure the
-   attached service without invalidating or resetting its source handle. Reject
-   attempts to attach a different decoded-budget object after a service is
-   installed rather than silently moving sources between managers.
-6. Preserve service-construction behavior: `decodedByteCapacity` initializes a
-   newly created budget only when no external shared budget was supplied.
+1. Extend the chunk-fetcher persistence contract so a fetched source payload
+   can be written before and independently of decoding. Store maintenance
+   payloads under one generic exact-source extension and teach normal reads to
+   decode that representation. Keep ordinary interactive cache-write policy
+   unchanged: decoded `.bin`, cache-compressed `.zst`, and existing native
+   encoded formats remain valid, readable representations.
+2. Add a persistence-only chunk request API to `ChunkCache`. It must support:
+   - ensure mode, which accepts an existing persistent entry;
+   - refresh mode, which fetches the source again and atomically replaces the
+     persistent entry;
+   - blocking result/status reporting for bounded background workflows.
+3. Keep per-key maintenance request/completion state separate from decoded
+   entry state. Both consumers join one source-transfer registry keyed by
+   source/chunk. A refresh never hides, invalidates, or waits on resident decoded
+   data. Joining works in both orders: persistence joins an existing interactive
+   transfer, and an interactive miss joins and promotes an existing maintenance
+   transfer. Both orders perform one source read.
+4. Add a third maintenance scheduler class below interactive and ordinary
+   background work. Maintenance runs only when neither higher class is pending.
+   If an interactive or normal background consumer joins the same keyed
+   transfer, reprioritize that transfer in place into the higher class.
+5. On a shared source result, give decode and persistence independent completion
+   paths over the same immutable fetched payload. Rendering may publish decoded
+   data without waiting for disk, while maintenance completes only after its
+   atomic disk write commits. Decode only when a decoded consumer exists.
+   Persistence-only completion must not insert bytes into the decoded LRU or
+   decoded-byte budget.
+6. Ensure persistent replacement removes stale `.bin`, `.zst`, `.c3d`, exact
+   source, and `.empty` alternatives,
+   remains atomic, participates in the existing persistent-disk budget, and
+   reports completion only after the write commits. Found source payloads become
+   exact-source entries; authoritative source missing results become `.empty`;
+   HTTP/I/O failures preserve the prior entry and report failure. Without a
+   decode, encoded all-fill chunks are counted as found data.
+7. Change Open Data prefill to use the normal Volume's shared cache handle and
+   persistence-only ensure requests. Keep one bounded producer and background
+   priority; retain cancellation, progress, completion markers, and error
+   accounting.
+8. Change Settings "Redownload cache" to use persistence-only refresh requests
+   on the current Volume's shared cache. Remove its private service, custom
+   source-read workers, and decode/recompression path. Refresh only keys already
+   represented on disk and recognize `.bin`, `.zst`, `.c3d`, `.empty`, and the
+   exact-source extension. Remove compression/quantization semantics from
+   redownload and relabel its worker control as compression-only; the separate
+   existing-cache compression action remains responsible for offline
+   recompression.
+9. Remove both Volume-level isolated-cache factories and their process-budget
+   injection. Keep lower-level standalone cache factories for genuinely
+   separate processes, batch tools, and tests; an explicit isolated service owns
+   its complete budget and shares nothing with the process service.
+10. Audit all in-process `prefetchChunks()` users and Lasagna channel samplers.
+    Ordinary Volume-based sampling remains on the process cache. Make all
+    in-process Lasagna channel arrays acquire canonical array identities from
+    the process service, eliminating their private-service/shared-budget hybrid.
+    Standalone executables naturally get their own process service.
+11. Add the exact-source extension to persistent budget discovery, probing,
+    alternate cleanup, invalidation, and redownload enumeration.
 
 ## Tests
 
-- Verify reducing service capacity evicts globally oldest decoded data across
-  sources without changing source IDs.
-- Verify an in-flight source read completes exactly once across a capacity
-  reduction and queued work is not cancelled or restarted.
-- Verify `Volume::setCacheBudget()` preserves its existing handle and warm data
-  when increasing capacity.
-- Verify reduction through `Volume::setCacheBudget()` uses the same source and
-  enforces the new global limit.
-- Retain and run existing concurrency reconfiguration tests.
-- Build/run `test_chunk_cache`, `test_volume_local`, and VC3D; run
-  `git diff --check`.
+- Add a fetcher fixture that counts source fetches and decode calls.
+- Verify persistence-only ensure writes bytes and performs zero decodes.
+- Verify persistence-only refresh replaces disk data and performs zero decodes.
+- Verify an interactive request joining a queued persistence request causes one
+  source fetch, one decode, and one persistent write.
+- Verify persistence joining an existing interactive source read also performs
+  one source fetch and completes independently after disk commit.
+- Verify interactive priority promotes the shared pending source task ahead of
+  unrelated background persistence work.
+- Verify maintenance does not start while interactive or ordinary background
+  source work remains pending.
+- Verify persistent-only completion does not increase decoded RAM accounting.
+- Verify exact encoded Zarr payloads round-trip through the persistent cache and
+  legacy decoded/cache-compressed entries remain readable.
+- Verify remote missing replaces stale alternatives with `.empty`, while HTTP
+  and I/O failures preserve the previous persistent entry.
+- Update Open Data prefill tests for shared-cache, no-decode behavior and marker
+  completion.
+- Build `test_chunk_cache`, `test_open_data_volume_prefill`, VC3D, and the Python
+  extension; run the complete core CTest suite and `git diff --check`.
 
 ## Spec update
 
-Specify that decoded RAM capacity and fetch concurrency are mutable global
-service policy. Runtime policy changes preserve all source and queue state;
-only decoded LRU eviction needed to satisfy a reduced capacity is allowed.
+- Replace both isolated prefill/redownload clauses with persistence-only
+  maintenance demand on the process source service.
+- State that persistence-only work shares source fetches and scheduling with
+  interactive work, has a third lowest-priority class unless the same transfer
+  gains a higher-priority consumer, and never populates decoded RAM by itself.
+- State that exact encoded source payload is the maintenance representation,
+  ordinary cache-write policy is unchanged, and legacy persistent entries
+  remain readable.
+- Clarify that explicit isolated services are reserved for standalone, batch,
+  low-level array, and test workloads, and never partially share only RAM
+  accounting with the process service.
 
 ## Documentation updates
 
-Update the ChunkCache and Volume API documentation to describe in-place global
-capacity configuration and remove the obsolete source-handle reset statement.
+- Update `docs/remote_file_cache.md` with the decoded-prefetch versus
+  persistence-only distinction, scheduler/deduplication behavior, encoded
+  payload format, and legacy-read behavior.
+- Update API documentation for the persistence-only request and removal of the
+  Volume prefill/redownload construction overload.
 
 ## Changelog
 
-Record the source- and queue-preserving RAM-capacity correction under
-2026-08-15.
-
-## Independent review
-
-- A source must retain decoded byte accounting, LRU touches, and an eviction
-  callback because it owns the entries, but it does not need a ceiling.
-- The global budget already selects the oldest entry across all registered
-  sources, so removing the local ceiling does not weaken total enforcement.
-- Atomic capacity reads plus serialized budget enforcement permit concurrent
-  completions during a reduction; each completion is accounted and then
-  globally enforced without cancellation.
-- Scheduler admission and task generations are untouched, so queued and
-  running work cannot be restarted by this change.
-- Persistent disk budget and write-format policy are separate concerns and are
-  intentionally unchanged.
+- Record the shared persistence-only download path and removal of decoded
+  prefill/redownload caches.

@@ -930,6 +930,25 @@ NB_MODULE(volume, m)
 {
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
 
+    m.def("set_chunk_cache_budget",
+          [](std::size_t bytes) {
+              if (bytes == 0)
+                  throw std::invalid_argument("bytes must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureDecodedByteCapacity(bytes);
+          },
+          "bytes"_a,
+          "Set the process-wide decoded regular-chunk cache capacity.");
+    m.def("set_chunk_cache_io_threads",
+          [](std::size_t count) {
+              if (count == 0)
+                  throw std::invalid_argument("count must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureFetchConcurrency(count, false);
+          },
+          "count"_a,
+          "Set fixed process-wide regular chunk source-read concurrency.");
+
     nb::class_<Volume>(m, "Volume")
         .def_static("open",
             [](const std::string& path) {
@@ -965,11 +984,6 @@ NB_MODULE(volume, m)
         .def("chunk_count", &Volume::chunkCount, "level"_a = 0)
         .def("has_scale_level", &Volume::hasScaleLevel, "level"_a)
         .def("present_scale_levels", &Volume::presentScaleLevels)
-        .def("set_cache_budget",
-             [](Volume& volume, size_t bytes) {
-                 volume.setCacheBudget(bytes);
-             },
-             "bytes"_a)
         .def("invalidate_cache", &Volume::invalidateCache)
         .def("read_zyx", &readZYX,
             "offset"_a,

@@ -292,7 +292,7 @@ TEST_CASE("generated display tangent sign is independent of stored point order")
 
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
-    CState state(64 * 1024 * 1024);
+    CState state;
     state.setSurface("line_annotation_slice_1", state.surface("xy plane"));
 
     const auto views = vc::lasagna::buildLineViewSurfaces(lineModel());

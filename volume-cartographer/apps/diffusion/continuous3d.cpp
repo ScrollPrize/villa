@@ -5,6 +5,7 @@
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -161,7 +162,8 @@ int continuous3d_main(const po::variables_map& vm) {
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
     Volume volume(volume_path);
-    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        4llu * 1024 * 1024 * 1024);
     const auto parsedLevel = parseScaleLevelDatasetName(dataset_name, volume.numScales(), std::cerr);
     if (!parsedLevel) {
         return 1;

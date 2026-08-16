@@ -5,10 +5,13 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace vc::render {
+
+inline constexpr std::string_view kPersistentSourcePayloadExtension = ".source";
 
 struct VolumeSourceId {
     std::uint64_t value = 0;
@@ -55,6 +58,8 @@ struct ChunkFetchResult {
     std::vector<std::byte> bytes;
     std::vector<std::byte> persistentBytes;
     bool hasPersistentBytes = false;
+    // An independent exact-source write owns persistence for this fetch.
+    bool persistentWriteHandled = false;
     int httpStatus = 0;
     std::string message;
 };
@@ -112,6 +117,24 @@ public:
     virtual bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const
     {
         return false;
+    }
+
+    // Persistence maintenance stores the exact source payload without
+    // decoding. Fetchers opt in only when decodeSourcePayload() can reconstruct
+    // the decoded chunk from those bytes later.
+    virtual bool supportsSourcePayloadPersistence(const ChunkKey&) const
+    {
+        return false;
+    }
+
+    virtual ChunkFetchResult decodeSourcePayload(
+        const ChunkKey& key,
+        std::vector<std::byte> bytes) const
+    {
+        ChunkFetchResult fetched;
+        fetched.status = ChunkFetchStatus::Found;
+        fetched.bytes = std::move(bytes);
+        return decodeFetched(key, std::move(fetched));
     }
 
     virtual ChunkFetchResult decodePersistentBytes(

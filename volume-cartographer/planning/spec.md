@@ -17,10 +17,12 @@
 
 ## Regular chunk-cache ownership
 
-- VC3D constructs one `ChunkCacheService` at application startup and passes it
-  through every window/workspace state. Main, Spiral, overlay, and derived
-  surface-tile input reads must acquire source handles from this service rather
-  than construct independent decoded regular-chunk pools.
+- Core owns one process-lifetime regular `ChunkCacheService`. Every normal
+  `Volume` discovers it internally; applications, windows, workspaces, and
+  Python callers must not attach or replace services per volume. Main, Spiral,
+  overlay, and derived surface-tile input reads acquire source handles from
+  this process service rather than construct independent decoded regular-chunk
+  pools.
 - `ChunkCacheService::acquireSource()` is the only shared-service source factory.
   It interns or reacquires the source and returns a source-bound `ChunkCache`
   implementing `IChunkedArray`. A standalone `ChunkCache` convenience
@@ -61,13 +63,17 @@
   decreasing it evicts only globally oldest decoded entries until accounting
   satisfies the new ceiling. Concurrent completions drain normally and are
   accounted and enforced against the new ceiling.
-- Explicit bounded prefill, redownload, and batch caches use a separate
-  `ChunkCacheService`. Their fixed concurrency is isolated from the regular
-  interactive service even when both services share one decoded-byte budget.
-- `Volume` may receive a service or create a private one, but it owns neither a
-  per-volume decoded-byte ceiling nor a per-volume source-read concurrency
-  setting. `Volume::setCacheBudget()` configures the attached service in place
-  and must not invalidate or reacquire its source.
+- Open Data prefill and Settings redownload submit persistence-only maintenance
+  demand to the process service. Maintenance is below interactive and ordinary
+  background work but shares source transfers, workers, adaptive admission,
+  and connections. Maintenance alone never decodes or consumes decoded RAM.
+- Low-level standalone and test workloads may own a separate service, but that
+  service owns its complete scheduling and decoded-memory policy. Services do
+  not partially share only a decoded-byte budget.
+- `Volume` owns neither a service nor per-volume decoded-byte or source-read
+  policy. C++ callers configure the process service directly; Python callers
+  use module-level regular-cache configuration APIs. Configuration must not
+  invalidate or reacquire a source.
 - Releasing a viewer/cache client does not invalidate service-owned source
   state. Writes and explicit `Volume::invalidateCache()` invalidate only that
   source; stale generation results must not publish afterward.
@@ -194,10 +200,12 @@
 - Adaptive admission is service-wide for normal remote rendering and changes
   only how many source tasks may start; it does not alter pending-task priority.
   A decrease does not interrupt running work. Explicit fixed-concurrency
-  callers, tests, prefill operations, and local volumes use fixed service
-  configurations; independent operations require independent services.
-- Each queue uses the work-conserving 7:1 interactive/background admission
-  policy. Current view-relative priority is recalculated at every stage handoff,
+  callers, tests, and local volumes may use fixed service configurations;
+  independent operations require independent services.
+- Each stage scheduler uses interactive, ordinary background, and maintenance
+  work classes. Interactive/background retain their work-conserving 7:1
+  admission; maintenance runs only while neither higher class is pending.
+  Current view-relative priority is recalculated at every stage handoff,
   and atomic view-demand publication reprioritizes pending work in all three
   queues. Classification never waits for cached payload reads or decoding, so
   known remote misses can be admitted while cached decodes are busy. There is

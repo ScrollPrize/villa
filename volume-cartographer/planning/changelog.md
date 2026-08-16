@@ -1,7 +1,17 @@
 # Changelog
 
+- Routed Open Data prefill and Settings redownload through persistence-only
+  maintenance demand on the process chunk-cache service. Exact source payloads
+  are stored without decode, share keyed transfers with rendering, and run
+  behind interactive and ordinary background work. Removed Volume-level
+  private-cache factories and migrated in-process Lasagna corner sampling to
+  canonical process-cache sources.
+
 ## 2026-08-15
 
+- Completed process-global regular chunk-cache ownership. Normal volumes now
+  discover the core-owned service internally, VC3D no longer injects services,
+  and C++/Python cache policy callers use global configuration APIs.
 - Moved decoded RAM capacity fully into the shared cache service and made
   runtime capacity changes preserve sources, queues, and in-flight work;
   reductions now evict only globally oldest decoded entries.

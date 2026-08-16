@@ -2,41 +2,48 @@
 
 ## Findings
 
-- Fetch parallelism already updates only `ChunkRequestScheduler` admission.
-  Existing queued and running work and all source states remain intact.
-- `Volume::setCacheBudget()` invalidates source state, cancels scheduler groups,
-  clears decoded data, and then reacquires the service-retained state with its
-  old immutable capacity.
-- Every source currently has a redundant `decodedByteCapacity_`; the shared
-  `DecodedChunkCacheBudget` already accounts all sources and evicts the global
-  oldest decoded entry.
-- Persistent disk limits are manager-owned and do not invalidate RAM sources.
-  Persistent write-format options remain source-construction policy and are not
-  runtime RAM/scheduler settings.
+- Open Data prefill currently walks a private cache through
+  `getChunkBlocking()`, so every downloaded chunk is decoded and enters decoded
+  cache accounting before disk persistence.
+- Settings redownload repeats the same pattern with a separate service, then
+  writes the returned decoded bytes itself.
+- Ordinary prefetch users already target a Volume's shared cache; the main
+  architectural gap is a persistence-only consumer on the shared keyed source
+  fetch.
+- Generic compressed Zarr source payloads currently become decoded `.bin`
+  persistent entries. A strict no-decode prefill therefore requires exact
+  encoded source payloads to become a supported persistent representation.
+- The previous task's default injection of the process decoded-byte budget into
+  isolated services creates eviction coupling without cache/data sharing. This
+  task removes that prefill/redownload special case.
+- Independent plan review found that maintenance completion must remain separate
+  from decoded entry state, that the existing fair background lane is not a
+  strict lowest-priority lane, and that changing ordinary persistent writes to
+  exact-source format would exceed the task. The revised plan uses a separate
+  maintenance state, a third scheduler class, and an additional exact-source
+  representation used only by maintenance.
+- Exact no-decode refresh cannot preserve redownload's current compression and
+  quantization behavior. Redownload will refresh exact source payloads only;
+  existing-cache compression remains a separate explicit action.
+- Implemented a third maintenance work class inside each existing scheduler;
+  no additional scheduler, worker pool, or connection pool was introduced.
+- Added exact `.source` persistence, normal-read decoding of that form,
+  bidirectional source-transfer joining, and atomic replacement semantics.
+- Migrated Open Data prefill and Settings redownload to the shared source cache,
+  removed Volume-level private cache construction, and moved Lasagna corner
+  samplers to stable path-keyed process-cache sources.
+- Added focused tests for zero-decode persistence, source refresh outcomes,
+  both transfer-join directions, view-demand removal, fetcher refresh, decoded
+  RAM accounting, and maintenance priority.
 
 ## Deviations
 
 - None.
 
-## Implementation
-
-- Made the aggregate decoded budget capacity atomic and mutable in place.
-- Added service-level decoded-capacity configuration using the existing global
-  LRU enforcement callbacks.
-- Removed the copied source-local decoded-byte ceiling and its independent
-  eviction condition.
-- Changed `Volume::setCacheBudget()` to configure its attached service without
-  invalidating or resetting the source handle.
-- Added regressions for cross-source LRU reduction, preserved in-flight and
-  queued requests, stable source IDs, stable Volume handles, and warm-data
-  retention on capacity increase.
-
 ## Validation
 
-- `cmake --build volume-cartographer/build --target test_chunk_cache test_volume_local -j 8`
-- `volume-cartographer/build/bin/test_chunk_cache` (80 passed)
-- `volume-cartographer/build/bin/test_volume_local` (16 passed)
-- `cmake --build volume-cartographer/build --target test_volume_extras -j 8`
-- `volume-cartographer/build/bin/test_volume_extras` (12 passed)
-- `cmake --build volume-cartographer/build --target VC3D -j 8`
-- `git diff --check`
+- Built the complete configured project, including VC3D and `vc_volume`.
+- Focused cache/Volume/Open Data/Lasagna tests passed (6/6).
+- Full CTest passed (150/150), including the configured live network tests.
+- Final source scans found no remaining Volume-level private cache factory or
+  in-process Lasagna corner-budget hybrid.

@@ -292,14 +292,7 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
             return result;
         }
 
-        vc::render::ChunkCache::Options options;
-        options.metadataEntryCapacity = std::max<std::size_t>(result.totalChunks, 1ULL << 12);
-        vc::render::ChunkCacheService::Options serviceOptions;
-        serviceOptions.decodedByteCapacity = 64ULL * 1024ULL * 1024ULL;
-        serviceOptions.fetchConcurrency.workerCapacity = 1;
-        serviceOptions.fetchConcurrency.maxConcurrentReads = 1;
-        auto cache = volume->createChunkCache(
-            std::move(options), std::move(serviceOptions));
+        auto cache = volume->sharedChunkCache();
         if (!cache) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
             result.message = "could not create chunk cache";
@@ -316,17 +309,18 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
                         return result;
                     }
 
-                    const auto chunk = cache->getChunkBlocking(level, iz, iy, ix);
+                    const auto chunk = cache->persistChunkBlocking(
+                        level, iz, iy, ix,
+                        vc::render::ChunkCache::PersistentRequestMode::Ensure);
                     ++result.resolvedChunks;
                     switch (chunk.status) {
-                    case vc::render::ChunkStatus::Data:
+                    case vc::render::ChunkCache::PersistentRequestStatus::Data:
                         ++result.dataChunks;
                         break;
-                    case vc::render::ChunkStatus::Missing:
-                    case vc::render::ChunkStatus::AllFill:
+                    case vc::render::ChunkCache::PersistentRequestStatus::Missing:
                         ++result.emptyChunks;
                         break;
-                    case vc::render::ChunkStatus::Error:
+                    case vc::render::ChunkCache::PersistentRequestStatus::Error:
                         ++result.errorChunks;
                         Logger()->warn(
                             "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
@@ -336,9 +330,6 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
                             iy,
                             ix,
                             chunk.error);
-                        break;
-                    case vc::render::ChunkStatus::MissQueued:
-                        ++result.errorChunks;
                         break;
                     }
 

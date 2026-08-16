@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <latch>
 #include <limits>
 #include <memory>
@@ -209,6 +210,101 @@ private:
     bool released_ = false;
 };
 
+class PersistentSourceFetcher : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        return decodeFetched(key, fetchEncoded(key));
+    }
+
+    ChunkFetchResult fetchEncoded(const ChunkKey&) override
+    {
+        ++fetchCalls;
+        {
+            std::unique_lock lock(mutex_);
+            ++started_;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return !blocking_ || released_; });
+            return encoded_;
+        }
+    }
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult fetched) const override
+    {
+        ++decodeCalls;
+        if (fetched.status != ChunkFetchStatus::Found)
+            return fetched;
+        ChunkFetchResult decoded;
+        decoded.status = ChunkFetchStatus::Found;
+        decoded.bytes = makeDecoded(fetched.bytes);
+        return decoded;
+    }
+
+    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
+    {
+        return true;
+    }
+
+    ChunkFetchResult decodeSourcePayload(
+        const ChunkKey&, std::vector<std::byte> bytes) const override
+    {
+        ++sourceDecodeCalls;
+        ChunkFetchResult decoded;
+        decoded.status = ChunkFetchStatus::Found;
+        decoded.bytes = makeDecoded(bytes);
+        return decoded;
+    }
+
+    void setEncoded(ChunkFetchResult result)
+    {
+        std::lock_guard lock(mutex_);
+        encoded_ = std::move(result);
+    }
+
+    void block()
+    {
+        std::lock_guard lock(mutex_);
+        blocking_ = true;
+        released_ = false;
+    }
+
+    bool waitForStarted(int count, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return started_ >= count; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    std::atomic<int> fetchCalls{0};
+    mutable std::atomic<int> decodeCalls{0};
+    mutable std::atomic<int> sourceDecodeCalls{0};
+
+private:
+    static std::vector<std::byte> makeDecoded(
+        const std::vector<std::byte>& encoded)
+    {
+        const auto value = encoded.empty() ? std::byte{0} : encoded.front();
+        return std::vector<std::byte>(64, value);
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    ChunkFetchResult encoded_{
+        ChunkFetchStatus::Found, {std::byte{71}}};
+    int started_ = 0;
+    bool blocking_ = false;
+    bool released_ = false;
+};
+
 class ThrowingFetcher : public IChunkFetcher {
 public:
     ChunkFetchResult fetch(const ChunkKey&) override
@@ -396,6 +492,19 @@ void writeTestBytes(const fs::path& path, std::span<const std::byte> bytes)
     REQUIRE(file.good());
 }
 
+std::vector<std::byte> readTestBytes(const fs::path& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    REQUIRE(file.good());
+    const auto size = file.tellg();
+    REQUIRE(size >= 0);
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    REQUIRE(file.good());
+    return bytes;
+}
+
 std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
                                        std::array<int, 3> shape = {8, 8, 8},
                                        std::array<int, 3> chunkShape = {4, 4, 4})
@@ -430,6 +539,24 @@ std::shared_ptr<ChunkCache> makeServiceCache(
         service->configureFetchConcurrency(
             maxConcurrentReads, adaptiveConcurrentReads);
     }
+    return service->acquireSource(
+        std::move(identity), std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+        0.0, ChunkDtype::UInt8, std::move(options));
+}
+
+std::shared_ptr<ChunkCache> makePersistentServiceCache(
+    const std::shared_ptr<ChunkCacheService>& service,
+    std::string identity,
+    const std::shared_ptr<IChunkFetcher>& fetcher,
+    const fs::path& persistentPath)
+{
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{8, 8, 8}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options options;
+    options.detectAllFillChunks = false;
+    options.persistentCachePath = persistentPath;
     return service->acquireSource(
         std::move(identity), std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
@@ -1291,6 +1418,213 @@ TEST_CASE("ChunkCache: persistent cache path round-trip")
     fs::remove_all(persistDir);
 }
 
+TEST_CASE("ChunkCache maintenance persists exact source without decoding")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_source_persist_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    auto service = makeService();
+    auto fetcher = std::make_shared<PersistentSourceFetcher>();
+    auto cache = makePersistentServiceCache(
+        service, "source-persist", fetcher, dir);
+
+    const auto result = cache->persistChunkBlocking(
+        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Ensure);
+    CHECK(result.status == ChunkCache::PersistentRequestStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 0);
+    CHECK(fetcher->sourceDecodeCalls.load() == 0);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+
+    const auto sourcePath = dir / "level_0" / "0" / "0" / "0.source";
+    CHECK(readTestBytes(sourcePath) ==
+          std::vector<std::byte>{std::byte{71}});
+
+    const auto decoded = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(decoded.status == ChunkStatus::Data);
+    REQUIRE(decoded.bytes);
+    CHECK(decoded.bytes->front() == std::byte{71});
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 0);
+    CHECK(fetcher->sourceDecodeCalls.load() == 1);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache source refresh replaces only after a successful outcome")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_source_refresh_" + std::to_string(rng()));
+    const auto sourcePath = dir / "level_0" / "0" / "0" / "0.source";
+    const auto emptyPath = dir / "level_0" / "0" / "0" / "0.empty";
+    writeTestBytes(sourcePath, std::vector<std::byte>{std::byte{11}});
+
+    auto service = makeService();
+    auto fetcher = std::make_shared<PersistentSourceFetcher>();
+    auto cache = makePersistentServiceCache(
+        service, "source-refresh", fetcher, dir);
+
+    ChunkFetchResult failed;
+    failed.status = ChunkFetchStatus::HttpError;
+    failed.httpStatus = 503;
+    fetcher->setEncoded(failed);
+    auto result = cache->persistChunkBlocking(
+        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    CHECK(result.status == ChunkCache::PersistentRequestStatus::Error);
+    CHECK(readTestBytes(sourcePath) ==
+          std::vector<std::byte>{std::byte{11}});
+
+    ChunkFetchResult missing;
+    missing.status = ChunkFetchStatus::Missing;
+    fetcher->setEncoded(missing);
+    result = cache->persistChunkBlocking(
+        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    CHECK(result.status == ChunkCache::PersistentRequestStatus::Missing);
+    CHECK_FALSE(fs::exists(sourcePath));
+    CHECK(fs::exists(emptyPath));
+
+    ChunkFetchResult found;
+    found.status = ChunkFetchStatus::Found;
+    found.bytes = {std::byte{29}};
+    fetcher->setEncoded(found);
+    result = cache->persistChunkBlocking(
+        0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    CHECK(result.status == ChunkCache::PersistentRequestStatus::Data);
+    CHECK(readTestBytes(sourcePath) ==
+          std::vector<std::byte>{std::byte{29}});
+    CHECK_FALSE(fs::exists(emptyPath));
+    CHECK(fetcher->decodeCalls.load() == 0);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache maintenance and decoded demand share one source transfer")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_source_join_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<PersistentSourceFetcher>();
+    fetcher->block();
+    auto cache = makePersistentServiceCache(
+        service, "source-join", fetcher, dir);
+
+    auto persistence = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    fetcher->release();
+
+    CHECK(persistence.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache maintenance survives replacement of joined view demand")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_source_view_clear_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    auto service = makeService(1024 * 1024, 1);
+    auto fetcher = std::make_shared<PersistentSourceFetcher>();
+    fetcher->block();
+    auto cache = makePersistentServiceCache(
+        service, "source-view-clear", fetcher, dir);
+
+    auto persistence = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    cache->replaceViewDemand({41, 1}, {0.0f, 0.0f}, {
+        {{0, 0, 0, 0}, {0.0f, 0.0f}},
+    });
+    cache->replaceViewDemand({41, 2}, {0.0f, 0.0f}, {});
+    fetcher->release();
+
+    CHECK(persistence.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 0);
+    CHECK(fs::exists(dir / "level_0" / "0" / "0" / "0.source"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache maintenance joins a source transfer started by decoding")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_decode_join_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    auto service = makeService(1024 * 1024, 2);
+    auto fetcher = std::make_shared<PersistentSourceFetcher>();
+    fetcher->block();
+    auto cache = makePersistentServiceCache(
+        service, "decode-join", fetcher, dir);
+
+    CHECK(cache->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    auto persistence = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    fetcher->release();
+
+    CHECK(persistence.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
+    CHECK(fs::exists(dir / "level_0" / "0" / "0" / "0.source"));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("ChunkCache maintenance restarts on source fetcher refresh")
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = fs::temp_directory_path() /
+        ("vc_chunk_maintenance_refresh_" + std::to_string(rng()));
+    fs::create_directories(dir);
+    auto service = makeService(1024 * 1024, 2);
+    auto expired = std::make_shared<PersistentSourceFetcher>();
+    expired->block();
+    auto first = makePersistentServiceCache(
+        service, "maintenance-refresh", expired, dir);
+
+    auto persistence = std::async(std::launch::async, [&] {
+        return first->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    REQUIRE(expired->waitForStarted(1, std::chrono::seconds{2}));
+
+    auto refreshed = std::make_shared<PersistentSourceFetcher>();
+    ChunkFetchResult replacement;
+    replacement.status = ChunkFetchStatus::Found;
+    replacement.bytes = {std::byte{88}};
+    refreshed->setEncoded(replacement);
+    auto second = makePersistentServiceCache(
+        service, "maintenance-refresh", refreshed, dir);
+    (void)second;
+
+    REQUIRE(refreshed->waitForStarted(1, std::chrono::seconds{2}));
+    CHECK(persistence.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(readTestBytes(
+              dir / "level_0" / "0" / "0" / "0.source") ==
+          std::vector<std::byte>{std::byte{88}});
+    expired->release();
+    fs::remove_all(dir);
+}
+
 TEST_CASE("ChunkCache: ctor without options uses defaults")
 {
     auto f = std::make_shared<CountingFetcher>();
@@ -1800,6 +2134,47 @@ TEST_CASE("ChunkRequestScheduler bounds interactive bursts")
     scheduler.waitIdle();
     REQUIRE(order.size() == 7);
     CHECK(order[4] == 7); // blocker, three GUI tasks, then background
+}
+
+TEST_CASE("ChunkRequestScheduler runs maintenance after interactive and background work")
+{
+    ChunkRequestScheduler scheduler(1);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    std::latch started{1};
+    std::vector<int> order;
+    scheduler.submit(1, {}, 1, 0, [&] {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+        order.push_back(1);
+    });
+    started.wait();
+
+    ChunkWorkPriority maintenance;
+    maintenance.maintenance = true;
+    scheduler.submit(2, maintenance, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(2);
+    });
+    scheduler.submit(3, {}, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(3);
+    });
+    ChunkWorkPriority interactive;
+    interactive.interactive = true;
+    scheduler.submit(4, interactive, 1, 0, [&] {
+        std::lock_guard lock(mutex);
+        order.push_back(4);
+    });
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    CHECK(order == std::vector<int>{1, 4, 3, 2});
 }
 
 TEST_CASE("ChunkRequestScheduler orders level then active view then distance")

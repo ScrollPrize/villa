@@ -550,9 +550,9 @@ auto main(int argc, char* argv[]) -> int
         cacheOptions.fetchConcurrency.maxConcurrentReads = 64;
         cacheOptions.fetchConcurrency.adaptive = true;
         cacheOptions.initialAdaptiveDownloadState = loadAdaptiveDownloadState();
-        chunkCacheService = std::make_shared<vc::render::ChunkCacheService>(
+        chunkCacheService = vc::render::configureProcessChunkCacheService(
             std::move(cacheOptions));
-        CWindow aWin(cacheSizeGB, benchOptions, chunkCacheService);
+        CWindow aWin(cacheSizeGB, benchOptions);
 
         if (parser.isSet(volumePackageOption)) {
             QString errorMessage;
@@ -599,7 +599,6 @@ auto main(int argc, char* argv[]) -> int
         rc = QApplication::exec();
     }
     saveAdaptiveDownloadState(chunkCacheService->adaptiveDownloadState());
-    chunkCacheService.reset();
     // Skip DSO finalizers: gnutls/libtasn1 destructors free through mimalloc after
     // its own teardown, segfaulting in _dl_fini on every otherwise-clean exit.
     // CWindow (above scope) has already run its real cleanup.

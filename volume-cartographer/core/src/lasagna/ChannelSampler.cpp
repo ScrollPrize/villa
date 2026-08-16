@@ -502,9 +502,7 @@ size_t LasagnaChannelChunkKeyHash::operator()(const LasagnaChannelChunkKey& key)
 
 class LasagnaChannelCornerSampler::Impl {
 public:
-    Impl(const LasagnaChannelBinding& binding,
-         size_t maxCachedBytes,
-         std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
+    explicit Impl(const LasagnaChannelBinding& binding)
         : spacing_(static_cast<float>(binding.spacing))
         , shapeZYX_{static_cast<int>(binding.shapeZYX[0]),
                     static_cast<int>(binding.shapeZYX[1]),
@@ -512,14 +510,16 @@ public:
     {
         if (!binding.array)
             throw std::runtime_error("VC3D corner-batch sampling requires an open Zarr array");
-        vc::render::ChunkCache::Options options;
-        vc::render::ChunkCacheService::Options serviceOptions;
-        serviceOptions.decodedByteCapacity = std::max<size_t>(1, maxCachedBytes);
-        serviceOptions.decodedByteBudget = std::move(sharedBudget);
-        serviceOptions.fetchConcurrency.workerCapacity = 16;
-        serviceOptions.fetchConcurrency.maxConcurrentReads = 16;
-        cache_ = vc::render::createChunkCache(
-            binding.array, std::move(options), std::move(serviceOptions));
+        std::error_code ec;
+        auto sourcePath = std::filesystem::weakly_canonical(binding.path, ec);
+        if (ec)
+            sourcePath = std::filesystem::absolute(binding.path, ec);
+        if (ec)
+            sourcePath = binding.path;
+        cache_ = vc::render::acquireProcessChunkCache(
+            "lasagna-channel|" + sourcePath.lexically_normal().string() +
+                "|channel=" + std::to_string(binding.channelIndex),
+            binding.array);
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(
@@ -605,15 +605,12 @@ public:
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
-    std::unique_ptr<vc::render::ChunkCache> cache_;
+    std::shared_ptr<vc::render::ChunkCache> cache_;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
-    const LasagnaChannelBinding& binding,
-    size_t maxCachedBytes,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
-    : impl_(std::make_unique<Impl>(
-          binding, maxCachedBytes, std::move(sharedBudget)))
+    const LasagnaChannelBinding& binding)
+    : impl_(std::make_unique<Impl>(binding))
 {
 }
 

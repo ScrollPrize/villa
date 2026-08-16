@@ -111,6 +111,14 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
+// Process-lifetime service used by every regular Volume cache. The first
+// configure call may supply startup-only state such as the persisted adaptive
+// download model. Later calls update mutable policy in place and preserve all
+// sources and queued/running work.
+std::shared_ptr<ChunkCacheService> processChunkCacheService();
+std::shared_ptr<ChunkCacheService> configureProcessChunkCacheService(
+    ChunkCacheService::Options options);
+
 class ChunkCache final : public IChunkedArray {
 public:
     using RemoteFetchActivityCallbackId = std::uint64_t;
@@ -119,6 +127,22 @@ public:
 
     using LevelInfo = ChunkCacheLevelInfo;
     using Options = ChunkCacheOptions;
+
+    enum class PersistentRequestMode {
+        Ensure,
+        Refresh,
+    };
+
+    enum class PersistentRequestStatus {
+        Data,
+        Missing,
+        Error,
+    };
+
+    struct PersistentRequestResult {
+        PersistentRequestStatus status = PersistentRequestStatus::Error;
+        std::string error;
+    };
 
     struct Stats {
         std::size_t decodedBytes = 0;
@@ -211,6 +235,14 @@ public:
     Stats stats() const;
     void invalidate();
     void waitForPersistentWrites() const;
+    // Uses the service's shared source scheduler and keyed transfer registry.
+    // This request never decodes or populates decoded RAM by itself.
+    PersistentRequestResult persistChunkBlocking(
+        int level,
+        int iz,
+        int iy,
+        int ix,
+        PersistentRequestMode mode = PersistentRequestMode::Ensure);
 
     // Process-wide default for Options::compressPersistentCache, OR-ed into
     // every cache built afterwards. Lets an application apply a user setting
@@ -250,14 +282,20 @@ private:
     };
 
     struct PersistentProbeResult {
+        bool sourceData = false;
         bool compressedData = false;
         bool primaryData = false;
         bool empty = false;
 
         bool hasData() const noexcept
         {
-            return compressedData || primaryData;
+            return sourceData || compressedData || primaryData;
         }
+    };
+
+    struct PersistentReadResult {
+        std::vector<std::byte> bytes;
+        bool sourcePayload = false;
     };
 
     struct Entry {
@@ -278,6 +316,28 @@ private:
         bool backgroundDemand = false;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
+    };
+
+    struct PersistenceOperation {
+        mutable std::mutex mutex;
+        std::condition_variable cv;
+        PersistentRequestResult result;
+        bool completed = false;
+        bool refresh = false;
+        std::atomic_bool writeQueued{false};
+        std::uint64_t probeTaskId = 0;
+        std::uint64_t sourceTaskId = 0;
+    };
+
+    struct SourceTransfer {
+        std::uint64_t serial = 0;
+        std::uint64_t taskId = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t fetcherGeneration = 0;
+        std::uint64_t schedulerEpoch = 0;
+        std::shared_ptr<IChunkFetcher> fetcher;
+        bool decodeRequested = false;
+        std::weak_ptr<PersistenceOperation> persistence;
     };
 
     struct State {
@@ -323,6 +383,10 @@ private:
         mutable std::mutex mutex_;
         std::condition_variable cv_;
         std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
+        std::unordered_map<ChunkKey,
+                           std::shared_ptr<PersistenceOperation>,
+                           ChunkKeyHash> persistenceOperations_;
+        std::unordered_map<ChunkKey, SourceTransfer, ChunkKeyHash> sourceTransfers_;
         std::list<ChunkKey> lru_;
         std::vector<std::size_t> unresolvedFetchesByLevel_;
         std::size_t decodedBytes_ = 0;
@@ -334,6 +398,7 @@ private:
         const std::uint64_t schedulerGroup_;
         std::uint64_t schedulerEpoch_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
+        std::uint64_t nextSourceTransferSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
         std::weak_ptr<ChunkRequestScheduler> decodeScheduler_;
@@ -398,9 +463,6 @@ private:
     static void probePersistentAndDispatch(const std::shared_ptr<State>& state,
                                            ChunkKey key,
                                            FetchContext context);
-    static void fetchRemoteAndDispatch(const std::shared_ptr<State>& state,
-                                       ChunkKey key,
-                                       FetchContext context);
     static void decodePersistentAndStore(const std::shared_ptr<State>& state,
                                          ChunkKey key,
                                          FetchContext context,
@@ -413,6 +475,24 @@ private:
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
+    static void joinSourceTransferLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        FetchContext context,
+        bool decodeRequested,
+        const std::shared_ptr<PersistenceOperation>& persistence);
+    static void runSourceTransfer(const std::shared_ptr<State>& state,
+                                  ChunkKey key,
+                                  std::uint64_t transferSerial);
+    static void probePersistenceAndDispatch(
+        const std::shared_ptr<State>& state,
+        ChunkKey key,
+        std::shared_ptr<PersistenceOperation> operation);
+    static void completePersistenceOperation(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        const std::shared_ptr<PersistenceOperation>& operation,
+        PersistentRequestResult result);
     static void queuePersistentDecode(const std::shared_ptr<State>& state,
                                       const ChunkKey& key,
                                       FetchContext context,
@@ -428,7 +508,7 @@ private:
                                bool loadedFromPersistentCache);
     static PersistentProbeResult probePersistent(const State& state,
                                                   const ChunkKey& key);
-    static std::optional<std::vector<std::byte>> readPersistent(
+    static std::optional<PersistentReadResult> readPersistent(
         const State& state,
         const ChunkKey& key,
         const PersistentProbeResult& probe);
@@ -441,11 +521,25 @@ private:
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
     static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                                           const ChunkKey& key);
+    static bool queuePersistentSourceWrite(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        std::shared_ptr<const std::vector<std::byte>> bytes,
+        std::shared_ptr<PersistenceOperation> operation);
+    static bool queuePersistentSourceEmptyWrite(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        std::shared_ptr<PersistenceOperation> operation);
+    static bool writePersistentSource(
+        State& state,
+        const ChunkKey& key,
+        const std::vector<std::byte>& bytes);
     static bool writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
     static bool writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentSourcePath(const State& state, const ChunkKey& key);
     static bool persistentEntryIsRaw(const State& state, const ChunkKey& key);
     static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
     static std::size_t persistentCacheBytes(

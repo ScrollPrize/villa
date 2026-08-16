@@ -156,29 +156,6 @@ public:
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
-    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
-        vc::render::ChunkCache::Options options) const;
-    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
-        vc::render::ChunkCache::Options options,
-        vc::render::ChunkCacheService::Options serviceOptions) const;
-    void setChunkCacheService(
-        std::shared_ptr<vc::render::ChunkCacheService> service);
-    [[nodiscard]] std::shared_ptr<vc::render::ChunkCacheService>
-    chunkCacheService() const;
-    [[nodiscard]] std::string chunkCacheSourceIdentity() const;
-
-    // Configure the process-wide decoded RAM ceiling in place. If this Volume
-    // is attached to a service, sources and queued/running work are preserved.
-    // The optional budget may select a shared manager before service creation;
-    // an attached service's manager cannot be replaced through a Volume.
-    void setCacheBudget(
-        size_t hotBytes,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
-
-    // CState clients keep a shared Volume active across workspaces. A shared
-    // service keeps the source handle and decoded chunks warm after release.
-    void retainCacheClient();
-    void releaseCacheClient();
 
     // Drop decoded/read cache state. Writes call this automatically.
     void invalidateCache();
@@ -302,11 +279,7 @@ protected:
 
     // Cache ownership
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
-    std::shared_ptr<vc::render::ChunkCacheService> chunkCacheService_;
     mutable std::mutex cacheMutex_;
-    size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
-    std::size_t cacheClientCount_ = 0;
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
     // and rebuilding the codec registry on every chunk read. ZarrArray is
@@ -316,9 +289,8 @@ protected:
     mutable std::mutex readArrayCacheMutex_;
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
     std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
-        vc::render::ChunkCache::Options options,
-        std::shared_ptr<vc::render::ChunkCacheService> service,
-        vc::render::ChunkCacheService::Options serviceOptions) const;
+        vc::render::ChunkCache::Options options) const;
+    [[nodiscard]] std::string chunkCacheSourceIdentity() const;
 
     void loadMetadata();
 

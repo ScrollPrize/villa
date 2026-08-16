@@ -91,9 +91,16 @@ struct ChunkRequestScheduler::Impl {
     using BackgroundQueue = std::set<std::shared_ptr<Item>, BackgroundLess>;
 
     struct Location {
-        bool interactive = false;
+        enum class Kind {
+            Interactive,
+            Background,
+            Maintenance,
+        };
+
+        Kind kind = Kind::Background;
         GuiQueue::iterator gui;
         BackgroundQueue::iterator background;
+        BackgroundQueue::iterator maintenance;
     };
 
     struct TransferSample {
@@ -255,21 +262,37 @@ struct ChunkRequestScheduler::Impl {
         const auto found = locations.find(id);
         if (found == locations.end())
             return;
-        if (found->second.interactive)
+        if (found->second.kind == Location::Kind::Interactive)
             gui.erase(found->second.gui);
+        else if (found->second.kind == Location::Kind::Maintenance)
+            maintenance.erase(found->second.maintenance);
         else
             background.erase(found->second.background);
         locations.erase(found);
     }
 
+    std::shared_ptr<Item> itemAtLocked(const Location& location) const
+    {
+        if (location.kind == Location::Kind::Interactive)
+            return *location.gui;
+        if (location.kind == Location::Kind::Maintenance)
+            return *location.maintenance;
+        return *location.background;
+    }
+
     void insertLocked(const std::shared_ptr<Item>& item)
     {
         Location location;
-        location.interactive = item->priority.interactive;
-        if (location.interactive)
+        if (item->priority.interactive) {
+            location.kind = Location::Kind::Interactive;
             location.gui = gui.insert(item).first;
-        else
+        } else if (item->priority.maintenance) {
+            location.kind = Location::Kind::Maintenance;
+            location.maintenance = maintenance.insert(item).first;
+        } else {
+            location.kind = Location::Kind::Background;
             location.background = background.insert(item).first;
+        }
         locations[item->id] = location;
     }
 
@@ -288,6 +311,11 @@ struct ChunkRequestScheduler::Impl {
             item = *it;
             background.erase(it);
             consecutiveInteractive = 0;
+        } else if (gui.empty() && !maintenance.empty()) {
+            auto it = maintenance.begin();
+            item = *it;
+            maintenance.erase(it);
+            consecutiveInteractive = 0;
         }
         if (item)
             locations.erase(item->id);
@@ -296,7 +324,7 @@ struct ChunkRequestScheduler::Impl {
 
     bool canSelectLocked() const
     {
-        return (!gui.empty() || !background.empty()) &&
+        return (!gui.empty() || !background.empty() || !maintenance.empty()) &&
                activeCount.load(std::memory_order_acquire) < admissionLimit;
     }
 
@@ -819,7 +847,8 @@ struct ChunkRequestScheduler::Impl {
                 cv.wait(lock, [&] {
                     return stop.stop_requested() || canSelectLocked();
                 });
-                if (stop.stop_requested() && gui.empty() && background.empty())
+                if (stop.stop_requested() && gui.empty() && background.empty() &&
+                    maintenance.empty())
                     return;
             }
             {
@@ -827,7 +856,8 @@ struct ChunkRequestScheduler::Impl {
                 // the publisher updates queued items through reprioritize().
                 std::lock_guard selectionLock(selectionGate->impl_->mutex);
                 std::unique_lock lock(mutex);
-                if (stop.stop_requested() && gui.empty() && background.empty())
+                if (stop.stop_requested() && gui.empty() && background.empty() &&
+                    maintenance.empty())
                     return;
                 if (!canSelectLocked())
                     continue;
@@ -835,7 +865,7 @@ struct ChunkRequestScheduler::Impl {
                 if (!item)
                     continue;
                 if (staleLocked(*item)) {
-                    if (gui.empty() && background.empty() &&
+                    if (gui.empty() && background.empty() && maintenance.empty() &&
                         activeCount.load(std::memory_order_acquire) == 0) {
                         idleCv.notify_all();
                     }
@@ -852,7 +882,7 @@ struct ChunkRequestScheduler::Impl {
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
             cv.notify_all();
-            if (gui.empty() && background.empty() &&
+            if (gui.empty() && background.empty() && maintenance.empty() &&
                 activeCount.load(std::memory_order_acquire) == 0) {
                 idleCv.notify_all();
             }
@@ -864,6 +894,7 @@ struct ChunkRequestScheduler::Impl {
     std::condition_variable idleCv;
     GuiQueue gui;
     BackgroundQueue background;
+    BackgroundQueue maintenance;
     std::unordered_map<TaskId, Location> locations;
     std::unordered_map<TaskGroup, std::uint64_t> minimumGroupEpoch;
     std::shared_ptr<ChunkRequestSelectionGate> selectionGate;
@@ -981,9 +1012,7 @@ bool ChunkRequestScheduler::reprioritize(TaskId id, ChunkWorkPriority priority)
     const auto found = impl_->locations.find(id);
     if (found == impl_->locations.end())
         return false;
-    std::shared_ptr<Impl::Item> item = found->second.interactive
-        ? *found->second.gui
-        : *found->second.background;
+    std::shared_ptr<Impl::Item> item = impl_->itemAtLocked(found->second);
     impl_->eraseLocked(id);
     item->priority = priority;
     impl_->insertLocked(item);
@@ -1000,6 +1029,7 @@ bool ChunkRequestScheduler::cancel(TaskId id)
         return false;
     impl_->eraseLocked(id);
     if (impl_->gui.empty() && impl_->background.empty() &&
+        impl_->maintenance.empty() &&
         impl_->activeCount.load(std::memory_order_acquire) == 0) {
         impl_->idleCv.notify_all();
     }
@@ -1014,7 +1044,7 @@ void ChunkRequestScheduler::cancelGroupBefore(TaskGroup group,
     accepted = std::max(accepted, minimumEpoch);
     for (auto it = impl_->locations.begin(); it != impl_->locations.end();) {
         const auto& location = it->second;
-        const auto item = location.interactive ? *location.gui : *location.background;
+        const auto item = impl_->itemAtLocked(location);
         if (item->group == group && item->groupEpoch < accepted) {
             const auto id = it->first;
             ++it;
@@ -1024,6 +1054,7 @@ void ChunkRequestScheduler::cancelGroupBefore(TaskGroup group,
         }
     }
     if (impl_->gui.empty() && impl_->background.empty() &&
+        impl_->maintenance.empty() &&
         impl_->activeCount.load(std::memory_order_acquire) == 0) {
         impl_->idleCv.notify_all();
     }
@@ -1231,6 +1262,7 @@ void ChunkRequestScheduler::waitIdle()
     std::unique_lock lock(impl_->mutex);
     impl_->idleCv.wait(lock, [&] {
         return impl_->gui.empty() && impl_->background.empty() &&
+               impl_->maintenance.empty() &&
                impl_->activeCount.load(std::memory_order_acquire) == 0;
     });
 }
