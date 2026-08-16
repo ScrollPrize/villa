@@ -38,6 +38,12 @@ absolute CT value greater than zero. Use `--minimum-support-fraction`,
 different fill-value convention. Threshold changes are recorded in the
 report.
 
+A signal-support failure means the selected volume does not contain enough
+nonzero signal at the sampled surface coordinates. This can indicate a wrong
+pairing, a cropped, sparse, or partially populated volume store, or genuinely
+unsupported surface coverage; it is not by itself evidence that the surface
+geometry is defective.
+
 This is an input-pairing preflight, not a proof of surface correctness. It does
 not replace geometric diagnostics such as self-intersection or local
 orientation analysis.
