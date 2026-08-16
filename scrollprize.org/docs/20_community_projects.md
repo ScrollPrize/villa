@@ -76,6 +76,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [vesuvius-repro](https://github.com/TAUIL-Abd-Elilah/vesuvius-repro): Regional reproducibility spot-checks of one selected 256³ region (central 128³ scored) from each of 41 m7 artifacts across 36 scrolls. Forty TTA-off checks match at Dice 0.9983–1.0000; PHerc. Paris 4 matches at 0.9999 with TTA on. The audit exposed previously missing configuration provenance; [#1253](https://github.com/ScrollPrize/villa/pull/1253) now records TTA, and maintainers backfilled existing artifacts. Also resolves each artifact's CT level. By TAUIL Abd Elilah
 
 - [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
+- [tifxyz-audit](https://github.com/jaideepsaipadhi/tifxyz-audit) by Jaideep Sai Padhi. Cross-scan tifxyz mesh consistency audit: reconciles a segment's meshes across its different source scans via the catalog's `transform.json` chains -- complements scroll-data-audit's volume-side reconciliation with a mesh-side check. 112/112 cross-scan pairs verified consistent across PHerc1667/PHerc0172/PHerc0332; found `area_vx2` absent from 100% of meshes built on two specific source scans ([#1468](https://github.com/ScrollPrize/villa/issues/1468)).
 
 ## Segmentation
 
