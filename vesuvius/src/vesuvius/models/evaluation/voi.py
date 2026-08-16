@@ -4,7 +4,7 @@ import torch
 from typing import Dict, Optional, Tuple
 from skimage.metrics import variation_of_information
 
-from .base_metric import BaseMetric
+from .base_metric import BaseMetric, binarize_scores
 
 
 class VOIMetric(BaseMetric):
@@ -232,7 +232,10 @@ def compute_voi(
 
         # Create binary masks (foreground = class 1 for binary, or nonzero for multi-class)
         # Apply valid mask by setting invalid regions to 0
-        pred_bin = ((pred_vol == 1) & valid) if pred_vol.max() <= 1 else ((pred_vol > 0) & valid)
+        # A single-channel head emits scores; picking the comparison from the
+        # data ("== 1" when nothing exceeds 1) makes probability outputs select
+        # no voxels at all, and flips with the batch. Threshold explicitly.
+        pred_bin = (binarize_scores(pred_vol) > 0) & valid
         gt_bin = ((gt_vol == 1) & valid) if gt_vol.max() <= 1 else ((gt_vol > 0) & valid)
 
         result = _compute_voi_3d(
