@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <fstream>
@@ -4297,11 +4298,16 @@ bool ChunkCache::isAllFill(const State& state, const std::vector<std::byte>& byt
         state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<std::uint16_t>::max())));
     if (bytes.size() % sizeof(std::uint16_t) != 0)
         return false;
-    const auto* ptr = reinterpret_cast<const std::uint16_t*>(bytes.data());
-    const std::size_t count = bytes.size() / sizeof(std::uint16_t);
-    return std::all_of(ptr, ptr + count, [fill](std::uint16_t value) {
-        return value == fill;
-    });
+    const auto fillBytes =
+        std::bit_cast<std::array<std::byte, sizeof(fill)>>(fill);
+    for (std::size_t offset = 0; offset < bytes.size();
+         offset += sizeof(fill)) {
+        if (bytes[offset] != fillBytes[0] ||
+            bytes[offset + 1] != fillBytes[1]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::size_t ChunkCache::dtypeSize(ChunkDtype dtype)

@@ -1,5 +1,9 @@
 # Changelog
 
+- Added a VC3D Download parallelism setting that switches the process-wide
+  chunk scheduler between automatic bandwidth-based admission and an explicit
+  fixed number of simultaneous downloads. Changes apply live without replacing
+  cache sources or queued/running work.
 - New remote-volume disk caches are incomplete byte-for-byte native Zarr
   mirrors. Complete sharded objects are coalesced across logical inner-chunk
   consumers, metadata remains protected, and prefill/redownload operate on

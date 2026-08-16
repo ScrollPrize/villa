@@ -254,9 +254,17 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable. Interactive remote volume reads use
-    // adaptive 2-64 source fetches; local reads use two. Decode workers are
-    // managed separately.
+    // Process-wide remote source-download admission. Automatic mode adapts
+    // between 2 and the fixed worker capacity. Manual mode admits exactly the
+    // configured number of simultaneous downloads. Decode workers are managed
+    // separately.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
+        "perf/remote_download_automatic";
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
+        "perf/remote_download_parallelism";
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
 
     // Reusable adaptive-download capacity model. Runtime probe phase and
     // stability timing are reset on every launch.

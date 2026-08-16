@@ -507,7 +507,9 @@ std::vector<std::byte> readTestBytes(const fs::path& path)
 
 std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
                                        std::array<int, 3> shape = {8, 8, 8},
-                                       std::array<int, 3> chunkShape = {4, 4, 4})
+                                       std::array<int, 3> chunkShape = {4, 4, 4},
+                                       double fillValue = 0.0,
+                                       ChunkDtype dtype = ChunkDtype::UInt8)
 {
     std::vector<ChunkCache::LevelInfo> levels = {
         {shape, chunkShape, {}},
@@ -518,8 +520,8 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        /*fillValue=*/0.0,
-        ChunkDtype::UInt8,
+        fillValue,
+        dtype,
         opts, std::move(cacheServiceOptions));
 }
 
@@ -657,6 +659,11 @@ TEST_CASE("ChunkCacheService source acquisition cannot change concurrency")
     concurrency = service->fetchConcurrency();
     CHECK(concurrency.maxConcurrentReads == 3);
     CHECK_FALSE(concurrency.adaptive);
+
+    service->configureFetchConcurrency(4, true);
+    concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 4);
+    CHECK(concurrency.adaptive);
 }
 
 TEST_CASE("ChunkCacheService increases admission without restarting work")
@@ -1288,6 +1295,31 @@ TEST_CASE("ChunkCache: all-zero data is detected as AllFill")
     auto c = makeCache(f);
     auto r = waitForResolved(*c, 0, 0, 0, 0);
     CHECK(r.status == ChunkStatus::AllFill);
+}
+
+TEST_CASE("ChunkCache: uint16 all-fill detection compares native byte pairs")
+{
+    constexpr std::uint16_t fill = 0x1234;
+    std::vector<std::uint16_t> values(2 * 4 * 4 * 4, fill);
+    values.back() = static_cast<std::uint16_t>(fill + 1);
+    const auto bytes = std::as_bytes(std::span{values});
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult uniform;
+    uniform.status = ChunkFetchStatus::Found;
+    uniform.bytes.assign(bytes.begin(), bytes.begin() + 4 * 4 * 4 * 2);
+    f->setCanned({0, 0, 0, 0}, std::move(uniform));
+
+    ChunkFetchResult mixed;
+    mixed.status = ChunkFetchStatus::Found;
+    mixed.bytes.assign(bytes.begin() + 4 * 4 * 4 * 2, bytes.end());
+    f->setCanned({0, 0, 0, 1}, std::move(mixed));
+
+    auto c = makeCache(
+        f, {4, 4, 8}, {4, 4, 4}, static_cast<double>(fill),
+        ChunkDtype::UInt16);
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::AllFill);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
 }
 
 TEST_CASE("ChunkCache: HttpError/IoError surface as Error status")

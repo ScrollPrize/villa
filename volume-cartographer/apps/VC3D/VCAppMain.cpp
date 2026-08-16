@@ -487,10 +487,22 @@ auto main(int argc, char* argv[]) -> int
 
     // RAM cache size: CLI flag > QSettings > CMake default
     size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB;
+    bool automaticDownloadParallelism =
+        vc3d::settings::perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT;
+    std::size_t fixedDownloadParallelism =
+        vc3d::settings::perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT;
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        automaticDownloadParallelism = settings.value(
+            perf::REMOTE_DOWNLOAD_AUTOMATIC,
+            perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
+        fixedDownloadParallelism = static_cast<std::size_t>(std::clamp(
+            settings.value(
+                perf::REMOTE_DOWNLOAD_PARALLELISM,
+                perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
+            1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
 
         // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
         QuadSurface::setBackupCount(
@@ -537,12 +549,18 @@ auto main(int argc, char* argv[]) -> int
             cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
         vc::render::ChunkCacheService::Options cacheOptions;
         cacheOptions.decodedByteCapacity = cacheSizeBytes;
-        cacheOptions.fetchConcurrency.workerCapacity = 64;
-        cacheOptions.fetchConcurrency.maxConcurrentReads = 64;
+        cacheOptions.fetchConcurrency.workerCapacity =
+            vc3d::settings::perf::REMOTE_DOWNLOAD_WORKER_CAPACITY;
+        cacheOptions.fetchConcurrency.maxConcurrentReads =
+            vc3d::settings::perf::REMOTE_DOWNLOAD_WORKER_CAPACITY;
         cacheOptions.fetchConcurrency.adaptive = true;
         cacheOptions.initialAdaptiveDownloadState = loadAdaptiveDownloadState();
         chunkCacheService = vc::render::configureProcessChunkCacheService(
             std::move(cacheOptions));
+        if (!automaticDownloadParallelism) {
+            chunkCacheService->configureFetchConcurrency(
+                fixedDownloadParallelism, false);
+        }
         CWindow aWin(cacheSizeGB, benchOptions);
 
         if (parser.isSet(volumePackageOption)) {

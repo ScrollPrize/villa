@@ -22,6 +22,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -129,14 +130,21 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
 
-    // IO threads is no longer user-configurable. Interactive volume reads use
-    // the conservative two-worker default in Volume::sharedChunkCache().
-    if (spinIOThreads) {
-        spinIOThreads->setEnabled(false);
-        spinIOThreads->setValue(2);
-    }
-    if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
-    if (spinIOThreads) spinIOThreads->hide();
+    const bool automaticDownloads = settings.value(
+        perf::REMOTE_DOWNLOAD_AUTOMATIC,
+        perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
+    chkAutoDownloadParallelism->setChecked(automaticDownloads);
+    spinIOThreads->setRange(1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY);
+    spinIOThreads->setValue(std::clamp(
+        settings.value(
+            perf::REMOTE_DOWNLOAD_PARALLELISM,
+            perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
+        1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
+    spinIOThreads->setEnabled(!automaticDownloads);
+    connect(chkAutoDownloadParallelism, &QCheckBox::toggled,
+            spinIOThreads, [this](bool automatic) {
+                spinIOThreads->setEnabled(!automatic);
+            });
 
     setupCacheActionControls();
 
@@ -292,6 +300,17 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+    const bool automaticDownloads = chkAutoDownloadParallelism->isChecked();
+    const int downloadParallelism = spinIOThreads->value();
+    settings.setValue(
+        perf::REMOTE_DOWNLOAD_AUTOMATIC, automaticDownloads);
+    settings.setValue(
+        perf::REMOTE_DOWNLOAD_PARALLELISM, downloadParallelism);
+    vc::render::processChunkCacheService()->configureFetchConcurrency(
+        automaticDownloads
+            ? static_cast<std::size_t>(perf::REMOTE_DOWNLOAD_WORKER_CAPACITY)
+            : static_cast<std::size_t>(downloadParallelism),
+        automaticDownloads);
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
     constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
@@ -309,9 +328,6 @@ void SettingsDialog::accept()
         settings.setValue(backup::SEGMENT_COUNT, backupCount);
         QuadSurface::setBackupCount(backupCount);
     }
-
-    // Source-read concurrency is process-global and managed by the shared
-    // chunk-cache service.
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

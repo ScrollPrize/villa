@@ -167,6 +167,14 @@ sampling, Open Data prefill, and Settings redownload all use this same process
 service. Standalone low-level tools and tests may intentionally own a wholly
 separate service and budget.
 
+VC3D exposes this policy as **Download parallelism** in Settings. Automatic
+mode uses adaptive admission from 2 through the process worker capacity of 64.
+Manual mode disables adaptation and admits exactly the selected number of
+simultaneous source downloads. Switching modes or changing the fixed number is
+applied immediately without replacing sources or interrupting queued/running
+work. The last manual number and mode persist across launches; adaptive history
+is retained while manual mode is active.
+
 Open Data prefill and Settings redownload submit persistence-only maintenance
 demand. Maintenance is the lowest scheduler class, below interactive and
 ordinary background work, but it uses the same worker pool, adaptive admission,
