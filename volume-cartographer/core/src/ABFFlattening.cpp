@@ -2405,6 +2405,18 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
     QuadSurface* result = new QuadSurface(outPoints, outScale);
 
+    // Preserve provenance metadata from the input. This constructor only
+    // sets points/scale -- meta (Surface's public utils::Json member) is left
+    // at its default, and save() only ever SETS bbox/type/uuid/format/scale
+    // on whatever meta already is rather than rebuilding it from scratch. So
+    // without this copy, every other key on the source's meta.json (anything
+    // beyond those five computed fields -- provenance, custom pipeline keys,
+    // whatever the source segment carried) is silently absent from the
+    // flattened output's meta.json. save()'s five computed keys correctly
+    // overwrite the corresponding ones copied here, since they describe the
+    // NEW (flattened) surface, not the source.
+    result->meta = surface.meta;
+
     // Step 7: Optionally rotate to place highest Z values at top (row 0)
     if (config.rotateHighZToTop) {
         result->orientZUp();

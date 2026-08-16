@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include "vc/core/util/MemMap.hpp"
 #include <vector>
@@ -170,7 +171,51 @@ int main(int argc, char* argv[])
     }
 
     Json meta = Json::parse_file(src / "meta.json");
-    if (meta.contains("bbox")) meta.erase("bbox");
+    // Recompute bbox from the TRIMMED points rather than dropping it. The old
+    // grid's bbox is wrong for the new extent, but a MISSING bbox is worse
+    // than a stale one: nothing downstream expects the field to be absent
+    // (QuadSurface::save() always writes one -- see core/src/QuadSurface.cpp,
+    // where bbox is recomputed from the saved points immediately before
+    // meta.json is written), so this keeps that convention instead of
+    // introducing a segment that violates it. `trimmed` (the already-cropped
+    // points, above) is exactly what QuadSurface::save() would see if this
+    // trimmed grid were loaded and re-saved, so bbox is computed the same
+    // way: min/max XYZ over valid points, skipping the -1,-1,-1 sentinel.
+    {
+        cv::Vec3f lo(std::numeric_limits<float>::max(),
+                    std::numeric_limits<float>::max(),
+                    std::numeric_limits<float>::max());
+        cv::Vec3f hi(-std::numeric_limits<float>::max(),
+                    -std::numeric_limits<float>::max(),
+                    -std::numeric_limits<float>::max());
+        bool any = false;
+        for (int r = 0; r < trimmed.rows; ++r) {
+            const cv::Vec3f* row = trimmed[r];
+            for (int c = 0; c < trimmed.cols; ++c) {
+                if (row[c][0] == -1.f) continue;
+                any = true;
+                for (int k = 0; k < 3; ++k) {
+                    lo[k] = std::min(lo[k], row[c][k]);
+                    hi[k] = std::max(hi[k], row[c][k]);
+                }
+            }
+        }
+        Json bbox = Json::array();
+        if (any) {
+            Json loJ = Json::array(); loJ.push_back(lo[0]); loJ.push_back(lo[1]); loJ.push_back(lo[2]);
+            Json hiJ = Json::array(); hiJ.push_back(hi[0]); hiJ.push_back(hi[1]); hiJ.push_back(hi[2]);
+            bbox.push_back(std::move(loJ));
+            bbox.push_back(std::move(hiJ));
+        } else {
+            // Unreachable in practice: r1/c1 < 0 above already exits when
+            // there are no valid cells at all, so `trimmed` always has at
+            // least one. Kept as a defensive fallback rather than assuming.
+            Json sentinel = Json::array(); sentinel.push_back(-1); sentinel.push_back(-1); sentinel.push_back(-1);
+            bbox.push_back(sentinel);
+            bbox.push_back(sentinel);
+        }
+        meta["bbox"] = std::move(bbox);
+    }
     {
         std::ofstream out(stage / "meta.json");
         out << meta.dump(4) << std::endl;
