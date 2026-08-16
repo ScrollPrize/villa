@@ -139,6 +139,90 @@ def test_tiled_tiff_streaming_matches_flat_image(tmp_path):
     )
 
 
+def test_striped_tiff_streaming_matches_flat_image(tmp_path):
+    """A plain ``tifffile.imwrite`` with no ``tile=`` writes a striped TIFF --
+    this is the input shape #1231's second half reports OOMing on, because the
+    old streaming gate checked only ``page.is_tiled``.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    image_YX = np.arange(64 * 96, dtype=np.uint16).reshape(64, 96)
+    tifffile.imwrite(label_path, image_YX)  # no tile= -> striped by default
+
+    with tifffile.TiffFile(label_path) as tif:
+        assert not tif.pages[0].is_tiled, "fixture must actually be striped"
+
+    result = convert_image(label_path, levels=2)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
+    )
+
+
+@pytest.mark.parametrize("compression", ["lzw", "deflate", "packbits"])
+def test_striped_tiff_streaming_covers_common_codecs(tmp_path, compression):
+    """Block decode must round-trip for every codec the streaming path
+    claims to support, not just uncompressed strips."""
+    label_path = tmp_path / f"segment-a_{compression}_supervision_mask.tif"
+    image_YX = np.random.default_rng(0).integers(
+        0, 255, size=(80, 120), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, image_YX, compression=compression)
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+def test_unstreamable_codec_falls_back_without_error(tmp_path):
+    """A codec outside the verified set (e.g. JPEG) must fall through to the
+    existing in-memory path rather than attempt an unsupported block decode."""
+    label_path = tmp_path / "segment-a_jpeg_inklabels.tif"
+    image_YX = np.random.default_rng(1).integers(
+        0, 255, size=(64, 64), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, image_YX, compression="jpeg")
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "false"
+    group = zarr.open_group(label_path.with_suffix(".zarr"), mode="r")
+    # JPEG is lossy, so this is a sanity check on shape/dtype, not exact
+    # pixel equality.
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == image_YX.shape
+
+
+def test_multipage_tiff_is_left_to_the_existing_path_unchanged(tmp_path):
+    """Multi-page TIFFs are explicitly out of scope for this change.
+
+    The rest of this module assumes a single flat 2D label image; converting
+    a genuine multi-page file already produces silently wrong output on the
+    pre-existing in-memory path today (tifffile.imread stacks pages, and the
+    channel-squeeze logic then mistakes the page axis for height). That bug
+    is real but separate, and this PR does not fix it -- it only guarantees
+    not to touch multi-page behaviour at all, so the streaming gate must
+    return "false" (unchanged from before this PR) for any multi-page input,
+    whether tiled or striped.
+    """
+    label_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    # z=5, not 3 or 4: tifffile's imwrite heuristically treats a leading axis
+    # of exactly 3 or 4 on a uint8 array as RGB(A) color planes and writes ONE
+    # page instead of several -- confirmed by hitting that ambiguity with
+    # z=3 while writing this test, which is itself a small illustration of
+    # how easy it is to end up with an unintended single-page file.
+    volume_ZYX = np.random.default_rng(2).integers(
+        0, 2, size=(5, 20, 30), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, volume_ZYX)  # writes 5 separate pages
+
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 5, "fixture must actually be multi-page"
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "false"
+
+
 def test_label_command_reports_failure_and_cli_module_help(tmp_path, capsys):
     bad = tmp_path / "bad_inklabels.tif"
     bad.write_bytes(b"not a tiff")
