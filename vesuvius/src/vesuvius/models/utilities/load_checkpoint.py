@@ -316,4 +316,4 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler, mgr, device, l
         )
         print("Loaded model weights only; starting new training run from epoch 1.")
     
-    return model, optimizer, scheduler, start_epoch, True
+    return model, optimizer, scheduler, start_epoch, strict_loaded
