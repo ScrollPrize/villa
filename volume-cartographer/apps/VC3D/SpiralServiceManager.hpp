@@ -92,6 +92,11 @@ public:
     // are no longer a side effect of pausing or of resuming a checkpoint, so
     // this is what keeps VC3D's "see the fit after it stops" behaviour.
     void requestPreview();
+    // Whether preview exports should also compute the loss overlays. They
+    // roughly double the cost of a preview and arrive as a second artifact
+    // after the surface, so this follows what the panel is displaying rather
+    // than being on by default.
+    void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
@@ -99,7 +104,7 @@ public:
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
-    // Only files declared by the currently installed preview artifact are
+    // Only files declared by the currently installed diagnostics artifact are
     // accepted by the cache.
     void fetchPreviewFile(const QString& relativeName,
                           FetchPreviewFileCallback done);
@@ -119,6 +124,10 @@ signals:
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
+    // The loss overlays for an already-installed preview, published by the
+    // service as a second artifact once the surface was on its way.
+    void previewDiagnosticsAvailable(const QString& manifestPath,
+                                     qint64 generation);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -235,8 +244,12 @@ private:
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;
+    QString _installedDiagnosticsArtifact;
+    QString _fetchingDiagnosticsArtifact;
+    bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
+    QString _lastDiagnosticsLocalPath;
     QString _synchronizedSessionId;
 };

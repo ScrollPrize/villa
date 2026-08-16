@@ -7,6 +7,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             FileStoreRendezvous, IncorporateCommand,
                             InteractiveFitSession, SaveCheckpointCommand,
                             collective_view)
+import spiral_helpers
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
 from tifxyz import save_combined_tifxyz
@@ -262,10 +264,95 @@ class PreviewRangeTests(unittest.TestCase):
             authoritative_zyx_lines=tracks,
         )
 
-        self.assertEqual(transform.calls, 2)
+        # One call for 70k single-point tracks: they are transformed as
+        # points, in batches of the transform chunk, not one call per line.
+        self.assertEqual(transform.calls, 1)
         self.assertEqual(winding_range, (10, 7005))
         self.assertEqual(patch_extents, [])
         self.assertEqual(pcl_extents, [])
+
+    def test_a_point_budget_bounds_the_transformed_track_points(self):
+        class CountingIdentity:
+            def __init__(self):
+                self.points = 0
+
+            def __call__(self, value):
+                self.points += int(value.shape[0])
+                return value
+
+        # One long track, so the budget has to thin within it. Points lie a
+        # voxel apart and dr_per_winding is 2000, the realistic ratio: a
+        # 200-point stride then costs a tenth of a winding.
+        dr_per_winding = torch.tensor(2000.0)
+        tracks = [torch.tensor(
+            [[50.0, 0.0, float(x)] for x in range(200_000)],
+            dtype=torch.float32)]
+        cfg = {"output_first_winding": 10, "output_winding_margin": 4}
+        exact = CountingIdentity()
+        exact_range, _, _ = compute_winding_range_and_input_extents(
+            exact, dr_per_winding, [], [], cfg, 0, 100, lambda *_: None,
+            authoritative_zyx_lines=tracks)
+        budgeted = CountingIdentity()
+        budgeted_range, _, _ = compute_winding_range_and_input_extents(
+            budgeted, dr_per_winding, [], [], cfg, 0, 100,
+            lambda *_: None, authoritative_zyx_lines=tracks,
+            point_budget=1000)
+
+        self.assertEqual(exact.points, 200_000)
+        self.assertLessEqual(budgeted.points, 1000)
+        # Thinning a track by a fixed stride moves the observed extreme by a
+        # fraction of a winding, which the output margin already covers.
+        self.assertEqual(exact_range[0], budgeted_range[0])
+        self.assertLessEqual(exact_range[1] - budgeted_range[1], 1)
+        self.assertLessEqual(budgeted_range[1], exact_range[1])
+
+
+class PreviewWindingBoundTests(unittest.TestCase):
+    """What sets the preview's outer winding, and what it costs to find out."""
+
+    class _Stop(Exception):
+        pass
+
+    def _export(self, cfg):
+        return spiral_helpers.save_combined_preview(
+            object(), torch.tensor(500.0), [], [], "/unused", cfg,
+            z_begin=0, z_end=100, voxel_size_um=9.6,
+            get_or_build_unattached_pcl_flat=lambda *_: None,
+            surface_id="surface")
+
+    def test_a_configured_shell_index_is_taken_without_deriving_it(self):
+        cfg = {"shell_outer_winding_idx": 130, "output_first_winding": 10,
+               "output_step_size": 20, "model_flow_bounds_z_margin": 0}
+        with mock.patch.object(
+                spiral_helpers,
+                "compute_winding_range_and_input_extents") as extents, \
+             mock.patch.object(spiral_helpers, "get_spiral_yxs",
+                               side_effect=self._Stop) as spiral_yxs:
+            with self.assertRaises(self._Stop):
+                self._export(cfg)
+
+        # No pass over the patch, PCL and track points: the configured index
+        # is the bound, and every dense sampler already integrates to it.
+        extents.assert_not_called()
+        self.assertEqual(spiral_yxs.call_args.args[0], 131)
+
+    def test_an_unset_shell_index_derives_the_bound_from_a_sample(self):
+        cfg = {"shell_outer_winding_idx": None, "output_first_winding": 10,
+               "output_winding_margin": 4, "output_step_size": 20,
+               "model_flow_bounds_z_margin": 0}
+        with mock.patch.object(
+                spiral_helpers, "compute_winding_range_and_input_extents",
+                return_value=((10, 61), [], [])) as extents, \
+             mock.patch.object(spiral_helpers, "get_spiral_yxs",
+                               side_effect=self._Stop) as spiral_yxs:
+            with self.assertRaises(self._Stop):
+                self._export(cfg)
+
+        extents.assert_called_once()
+        self.assertEqual(
+            extents.call_args.kwargs["point_budget"],
+            spiral_helpers.ESTIMATED_WINDING_RANGE_POINT_BUDGET)
+        self.assertEqual(spiral_yxs.call_args.args[0], 61)
 
 
 class _FakeWorker:
@@ -1074,7 +1161,7 @@ class ProtocolTests(unittest.TestCase):
             states = []
             session._state = SessionState.ExportingPreview
             session._context = SimpleNamespace(
-                export_preview=lambda destination, surface_id: {
+                export_preview=lambda destination, surface_id, diagnostics: {
                     "manifest_path": str(Path(destination) / "manifest.json"),
                 })
             session._publish_status = lambda: states.append((
@@ -1126,8 +1213,8 @@ class ProtocolTests(unittest.TestCase):
         session._publish_status = lambda: None
         states = []
 
-        def publish_preview():
-            states.append(session._state)
+        def publish_preview(diagnostics=False):
+            states.append((session._state, diagnostics))
             session._preview_manifest = "/preview/manifest.json"
             session._preview_generation = 3
 
@@ -1148,7 +1235,9 @@ class ProtocolTests(unittest.TestCase):
         session._run_export_preview(command)
         requester.join(5)
 
-        self.assertEqual(states, [SessionState.ExportingPreview])
+        # Diagnostics are opt-in, so an unqualified request does not ask the
+        # fitter for the loss overlays.
+        self.assertEqual(states, [(SessionState.ExportingPreview, False)])
         self.assertEqual(session._state, SessionState.Idle)
         self.assertEqual(results, [{"preview_manifest_path": "/preview/manifest.json",
                                     "preview_generation": 3}])

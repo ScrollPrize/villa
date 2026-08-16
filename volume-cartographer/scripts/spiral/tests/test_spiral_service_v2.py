@@ -43,6 +43,7 @@ from spiral_service import (ApiError, ArtifactRegistry, EphemeralLedger,
                             _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
+from lasagna_publish import PublishedPreview
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          AUTOSAVE_METADATA_NAME, AUTOSAVE_METADATA_SCHEMA,
                          SCROLL_SPEC_OWNED_RUN_KEYS,
@@ -87,6 +88,7 @@ class FakeSession:
         self.saved = []
         self.autosave_calls = []
         self.previews = 0
+        self.preview_diagnostics = []
         self.preview_gate = None
         self.preview_failure = None
         self.loaded = []
@@ -135,7 +137,7 @@ class FakeSession:
         return {"completed_iterations": 4200, "config_revision": 1,
                 "path": path}
 
-    def export_preview(self, timeout=600.0):
+    def export_preview(self, timeout=600.0, diagnostics=False):
         # The real export blocks its caller for minutes; these let a test
         # hold it open, or fail it, the way a real one can.
         if self.preview_gate is not None:
@@ -143,8 +145,10 @@ class FakeSession:
         if self.preview_failure is not None:
             raise RuntimeError(self.preview_failure)
         self.previews += 1
+        self.preview_diagnostics.append(bool(diagnostics))
         return {"preview_generation": self.previews,
-                "preview_manifest_path": f"/preview/{self.previews}"}
+                "preview_manifest_path": f"/preview/{self.previews}",
+                "preview_diagnostics": bool(diagnostics)}
 
     def rebuild_model(self, paths, run, timeout=1800.0):
         self.model_rebuilds.append((paths, run))
@@ -2654,6 +2658,101 @@ class MappedPreviewArtifactTests(unittest.TestCase):
             self.assertEqual(state._preview.completed_generation, 1)
             self.assertEqual(state._preview.previous_raw_manifest,
                              str(previous_manifest))
+
+    def _published(self, root, generation=1):
+        """A finished surface wave, as the publisher hands one over."""
+        surface = root / "published"
+        surface.mkdir()
+        (surface / "manifest.json").write_text("{}")
+        return PublishedPreview(
+            manifest_path=surface / "manifest.json",
+            surface_id="surface-1", generation=generation,
+            raw_manifest={}, raw_manifest_path=root / "raw" / "manifest.json",
+            publish_parent=root, correspondence=None, flattened_valid=None)
+
+    def test_surface_is_announced_before_the_diagnostics_wave_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "raw").mkdir()
+            (root / "raw" / "manifest.json").write_text("{}")
+            diagnostics = root / "diagnostics"
+            diagnostics.mkdir()
+            (diagnostics / "manifest.json").write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            announced = []
+            publisher = mock.Mock()
+            # The surface must already be announced by the time the overlays
+            # are asked for; that is the whole point of the second wave.
+            publisher.publish_diagnostics.side_effect = (
+                lambda published: (
+                    announced.append(dict(state._preview.artifact or {})),
+                    diagnostics / "manifest.json")[1])
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    return_value=(publisher, self._published(root))):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(root / "raw" / "manifest.json"),
+                    "preview_diagnostics": True,
+                })
+
+            self.assertEqual(len(announced), 1)
+            self.assertEqual(announced[0].get("kind"), "spiral-preview")
+            self.assertEqual(state._preview.artifact["kind"], "spiral-preview")
+            self.assertEqual(state._preview.diagnostics_artifact["kind"],
+                             "spiral-preview-diagnostics")
+            self.assertIsNone(state._preview.error)
+            self.assertIn("preview_diagnostics_artifact", state.status())
+
+    def test_a_preview_without_diagnostics_publishes_no_second_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "raw").mkdir()
+            (root / "raw" / "manifest.json").write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            publisher = mock.Mock()
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    return_value=(publisher, self._published(root))):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(root / "raw" / "manifest.json"),
+                })
+
+            publisher.publish_diagnostics.assert_not_called()
+            self.assertEqual(state._preview.artifact["kind"], "spiral-preview")
+            self.assertIsNone(state._preview.diagnostics_artifact)
+
+    def test_failed_overlays_do_not_fail_the_published_surface(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "raw").mkdir()
+            (root / "raw" / "manifest.json").write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            publisher = mock.Mock()
+            publisher.publish_diagnostics.side_effect = RuntimeError(
+                "overlay remap failed")
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    return_value=(publisher, self._published(root))):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(root / "raw" / "manifest.json"),
+                    "preview_diagnostics": True,
+                })
+
+            self.assertEqual(state._preview.artifact["kind"], "spiral-preview")
+            self.assertIsNone(state._preview.diagnostics_artifact)
+            self.assertIsNone(state._preview.error)
+            # The raw generation is the next run-difference base; a failed
+            # overlay must not discard it.
+            self.assertTrue((root / "raw").exists())
 
     def test_winding_membership_uses_flatten_correspondence(self):
         manifest = {
