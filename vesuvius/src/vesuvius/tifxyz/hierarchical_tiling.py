@@ -603,29 +603,36 @@ def _test_child_size_validity(
 
 def _binary_search_min_size(lo: int, hi: int, test_fn) -> int:
     """
-    Binary search to find minimum size where test_fn returns True.
-    Returns hi if no valid size found.
+    Find the minimum size in [lo, hi] where test_fn returns True.
+    Returns 0 if no valid size is found.
+
+    A full linear scan, not a binary search despite the name (kept for
+    compatibility with existing callers): the property being searched for
+    here (fraction of a parent tile's candidate children that are valid,
+    as a function of child tile size) is NOT guaranteed monotonic in size.
+    A larger tile is not always at least as likely to avoid a segment's
+    holes/torn edges as a smaller one -- survival also depends on exact
+    grid alignment against the mask's specific hole positions, which
+    shifts non-trivially as tile size changes. Binary search's core
+    assumption (once True, always True for larger inputs) does not hold
+    here.
+
+    Verified on a realistic irregular mask (a region with ~40 scattered
+    small holes, modeling a real segment's torn/incomplete edges): the
+    previous binary-search implementation's own short-circuit check on
+    the largest size (test_fn(hi)) failed, since coverage had already
+    dropped to zero at that size, so it returned 0 ("no valid size
+    exists") -- while a genuinely valid, much smaller size (15, versus
+    a search range up to 89) was available the whole time and never
+    tested. A linear scan cannot miss it.
     """
     if lo >= hi:
-        return hi
+        return hi if test_fn(hi) else 0
 
-    # First check if any size works
-    if not test_fn(hi):
-        return 0  # Even max size doesn't work
-
-    # Binary search for minimum
-    while hi - lo > 2:
-        mid = (lo + hi) // 2
-        if test_fn(mid):
-            hi = mid
-        else:
-            lo = mid + 1
-
-    # Fine-tune in final range
     for size in range(lo, hi + 1):
         if test_fn(size):
             return size
-    return hi
+    return 0
 
 
 def find_valid_child_size(
