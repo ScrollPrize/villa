@@ -34,6 +34,17 @@ struct ChunkCacheLevelInfo {
     IChunkedArray::LevelTransform transform{};
 };
 
+enum class PersistentCacheLayout {
+    Auto,
+    Legacy,
+    ZarrMirror,
+};
+
+struct PersistentCacheMetadataObject {
+    std::string key;
+    std::vector<std::byte> bytes;
+};
+
 struct ChunkCacheOptions {
     // Bound resolved non-data entries for sparse volumes.
     std::size_t metadataEntryCapacity = 1ULL << 20;
@@ -41,7 +52,12 @@ struct ChunkCacheOptions {
     std::optional<std::filesystem::path> persistentCachePath;
     // Optional root registered with PersistentZarrCacheBudget.
     std::optional<std::filesystem::path> persistentCacheBudgetRoot;
-    // Persistent writes only. Readers accept compressed and raw entries.
+    // Auto selects an existing legacy footprint, otherwise an exact Zarr
+    // mirror when metadata and physical-object fetchers are available.
+    PersistentCacheLayout persistentCacheLayout = PersistentCacheLayout::Auto;
+    std::vector<PersistentCacheMetadataObject> zarrMirrorMetadata;
+    // Deprecated compatibility fields. Readers accept legacy compressed
+    // entries, but production writes never create recompressed cache data.
     bool compressPersistentCache = false;
     // Near-lossless persistent-cache quantization width; one is lossless.
     int cacheQuantBinWidth = 1;
@@ -173,6 +189,7 @@ public:
         std::filesystem::path persistentEmptyPath;
         std::string persistentExtension;
         bool sourcePayloadMatchesPersistentCache = false;
+        PersistentCacheLayout layout = PersistentCacheLayout::Legacy;
     };
 
     ChunkCache(std::vector<LevelInfo> levels,
@@ -231,6 +248,9 @@ public:
     std::vector<ChunkKey> activeRemoteFetches() const;
 
     PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
+    PersistentCacheLayout persistentCacheLayout() const noexcept;
+    std::vector<ChunkKey> persistedStorageObjectRepresentatives() const;
+    std::vector<ChunkKey> storageObjectRepresentatives(int level) const;
 
     Stats stats() const;
     void invalidate();
@@ -244,9 +264,8 @@ public:
         int ix,
         PersistentRequestMode mode = PersistentRequestMode::Ensure);
 
-    // Process-wide default for Options::compressPersistentCache, OR-ed into
-    // every cache built afterwards. Lets an application apply a user setting
-    // without threading it through each construction site.
+    // Deprecated no-op compatibility API. Legacy compressed entries remain
+    // readable; new writes are never recompressed.
     static void setPersistentCompressionDefault(bool enabled);
     static bool persistentCompressionDefault();
 
@@ -340,6 +359,55 @@ private:
         std::weak_ptr<PersistenceOperation> persistence;
     };
 
+    struct StorageObjectKey {
+        int level = 0;
+        int iz = 0;
+        int iy = 0;
+        int ix = 0;
+
+        friend bool operator==(const StorageObjectKey&, const StorageObjectKey&) = default;
+    };
+
+    struct StorageObjectKeyHash {
+        std::size_t operator()(const StorageObjectKey& key) const noexcept
+        {
+            std::size_t seed = std::hash<int>{}(key.level);
+            auto combine = [&seed](int value) {
+                seed ^= std::hash<int>{}(value) + 0x9e3779b9 +
+                        (seed << 6) + (seed >> 2);
+            };
+            combine(key.iz);
+            combine(key.iy);
+            combine(key.ix);
+            return seed;
+        }
+    };
+
+    struct StorageConsumer {
+        std::uint64_t generation = 0;
+        std::uint64_t fetcherGeneration = 0;
+        std::uint64_t fetchSerial = 0;
+        std::uint64_t schedulerEpoch = 0;
+        std::shared_ptr<IChunkFetcher> fetcher;
+    };
+
+    struct StorageObjectTransfer {
+        enum class Stage { Probe, PersistentRead, Source };
+        std::uint64_t serial = 0;
+        std::uint64_t taskId = 0;
+        std::uint64_t schedulerEpoch = 0;
+        Stage stage = Stage::Probe;
+        ChunkStorageObject object;
+        std::shared_ptr<IChunkFetcher> fetcher;
+        std::unordered_map<ChunkKey, StorageConsumer, ChunkKeyHash> consumers;
+        std::unordered_map<ChunkKey,
+                           std::weak_ptr<PersistenceOperation>,
+                           ChunkKeyHash> persistence;
+        std::unordered_set<ChunkKey, ChunkKeyHash> notifiedConsumers;
+        bool refreshRequested = false;
+        bool sourceStarted = false;
+    };
+
     struct State {
         State(std::vector<LevelInfo> levels,
               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
@@ -359,6 +427,7 @@ private:
             , sourceIdentity_(std::move(sourceIdentity))
             , schedulerGroup_(ChunkCache::nextSchedulerGroup())
         {
+            persistentLayout_ = options_.persistentCacheLayout;
             unresolvedFetchesByLevel_.resize(levels_.size(), 0);
             persistentExtensions_.resize(fetchers_.size());
             for (std::size_t level = 0; level < fetchers_.size(); ++level) {
@@ -376,6 +445,7 @@ private:
         double fillValue_ = 0.0;
         ChunkDtype dtype_ = ChunkDtype::UInt8;
         Options options_;
+        PersistentCacheLayout persistentLayout_ = PersistentCacheLayout::Legacy;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget_;
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;
@@ -387,6 +457,9 @@ private:
                            std::shared_ptr<PersistenceOperation>,
                            ChunkKeyHash> persistenceOperations_;
         std::unordered_map<ChunkKey, SourceTransfer, ChunkKeyHash> sourceTransfers_;
+        std::unordered_map<StorageObjectKey,
+                           StorageObjectTransfer,
+                           StorageObjectKeyHash> storageObjectTransfers_;
         std::list<ChunkKey> lru_;
         std::vector<std::size_t> unresolvedFetchesByLevel_;
         std::size_t decodedBytes_ = 0;
@@ -446,6 +519,10 @@ private:
     static void reprioritizeEntryLocked(const State& state,
                                         const ChunkKey& key,
                                         Entry& entry);
+    static ChunkWorkPriority storageObjectPriorityLocked(
+        const State& state, const StorageObjectTransfer& transfer);
+    static void reprioritizeStorageObjectTransferLocked(
+        const State& state, const StorageObjectTransfer& transfer);
     static bool addRequestDemandLocked(State& state,
                                        const ChunkKey& key,
                                        Entry& entry,
@@ -456,10 +533,11 @@ private:
                                             Entry& entry);
     static void eraseUnresolvedEntryLocked(State& state,
                                            const ChunkKey& key);
-    static void queueFetchLocked(const std::shared_ptr<State>& state,
-                                 const ChunkKey& key,
-                                 std::uint64_t generation,
-                                 int priorityOffset);
+    [[nodiscard]] static bool queueFetchLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        std::uint64_t generation,
+        int priorityOffset);
     static void probePersistentAndDispatch(const std::shared_ptr<State>& state,
                                            ChunkKey key,
                                            FetchContext context);
@@ -484,6 +562,40 @@ private:
     static void runSourceTransfer(const std::shared_ptr<State>& state,
                                   ChunkKey key,
                                   std::uint64_t transferSerial);
+    [[nodiscard]] static bool joinStorageObjectTransferLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        FetchContext context,
+        bool decodeRequested,
+        const std::shared_ptr<PersistenceOperation>& persistence);
+    static void runStorageObjectProbe(
+        const std::shared_ptr<State>& state,
+        StorageObjectKey objectKey,
+        std::uint64_t transferSerial);
+    static void runStorageObjectRead(
+        const std::shared_ptr<State>& state,
+        StorageObjectKey objectKey,
+        std::uint64_t transferSerial);
+    static void queueStorageObjectSourceLocked(
+        const std::shared_ptr<State>& state,
+        StorageObjectKey objectKey,
+        StorageObjectTransfer& transfer);
+    static void runStorageObjectFetch(
+        const std::shared_ptr<State>& state,
+        StorageObjectKey objectKey,
+        std::uint64_t transferSerial);
+    static void dispatchStorageObjectResult(
+        const std::shared_ptr<State>& state,
+        StorageObjectKey objectKey,
+        std::uint64_t transferSerial,
+        ChunkFetchResult fetch,
+        bool loadedFromPersistentCache);
+    static void queueStorageObjectDecode(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        StorageConsumer consumer,
+        std::shared_ptr<const std::vector<std::byte>> objectBytes,
+        bool loadedFromPersistentCache);
     static void probePersistenceAndDispatch(
         const std::shared_ptr<State>& state,
         ChunkKey key,
@@ -540,6 +652,20 @@ private:
     static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentSourcePath(const State& state, const ChunkKey& key);
+    static std::filesystem::path mirrorObjectPath(
+        const State& state, const ChunkStorageObject& object);
+    static std::filesystem::path mirrorEmptyPath(
+        const State& state, const ChunkStorageObject& object);
+    static bool writeMirrorObject(
+        State& state,
+        const ChunkStorageObject& object,
+        std::span<const std::byte> bytes);
+    static bool writeMirrorEmpty(
+        State& state, const ChunkStorageObject& object);
+    static PersistentCacheLayout resolvePersistentCacheLayout(
+        const Options& options,
+        const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers);
+    static void publishMirrorMetadata(const std::shared_ptr<State>& state);
     static bool persistentEntryIsRaw(const State& state, const ChunkKey& key);
     static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
     static std::size_t persistentCacheBytes(

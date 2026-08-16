@@ -13,6 +13,7 @@
 #include <fstream>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace vc3d::opendata {
 namespace {
@@ -118,6 +119,17 @@ bool markerMatchesJson(const nlohmann::json& marker,
 bool cancelled(const std::atomic<bool>* cancelFlag)
 {
     return cancelFlag && cancelFlag->load(std::memory_order_acquire);
+}
+
+std::filesystem::path markerDirectoryForLayout(
+    const std::filesystem::path& cacheDir,
+    vc::render::PersistentCacheLayout layout)
+{
+    if (layout == vc::render::PersistentCacheLayout::ZarrMirror) {
+        return cacheDir.parent_path() / ".vc_cache_bookkeeping" /
+               cacheDir.filename();
+    }
+    return cacheDir;
 }
 
 } // namespace
@@ -270,13 +282,6 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
         result.message = "remote volume does not have scale level " + std::to_string(level);
         return result;
     }
-    if (openDataVolumePrefillMarkerMatches(result.cacheDir, *volume, level)) {
-        result.status = OpenDataVolumePrefillResult::Status::Skipped;
-        result.totalChunks = volume->chunkCount(level);
-        result.resolvedChunks = result.totalChunks;
-        result.message = "level already prefetched";
-        return result;
-    }
     if (cancelled(cancelFlag)) {
         result.status = OpenDataVolumePrefillResult::Status::Cancelled;
         result.message = "cancelled";
@@ -284,14 +289,6 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
     }
 
     try {
-        const auto grid = volume->chunkGridShape(level);
-        result.totalChunks = chunkCountForGrid(grid);
-        if (result.totalChunks == 0) {
-            result.status = OpenDataVolumePrefillResult::Status::Skipped;
-            result.message = "level has no chunks";
-            return result;
-        }
-
         auto cache = volume->sharedChunkCache();
         if (!cache) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
@@ -299,46 +296,74 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
             return result;
         }
 
-        for (int iz = 0; iz < grid[0]; ++iz) {
-            for (int iy = 0; iy < grid[1]; ++iy) {
-                for (int ix = 0; ix < grid[2]; ++ix) {
-                    if (cancelled(cancelFlag)) {
-                        result.status = OpenDataVolumePrefillResult::Status::Cancelled;
-                        result.message = "cancelled";
-                        cache->waitForPersistentWrites();
-                        return result;
-                    }
-
-                    const auto chunk = cache->persistChunkBlocking(
-                        level, iz, iy, ix,
-                        vc::render::ChunkCache::PersistentRequestMode::Ensure);
-                    ++result.resolvedChunks;
-                    switch (chunk.status) {
-                    case vc::render::ChunkCache::PersistentRequestStatus::Data:
-                        ++result.dataChunks;
-                        break;
-                    case vc::render::ChunkCache::PersistentRequestStatus::Missing:
-                        ++result.emptyChunks;
-                        break;
-                    case vc::render::ChunkCache::PersistentRequestStatus::Error:
-                        ++result.errorChunks;
-                        Logger()->warn(
-                            "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
-                            result.volumeId,
-                            level,
-                            iz,
-                            iy,
-                            ix,
-                            chunk.error);
-                        break;
-                    }
-
-                    if (progressCallback &&
-                        (result.resolvedChunks == result.totalChunks ||
-                         result.resolvedChunks % kProgressIntervalChunks == 0)) {
-                        progressCallback(result.resolvedChunks, result.totalChunks);
-                    }
+        std::vector<vc::render::ChunkKey> requests;
+        if (cache->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::ZarrMirror) {
+            requests = cache->storageObjectRepresentatives(level);
+        } else {
+            const auto grid = volume->chunkGridShape(level);
+            requests.reserve(chunkCountForGrid(grid));
+            for (int iz = 0; iz < grid[0]; ++iz) {
+                for (int iy = 0; iy < grid[1]; ++iy) {
+                    for (int ix = 0; ix < grid[2]; ++ix)
+                        requests.push_back({level, iz, iy, ix});
                 }
+            }
+        }
+        result.totalChunks = requests.size();
+        if (result.totalChunks == 0) {
+            result.status = OpenDataVolumePrefillResult::Status::Skipped;
+            result.message = "level has no chunks";
+            return result;
+        }
+
+        auto markerInfo = markerInfoForVolume(*volume, level);
+        markerInfo.totalChunks = result.totalChunks;
+        const auto markerDir = markerDirectoryForLayout(
+            result.cacheDir, cache->persistentCacheLayout());
+        if (openDataVolumePrefillMarkerMatches(markerDir, markerInfo)) {
+            result.status = OpenDataVolumePrefillResult::Status::Skipped;
+            result.resolvedChunks = result.totalChunks;
+            result.message = "level already prefetched";
+            return result;
+        }
+
+        for (const auto& key : requests) {
+            if (cancelled(cancelFlag)) {
+                result.status = OpenDataVolumePrefillResult::Status::Cancelled;
+                result.message = "cancelled";
+                cache->waitForPersistentWrites();
+                return result;
+            }
+
+            const auto chunk = cache->persistChunkBlocking(
+                level, key.iz, key.iy, key.ix,
+                vc::render::ChunkCache::PersistentRequestMode::Ensure);
+            ++result.resolvedChunks;
+            switch (chunk.status) {
+            case vc::render::ChunkCache::PersistentRequestStatus::Data:
+                ++result.dataChunks;
+                break;
+            case vc::render::ChunkCache::PersistentRequestStatus::Missing:
+                ++result.emptyChunks;
+                break;
+            case vc::render::ChunkCache::PersistentRequestStatus::Error:
+                ++result.errorChunks;
+                Logger()->warn(
+                    "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
+                    result.volumeId,
+                    level,
+                    key.iz,
+                    key.iy,
+                    key.ix,
+                    chunk.error);
+                break;
+            }
+
+            if (progressCallback &&
+                (result.resolvedChunks == result.totalChunks ||
+                 result.resolvedChunks % kProgressIntervalChunks == 0)) {
+                progressCallback(result.resolvedChunks, result.totalChunks);
             }
         }
 
@@ -351,7 +376,7 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
 
         std::string markerError;
         if (!writeOpenDataVolumePrefillMarker(
-                result.cacheDir, *volume, level, result.totalChunks, &markerError)) {
+                markerDir, markerInfo, &markerError)) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
             result.message = "could not write prefill marker: " + markerError;
             return result;

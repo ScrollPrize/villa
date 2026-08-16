@@ -236,21 +236,6 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true, raw chunks downloaded from remote volumes are stored in the
-    // persistent disk cache compressed at the configured quantization width.
-    // Reading understands both formats regardless of this flag; it only
-    // controls the write format. Requires restart.
-    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
-    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
-
-    // Quantization bin width for compressed disk-cache writes
-    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
-    // Only affects newly written chunks; reading is unaffected. Requires
-    // restart, except for the explicit "recompress existing cache" action.
-    // Default lossless: compression saves space without changing voxels.
-    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
-    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
-
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
     constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";

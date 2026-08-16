@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +14,26 @@
 namespace vc::render {
 
 inline constexpr std::string_view kPersistentSourcePayloadExtension = ".source";
+
+// Zarr store keys are relative slash-separated object names. Reject platform
+// roots, empty components, and traversal before joining them to a cache root.
+inline bool isSafeZarrStoreKey(std::string_view key) noexcept
+{
+    if (key.empty() || key.front() == '/' || key.find('\\') != std::string_view::npos ||
+        (key.size() >= 2 && key[1] == ':'))
+        return false;
+    std::size_t begin = 0;
+    while (begin < key.size()) {
+        const auto end = key.find('/', begin);
+        const auto component = key.substr(begin, end - begin);
+        if (component.empty() || component == "." || component == "..")
+            return false;
+        if (end == std::string_view::npos)
+            return true;
+        begin = end + 1;
+    }
+    return false;
+}
 
 struct VolumeSourceId {
     std::uint64_t value = 0;
@@ -64,6 +86,24 @@ struct ChunkFetchResult {
     std::string message;
 };
 
+// A logical decoded chunk may be an inner member of one physical storage
+// object (a Zarr shard). Persistent probing, downloading, and writing use this
+// identity; decoded RAM remains keyed by ChunkKey.
+struct ChunkStorageObject {
+    ChunkKey representativeKey;
+    int outerZ = 0;
+    int outerY = 0;
+    int outerX = 0;
+    std::array<int, 3> innerIndices{};
+    std::array<int, 3> innerChunksPerObject{1, 1, 1};
+    std::string sourceKey;
+
+    [[nodiscard]] bool sharded() const noexcept
+    {
+        return innerChunksPerObject != std::array<int, 3>{1, 1, 1};
+    }
+};
+
 class IChunkFetcher {
 public:
     using DownloadProgressCallback = std::function<void(std::size_t)>;
@@ -110,6 +150,36 @@ public:
     }
 
     virtual std::optional<std::string> sourceChunkKey(const ChunkKey&) const
+    {
+        return std::nullopt;
+    }
+
+    // Exact physical-object access used by native Zarr mirror caches. Generic
+    // fetchers remain on the legacy logical-chunk persistence path.
+    virtual std::optional<ChunkStorageObject>
+    storageObject(const ChunkKey&) const
+    {
+        return std::nullopt;
+    }
+
+    virtual ChunkFetchResult fetchStorageObject(
+        const ChunkStorageObject& object,
+        const DownloadProgressCallback& progress)
+    {
+        return fetchEncoded(object.representativeKey, progress);
+    }
+
+    virtual ChunkFetchResult decodeStorageObject(
+        const ChunkKey& key,
+        std::span<const std::byte> objectBytes) const
+    {
+        return decodeSourcePayload(
+            key, std::vector<std::byte>(objectBytes.begin(), objectBytes.end()));
+    }
+
+    virtual std::optional<ChunkKey> logicalRepresentativeForStorageKey(
+        int,
+        std::string_view) const
     {
         return std::nullopt;
     }

@@ -496,15 +496,6 @@ auto main(int argc, char* argv[]) -> int
         QuadSurface::setBackupCount(
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
 
-        // Remote-volume disk-cache compression. Applied as a process-wide
-        // default so every ChunkCache picks it up, including the core-created
-        // ones used by blocking readers.
-        vc::render::ChunkCache::setPersistentCompressionDefault(
-            settings.value(perf::REMOTE_CACHE_COMPRESSION,
-                           perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
-        vc::render::ChunkCache::setPersistentQuantizationDefault(
-            settings.value(perf::REMOTE_CACHE_QUANTIZATION,
-                           perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt());
         constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
         vc::render::PersistentZarrCacheBudget::Limits limits;
         const auto maximumGiB = settings.value(

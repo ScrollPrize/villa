@@ -1,49 +1,61 @@
-# Task log
+# Direct Zarr mirror disk-cache task log
 
-## Findings
+## 2026-08-16
 
-- Open Data prefill currently walks a private cache through
-  `getChunkBlocking()`, so every downloaded chunk is decoded and enters decoded
-  cache accounting before disk persistence.
-- Settings redownload repeats the same pattern with a separate service, then
-  writes the returned decoded bytes itself.
-- Ordinary prefetch users already target a Volume's shared cache; the main
-  architectural gap is a persistence-only consumer on the shared keyed source
-  fetch.
-- Generic compressed Zarr source payloads currently become decoded `.bin`
-  persistent entries. A strict no-decode prefill therefore requires exact
-  encoded source payloads to become a supported persistent representation.
-- The previous task's default injection of the process decoded-byte budget into
-  isolated services creates eviction coupling without cache/data sharing. This
-  task removes that prefill/redownload special case.
-- Independent plan review found that maintenance completion must remain separate
-  from decoded entry state, that the existing fair background lane is not a
-  strict lowest-priority lane, and that changing ordinary persistent writes to
-  exact-source format would exceed the task. The revised plan uses a separate
-  maintenance state, a third scheduler class, and an additional exact-source
-  representation used only by maintenance.
-- Exact no-decode refresh cannot preserve redownload's current compression and
-  quantization behavior. Redownload will refresh exact source payloads only;
-  existing-cache compression remains a separate explicit action.
-- Implemented a third maintenance work class inside each existing scheduler;
-  no additional scheduler, worker pool, or connection pool was introduced.
-- Added exact `.source` persistence, normal-read decoding of that form,
-  bidirectional source-transfer joining, and atomic replacement semantics.
-- Migrated Open Data prefill and Settings redownload to the shared source cache,
-  removed Volume-level private cache construction, and moved Lasagna corner
-  samplers to stable path-keyed process-cache sources.
-- Added focused tests for zero-decode persistence, source refresh outcomes,
-  both transfer-join directions, view-demand removal, fetcher refresh, decoded
-  RAM accounting, and maintenance priority.
-
-## Deviations
-
-- None.
-
-## Validation
-
-- Built the complete configured project, including VC3D and `vc_volume`.
-- Focused cache/Volume/Open Data/Lasagna tests passed (6/6).
-- Full CTest passed (150/150), including the configured live network tests.
-- Final source scans found no remaining Volume-level private cache factory or
-  in-process Lasagna corner-budget hybrid.
+- Committed the preceding shared cache-service and persistence work as
+  `03fac62b9` before starting this layout change.
+- Confirmed legacy caches support per-chunk mixed representations. Legacy
+  `.zst` wins over `.bin`, corrupt `.zst` falls back to `.bin`, and `.empty` is
+  considered only when no data representation exists.
+- Confirmed `ZarrChunkFetcher::sourceChunkKey()` already exposes the physical
+  source-relative object key needed by a direct mirror.
+- Confirmed remote Zarr metadata is fetched during pyramid opening, before
+  normal chunk-cache work, so metadata mirroring must be integrated with the
+  remote opener rather than inferred from decoded chunks.
+- Independent review found that the first plan incorrectly treated an extracted
+  sharded inner payload as a complete source object. The revised plan separates
+  logical decode keys from physical storage-object keys and requires full-shard
+  download, persistence, read deduplication, and decode fanout.
+- The revised plan also makes physical download notifications distinct from
+  logical overlay/ready notifications, moves mirror bookkeeping outside the
+  Zarr root, requires explicit metadata collection, and makes prefill,
+  redownload, and budget accounting storage-object-aware.
+- Implemented immutable layout selection: a complete legacy cache footprint
+  retains legacy behavior, native/empty cache roots use direct mirrors, and
+  ambiguous nonempty roots fail rather than mixing representations.
+- Added exact metadata publication and source-relative object persistence with
+  validated store keys. Structural metadata is protected from eviction while
+  still respecting the disk free-space floor.
+- Separated logical decoded chunks from physical storage objects throughout
+  probe, persistent-read, source-download, write, and decode stages. Concurrent
+  inner-chunk requests now share one complete outer-shard transfer and exact
+  write, then decode independently from the shared payload.
+- Updated `.empty` handling so whole missing shards receive one outer marker,
+  while missing inner entries in present shards do not create false sidecars.
+- Made Open Data prefill and redownload enumerate physical storage objects in
+  mirror mode and retain the existing logical legacy scanners otherwise.
+- Removed VC3D remote-cache recompression controls and production writes while
+  retaining mixed legacy `.bin`, `.zst`, `.c3d`, `.source`, and `.empty`
+  decoding/writing compatibility.
+- Added regression coverage for mirror selection, exact-byte reopen, complete
+  shard coalescing and notifications, missing-shard semantics, unsafe metadata
+  paths, protected metadata accounting, and legacy selection.
+- Final concurrency review corrected physical-transfer activity retirement so
+  consumers joining during the post-download mirror write cannot retain stale
+  active notifications, and retired fetcher generations cannot decrement a
+  newer transfer's in-flight count.
+- Native budget discovery now parses v2/v3 array metadata and validates exact
+  chunk-key syntax. Unrelated files inside an array directory remain protected
+  and untracked rather than becoming eviction candidates.
+- Mirror layout selection now validates physical storage-object support before
+  admitting any request, so incompatible generic fetchers fail immediately
+  instead of leaving logical requests unresolved.
+- Validation:
+  - `cmake --build volume-cartographer/build -j 8`
+  - `ctest --test-dir volume-cartographer/build -j 8 --output-on-failure`
+    (`150/150` passed)
+  - `git diff --check`
+- The first aggregate rebuild exposed a corrupt generated `test_atlas.cpp.o`.
+  Forcing that target to rebuild cleared the build-tree artifact; the following
+  complete build and test run passed.
+- No implementation deviations from the reviewed full-shard mirror plan.

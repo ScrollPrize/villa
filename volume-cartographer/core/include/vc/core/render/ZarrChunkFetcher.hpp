@@ -33,6 +33,7 @@ struct OpenedChunkedZarr {
     // identity scale with zero translation. This survives logical rebasing so
     // catalog prediction/source preflight can enforce prediction identity.
     bool physicalLevelZeroTransformIsIdentity = true;
+    std::vector<PersistentCacheMetadataObject> zarrMirrorMetadata;
 };
 
 struct RemoteZarrOpenOptions {

@@ -1,5 +1,11 @@
 # Changelog
 
+- New remote-volume disk caches are incomplete byte-for-byte native Zarr
+  mirrors. Complete sharded objects are coalesced across logical inner-chunk
+  consumers, metadata remains protected, and prefill/redownload operate on
+  physical storage objects. Existing mixed legacy caches retain their reader
+  and writer behavior, while production decoded-cache recompression and its
+  VC3D controls have been removed.
 - Routed Open Data prefill and Settings redownload through persistence-only
   maintenance demand on the process chunk-cache service. Exact source payloads
   are stored without decode, share keyed transfers with rendering, and run

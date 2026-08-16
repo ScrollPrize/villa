@@ -1,16 +1,27 @@
-# Task
+# Direct Zarr mirror disk cache
 
-Separate persistent-cache population from decoded-data prefetch without
-creating a second download system.
+Change persistent remote-volume caching so a newly encountered remote Zarr is
+cached as an incomplete but otherwise exact local mirror of the source Zarr.
 
-- Normal prefetch and blocking sampling must always use the process-global
-  decoded chunk cache with no special per-caller cache services.
-- Open Data prefill and Settings "Redownload cache" must write exact source
-  payloads to the persistent disk cache without decoding or retaining decoded
-  chunks.
-- Persistence-only work must use the process service's existing source-read
-  scheduler, run at maintenance priority behind interactive and ordinary
-  background work, and deduplicate source reads with simultaneous decoded
-  requests for the same chunk.
-- Standalone processes and explicitly low-level batch/test construction may
-  continue to own a separate cache service.
+Requirements:
+
+- Select the legacy cache layout whenever an existing cache directory contains
+  the legacy cache footprint, including for a remote volume newly added to a
+  project.
+- Keep legacy per-chunk reading and writing so existing mixed `.bin`, `.zst`,
+  `.c3d`, `.source`, and `.empty` caches remain usable.
+- Select the direct-mirror layout for a remote volume with no legacy footprint.
+- Mirror required Zarr metadata and store every downloaded encoded chunk at its
+  exact source-relative Zarr object key. The resulting directory must be
+  readable as an incomplete native Zarr volume.
+- For sharded arrays, download, deduplicate, persist, and account the complete
+  outer shard object while decoding only requested logical inner chunks.
+- Continue writing missing-chunk markers as an adjacent `<chunk-key>.empty`
+  file; native Zarr readers must continue to see the original chunk key as
+  absent and ignore the marker.
+- Ordinary remote reads, Open Data prefill, and cache redownload must all use
+  the selected layout and the shared source scheduler.
+- Remove VC3D options and production paths that recompress decoded cache data.
+  Keep legacy compressed-cache decoding, but do not create new recompressed
+  cache entries.
+- Preserve exact downloaded bytes and existing rendering values.

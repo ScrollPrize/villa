@@ -1724,6 +1724,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         return nullptr;
     }
 
+    options.zarrMirrorMetadata = std::move(opened.zarrMirrorMetadata);
     auto levels = makeChunkCacheLevelInfo(opened);
     return vc::render::processChunkCacheService()->acquireSource(
         chunkCacheSourceIdentity(), std::move(levels),

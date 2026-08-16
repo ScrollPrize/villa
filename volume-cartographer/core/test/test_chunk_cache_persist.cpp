@@ -7,6 +7,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/CacheCompression.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -127,6 +129,14 @@ void writeSizedFile(const fs::path& path, std::size_t size, unsigned char value 
     std::ofstream f(path, std::ios::binary);
     std::vector<char> bytes(size, static_cast<char>(value));
     f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+void writeBytes(const fs::path& path, std::span<const std::byte> bytes)
+{
+    fs::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
 }
 
 template <typename Predicate>
@@ -485,7 +495,7 @@ std::vector<std::byte> variedBytes(std::size_t n)
 
 } // namespace
 
-TEST_CASE("compressPersistentCache stores .zst instead of .bin")
+TEST_CASE("deprecated persistent compression option does not recompress new writes")
 {
     auto persist = tmpDir("compress_write");
     auto f = std::make_shared<CountingFetcher>();
@@ -498,9 +508,9 @@ TEST_CASE("compressPersistentCache stores .zst instead of .bin")
     auto r = waitForResolved(*c, 0, 0, 0, 0);
     REQUIRE(r.status == ChunkStatus::Data);
 
-    const auto zst = persist / "level_0" / "0" / "0" / "0.zst";
-    CHECK(waitForFile(zst));
-    CHECK_FALSE(fs::exists(persist / "level_0" / "0" / "0" / "0.bin"));
+    const auto raw = persist / "level_0" / "0" / "0" / "0.bin";
+    CHECK(waitForFile(raw));
+    CHECK_FALSE(fs::exists(persist / "level_0" / "0" / "0" / "0.zst"));
     fs::remove_all(persist);
 }
 
@@ -508,19 +518,13 @@ TEST_CASE("Reopen cache: compressed .zst entry is loaded without a fetch")
 {
     auto persist = tmpDir("compress_reload");
     const auto expected = variedBytes(64);
+    const auto compressed = vc::cacheCompress(
+        expected, {4, 4, 4}, 1, vc::kCacheCompressionLevel,
+        vc::kCacheQuantLossless);
+    writeBytes(
+        persist / "level_0" / "0" / "0" / "0.zst", compressed);
 
-    {
-        auto f = std::make_shared<CountingFetcher>();
-        ChunkFetchResult fr;
-        fr.status = ChunkFetchStatus::Found;
-        fr.bytes = expected;
-        f->setCanned({0, 0, 0, 0}, fr);
-        auto c = makeCache(f, persist, /*compress=*/true);
-        REQUIRE(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
-        REQUIRE(waitForFile(persist / "level_0" / "0" / "0" / "0.zst"));
-    }
-
-    // Compression off: the reader must still understand the .zst entry.
+    // New writes never recompress, but the reader still accepts legacy .zst.
     auto f = std::make_shared<CountingFetcher>();
     auto c = makeCache(f, persist, /*compress=*/false);
     auto r = waitForResolved(*c, 0, 0, 0, 0);

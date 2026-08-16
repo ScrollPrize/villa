@@ -160,6 +160,14 @@ Python exposes the equivalent module-level functions
 `vc.set_chunk_cache_io_threads(count)`. The latter selects fixed admission.
 Cache policy is deliberately not configured through a `Volume` instance.
 
+For a newly encountered remote Zarr, `cacheRoot` holds an incomplete native
+mirror: metadata and fetched storage objects keep their source-relative paths
+and exact encoded bytes. Sharded arrays cache one complete outer shard and fan
+out requested inner-chunk decodes from that shared payload. Adjacent `.empty`
+markers represent missing whole objects. Existing legacy
+`level_N/z/y/x.<ext>` caches are detected automatically and remain readable and
+writable without migration; no new decoded-cache recompression is performed.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `chunkedCache()` | `vc::render::IChunkedArray*` | Shared chunked cache for local or remote reads |

@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <fstream>
+#include <regex>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -98,6 +100,150 @@ std::string fetchErrorMessage(const ChunkFetchResult& fetch)
     }
     return "chunk fetch error";
 }
+
+bool hasLegacyCacheFootprint(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec) || ec)
+        return false;
+    const std::regex levelPattern(R"(^level_[0-9]+$)");
+    const auto isUnsignedInteger = [](std::string_view value) {
+        return !value.empty() && std::ranges::all_of(
+            value, [](unsigned char ch) { return std::isdigit(ch) != 0; });
+    };
+    const auto isLegacyPayload = [&](const std::filesystem::path& path) {
+        const auto extension = path.extension().string();
+        if (extension != ".bin" && extension != ".zst" &&
+            extension != ".c3d" && extension != ".source" &&
+            extension != ".empty") {
+            return false;
+        }
+        return isUnsignedInteger(path.stem().string());
+    };
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec)
+            return false;
+        const auto name = entry.path().filename().string();
+        if (entry.is_regular_file(ec) && !ec &&
+            name.rfind(".vc_prefill_level_", 0) == 0) {
+            return true;
+        }
+        ec.clear();
+        if (!entry.is_directory(ec) || ec || !std::regex_match(name, levelPattern)) {
+            ec.clear();
+            continue;
+        }
+        for (const auto& zEntry :
+             std::filesystem::directory_iterator(entry.path(), ec)) {
+            if (ec)
+                break;
+            if (!zEntry.is_directory(ec) || ec ||
+                !isUnsignedInteger(zEntry.path().filename().string())) {
+                ec.clear();
+                continue;
+            }
+            for (const auto& yEntry :
+                 std::filesystem::directory_iterator(zEntry.path(), ec)) {
+                if (ec)
+                    break;
+                if (!yEntry.is_directory(ec) || ec ||
+                    !isUnsignedInteger(yEntry.path().filename().string())) {
+                    ec.clear();
+                    continue;
+                }
+                for (const auto& xEntry :
+                     std::filesystem::directory_iterator(yEntry.path(), ec)) {
+                    if (ec)
+                        break;
+                    if (xEntry.is_regular_file(ec) && !ec &&
+                        isLegacyPayload(xEntry.path())) {
+                        return true;
+                    }
+                    ec.clear();
+                }
+                ec.clear();
+            }
+            ec.clear();
+        }
+        ec.clear();
+    }
+    return false;
+}
+
+bool hasNativeZarrMetadata(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(root / "zarr.json", ec) && !ec)
+        return true;
+    ec.clear();
+    if (std::filesystem::is_regular_file(root / ".zgroup", ec) && !ec)
+        return true;
+    ec.clear();
+    if (std::filesystem::is_regular_file(root / ".zarray", ec) && !ec)
+        return true;
+    ec.clear();
+    if (!std::filesystem::is_directory(root, ec) || ec)
+        return false;
+    for (std::filesystem::recursive_directory_iterator it(
+             root, std::filesystem::directory_options::skip_permission_denied,
+             ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+        const auto name = it->path().filename().string();
+        if (name == ".zarray" || name == "zarr.json")
+            return true;
+    }
+    return false;
+}
+
+bool directoryHasEntries(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || ec)
+        return false;
+    if (!std::filesystem::is_directory(root, ec) || ec)
+        return true;
+    return std::filesystem::directory_iterator(root, ec) !=
+           std::filesystem::directory_iterator{};
+}
+
+bool atomicWriteBytes(const std::filesystem::path& path,
+                      std::span<const std::byte> bytes)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+        return false;
+    const auto tmp = path.string() + uniqueTmpSuffix();
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return false;
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            file.close();
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (!ec)
+        return true;
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tmp, path, ec);
+    if (!ec)
+        return true;
+    std::filesystem::remove(tmp, ec);
+    return false;
+}
+
+std::optional<std::vector<std::byte>>
+readFileBytes(const std::filesystem::path& path);
 
 } // namespace
 
@@ -297,12 +443,11 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
         throw std::invalid_argument(
             "ChunkCache requires a non-empty source identity");
     }
-    options.compressPersistentCache =
-        options.compressPersistentCache || ChunkCache::persistentCompressionDefault();
-    options.cacheQuantBinWidth = std::max(
-        options.cacheQuantBinWidth,
-        ChunkCache::persistentQuantizationDefault());
+    options.compressPersistentCache = false;
+    options.cacheQuantBinWidth = 1;
     ChunkCache::validateSourceDefinition(levels, fetchers);
+    options.persistentCacheLayout = ChunkCache::resolvePersistentCacheLayout(
+        options, fetchers);
 
     auto service = shared_from_this();
     std::unique_lock serviceLock(impl_->mutex);
@@ -340,6 +485,8 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     }
     if (state->options_.persistentCachePath && !state->persistentBudget_)
         ChunkCache::startPersistentCacheSizeScan(state);
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror)
+        ChunkCache::publishMirrorMetadata(state);
     ChunkCache::registerStateBudget(state);
     impl_->sources.emplace(state->sourceIdentity_, state);
     return std::shared_ptr<ChunkCache>(
@@ -533,6 +680,7 @@ void ChunkCache::refreshFetchers(
         throw std::invalid_argument("ChunkCache fetcher refresh requires state");
     validateRefreshedFetchers(*state, fetchers);
 
+    std::vector<ChunkKey> stoppedRemoteActivity;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
         if (std::equal(fetchers.begin(), fetchers.end(),
@@ -556,6 +704,24 @@ void ChunkCache::refreshFetchers(
             }
         }
         state->sourceTransfers_.clear();
+        for (const auto& [objectKey, transfer] :
+             state->storageObjectTransfers_) {
+            (void)objectKey;
+            if (transfer.sourceStarted && state->remoteFetchesInFlight_ > 0)
+                --state->remoteFetchesInFlight_;
+            for (const auto& key : transfer.notifiedConsumers) {
+                auto active = state->activeRemoteFetches_.find(key);
+                if (active == state->activeRemoteFetches_.end() ||
+                    active->second.erase(transfer.serial) == 0) {
+                    continue;
+                }
+                if (active->second.empty()) {
+                    state->activeRemoteFetches_.erase(active);
+                    stoppedRemoteActivity.push_back(key);
+                }
+            }
+        }
+        state->storageObjectTransfers_.clear();
         restartUnresolvedLocked(state);
         for (auto& [key, operation] : state->persistenceOperations_) {
             if (operation->writeQueued.load(std::memory_order_acquire))
@@ -570,6 +736,11 @@ void ChunkCache::refreshFetchers(
                 state->fetchers_.at(static_cast<std::size_t>(key.level)),
                 {},
             };
+            if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+                (void)joinStorageObjectTransferLocked(
+                    state, key, std::move(context), false, operation);
+                continue;
+            }
             if (operation->refresh) {
                 joinSourceTransferLocked(
                     state, key, std::move(context), false, operation);
@@ -593,6 +764,8 @@ void ChunkCache::refreshFetchers(
                 });
         }
     });
+    for (const auto& key : stoppedRemoteActivity)
+        notifyRemoteFetchListeners(state, key, false);
     state->cv_.notify_all();
 }
 
@@ -636,7 +809,7 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
     });
     for (const auto& [serial, key] : retry) {
         (void)serial;
-        queueFetchLocked(state, key, state->generation_, 0);
+        (void)queueFetchLocked(state, key, state->generation_, 0);
     }
 }
 
@@ -649,7 +822,8 @@ std::weak_ptr<DecodedChunkCacheBudget> g_decodedBudgetDefault;
 
 void ChunkCache::setPersistentCompressionDefault(bool enabled)
 {
-    g_persistentCompressionDefault.store(enabled, std::memory_order_relaxed);
+    (void)enabled;
+    g_persistentCompressionDefault.store(false, std::memory_order_relaxed);
 }
 
 bool ChunkCache::persistentCompressionDefault()
@@ -659,8 +833,8 @@ bool ChunkCache::persistentCompressionDefault()
 
 void ChunkCache::setPersistentQuantizationDefault(int binWidth)
 {
-    g_persistentQuantizationDefault.store(std::clamp(binWidth, 1, 255),
-                                          std::memory_order_relaxed);
+    (void)binWidth;
+    g_persistentQuantizationDefault.store(1, std::memory_order_relaxed);
 }
 
 int ChunkCache::persistentQuantizationDefault()
@@ -729,6 +903,7 @@ bool ChunkCache::metadataCompatible(const State& state,
         state.dtype_ != dtype || state.fillValue_ != fillValue ||
         state.options_.persistentCachePath != options.persistentCachePath ||
         state.options_.persistentCacheBudgetRoot != options.persistentCacheBudgetRoot ||
+        state.persistentLayout_ != options.persistentCacheLayout ||
         state.options_.compressPersistentCache != options.compressPersistentCache ||
         state.options_.cacheQuantBinWidth != options.cacheQuantBinWidth ||
         state.options_.detectAllFillChunks != options.detectAllFillChunks) {
@@ -743,6 +918,96 @@ bool ChunkCache::metadataCompatible(const State& state,
         }
     }
     return true;
+}
+
+PersistentCacheLayout ChunkCache::resolvePersistentCacheLayout(
+    const Options& options,
+    const std::vector<std::shared_ptr<IChunkFetcher>>& fetchers)
+{
+    if (!options.persistentCachePath)
+        return PersistentCacheLayout::Legacy;
+
+    const auto& root = *options.persistentCachePath;
+    const auto validateMirrorFetchers = [&] {
+        for (std::size_t level = 0; level < fetchers.size(); ++level) {
+            if (!fetchers[level])
+                continue;
+            const ChunkKey key{static_cast<int>(level), 0, 0, 0};
+            const auto object = fetchers[level]->storageObject(key);
+            if (!object) {
+                throw std::runtime_error(
+                    "Zarr mirror cache requires physical storage-object support");
+            }
+            if (!isSafeZarrStoreKey(object->sourceKey)) {
+                throw std::runtime_error(
+                    "unsafe Zarr storage-object key: " + object->sourceKey);
+            }
+        }
+    };
+    if (options.persistentCacheLayout == PersistentCacheLayout::Legacy)
+        return PersistentCacheLayout::Legacy;
+    if (options.persistentCacheLayout == PersistentCacheLayout::ZarrMirror) {
+        if (options.zarrMirrorMetadata.empty() &&
+            !hasNativeZarrMetadata(root)) {
+            throw std::runtime_error(
+                "Zarr mirror cache requires native array metadata");
+        }
+        validateMirrorFetchers();
+        return PersistentCacheLayout::ZarrMirror;
+    }
+
+    if (hasLegacyCacheFootprint(root))
+        return PersistentCacheLayout::Legacy;
+    if (hasNativeZarrMetadata(root)) {
+        validateMirrorFetchers();
+        return PersistentCacheLayout::ZarrMirror;
+    }
+    // Generic chunk fetchers do not define a native Zarr object namespace;
+    // their persistent paths remain the legacy logical layout even when a
+    // test or caller pre-populated files before constructing the cache.
+    if (options.zarrMirrorMetadata.empty())
+        return PersistentCacheLayout::Legacy;
+    if (directoryHasEntries(root)) {
+        throw std::runtime_error(
+            "persistent cache directory is neither a legacy cache nor a Zarr mirror: " +
+            root.string());
+    }
+
+    validateMirrorFetchers();
+    return PersistentCacheLayout::ZarrMirror;
+}
+
+void ChunkCache::publishMirrorMetadata(const std::shared_ptr<State>& state)
+{
+    if (!state || !state->options_.persistentCachePath ||
+        state->persistentLayout_ != PersistentCacheLayout::ZarrMirror) {
+        return;
+    }
+    for (const auto& object : state->options_.zarrMirrorMetadata) {
+        if (!isSafeZarrStoreKey(object.key)) {
+            throw std::runtime_error(
+                "unsafe Zarr metadata cache key: " + object.key);
+        }
+        const auto path = *state->options_.persistentCachePath /
+                          std::filesystem::path(object.key);
+        if (auto existing = readFileBytes(path); existing && *existing == object.bytes)
+            continue;
+        auto reservation = state->persistentBudget_
+            ? state->persistentBudget_->reserveProtectedWrite(
+                  path, object.bytes.size())
+            : PersistentZarrCacheBudget::WriteReservation{};
+        if (state->persistentBudget_ && !reservation) {
+            throw std::runtime_error(
+                "insufficient disk budget for Zarr mirror metadata: " +
+                path.string());
+        }
+        if (!atomicWriteBytes(path, object.bytes)) {
+            reservation.commit();
+            throw std::runtime_error(
+                "failed to publish Zarr mirror metadata: " + path.string());
+        }
+        reservation.commit();
+    }
 }
 
 int ChunkCache::numLevels() const
@@ -818,7 +1083,11 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
             ChunkStatus::MissQueued, state->dtype_,
             state->levels_[level].chunkShape, {}, {}};
     }
-    queueFetchLocked(state, key, state->generation_, 0);
+    const bool notifyRemoteStart = queueFetchLocked(
+        state, key, state->generation_, 0);
+    lock.unlock();
+    if (notifyRemoteStart)
+        notifyRemoteFetchListeners(state, key, true);
     return ChunkResult{
         ChunkStatus::MissQueued, state->dtype_,
         state->levels_[level].chunkShape, {}, {}};
@@ -872,8 +1141,13 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 
     auto [it, inserted] = state->entries_.emplace(key, Entry{});
     it->second.backgroundDemand = true;
-    if (inserted)
-        queueFetchLocked(state, key, state->generation_, 0);
+    const bool notifyRemoteStart = inserted && queueFetchLocked(
+        state, key, state->generation_, 0);
+    if (notifyRemoteStart) {
+        lock.unlock();
+        notifyRemoteFetchListeners(state, key, true);
+        lock.lock();
+    }
     waitForResolvedLocked(*state, lock, key);
     it = state->entries_.find(key);
     if (it == state->entries_.end())
@@ -895,6 +1169,7 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
 {
     auto state = state_;
     std::unique_lock lock(state->mutex_);
+    std::vector<ChunkKey> remoteStarts;
     for (auto key : keys) {
         key = sourceKey(*state, key);
         if (!isValidKey(*state, key))
@@ -902,7 +1177,10 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
         if (inserted) {
             if (addRequestDemandLocked(*state, key, it->second, request)) {
-                queueFetchLocked(state, key, state->generation_, priorityOffset);
+                if (queueFetchLocked(
+                        state, key, state->generation_, priorityOffset)) {
+                    remoteStarts.push_back(key);
+                }
             } else {
                 state->entries_.erase(it);
             }
@@ -914,6 +1192,14 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
                 reprioritizeEntryLocked(*state, key, it->second);
             }
         }
+    }
+    if (!remoteStarts.empty()) {
+        lock.unlock();
+        for (const auto& key : remoteStarts)
+            notifyRemoteFetchListeners(state, key, true);
+        if (!wait)
+            return;
+        lock.lock();
     }
     if (!wait)
         return;
@@ -1003,11 +1289,119 @@ ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
     if (!result.valid)
         return result;
     const ChunkKey externalKey = fetcherKey(key);
+    result.layout = state->persistentLayout_;
     result.sourceChunkKey = fetcher->sourceChunkKey(externalKey);
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+        const auto object = fetcher->storageObject(externalKey);
+        if (!object) {
+            result.valid = false;
+            return result;
+        }
+        result.sourceChunkKey = object->sourceKey;
+        result.persistentPath = mirrorObjectPath(*state, *object);
+        result.persistentEmptyPath = mirrorEmptyPath(*state, *object);
+        result.persistentExtension.clear();
+        result.sourcePayloadMatchesPersistentCache = true;
+        return result;
+    }
     result.persistentPath = persistentPath(*state, key);
     result.persistentEmptyPath = persistentEmptyPath(*state, key);
     result.persistentExtension = fetcher->persistentCacheExtension(externalKey);
     result.sourcePayloadMatchesPersistentCache = fetcher->sourcePayloadMatchesPersistentCache(externalKey);
+    return result;
+}
+
+PersistentCacheLayout ChunkCache::persistentCacheLayout() const noexcept
+{
+    return state_->persistentLayout_;
+}
+
+std::vector<ChunkKey> ChunkCache::persistedStorageObjectRepresentatives() const
+{
+    auto state = state_;
+    std::vector<ChunkKey> result;
+    if (!state->options_.persistentCachePath ||
+        state->persistentLayout_ != PersistentCacheLayout::ZarrMirror) {
+        return result;
+    }
+
+    std::unordered_set<ChunkKey, ChunkKeyHash> seen;
+    std::error_code ec;
+    const auto& root = *state->options_.persistentCachePath;
+    for (std::filesystem::recursive_directory_iterator it(
+             root, std::filesystem::directory_options::skip_permission_denied,
+             ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+        auto relative = std::filesystem::relative(it->path(), root, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        std::string key = relative.generic_string();
+        if (key.size() > 6 && key.ends_with(".empty"))
+            key.resize(key.size() - 6);
+        for (std::size_t level = 0; level < state->fetchers_.size(); ++level) {
+            const auto& fetcher = state->fetchers_[level];
+            if (!fetcher)
+                continue;
+            auto logical = fetcher->logicalRepresentativeForStorageKey(
+                static_cast<int>(level), key);
+            if (!logical)
+                continue;
+            *logical = sourceKey(*state, *logical);
+            if (isValidKey(*state, *logical) && seen.insert(*logical).second)
+                result.push_back(*logical);
+            break;
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+        return std::tie(lhs.level, lhs.iz, lhs.iy, lhs.ix) <
+               std::tie(rhs.level, rhs.iz, rhs.iy, rhs.ix);
+    });
+    return result;
+}
+
+std::vector<ChunkKey> ChunkCache::storageObjectRepresentatives(int level) const
+{
+    auto state = state_;
+    if (level < 0 || level >= static_cast<int>(state->levels_.size()))
+        throw std::out_of_range("storage-object level out of range");
+    const auto& fetcher = state->fetchers_.at(static_cast<std::size_t>(level));
+    if (!fetcher)
+        return {};
+    const auto first = fetcher->storageObject(ChunkKey{level, 0, 0, 0});
+    if (!first)
+        return {};
+
+    const auto& info = state->levels_.at(static_cast<std::size_t>(level));
+    std::array<int, 3> logicalGrid{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        logicalGrid[axis] =
+            (info.shape[axis] + info.chunkShape[axis] - 1) /
+            info.chunkShape[axis];
+    }
+    const auto& factor = first->innerChunksPerObject;
+    const std::array<int, 3> objectGrid{
+        (logicalGrid[0] + factor[0] - 1) / factor[0],
+        (logicalGrid[1] + factor[1] - 1) / factor[1],
+        (logicalGrid[2] + factor[2] - 1) / factor[2]};
+    std::vector<ChunkKey> result;
+    result.reserve(static_cast<std::size_t>(objectGrid[0]) *
+                   static_cast<std::size_t>(objectGrid[1]) *
+                   static_cast<std::size_t>(objectGrid[2]));
+    for (int oz = 0; oz < objectGrid[0]; ++oz) {
+        for (int oy = 0; oy < objectGrid[1]; ++oy) {
+            for (int ox = 0; ox < objectGrid[2]; ++ox) {
+                result.push_back(sourceKey(
+                    *state, ChunkKey{level, oz * factor[0],
+                                     oy * factor[1], ox * factor[2]}));
+            }
+        }
+    }
     return result;
 }
 
@@ -1096,6 +1490,7 @@ void ChunkCache::replaceViewDemand(const ChunkRequestContext& request,
     }
 
     auto state = state_;
+    std::vector<ChunkKey> remoteStarts;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
         const auto previousSnapshot = state->viewSnapshots_.find(request.viewId);
@@ -1140,10 +1535,12 @@ void ChunkCache::replaceViewDemand(const ChunkRequestContext& request,
             slot.version = request.viewVersion;
             slot.relativeLevel = demand.relativeLevel;
             slot.distanceSquared = demand.distanceSquared;
-            if (inserted)
-                queueFetchLocked(state, key, state->generation_, 0);
-            else
+            if (inserted) {
+                if (queueFetchLocked(state, key, state->generation_, 0))
+                    remoteStarts.push_back(key);
+            } else {
                 reprioritizeEntryLocked(*state, key, entryIt->second);
+            }
         }
 
         for (const ChunkKey& key : previousKeys) {
@@ -1162,6 +1559,8 @@ void ChunkCache::replaceViewDemand(const ChunkRequestContext& request,
         for (auto& [key, entry] : state->entries_)
             reprioritizeEntryLocked(*state, key, entry);
     });
+    for (const auto& key : remoteStarts)
+        notifyRemoteFetchListeners(state, key, true);
     state->cv_.notify_all();
 }
 
@@ -1259,6 +1658,7 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         state->viewSnapshots_.clear();
         state->viewDemandKeys_.clear();
         state->sourceTransfers_.clear();
+        state->storageObjectTransfers_.clear();
         for (const auto& [key, operation] : state->persistenceOperations_) {
             (void)key;
             if (!operation->writeQueued.load(std::memory_order_acquire))
@@ -1349,8 +1749,23 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
         auto existing = state->persistenceOperations_.find(key);
         if (existing != state->persistenceOperations_.end()) {
             operation = existing->second;
-            if (mode == PersistentRequestMode::Refresh)
+            if (mode == PersistentRequestMode::Refresh) {
                 operation->refresh = true;
+                if (state->persistentLayout_ ==
+                    PersistentCacheLayout::ZarrMirror) {
+                    if (const auto object = fetcher->storageObject(
+                            fetcherKey(key))) {
+                        const StorageObjectKey objectKey{
+                            key.level, object->outerZ,
+                            object->outerY, object->outerX};
+                        if (auto transfer =
+                                state->storageObjectTransfers_.find(objectKey);
+                            transfer != state->storageObjectTransfers_.end()) {
+                            transfer->second.refreshRequested = true;
+                        }
+                    }
+                }
+            }
         } else {
             operation = std::make_shared<PersistenceOperation>();
             operation->refresh = mode == PersistentRequestMode::Refresh;
@@ -1376,6 +1791,11 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
                 state->fetchers_.at(static_cast<std::size_t>(level)),
                 {},
             };
+            if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+                (void)joinStorageObjectTransferLocked(
+                    state, key, std::move(context), false, operation);
+                return;
+            }
             if (operation->refresh) {
                 joinSourceTransferLocked(
                     state, key, std::move(context), false, operation);
@@ -1410,6 +1830,23 @@ void ChunkCache::probePersistenceAndDispatch(
     ChunkKey key,
     std::shared_ptr<PersistenceOperation> operation)
 {
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+        state->schedulerSelectionGate_->publish([&] {
+            std::lock_guard lock(state->mutex_);
+            const auto current = state->persistenceOperations_.find(key);
+            if (current == state->persistenceOperations_.end() ||
+                current->second != operation) {
+                return;
+            }
+            FetchContext context{
+                state->generation_, state->fetcherGeneration_, 0,
+                state->schedulerEpoch_,
+                state->fetchers_.at(static_cast<std::size_t>(key.level)), {}};
+            (void)joinStorageObjectTransferLocked(
+                state, key, std::move(context), false, operation);
+        });
+        return;
+    }
     bool refresh = false;
     {
         std::lock_guard lock(state->mutex_);
@@ -1588,18 +2025,105 @@ void ChunkCache::reprioritizeEntryLocked(const State& state,
     if (entry.status != EntryStatus::InFlight)
         return;
     const auto priority = workPriorityLocked(state, key, entry);
-    if (entry.probeTaskId != 0) {
+    bool sharedObjectTask = false;
+    if (state.persistentLayout_ == PersistentCacheLayout::ZarrMirror &&
+        (entry.probeTaskId != 0 || entry.fetchTaskId != 0 ||
+         entry.decodeTaskId != 0)) {
+        const auto& fetcher = state.fetchers_.at(
+            static_cast<std::size_t>(key.level));
+        if (fetcher) {
+            if (const auto object = fetcher->storageObject(fetcherKey(key))) {
+                const StorageObjectKey objectKey{
+                    key.level, object->outerZ, object->outerY, object->outerX};
+                if (auto transfer = state.storageObjectTransfers_.find(objectKey);
+                    transfer != state.storageObjectTransfers_.end()) {
+                    sharedObjectTask =
+                        transfer->second.taskId == entry.probeTaskId ||
+                        transfer->second.taskId == entry.fetchTaskId ||
+                        transfer->second.taskId == entry.decodeTaskId;
+                    if (sharedObjectTask) {
+                        reprioritizeStorageObjectTransferLocked(
+                            state, transfer->second);
+                    }
+                }
+            }
+        }
+    }
+    if (!sharedObjectTask && entry.probeTaskId != 0) {
         if (auto scheduler = state.probeScheduler_.lock())
             scheduler->reprioritize(entry.probeTaskId, priority);
     }
-    if (entry.fetchTaskId != 0) {
+    if (!sharedObjectTask && entry.fetchTaskId != 0) {
         if (auto scheduler = state.fetchScheduler_.lock())
             scheduler->reprioritize(entry.fetchTaskId, priority);
     }
-    if (entry.decodeTaskId != 0) {
+    if (!sharedObjectTask && entry.decodeTaskId != 0) {
         if (auto scheduler = state.decodeScheduler_.lock())
             scheduler->reprioritize(entry.decodeTaskId, priority);
     }
+}
+
+ChunkWorkPriority ChunkCache::storageObjectPriorityLocked(
+    const State& state,
+    const StorageObjectTransfer& transfer)
+{
+    ChunkWorkPriority best;
+    best.maintenance = transfer.consumers.empty();
+    bool have = false;
+    for (const auto& [consumerKey, consumer] : transfer.consumers) {
+        (void)consumer;
+        const auto entry = state.entries_.find(consumerKey);
+        if (entry == state.entries_.end() || !hasDemandLocked(entry->second))
+            continue;
+        const auto candidate = workPriorityLocked(
+            state, consumerKey, entry->second);
+        const auto candidateDistance = std::isfinite(candidate.distanceSquared)
+            ? candidate.distanceSquared
+            : std::numeric_limits<float>::infinity();
+        const auto bestDistance = std::isfinite(best.distanceSquared)
+            ? best.distanceSquared
+            : std::numeric_limits<float>::infinity();
+        const bool better = !have ||
+            (candidate.interactive && !best.interactive) ||
+            (candidate.interactive == best.interactive &&
+             candidate.levelPriority > best.levelPriority) ||
+            (candidate.interactive == best.interactive &&
+             candidate.levelPriority == best.levelPriority &&
+             candidate.activeView && !best.activeView) ||
+            (candidate.interactive == best.interactive &&
+             candidate.levelPriority == best.levelPriority &&
+             candidate.activeView == best.activeView &&
+             candidateDistance < bestDistance) ||
+            (!candidate.interactive && !best.interactive &&
+             candidate.backgroundPriority < best.backgroundPriority);
+        if (better) {
+            best = candidate;
+            have = true;
+        }
+    }
+    best.maintenance = !have;
+    return best;
+}
+
+void ChunkCache::reprioritizeStorageObjectTransferLocked(
+    const State& state,
+    const StorageObjectTransfer& transfer)
+{
+    std::shared_ptr<ChunkRequestScheduler> scheduler;
+    switch (transfer.stage) {
+    case StorageObjectTransfer::Stage::Probe:
+        scheduler = state.probeScheduler_.lock();
+        break;
+    case StorageObjectTransfer::Stage::PersistentRead:
+        scheduler = state.decodeScheduler_.lock();
+        break;
+    case StorageObjectTransfer::Stage::Source:
+        scheduler = state.fetchScheduler_.lock();
+        break;
+    }
+    if (scheduler)
+        scheduler->reprioritize(
+            transfer.taskId, storageObjectPriorityLocked(state, transfer));
 }
 
 bool ChunkCache::addRequestDemandLocked(State& state,
@@ -1643,6 +2167,55 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
 {
     if (entry.status != EntryStatus::InFlight || hasDemandLocked(entry))
         return false;
+
+    if (state.persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+        const auto& fetcher = state.fetchers_.at(
+            static_cast<std::size_t>(key.level));
+        if (fetcher) {
+            if (const auto object = fetcher->storageObject(fetcherKey(key))) {
+                const StorageObjectKey objectKey{
+                    key.level, object->outerZ, object->outerY, object->outerX};
+                auto transfer = state.storageObjectTransfers_.find(objectKey);
+                if (transfer != state.storageObjectTransfers_.end()) {
+                    if (!transfer->second.notifiedConsumers.contains(key))
+                        transfer->second.consumers.erase(key);
+                    entry.probeTaskId = 0;
+                    entry.fetchTaskId = 0;
+                    entry.decodeTaskId = 0;
+                    bool hasPersistence = false;
+                    for (auto it = transfer->second.persistence.begin();
+                         it != transfer->second.persistence.end();) {
+                        if (it->second.expired())
+                            it = transfer->second.persistence.erase(it);
+                        else {
+                            hasPersistence = true;
+                            ++it;
+                        }
+                    }
+                    if (transfer->second.consumers.empty() && !hasPersistence) {
+                        std::shared_ptr<ChunkRequestScheduler> scheduler;
+                        switch (transfer->second.stage) {
+                        case StorageObjectTransfer::Stage::Probe:
+                            scheduler = state.probeScheduler_.lock();
+                            break;
+                        case StorageObjectTransfer::Stage::PersistentRead:
+                            scheduler = state.decodeScheduler_.lock();
+                            break;
+                        case StorageObjectTransfer::Stage::Source:
+                            scheduler = state.fetchScheduler_.lock();
+                            break;
+                        }
+                        if (scheduler && scheduler->cancel(transfer->second.taskId))
+                            state.storageObjectTransfers_.erase(transfer);
+                    } else {
+                        reprioritizeStorageObjectTransferLocked(
+                            state, transfer->second);
+                    }
+                    return true;
+                }
+            }
+        }
+    }
 
     bool hadPendingTask = false;
     bool taskAlreadyRunning = false;
@@ -1705,14 +2278,14 @@ void ChunkCache::eraseUnresolvedEntryLocked(State& state,
     state.entries_.erase(entry);
 }
 
-void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
+bool ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
                                   const ChunkKey& key,
                                   std::uint64_t generation,
                                   int priorityOffset)
 {
     auto it = state->entries_.find(key);
     if (it == state->entries_.end())
-        return;
+        return false;
     Entry& entry = it->second;
     if (!entry.unresolvedCounted &&
         key.level >= 0 &&
@@ -1734,17 +2307,21 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
         state->fetchers_.at(static_cast<std::size_t>(key.level)),
         {}};
     if (!context.fetcher)
-        return;
+        return false;
     std::weak_ptr<State> weakState = state;
     entry.probeTaskId = 0;
     entry.fetchTaskId = 0;
     entry.decodeTaskId = 0;
-    if (state->options_.persistentCachePath) {
+    if (state->options_.persistentCachePath &&
+        state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+        return joinStorageObjectTransferLocked(
+            state, key, context, true, {});
+    } else if (state->options_.persistentCachePath) {
         const auto taskId = state->nextTaskId_->fetch_add(1, std::memory_order_relaxed);
         entry.probeTaskId = taskId;
         auto scheduler = state->probeScheduler_.lock();
         if (!scheduler)
-            return;
+            return false;
         scheduler->submit(
             taskId, priority, state->schedulerGroup_, schedulerEpoch,
             [weakState, key, context] {
@@ -1755,6 +2332,7 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
     } else {
         joinSourceTransferLocked(state, key, context, true, {});
     }
+    return false;
 }
 
 void ChunkCache::probePersistentAndDispatch(const std::shared_ptr<State>& state,
@@ -1802,6 +2380,7 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
                                   FetchContext context)
 {
     bool pruned = false;
+    bool remoteStart = false;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
         auto it = state->entries_.find(key);
@@ -1816,8 +2395,15 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
             pruned = true;
             return;
         }
-        joinSourceTransferLocked(state, key, context, true, {});
+        if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
+            remoteStart = joinStorageObjectTransferLocked(
+                state, key, context, true, {});
+        } else {
+            joinSourceTransferLocked(state, key, context, true, {});
+        }
     });
+    if (remoteStart)
+        notifyRemoteFetchListeners(state, key, true);
     if (pruned)
         state->cv_.notify_all();
 }
@@ -2137,6 +2723,533 @@ void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
 
     if (decodeRequested)
         finishAndStore(state, key, context, std::move(fetch), false);
+}
+
+bool ChunkCache::joinStorageObjectTransferLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    FetchContext context,
+    bool decodeRequested,
+    const std::shared_ptr<PersistenceOperation>& persistence)
+{
+    if (!context.fetcher)
+        return false;
+    const auto object = context.fetcher->storageObject(fetcherKey(key));
+    if (!object || !isSafeZarrStoreKey(object->sourceKey)) {
+        if (persistence) {
+            state->persistenceOperations_.erase(key);
+            {
+                std::lock_guard operationLock(persistence->mutex);
+                persistence->result = {
+                    PersistentRequestStatus::Error,
+                    "source fetcher has no valid physical Zarr object"};
+                persistence->completed = true;
+            }
+            persistence->cv.notify_all();
+        }
+        return false;
+    }
+    const StorageObjectKey objectKey{
+        key.level, object->outerZ, object->outerY, object->outerX};
+
+    auto found = state->storageObjectTransfers_.find(objectKey);
+    if (found != state->storageObjectTransfers_.end()) {
+        auto& transfer = found->second;
+        bool notifyRemoteStart = false;
+        if (persistence && persistence->refresh)
+            transfer.refreshRequested = true;
+        if (decodeRequested) {
+            transfer.consumers[key] = StorageConsumer{
+                context.generation, context.fetcherGeneration,
+                context.fetchSerial, context.schedulerEpoch, context.fetcher};
+            if (auto entry = state->entries_.find(key);
+                entry != state->entries_.end()) {
+                if (transfer.stage == StorageObjectTransfer::Stage::Probe)
+                    entry->second.probeTaskId = transfer.taskId;
+                else if (transfer.stage == StorageObjectTransfer::Stage::PersistentRead)
+                    entry->second.decodeTaskId = transfer.taskId;
+                else
+                    entry->second.fetchTaskId = transfer.taskId;
+            }
+            if (transfer.sourceStarted &&
+                transfer.notifiedConsumers.insert(key).second) {
+                state->activeRemoteFetches_[key].insert(transfer.serial);
+                notifyRemoteStart = true;
+            }
+        }
+        if (persistence) {
+            transfer.persistence[key] = persistence;
+            if (transfer.stage == StorageObjectTransfer::Stage::Source) {
+                persistence->probeTaskId = 0;
+                persistence->sourceTaskId = transfer.taskId;
+            } else {
+                persistence->probeTaskId = transfer.taskId;
+                persistence->sourceTaskId = 0;
+            }
+        }
+        reprioritizeStorageObjectTransferLocked(*state, transfer);
+        return notifyRemoteStart;
+    }
+
+    StorageObjectTransfer transfer;
+    transfer.serial = state->nextSourceTransferSerial_++;
+    transfer.taskId = state->nextTaskId_->fetch_add(
+        1, std::memory_order_relaxed);
+    transfer.schedulerEpoch = context.schedulerEpoch;
+    transfer.object = *object;
+    transfer.fetcher = context.fetcher;
+    transfer.refreshRequested = persistence && persistence->refresh;
+    transfer.stage = persistence && persistence->refresh
+        ? StorageObjectTransfer::Stage::Source
+        : StorageObjectTransfer::Stage::Probe;
+    if (decodeRequested) {
+        transfer.consumers.emplace(
+            key, StorageConsumer{context.generation, context.fetcherGeneration,
+                                 context.fetchSerial, context.schedulerEpoch,
+                                 context.fetcher});
+        if (auto entry = state->entries_.find(key);
+            entry != state->entries_.end()) {
+            if (transfer.stage == StorageObjectTransfer::Stage::Probe)
+                entry->second.probeTaskId = transfer.taskId;
+            else if (transfer.stage == StorageObjectTransfer::Stage::PersistentRead)
+                entry->second.decodeTaskId = transfer.taskId;
+            else
+                entry->second.fetchTaskId = transfer.taskId;
+        }
+    }
+    if (persistence) {
+        transfer.persistence.emplace(key, persistence);
+        if (transfer.stage == StorageObjectTransfer::Stage::Source)
+            persistence->sourceTaskId = transfer.taskId;
+        else
+            persistence->probeTaskId = transfer.taskId;
+    }
+
+    const auto serial = transfer.serial;
+    const auto taskId = transfer.taskId;
+    const auto stage = transfer.stage;
+    const auto priority = storageObjectPriorityLocked(*state, transfer);
+    state->storageObjectTransfers_.emplace(objectKey, std::move(transfer));
+    auto scheduler = stage == StorageObjectTransfer::Stage::Probe
+        ? state->probeScheduler_.lock()
+        : state->fetchScheduler_.lock();
+    if (!scheduler)
+        return false;
+    std::weak_ptr<State> weakState = state;
+    scheduler->submit(
+        taskId, priority, state->schedulerGroup_, context.schedulerEpoch,
+        [weakState, objectKey, serial, stage] {
+            if (auto state = weakState.lock()) {
+                if (stage == StorageObjectTransfer::Stage::Probe)
+                    runStorageObjectProbe(state, objectKey, serial);
+                else
+                    runStorageObjectFetch(state, objectKey, serial);
+            }
+        });
+    return false;
+}
+
+void ChunkCache::runStorageObjectProbe(
+    const std::shared_ptr<State>& state,
+    StorageObjectKey objectKey,
+    std::uint64_t transferSerial)
+{
+    ChunkStorageObject object;
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial ||
+            found->second.stage != StorageObjectTransfer::Stage::Probe) {
+            return;
+        }
+        object = found->second.object;
+    }
+
+    const auto dataPath = mirrorObjectPath(*state, object);
+    const auto emptyPath = mirrorEmptyPath(*state, object);
+    std::error_code ec;
+    const bool haveData = std::filesystem::is_regular_file(dataPath, ec) && !ec;
+    ec.clear();
+    const bool haveEmpty =
+        std::filesystem::is_regular_file(emptyPath, ec) && !ec;
+
+    bool dispatchMissing = false;
+
+    state->schedulerSelectionGate_->publish([&] {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial ||
+            found->second.stage != StorageObjectTransfer::Stage::Probe) {
+            return;
+        }
+        auto& transfer = found->second;
+        if (transfer.refreshRequested || (!haveData && !haveEmpty)) {
+            queueStorageObjectSourceLocked(state, objectKey, transfer);
+            return;
+        }
+        if (haveEmpty) {
+            dispatchMissing = true;
+            return;
+        }
+
+        transfer.stage = StorageObjectTransfer::Stage::PersistentRead;
+        transfer.taskId = state->nextTaskId_->fetch_add(
+            1, std::memory_order_relaxed);
+        for (const auto& [key, consumer] : transfer.consumers) {
+            (void)consumer;
+            if (auto entry = state->entries_.find(key);
+                entry != state->entries_.end()) {
+                entry->second.probeTaskId = 0;
+                entry->second.decodeTaskId = transfer.taskId;
+            }
+        }
+        for (auto& [key, weakOperation] : transfer.persistence) {
+            (void)key;
+            if (auto operation = weakOperation.lock()) {
+                operation->probeTaskId = transfer.taskId;
+                operation->sourceTaskId = 0;
+            }
+        }
+        auto scheduler = state->decodeScheduler_.lock();
+        if (!scheduler)
+            return;
+        const auto taskId = transfer.taskId;
+        const auto epoch = transfer.schedulerEpoch;
+        const auto priority = storageObjectPriorityLocked(*state, transfer);
+        std::weak_ptr<State> weakState = state;
+        scheduler->submit(
+            taskId, priority, state->schedulerGroup_, epoch,
+            [weakState, objectKey, transferSerial] {
+                if (auto state = weakState.lock())
+                    runStorageObjectRead(state, objectKey, transferSerial);
+            });
+    });
+
+    if (dispatchMissing) {
+        ChunkFetchResult cached;
+        cached.status = ChunkFetchStatus::Missing;
+        dispatchStorageObjectResult(
+            state, objectKey, transferSerial, std::move(cached), true);
+    }
+}
+
+void ChunkCache::runStorageObjectRead(
+    const std::shared_ptr<State>& state,
+    StorageObjectKey objectKey,
+    std::uint64_t transferSerial)
+{
+    ChunkStorageObject object;
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial ||
+            found->second.stage != StorageObjectTransfer::Stage::PersistentRead) {
+            return;
+        }
+        object = found->second.object;
+    }
+
+    const auto dataPath = mirrorObjectPath(*state, object);
+    auto pin = state->persistentBudget_
+        ? state->persistentBudget_->pinRead(dataPath)
+        : PersistentZarrCacheBudget::ReadPin{};
+    auto bytes = readFileBytes(dataPath);
+    pin.complete(bytes.has_value());
+
+    bool useCached = false;
+    state->schedulerSelectionGate_->publish([&] {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial ||
+            found->second.stage != StorageObjectTransfer::Stage::PersistentRead) {
+            return;
+        }
+        if (!bytes || found->second.refreshRequested) {
+            queueStorageObjectSourceLocked(state, objectKey, found->second);
+            return;
+        }
+        useCached = true;
+    });
+
+    if (useCached) {
+        ChunkFetchResult cached;
+        cached.status = ChunkFetchStatus::Found;
+        cached.bytes = std::move(*bytes);
+        dispatchStorageObjectResult(
+            state, objectKey, transferSerial, std::move(cached), true);
+    }
+}
+
+void ChunkCache::queueStorageObjectSourceLocked(
+    const std::shared_ptr<State>& state,
+    StorageObjectKey objectKey,
+    StorageObjectTransfer& transfer)
+{
+    transfer.stage = StorageObjectTransfer::Stage::Source;
+    transfer.taskId = state->nextTaskId_->fetch_add(
+        1, std::memory_order_relaxed);
+    for (const auto& [key, consumer] : transfer.consumers) {
+        (void)consumer;
+        if (auto entry = state->entries_.find(key);
+            entry != state->entries_.end()) {
+            entry->second.probeTaskId = 0;
+            entry->second.decodeTaskId = 0;
+            entry->second.fetchTaskId = transfer.taskId;
+        }
+    }
+    for (auto& [key, weakOperation] : transfer.persistence) {
+        (void)key;
+        if (auto operation = weakOperation.lock()) {
+            operation->probeTaskId = 0;
+            operation->sourceTaskId = transfer.taskId;
+        }
+    }
+    auto scheduler = state->fetchScheduler_.lock();
+    if (!scheduler)
+        return;
+    const auto taskId = transfer.taskId;
+    const auto epoch = transfer.schedulerEpoch;
+    const auto serial = transfer.serial;
+    const auto priority = storageObjectPriorityLocked(*state, transfer);
+    std::weak_ptr<State> weakState = state;
+    scheduler->submit(
+        taskId, priority, state->schedulerGroup_, epoch,
+        [weakState, objectKey, serial] {
+            if (auto state = weakState.lock())
+                runStorageObjectFetch(state, objectKey, serial);
+        });
+}
+
+void ChunkCache::runStorageObjectFetch(
+    const std::shared_ptr<State>& state,
+    StorageObjectKey objectKey,
+    std::uint64_t transferSerial)
+{
+    StorageObjectTransfer snapshot;
+    std::vector<ChunkKey> activityKeys;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial ||
+            found->second.stage != StorageObjectTransfer::Stage::Source) {
+            return;
+        }
+        snapshot = found->second;
+        found->second.sourceStarted = true;
+        ++state->remoteFetchesInFlight_;
+        for (const auto& [key, consumer] : found->second.consumers) {
+            (void)consumer;
+            found->second.notifiedConsumers.insert(key);
+            state->activeRemoteFetches_[key].insert(transferSerial);
+            activityKeys.push_back(key);
+        }
+    }
+    for (const auto& key : activityKeys)
+        notifyRemoteFetchListeners(state, key, true);
+
+    ChunkFetchResult fetch;
+    const auto started = std::chrono::steady_clock::now();
+    auto scheduler = state->fetchScheduler_.lock();
+    std::optional<ChunkRequestScheduler::TransferMeasurement> measurement;
+    if (scheduler && snapshot.fetcher->measuresRemoteTransfer())
+        measurement.emplace(scheduler->beginTransfer(started));
+    auto progress = [&](std::size_t bytes) {
+        if (measurement)
+            measurement->recordBytes(bytes);
+    };
+    try {
+        fetch = snapshot.fetcher->fetchStorageObject(snapshot.object, progress);
+    } catch (const std::exception& error) {
+        fetch.status = ChunkFetchStatus::IoError;
+        fetch.message = error.what();
+    } catch (...) {
+        fetch.status = ChunkFetchStatus::IoError;
+        fetch.message = "unknown storage-object fetch exception";
+    }
+    if (measurement) {
+        measurement->finish(
+            fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty(),
+            fetch.bytes.size(), std::chrono::steady_clock::now());
+    }
+
+    std::vector<ChunkKey> stopped;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found != state->storageObjectTransfers_.end() &&
+            found->second.serial == transferSerial &&
+            found->second.sourceStarted) {
+            for (const auto& key : found->second.notifiedConsumers) {
+                auto active = state->activeRemoteFetches_.find(key);
+                if (active != state->activeRemoteFetches_.end() &&
+                    active->second.erase(transferSerial) != 0) {
+                    if (active->second.empty()) {
+                        state->activeRemoteFetches_.erase(active);
+                        stopped.push_back(key);
+                    }
+                }
+            }
+            found->second.sourceStarted = false;
+            if (state->remoteFetchesInFlight_ > 0)
+                --state->remoteFetchesInFlight_;
+        }
+    }
+    for (const auto& key : stopped)
+        notifyRemoteFetchListeners(state, key, false);
+
+    dispatchStorageObjectResult(
+        state, objectKey, transferSerial, std::move(fetch), false);
+}
+
+void ChunkCache::dispatchStorageObjectResult(
+    const std::shared_ptr<State>& state,
+    StorageObjectKey objectKey,
+    std::uint64_t transferSerial,
+    ChunkFetchResult fetch,
+    bool loadedFromPersistentCache)
+{
+    ChunkStorageObject object;
+    bool persistenceSucceeded = loadedFromPersistentCache;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial) {
+            return;
+        }
+        if (loadedFromPersistentCache && found->second.refreshRequested) {
+            queueStorageObjectSourceLocked(state, objectKey, found->second);
+            return;
+        }
+        object = found->second.object;
+    }
+
+    if (!loadedFromPersistentCache) {
+        if (fetch.status == ChunkFetchStatus::Found) {
+            persistenceSucceeded = writeMirrorObject(
+                *state, object, fetch.bytes);
+        } else if (fetch.status == ChunkFetchStatus::Missing) {
+            persistenceSucceeded = writeMirrorEmpty(*state, object);
+        }
+    }
+
+    StorageObjectTransfer transfer;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto found = state->storageObjectTransfers_.find(objectKey);
+        if (found == state->storageObjectTransfers_.end() ||
+            found->second.serial != transferSerial) {
+            return;
+        }
+        transfer = std::move(found->second);
+        state->storageObjectTransfers_.erase(found);
+    }
+
+    for (const auto& [key, weakOperation] : transfer.persistence) {
+        if (auto operation = weakOperation.lock()) {
+            PersistentRequestResult result;
+            if ((fetch.status == ChunkFetchStatus::Found ||
+                 fetch.status == ChunkFetchStatus::Missing) &&
+                !persistenceSucceeded) {
+                result = {PersistentRequestStatus::Error,
+                          "could not persist exact Zarr storage object"};
+            } else if (fetch.status == ChunkFetchStatus::Found) {
+                result = {PersistentRequestStatus::Data, {}};
+            } else if (fetch.status == ChunkFetchStatus::Missing) {
+                result = {PersistentRequestStatus::Missing, {}};
+            } else {
+                result = {PersistentRequestStatus::Error,
+                          fetchErrorMessage(fetch)};
+            }
+            completePersistenceOperation(state, key, operation, std::move(result));
+        }
+    }
+
+    std::shared_ptr<const std::vector<std::byte>> payload;
+    if (fetch.status == ChunkFetchStatus::Found) {
+        payload = std::make_shared<const std::vector<std::byte>>(
+            std::move(fetch.bytes));
+    }
+    for (const auto& [key, consumer] : transfer.consumers) {
+        {
+            std::lock_guard lock(state->mutex_);
+            if (auto entry = state->entries_.find(key);
+                entry != state->entries_.end()) {
+                if (entry->second.probeTaskId == transfer.taskId)
+                    entry->second.probeTaskId = 0;
+                if (entry->second.fetchTaskId == transfer.taskId)
+                    entry->second.fetchTaskId = 0;
+            }
+        }
+        if (payload) {
+            queueStorageObjectDecode(
+                state, key, consumer, payload, loadedFromPersistentCache);
+        } else {
+            FetchContext context{
+                consumer.generation, consumer.fetcherGeneration,
+                consumer.fetchSerial, consumer.schedulerEpoch,
+                consumer.fetcher, {}};
+            finishAndStore(
+                state, key, std::move(context), fetch,
+                loadedFromPersistentCache);
+        }
+    }
+}
+
+void ChunkCache::queueStorageObjectDecode(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    StorageConsumer consumer,
+    std::shared_ptr<const std::vector<std::byte>> objectBytes,
+    bool loadedFromPersistentCache)
+{
+    state->schedulerSelectionGate_->publish([&] {
+        std::lock_guard lock(state->mutex_);
+        auto entry = state->entries_.find(key);
+        if (entry == state->entries_.end() ||
+            entry->second.fetchSerial != consumer.fetchSerial ||
+            consumer.generation != state->generation_ ||
+            consumer.fetcherGeneration != state->fetcherGeneration_ ||
+            !hasDemandLocked(entry->second)) {
+            return;
+        }
+        const auto taskId = state->nextTaskId_->fetch_add(
+            1, std::memory_order_relaxed);
+        entry->second.decodeTaskId = taskId;
+        auto scheduler = state->decodeScheduler_.lock();
+        if (!scheduler)
+            return;
+        const auto priority = workPriorityLocked(*state, key, entry->second);
+        std::weak_ptr<State> weakState = state;
+        scheduler->submit(
+            taskId, priority, state->schedulerGroup_, consumer.schedulerEpoch,
+            [weakState, key, consumer, objectBytes, loadedFromPersistentCache] {
+                auto state = weakState.lock();
+                if (!state)
+                    return;
+                ChunkFetchResult decoded;
+                try {
+                    decoded = consumer.fetcher->decodeStorageObject(
+                        fetcherKey(key), std::span<const std::byte>(
+                            objectBytes->data(), objectBytes->size()));
+                } catch (const std::exception& error) {
+                    decoded.status = ChunkFetchStatus::DecodeError;
+                    decoded.message = error.what();
+                }
+                FetchContext context{
+                    consumer.generation, consumer.fetcherGeneration,
+                    consumer.fetchSerial, consumer.schedulerEpoch,
+                    consumer.fetcher, {}};
+                finishAndStore(
+                    state, key, std::move(context), std::move(decoded),
+                    loadedFromPersistentCache);
+            });
+    });
 }
 
 void ChunkCache::decodePersistentAndStore(
@@ -2620,37 +3733,8 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     if (rawEntry && bytes.size() != expectedChunkBytes(state, key))
         return false;
 
-    bool compress = rawEntry && state.options_.compressPersistentCache;
+    const bool compress = false;
     const std::vector<std::byte>* payload = &bytes;
-    std::vector<std::byte> compressed;
-    if (compress) {
-        try {
-            compressed = vc::cacheCompress(
-                std::span<const std::byte>(bytes.data(), bytes.size()),
-                state.levels_[static_cast<std::size_t>(key.level)].chunkShape,
-                dtypeSize(state.dtype_),
-                vc::kCacheCompressionLevel,
-                state.options_.cacheQuantBinWidth);
-            // A frame the decoder cannot read back is worse than no entry:
-            // readPersistent falls through to a remote refetch and the raw
-            // counterpart gets deleted below. Verify decodability before
-            // committing the compressed copy.
-            if (!vc::cacheDecompress(
-                    std::span<const std::byte>(compressed.data(), compressed.size()),
-                    bytes.size())) {
-                Logger()->warn(
-                    "ChunkCache compressed self-check failed for {}/{}/{}/{}; storing raw",
-                    key.level, key.iz, key.iy, key.ix);
-                compress = false;
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("ChunkCache persistent-cache compression failed: {}; storing raw",
-                           e.what());
-            compress = false;
-        }
-        if (compress)
-            payload = &compressed;
-    }
 
     const auto path = compress ? persistentCompressedPath(state, key)
                                : persistentPath(state, key);
@@ -2919,6 +4003,84 @@ std::filesystem::path ChunkCache::persistentSourcePath(
            std::to_string(key.iy) /
            (std::to_string(key.ix) +
             std::string(kPersistentSourcePayloadExtension));
+}
+
+std::filesystem::path ChunkCache::mirrorObjectPath(
+    const State& state,
+    const ChunkStorageObject& object)
+{
+    if (!state.options_.persistentCachePath ||
+        !isSafeZarrStoreKey(object.sourceKey)) {
+        throw std::runtime_error("invalid Zarr mirror storage-object key");
+    }
+    return *state.options_.persistentCachePath /
+           std::filesystem::path(object.sourceKey);
+}
+
+std::filesystem::path ChunkCache::mirrorEmptyPath(
+    const State& state,
+    const ChunkStorageObject& object)
+{
+    auto path = mirrorObjectPath(state, object);
+    path += ".empty";
+    return path;
+}
+
+bool ChunkCache::writeMirrorObject(
+    State& state,
+    const ChunkStorageObject& object,
+    std::span<const std::byte> bytes)
+{
+    const auto path = mirrorObjectPath(state, object);
+    const auto emptyPath = mirrorEmptyPath(state, object);
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(path, bytes.size(), {emptyPath})
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
+    const auto oldSize = regularFileSize(path).value_or(0);
+    const auto oldEmptySize = regularFileSize(emptyPath).value_or(0);
+    if (!atomicWriteBytes(path, bytes)) {
+        reservation.commit();
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::remove(emptyPath, ec);
+    const auto newSize = regularFileSize(path).value_or(bytes.size());
+    addPersistentCacheBytesDelta(
+        state, static_cast<std::int64_t>(newSize) -
+                   static_cast<std::int64_t>(oldSize) -
+                   static_cast<std::int64_t>(oldEmptySize));
+    reservation.commit();
+    return true;
+}
+
+bool ChunkCache::writeMirrorEmpty(
+    State& state,
+    const ChunkStorageObject& object)
+{
+    const auto path = mirrorEmptyPath(state, object);
+    const auto dataPath = mirrorObjectPath(state, object);
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(path, 0, {dataPath})
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
+    const auto oldSize = regularFileSize(path).value_or(0);
+    const auto oldDataSize = regularFileSize(dataPath).value_or(0);
+    if (!atomicWriteBytes(path, {})) {
+        reservation.commit();
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::remove(dataPath, ec);
+    const auto newSize = regularFileSize(path).value_or(0);
+    addPersistentCacheBytesDelta(
+        state, static_cast<std::int64_t>(newSize) -
+                   static_cast<std::int64_t>(oldSize) -
+                   static_cast<std::int64_t>(oldDataSize));
+    reservation.commit();
+    return true;
 }
 
 void ChunkCache::startPersistentCacheSizeScan(const std::shared_ptr<State>& state)

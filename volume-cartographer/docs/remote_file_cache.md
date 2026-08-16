@@ -171,12 +171,35 @@ Open Data prefill and Settings redownload submit persistence-only maintenance
 demand. Maintenance is the lowest scheduler class, below interactive and
 ordinary background work, but it uses the same worker pool, adaptive admission,
 connections, and keyed source-transfer registry. If decoded demand joins the
-same chunk, that one transfer is promoted and serves both consumers. A
-maintenance-only request writes the exact encoded source payload as `.source`
-and never decodes or enters the RAM LRU. Normal reads can decode `.source`
-entries, while legacy `.bin`, `.zst`, `.c3d`, and `.empty` entries remain valid.
-Refresh replaces alternatives only after a successful source result; missing
-data becomes `.empty`, and transport errors leave the prior disk entry intact.
+same storage object, that one transfer is promoted and serves both consumers.
+Maintenance-only work never decodes or enters the RAM LRU. Refresh replaces an
+object only after a successful source result; transport errors leave its prior
+disk entry intact.
+
+New remote-volume cache directories are incomplete byte-for-byte Zarr mirrors.
+Required root, group, and array metadata is copied to its original relative
+path. Each downloaded data object is written at its exact source key without a
+private extension or payload transformation, so the directory remains readable
+by ordinary Zarr clients despite missing objects. An adjacent `<object>.empty`
+file records a source-level missing object and is ignored by Zarr clients.
+Structural metadata is protected from eviction; only validated array data
+objects and `.empty` markers count toward the evictable disk budget.
+
+The cache distinguishes logical decode chunks from physical Zarr storage
+objects. For an unsharded array they are identical. For a sharded array, every
+logical inner chunk maps to its complete outer shard: one shared probe, disk
+read, download, and atomic write serves all concurrent inner consumers, then
+independent decode tasks extract only the requested inner chunks. A missing
+outer shard creates one shard-level `.empty`; a missing index entry inside a
+present shard does not create a sidecar. Prefill and redownload enumerate outer
+objects, so one shard is transferred at most once.
+
+Existing caches with a complete `level_N/z/y/x.<ext>` footprint remain in the
+legacy layout and are never mixed or automatically migrated. Legacy `.source`,
+`.zst`, `.bin`, `.c3d`, and `.empty` precedence and mixed-entry decoding remain
+supported. Production no longer recompresses decoded remote-cache chunks or
+offers recompression settings; a selected legacy cache continues writing its
+compatible legacy representation.
 
 Decoded RAM capacity is also mutable service policy.
 `configureDecodedByteCapacity()` updates the existing aggregate budget without
@@ -235,14 +258,14 @@ point grid to base-voxel surface coordinates and is not a second LOD.
 GUI and non-GUI callers use separate pending lanes in three shared scheduler
 stages:
 
-1. A 32-worker local probe stage classifies persistent encoded data, persistent
+1. A 32-worker local probe stage classifies persistent data objects, persistent
    empty markers, and cache misses using filesystem metadata only.
 2. A source-read stage performs remote downloads, or direct source reads when
    no persistent cache is configured. Its physical capacity and initial
    admission policy are service construction options; only
    `ChunkCacheService::configureFetchConcurrency()` changes admission later.
-3. An eight-worker CPU stage reads and decodes persistent hits or decodes
-   successful source reads.
+3. An eight-worker CPU stage reads persistent object hits and decodes logical
+   chunks from persistent or newly downloaded object bytes.
 
 The local probe never reads or decodes payloads. Consequently it can classify
 the visible working set quickly, send known misses to the network, and send

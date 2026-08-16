@@ -674,43 +674,6 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="2">
-           <widget class="QCheckBox" name="chkCompressRemoteCache">
-            <property name="text">
-             <string>Compress remote volume disk cache</string>
-            </property>
-            <property name="toolTip">
-             <string>When enabled, chunks downloaded from remote volumes are stored compressed in the disk cache using the selected accuracy below. Existing cache entries stay readable either way. Requires restart.</string>
-            </property>
-            <property name="checked">
-             <bool>true</bool>
-            </property>
-           </widget>
-          </item>
-          <item row="2" column="2">
-           <widget class="QPushButton" name="btnCompressExistingCache">
-            <property name="text">
-             <string>Compress existing cache...</string>
-            </property>
-            <property name="toolTip">
-             <string>Compress the already-downloaded chunks in the disk cache of the currently shown volume using the compression accuracy selected below. Runs with multiple workers and can be cancelled.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="3" column="0">
-           <widget class="QLabel" name="labelCacheQuantization">
-            <property name="text">
-             <string>Cache compression accuracy</string>
-            </property>
-           </widget>
-          </item>
-          <item row="3" column="1">
-           <widget class="QComboBox" name="cmbCacheQuantization">
-            <property name="toolTip">
-             <string>Accuracy of compressed disk-cache chunks. Lossless preserves exact voxel values. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels) and shrink the cache further. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
-            </property>
-           </widget>
-          </item>
           <item row="4" column="0">
            <widget class="QLabel" name="labelRemoteCacheMaximum">
             <property name="text">
@@ -724,7 +687,7 @@
             <property name="maximum"><number>1048576</number></property>
             <property name="specialValueText"><string>Unlimited</string></property>
             <property name="suffix"><string> GiB</string></property>
-            <property name="toolTip"><string>Maximum compressed bytes shared by all remote volume and Lasagna Zarr caches in this cache directory. 0 means unlimited. Applied immediately.</string></property>
+            <property name="toolTip"><string>Maximum managed data bytes shared by all remote volume and Lasagna Zarr caches in this cache directory. Metadata is excluded. 0 means unlimited. Applied immediately.</string></property>
            </widget>
           </item>
           <item row="5" column="0">
