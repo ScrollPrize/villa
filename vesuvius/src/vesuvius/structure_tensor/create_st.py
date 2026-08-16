@@ -781,7 +781,20 @@ def _finalize_structure_tensor_torch(
             nx[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 2, slz, sly, slx])
 
             # Confidence (default: Fractional Anisotropy)
-            l1, l2, l3 = w_np[0], w_np[1], w_np[2]
+            # Sort ascending here rather than trusting eigvals_block's slot
+            # order directly. torch.linalg.eigh guarantees ascending order,
+            # but swap_eigenvectors (above) exchanges slots 0 and 1 -- on
+            # purpose, to relabel which spatial direction is "first" vs
+            # "second" in the vector outputs -- and that swap also moves the
+            # eigenVALUES sitting in those slots. linearity/planarity/max_lp
+            # assume l1<=l2<=l3 (smallest to largest); reading w_np[0..2]
+            # directly after a swap breaks that assumption and silently
+            # corrupts the confidence channel (verified: on eigenvalues
+            # [2,4,6], swap_eigenvectors=True changes linearity 0.333->0.667
+            # and planarity 0.333->-0.333, while fa is unaffected since it
+            # is symmetric in the three eigenvalues -- the invariant this
+            # sorting step now makes true of every choice, not just fa).
+            l1, l2, l3 = np.sort(w_np, axis=0)
             eps = 1e-12
             if confidence_metric == "linearity":
                 conf = (l3 - l2) / (np.abs(l3) + eps)

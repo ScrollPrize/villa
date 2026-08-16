@@ -343,6 +343,74 @@ def test_eigh_and_sanitize_handles_nans_infs():
     assert (~torch.isnan(w)).all() and (~torch.isnan(v)).all()
     assert (~torch.isinf(w)).all() and (~torch.isinf(v)).all()
 
+
+@pytest.mark.parametrize("metric", ["linearity", "planarity", "max_lp"])
+def test_confidence_invariant_to_swap_eigenvectors(tmp_path, metric):
+    """swap_eigenvectors relabels which spatial direction is "first" vs
+    "second" -- it must not change the scalar confidence/anisotropy channel,
+    which describes the SHAPE of the eigenvalue spectrum, not which vector
+    is called what.
+
+    Reproduces a real bug: the confidence block read w_np[0], w_np[1],
+    w_np[2] directly, assuming ascending order (which torch.linalg.eigh
+    guarantees). swap_eigenvectors exchanges slots 0 and 1 -- correctly, for
+    the vector outputs -- but that same swapped array fed the confidence
+    formulas too, breaking the ascending assumption those formulas depend
+    on. Concretely, on eigenvalues [1, 2, 3] this changed "linearity" from
+    0.333 to 0.667 and "planarity" from 0.333 to -0.333 (silently floored to
+    0 by the uint8 quantizer, since confidence is clipped to [0, 1] before
+    quantizing -- the negative number itself never survives to disk, only
+    its effect on the byte does). "fa" (fractional anisotropy, the default
+    metric) is untouched by this bug, since it happens to be symmetric in
+    the three eigenvalues -- which is exactly why testing only the default
+    metric would not have caught it.
+
+    Placed here (not near the existing swap test further down) because a
+    second stray `\'\'\'` later in this file currently disables everything
+    from test_eigenanalysis_chunk_defaults_and_shapes through
+    test_swap_eigenvectors_flag -- separate, pre-existing issue, out of
+    scope here. This test is independent of that and needs to run on
+    current main regardless of when that gets fixed.
+    """
+    Z, Y, X = 2, 2, 2
+    st = np.zeros((6, Z, Y, X), dtype=np.float32)
+    # diag(J) = [Jzz, Jyy, Jxx] = [3, 2, 1] -> eigenvalues [1, 2, 3] (diagonal
+    # matrix, so eigenvalues are just the diagonal entries, trivially sorted).
+    st[0] = 3.0; st[3] = 2.0; st[5] = 1.0
+    zarr_path = os.path.join(tmp_path, "st_conf.zarr")
+    root = zarr.open_group(zarr_path, mode="w")
+    root.create_dataset("structure_tensor", data=st, chunks=(1, Z, Y, X), dtype="f4")
+
+    _finalize_structure_tensor_torch(
+        zarr_path=zarr_path,
+        chunk_size=(Z, Y, X),
+        num_workers=0,
+        compressor=None,
+        verbose=False,
+        swap_eigenvectors=False,
+        ome_out=True,
+        confidence_metric=metric,
+    )
+    conf_no = zarr.open_group(zarr_path, mode="r")["confidence"]["0"][...]
+
+    _finalize_structure_tensor_torch(
+        zarr_path=zarr_path,
+        chunk_size=(Z, Y, X),
+        num_workers=0,
+        compressor=None,
+        verbose=False,
+        swap_eigenvectors=True,
+        ome_out=True,
+        confidence_metric=metric,
+    )
+    conf_sw = zarr.open_group(zarr_path, mode="r")["confidence"]["0"][...]
+
+    assert np.array_equal(conf_no, conf_sw), (
+        f"{metric}: confidence channel changed under swap_eigenvectors "
+        f"(no-swap={conf_no.flatten()}, swap={conf_sw.flatten()}) -- "
+        f"confidence must not depend on which vector is labeled first/second"
+    )
+
 '''
 def test_eigenanalysis_chunk_defaults_and_shapes(tmp_path):
     """
