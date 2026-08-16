@@ -198,6 +198,24 @@ def _sample_points_along_path(path_ij, num_points, rng=None):
         0., 1., size=[num_points, 2]).astype(np.float32)
 
 
+def build_serpentine_quad_path(valid_quad_mask):
+    # Order every valid quad along a boustrophedon walk (row by row, alternating
+    # direction) so consecutive entries are spatially close and the sequential
+    # theta=0 unwrap (unwrap_shifted_radii) applies to samples drawn along the
+    # path exactly as it does to strips. Only used for small patches (area below
+    # cfg['patch_2d_sampling_max_area']): holes and row turns make jumps whose
+    # theta change must stay below pi, which a small physical extent guarantees.
+    rows = []
+    for i in np.flatnonzero(valid_quad_mask.any(axis=1)):
+        js = np.flatnonzero(valid_quad_mask[i])
+        if len(rows) % 2:
+            js = js[::-1]
+        rows.append(np.stack(
+            [np.full(js.shape[0], i, dtype=np.int64), js.astype(np.int64)],
+            axis=1))
+    return np.ascontiguousarray(np.concatenate(rows, axis=0))
+
+
 def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
     # 'dijkstra'-mode replacement for _sample_l_shapes_at_ij: 4 geodesic strips from the
     # annotated cell, one per cardinal cone; None while the anchor's pools are still being
@@ -303,7 +321,10 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
 
     use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
     if use_dijkstra_strips:
-        touched_patches = [patches[patch_idx] for patch_idx in dict.fromkeys(patch_indices)]
+        # Small 2D-sampled patches never draw from the geodesic pools, so don't
+        # build or refresh pools for them.
+        touched_patches = [patches[patch_idx] for patch_idx in dict.fromkeys(patch_indices)
+                           if getattr(patches[patch_idx], '_sampling_2d_path', None) is None]
         strip_path_pools.ensure_patch_path_pools(touched_patches)
         # Submitted before the sampling below so the workers refresh while this step proceeds.
         for patch in touched_patches:
@@ -320,6 +341,16 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
     var_jitters_v = rand((N, P)).astype(np.float32)
     for n, patch_idx in enumerate(patch_indices):
         patch = patches[patch_idx]
+
+        path_2d = getattr(patch, '_sampling_2d_path', None)
+        if path_2d is not None:
+            # Small patch (area below cfg['patch_2d_sampling_max_area']): both
+            # strip slots become independent sparse 2D samples over the whole
+            # patch, drawn along the precomputed serpentine quad walk so the
+            # downstream sequential unwrap sees spatially contiguous samples.
+            horizontal_ijs_by_patch[n] = _sample_points_along_path(path_2d, P, rng)
+            vertical_ijs_by_patch[n] = _sample_points_along_path(path_2d, P, rng)
+            continue
 
         if use_dijkstra_strips:
             # Two independent geodesic strips per patch (no horizontal/vertical distinction;
@@ -393,6 +424,21 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                 num_points_per_direction,
                 seed,
             ))
+            # The native sampler only knows strips; rows for small 2D-sampled
+            # patches (see cfg['patch_2d_sampling_max_area']) are overwritten
+            # with serpentine whole-patch samples.
+            small_ns = [
+                n for n, patch_idx in enumerate(patch_indices)
+                if getattr(patches[patch_idx], '_sampling_2d_path', None) is not None
+            ]
+            if small_ns:
+                ijs_np = np.array(ijs_np)  # the native buffer may be read-only
+                for n in small_ns:
+                    path_2d = patches[patch_indices[n]]._sampling_2d_path
+                    ijs_np[0, n] = _sample_points_along_path(
+                        path_2d, num_points_per_direction, rng)
+                    ijs_np[1, n] = _sample_points_along_path(
+                        path_2d, num_points_per_direction, rng)
         else:
             ijs_np = _build_patch_ijs(
                 patches, patch_indices, num_points_per_direction, rng, cfg)

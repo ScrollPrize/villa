@@ -697,7 +697,13 @@ void SpiralWorkspace::updateSurfaceIntersections()
     addCategory(QStringLiteral("brush"), false);
     for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) continue;
-        if (viewer == _flattenedViewer) {
+        // Identify the flattened output viewer by its surface name rather
+        // than a cached pointer: the pointer can go stale across
+        // ViewerManager recreations and caused the surface-overlay toggle
+        // (spiralShowSurfaceOverlap) to silently clear the flattened viewer's
+        // overlays while treating it as a plane viewer.
+        const bool isFlattened = viewer->surfName() == "segmentation";
+        if (isFlattened) {
             viewer->setSurfaceOverlays(surfaceOverlays);
             viewer->setSurfaceOverlayEnabled(_showSurfaceOverlap
                                              && !surfaceOverlays.empty());
