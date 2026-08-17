@@ -31,6 +31,7 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
+#include "vc/core/Version.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -44,6 +45,10 @@ QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
     result["pid"] = static_cast<double>(QCoreApplication::applicationPid());
     result["version"] = QCoreApplication::applicationVersion();
     result["protocolVersion"] = kProtocolVersion;
+    result["gitSha"] = QString::fromStdString(ProjectInfo::RepositoryHash());
+    result["gitShaShort"] =
+        QString::fromStdString(ProjectInfo::RepositoryShortHash());
+    result["executablePath"] = QCoreApplication::applicationFilePath();
     return result;
 }
 

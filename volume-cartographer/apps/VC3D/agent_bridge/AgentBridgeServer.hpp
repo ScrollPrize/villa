@@ -82,6 +82,7 @@ private:
     void registerWrapHandlers();
     void registerJobHandlers();
     void registerLasagnaHandlers();
+    void registerSpiralHandlers();
     void registerAtlasHandlers();
     void registerFiberHandlers();
     void registerPointsHandlers();
@@ -223,7 +224,26 @@ private:
     QJsonObject handleLasagnaCancel(const QJsonValue& params);
     QJsonObject handleLasagnaSelectOutputSegment(const QJsonValue& params);
     QJsonObject handleLasagnaRepeatLast(const QJsonValue& params);
+    QJsonObject handleLasagnaAttachManifest(const QJsonValue& params);
     QJsonObject handleWorkspaceSwitch(const QJsonValue& params);
+    // Spiral workspace/service RPCs.
+    QJsonObject handleSpiralStatus(const QJsonValue& params);
+    QJsonObject handleSpiralProfiles(const QJsonValue& params);
+    QJsonObject handleSpiralConnect(const QJsonValue& params);
+    QJsonObject handleSpiralDisconnect(const QJsonValue& params);
+    QJsonObject handleSpiralReconnect(const QJsonValue& params);
+    QJsonObject handleSpiralDataset(const QJsonValue& params);
+    QJsonObject handleSpiralRebuild(const QJsonValue& params);
+    QJsonObject handleSpiralRun(const QJsonValue& params);
+    QJsonObject handleSpiralStop(const QJsonValue& params);
+    QJsonObject handleSpiralPreviewExport(const QJsonValue& params);
+    QJsonObject handleSpiralCheckpointSave(const QJsonValue& params);
+    QJsonObject handleSpiralCheckpointDownload(const QJsonValue& params);
+    QJsonObject handleSpiralCheckpointLoad(const QJsonValue& params);
+    QJsonObject handleSpiralInputUpload(const QJsonValue& params);
+    QJsonObject handleSpiralInputRemove(const QJsonValue& params);
+    QJsonObject handleSpiralInputsCommit(const QJsonValue& params);
+    class SpiralServiceManager* spiralService() const;
     // Atlas RPCs.
     QJsonObject handleAtlasOpen(const QJsonValue& params);
     QJsonObject handleAtlasStatus(const QJsonValue& params);

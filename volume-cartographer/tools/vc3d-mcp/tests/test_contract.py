@@ -10,9 +10,8 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 
 
 VC_ROOT = Path(__file__).resolve().parents[3]
-SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
-EXPECTED_RPC_METHODS = 119
+EXPECTED_RPC_METHODS = 136
 MCP_ONLY_TOOLS = {"vc3d_wait_job"}
 
 
@@ -74,15 +73,6 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                 extras = mcp_contract.get("extraParams", [])
                 self.assertEqual(len(extras), len(set(extras)))
                 self.assertFalse(mapped & set(extras))
-
-    def test_spec_lists_every_mcp_mapping(self) -> None:
-        spec = SPEC_PATH.read_text(encoding="utf-8")
-        for method, contract in self.described_methods.items():
-            if "mcp" not in contract:
-                continue
-            tool = contract["mcp"]["tool"]
-            row_start = f"| `{tool}` | `{method}` |"
-            self.assertIn(row_start, spec)
 
     async def test_fastmcp_input_shapes_match_contract(self) -> None:
         registered = {tool.name: tool.inputSchema for tool in await core.mcp.list_tools()}

@@ -187,3 +187,19 @@ async def vc3d_lasagna_repeat_last(
     """
     result = await _call("lasagna.repeat_last", {})
     return await _wait_for_job(result["jobId"], wait, result, ctx)
+
+
+@mcp.tool()
+async def vc3d_attach_lasagna_manifest(
+    location: str,
+    role: Literal["regular", "fiber_inference"],
+    select: bool = True,
+) -> dict[str, Any]:
+    """Transactionally attach a local, HTTPS, s3://, or s3+REGION:// Lasagna
+    or Fiber3D manifest. Remote chunks remain lazy in VC3D's bounded cache.
+    Coordinate tags are reused only when provenance is unambiguous."""
+    return await _call(
+        "lasagna.attach_manifest",
+        {"location": location, "role": role, "select": select},
+        timeout=130.0,
+    )

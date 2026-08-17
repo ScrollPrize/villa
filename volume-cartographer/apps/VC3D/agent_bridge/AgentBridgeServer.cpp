@@ -694,6 +694,7 @@ void AgentBridgeServer::registerHandlers()
     registerJobHandlers();
 
     registerLasagnaHandlers();
+    registerSpiralHandlers();
     registerAtlasHandlers();
     registerFiberHandlers();
     registerSeedingHandlers();

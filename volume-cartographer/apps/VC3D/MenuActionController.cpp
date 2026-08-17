@@ -1817,6 +1817,59 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
 
+    QString error;
+    const bool started = startLasagnaManifestAttachmentImpl(
+        location, fiberInference, true, true,
+        [this](const LasagnaManifestAttachOutcome& outcome) {
+            if (!outcome.success) {
+                QMessageBox::warning(
+                    _window, QObject::tr("Attach Lasagna failed"), outcome.error);
+            }
+        },
+        &error);
+    if (!started && !error.isEmpty()) {
+        QMessageBox::warning(
+            _window, QObject::tr("Attach failed"), error);
+    }
+}
+
+bool MenuActionController::startLasagnaManifestAttachment(
+    const QString& location,
+    bool fiberInference,
+    bool select,
+    std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+    QString* errorMessage)
+{
+    return startLasagnaManifestAttachmentImpl(
+        location, fiberInference, select, false, std::move(onFinished),
+        errorMessage);
+}
+
+bool MenuActionController::startLasagnaManifestAttachmentImpl(
+    const QString& location,
+    bool fiberInference,
+    bool select,
+    bool interactive,
+    std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+    QString* errorMessage)
+{
+    if (errorMessage)
+        errorMessage->clear();
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage)
+            *errorMessage = message;
+        return false;
+    };
+    if (!_window || !_window->_state || !_window->_state->vpkg())
+        return fail(QObject::tr("Open or create a project first."));
+    if (_lasagnaAttachmentInFlight)
+        return fail(QObject::tr("A Lasagna manifest attachment is already in progress."));
+    if (location.trimmed().isEmpty())
+        return fail(QObject::tr("A Lasagna manifest location is required."));
+
+    const bool remote =
+        vc::lasagna::isRemoteLasagnaLocation(location.toStdString());
+
     vc::lasagna::LasagnaDatasetOpenOptions openOptions;
     QString cacheRoot;
     bool needsRemoteCache = remote;
@@ -1852,21 +1905,22 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     }
     if (needsRemoteAuth || needsRemoteCache) {
         auto* attachment = _window->_volumeAttachmentController.get();
-        if (!attachment) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Remote attachment settings are unavailable."));
-            return;
-        }
+        if (!attachment)
+            return fail(QObject::tr("Remote attachment settings are unavailable."));
         QString authError;
-        if (!attachment->resolveRemoteAuth(authLocation, &openOptions.remoteAuth, &authError)) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), authError);
-            return;
-        }
+        if (!attachment->resolveRemoteAuth(
+                authLocation, &openOptions.remoteAuth, &authError))
+            return fail(authError);
     }
     if (needsRemoteCache) {
         auto* attachment = _window->_volumeAttachmentController.get();
-        cacheRoot = attachment->remoteCacheDirectory(VolumeAttachmentPresentation::Interactive);
+        cacheRoot = attachment->remoteCacheDirectory(
+            interactive ? VolumeAttachmentPresentation::Interactive
+                        : VolumeAttachmentPresentation::Silent);
+        if (cacheRoot.isEmpty() && interactive)
+            return false;
         if (cacheRoot.isEmpty())
-            return;
+            return fail(QObject::tr("A writable remote cache directory is required."));
         openOptions.remoteCacheRoot = cacheRoot.toStdString();
     } else {
         const auto persisted = _window->_state->vpkg()->remoteCacheRootOrEmpty();
@@ -1877,7 +1931,16 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
     const auto targetPackage = _window->_state->vpkg();
     const std::string persistedLocation = location.toStdString();
     auto* watcher = new QFutureWatcher<LasagnaAttachTaskResult>(this);
-    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this, [this, watcher, targetPackage, persistedLocation, fiberInference, cacheRoot]() {
+    connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this,
+            [this, watcher, targetPackage, persistedLocation, fiberInference,
+             select, cacheRoot, onFinished = std::move(onFinished)]() mutable {
+        LasagnaManifestAttachOutcome outcome;
+        outcome.fiberInference = fiberInference;
+        outcome.manifestLocation = QString::fromStdString(persistedLocation);
+        auto complete = [&]() {
+            if (onFinished)
+                onFinished(outcome);
+        };
         auto task = watcher->result();
         watcher->deleteLater();
         _lasagnaAttachmentInFlight = false;
@@ -1886,29 +1949,49 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         if (_attachRemoteLasagnaManifestAct)
             _attachRemoteLasagnaManifestAct->setEnabled(true);
         if (!task.error.isEmpty()) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), task.error);
+            outcome.error = task.error;
+            complete();
             return;
         }
         if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("The open project changed while the manifest was loading."));
+            outcome.error =
+                QObject::tr("The open project changed while the manifest was loading.");
+            complete();
             return;
         }
         try {
             const auto result =
-                targetPackage->attachPreparedLasagnaDataset(persistedLocation, {}, fiberInference, task.volumes, cacheRoot.toStdString());
+                targetPackage->attachPreparedLasagnaDataset(
+                    persistedLocation, {}, fiberInference, task.volumes,
+                    cacheRoot.toStdString(), select);
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
+                outcome.error = QObject::tr(
+                    "A Lasagna volume conflicts with an existing volume id.");
+                complete();
                 return;
             }
             _window->refreshCurrentVolumePackageUi(QString(), true);
+            outcome.success = true;
+            outcome.attached =
+                result == VolumePkg::AttachLasagnaResult::Attached;
+            outcome.alreadyAttached =
+                result == VolumePkg::AttachLasagnaResult::AlreadyAttached;
+            for (const auto& prepared : task.volumes) {
+                if (prepared.volume)
+                    outcome.volumeIds.append(
+                        QString::fromStdString(prepared.volume->id()));
+            }
         } catch (const std::exception& error) {
-            QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QString::fromUtf8(error.what()));
+            outcome.error = QString::fromUtf8(error.what());
         }
+        complete();
     });
 
     _lasagnaAttachmentInFlight = true;
-    _attachLasagnaManifestAct->setEnabled(false);
-    _attachRemoteLasagnaManifestAct->setEnabled(false);
+    if (_attachLasagnaManifestAct)
+        _attachLasagnaManifestAct->setEnabled(false);
+    if (_attachRemoteLasagnaManifestAct)
+        _attachRemoteLasagnaManifestAct->setEnabled(false);
     watcher->setFuture(QtConcurrent::run([persistedLocation, openOptions, fiberInference]() {
         LasagnaAttachTaskResult result;
         try {
@@ -1930,6 +2013,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
         }
         return result;
     }));
+    return true;
 }
 
 void MenuActionController::detachEntry()

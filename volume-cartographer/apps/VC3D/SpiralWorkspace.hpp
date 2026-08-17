@@ -47,6 +47,7 @@ public:
 
     ViewerManager* viewerManager() const { return _viewerManager.get(); }
     ViewerSplitGrid* viewerGrid() const { return _grid; }
+    SpiralServiceManager* serviceManager() const { return _service; }
     QComboBox* volumeSelectionControl() const;
     void synchronizeVolume(const std::shared_ptr<Volume>& volume,
                            const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
