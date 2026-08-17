@@ -101,16 +101,16 @@ private:
     // most once per fiber generation: it is filesystem work, and the whole point
     // of the generation check is to keep that off the annotation paths.
     [[nodiscard]] QString withCachedUmbilicusStatus(const QString& status);
-    // The voxel size the layout's physical numbers were computed at: the
-    // package's own when it has one, otherwise the documented assumption, which
-    // exists only so the layout's cm-valued tuning constants stay meaningful.
-    // Never use it to display a physical figure — that is formatMapLength()'s
-    // job, and it refuses when the real voxel size is unknown.
-    [[nodiscard]] double layoutVoxelSizeUm() const;
-    // A layout length (cm) as display text: centimetres when the voxel size is
-    // known, otherwise the same length back in voxels, which is the one unit
-    // that is still true when the package cannot say how big a voxel is.
-    [[nodiscard]] QString formatMapLength(double valueCm) const;
+    // Scene units (voxels) per centimetre, from the package's voxel size when it
+    // has one and from the documented assumption otherwise. This is the only
+    // route from the map's cm-valued styling constants into the voxel-space
+    // scene; it is never allowed to produce displayed text, because when the
+    // voxel size is unknown it is a guess.
+    [[nodiscard]] double sceneVxPerCm() const;
+    // A layout length (voxels) as display text: centimetres when the voxel size
+    // is known, otherwise the voxel count itself, which is the one figure still
+    // true when the package cannot say how big a voxel is.
+    [[nodiscard]] QString formatMapLength(double valueVx) const;
     void setHighlightedFiber(uint64_t fiberId);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
@@ -136,8 +136,8 @@ private:
     // unset when the package could not say, in which case nothing physical is
     // displayed.
     std::optional<double> _voxelSizeUm;
-    // Scroll top in scene z, cm; 0 when the volume's extent is unknown.
-    double _scrollZMaxCm = 0.0;
+    // Scroll top in scene z, i.e. voxels; 0 when the volume's extent is unknown.
+    double _scrollZMaxVx = 0.0;
     // The scene rect keeps slack on either side so a zoomed-in view can pan
     // past the outer panels; this is the tight rect around the content, which
     // is what the first-build fit frames.

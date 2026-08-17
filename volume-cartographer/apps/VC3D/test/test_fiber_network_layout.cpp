@@ -1,5 +1,6 @@
 #include <QtTest/QtTest>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -20,8 +21,17 @@ constexpr double kTwoPi = 2.0 * M_PI;
 // control points one turn apart differ by exactly 2*pi.
 constexpr int kStepsPerTurn = 1256;
 constexpr double kStep = kTwoPi / static_cast<double>(kStepsPerTurn);
+// The layout is unit-free: its inputs and outputs are voxels. These tests fix a
+// voxel size only so the expectations can be written as the physical lengths the
+// layout was tuned for, converted here exactly as the workspace converts them.
 constexpr double kVoxelUm = 2.4;
-constexpr double kToCm = kVoxelUm / 10000.0;
+constexpr double kVxPerCm = 10000.0 / kVoxelUm;
+
+// A physical expectation, in voxels at kVoxelUm.
+constexpr double vx(double centimetres)
+{
+    return centimetres * kVxPerCm;
+}
 
 std::vector<cv::Vec3f> straightUmbilicus(int zMax)
 {
@@ -111,10 +121,18 @@ const PlacedLink* findLink(const PlacedNetwork& network, uint64_t fiberA, int cp
     return nullptr;
 }
 
+// The parameters the workspace derives from a known voxel size: the same
+// physical intents documented on LayoutParams, converted at kVoxelUm. Keep this
+// in step with FiberMapWorkspace::rebuildLayout().
 LayoutParams defaultParams()
 {
     LayoutParams params;
-    params.voxelSizeUm = kVoxelUm;
+    params.smoothVx = vx(0.12);
+    params.resampleStepVx = vx(0.025);
+    params.minPadXVx = vx(2.2);
+    params.minPadYVx = vx(1.6);
+    params.panelTickVx = vx(5.0);
+    params.minGapVx = vx(1.0);
     return params;
 }
 
@@ -150,6 +168,26 @@ Weave makeWeave(uint64_t firstId, const QString& prefix, double z, double radius
         weave.fibers.push_back(std::move(vertical));
     }
     return weave;
+}
+
+// The median control-point radius about the umbilicus, in voxels: the layout's
+// own reference radius, computed here straight from the input so the assertion
+// cannot inherit a conversion from the code under test.
+double medianControlRadius(const std::vector<InputFiber>& fibers)
+{
+    std::vector<double> radii;
+    for (const InputFiber& fiber : fibers) {
+        for (const cv::Vec3d& point : fiber.controlPoints) {
+            radii.push_back(std::hypot(point[0], point[1]));
+        }
+    }
+    std::sort(radii.begin(), radii.end());
+    if (radii.empty()) {
+        return 0.0;
+    }
+    const std::size_t middle = radii.size() / 2;
+    return radii.size() % 2 == 1 ? radii[middle]
+                                 : 0.5 * (radii[middle - 1] + radii[middle]);
 }
 
 std::vector<InputFiber> collect(const std::vector<Weave*>& weaves,
@@ -196,7 +234,7 @@ private slots:
         QCOMPARE(result.networks.size(), std::size_t{2});
         // Panels run inner -> outer by median umbilicus radius; the inner
         // network is the smaller one, so it carries network index 1.
-        QVERIFY(result.networks[0].rRefCm < result.networks[1].rRefCm);
+        QVERIFY(result.networks[0].rRefVx < result.networks[1].rRefVx);
         QCOMPARE(result.networks[0].networkIndex, 1);
         QCOMPARE(result.networks[1].networkIndex, 0);
         QCOMPARE(result.networks[0].fibers.size(), std::size_t{3});
@@ -219,12 +257,12 @@ private slots:
         params.minFibers = 3;
         const Result repeated = vc3d::fiber_map::buildLayout(fibers, umbilicus, params);
         QCOMPARE(repeated.networks.size(), result.networks.size());
-        QVERIFY(repeated.widthCm == result.widthCm);
+        QVERIFY(repeated.widthVx == result.widthVx);
         for (std::size_t i = 0; i < result.networks.size(); ++i) {
             const PlacedNetwork& a = result.networks[i];
             const PlacedNetwork& b = repeated.networks[i];
-            QVERIFY(b.rRefCm == a.rRefCm);
-            QVERIFY(b.x0Cm == a.x0Cm);
+            QVERIFY(b.rRefVx == a.rRefVx);
+            QVERIFY(b.x0Vx == a.x0Vx);
             QCOMPARE(b.fibers.size(), a.fibers.size());
             for (std::size_t f = 0; f < a.fibers.size(); ++f) {
                 QCOMPARE(b.fibers[f].label, a.fibers[f].label);
@@ -279,7 +317,7 @@ private slots:
 
         std::vector<InputFiber> fibers{horizontal, verticals[0], verticals[1]};
         LayoutParams params = defaultParams();
-        params.smoothMm = 0.0;
+        params.smoothVx = 0.0;
         const Result result = vc3d::fiber_map::buildLayout(fibers, umbilicus, params);
         QCOMPARE(result.networks.size(), std::size_t{1});
         const PlacedNetwork& network = result.networks.front();
@@ -289,9 +327,9 @@ private slots:
         for (const PlacedLink& link : network.links) {
             QVERIFY2(link.turnErr < 1e-9, qPrintable(QString::number(link.turnErr)));
             QVERIFY(!link.suspect);
-            // The crossing coincides by construction.
-            QVERIFY(std::abs(link.a.x() - link.b.x()) < 0.01);
-            QVERIFY(std::abs(link.a.y() - link.b.y()) < 0.01);
+            // The crossing coincides by construction, to well under 0.01 cm.
+            QVERIFY(std::abs(link.a.x() - link.b.x()) < vx(0.01));
+            QVERIFY(std::abs(link.a.y() - link.b.y()) < vx(0.01));
         }
 
         const PlacedLink* first = findLink(network, 1, 0, 2, 1);
@@ -308,10 +346,10 @@ private slots:
                      placed.label + QStringLiteral(".json"));
         }
         const double gap = std::abs(second->a.x() - first->a.x());
-        QVERIFY2(std::abs(gap - kTwoPi * network.rRefCm) < 0.02,
+        QVERIFY2(std::abs(gap - kTwoPi * network.rRefVx) < vx(0.02),
                  qPrintable(QStringLiteral("gap %1 vs %2")
                                 .arg(gap)
-                                .arg(kTwoPi * network.rRefCm)));
+                                .arg(kTwoPi * network.rRefVx)));
 
         // Whichever ref of the pair the dedup sees first, the merged link is
         // pending: here only the V side of the first crossing carries the flag.
@@ -356,7 +394,7 @@ private slots:
 
         std::vector<InputFiber> fibers{horizontal, verticals[0], verticals[1]};
         LayoutParams params = defaultParams();
-        params.smoothMm = 0.0;
+        params.smoothVx = 0.0;
         const Result result = vc3d::fiber_map::buildLayout(fibers, umbilicus, params);
         QCOMPARE(result.networks.size(), std::size_t{1});
         const PlacedNetwork& network = result.networks.front();
@@ -397,7 +435,7 @@ private slots:
                                      1.4 * kTwoPi, {100, 900});
             const std::vector<InputFiber> fibers = collect({&wide, &narrow});
             LayoutParams params = defaultParams();
-            params.smoothMm = 0.0;
+            params.smoothVx = 0.0;
             params.maxNetworks = 2;
             return vc3d::fiber_map::buildLayout(fibers, umbilicus, params);
         };
@@ -409,31 +447,31 @@ private slots:
 
         // The outer, wider network is the second panel.
         const PlacedNetwork& wide = tight.networks[1];
-        QVERIFY(wide.rRefCm > tight.networks[0].rRefCm);
-        const double circumference = turns * kTwoPi * wide.rRefCm;
-        const double pad = std::max(0.05 * circumference, 2.2);
-        const double span = wide.x1Cm - wide.x0Cm;
-        QVERIFY2(std::abs(span - (circumference + 2.0 * pad)) < 0.1,
+        QVERIFY(wide.rRefVx > tight.networks[0].rRefVx);
+        const double circumference = turns * kTwoPi * wide.rRefVx;
+        const double pad = std::max(0.05 * circumference, vx(2.2));
+        const double span = wide.x1Vx - wide.x0Vx;
+        QVERIFY2(std::abs(span - (circumference + 2.0 * pad)) < vx(0.1),
                  qPrintable(QStringLiteral("span %1 vs %2")
                                 .arg(span)
                                 .arg(circumference + 2.0 * pad)));
 
         // Line-point tails a radian beyond the outermost control points would
-        // add ~2 * 1.0 * rRefCm to the panel; they are clipped out instead.
-        const double tailedSpan = tailed.networks[1].x1Cm - tailed.networks[1].x0Cm;
-        QVERIFY2(std::abs(tailedSpan - span) < 0.1,
+        // add ~2 * 1.0 * rRefVx to the panel; they are clipped out instead.
+        const double tailedSpan = tailed.networks[1].x1Vx - tailed.networks[1].x0Vx;
+        QVERIFY2(std::abs(tailedSpan - span) < vx(0.1),
                  qPrintable(QStringLiteral("tailed span %1 vs %2")
                                 .arg(tailedSpan)
                                 .arg(span)));
-        QVERIFY(tailed.networks[1].x0Cm == wide.x0Cm);
+        QVERIFY(tailed.networks[1].x0Vx == wide.x0Vx);
 
         // Unrolled length starts at 0 and every later panel starts on the 5 cm
-        // grid; winding numbers run continuously across the panels.
-        QVERIFY(std::abs(tight.networks[0].x0Cm) < 1e-12);
-        const double gridSteps = tight.networks[1].x0Cm / 5.0;
+        // tick grid; winding numbers run continuously across the panels.
+        QVERIFY(std::abs(tight.networks[0].x0Vx) < 1e-12);
+        const double gridSteps = tight.networks[1].x0Vx / vx(5.0);
         QVERIFY2(std::abs(gridSteps - std::round(gridSteps)) < 1e-9,
-                 qPrintable(QString::number(tight.networks[1].x0Cm)));
-        QVERIFY(tight.networks[1].x0Cm >= tight.networks[0].x1Cm + 1.0);
+                 qPrintable(QString::number(tight.networks[1].x0Vx)));
+        QVERIFY(tight.networks[1].x0Vx >= tight.networks[0].x1Vx + vx(1.0));
 
         int expected = 0;
         for (const PlacedNetwork& network : tight.networks) {
@@ -441,21 +479,180 @@ private slots:
             for (const auto& mark : network.windings) {
                 QCOMPARE(mark.number, expected);
                 ++expected;
-                QVERIFY(mark.xCm >= network.x0Cm - 1e-9);
-                QVERIFY(mark.xCm <= network.x1Cm + 1e-9);
+                QVERIFY(mark.xVx >= network.x0Vx - vx(1e-9));
+                QVERIFY(mark.xVx <= network.x1Vx + vx(1e-9));
             }
         }
 
         // One turn of the panel is one circumference of the reference radius.
         for (const PlacedNetwork& network : tight.networks) {
             for (std::size_t i = 1; i < network.windings.size(); ++i) {
-                const double step = network.windings[i].xCm - network.windings[i - 1].xCm;
-                QVERIFY(std::abs(step - kTwoPi * network.rRefCm) < 1e-9);
+                const double step = network.windings[i].xVx - network.windings[i - 1].xVx;
+                QVERIFY(std::abs(step - kTwoPi * network.rRefVx) < vx(1e-9));
             }
         }
 
-        // The reference radius is the median crossing radius in cm.
-        QVERIFY(std::abs(tight.networks[0].rRefCm - 1500.0 * kToCm) < 0.05);
+        // The reference radius is the median crossing radius, in voxels: the
+        // narrow weave was drawn at radius 1500 vx, and the layout reports it
+        // as-is rather than converting it to a length.
+        QVERIFY(std::abs(tight.networks[0].rRefVx - 1500.0) < vx(0.05));
+    }
+
+    // The layout has no voxel size to get wrong: it is handed voxels and returns
+    // voxels. A project's resolution can only reach it through the LayoutParams
+    // lengths, which are voxels themselves, so the same network placed under the
+    // same voxel-valued parameters must come out bit-identical whatever the
+    // volume's voxel size happens to be — and the voxel ground truths below fail
+    // if any conversion reappears inside the layout.
+    void voxelGeometryIsIndependentOfVoxelSize()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        Weave weave = makeWeave(100, QStringLiteral("a-"), 30000.0, 1500.0, 100.0, 0.0,
+                                1.4 * kTwoPi, {100, 900});
+        const std::vector<InputFiber> fibers = collect({&weave});
+        const double expectedRadius = medianControlRadius(fibers);
+        QVERIFY(expectedRadius > 1000.0);
+
+        std::vector<Result> results;
+        for (const double voxelSizeUm : {1.0, 2.4, 5.0}) {
+            // The voxel size is deliberately not passed anywhere: after this
+            // change there is no parameter that takes one. It varies here to say
+            // exactly that, and the assertions below pin the voxel scale of the
+            // output so a reintroduced conversion cannot hide.
+            (void)voxelSizeUm;
+            LayoutParams params;
+            params.smoothVx = 0.0;
+            results.push_back(
+                vc3d::fiber_map::buildLayout(fibers, umbilicus, params));
+        }
+
+        for (const Result& result : results) {
+            QCOMPARE(result.networks.size(), std::size_t{1});
+            const PlacedNetwork& network = result.networks.front();
+            // Voxels in, voxels out: the reference radius is the input's own
+            // median control radius, not a length derived from it.
+            QVERIFY2(std::abs(network.rRefVx - expectedRadius) < 1e-9,
+                     qPrintable(QStringLiteral("rRef %1 vs %2")
+                                    .arg(network.rRefVx)
+                                    .arg(expectedRadius)));
+            QVERIFY(std::abs(network.x0Vx) < 1e-12);
+            // The drawn arc runs between the H fiber's outer control points, 800
+            // angular samples apart, so its unrolled length is that angle times
+            // the radius — in voxels, times nothing else. Plus a voxel pad on
+            // either side. Tolerance: the clip lands on the resample grid.
+            const double arc = 800.0 * kStep * expectedRadius;
+            const double pad = std::max(0.05 * arc, LayoutParams{}.minPadXVx);
+            QVERIFY2(std::abs((network.x1Vx - network.x0Vx) -
+                              (arc + 2.0 * pad)) < 4.0 * LayoutParams{}.resampleStepVx,
+                     qPrintable(QStringLiteral("span %1 vs %2")
+                                    .arg(network.x1Vx - network.x0Vx)
+                                    .arg(arc + 2.0 * pad)));
+        }
+
+        // Identical, not merely close: nothing in the run depended on the size.
+        for (std::size_t i = 1; i < results.size(); ++i) {
+            const PlacedNetwork& a = results.front().networks.front();
+            const PlacedNetwork& b = results[i].networks.front();
+            QVERIFY(results[i].widthVx == results.front().widthVx);
+            QVERIFY(results[i].yMinVx == results.front().yMinVx);
+            QVERIFY(results[i].yMaxVx == results.front().yMaxVx);
+            QVERIFY(b.rRefVx == a.rRefVx);
+            QVERIFY(b.x0Vx == a.x0Vx);
+            QVERIFY(b.x1Vx == a.x1Vx);
+            QCOMPARE(b.fibers.size(), a.fibers.size());
+            for (std::size_t f = 0; f < a.fibers.size(); ++f) {
+                QCOMPARE(b.fibers[f].label, a.fibers[f].label);
+                QCOMPARE(b.fibers[f].runs.size(), a.fibers[f].runs.size());
+                for (std::size_t r = 0; r < a.fibers[f].runs.size(); ++r) {
+                    const auto& runA = a.fibers[f].runs[r];
+                    const auto& runB = b.fibers[f].runs[r];
+                    QCOMPARE(runB.points.size(), runA.points.size());
+                    for (std::size_t p = 0; p < runA.points.size(); ++p) {
+                        QVERIFY(runB.points[p].x() == runA.points[p].x());
+                        QVERIFY(runB.points[p].y() == runA.points[p].y());
+                    }
+                }
+            }
+            QCOMPARE(b.windings.size(), a.windings.size());
+            for (std::size_t w = 0; w < a.windings.size(); ++w) {
+                QVERIFY(b.windings[w].xVx == a.windings[w].xVx);
+            }
+        }
+    }
+
+    // A project whose voxel size is unknown gets the documented voxel defaults —
+    // the same tuning lengths at 2.4 µm — so it still lays out sensibly instead of
+    // failing or scaling by a guess.
+    void unsetVoxelSizeUsesDocumentedDefaults()
+    {
+        // The table on LayoutParams, asserted so it cannot drift from the values
+        // the workspace's known-voxel-size derivation produces at 2.4 µm.
+        const LayoutParams defaults;
+        QCOMPARE(defaults.smoothVx, 500.0);
+        QCOMPARE(defaults.resampleStepVx, 104.0);
+        QCOMPARE(defaults.minPadXVx, 9167.0);
+        QCOMPARE(defaults.minPadYVx, 6667.0);
+        QCOMPARE(defaults.panelTickVx, 20833.0);
+        QCOMPARE(defaults.minGapVx, 4167.0);
+        QVERIFY(std::abs(defaults.smoothVx - vx(0.12)) < 1.0);
+        QVERIFY(std::abs(defaults.resampleStepVx - vx(0.025)) < 1.0);
+        QVERIFY(std::abs(defaults.minPadXVx - vx(2.2)) < 1.0);
+        QVERIFY(std::abs(defaults.minPadYVx - vx(1.6)) < 1.0);
+        QVERIFY(std::abs(defaults.panelTickVx - vx(5.0)) < 1.0);
+        QVERIFY(std::abs(defaults.minGapVx - vx(1.0)) < 1.0);
+
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        Weave outer = makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0, 0.0,
+                                1.5 * kTwoPi, {200, 900, 1600});
+        Weave inner = makeWeave(300, QStringLiteral("b-"), 30000.0, 1500.0, 100.0, 0.0,
+                                1.2 * kTwoPi, {150, 1100});
+        const std::vector<InputFiber> fibers = collect({&outer, &inner});
+
+        // What the workspace passes when the snapshot has no voxel size: the
+        // parameters untouched.
+        LayoutParams unknown;
+        unknown.maxNetworks = 2;
+        const Result plain = vc3d::fiber_map::buildLayout(fibers, umbilicus, unknown);
+        QCOMPARE(plain.networks.size(), std::size_t{2});
+        for (const PlacedNetwork& network : plain.networks) {
+            QVERIFY(!network.fibers.empty());
+            QVERIFY(!network.windings.empty());
+            QVERIFY(network.x1Vx > network.x0Vx);
+        }
+        // Panels still snap to the default tick grid, and the pads are the
+        // default voxel pads.
+        QVERIFY(std::abs(plain.networks[0].x0Vx) < 1e-12);
+        const double ticks = plain.networks[1].x0Vx / defaults.panelTickVx;
+        QVERIFY2(std::abs(ticks - std::round(ticks)) < 1e-9,
+                 qPrintable(QString::number(plain.networks[1].x0Vx)));
+        QVERIFY(plain.networks[1].x0Vx >=
+                plain.networks[0].x1Vx + defaults.minGapVx);
+
+        // And the result is the 2.4 µm layout to within the rounding of those
+        // defaults: an unmeasured project gets the same map, not a scaled one.
+        LayoutParams known = defaultParams();
+        known.maxNetworks = 2;
+        const Result exact = vc3d::fiber_map::buildLayout(fibers, umbilicus, known);
+        QCOMPARE(exact.networks.size(), plain.networks.size());
+        for (std::size_t i = 0; i < exact.networks.size(); ++i) {
+            QVERIFY(std::abs(exact.networks[i].rRefVx -
+                             plain.networks[i].rRefVx) < 1e-9);
+            // The default pads and tick are the cm intents rounded to whole
+            // voxels, so the panel edges agree to a few voxels out of ~10^5.
+            QVERIFY2(std::abs(exact.networks[i].x0Vx -
+                              plain.networks[i].x0Vx) < 10.0,
+                     qPrintable(QStringLiteral("x0 %1 vs %2")
+                                    .arg(exact.networks[i].x0Vx)
+                                    .arg(plain.networks[i].x0Vx)));
+            // The right edge additionally depends on where the clipped geometry
+            // falls on the resample grid, which the rounded default step shifts
+            // by under one sample.
+            QVERIFY2(std::abs(exact.networks[i].x1Vx - plain.networks[i].x1Vx) <
+                         2.0 * defaults.resampleStepVx,
+                     qPrintable(QStringLiteral("x1 %1 vs %2")
+                                    .arg(exact.networks[i].x1Vx)
+                                    .arg(plain.networks[i].x1Vx)));
+        }
     }
 
     void interpolatedRunsSplitTheGeometry()

@@ -145,6 +145,10 @@ constexpr qreal kHighlightZ = 7.0;
 // pixel-clamped radius, and with it the painting bounds: once zoomed far enough
 // out the dots stop growing in scene units rather than outrun their bounding
 // rect.
+//
+// These are the sizes the markers are meant to have on a printed map, in cm;
+// the scene is in voxels, so each is multiplied by sceneVxPerCm() at build time.
+// Nothing below may reach the scene without that conversion.
 constexpr qreal kControlDotRadiusCm = 0.06;
 constexpr qreal kMinControlDotPx = 3.5;
 constexpr qreal kControlDotBoundsCm = 0.5;
@@ -154,16 +158,20 @@ constexpr qreal kCrossingDotBoundsCm = 0.4;
 constexpr qreal kSuspectRingRadiusCm = 0.08;
 constexpr qreal kMinSuspectRingPx = 4.0;
 constexpr qreal kSuspectRingBoundsCm = 0.6;
+// Slack kept on either side of the content so a zoomed-in view can pan the outer
+// panels away from the edge, in cm; it is the floor under the quarter-of-the-width
+// margin, so it only decides maps narrower than 12 cm.
+constexpr qreal kMinSceneMarginCm = 3.0;
 constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
 constexpr int kClickSlopPx = 4;
 
-// The layout's tuning constants (resample step, label pads, panel tick) are
-// physical lengths, so it needs some voxel size to lay anything out at all. A
-// package that cannot say how big its voxels are gets this stand-in for the
-// geometry alone: it is the voxel size of the open-data scrolls, so the common
-// case is unaffected, and every physical figure the workspace would otherwise
-// derive from it is reported in voxels instead (see formatMapLength()).
+// Stand-in voxel size for a package that cannot say how big its voxels are. It
+// is the resolution of the open-data scrolls, so the common case is unaffected,
+// and it decides two things only: the scale the map's cm-valued styling
+// constants are converted at, and the physical intents handed to the layout as
+// voxel lengths. No physical figure is ever displayed from it — see
+// formatMapLength(), which reports voxels instead.
 constexpr double kAssumedVoxelSizeUm = 2.4;
 constexpr double kUmPerCm = 10000.0;
 
@@ -318,19 +326,22 @@ private:
 class ScaledDot : public QGraphicsItem
 {
 public:
-    ScaledDot(const QBrush& fill, const QPen& outline, qreal radiusCm,
-              qreal minPixels, qreal maxRadiusCm)
+    // radius and maxRadius are scene units (voxels); minPixels is on screen, and
+    // the level-of-detail factor converts between the two, so this needs to know
+    // nothing about what a scene unit measures.
+    ScaledDot(const QBrush& fill, const QPen& outline, qreal radius,
+              qreal minPixels, qreal maxRadius)
         : _fill(fill)
         , _outline(outline)
-        , _radiusCm(radiusCm)
+        , _radius(radius)
         , _minPixels(minPixels)
-        , _maxRadiusCm(maxRadiusCm)
+        , _maxRadius(maxRadius)
     {
     }
 
     QRectF boundingRect() const override
     {
-        return QRectF(-_maxRadiusCm, -_maxRadiusCm, 2.0 * _maxRadiusCm, 2.0 * _maxRadiusCm);
+        return QRectF(-_maxRadius, -_maxRadius, 2.0 * _maxRadius, 2.0 * _maxRadius);
     }
 
     // Hit testing stays tight to the scene-space radius; the ctrl+right-click
@@ -338,7 +349,7 @@ public:
     QPainterPath shape() const override
     {
         QPainterPath path;
-        path.addEllipse(QPointF(0.0, 0.0), _radiusCm, _radiusCm);
+        path.addEllipse(QPointF(0.0, 0.0), _radius, _radius);
         return path;
     }
 
@@ -347,8 +358,8 @@ public:
         const qreal lod =
             QStyleOptionGraphicsItem::levelOfDetailFromTransform(painter->worldTransform());
         const qreal radius = lod > 0.0
-            ? std::clamp<qreal>(_minPixels / lod, _radiusCm, _maxRadiusCm)
-            : _radiusCm;
+            ? std::clamp<qreal>(_minPixels / lod, _radius, _maxRadius)
+            : _radius;
         painter->setRenderHint(QPainter::Antialiasing, true);
         painter->setPen(_outline);
         painter->setBrush(_fill);
@@ -358,9 +369,9 @@ public:
 private:
     QBrush _fill;
     QPen _outline;
-    qreal _radiusCm = 0.0;
+    qreal _radius = 0.0;
     qreal _minPixels = 0.0;
-    qreal _maxRadiusCm = 0.0;
+    qreal _maxRadius = 0.0;
 };
 
 // Appends the package's umbilicus state to a pre-rebuild status line. Unrolling
@@ -573,20 +584,19 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidg
     rebuildScene(tr("press Rebuild layout"));
 }
 
-double FiberMapWorkspace::layoutVoxelSizeUm() const
+double FiberMapWorkspace::sceneVxPerCm() const
 {
-    return _voxelSizeUm.value_or(kAssumedVoxelSizeUm);
+    return kUmPerCm / _voxelSizeUm.value_or(kAssumedVoxelSizeUm);
 }
 
-QString FiberMapWorkspace::formatMapLength(double valueCm) const
+QString FiberMapWorkspace::formatMapLength(double valueVx) const
 {
     if (_voxelSizeUm) {
-        return tr("%1 cm").arg(valueCm, 0, 'f', 2);
+        return tr("%1 cm").arg(valueVx * *_voxelSizeUm / kUmPerCm, 0, 'f', 2);
     }
-    // The layout ran at kAssumedVoxelSizeUm, so its centimetres divide back into
-    // voxels exactly; the voxel count is what the geometry really says.
-    const double voxels = valueCm * kUmPerCm / kAssumedVoxelSizeUm;
-    return tr("%1 vx").arg(std::llround(voxels));
+    // The layout works in voxels, so the voxel count is exactly what it computed;
+    // only the trip to centimetres needs a voxel size, and there is none.
+    return tr("%1 vx").arg(std::llround(valueVx));
 }
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
@@ -675,14 +685,26 @@ void FiberMapWorkspace::rebuildLayout()
     _voxelSizeUm = snapshot.voxelSizeUm;
 
     vc3d::fiber_map::LayoutParams params;
-    params.voxelSizeUm = layoutVoxelSizeUm();
     params.minFibers = _minFiberSpin->value();
     params.maxNetworks = _topNetworkSpin->value();
+    // The layout is unit-free, so the physical intents behind its tuning lengths
+    // are converted here — once the voxel size is known, exactly as documented on
+    // LayoutParams. Left alone when it is not, so the defaults (the same intents
+    // at 2.4 µm) stand in and the map still lays out sensibly.
+    if (_voxelSizeUm) {
+        const double vxPerCm = sceneVxPerCm();
+        params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
+        params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
+        params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
+        params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
+        params.panelTickVx = 5.0 * vxPerCm;       // 5 cm winding-label grid
+        params.minGapVx = 1.0 * vxPerCm;          // 1 cm minimum panel gap
+    }
     _layout = vc3d::fiber_map::buildLayout(inputs, snapshot.umbilicusCenters, params);
-    // Scene coordinates, so this converts with the scale the layout itself used
-    // rather than with a real voxel size the package may not have.
-    _scrollZMaxCm = snapshot.annotationZSlices > 0
-        ? snapshot.annotationZSlices * layoutVoxelSizeUm() / kUmPerCm
+    // Scene space is voxels and the slice count already is one, so the scroll
+    // extent needs no voxel size at all.
+    _scrollZMaxVx = snapshot.annotationZSlices > 0
+        ? static_cast<double>(snapshot.annotationZSlices)
         : 0.0;
 
     QString emptyMessage;
@@ -767,11 +789,18 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         return;
     }
 
-    // Scene coordinates are (x, -y): negating z once here keeps the scroll
-    // axis reading upward without ever mirroring text.
-    const double topY = -_layout.yMaxCm;
-    const double bottomY = -_layout.yMinCm;
-    const double sceneWidth = std::max(_layout.widthCm, 1e-6);
+    // Scene coordinates are (x, -y) in voxels: negating z once here keeps the
+    // scroll axis reading upward without ever mirroring text.
+    const double topY = -_layout.yMaxVx;
+    const double bottomY = -_layout.yMinVx;
+    const double sceneWidth = std::max(_layout.widthVx, 1e-6);
+    // The one conversion of this rebuild. Every scene-space size below that was
+    // chosen as a physical length goes through it, and nothing else does.
+    const double vxPerCm = sceneVxPerCm();
+    const qreal crossingDotRadius = kCrossingDotRadiusCm * vxPerCm;
+    const qreal crossingDotBounds = kCrossingDotBoundsCm * vxPerCm;
+    const qreal suspectRingRadius = kSuspectRingRadiusCm * vxPerCm;
+    const qreal suspectRingBounds = kSuspectRingBoundsCm * vxPerCm;
     QFont labelFont = font();
     labelFont.setPointSizeF(8.0);
     QFont headerFont = font();
@@ -781,9 +810,9 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // own z extent instead of floating on their own; the winding gridlines and
     // the panel grounds span the same range. Without that extent the layout's
     // own y range has to do.
-    const bool scrollExtentKnown = _scrollZMaxCm > 0.0;
+    const bool scrollExtentKnown = _scrollZMaxVx > 0.0;
     const double extentBottomY = scrollExtentKnown ? 0.0 : bottomY;
-    const double extentTopY = scrollExtentKnown ? -_scrollZMaxCm : topY;
+    const double extentTopY = scrollExtentKnown ? -_scrollZMaxVx : topY;
     const double sceneTopY = std::min(extentTopY, topY);
     const double sceneBottomY = std::max(extentBottomY, bottomY);
 
@@ -801,12 +830,12 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         // what says where one network ends and the next begins, and their
         // top/bottom edges are the scroll ceiling and floor.
         auto* panel = _scene->addRect(
-            QRectF(QPointF(network.x0Cm, extentTopY), QPointF(network.x1Cm, extentBottomY)),
+            QRectF(QPointF(network.x0Vx, extentTopY), QPointF(network.x1Vx, extentBottomY)),
             QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
         panel->setZValue(kPanelZ);
 
         for (const vc3d::fiber_map::WindingMark& mark : network.windings) {
-            auto* line = _scene->addLine(mark.xCm, extentTopY, mark.xCm, extentBottomY);
+            auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
             QPen pen(theme.winding);
             pen.setWidthF(0.8);
             pen.setCosmetic(true);
@@ -820,7 +849,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         auto* header = _scene->addSimpleText(
             tr("network %1").arg(network.networkIndex + 1), headerFont);
         header->setBrush(theme.inkSoft);
-        pinText(header, QPointF(0.5 * (network.x0Cm + network.x1Cm), topY), 0.0, -36.0, true);
+        pinText(header, QPointF(0.5 * (network.x0Vx + network.x1Vx), topY), 0.0, -36.0, true);
 
         for (const vc3d::fiber_map::PlacedFiber& placed : network.fibers) {
             FiberEntry entry;
@@ -884,7 +913,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                 } else {
                     const QPointF left = endpoint(true, true);
                     const QPointF right = endpoint(false, true);
-                    const bool atRight = (network.x1Cm - right.x()) < (left.x() - network.x0Cm);
+                    const bool atRight = (network.x1Vx - right.x()) < (left.x() - network.x0Vx);
                     anchor = atRight ? right : left;
                     offsetX = atRight ? 10.0 : -10.0;
                     anchorRight = !atRight;
@@ -916,8 +945,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                     linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
                 auto* dot = new ScaledDot(QBrush(palette.brush),
                                           cosmeticPen(palette.pen, 1.0),
-                                          kCrossingDotRadiusCm,
-                                          kMinCrossingDotPx, kCrossingDotBoundsCm);
+                                          crossingDotRadius,
+                                          kMinCrossingDotPx, crossingDotBounds);
                 _scene->addItem(dot);
                 dot->setPos(middle);
                 dot->setZValue(4.0);
@@ -932,8 +961,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             line->setZValue(4.0);
             for (const QPointF& endpoint : {a, b}) {
                 auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
-                                           kSuspectRingRadiusCm, kMinSuspectRingPx,
-                                           kSuspectRingBoundsCm);
+                                           suspectRingRadius, kMinSuspectRingPx,
+                                           suspectRingBounds);
                 _scene->addItem(ring);
                 ring->setPos(endpoint);
                 ring->setZValue(5.0);
@@ -955,7 +984,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // Panning stops at the scene rect, so the rect runs wider than the content:
     // zoomed in, the outermost panels can be dragged away from the edge instead
     // of being pinned to it.
-    const double xMargin = std::max(0.25 * sceneWidth, 3.0);
+    const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
     _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
 }
 
@@ -974,7 +1003,7 @@ void FiberMapWorkspace::rebuildTree()
         QString title = tr("Network %1 — %2 fibers · r ≈ %3")
                             .arg(network.networkIndex + 1)
                             .arg(network.fibers.size())
-                            .arg(formatMapLength(network.rRefCm));
+                            .arg(formatMapLength(network.rRefVx));
         if (suspectCount > 0) {
             title += tr(" · %1 winding-suspect").arg(suspectCount);
         }
@@ -1044,8 +1073,8 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
 {
     // Only the label chips answer by hit test. A fiber path's shape() is its
     // painter path stroked with the pen width read as scene units, and the fiber
-    // pens are cosmetic (2.2 device pixels, hence a 2.2 cm ribbon in the scene),
-    // so consulting the items would hand every click to whichever of the
+    // pens are cosmetic (2.2 device pixels, hence a 2.2-voxel ribbon in the
+    // scene), so consulting the items would hand every click to whichever of the
     // overlapping ribbons happens to stack highest instead of to the nearest
     // fiber.
     const QList<QGraphicsItem*> under = _scene->items(
@@ -1164,9 +1193,11 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
             interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedHighlightWidth));
         entry->interpolatedItem->setZValue(kHighlightZ);
     }
+    const double vxPerCm = sceneVxPerCm();
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         auto* dot = new ScaledDot(QBrush(color), cosmeticPen(theme.chipInk, 1.0),
-                                  kControlDotRadiusCm, kMinControlDotPx, kControlDotBoundsCm);
+                                  kControlDotRadiusCm * vxPerCm, kMinControlDotPx,
+                                  kControlDotBoundsCm * vxPerCm);
         _scene->addItem(dot);
         dot->setPos(entry->fiber.controlPoints[i]);
         dot->setZValue(kHighlightZ + 1.0);
@@ -1186,8 +1217,8 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     }
     // Grabbing a dot must work wherever it is drawn: kControlDotTolerancePx is
     // the floor, the scene-space radius takes over once zoomed in.
-    const double tolerance =
-        std::max(sceneTolerance(kControlDotTolerancePx), double{kControlDotRadiusCm});
+    const double tolerance = std::max(sceneTolerance(kControlDotTolerancePx),
+                                      kControlDotRadiusCm * sceneVxPerCm());
     int bestIndex = -1;
     double bestDistance = tolerance;
     for (QGraphicsItem* dot : _controlPointDots) {

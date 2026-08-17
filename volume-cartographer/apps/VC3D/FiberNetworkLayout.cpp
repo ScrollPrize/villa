@@ -21,11 +21,8 @@ namespace
 {
 
 constexpr double kTwoPi = 2.0 * M_PI;
-// Uniform arclength resampling step of the drawn geometry, in cm.
-constexpr double kResampleStepCm = 0.025;
-// Minimum padding around a network, in cm: room for a few rows of label chips.
-constexpr double kMinPadXCm = 2.2;
-constexpr double kMinPadYCm = 1.6;
+// Fraction of a network's own extent taken as padding; the LayoutParams pads are
+// the floor under it. Dimensionless, so no unit to get wrong.
 constexpr double kPadFraction = 0.05;
 
 // Whole-turn rounding with the ties-to-even behaviour of Python's round().
@@ -256,13 +253,13 @@ struct FiberGeometry {
 
 struct NetworkDraft {
     int networkIndex = 0;
-    double rRefCm = 0.0;
+    double rRefVx = 0.0;
     std::vector<PlacedFiber> fibers;
     std::vector<PlacedLink> links;
-    double loXCm = 0.0;
-    double hiXCm = 0.0;
-    double loYCm = 0.0;
-    double hiYCm = 0.0;
+    double loXVx = 0.0;
+    double hiXVx = 0.0;
+    double loYVx = 0.0;
+    double hiYVx = 0.0;
 };
 
 } // namespace
@@ -359,8 +356,14 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
                   return a.front() < b.front();
               });
 
-    const double toCm = params.voxelSizeUm / 10000.0;
-    const double sigmaCm = params.smoothMm / 10.0;
+    // Voxels throughout: line points, radii and every tuning length arrive in
+    // the same unit, so there is nothing to convert.
+    const double sigmaVx = std::max(0.0, params.smoothVx);
+    // A step of zero would resample forever, so it falls back to the documented
+    // default rather than to a literal repeated from the header.
+    const double resampleStepVx = params.resampleStepVx > 0.0
+        ? params.resampleStepVx
+        : LayoutParams{}.resampleStepVx;
     const int minFibers = std::max(1, params.minFibers);
 
     std::vector<NetworkDraft> drafts;
@@ -535,15 +538,15 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         for (const std::size_t member : component) {
             prepared.at(member).offset -= shiftTurns;
         }
-        const double rRefCm = median(controlRadii) * toCm;
+        const double rRefVx = median(controlRadii);
 
         NetworkDraft draft;
         draft.networkIndex = networkIndex;
-        draft.rRefCm = rRefCm;
-        draft.loXCm = std::numeric_limits<double>::infinity();
-        draft.hiXCm = -std::numeric_limits<double>::infinity();
-        draft.loYCm = std::numeric_limits<double>::infinity();
-        draft.hiYCm = -std::numeric_limits<double>::infinity();
+        draft.rRefVx = rRefVx;
+        draft.loXVx = std::numeric_limits<double>::infinity();
+        draft.hiXVx = -std::numeric_limits<double>::infinity();
+        draft.loYVx = std::numeric_limits<double>::infinity();
+        draft.hiYVx = -std::numeric_limits<double>::infinity();
 
         std::unordered_map<std::size_t, FiberGeometry> geometry;
         geometry.reserve(component.size());
@@ -552,13 +555,13 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             const InputFiber& fiber = *entry.input;
             std::vector<QPointF> unrolled(fiber.linePoints.size());
             for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
-                unrolled[i] = QPointF((entry.thetaLine[i] + entry.offset) * rRefCm,
-                                      fiber.linePoints[i][2] * toCm);
+                unrolled[i] = QPointF((entry.thetaLine[i] + entry.offset) * rRefVx,
+                                      fiber.linePoints[i][2]);
             }
 
             FiberGeometry geo;
             const std::vector<double> rawArclength = arclengths(unrolled);
-            smoothPolyline(unrolled, sigmaCm, kResampleStepCm, geo.sampleArclength,
+            smoothPolyline(unrolled, sigmaVx, resampleStepVx, geo.sampleArclength,
                            geo.samples);
             std::vector<double> sampleX(geo.samples.size());
             std::vector<double> sampleY(geo.samples.size());
@@ -601,14 +604,14 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
                                   static_cast<std::ptrdiff_t>(clipBegin));
 
             for (const QPointF& point : geo.samples) {
-                draft.loXCm = std::min(draft.loXCm, point.x());
-                draft.hiXCm = std::max(draft.hiXCm, point.x());
-                draft.loYCm = std::min(draft.loYCm, point.y());
-                draft.hiYCm = std::max(draft.hiYCm, point.y());
+                draft.loXVx = std::min(draft.loXVx, point.x());
+                draft.hiXVx = std::max(draft.hiXVx, point.x());
+                draft.loYVx = std::min(draft.loYVx, point.y());
+                draft.hiYVx = std::max(draft.hiYVx, point.y());
             }
             geometry.emplace(member, std::move(geo));
         }
-        if (!(draft.loXCm <= draft.hiXCm) || !(draft.loYCm <= draft.hiYCm)) {
+        if (!(draft.loXVx <= draft.hiXVx) || !(draft.loYVx <= draft.hiYVx)) {
             continue;
         }
 
@@ -679,12 +682,14 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             draft.links.push_back(std::move(placedLink));
         }
 
-        const double padX = std::max(kPadFraction * (draft.hiXCm - draft.loXCm), kMinPadXCm);
-        const double padY = std::max(kPadFraction * (draft.hiYCm - draft.loYCm), kMinPadYCm);
-        draft.loXCm -= padX;
-        draft.hiXCm += padX;
-        draft.loYCm -= padY;
-        draft.hiYCm += padY;
+        const double padX =
+            std::max(kPadFraction * (draft.hiXVx - draft.loXVx), params.minPadXVx);
+        const double padY =
+            std::max(kPadFraction * (draft.hiYVx - draft.loYVx), params.minPadYVx);
+        draft.loXVx -= padX;
+        draft.hiXVx += padX;
+        draft.loYVx -= padY;
+        draft.hiYVx += padY;
         drafts.push_back(std::move(draft));
     }
     if (drafts.empty()) {
@@ -695,27 +700,28 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
     // Unrolled length starts at 0 on the left and runs continuously through
     // every panel: each next panel starts on the global tick grid, so every
     // panel shows the same labeling interval, and the gap between networks is
-    // whatever that snap requires (at least minGapCm).
+    // whatever that snap requires (at least minGapVx).
     std::stable_sort(drafts.begin(), drafts.end(),
                      [](const NetworkDraft& a, const NetworkDraft& b) {
-                         return a.rRefCm < b.rRefCm;
+                         return a.rRefVx < b.rRefVx;
                      });
 
-    const double tickCm = params.panelTickCm > 0.0 ? params.panelTickCm : 5.0;
+    const double tickVx = params.panelTickVx > 0.0 ? params.panelTickVx
+                                                  : LayoutParams{}.panelTickVx;
     double panelStart = 0.0;
     int windingNumber = 0;
-    result.yMinCm = std::numeric_limits<double>::infinity();
-    result.yMaxCm = -std::numeric_limits<double>::infinity();
+    result.yMinVx = std::numeric_limits<double>::infinity();
+    result.yMaxVx = -std::numeric_limits<double>::infinity();
     result.networks.reserve(drafts.size());
     for (NetworkDraft& draft : drafts) {
-        const double width = draft.hiXCm - draft.loXCm;
-        const double shift = panelStart - draft.loXCm;
+        const double width = draft.hiXVx - draft.loXVx;
+        const double shift = panelStart - draft.loXVx;
 
         PlacedNetwork network;
         network.networkIndex = draft.networkIndex;
-        network.rRefCm = draft.rRefCm;
-        network.x0Cm = panelStart;
-        network.x1Cm = panelStart + width;
+        network.rRefVx = draft.rRefVx;
+        network.x0Vx = panelStart;
+        network.x1Vx = panelStart + width;
         network.fibers = std::move(draft.fibers);
         network.links = std::move(draft.links);
         for (PlacedFiber& fiber : network.fibers) {
@@ -733,12 +739,12 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             link.b.setX(link.b.x() + shift);
         }
 
-        const double circumference = kTwoPi * draft.rRefCm;
+        const double circumference = kTwoPi * draft.rRefVx;
         if (circumference > 0.0) {
             const long long first =
-                static_cast<long long>(std::ceil(draft.loXCm / circumference));
+                static_cast<long long>(std::ceil(draft.loXVx / circumference));
             const long long lastMark =
-                static_cast<long long>(std::floor(draft.hiXCm / circumference));
+                static_cast<long long>(std::floor(draft.hiXVx / circumference));
             for (long long mark = first; mark <= lastMark; ++mark) {
                 network.windings.push_back(WindingMark{
                     static_cast<double>(mark) * circumference + shift, windingNumber});
@@ -746,11 +752,11 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             }
         }
 
-        result.yMinCm = std::min(result.yMinCm, draft.loYCm);
-        result.yMaxCm = std::max(result.yMaxCm, draft.hiYCm);
-        result.widthCm = panelStart + width;
+        result.yMinVx = std::min(result.yMinVx, draft.loYVx);
+        result.yMaxVx = std::max(result.yMaxVx, draft.hiYVx);
+        result.widthVx = panelStart + width;
         result.networks.push_back(std::move(network));
-        panelStart = tickCm * std::ceil((panelStart + width + params.minGapCm) / tickCm);
+        panelStart = tickVx * std::ceil((panelStart + width + params.minGapVx) / tickVx);
     }
     return result;
 }
