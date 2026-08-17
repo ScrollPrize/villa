@@ -283,4 +283,36 @@ std::optional<UmbilicusScale> deriveUmbilicusScale(
     return match;
 }
 
+UmbilicusFrameClaim umbilicusFrameClaim(const UmbilicusFileInfo& info)
+{
+    UmbilicusFrameClaim claim;
+    // A partial triplet is not a claim: two of three counts cannot describe a
+    // grid, and treating it as one would refuse files over a typo.
+    claim.dimensions = info.volumeWidth && info.volumeHeight &&
+                       info.volumeSlices && *info.volumeWidth > 0 &&
+                       *info.volumeHeight > 0 && *info.volumeSlices > 0;
+    claim.voxelSize = info.voxelsizeUm && *info.voxelsizeUm > 0.0;
+    return claim;
+}
+
+UmbilicusLoadAction decideUmbilicusLoadAction(
+    const std::optional<UmbilicusScale>& scale,
+    const UmbilicusFrameClaim& claim,
+    bool haveTargetGrid)
+{
+    if (!haveTargetGrid) {
+        // Nothing to carry the points into, so there is nothing to conflict
+        // with either. A scale derived from a stated voxel size alone can exist
+        // here, but placing the points still needs the frame's extent.
+        return UmbilicusLoadAction::UseLegacy;
+    }
+    if (scale) {
+        return UmbilicusLoadAction::Apply;
+    }
+    if (claim.any()) {
+        return UmbilicusLoadAction::Refuse;
+    }
+    return UmbilicusLoadAction::UseLegacy;
+}
+
 } // namespace vc::core::util

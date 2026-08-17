@@ -545,6 +545,8 @@ private:
     // volume's grid carried to the resolution the fibers were annotated at.
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Pushes _umbilicusNotice to every open pane's dialog.
+    void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
@@ -805,6 +807,11 @@ private:
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
     bool _scrollUmbilicusLoadAttempted = false;
+    // Why the package's umbilicus could not be used, for the strip notice.
+    // Empty when one was applied, and when none exists to complain about.
+    // Orienting off the volume centre instead is exactly the silent degradation
+    // that hid a frame mismatch for a whole scroll, so it is said out loud.
+    QString _umbilicusNotice;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

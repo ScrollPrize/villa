@@ -1887,6 +1887,16 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 &CState::vpkgChanged,
                 this,
                 &LineAnnotationController::onVolumePackageChanged);
+        // The resolved umbilicus is cached until the volpkg root changes, so
+        // without this an attach or detach would not reach normal orientation
+        // until the project was reopened. Only the cache is dropped; the next
+        // materialization of a generated view resolves again.
+        connect(_state, &CState::umbilicusChanged, this, [this]() {
+            _scrollUmbilicusLoadAttempted = false;
+            _scrollUmbilicus.reset();
+            _umbilicusNotice.clear();
+            publishUmbilicusNotice();
+        });
         if (_state->vpkg()) {
             loadFibersForCurrentPackage();
         }
@@ -2188,6 +2198,9 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     _panes.push_back(PaneRecord{_nextPaneId - 1, sourceKind, surfaceName, dialog, session});
     pushFiberUiState(_panes.back());
+    // A pane opened after the umbilicus was resolved has to be told too; the
+    // notice describes the package, not this pane's fiber.
+    dialog->setUmbilicusNotice(_umbilicusNotice);
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
@@ -9509,6 +9522,17 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
+void LineAnnotationController::publishUmbilicusNotice()
+{
+    // Every open pane, because the umbilicus is a property of the package rather
+    // than of any one fiber. Idempotent: the dialog ignores an unchanged notice.
+    for (const auto& pane : _panes) {
+        if (pane.dialog) {
+            pane.dialog->setUmbilicusNotice(_umbilicusNotice);
+        }
+    }
+}
+
 vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
 {
     if (!_state) {
@@ -9564,6 +9588,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
         _scrollUmbilicus.reset();
+        // Cleared before the attempt: whatever is set below describes this
+        // attempt, and success has to be able to retract an earlier complaint.
+        _umbilicusNotice.clear();
         try {
             if (_state && _state->vpkg() && volume) {
                 const auto resolved =
@@ -9572,6 +9599,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     if (!resolved.error.empty()) {
                         Logger()->warn("Line annotation: no usable umbilicus: {}",
                                        resolved.error);
+                        _umbilicusNotice =
+                            tr("no usable umbilicus: %1")
+                                .arg(QString::fromStdString(resolved.error));
                     }
                 } else {
                     std::vector<cv::Vec3f> controlPoints = resolved.info.controlPoints;
@@ -9586,11 +9616,53 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     const auto scale = vc::core::util::deriveUmbilicusScale(
                         resolved.info, annotationGrid, frame.voxelSizeUm);
 
-                    const bool stamped =
-                        scale && scale->source !=
-                                     vc::core::util::UmbilicusScaleSource::
-                                         InferredFromGrid;
-                    if (stamped && annotationGrid[2] > 0.0) {
+                    // Three outcomes, not two: a file whose stated frame does
+                    // not fit the target is refused rather than quietly read as
+                    // though it had stated nothing, which was a fail-open that
+                    // could orient views from the wrong frame.
+                    //
+                    // An inferred scale is applied here as it already was in the
+                    // Fiber Map. An umbilicus spans very nearly the full height
+                    // of a scroll, which is the property the inference tests, so
+                    // it is trustworthy on the cases it accepts. It also declines
+                    // the case it could not express: a file in a registration's
+                    // fixed-volume frame is offset rather than rescaled, so its
+                    // points do not fit inside any candidate grid and inference
+                    // yields nothing, dropping through to the legacy reading that
+                    // does handle a pose.
+                    const auto claim =
+                        vc::core::util::umbilicusFrameClaim(resolved.info);
+                    const bool haveTargetGrid = annotationGrid[2] > 0.0;
+                    const auto action = vc::core::util::decideUmbilicusLoadAction(
+                        scale, claim, haveTargetGrid);
+
+                    if (action == vc::core::util::UmbilicusLoadAction::Refuse) {
+                        const auto stampedGrid =
+                            claim.dimensions
+                                ? std::to_string(*resolved.info.volumeWidth) + "x" +
+                                      std::to_string(*resolved.info.volumeHeight) + "x" +
+                                      std::to_string(*resolved.info.volumeSlices)
+                                : std::string("(no dimensions)");
+                        Logger()->warn(
+                            "Line annotation: refusing umbilicus {}: it states a "
+                            "{} grid{}, which is not a uniform rescale of the "
+                            "{:g}x{:g}x{:g} annotation frame; orienting without it",
+                            resolved.path.string(),
+                            stampedGrid,
+                            claim.voxelSize
+                                ? " at " + std::to_string(*resolved.info.voxelsizeUm) +
+                                      " um voxels"
+                                : "",
+                            annotationGrid[0],
+                            annotationGrid[1],
+                            annotationGrid[2]);
+                        _umbilicusNotice =
+                            tr("umbilicus %1 refused: its stated frame does not "
+                               "match this volume")
+                                .arg(QString::fromStdString(
+                                    resolved.path.filename().string()));
+                    } else if (action ==
+                               vc::core::util::UmbilicusLoadAction::Apply) {
                         for (auto& point : controlPoints) {
                             point *= static_cast<float>(scale->factor);
                         }
@@ -9606,8 +9678,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             scale->factor,
                             scale->description);
                     } else {
-                        // Unstamped: keep the legacy reading rather than acting on
-                        // a guess. Stored umbilici of this vintage may live in the
+                        // Nothing usable stated and nothing inferable, or no
+                        // annotation frame to reach: keep the legacy reading.
+                        // Stored umbilici of this vintage may live in the
                         // registration's fixed-volume frame when the session volume
                         // carries a transform.json (native /0 coordinates mapping
                         // session coordinates to that fixed frame, discovered the
@@ -9681,6 +9754,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         } catch (...) {
             _scrollUmbilicus.reset();
         }
+        publishUmbilicusNotice();
     }
 
     cv::Vec2f volumeCenterXY{kNan, kNan};

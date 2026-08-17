@@ -86,4 +86,49 @@ namespace vc::core::util {
         const std::array<double, 3>& targetGridXyz,
         std::optional<double> targetVoxelSizeUm);
 
+    // Whether the file itself declares the grid its coordinates index, and by
+    // which key. Dimensions outrank voxel size: exact integer counts, no
+    // rounding, and they express rescales no µm figure can.
+    //
+    // This is deliberately separate from whether a scale could be *derived*.
+    // deriveUmbilicusScale() returns nothing both for a file that says nothing
+    // and for a file whose statement does not fit the target, and those two
+    // deserve opposite treatment — hence a predicate that answers only the
+    // first half. Malformed values never reach here: they populate
+    // UmbilicusFileInfo::metadataErrors and the resolver refuses the file.
+    struct UmbilicusFrameClaim {
+        bool dimensions = false;   // complete, positive triplet
+        bool voxelSize = false;
+        [[nodiscard]] bool any() const { return dimensions || voxelSize; }
+    };
+
+    [[nodiscard]] UmbilicusFrameClaim umbilicusFrameClaim(
+        const UmbilicusFileInfo& info);
+
+    // What a consumer should do with a resolved umbilicus file.
+    enum class UmbilicusLoadAction {
+        // A scale was derived; carry the points into the target frame.
+        Apply,
+        // The file states a frame that does not fit the target. Refusing is the
+        // point: a frame applied confidently but wrongly is worse than none,
+        // and silently reinterpreting it is what this replaced.
+        Refuse,
+        // The file states nothing usable, so a consumer may fall back to
+        // whatever reading it used before frames were declarable.
+        UseLegacy,
+    };
+
+    // Extracted from the branch it drives so all three arms are testable
+    // without a volume: the consumer that needs it lives behind a package, a
+    // loaded volume and a registration transform.
+    //
+    // haveTargetGrid must be false when the caller cannot say what frame it
+    // wants. Refusing then would blame the file for the caller's own missing
+    // information — and a stated frame that could not even be compared is not
+    // a conflict.
+    [[nodiscard]] UmbilicusLoadAction decideUmbilicusLoadAction(
+        const std::optional<UmbilicusScale>& scale,
+        const UmbilicusFrameClaim& claim,
+        bool haveTargetGrid);
+
 } // namespace vc::core::util

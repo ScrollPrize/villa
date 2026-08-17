@@ -562,3 +562,95 @@ TEST_CASE("deriveUmbilicusScale: no target grid and no voxel size means no answe
     info.voxelsizeUm = 9.6;
     CHECK_FALSE(deriveUmbilicusScale(info, {0.0, 0.0, 0.0}, std::nullopt).has_value());
 }
+
+TEST_CASE("umbilicusFrameClaim: a claim is what the file states, not what fits")
+{
+    using vc::core::util::umbilicusFrameClaim;
+
+    UmbilicusFileInfo none;
+    CHECK_FALSE(umbilicusFrameClaim(none).any());
+
+    UmbilicusFileInfo dimensionsOnly;
+    dimensionsOnly.volumeWidth = 8174;
+    dimensionsOnly.volumeHeight = 8174;
+    dimensionsOnly.volumeSlices = 18946;
+    const auto dims = umbilicusFrameClaim(dimensionsOnly);
+    CHECK(dims.dimensions);
+    CHECK_FALSE(dims.voxelSize);
+    CHECK(dims.any());
+
+    UmbilicusFileInfo voxelOnly;
+    voxelOnly.voxelsizeUm = 9.6;
+    const auto voxel = umbilicusFrameClaim(voxelOnly);
+    CHECK_FALSE(voxel.dimensions);
+    CHECK(voxel.voxelSize);
+    CHECK(voxel.any());
+
+    UmbilicusFileInfo both;
+    both.volumeWidth = 8174;
+    both.volumeHeight = 8174;
+    both.volumeSlices = 18946;
+    both.voxelsizeUm = 9.6;
+    CHECK(umbilicusFrameClaim(both).dimensions);
+    CHECK(umbilicusFrameClaim(both).voxelSize);
+
+    // Two of three counts describe no grid, so this is not a claim; treating it
+    // as one would refuse a file over a typo.
+    UmbilicusFileInfo partial;
+    partial.volumeWidth = 8174;
+    partial.volumeSlices = 18946;
+    CHECK_FALSE(umbilicusFrameClaim(partial).any());
+
+    // A stated frame that does not fit the target still counts as stated: that
+    // pairing — no scale, but a claim — is what a consumer must refuse rather
+    // than read as unstamped.
+    UmbilicusFileInfo mismatched;
+    mismatched.volumeWidth = 8174;
+    mismatched.volumeHeight = 4000;
+    mismatched.volumeSlices = 18946;
+    CHECK(umbilicusFrameClaim(mismatched).any());
+    CHECK_FALSE(
+        deriveUmbilicusScale(mismatched, {32696.0, 32696.0, 75784.0}, 2.4).has_value());
+}
+
+TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
+{
+    using vc::core::util::decideUmbilicusLoadAction;
+    using vc::core::util::UmbilicusFrameClaim;
+    using vc::core::util::UmbilicusLoadAction;
+    using vc::core::util::UmbilicusScale;
+
+    const UmbilicusFrameClaim noClaim;
+    UmbilicusFrameClaim claimed;
+    claimed.dimensions = true;
+
+    UmbilicusScale stamped;
+    stamped.factor = 4.0;
+    stamped.source = UmbilicusScaleSource::StampedDimensions;
+    UmbilicusScale inferred;
+    inferred.factor = 4.0;
+    inferred.source = UmbilicusScaleSource::InferredFromGrid;
+
+    // A derived scale is applied whatever its provenance: an umbilicus spans
+    // nearly the whole scroll, which is what the inference tests.
+    CHECK(decideUmbilicusLoadAction(stamped, claimed, true) ==
+          UmbilicusLoadAction::Apply);
+    CHECK(decideUmbilicusLoadAction(inferred, noClaim, true) ==
+          UmbilicusLoadAction::Apply);
+
+    // The case this exists for: stated, does not fit, refused rather than read
+    // as though it had stated nothing.
+    CHECK(decideUmbilicusLoadAction(std::nullopt, claimed, true) ==
+          UmbilicusLoadAction::Refuse);
+
+    // Nothing stated and nothing inferable is not a conflict.
+    CHECK(decideUmbilicusLoadAction(std::nullopt, noClaim, true) ==
+          UmbilicusLoadAction::UseLegacy);
+
+    // Without a target frame there is nothing to conflict with, so a claim that
+    // could not even be compared must not be blamed for the caller's gap.
+    CHECK(decideUmbilicusLoadAction(std::nullopt, claimed, false) ==
+          UmbilicusLoadAction::UseLegacy);
+    CHECK(decideUmbilicusLoadAction(stamped, claimed, false) ==
+          UmbilicusLoadAction::UseLegacy);
+}

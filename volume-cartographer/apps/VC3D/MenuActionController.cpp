@@ -1808,6 +1808,9 @@ void MenuActionController::attachUmbilicus()
     }
 
     pkg->setUmbilicus(file.toStdString());
+    // Consumers that placed geometry relative to the old umbilicus have no other
+    // way to learn this happened.
+    _window->_state->notifyUmbilicusChanged();
     if (_window->statusBar()) {
         _window->showStatusBarMessage(
             QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
@@ -1826,9 +1829,12 @@ void MenuActionController::attachUmbilicus()
             QObject::tr("%1 declares malformed frame metadata and will be refused "
                         "until the file is fixed:\n\n%2")
                 .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
-    } else if (!info.voxelsizeUm) {
+    } else if (!vc::core::util::umbilicusFrameClaim(info).any()) {
+        // Dimensions alone are a complete statement — the preferred one, in fact,
+        // being exact integer counts — so warning about a missing voxelsize_um
+        // there would call the better-stamped file unstamped.
         QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
-            QObject::tr("%1 declares no voxelsize_um, so consumers may have to guess "
+            QObject::tr("%1 declares no frame, so consumers may have to guess "
                         "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
     }
 }
@@ -1851,6 +1857,7 @@ void MenuActionController::detachUmbilicus()
     // resolution; the umbilicus is a single-valued field, so it is not part of
     // the entry-based Detach dialog.
     pkg->setUmbilicus({});
+    _window->_state->notifyUmbilicusChanged();
     if (_window->statusBar()) {
         _window->showStatusBarMessage(
             QObject::tr("Detached umbilicus %1; resolution is automatic again")
