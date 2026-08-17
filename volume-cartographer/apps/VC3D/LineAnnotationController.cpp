@@ -14177,9 +14177,10 @@ void LineAnnotationController::finishFiberSaveJob(
 
     QString errorMessage;
     if (result.ok) {
-        // Saves do not go through emitFiberSummaries(), but they do change the
-        // stored geometry derived views were built from.
-        ++_fiberDataGeneration;
+        // No generation bump here: the mutation that prompted this save already
+        // updated _fibers and went through emitFiberSummaries(), and writing it
+        // to disk changes nothing a snapshot reads. Bumping again only made
+        // every save look like fresh fiber data to derived views.
         for (size_t i = 0; i < result.fiberIds.size(); ++i) {
             const uint64_t generation =
                 i < result.generations.size() ? result.generations[i] : 0;
