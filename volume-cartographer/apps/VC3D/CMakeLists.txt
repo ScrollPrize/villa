@@ -93,6 +93,10 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/DownloadQueueStats.cpp
+    elements/DownloadQueueStats.hpp
+    elements/DownloadQueueDebugOverlay.cpp
+    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp
@@ -212,6 +216,8 @@ set(srcs
     SpiralSshTunnel.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
+    SpiralMinimap.cpp
+    SpiralMinimap.hpp
     SpiralWorkspace.cpp
     SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
@@ -412,3 +418,13 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
         PATTERN "*.json"
         PATTERN "tests" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+set(_vc3d_fiber_format_src
+    "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")
+if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
+    install(DIRECTORY "${_vc3d_fiber_format_src}"
+        DESTINATION share/volume-cartographer/spiral
+        FILES_MATCHING
+            PATTERN "*.py"
+            PATTERN "__pycache__" EXCLUDE)
+endif()

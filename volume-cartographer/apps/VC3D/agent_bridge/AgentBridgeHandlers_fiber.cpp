@@ -227,6 +227,17 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
         f["automaticHvTag"] = QString::fromStdString(s.automaticHvTag);
         f["manualHvTag"] = QString::fromStdString(s.manualHvTag);
         f["automaticCertainty"] = s.automaticCertainty;
+        switch (s.traceState) {
+        case vc3d::line_annotation::FiberTraceState::Predictions:
+            f["traceState"] = "predictions";
+            break;
+        case vc3d::line_annotation::FiberTraceState::Mixed:
+            f["traceState"] = "mixed";
+            break;
+        case vc3d::line_annotation::FiberTraceState::Legacy:
+            f["traceState"] = "legacy";
+            break;
+        }
         QJsonArray tags;
         for (const auto& tag : s.tags)
             tags.push_back(QString::fromStdString(tag));
@@ -240,6 +251,10 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
             span["controlPointCount"] = sp.controlPointCount;
             span["linePointCount"] = sp.linePointCount;
             span["lengthVx"] = sp.lengthVx;
+            span["interpMode"] = QString(QChar::fromLatin1(sp.interpMarker));
+            if (!sp.fiberManifest.empty()) {
+                span["fiberManifest"] = QString::fromStdString(sp.fiberManifest);
+            }
             spans.push_back(span);
         }
         f["spans"] = spans;

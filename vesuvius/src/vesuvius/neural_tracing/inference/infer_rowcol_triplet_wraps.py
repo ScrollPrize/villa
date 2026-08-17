@@ -131,23 +131,20 @@ class _VcVolumeLevel:
 def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
     path = str(volume_path)
     cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
-
-    def _set_cache_budget(volume):
-        volume.set_cache_budget(cache_bytes)
-        return volume
+    vc.set_chunk_cache_budget(cache_bytes)
 
     target_level = int(volume_scale)
     if path.startswith(("http://", "https://", "s3://")):
-        volume = _set_cache_budget(vc.Volume.open_url(path, cache_root=str(cache_dir)))
+        volume = vc.Volume.open_url(path, cache_root=str(cache_dir))
     else:
         try:
-            volume = _set_cache_budget(vc.Volume.open(path))
+            volume = vc.Volume.open(path)
         except RuntimeError as exc:
             scale_path = Path(path) / str(target_level)
             if not scale_path.exists():
                 raise
             try:
-                volume = _set_cache_budget(vc.Volume.open(str(scale_path)))
+                volume = vc.Volume.open(str(scale_path))
             except RuntimeError:
                 raise exc
             return _VcVolumeLevel(volume, 0), target_level

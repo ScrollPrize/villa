@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +32,8 @@ fs::path uniqueRecoveryPath(const fs::path& finalPath, uint64_t sequence, size_t
 } // namespace
 
 FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
-                                   std::vector<FiberSavePayload> payloads)
+                                   std::vector<FiberSavePayload> payloads,
+                                   std::vector<std::filesystem::path> retirePaths)
 {
     FiberSaveJobResult result;
     result.ok = false;
@@ -45,6 +47,17 @@ FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
     const bool multiFiberSave = payloads.size() > 1;
     std::vector<fs::path> tempPaths;
     tempPaths.reserve(payloads.size());
+    // (original path, backup path) for every retirement performed, so a
+    // failure can rename each backup straight back into place.
+    std::vector<std::pair<fs::path, fs::path>> retiredMoves;
+    retiredMoves.reserve(retirePaths.size());
+    // Whether each payload target existed before its rename, and how many
+    // renames landed: a failure removes renamed targets that had no
+    // previous content, so a partial batch cannot leave orphan new files
+    // (pre-existing targets keep the new content plus their recovery copy).
+    std::vector<bool> targetExisted;
+    targetExisted.reserve(payloads.size());
+    size_t renamedCount = 0;
     try {
         for (size_t i = 0; i < payloads.size(); ++i) {
             const auto& payload = payloads[i];
@@ -90,32 +103,84 @@ FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
             }
         }
 
+        // Retire originals before the renames: an atomic move into the
+        // dot-prefixed sibling directory doubles as the backup, and nothing
+        // has been renamed into place yet when a move fails.
+        for (size_t i = 0; i < retirePaths.size(); ++i) {
+            const fs::path& retirePath = retirePaths[i];
+            std::error_code ec;
+            if (!fs::exists(retirePath, ec)) {
+                continue;
+            }
+            const fs::path retiredDir = retirePath.parent_path() / ".retired";
+            fs::create_directories(retiredDir, ec);
+            if (ec) {
+                throw std::runtime_error("Failed to create " + retiredDir.string() +
+                                         ": " + ec.message());
+            }
+            const fs::path backupPath = uniqueRecoveryPath(
+                retiredDir / retirePath.filename(), sequence, i);
+            fs::rename(retirePath, backupPath, ec);
+            if (ec) {
+                throw std::runtime_error("Failed to retire " + retirePath.string() +
+                                         ": " + ec.message());
+            }
+            retiredMoves.emplace_back(retirePath, backupPath);
+        }
+
         const bool failAfterFirst =
             std::getenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE") != nullptr;
         for (size_t i = 0; i < payloads.size(); ++i) {
             std::error_code ec;
+            targetExisted.push_back(fs::exists(payloads[i].path, ec));
             fs::rename(tempPaths[i], payloads[i].path, ec);
             if (ec) {
                 throw std::runtime_error("Failed to replace " +
                                          payloads[i].path.string() + ": " +
                                          ec.message());
             }
+            renamedCount = i + 1;
             if (failAfterFirst && multiFiberSave && i == 0) {
                 throw std::runtime_error("Injected failure after first fiber replacement");
             }
         }
 
+        // Backups go only after every rename succeeded. Leftovers in
+        // .retired/ are invisible to the loaders and to sync, so removal
+        // errors are ignored.
         for (const auto& recoveryPath : result.recoveryFiles) {
             std::error_code ec;
             fs::remove(recoveryPath, ec);
         }
         result.recoveryFiles.clear();
+        for (const auto& [retirePath, backupPath] : retiredMoves) {
+            (void)retirePath;
+            std::error_code ec;
+            fs::remove(backupPath, ec);
+        }
         result.ok = true;
     } catch (const std::exception& ex) {
         result.error = ex.what();
         for (const auto& tempPath : tempPaths) {
             std::error_code ec;
             fs::remove(tempPath, ec);
+        }
+        // Remove renamed targets that did not exist before the job so a
+        // partial batch leaves no orphan new files behind.
+        for (size_t i = 0; i < renamedCount && i < targetExisted.size(); ++i) {
+            if (!targetExisted[i]) {
+                std::error_code ec;
+                fs::remove(payloads[i].path, ec);
+            }
+        }
+        // Restore retirements; a backup that cannot be moved back is
+        // surfaced like a kept recovery file.
+        for (const auto& [retirePath, backupPath] : retiredMoves) {
+            std::error_code ec;
+            fs::rename(backupPath, retirePath, ec);
+            if (ec) {
+                result.recoveryFiles.push_back(backupPath);
+            }
         }
     }
     return result;

@@ -34,6 +34,14 @@ public:
             std::string error;
         };
 
+        // Mirrors vc3d::line_annotation::FiberTraceState without pulling
+        // the annotation headers into this standalone widget.
+        enum class TraceState {
+            Legacy,       // no prediction-traced spans
+            Predictions,  // traced spans, fiber mode native_fiber_trace3d
+            Mixed,        // traced spans under a lasagna-global fiber
+        };
+
         struct SpanEntry {
             int spanIndex = 0;
             int firstControlIndex = 0;
@@ -42,6 +50,11 @@ public:
             int linePointCount = 0;
             double lengthVx = 0.0;
             AlignmentMetrics alignment;
+            // 'C' (cspline), 'L' (lasagna), or 'T' (prediction trace).
+            char interpMarker = 'L';
+            // Fiber-inference manifest the trace ran with; empty for
+            // non-trace spans.
+            std::string fiberManifest;
         };
 
         uint64_t id = 0;
@@ -61,6 +74,7 @@ public:
         std::vector<std::string> tags;
         int linkedFiberCount = 0;
         int pendingLinkCount = 0;
+        TraceState traceState = TraceState::Legacy;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -148,6 +162,7 @@ private:
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString displayNameForFiber(const FiberEntry& fiber);
     static QString directionForFiber(const FiberEntry& fiber);
+    static QString statusTextForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
     std::vector<FiberEntry> _fibers;

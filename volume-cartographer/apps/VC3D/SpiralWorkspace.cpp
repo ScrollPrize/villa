@@ -7,6 +7,7 @@
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
+#include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -14,6 +15,7 @@
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -26,6 +28,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QImageReader>
 #include <QJsonArray>
@@ -80,19 +83,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Share Main's process-wide decoded-chunk budget. Both workspaces use the
-    // single cache owned by their shared Volume.
+    // Regular volume chunks use the process service. Derived surface tiles
+    // remain local to each ViewerManager.
     _state = new CState(
-        _mainState ? _mainState->cacheSizeBytes() : 0,
-        this,
-        _mainState ? _mainState->decodedCacheBudget() : nullptr);
+        this, _mainState && _mainState->debugDownloadQueueEnabled());
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // Spiral's plane panes get their own hard-capped decoded-chunk pool instead
-    // of sharing the Volume's, so browsing slices here can never displace the
-    // main workspace's working set, and the flattened pane renders from tiles of
-    // resampled surface space. Applied before the viewers exist so they pick up
-    // the policy on construction.
-    _viewerManager->applySpiralCacheSettings();
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
     _viewerManager->setSurfacePatchSamplingStride(4, false);
@@ -136,6 +131,18 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
     }
+    // The winding minimap docks below the flattened viewer's graphics view,
+    // inside the same pane; the viewer widget's layout only holds the view.
+    if (auto* flattenedWidget =
+            qobject_cast<QWidget*>(_flattenedViewer->asQObject());
+        flattenedWidget && flattenedWidget->layout()) {
+        _windingMinimap = new SpiralMinimap(flattenedWidget);
+        flattenedWidget->layout()->addWidget(_windingMinimap);
+        connect(_windingMinimap, &SpiralMinimap::columnClicked, this,
+                [this](float column) { panFlattenedViewerToColumn(column); });
+        _flattenedViewer->connectOverlaysUpdated(
+            this, [this]() { updateMinimapViewIndicator(); });
+    }
     _grid->setPaneHidden(2, true);
     QSettings settings;
     _grid->setSplits(settings.value(QStringLiteral("spiral/split_x"), 0.5).toDouble(),
@@ -148,7 +155,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     auto* cacheStatsLabel = new QLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
-    cacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged, cacheStatsLabel,
             [cacheStatsLabel](const QStringList& items) {
@@ -170,24 +177,17 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // available alongside the live fit-stage bar.
     _pythonOutput->setMaximumBlockCount(100000);
     pythonOutputLayout->addWidget(_pythonOutput);
+    // The service suppresses successful polling access lines at the source
+    // (SpiralHandler.log_request), so every relayed message is worth showing.
     connect(_service, &SpiralServiceManager::logMessage, _pythonOutput,
             [this](const QString& message) {
-                const QString line = message.trimmed();
-                const bool routineStatusPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /session/status HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                const bool routineLogPoll =
-                    line.startsWith(QStringLiteral("SPIRAL_HTTP \"GET /logs?after="))
-                    && line.contains(QStringLiteral(" HTTP/"))
-                    && line.endsWith(QStringLiteral("\" 200 -"));
-                if (!routineStatusPoll && !routineLogPoll)
-                    _pythonOutput->appendOutput(message);
+                _pythonOutput->appendOutput(message);
             });
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
         statusBar()->showMessage(error, 15000);
+        // The dialog stays where the user left it; the status bar carries the
+        // error and the panel's "Logs" button opens the detail on demand.
         _pythonOutput->appendOutput(tr("Error: %1").arg(error));
-        _pythonOutputDialog->show();
-        _pythonOutputDialog->raise();
     });
     connect(_service, &SpiralServiceManager::inputUploadFinished, this,
             [this](const QString& inputId, const QString& error) {
@@ -305,7 +305,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         connect(dock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(_panel, &SpiralPanel::volumeSelected, this, &SpiralWorkspace::selectVolume);
     connect(_panel, &SpiralPanel::pythonOutputRequested, this, [this]() {
         _pythonOutputDialog->show();
         _pythonOutputDialog->raise();
@@ -352,13 +351,23 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _overlay->publishRunDiff({}, {});
         }
     });
+    connect(_panel, &SpiralPanel::windingTransitionsChanged, this, [this](bool shown) {
+        _windingTransitionsVisible = shown;
+        updateWindingTransitionOverlay();
+    });
     connect(_panel, &SpiralPanel::lossMapChanged, this,
             [this](const QString& name, qreal opacity) {
                 _selectedLossMap = name;
                 _lossMapOpacity = opacity;
                 updateLossMapOverlay();
             });
+    connect(_panel, &SpiralPanel::previewDiagnosticsChanged, this,
+            [this](bool enabled) {
+                if (_service) _service->setPreviewDiagnostics(enabled);
+            });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
+    connect(_service, &SpiralServiceManager::previewDiagnosticsAvailable, this,
+            &SpiralWorkspace::installPreviewDiagnostics);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
@@ -426,26 +435,24 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
             });
-    if (_mainState) {
-        connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
-        connect(_mainState, &CState::volumeChanged, this, [this](const std::shared_ptr<Volume>& volume, const std::string&) {
-            if (!_state->currentVolume()) _state->setCurrentVolume(volume);
-            refreshVolumes();
-        });
-    }
-    refreshVolumes();
+    synchronizeVolume(_mainState ? _mainState->currentVolume() : nullptr);
 }
 
 QString SpiralWorkspace::mapServicePath(const QString& servicePath) const
 {
     const SpiralServiceProfile& profile = _service->profile();
     if (profile.isLocalhost()) return servicePath;
-    if (profile.serviceRootPrefix.isEmpty() || profile.localRootPrefix.isEmpty()
-        || !servicePath.startsWith(profile.serviceRootPrefix))
+    // The service side of the mapping is the dataset root the service
+    // advertises; the profile only names where this computer mounts it.
+    QString serviceRoot = _service->advertisedDataset()
+                              .value(QStringLiteral("root")).toString();
+    while (serviceRoot.endsWith(QLatin1Char('/'))) serviceRoot.chop(1);
+    if (serviceRoot.isEmpty() || profile.localRootPrefix.isEmpty()
+        || !servicePath.startsWith(serviceRoot))
         return {};
     // Translate separators as well as prefixes: a Windows viewer may map a
     // POSIX service root.
-    QString rest = servicePath.mid(profile.serviceRootPrefix.size());
+    QString rest = servicePath.mid(serviceRoot.size());
     rest.replace(QLatin1Char('\\'), QLatin1Char('/'));
     QString local = profile.localRootPrefix;
     while (local.endsWith(QLatin1Char('/')) || local.endsWith(QLatin1Char('\\'))) local.chop(1);
@@ -688,7 +695,13 @@ void SpiralWorkspace::updateSurfaceIntersections()
     addCategory(QStringLiteral("brush"), false);
     for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) continue;
-        if (viewer == _flattenedViewer) {
+        // Identify the flattened output viewer by its surface name rather
+        // than a cached pointer: the pointer can go stale across
+        // ViewerManager recreations and caused the surface-overlay toggle
+        // (spiralShowSurfaceOverlap) to silently clear the flattened viewer's
+        // overlays while treating it as a plane viewer.
+        const bool isFlattened = viewer->surfName() == "segmentation";
+        if (isFlattened) {
             viewer->setSurfaceOverlays(surfaceOverlays);
             viewer->setSurfaceOverlayEnabled(_showSurfaceOverlap
                                              && !surfaceOverlays.empty());
@@ -971,50 +984,76 @@ void SpiralWorkspace::initializePreviewFocus()
     _viewerManager->recenterViewersOnCurrentFocus();
 }
 
-void SpiralWorkspace::refreshVolumes()
+QComboBox* SpiralWorkspace::volumeSelectionControl() const
 {
-    QVector<VolumeSelector::VolumeOption> options;
-    auto package = _mainState ? _mainState->vpkg() : nullptr;
-    // Borrow Main's package so volume-ID resolution, coordinate identity and
-    // the remote chunk-cache root all match Main's viewers. Teardown clears it
-    // again before closeAll() so the shared package is never unloaded from here.
-    if (_state->vpkg() != package) _state->setVpkg(package);
-    if (package) {
-        for (const auto& id : package->volumeIDs()) {
-            auto volume = package->volume(id);
-            if (!volume) continue;
-            options.push_back({QString::fromStdString(id), QString::fromStdString(volume->name()),
-                               QString::fromStdString(volume->path().string())});
-        }
-    }
-    QString selected = QString::fromStdString(_state->currentVolumeId());
-    if (selected.isEmpty() && _mainState) selected = QString::fromStdString(_mainState->currentVolumeId());
-    _panel->setVolumes(options, selected);
-    if (!_state->currentVolume() && _mainState) {
-        _state->setCurrentVolume(_mainState->currentVolume());
-    }
-    ensureInitialFocus();
+    return _panel ? _panel->volumeSelectionControl() : nullptr;
 }
 
-void SpiralWorkspace::selectVolume(const QString& id)
+void SpiralWorkspace::synchronizeVolume(
+    const std::shared_ptr<Volume>& volume,
+    const std::optional<cv::Matx44d>& navigationTransform)
 {
-    auto package = _mainState ? _mainState->vpkg() : nullptr;
-    if (!package || id.isEmpty()) return;
-    auto volume = package->volume(id.toStdString());
-    if (!volume) return;
+    const auto package = _mainState ? _mainState->vpkg() : nullptr;
+    if (_state->vpkg() != package) {
+        // Spiral borrows Main's package; it never owns or independently closes it.
+        _state->setVpkg(package);
+    }
     if (volume == _state->currentVolume()) {
         ensureInitialFocus();
         return;
     }
     const bool hadFocus = _state->poi("focus") != nullptr;
-    _viewerManager->switchVolume(volume);
-    if (!hadFocus) {
+    _viewerManager->switchVolume(volume, navigationTransform);
+    if (volume && !hadFocus) {
         // switchVolume created a volume-center default; prefer the preview
         // focus when one is already loaded.
         _focusIsAutoDefault = true;
         initializePreviewFocus();
     }
-    for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
+    for (auto* viewer : _viewerManager->baseViewers())
+        if (viewer) viewer->requestRender("Shared display volume changed");
+}
+
+std::vector<SpiralWorkspace::PreviewLoadResult::LossMap>
+SpiralWorkspace::parseLossMaps(const QJsonObject& manifest,
+                               const QString& artifactRoot)
+{
+    std::vector<PreviewLoadResult::LossMap> lossMaps;
+    for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        const QString name = entry.value(QStringLiteral("name")).toString();
+        const QString relativePath = QDir::cleanPath(
+            entry.value(QStringLiteral("path")).toString());
+        if (name.isEmpty() || relativePath.isEmpty()
+            || QDir::isAbsolutePath(relativePath)
+            || relativePath == QStringLiteral("..")
+            || relativePath.startsWith(QStringLiteral("../")))
+            continue;
+        PreviewLoadResult::LossMap map;
+        map.name = name;
+        map.relativePath = relativePath;
+        const QString imagePath = QDir(artifactRoot).filePath(relativePath);
+        if (QFileInfo::exists(imagePath)) map.imagePath = imagePath;
+        map.weight = entry.value(QStringLiteral("weight")).toDouble();
+        map.p50 = entry.value(QStringLiteral("p50")).toDouble();
+        map.p95 = entry.value(QStringLiteral("p95")).toDouble();
+        map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
+        map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
+        map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
+        map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
+            ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
+            : map.sampleCount;
+        map.projectedSampleCount = entry.contains(QStringLiteral("projected_sample_count"))
+            ? entry.value(QStringLiteral("projected_sample_count")).toInteger()
+            : map.sampleCount;
+        map.offSurfaceSampleCount =
+            entry.value(QStringLiteral("off_surface_sample_count")).toInteger();
+        map.omittedSampleCount =
+            entry.value(QStringLiteral("omitted_sample_count")).toInteger();
+        map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
+        lossMaps.push_back(std::move(map));
+    }
+    return lossMaps;
 }
 
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)
@@ -1184,41 +1223,8 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     return failure(QObject::tr(
                         "Spiral winding bounds exceed the surface grid"));
             }
-            std::vector<PreviewLoadResult::LossMap> lossMaps;
-            for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
-                const QJsonObject entry = value.toObject();
-                const QString name = entry.value(QStringLiteral("name")).toString();
-                const QString relativePath = QDir::cleanPath(
-                    entry.value(QStringLiteral("path")).toString());
-                if (name.isEmpty() || relativePath.isEmpty()
-                    || QDir::isAbsolutePath(relativePath)
-                    || relativePath == QStringLiteral("..")
-                    || relativePath.startsWith(QStringLiteral("../")))
-                    continue;
-                PreviewLoadResult::LossMap map;
-                map.name = name;
-                map.relativePath = relativePath;
-                const QString imagePath = QDir(artifactRoot).filePath(relativePath);
-                if (QFileInfo::exists(imagePath)) map.imagePath = imagePath;
-                map.weight = entry.value(QStringLiteral("weight")).toDouble();
-                map.p50 = entry.value(QStringLiteral("p50")).toDouble();
-                map.p95 = entry.value(QStringLiteral("p95")).toDouble();
-                map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
-                map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
-                map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
-                map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
-                    ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()
-                    : map.sampleCount;
-                map.projectedSampleCount = entry.contains(QStringLiteral("projected_sample_count"))
-                    ? entry.value(QStringLiteral("projected_sample_count")).toInteger()
-                    : map.sampleCount;
-                map.offSurfaceSampleCount =
-                    entry.value(QStringLiteral("off_surface_sample_count")).toInteger();
-                map.omittedSampleCount =
-                    entry.value(QStringLiteral("omitted_sample_count")).toInteger();
-                map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
-                lossMaps.push_back(std::move(map));
-            }
+            std::vector<PreviewLoadResult::LossMap> lossMaps =
+                parseLossMaps(manifest, artifactRoot);
             QString runDiffPath;
             const QString runDiffRelative = QDir::cleanPath(
                 manifest.value(QStringLiteral("run_diff")).toObject()
@@ -1271,6 +1277,43 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
     applyPreviewWindingRange(false);
     if (_runDiffVisible) loadRunDiff();
+}
+
+void SpiralWorkspace::installPreviewDiagnostics(const QString& manifestPath,
+                                                qint64 generation)
+{
+    // The overlays are published after the surface they were mapped through,
+    // so by the time they arrive the workspace may have moved on to a newer
+    // preview. Both the generation and the surface id are checked: drawing an
+    // overlay sampled through a different flatten would be silently wrong.
+    if (_shuttingDown || generation != _requestedPreviewGeneration
+        || !_previewSource)
+        return;
+    QFile file(manifestPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        statusBar()->showMessage(
+            tr("Could not open the Spiral preview diagnostics manifest"), 15000);
+        return;
+    }
+    const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
+    if (manifest.value(QStringLiteral("surface_id")).toString() != _previewSourceId)
+        return;
+    const std::vector<PreviewLoadResult::LossMap> lossMaps =
+        parseLossMaps(manifest, QFileInfo(manifestPath).absolutePath());
+
+    _previewLossMaps.clear();
+    _fetchingLossMaps.clear();
+    _loadedLossMap.clear();
+    _loadedLossMapImage = {};
+    QStringList lossMapNames;
+    for (const auto& map : lossMaps) {
+        _previewLossMaps.insert(map.name, map);
+        lossMapNames.push_back(map.name);
+    }
+    _panel->setLossMapOptions(lossMapNames);
+    // A selection that survived the new preview is now backed by these
+    // overlays; anything else leaves the overlay cleared.
+    updateLossMapOverlay();
 }
 
 void SpiralWorkspace::loadRunDiff()
@@ -1426,6 +1469,163 @@ void SpiralWorkspace::updateLossMapOverlay()
         _lossMapOpacity);
 }
 
+namespace
+{
+
+// Trace the boundaries between winding regions of the displayed preview crop
+// as row-ordered polylines, one curve per winding pair. Each row is walked
+// left to right over the winding-id map; wherever the winding changes between
+// two valid pixels no more than kMaxGapColumns apart, the midpoint between
+// them is a boundary point. Per pair, points chain into segments that break
+// when the boundary vanishes for more than kMaxRowGap rows or jumps by more
+// than kMaxGapColumns columns, so curves never bridge holes in the surface.
+// Windings outside the displayed range count as invalid: their vertices were
+// masked off the surface, so a boundary against them would float in a void.
+std::vector<SpiralOverlayController::WindingTransitionCurve>
+traceWindingTransitions(const cv::Mat_<int32_t>& windings,
+                        int minimumWinding, int maximumWinding)
+{
+    constexpr int kMaxGapColumns = 8;
+    constexpr float kMaxRowGap = 4.0f;
+    constexpr float kMaxRowStep = 16.0f;
+    constexpr float kColumnTolerance = 0.5f;
+    std::map<std::pair<int, int>, std::vector<cv::Vec2f>> pointsByPair;
+    for (int row = 0; row < windings.rows; ++row) {
+        int previousColumn = -1;
+        int previousWinding = -1;
+        for (int column = 0; column < windings.cols; ++column) {
+            const int winding = windings(row, column);
+            if (winding < minimumWinding
+                || (maximumWinding >= 0 && winding > maximumWinding))
+                continue;
+            if (previousColumn >= 0 && winding != previousWinding
+                && column - previousColumn <= kMaxGapColumns) {
+                pointsByPair[{previousWinding, winding}].emplace_back(
+                    static_cast<float>(previousColumn + column) / 2.0f,
+                    static_cast<float>(row));
+            }
+            previousColumn = column;
+            previousWinding = winding;
+        }
+    }
+    std::vector<SpiralOverlayController::WindingTransitionCurve> curves;
+    for (auto& [pair, points] : pointsByPair) {
+        SpiralOverlayController::WindingTransitionCurve curve;
+        curve.fromWinding = pair.first;
+        curve.toWinding = pair.second;
+        std::vector<std::vector<cv::Vec2f>> segments(1);
+        for (const cv::Vec2f& point : points) {
+            if (!segments.back().empty()
+                && (point[1] - segments.back().back()[1] > kMaxRowGap
+                    || std::abs(point[0] - segments.back().back()[0])
+                        > static_cast<float>(kMaxGapColumns)))
+                segments.emplace_back();
+            segments.back().push_back(point);
+        }
+        for (std::vector<cv::Vec2f>& segment : segments) {
+            if (segment.size() < 2) continue;
+            // Decimate near-vertical runs: keep both endpoints plus any point
+            // that moved in column or is kMaxRowStep rows past the last kept.
+            std::vector<cv::Vec2f> kept{segment.front()};
+            for (std::size_t index = 1; index + 1 < segment.size(); ++index) {
+                if (std::abs(segment[index][0] - kept.back()[0])
+                        >= kColumnTolerance
+                    || segment[index][1] - kept.back()[1] >= kMaxRowStep)
+                    kept.push_back(segment[index]);
+            }
+            kept.push_back(segment.back());
+            curve.segments.push_back(std::move(kept));
+        }
+        if (!curve.segments.empty()) curves.push_back(std::move(curve));
+    }
+    return curves;
+}
+
+} // namespace
+
+void SpiralWorkspace::updateWindingMinimap()
+{
+    if (!_windingMinimap) return;
+    const auto selection = displayedPreviewSelection();
+    if (!selection || !_currentPreview) {
+        _windingMinimap->clearBands();
+        return;
+    }
+    const cv::Rect region = selection->region;
+    std::vector<SpiralMinimap::Band> bands;
+    for (const PreviewComponent& component : _previewComponents) {
+        if (component.winding < selection->minimumWinding
+            || (selection->maximumWinding >= 0
+                && component.winding > selection->maximumWinding))
+            continue;
+        bands.push_back({component.winding,
+                         static_cast<float>(component.columnBegin - region.x),
+                         static_cast<float>(component.columnEnd - region.x)});
+    }
+    _windingMinimap->setBands(std::move(bands), 0.0f,
+                              static_cast<float>(region.width));
+    updateMinimapViewIndicator();
+}
+
+void SpiralWorkspace::updateMinimapViewIndicator()
+{
+    if (!_windingMinimap || !_windingMinimap->isVisible()) return;
+    if (!_currentPreview || !_flattenedViewer
+        || _flattenedViewer->currentSurface() != _currentPreview.get()) {
+        _windingMinimap->setViewIndicator(0.0f, -1.0f);
+        return;
+    }
+    auto* view = _flattenedViewer->graphicsView();
+    if (!view || !view->viewport()) return;
+    const QRect viewport = view->viewport()->rect();
+    const cv::Vec2f scale = _currentPreview->scale();
+    const cv::Vec3f center = _currentPreview->center();
+    const auto columnAt = [&](const QPoint& viewportPoint) {
+        const cv::Vec2f surface = _flattenedViewer->sceneToSurfaceCoords(
+            view->mapToScene(viewportPoint));
+        return (surface[0] + center[0]) * scale[0];
+    };
+    _windingMinimap->setViewIndicator(
+        columnAt(QPoint(viewport.left(), viewport.center().y())),
+        columnAt(QPoint(viewport.right(), viewport.center().y())));
+}
+
+void SpiralWorkspace::panFlattenedViewerToColumn(float column)
+{
+    if (!_currentPreview || !_flattenedViewer
+        || _flattenedViewer->currentSurface() != _currentPreview.get())
+        return;
+    const cv::Vec2f scale = _currentPreview->scale();
+    const cv::Vec3f center = _currentPreview->center();
+    if (std::abs(scale[0]) < 1e-6f) return;
+    // Pan horizontally only: keep the viewer's current vertical position,
+    // read back through the inverse of the same mapping the minimap uses.
+    auto* view = _flattenedViewer->graphicsView();
+    if (!view || !view->viewport()) return;
+    const cv::Vec2f viewCenter = _flattenedViewer->sceneToSurfaceCoords(
+        view->mapToScene(view->viewport()->rect().center()));
+    const float surfaceX = column / scale[0] - center[0];
+    _flattenedViewer->centerOnSurfacePoint(cv::Vec2f(surfaceX, viewCenter[1]),
+                                           true);
+}
+
+void SpiralWorkspace::updateWindingTransitionOverlay()
+{
+    const auto selection = displayedPreviewSelection();
+    if (!_windingTransitionsVisible || !selection || !_currentPreview
+        || _previewWindingIds.empty()) {
+        _overlay->publishWindingTransitions({}, {});
+        return;
+    }
+    // Tracing on the winding-range crop keeps the curves in the displayed
+    // surface's own grid coordinates.
+    _overlay->publishWindingTransitions(
+        _currentPreview,
+        traceWindingTransitions(_previewWindingIds(selection->region),
+                                selection->minimumWinding,
+                                selection->maximumWinding));
+}
+
 std::optional<SpiralWorkspace::PreviewDisplaySelection>
 SpiralWorkspace::displayedPreviewSelection() const
 {
@@ -1468,12 +1668,14 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
     _previewRunDiffImage = {};
     _overlay->publishRunDiff({}, {});
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
+    _overlay->publishWindingTransitions({}, {});
 
     const auto selection = displayedPreviewSelection();
     if (!selection) {
         if (_outputVisible) _state->setSurface("segmentation", nullptr);
         const QString previousRegistration = _currentPreviewRegistrationId;
         _currentPreview.reset();
+        if (_windingMinimap) _windingMinimap->clearBands();
         _brush->setPaintSurface({});
         _currentPreviewRegistrationId.clear();
         updateSurfaceIntersections();
@@ -1584,6 +1786,8 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     else
         updateRunDiffOverlay();
     updateLossMapOverlay();
+    updateWindingTransitionOverlay();
+    updateWindingMinimap();
     // No-op unless the focus is still missing or the automatic default.
     initializePreviewFocus();
     updateSurfaceIntersections();

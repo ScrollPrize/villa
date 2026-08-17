@@ -75,12 +75,14 @@ public:
 
     State state() const;
     ApplyResult apply(const Update& update);
-    void setViewerManager(ViewerManager* manager);
+    void setViewerManagers(const std::vector<ViewerManager*>& managers);
     void setUi(const UiRefs& ui);
     void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg, const QString& path);
     void clearVolumePkg();
     void refreshVolumeOptions();
     void refreshForCurrentVolume();
+    void beginBaseVolumeUpdate();
+    void endBaseVolumeUpdate();
     void toggleVisibility();
     bool hasOverlaySelection() const;
     void syncWindowFromManager(float low, float high);
@@ -119,7 +121,8 @@ private:
     void handleCompositeLayersFrontChanged(int value);
     void handleCompositeLayersBehindChanged(int value);
 
-    ViewerManager* _viewerManager{nullptr};
+    ViewerManager* primaryViewerManager() const;
+    std::vector<ViewerManager*> _viewerManagers;
     UiRefs _ui;
     std::shared_ptr<VolumePkg> _volumePkg;
     QString _volpkgPath;
@@ -140,7 +143,9 @@ private:
     int _compositeLayersBehind{0};
     bool _overlayVisible{false};
 
-    QMetaObject::Connection _volumeChangedConnection;
+    std::vector<QMetaObject::Connection> _managerConnections;
     std::vector<QMetaObject::Connection> _connections;
     bool _suspendPersistence{false};
+    bool _broadcastingWindow{false};
+    bool _baseVolumeUpdateInProgress{false};
 };

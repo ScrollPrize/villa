@@ -1,11 +1,16 @@
-# VC3D GitHub CI Acceleration
+# Task: minimize manager staging and Atlas inference ingestion
 
-- Reduce the wall time of the Volume Cartographer GitHub pull-request CI,
-  ideally to less than one minute.
-- Treat this as an interactive investigation: measure each proposed build and
-  workflow change locally in the exact GitHub CI container before adopting it.
-- Preserve compile coverage for every configured target, even when a target is
-  not executed by the test job. Compile coverage may live in separate jobs.
-- Preserve numerical behavior and portability requirements.
-- Record commands, inputs, cache state, timings, successes, failures, and
-  workflow findings in `planning/task_log.md` as the investigation proceeds.
+Remove the manager-specific `upload-manifest.json` protocol. S3 staging must
+use rclone's normal resumable copy behavior with only `_INCOMPLETE` as the
+publication guard: create the marker before transfer and remove it only after
+rclone succeeds.
+
+Keep portable `inference.json` and all previously approved model metadata.
+Do not copy portable inference provenance into an Atlas data entry's
+`creation_info`. Reuse the existing Atlas `lasagna` copy-first representation
+without extending its data-entry schema: store only the private origin and the
+existing `model_id` and `level` parameters.
+
+Clean the already staged/ingested work-in-progress runs consistently, without
+changing their artifacts, model identities, origins, parameters, or public
+publication state.

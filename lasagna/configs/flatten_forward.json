@@ -1,11 +1,12 @@
 {
 	"args": {
 		"model-init": "flatten",
-		"flatten_solver": "forward"
+		"flatten_solver": "forward",
+		"flatten_edge_step_global_scale": 100.0
 	},
 	"base": {
 		"flatten_sdir": 1.0,
-		"flatten_map_step": 0.1,
+		"flatten_edge_step": 1.0,
 		"flatten_avg_offset": 1.0,
 		"flatten_orient": 2.0
 	},
