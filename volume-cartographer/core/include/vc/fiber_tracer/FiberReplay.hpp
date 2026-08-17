@@ -57,6 +57,25 @@ struct FiberReplayStripMeshes {
     std::optional<FiberReplayStripTextureSource> textureSource;
 };
 
+struct FiberReplayOverviewPanel {
+    double referenceFractionBegin = 0.0;
+    double referenceFractionEnd = 0.0;
+    std::array<int, 2> topColumns{};
+    std::array<int, 2> sideColumns{};
+    std::array<int, 2> topRows{};
+    std::array<int, 2> sideRows{};
+};
+
+struct FiberReplayOverview {
+    cv::Mat_<cv::Vec3b> image;
+    FiberReplayStripTextureSource textureSource;
+    std::array<int, 2> topShapeYX{};
+    std::array<int, 2> sideShapeYX{};
+    int renderScale = 1;
+    int markerWidthPixels = 0;
+    std::vector<FiberReplayOverviewPanel> panels;
+};
+
 [[nodiscard]] FiberReplayTube makeFiberReplayTube(
     const std::vector<cv::Vec3d>& referenceLineBase,
     double centerArcBase,
@@ -82,6 +101,16 @@ enum class FiberReplayTracer {
 
 void renderFiberReplayStripTextures(
     FiberReplayStripMeshes& meshes,
+    ::Volume& volume,
+    const std::string& sourceLocator);
+
+[[nodiscard]] FiberReplayOverview renderFiberReplayOverview(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& greedyReplay,
+    const FiberletGraphReplayResult& fiberletReplay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    int parallelThreads,
     ::Volume& volume,
     const std::string& sourceLocator);
 
@@ -112,9 +141,19 @@ struct FiberReplayBundleInput {
     nlohmann::json predictionBinding;
     nlohmann::json requestedTraceConfig;
     nlohmann::json effectiveTraceConfig;
+    std::optional<FiberReplayOverview> overview;
     std::vector<FiberReplayVisualizationInput> visualizations;
 };
 
 [[nodiscard]] nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirectory, const FiberReplayBundleInput& input);
+
+#ifdef VC_TESTING
+namespace testing
+{
+[[nodiscard]] FiberReplayOverview composeFiberReplayOverviewForTesting(
+    const cv::Mat_<cv::Vec3b>& top,
+    const cv::Mat_<cv::Vec3b>& side);
+}  // namespace testing
+#endif
 
 }  // namespace vc::fiber_tracer

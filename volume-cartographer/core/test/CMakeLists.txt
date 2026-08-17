@@ -244,7 +244,8 @@ vc_add_test(NAME test_fiber_anchors
 vc_add_test(NAME test_fiberlet_paths
     LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_replay
-    LIBS doctest::doctest vc_fiber_tracer)
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)

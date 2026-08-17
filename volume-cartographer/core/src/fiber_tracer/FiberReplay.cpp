@@ -20,6 +20,9 @@
 #include <string_view>
 #include <tuple>
 
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
 namespace vc::fiber_tracer
 {
 namespace
@@ -355,6 +358,338 @@ cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
     return nativePoints;
 }
 
+const cv::Vec3b kReferenceColorBgr{0, 255, 255};
+const cv::Vec3b kGreedyColorBgr{0, 0, 255};
+const cv::Vec3b kFiberletColorBgr{255, 255, 0};
+constexpr int kOverviewHeaderRows = 50;
+constexpr int kOverviewLabelRows = 20;
+constexpr int kOverviewSeparatorRows = 4;
+constexpr int kOverviewPanelGapRows = 8;
+constexpr int kOverviewMinimumColumns = 90;
+constexpr int kOverviewPanelColumns = 32000;
+constexpr int kJpegMaximumDimension = 65500;
+constexpr int kOverviewRenderScale = 8;
+constexpr int kOverviewMarkerWidthPixels = 3;
+const cv::Vec3b kOverlapColorBgr{255, 0, 255};
+
+struct MatchedTracePoint {
+    cv::Vec3d pointBase;
+    cv::Vec3d referencePointBase;
+    double referenceArcBase = 0.0;
+};
+
+using MatchedTraceSegment = std::vector<MatchedTracePoint>;
+
+void validateMatchedPoint(const MatchedTracePoint& point, const PolylineArcGeometry& selectedReference, double referenceBeginArc, double referenceEndArc, const char* tracer)
+{
+    if (!std::isfinite(point.referenceArcBase) || point.referenceArcBase < referenceBeginArc - kEpsilon ||
+        point.referenceArcBase > referenceEndArc + kEpsilon) {
+        throw std::invalid_argument(std::string(tracer) + " replay overview match lies outside the selected interval");
+    }
+    const auto expected =
+        samplePolylineArc(selectedReference, std::clamp(point.referenceArcBase - referenceBeginArc, 0.0, selectedReference.length()));
+    if (cv::norm(expected.point - point.referencePointBase) > 1.0e-6) {
+        throw std::invalid_argument(std::string(tracer) + " replay overview match point differs from its reference arc");
+    }
+}
+
+std::vector<MatchedTraceSegment> matchedGreedySegments(const FiberReplayTraceResult& replay, const PolylineArcGeometry& selectedReference)
+{
+    std::vector<MatchedTraceSegment> output;
+    for (const auto& segment : replay.segments) {
+        if (segment.tracePointsBase.empty())
+            continue;
+        if (segment.matches.size() + 1 != segment.tracePointsBase.size()) {
+            throw std::invalid_argument("greedy replay overview requires one match per non-seed point");
+        }
+        MatchedTraceSegment points;
+        points.reserve(segment.tracePointsBase.size());
+        MatchedTracePoint seed{
+            segment.tracePointsBase.front(),
+            samplePolylineArc(
+                selectedReference, std::clamp(segment.startReferenceArcBase - replay.referenceBeginArcBase, 0.0, selectedReference.length()))
+                .point,
+            segment.startReferenceArcBase,
+        };
+        validateMatchedPoint(seed, selectedReference, replay.referenceBeginArcBase, replay.referenceEndArcBase, "greedy");
+        points.push_back(seed);
+        for (size_t index = 0; index < segment.matches.size(); ++index) {
+            const auto& match = segment.matches[index];
+            if (match.tracePointIndex != index + 1) {
+                throw std::invalid_argument("greedy replay overview match coverage is not contiguous");
+            }
+            MatchedTracePoint point{
+                segment.tracePointsBase[match.tracePointIndex],
+                match.matchedReferencePointBase,
+                match.matchedReferenceArcBase,
+            };
+            validateMatchedPoint(point, selectedReference, replay.referenceBeginArcBase, replay.referenceEndArcBase, "greedy");
+            if (point.referenceArcBase + kEpsilon < points.back().referenceArcBase) {
+                throw std::invalid_argument("greedy replay overview match arcs are not monotonic");
+            }
+            points.push_back(point);
+        }
+        output.push_back(std::move(points));
+    }
+    return output;
+}
+
+std::vector<MatchedTraceSegment> matchedFiberletSegments(const FiberletGraphReplayResult& replay, const PolylineArcGeometry& selectedReference)
+{
+    std::vector<MatchedTraceSegment> output;
+    for (const auto& segment : replay.segments) {
+        if (segment.routePointsBaseXYZ.empty())
+            continue;
+        if (segment.matches.size() != segment.routePointsBaseXYZ.size()) {
+            throw std::invalid_argument("fiberlet replay overview requires one match per route point");
+        }
+        MatchedTraceSegment points;
+        points.reserve(segment.routePointsBaseXYZ.size());
+        for (size_t index = 0; index < segment.matches.size(); ++index) {
+            const auto& match = segment.matches[index];
+            if (match.routePointIndex != index) {
+                throw std::invalid_argument("fiberlet replay overview match coverage is not contiguous");
+            }
+            MatchedTracePoint point{
+                segment.routePointsBaseXYZ[index],
+                match.matchedReferencePointBaseXYZ,
+                match.matchedReferenceArcBase,
+            };
+            validateMatchedPoint(point, selectedReference, replay.referenceBeginArcBase, replay.referenceEndArcBase, "fiberlet");
+            if (!points.empty() && point.referenceArcBase + kEpsilon < points.back().referenceArcBase) {
+                throw std::invalid_argument("fiberlet replay overview match arcs are not monotonic");
+            }
+            points.push_back(point);
+        }
+        output.push_back(std::move(points));
+    }
+    return output;
+}
+
+cv::Vec3d interpolateSurfacePoint(const cv::Mat_<cv::Vec3f>& surface, int row, double sourceColumn)
+{
+    const int left = std::clamp(static_cast<int>(std::floor(sourceColumn)), 0, surface.cols - 1);
+    const int right = std::min(left + 1, surface.cols - 1);
+    const double fraction = std::clamp(sourceColumn - left, 0.0, 1.0);
+    const cv::Vec3f value = surface(row, left) * static_cast<float>(1.0 - fraction) + surface(row, right) * static_cast<float>(fraction);
+    return {value[0], value[1], value[2]};
+}
+
+double referenceSourceColumn(
+    const PolylineArcGeometry& selectedReference,
+    double referenceBeginArc,
+    double referenceArc)
+{
+    const auto referenceSample =
+        samplePolylineArc(selectedReference, std::clamp(referenceArc - referenceBeginArc, 0.0, selectedReference.length()));
+    const double segmentBegin = selectedReference.vertexArcs[referenceSample.segmentIndex];
+    const double segmentEnd = selectedReference.vertexArcs[referenceSample.segmentIndex + 1];
+    const double fraction = segmentEnd > segmentBegin + kEpsilon ? (referenceSample.arc - segmentBegin) / (segmentEnd - segmentBegin) : 0.0;
+    return static_cast<double>(referenceSample.segmentIndex) + fraction;
+}
+
+cv::Point projectMatchedPoint(
+    const MatchedTracePoint& point, const PolylineArcGeometry& selectedReference, double referenceBeginArc, const cv::Mat_<cv::Vec3f>& surface, const cv::Size& renderedSize)
+{
+    const double sourceColumn = referenceSourceColumn(selectedReference, referenceBeginArc, point.referenceArcBase);
+    const cv::Vec3d low = interpolateSurfacePoint(surface, 0, sourceColumn);
+    const cv::Vec3d high = interpolateSurfacePoint(surface, surface.rows - 1, sourceColumn);
+    const cv::Vec3d cross = high - low;
+    const double crossLength = cv::norm(cross);
+    if (!(crossLength > kEpsilon) || !std::isfinite(crossLength))
+        throw std::runtime_error("replay overview strip has an invalid transverse axis");
+    const double transverse = (point.pointBase - point.referencePointBase).dot(cross / crossLength);
+    const double sourceRow = static_cast<double>(surface.rows / 2) + transverse * (surface.rows - 1) / crossLength;
+    const double pixelColumn = sourceColumn * (renderedSize.width - 1) / (surface.cols - 1);
+    const double pixelRow = sourceRow * (renderedSize.height - 1) / (surface.rows - 1);
+    if (!std::isfinite(pixelColumn) || !std::isfinite(pixelRow) || std::abs(pixelRow) > static_cast<double>(std::numeric_limits<int>::max() / 4)) {
+        throw std::runtime_error("replay overview projection is not finite");
+    }
+    return {
+        static_cast<int>(std::lround(pixelColumn)),
+        static_cast<int>(std::lround(pixelRow)),
+    };
+}
+
+void drawMatchedSegments(
+    cv::Mat_<cv::Vec3b>& image,
+    const std::vector<MatchedTraceSegment>& segments,
+    const PolylineArcGeometry& selectedReference,
+    double referenceBeginArc,
+    const cv::Mat_<cv::Vec3f>& surface,
+    const cv::Vec3b& color)
+{
+    for (const auto& segment : segments) {
+        std::vector<cv::Point> pixels;
+        pixels.reserve(segment.size());
+        for (const auto& point : segment) {
+            pixels.push_back(projectMatchedPoint(point, selectedReference, referenceBeginArc, surface, image.size()));
+        }
+        if (pixels.size() >= 2) {
+            cv::polylines(image, pixels, false, cv::Scalar(color[0], color[1], color[2]), 2, cv::LINE_AA);
+        } else if (pixels.size() == 1) {
+            cv::circle(image, pixels.front(), 1, cv::Scalar(color[0], color[1], color[2]), cv::FILLED, cv::LINE_AA);
+        }
+    }
+}
+
+void drawReferenceCenterline(cv::Mat_<cv::Vec3b>& image)
+{
+    const int row = static_cast<int>(std::lround((image.rows - 1) / 2.0));
+    cv::line(image, {0, row}, {image.cols - 1, row}, cv::Scalar(kReferenceColorBgr[0], kReferenceColorBgr[1], kReferenceColorBgr[2]), 1, cv::LINE_AA);
+}
+
+std::array<int, 2> markerBand(int center, int columns)
+{
+    const int begin = std::max(0, center - kOverviewMarkerWidthPixels / 2);
+    const int end = std::min(columns, begin + kOverviewMarkerWidthPixels);
+    return {std::max(0, end - kOverviewMarkerWidthPixels), end};
+}
+
+template <typename Failure>
+std::vector<std::array<int, 2>> failureMarkerBands(
+    const std::vector<Failure>& failures,
+    const PolylineArcGeometry& selectedReference,
+    double referenceBeginArc,
+    int sourceColumns,
+    int renderedColumns)
+{
+    std::vector<std::array<int, 2>> bands;
+    bands.reserve(failures.size());
+    for (const auto& failure : failures) {
+        const double sourceColumn = referenceSourceColumn(
+            selectedReference, referenceBeginArc, failure.referenceArcBase);
+        const int pixelColumn = static_cast<int>(std::lround(
+            sourceColumn * (renderedColumns - 1) / (sourceColumns - 1)));
+        bands.push_back(markerBand(pixelColumn, renderedColumns));
+    }
+    return bands;
+}
+
+void drawFailureMarkers(
+    cv::Mat_<cv::Vec3b>& image,
+    const std::vector<std::array<int, 2>>& greedyBands,
+    const std::vector<std::array<int, 2>>& fiberletBands)
+{
+    const auto drawBands = [&](const auto& bands, const cv::Vec3b& color) {
+        for (const auto& band : bands) {
+            if (band[1] > band[0]) {
+                image(cv::Rect(band[0], 0, band[1] - band[0], image.rows)) =
+                    color;
+            }
+        }
+    };
+    drawBands(greedyBands, kGreedyColorBgr);
+    drawBands(fiberletBands, kFiberletColorBgr);
+    for (const auto& greedy : greedyBands) {
+        for (const auto& fiberlet : fiberletBands) {
+            const int begin = std::max(greedy[0], fiberlet[0]);
+            const int end = std::min(greedy[1], fiberlet[1]);
+            if (end > begin) {
+                image(cv::Rect(begin, 0, end - begin, image.rows)) =
+                    kOverlapColorBgr;
+            }
+        }
+    }
+}
+
+FiberReplayOverview composeOverview(
+    const cv::Mat_<cv::Vec3b>& top,
+    const cv::Mat_<cv::Vec3b>& side)
+{
+    if (top.empty() || side.empty())
+        throw std::invalid_argument("fiber replay overview strips are empty");
+    const int unwrappedColumns = std::max(top.cols, side.cols);
+    const int panelCount = std::max(
+        1, (unwrappedColumns + kOverviewPanelColumns - 1) /
+            kOverviewPanelColumns);
+    const int panelBlockRows = kOverviewLabelRows + top.rows +
+        kOverviewSeparatorRows + kOverviewLabelRows + side.rows;
+    const int64_t outputRows64 = kOverviewHeaderRows +
+        static_cast<int64_t>(panelCount) * panelBlockRows +
+        static_cast<int64_t>(panelCount - 1) * kOverviewPanelGapRows;
+    int outputColumns = kOverviewMinimumColumns;
+    for (int index = 0; index < panelCount; ++index) {
+        const int topBegin = static_cast<int>(
+            static_cast<int64_t>(index) * top.cols / panelCount);
+        const int topEnd = static_cast<int>(
+            static_cast<int64_t>(index + 1) * top.cols / panelCount);
+        const int sideBegin = static_cast<int>(
+            static_cast<int64_t>(index) * side.cols / panelCount);
+        const int sideEnd = static_cast<int>(
+            static_cast<int64_t>(index + 1) * side.cols / panelCount);
+        outputColumns = std::max(
+            {outputColumns, topEnd - topBegin, sideEnd - sideBegin});
+    }
+    if (outputColumns > kJpegMaximumDimension ||
+        outputRows64 > kJpegMaximumDimension) {
+        throw std::invalid_argument(
+            "fiber replay overview cannot fit in one JPEG after panel wrapping");
+    }
+    const int outputRows = static_cast<int>(outputRows64);
+    cv::Mat_<cv::Vec3b> output(
+        outputRows, outputColumns, cv::Vec3b{0, 0, 0});
+    const auto text = [&](const std::string& value, cv::Point origin, const cv::Vec3b& color) {
+        cv::putText(output, value, origin, cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(color[0], color[1], color[2]), 1, cv::LINE_AA);
+    };
+    text("Reference", {8, 14}, kReferenceColorBgr);
+    text("Greedy", {8, 30}, kGreedyColorBgr);
+    text("Fiberlet", {8, 46}, kFiberletColorBgr);
+
+    FiberReplayOverview overview;
+    overview.topShapeYX = {top.rows, top.cols};
+    overview.sideShapeYX = {side.rows, side.cols};
+    overview.renderScale = kOverviewRenderScale;
+    overview.markerWidthPixels = kOverviewMarkerWidthPixels;
+    overview.panels.reserve(panelCount);
+    int panelRow = kOverviewHeaderRows;
+    for (int index = 0; index < panelCount; ++index) {
+        const int topBegin = static_cast<int>(
+            static_cast<int64_t>(index) * top.cols / panelCount);
+        const int topEnd = static_cast<int>(
+            static_cast<int64_t>(index + 1) * top.cols / panelCount);
+        const int sideBegin = static_cast<int>(
+            static_cast<int64_t>(index) * side.cols / panelCount);
+        const int sideEnd = static_cast<int>(
+            static_cast<int64_t>(index + 1) * side.cols / panelCount);
+        const int topRow = panelRow + kOverviewLabelRows;
+        const int sideLabelRow = topRow + top.rows + kOverviewSeparatorRows;
+        const int sideRow = sideLabelRow + kOverviewLabelRows;
+        top(cv::Rect(topBegin, 0, topEnd - topBegin, top.rows))
+            .copyTo(output(cv::Rect(0, topRow, topEnd - topBegin, top.rows)));
+        side(cv::Rect(sideBegin, 0, sideEnd - sideBegin, side.rows))
+            .copyTo(output(cv::Rect(0, sideRow, sideEnd - sideBegin, side.rows)));
+        const std::string suffix = panelCount == 1
+            ? std::string()
+            : " " + std::to_string(index + 1) + "/" +
+                std::to_string(panelCount);
+        text("Top strip" + suffix, {8, topRow - 5}, cv::Vec3b{255, 255, 255});
+        text("Side strip" + suffix, {8, sideRow - 5}, cv::Vec3b{255, 255, 255});
+        overview.panels.push_back({
+            static_cast<double>(index) / panelCount,
+            static_cast<double>(index + 1) / panelCount,
+            {topBegin, topEnd},
+            {sideBegin, sideEnd},
+            {topRow, topRow + top.rows},
+            {sideRow, sideRow + side.rows},
+        });
+        panelRow += panelBlockRows + kOverviewPanelGapRows;
+    }
+    overview.image = std::move(output);
+    return overview;
+}
+
+std::string encodeOverviewJpeg(const cv::Mat_<cv::Vec3b>& image)
+{
+    if (image.empty())
+        throw std::invalid_argument("fiber replay overview image is empty");
+    std::vector<uint8_t> encoded;
+    if (!cv::imencode(".jpg", image, encoded, {cv::IMWRITE_JPEG_QUALITY, 95, cv::IMWRITE_JPEG_PROGRESSIVE, 0, cv::IMWRITE_JPEG_OPTIMIZE, 0})) {
+        throw std::runtime_error("cannot encode fiber replay overview JPEG");
+    }
+    return {reinterpret_cast<const char*>(encoded.data()), encoded.size()};
+}
+
 StripAtlasArtifact stripAtlasArtifact(
     const char* header,
     const std::string& stem,
@@ -508,6 +843,78 @@ bool meshNearlyEqual(const cv::Vec3d& left, const cv::Vec3d& right)
     return meshNearlyEqual(left[0], right[0]) &&
         meshNearlyEqual(left[1], right[1]) &&
         meshNearlyEqual(left[2], right[2]);
+}
+
+void validateOverviewLayout(const FiberReplayOverview& overview)
+{
+    if (overview.image.empty() || overview.image.type() != CV_8UC3 ||
+        overview.topShapeYX[0] < 2 || overview.topShapeYX[1] < 2 ||
+        overview.sideShapeYX[0] < 2 || overview.sideShapeYX[1] < 2 ||
+        overview.renderScale != kOverviewRenderScale ||
+        overview.markerWidthPixels != kOverviewMarkerWidthPixels) {
+        throw std::invalid_argument(
+            "fiber replay overview image or rendering metadata is invalid");
+    }
+    const int unwrappedColumns = std::max(
+        overview.topShapeYX[1], overview.sideShapeYX[1]);
+    const int panelCount = std::max(
+        1, (unwrappedColumns + kOverviewPanelColumns - 1) /
+            kOverviewPanelColumns);
+    if (overview.panels.size() != static_cast<size_t>(panelCount)) {
+        throw std::invalid_argument(
+            "fiber replay overview panel count is invalid");
+    }
+    const int panelBlockRows = kOverviewLabelRows + overview.topShapeYX[0] +
+        kOverviewSeparatorRows + kOverviewLabelRows +
+        overview.sideShapeYX[0];
+    const int expectedRows = kOverviewHeaderRows + panelCount * panelBlockRows +
+        (panelCount - 1) * kOverviewPanelGapRows;
+    int expectedColumns = kOverviewMinimumColumns;
+    int panelRow = kOverviewHeaderRows;
+    for (int index = 0; index < panelCount; ++index) {
+        const std::array<int, 2> topColumns{
+            static_cast<int>(static_cast<int64_t>(index) *
+                             overview.topShapeYX[1] / panelCount),
+            static_cast<int>(static_cast<int64_t>(index + 1) *
+                             overview.topShapeYX[1] / panelCount),
+        };
+        const std::array<int, 2> sideColumns{
+            static_cast<int>(static_cast<int64_t>(index) *
+                             overview.sideShapeYX[1] / panelCount),
+            static_cast<int>(static_cast<int64_t>(index + 1) *
+                             overview.sideShapeYX[1] / panelCount),
+        };
+        const int topRow = panelRow + kOverviewLabelRows;
+        const int sideRow = topRow + overview.topShapeYX[0] +
+            kOverviewSeparatorRows + kOverviewLabelRows;
+        const auto& panel = overview.panels[static_cast<size_t>(index)];
+        if (!nearlyEqual(
+                panel.referenceFractionBegin,
+                static_cast<double>(index) / panelCount) ||
+            !nearlyEqual(
+                panel.referenceFractionEnd,
+                static_cast<double>(index + 1) / panelCount) ||
+            panel.topColumns != topColumns ||
+            panel.sideColumns != sideColumns ||
+            panel.topRows !=
+                std::array<int, 2>{topRow, topRow + overview.topShapeYX[0]} ||
+            panel.sideRows !=
+                std::array<int, 2>{sideRow, sideRow + overview.sideShapeYX[0]}) {
+            throw std::invalid_argument(
+                "fiber replay overview panel geometry is invalid");
+        }
+        expectedColumns = std::max(
+            {expectedColumns, topColumns[1] - topColumns[0],
+             sideColumns[1] - sideColumns[0]});
+        panelRow += panelBlockRows + kOverviewPanelGapRows;
+    }
+    if (overview.image.rows != expectedRows ||
+        overview.image.cols != expectedColumns ||
+        overview.image.rows > kJpegMaximumDimension ||
+        overview.image.cols > kJpegMaximumDimension) {
+        throw std::invalid_argument(
+            "fiber replay overview composed dimensions are invalid");
+    }
 }
 
 template <typename Replay>
@@ -951,6 +1358,89 @@ void renderFiberReplayStripTextures(
     meshes.textureSource = source;
 }
 
+FiberReplayOverview renderFiberReplayOverview(
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& greedyReplay,
+    const FiberletGraphReplayResult& fiberletReplay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    int parallelThreads,
+    ::Volume& volume,
+    const std::string& sourceLocator)
+{
+    if (referenceGeometryBase.size() < 2 || !(normalWorkingToBaseScale > 0.0) || !std::isfinite(normalWorkingToBaseScale) || parallelThreads < 1) {
+        throw std::invalid_argument("replay overview geometry or normal-sampling configuration is invalid");
+    }
+    if (!nearlyEqual(greedyReplay.referenceBeginArcBase, fiberletReplay.referenceBeginArcBase) ||
+        !nearlyEqual(greedyReplay.referenceEndArcBase, fiberletReplay.referenceEndArcBase)) {
+        throw std::invalid_argument("replay overview trace intervals are inconsistent");
+    }
+    const auto selectedReference = makePolylineArcGeometry(referenceGeometryBase);
+    if (!nearlyEqual(selectedReference.length(), greedyReplay.referenceEndArcBase - greedyReplay.referenceBeginArcBase)) {
+        throw std::invalid_argument("replay overview reference geometry has the wrong arc extent");
+    }
+    validateReplayFailures(greedyReplay, "greedy");
+    validateReplayFailures(fiberletReplay, "fiberlet");
+    const auto greedy = matchedGreedySegments(greedyReplay, selectedReference);
+    const auto fiberlet = matchedFiberletSegments(fiberletReplay, selectedReference);
+
+    std::vector<cv::Vec3d> workingPoints;
+    workingPoints.reserve(referenceGeometryBase.size());
+    for (const auto& point : referenceGeometryBase)
+        workingPoints.push_back(point * (1.0 / normalWorkingToBaseScale));
+    std::vector<vc::lasagna::NormalSampleWithDerivative> normalSamples;
+    normalSampler.sampleNormalBatch(workingPoints, false, parallelThreads, normalSamples);
+    if (normalSamples.size() != referenceGeometryBase.size()) {
+        throw std::runtime_error("replay overview normal sampler returned the wrong count");
+    }
+    vc::lasagna::LineModel line;
+    line.points.reserve(referenceGeometryBase.size());
+    for (size_t index = 0; index < referenceGeometryBase.size(); ++index) {
+        line.points.push_back({
+            referenceGeometryBase[index],
+            normalSamples[index].sample,
+            true,
+        });
+    }
+    const auto surfaces = vc::lasagna::buildLineViewSurfaces(line);
+    if (!surfaces.lineSurface || !surfaces.lineSideSlice) {
+        throw std::runtime_error("line view builder did not produce both replay overview strips");
+    }
+    const auto source = validateFiberReplayStripCtVolume(volume, sourceLocator);
+    const auto renderSurface = [&](const QuadSurface& surface) {
+        const auto* basePoints = surface.rawPointsPtr();
+        if (!basePoints || basePoints->empty()) {
+            throw std::invalid_argument("replay overview strip surface has no coordinates");
+        }
+        const auto groupPoints = nativeGroupTextureCoordinates(*basePoints, source);
+        cv::Mat_<uint8_t> grayscale =
+            vc::core::util::renderCoordsTextureFineToCoarse(groupPoints, volume, 0, kOverviewRenderScale, "Replay overview texture sampling");
+        cv::Mat_<cv::Vec3b> color;
+        cv::cvtColor(grayscale, color, cv::COLOR_GRAY2BGR);
+        return color;
+    };
+    auto top = renderSurface(*surfaces.lineSurface);
+    auto side = renderSurface(*surfaces.lineSideSlice);
+    const auto draw = [&](cv::Mat_<cv::Vec3b>& image, const QuadSurface& surface) {
+        const auto* points = surface.rawPointsPtr();
+        drawMatchedSegments(image, greedy, selectedReference, greedyReplay.referenceBeginArcBase, *points, kGreedyColorBgr);
+        drawMatchedSegments(image, fiberlet, selectedReference, greedyReplay.referenceBeginArcBase, *points, kFiberletColorBgr);
+        const auto greedyBands = failureMarkerBands(
+            greedyReplay.failures, selectedReference,
+            greedyReplay.referenceBeginArcBase, points->cols, image.cols);
+        const auto fiberletBands = failureMarkerBands(
+            fiberletReplay.failures, selectedReference,
+            greedyReplay.referenceBeginArcBase, points->cols, image.cols);
+        drawFailureMarkers(image, greedyBands, fiberletBands);
+        drawReferenceCenterline(image);
+    };
+    draw(top, *surfaces.lineSurface);
+    draw(side, *surfaces.lineSideSlice);
+    auto overview = composeOverview(top, side);
+    overview.textureSource = source;
+    return overview;
+}
+
 nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirectory, const FiberReplayBundleInput& input)
 {
     if (input.referenceGeometryBase.size() < 2)
@@ -1001,6 +1491,14 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
     validateReplayFailures(input.greedyReplay, "greedy");
     validateReplayFailures(input.fiberletReplay, "fiberlet");
 
+    std::optional<std::string> overviewJpeg;
+    if (input.overview.has_value()) {
+        const auto& overview = *input.overview;
+        validateTextureSource(overview.textureSource);
+        validateOverviewLayout(overview);
+        overviewJpeg = encodeOverviewJpeg(overview.image);
+    }
+
     std::vector<const FiberReplayVisualizationInput*> visualizations;
     visualizations.reserve(input.visualizations.size());
     for (const auto& visualization : input.visualizations)
@@ -1035,6 +1533,9 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         atomicWriteString(staging / "replay/greedy.obj", segmentedLineObj("# vc_greedy_fiber_replay version 2", greedySegments(input.greedyReplay)));
     vc::core::util::atomicWriteString(staging / "replay/fiberlet.json", fiberletJson.dump(2) + "\n");
     vc::core::util::atomicWriteString(staging / "replay/fiberlet.obj", fiberletGraphReplayObj(input.fiberletReplay));
+    if (overviewJpeg.has_value()) {
+        vc::core::util::atomicWriteString(staging / "replay/full_strip.jpg", *overviewJpeg);
+    }
 
     nlohmann::json visualizationIndex = nlohmann::json::array();
     for (size_t globalIndex = 0; globalIndex < visualizations.size(); ++globalIndex) {
@@ -1281,13 +1782,86 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         {"visualizations", visualizationIndex},
         {"artifacts", nlohmann::json::object()},
     };
-    for (const auto& relative : std::vector<
-             std::filesystem::
-                 path>{"replay/reference.obj", "replay/greedy.json", "replay/greedy.obj", "replay/fiberlet.json", "replay/fiberlet.obj"}) {
+    std::vector<std::filesystem::path> rootArtifacts{
+        "replay/reference.obj",
+        "replay/greedy.json",
+        "replay/greedy.obj",
+        "replay/fiberlet.json",
+        "replay/fiberlet.obj",
+    };
+    if (input.overview.has_value())
+        rootArtifacts.emplace_back("replay/full_strip.jpg");
+    for (const auto& relative : rootArtifacts) {
         root["artifacts"][relative.generic_string()] = {
             {"path", (generationRelative / relative).generic_string()},
             {"content_hash", artifactHash(finalGeneration / relative)},
         };
+    }
+    if (input.overview.has_value()) {
+        const auto& overview = *input.overview;
+        nlohmann::json panels = nlohmann::json::array();
+        for (size_t index = 0; index < overview.panels.size(); ++index) {
+            const auto& panel = overview.panels[index];
+            panels.push_back({
+                {"index", index},
+                {"reference_fraction_begin", panel.referenceFractionBegin},
+                {"reference_fraction_end", panel.referenceFractionEnd},
+                {"top_columns", panel.topColumns},
+                {"side_columns", panel.sideColumns},
+                {"top_rows", panel.topRows},
+                {"side_rows", panel.sideRows},
+            });
+        }
+        root["overview"] = {
+            {"artifact", root["artifacts"].at("replay/full_strip.jpg")},
+            {"stable_path", "fiber_replay.jpg"},
+            {"reference_begin_arc_base", beginArc},
+            {"reference_end_arc_base", endArc},
+            {"reference_point_count", input.referenceGeometryBase.size()},
+            {"ct_source",
+             {
+                 {"locator", overview.textureSource.locator},
+                 {"shape_zyx", overview.textureSource.shapeZYX},
+                 {"scale_from_base_xyz", overview.textureSource.scaleFromBaseXYZ},
+                 {"offset_from_base_xyz", overview.textureSource.offsetFromBaseXYZ},
+             }},
+            {"render_scale", overview.renderScale},
+            {"top_shape_yx", overview.topShapeYX},
+            {"side_shape_yx", overview.sideShapeYX},
+            {"image_shape_yx", {overview.image.rows, overview.image.cols}},
+            {"layout",
+             {
+                 {"order", {"top", "side"}},
+                 {"header_rows", kOverviewHeaderRows},
+                 {"label_rows", kOverviewLabelRows},
+                 {"separator_rows", kOverviewSeparatorRows},
+                 {"panel_gap_rows", kOverviewPanelGapRows},
+                 {"maximum_panel_columns", kOverviewPanelColumns},
+                 {"panel_count", overview.panels.size()},
+                 {"panels", std::move(panels)},
+                 {"alignment", "left"},
+                 {"padding", "black"},
+             }},
+            {"overlay_colors_rgb",
+             {
+                 {"reference", {255, 255, 0}},
+                 {"greedy", {255, 0, 0}},
+                 {"fiberlet", {0, 255, 255}},
+             }},
+            {"failure_markers",
+             {
+                 {"semantic", "pre_reset_error"},
+                 {"reference_arc_field", "failure_reference_arc"},
+                 {"reset_seed_markers", false},
+                 {"width_pixels", overview.markerWidthPixels},
+                 {"greedy_color_rgb", {255, 0, 0}},
+                 {"fiberlet_color_rgb", {0, 255, 255}},
+                 {"overlap_color_rgb", {255, 0, 255}},
+                 {"greedy_count", input.greedyReplay.failures.size()},
+                 {"fiberlet_count", input.fiberletReplay.failures.size()},
+             }},
+        };
+        vc::core::util::atomicWriteString(outputDirectory / "fiber_replay.jpg", *overviewJpeg);
     }
     vc::core::util::atomicWriteString(outputDirectory / "fiber_replay.json", root.dump(2) + "\n");
     constexpr std::string_view kVisualizationPrefix =
@@ -1301,7 +1875,24 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
             std::filesystem::remove(entry.path());
         }
     }
+    if (!input.overview.has_value()) {
+        const auto staleOverview = outputDirectory / "fiber_replay.jpg";
+        if (std::filesystem::exists(staleOverview))
+            std::filesystem::remove(staleOverview);
+    }
     return root;
 }
+
+#ifdef VC_TESTING
+namespace testing
+{
+FiberReplayOverview composeFiberReplayOverviewForTesting(
+    const cv::Mat_<cv::Vec3b>& top,
+    const cv::Mat_<cv::Vec3b>& side)
+{
+    return composeOverview(top, side);
+}
+}  // namespace testing
+#endif
 
 }  // namespace vc::fiber_tracer

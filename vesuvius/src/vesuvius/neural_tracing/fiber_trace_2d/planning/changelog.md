@@ -547,3 +547,12 @@
   source-group voxel resolution. Napari now tessellates the validated textured
   OBJ to every stored TIFF texel instead of displaying only coarse OBJ-vertex
   samples.
+- Added `fiber_replay.jpg`, a full-selected-interval top/side CT overview with
+  yellow reference, red greedy, and cyan fiberlet overlays. It uses the same
+  default line-view surfaces and shared renderer, honors `--length`, is emitted
+  even for zero-failure visual runs, and is stored both immutably and at a
+  stable direct-inspection path.
+- Increased only the direct-inspection replay overview to 8x source-group
+  sampling, added full-height pre-reset failure bands, and wrapped long strips
+  into deterministic fraction-aligned panels without resampling. Per-failure
+  OBJ/MTL/TIFF strips remain at native selected-group sampling.

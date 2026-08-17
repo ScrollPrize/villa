@@ -1,80 +1,57 @@
-# Task Log: existing VC3D strips for replay
+# Task Log: detailed replay overview and restart markers
 
-## Finding
+## Findings
 
-- The replay implementation incorrectly called `render_surface_image()`, a
-  fixed-level legacy helper that does not implement VC3D fine-to-coarse chunk
-  fallback.
-- Existing offline strip rendering already lives in
-  `vc_lasagna_line_probe`: it resizes raw `QuadSurface` coordinates, requires a
-  uint8 volume, blocks dependencies at the explicitly selected and coarser
-  levels, then calls `ChunkedPlaneSampler::sampleCoordsFineToCoarse()`.
-- Interactive `CChunkedVolumeViewer` uses the same fine-to-coarse sampler for
-  non-plane surfaces.
-- Replay also unnecessarily added a public line-ribbon builder, changed the
-  existing line-view caller, fixed rendering to level zero and scale one,
-  accepted uint16, generated a discarded mask, and introduced a PNG-specific
-  artifact contract.
-
-## Decision
-
-- Restore the original line-view code and call `buildLineViewSurfaces()`.
-- Mechanically extract and share the existing line-probe texture helper without
-  changing its sampling behavior.
-- Require `--volume` to name the concrete OME-Zarr dataset group. Use the `/2`
-  group for the current Paris4 sparse local OME-Zarr because it is fully stored.
-- Keep only necessary disconnected-layer atlas packaging after rendering.
-
-## Plan Review
-
-- Use `buildLineViewSurfaces(line)` with its exact default configuration and
-  existing failure behavior; do not retain replay-specific strip geometry.
-- Resolve the selected group against its parent OME `multiscales` metadata,
-  transform only the sampling coordinates, and persist that mapping.
-- Derive replay texture resolution from the selected Zarr group's voxel pitch;
-  replay does not expose the line probe's fixed supersampling control.
-- Extract existing `TexturedMesh`, OBJ/MTL, and TIFF conventions too. The only
-  new packaging is an affine atlas transform of existing component UVs.
-- Delete every alternate symbol/state/test rather than leaving compatibility
-  paths, and add a regression around the no-behavior-change extraction.
-
-## Validation
-
-- Built `test_fiber_replay`, `test_lasagna_line_view_surfaces`, `vc_fiberlets`,
-  and `vc_lasagna_line_probe` with `-j32`.
-- `test_fiber_replay`: 7 cases passed.
-- Focused CTest run: `test_fiber_replay` and
-  `test_lasagna_line_view_surfaces` both passed.
-- The existing `test_chunked_plane_sampler_fallback` regression passed after
-  rebuilding its stale binary.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src python -m pytest
-  vesuvius/tests/test_view_fiber_presence.py -q`: 67 passed.
-- Ruff passed for the viewer and its test file.
-- A 512-base-voxel Paris4 replay with `--volume <ct.ome.zarr>/2` produced 18 strict
-  visualization manifests and 54 TIFF artifacts. Strict reload accepted all 18.
-  All 36 nonempty reference/greedy atlases contained signal (maximum 157); the
-  18 fiberlet atlases were the expected empty 1x1 textures because that replay
-  had no local fiberlet surface components.
-- Every Paris4 sampler report used the explicitly opened `/2` group, render
-  scale 1, complete coverage, and zero error chunks.
-- Normalized concrete OME-Zarr group directory identity for metadata matching;
-  the replay renderer regression now passes the same group with a trailing `/`.
+- The overview currently renders the native selected-group coordinate grid at
+  scale one. The existing shared renderer already supports endpoint-preserving
+  coordinate interpolation and subvoxel CT sampling through its render-scale
+  parameter, so 8x does not require a new sampler.
+- Full Paris4 is roughly 11,500 native group pixels longitudinally and would be
+  roughly 92,000 pixels at 8x, above JPEG's 65,500-pixel dimension limit.
+  Deterministic longitudinal wrapping is required to retain all requested
+  pixels in one JPG.
+- Replay failure records already contain the absolute matched reference arc
+  which caused each reset. This is the correct focus position; the subsequent
+  segment seed is intentionally later.
+- Independent review required JPEG-safe marker bands, explicit overlap
+  semantics, strict pre-render failure validation, fraction-aligned independent
+  top/side panel ranges, typed panel descriptors, and a direct compositor test;
+  the plan was updated accordingly.
 
 ## Deviations
 
 - None.
 
-## Native-resolution correction
+## Implementation
 
-- The first implementation rendered every default 21-by-N surface at a fixed
-  fourfold matrix scale, even after its coordinates were mapped into a coarser
-  selected Zarr group. Napari then retained only values corresponding to the
-  original OBJ vertices, discarding almost all stored texels.
-- Each component now derives endpoint-inclusive width and height from maximum
-  surface arc in selected-group voxel coordinates and calls the unchanged
-  renderer at scale one. The napari adapter validates the standard OBJ/UV/TIFF
-  atlas and tessellates it in memory to one surface vertex per stored texel.
-- Focused validation passed: 7 C++ replay tests and 67 Python viewer tests. A
-  512-base-voxel Paris4 run with `/2/`, `--fail 1`, and `--along 64` generated
-  18 visualizations. Strict reload accepted all 18; all 36 nonempty CT textures
-  contained signal and the 18 empty fiberlet textures remained valid.
+- The full replay overview now passes render scale `8` to the existing shared
+  fine-to-coarse renderer. Its native surface coordinate grid remains the
+  authoritative grid; there is no image resize and no change to per-failure
+  OBJ/MTL/TIFF sampling.
+- Greedy and fiberlet failures are projected from their strict stored absolute
+  reference arcs and drawn as three-pixel, full-strip-height red and cyan
+  bands. Intersections are magenta. The marker identifies the failing sample
+  before reset, and no marker is added for the later reset seed.
+- Long overview rasters are split into the minimum number of equal-reference-
+  fraction panels needed to keep each source range at or below 32,000 columns.
+  Top and side use independent exact half-open column ranges, and all panels
+  remain in one vertically stacked JPEG. Typed panel descriptors are validated
+  before publication and recorded in the root manifest.
+- The compositor is exposed only to the focused test target through the
+  existing `VC_TESTING` convention.
+
+## Validation
+
+- Built with all 32 requested jobs:
+  `cmake --build volume-cartographer/build --target test_fiber_replay vc_fiberlets -j32`.
+- `volume-cartographer/build/bin/test_fiber_replay`: 9 test cases passed. The
+  suite verifies exact 8x dimensions, full-height red/cyan/magenta bands after
+  JPEG encoding, strict failure validation, exact two-panel source coverage,
+  boundary preservation, black panel gaps, and publication metadata.
+- Ran a Paris4 replay for a 512-base-voxel interval with `--vis` and CT group
+  `/2`. It completed with no failures and produced top `336x1056`, side
+  `336x1048`, combined `1056x766`; the former overview sizes were approximately
+  top `42x132` and side `42x131`.
+- Inspected `/tmp/vc_fiber_replay_8x.gdiT1s/fiber_replay.jpg`; CT detail and all
+  three polylines render correctly. This bounded replay had no restart events,
+  so it correctly contains no restart bands.

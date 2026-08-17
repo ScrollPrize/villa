@@ -474,6 +474,32 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
 For the current sparse Paris4 CT store, group `/2` is the first fully stored
 scale and must be passed directly as shown above.
 
+The same `--vis` run also writes `fiber_replay.jpg` for immediate inspection,
+even when neither evaluator fails. It contains the selected reference fiber's
+existing VC3D top strip and side strip, with the reference centerline in
+yellow, the regular greedy trace in red, and the fiberlet trace in cyan. Trace
+reset segments are disconnected. The image uses the same concrete CT group,
+default line-view surfaces, and shared fine-to-coarse renderer as the
+per-failure strips, but requests an 8x render scale from that renderer for
+detailed inspection. This does not resize or change the native-resolution
+per-failure OBJ/MTL/TIFF artifacts. Greedy failures are marked by three-pixel
+vertical red bands at the pre-reset error arc; fiberlet failures use cyan, and
+coincident bands are magenta. The later reset seed is intentionally not marked.
+An explicit `--length N` limits this JPEG
+to that same selected `N`-base-voxel interval; without `--length`, it covers the
+remaining reference fiber. Long 8x strips are split at equal reference-arc
+fractions into at most 32,000-column ranges and stacked as labeled panels in
+the same JPEG; the top and side ranges are mapped independently so neither is
+resampled or loses columns.
+
+The immutable copy is `runs/<content-hash>/replay/full_strip.jpg`; the root
+`fiber_replay.json` records its hash, selected arcs, reference-point count, CT
+group transform, full unwrapped top/side dimensions, 8x scale, marker
+semantics, exact panel ranges, layout, and colors. The stable
+`fiber_replay.jpg` is direct-inspection output, not a napari replay manifest.
+The separate per-failure OBJ/MTL/TIFF artifacts and their direct manifests are
+unchanged.
+
 Each run is published under `runs/<content-hash>/`; only after all requested
 generations exist is `fiber_replay.json` atomically replaced. The root stores
 the two scale bindings, requested and forced-effective trace configuration,

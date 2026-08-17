@@ -3013,6 +3013,41 @@
   valid MTL, and 1x1 TIFF. The manifest records the selected group path, its
   actual base-to-group scale/offset transform and shape, native-grid contract, and
   artifact hashes.
+- Independently of the failure-local artifacts, every replay run with `--vis`
+  publishes one full-selected-interval direct-inspection JPEG. It builds the
+  reference `LineModel` once and renders both the unchanged default
+  `buildLineViewSurfaces()` top surface and side slice through the same shared
+  fine-to-coarse CT renderer used by the failure strips. It first constructs
+  the native selected-group coordinate grid and passes render scale `8` to that
+  shared renderer, producing eight samples per native-grid interval without a
+  post-render resize. The per-failure OBJ/MTL/TIFF strips retain their existing
+  native selected-group sampling. The reference centerline, greedy trace, and fiberlet
+  trace are overlaid in yellow, red, and cyan respectively. Greedy and fiberlet
+  points project through their strict stored matched absolute reference arcs;
+  the selected interval begin is subtracted before mapping into the returned
+  surfaces' authoritative raw coordinate grids. Every non-seed greedy point
+  and every fiberlet point must have contiguous, monotonic, in-range match
+  metadata, and reset segments remain disconnected polylines. No nearest-point
+  rematching or alternate frame construction is permitted. Every failure is
+  marked at its stored pre-reset error arc by a three-pixel full-strip-height
+  vertical band: red for greedy and cyan for fiberlet. Coincident marker pixels
+  are magenta. The later reset seed is not marked.
+- The overview stacks a vertically labeled top strip followed by a side strip,
+  left-aligning unequal widths on black. When either 8x strip would exceed
+  `32000` columns, it is partitioned into the minimum number of equal-reference-
+  fraction panels. Top and side independently map those fractions to exact
+  half-open column ranges; every rasterized column is copied exactly once and
+  panels are stacked vertically in the same JPEG. The producer rejects an
+  output dimension above JPEG's `65500`-pixel bound before allocation. It
+  covers exactly the selected replay geometry, so `--length` also bounds this image. It is written before
+  generation hashing as `replay/full_strip.jpg`, described by the version-2
+  root with selected arcs/reference-point count, source group transform and
+  shape, full unwrapped top/side dimensions, render scale, marker semantics,
+  exact panel ranges, colors, path, and content hash, and copied to the stable
+  top-level `fiber_replay.jpg`. A
+  successful no-visual run removes a stale stable JPEG. This root overview is
+  separate from the per-failure OBJ/MTL/TIFF napari artifacts and is not a
+  direct visualization manifest.
 - The napari viewer takes one direct visualization manifest through `--replay`;
   there is no index argument. An aggregate root is discovery/reporting data and
   is rejected with either a directly usable manifest path or a request to rerun
