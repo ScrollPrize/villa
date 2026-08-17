@@ -431,6 +431,9 @@ private:
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
+    // The overlay only blocks the mouse, so keyboard-driven edits have to test
+    // this themselves before they queue any deferred state.
+    bool _optimizationBusy = false;
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;

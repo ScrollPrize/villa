@@ -1124,6 +1124,7 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
 {
+    _optimizationBusy = busy;
     if (_fiberOptimizationCombo) {
         _fiberOptimizationCombo->setEnabled(!busy);
     }
@@ -4439,7 +4440,11 @@ bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
 
 bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
 {
-    if (!_hasGeneratedViews || !_currentCutViewer ||
+    // A click cannot reach a busy dialog because the optimization overlay
+    // covers the panes, but the keys still arrive; the controller would reject
+    // the request and leave _pendingPlacementFocus behind for the running
+    // optimization to land on.
+    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationBusy ||
         !controlPointPlacementAllowedAt(_currentLinePosition)) {
         return false;
     }
