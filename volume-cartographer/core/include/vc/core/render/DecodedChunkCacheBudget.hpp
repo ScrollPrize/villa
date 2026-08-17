@@ -31,6 +31,9 @@ public:
 
     [[nodiscard]] Stats stats() const;
     [[nodiscard]] std::size_t maximumBytes() const noexcept;
+    // Changes the global decoded-byte ceiling in place. Existing participants
+    // and in-flight work remain registered; reductions evict decoded LRU data.
+    void setMaximumBytes(std::size_t maximumBytes);
 
 private:
     friend class ChunkCache;
@@ -47,7 +50,7 @@ private:
     void removeBytes(std::size_t bytes) noexcept;
     void enforce();
 
-    const std::size_t maximumBytes_;
+    std::atomic_size_t maximumBytes_;
     std::atomic_size_t decodedBytes_{0};
     std::atomic_uint64_t nextTouch_{1};
     mutable std::mutex participantsMutex_;

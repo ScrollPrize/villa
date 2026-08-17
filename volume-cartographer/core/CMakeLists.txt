@@ -37,12 +37,14 @@ add_library(vc_core
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/render/ChunkCache.cpp
+        src/render/ChunkRequestScheduler.cpp
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
+        src/render/ZarrDownloadBenchmark.cpp
         src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp

@@ -144,7 +144,7 @@ class FakeAgentBridgeServer:
                     "pong": True,
                     "pid": 4242,
                     "version": "test-0.0",
-                    "protocolVersion": 1,
+                    "protocolVersion": 2,
                 },
             )
         elif method == "state.get":

@@ -34,17 +34,22 @@ class SpiralPanel : public QWidget
     Q_OBJECT
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
-    void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
+    QComboBox* volumeSelectionControl() const
+    {
+        return _volumeSelector ? _volumeSelector->comboBox() : nullptr;
+    }
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
 signals:
-    void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
+    void windingTransitionsChanged(bool visible);
     void lossMapChanged(const QString& name, qreal opacity);
+    // Whether the next preview export should compute the loss overlays.
+    void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
@@ -67,8 +72,12 @@ private:
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
+    void applyScrollSpec(const QJsonObject& spec);
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
+    QString pendingRebuildStage() const;
+    void setSessionCheckpoint(const QString& hostPath);
+    void refreshCheckpointChoices();
     void refreshReloadRequired();
     void persist() const;
     void restore();
@@ -94,17 +103,23 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     QComboBox* _lossMap = nullptr;
+    QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;
     QSpinBox* _zEnd = nullptr;
     QSpinBox* _iterations = nullptr;
-    QSpinBox* _lasagnaScale = nullptr;
     QSpinBox* _legacyCheckpointStep = nullptr;
     QSpinBox* _renderVolumeScale = nullptr;
-    QDoubleSpinBox* _voxelSize = nullptr;
-    QLineEdit* _lasagnaGroup = nullptr;
-    QLineEdit* _scrollName = nullptr;
+    // Read-only reports of what spiral-scroll.json specifies.
+    QLabel* _scrollSummary = nullptr;
+    QLabel* _lasagnaSummary = nullptr;
+    // The checkpoint the resident fit was built from: reported, never typed,
+    // and carried back in a rebuild request unless the Checkpoint section
+    // replaces it.
+    QString _sessionCheckpoint;
+    QLabel* _sessionCheckpointLabel = nullptr;
+    QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
     QLineEdit* _pclPath = nullptr;
     QListWidget* _pclList = nullptr;
@@ -112,7 +127,6 @@ private:
     QPushButton* _removePcl = nullptr;
     QPushButton* _addPclButton = nullptr;
     QToolButton* _browsePclButton = nullptr;
-    QComboBox* _outwardSense = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QDoubleSpinBox* _trackShortWeight = nullptr;
@@ -133,6 +147,13 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    QPushButton* _loadCheckpoint = nullptr;
+    QLineEdit* _datasetRoot = nullptr;
+    QLineEdit* _outputRoot = nullptr;
+    QLineEdit* _cacheRoot = nullptr;
+    QWidget* _datasetRow = nullptr;
+    QWidget* _outputRow = nullptr;
+    QWidget* _cacheRow = nullptr;
     QLabel* _checkpointDownloadStatus = nullptr;
     QProgressBar* _checkpointDownloadProgress = nullptr;
     QTimer* _checkpointDownloadTimer = nullptr;
@@ -140,7 +161,6 @@ private:
     QString _checkpointDownloadPhase;
     qint64 _checkpointBytesReceived = 0;
     qint64 _checkpointTotalBytes = 0;
-    QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
     QProgressBar* _previewProgress = nullptr;
     QLabel* _metrics = nullptr;
@@ -152,12 +172,10 @@ private:
     QLineEdit* _sshDestination = nullptr;
     QSpinBox* _sshPort = nullptr;
     QLineEdit* _apiKey = nullptr;
-    QLineEdit* _mapServiceRoot = nullptr;
     QLineEdit* _mapLocalRoot = nullptr;
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;
     QPushButton* _disconnectButton = nullptr;
-    QToolButton* _restartServiceButton = nullptr;
     QWidget* _endpointRow = nullptr;
     QWidget* _sshRow = nullptr;
     QWidget* _apiKeyRow = nullptr;
@@ -174,11 +192,13 @@ private:
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
     QSet<QString> _runMutablePaths;
+    // schema.model_stage_keys: the settings a rebuild can apply without
+    // reloading the session's inputs.
+    QSet<QString> _modelStageKeys;
     qint64 _advancedSessionGeneration = -1;
 
     QString _currentProfileId;
     QStringList _profileIds;
-    QString _pendingDatasetRoot;
     bool _applyingResolution = false;
     bool _hasManualEdits = false;
     bool _hasSession = false;
@@ -189,6 +209,8 @@ private:
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
     QString _previewTransferText;
+    // Last reported session lifecycle state; "Error" is the recovery case.
+    QString _sessionState;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;

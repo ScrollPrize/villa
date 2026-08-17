@@ -236,21 +236,6 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true, raw chunks downloaded from remote volumes are stored in the
-    // persistent disk cache compressed at the configured quantization width.
-    // Reading understands both formats regardless of this flag; it only
-    // controls the write format. Requires restart.
-    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
-    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
-
-    // Quantization bin width for compressed disk-cache writes
-    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
-    // Only affects newly written chunks; reading is unaffected. Requires
-    // restart, except for the explicit "recompress existing cache" action.
-    // Default lossless: compression saves space without changing voxels.
-    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
-    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
-
     // Shared budget for every managed remote Zarr chunk beneath the resolved
     // vc3d cache root. Zero maximum means unlimited.
     constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
@@ -269,38 +254,52 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable — it tracks
-    // std::thread::hardware_concurrency() at runtime.
+    // Process-wide remote source-download admission. Automatic mode adapts
+    // between 2 and the fixed worker capacity. Manual mode admits exactly the
+    // configured number of simultaneous downloads. Decode workers are managed
+    // separately.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
+        "perf/remote_download_automatic";
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
+        "perf/remote_download_parallelism";
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
+
+    // Reusable adaptive-download capacity model. Runtime probe phase and
+    // stability timing are reset on every launch.
+    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
+        "perf/remote_download_state/version";
+    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
+    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
+        "perf/remote_download_state/settled_admission";
+    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
+        "perf/remote_download_state/long_term_bytes_per_second";
+    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
+        "perf/remote_download_state/max_saturated_parallelism";
+    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
+        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
 
 }
 
 // -----------------------------------------------------------------------------
-// Spiral Workspace Settings
+// Viewer Cache Settings
 //
-// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
-// the main workspace's shared decoded-chunk budget. All three apply without a
+// Each ViewerManager owns independent derived surface-tile caches. Raw decoded
+// volume chunks use the application-wide cache. These settings apply without a
 // restart.
 // -----------------------------------------------------------------------------
-namespace spiral {
-    // Budget for the flattened view's cache of resampled surface space, for the
-    // displayed (base) volume. 0 disables it, so the flattened view samples the
-    // volume every frame as it did before the cache existed.
-    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+namespace viewer_cache {
+    // Per-workspace budget for the flattened segmentation view's cache of
+    // resampled surface space. 0 selects the legacy direct-sampling path.
+    constexpr auto SURFACE_CACHE_GB = "viewer_cache/surface_cache_gb";
     constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
 
-    // Same, for the overlay volume. Its own budget because overlay and base
-    // compete for nothing else. 0 disables it and leaves the overlay channel on
-    // its existing resident-only sampling path.
-    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
-    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+    // Per-workspace budget for the overlay volume's surface-space cache. 0
+    // leaves the overlay channel on its legacy resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
-    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
-    // A floor rather than a ceiling: it is raised automatically when it cannot
-    // hold one frame (otherwise a single render thrashes), and the status bar
-    // reports the effective value. The surface-tile filler gets a pool of the
-    // same size as an internal constant.
-    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
-    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
 }
 
 // -----------------------------------------------------------------------------
@@ -324,11 +323,19 @@ namespace line_annotation {
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
+    // Cruise speed of the Left/Right arrow pan between control points, in line
+    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
+    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
+    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
     // "_v2" retires ratios saved before the fixed top strip / smaller bottom
     // strip layout; old values would override the new default proportions.
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    // Shared cursor cross across the four generated panes. Independent of the
+    // app-global "Sync cursor across views" toggle.
+    constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
+    constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";

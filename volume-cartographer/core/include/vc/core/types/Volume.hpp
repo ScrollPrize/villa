@@ -156,23 +156,6 @@ public:
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
-    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
-        vc::render::ChunkCache::Options options) const;
-
-    // Set the local safety ceiling and optional process-wide decoded budget
-    // for the single cache shared by volume sampling and viewers.
-    void setCacheBudget(
-        size_t hotBytes,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
-
-    // CState clients keep a shared Volume active across workspaces. The final
-    // release invalidates and drops its cache even if the Volume object itself
-    // remains retained by a VolumePkg.
-    void retainCacheClient();
-    void releaseCacheClient();
-
-    // Set the number of background IO threads for chunk fetching.
-    void setIOThreads(int count);
 
     // Drop decoded/read cache state. Writes call this automatically.
     void invalidateCache();
@@ -297,10 +280,6 @@ protected:
     // Cache ownership
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
-    size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
-    std::size_t cacheClientCount_ = 0;
-    int ioThreads_ = 0;  // 0 = use default
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
     // and rebuilding the codec registry on every chunk read. ZarrArray is
@@ -311,6 +290,7 @@ protected:
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
     std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
         vc::render::ChunkCache::Options options) const;
+    [[nodiscard]] std::string chunkCacheSourceIdentity() const;
 
     void loadMetadata();
 
