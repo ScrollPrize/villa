@@ -1,3 +1,31 @@
+# 2026-08-17: robust sampled-direction anchor refinement
+
+- Replaced joint angular line search with deterministic competitive robust
+  sampled-direction aggregation and position-only bounded refinement.
+- Removed pre-refinement close-direction merging, preserved robust membership
+  through peak fitting, and added strict configuration/artifact diagnostics.
+- Reduced the default alternating robust update budget to two measured passes;
+  legacy numeric identity is intentionally not required for this fitter.
+- Fused robust histogram/tensor work, reused tile gradients, paired spatial
+  objectives, and reduced peak-response geometry to transverse coordinates.
+- Increased anchor tiles from four to six cells per axis after measured tile
+  sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
+- Stored transient peak-search observations and evaluated transverse peak
+  responses in float32, reducing canonical anchor wall time to 9.76 seconds.
+
+# 2026-08-17: fiberlet extraction profiling
+
+- Added deterministic anchor and fiberlet workload counters and finer-grained
+  wall, CPU, and summed-worker timings without changing extraction decisions.
+- Added one shared versioned extraction-profile row to `vc_fiberlets benchmark`
+  and full `fiberlet-replay` extraction.
+- Documented a reproducible, exact-output performance protocol and recorded the
+  initial optimization candidates for the fiberlet tracing pipeline.
+- Added extraction-profile version 2 with exclusive anchor-fitting subphases,
+  repeated observation-visit counters, and exact peak-cache/backtracking
+  diagnostics. Measurement identified local component refinement, not
+  seed-pair fitting, as the next dominant extraction hotspot.
+
 # 2026-08-13: fiberlet graph replay
 
 - Replaced the quantized world-axis half-grid DP with a deterministic curved
@@ -565,3 +593,19 @@
   preserved reset components with explicit raster placement, and changed long
   output to complete four-strip blocks packed across indexed JPEGs capped at
   65,000 pixels per dimension.
+
+# 2026-08-17: profiled and accelerated fiberlet extraction
+
+- Added versioned anchor/fiberlet phase profiles to benchmark and replay output,
+  including deterministic work counters and process-CPU measurements.
+- Replaced repeated replay-tube scans with an immutable float32 Boost segment
+  R-tree and prioritized each local corridor's layer-adjacent segment. On the
+  5,000-base-voxel Paris4 replay workload, median wall time fell from 58.61 to
+  25.32 seconds while complete published artifacts remained byte-identical.
+- Added a conservative exact support-sphere broad phase to repeated anchor
+  refined-state evaluation. On the same 5,000-base-voxel replay, median wall
+  time fell from 24.92 to 22.09 seconds and complete artifacts remained
+  byte-identical.
+- Added version-3 local-refinement subphase profiling, identifying repeated
+  refined-state evaluation as roughly 89-90% of remaining local-refinement
+  worker time on the canonical replay.

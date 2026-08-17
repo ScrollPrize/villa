@@ -129,11 +129,12 @@ void usage(const char* executable)
               << "  --window N                    refinement radius in base voxels [cell-side]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
-              << "  --merge-angle-deg N           maximum duplicate-axis angle [10]\n"
-              << "  --merge-abs-loss N            maximum normalized merge loss [0.01]\n"
-              << "  --merge-rel-loss N            maximum relative merge loss [0.05]\n"
+              << "  --robust-max-trim N           maximum trimmed evidence mass [0.20]\n"
+              << "  --robust-mad-multiplier N     angular residual MAD multiplier [3]\n"
+              << "  --robust-min-angle-deg N      angular noise floor [5]\n"
+              << "  --nms-angle-deg N             maximum duplicate-axis angle [10]\n"
               << "  --maximum-seeds N             deterministic PCA seed count [8]\n"
-              << "  --maximum-iterations N        assignment/PCA iteration limit [64]\n"
+              << "  --maximum-iterations N        robust assignment/update pass limit [2]\n"
               << "  --crop X,Y,Z,W,H,D            base-volume box; selects intersected cells\n"
               << "  --glyph-length-base-voxels N  diagnostic anchor length [16]\n\n"
               << "Path options:\n"
@@ -325,14 +326,18 @@ CliOptions parseArgs(int argc, char** argv)
             options.anchors.observationPresenceFloor = parseDouble(valueAfter(index, argc, argv, "presence-floor"), "presence-floor");
         } else if (argument == "--minimum-support" && options.command != Command::Paths) {
             options.anchors.minimumAlignedSupport = parseDouble(valueAfter(index, argc, argv, "minimum-support"), "minimum-support");
-        } else if (argument == "--merge-angle-deg" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumAngleDegrees = parseDouble(valueAfter(index, argc, argv, "merge-angle-deg"), "merge-angle-deg");
-        } else if (argument == "--merge-abs-loss" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumAbsoluteObjectiveLoss =
-                parseDouble(valueAfter(index, argc, argv, "merge-abs-loss"), "merge-abs-loss");
-        } else if (argument == "--merge-rel-loss" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumRelativeObjectiveLoss =
-                parseDouble(valueAfter(index, argc, argv, "merge-rel-loss"), "merge-rel-loss");
+        } else if (argument == "--robust-max-trim" && options.command != Command::Paths) {
+            options.anchors.robustMaximumTrimMassFraction =
+                parseDouble(valueAfter(index, argc, argv, "robust-max-trim"), "robust-max-trim");
+        } else if (argument == "--robust-mad-multiplier" && options.command != Command::Paths) {
+            options.anchors.robustMadMultiplier =
+                parseDouble(valueAfter(index, argc, argv, "robust-mad-multiplier"), "robust-mad-multiplier");
+        } else if (argument == "--robust-min-angle-deg" && options.command != Command::Paths) {
+            options.anchors.robustMinimumAngleDegrees =
+                parseDouble(valueAfter(index, argc, argv, "robust-min-angle-deg"), "robust-min-angle-deg");
+        } else if (argument == "--nms-angle-deg" && options.command != Command::Paths) {
+            options.anchors.nmsMaximumAngleDegrees =
+                parseDouble(valueAfter(index, argc, argv, "nms-angle-deg"), "nms-angle-deg");
         } else if (argument == "--maximum-seeds" && options.command != Command::Paths) {
             const int value = parseInt(valueAfter(index, argc, argv, "maximum-seeds"), "maximum-seeds");
             if (value <= 0)
@@ -515,7 +520,6 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.peakGridStepPredictionVoxels = options.peakStepBaseVoxels.value_or(0.5 * grid.predictionToBaseScale) / grid.predictionToBaseScale;
     options.anchors.localWindowRadiusPredictionVoxels = options.localWindowBaseVoxels.value_or(cellSideBase) / grid.predictionToBaseScale;
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
-    options.anchors.nmsMaximumAngleDegrees = options.anchors.mergeMaximumAngleDegrees;
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
 }
@@ -561,6 +565,238 @@ struct TubeExtractionResult {
     double fiberletCpuSeconds = 0.0;
 };
 
+void printTubeExtractionProfile(
+    std::ostream& output,
+    const TubeExtractionResult& extraction)
+{
+    const auto previousPrecision = output.precision();
+    const auto& anchor = extraction.anchors.profile;
+    const auto& fit = anchor.fit;
+    const auto& paths = extraction.paths;
+    const double anchorProfiledSeconds =
+        anchor.setupSeconds + anchor.tilePlanningSeconds +
+        anchor.cellProcessingSeconds + anchor.selectionSeconds +
+        anchor.initialDiagnosticsSeconds +
+        anchor.duplicateSuppressionSeconds + anchor.finalizationSeconds;
+    const double fiberletProfiledSeconds =
+        paths.candidateGenerationSeconds + paths.preparationSeconds +
+        paths.cornerMergeSeconds + paths.predictionSamplingSeconds +
+        paths.normalSamplingSeconds + paths.samplingMaterializationSeconds +
+        paths.searchSeconds;
+    const double fitProfiledWorkSeconds =
+        fit.setupWorkSeconds + fit.seedGenerationWorkSeconds +
+        fit.seedPairRefinementWorkSeconds + fit.initializationWorkSeconds +
+        fit.localRefinementWorkSeconds + fit.peakSearchWorkSeconds +
+        fit.finalEvaluationWorkSeconds;
+    const double localProfiledWorkSeconds =
+        fit.localTensorProposalWorkSeconds +
+        fit.localCentroidProposalWorkSeconds +
+        fit.localStateEvaluationWorkSeconds;
+    const auto depthCounts = [](const auto& counts) {
+        std::ostringstream encoded;
+        for (size_t depth = 0; depth < counts.size(); ++depth) {
+            if (depth != 0)
+                encoded << ',';
+            encoded << counts[depth];
+        }
+        return encoded.str();
+    };
+    output << std::setprecision(17)
+           << "fiberlet_extraction_profile version=6"
+           << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
+           << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
+           << " anchor_profiled_seconds=" << anchorProfiledSeconds
+           << " anchor_residual_seconds="
+           << std::max(0.0, extraction.anchors.elapsedSeconds - anchorProfiledSeconds)
+           << " anchor_selected_cells=" << anchor.selectedCells
+           << " anchor_context_cells=" << anchor.contextCells
+           << " anchor_work_cells=" << anchor.workCells
+           << " anchor_tiles=" << anchor.tiles
+           << " anchor_workers=" << anchor.workers
+           << " anchor_sampler_calls=" << anchor.predictionSamplerCalls
+           << " anchor_submitted_prediction_voxels="
+           << anchor.submittedPredictionVoxels
+           << " anchor_candidate_observations=" << anchor.candidateObservations
+           << " anchor_retained_observations=" << anchor.retainedObservations
+           << " anchor_gradient_attempts=" << anchor.gradientAttempts
+           << " anchor_valid_gradients=" << anchor.validGradients
+           << " anchor_gradient_computations=" << anchor.gradientComputations
+           << " anchor_valid_gradient_computations="
+           << anchor.validGradientComputations
+           << " anchor_retain_predicate_calls=" << anchor.retainPredicateCalls
+           << " anchor_fit_iterations=" << anchor.fitIterations
+           << " anchor_setup_seconds=" << anchor.setupSeconds
+           << " anchor_tile_planning_seconds=" << anchor.tilePlanningSeconds
+           << " anchor_cell_processing_seconds=" << anchor.cellProcessingSeconds
+           << " anchor_cell_processing_cpu_seconds="
+           << anchor.cellProcessingCpuSeconds
+           << " anchor_coordinate_construction_work_seconds="
+           << anchor.coordinateConstructionWorkSeconds
+           << " anchor_prediction_sampling_work_seconds="
+           << anchor.predictionSamplingWorkSeconds
+           << " anchor_gradient_construction_work_seconds="
+           << anchor.gradientConstructionWorkSeconds
+           << " anchor_observation_construction_work_seconds="
+           << anchor.observationConstructionWorkSeconds
+           << " anchor_fitting_work_seconds=" << anchor.fittingWorkSeconds
+           << " anchor_fit_invocations=" << fit.invocations
+           << " anchor_fit_nonempty_cells=" << fit.nonemptyCells
+           << " anchor_fit_weighted_observations=" << fit.weightedObservations
+           << " anchor_fit_seeds=" << fit.seeds
+           << " anchor_fit_seed_generation_observation_visits="
+           << fit.seedGenerationObservationVisits
+           << " anchor_fit_seed_pairs=" << fit.seedPairs
+           << " anchor_fit_seed_pair_iterations=" << fit.seedPairIterations
+           << " anchor_fit_seed_assignment_observation_visits="
+           << fit.seedAssignmentObservationVisits
+           << " anchor_fit_seed_tensor_observation_visits="
+           << fit.seedTensorObservationVisits
+           << " anchor_fit_seed_objective_observation_visits="
+           << fit.seedObjectiveObservationVisits
+           << " anchor_fit_initialization_observation_visits="
+           << fit.initializationObservationVisits
+           << " anchor_fit_local_refinement_attempts="
+           << fit.localRefinementAttempts
+           << " anchor_fit_local_refinement_accepted_steps="
+           << fit.localRefinementAcceptedSteps
+           << " anchor_fit_backtracking_evaluations="
+           << fit.backtrackingEvaluations
+           << " anchor_fit_robust_components_without_outliers="
+           << fit.robustComponentsWithoutOutliers
+           << " anchor_fit_robust_trimmed_components="
+           << fit.robustTrimmedComponents
+           << " anchor_fit_robust_removed_nonunique_components="
+           << fit.robustRemovedNonuniqueComponents
+           << " anchor_fit_robust_hard_limit_hits="
+           << fit.robustHardLimitHits
+           << " anchor_fit_spatial_candidates_tested="
+           << fit.spatialCandidatesTested
+           << " anchor_fit_robust_candidate_trimmed_mass="
+           << fit.robustCandidateTrimmedMass
+           << " anchor_fit_robust_trimmed_mass="
+           << fit.robustTrimmedMass
+           << " anchor_fit_robust_retained_mass="
+           << fit.robustRetainedMass
+           << " anchor_fit_spatial_tested_by_depth="
+           << depthCounts(fit.spatialCandidatesTestedByDepth)
+           << " anchor_fit_spatial_accepted_by_depth="
+           << depthCounts(fit.spatialCandidatesAcceptedByDepth)
+           << " anchor_fit_local_tensor_observation_visits="
+           << fit.localTensorObservationVisits
+           << " anchor_fit_local_centroid_observation_visits="
+           << fit.localCentroidObservationVisits
+           << " anchor_fit_refined_evaluation_observation_visits="
+           << fit.refinedEvaluationObservationVisits
+           << " anchor_fit_peak_components=" << fit.peakComponents
+           << " anchor_fit_peak_preparation_observation_visits="
+           << fit.peakPreparationObservationVisits
+           << " anchor_fit_peak_grid_response_requests="
+           << fit.peakGridResponseRequests
+           << " anchor_fit_peak_computed_grid_responses="
+           << fit.peakComputedGridResponses
+           << " anchor_fit_peak_acceptance_responses="
+           << fit.peakAcceptanceResponses
+           << " anchor_fit_peak_response_observation_visits="
+           << fit.peakResponseObservationVisits
+           << " anchor_fit_final_evaluation_observation_visits="
+           << fit.finalEvaluationObservationVisits
+           << " anchor_fit_setup_work_seconds=" << fit.setupWorkSeconds
+           << " anchor_fit_seed_generation_work_seconds="
+           << fit.seedGenerationWorkSeconds
+           << " anchor_fit_seed_pair_refinement_work_seconds="
+           << fit.seedPairRefinementWorkSeconds
+           << " anchor_fit_initialization_work_seconds="
+           << fit.initializationWorkSeconds
+           << " anchor_fit_local_refinement_work_seconds="
+           << fit.localRefinementWorkSeconds
+           << " anchor_fit_local_tensor_proposal_work_seconds="
+           << fit.localTensorProposalWorkSeconds
+           << " anchor_fit_local_centroid_proposal_work_seconds="
+           << fit.localCentroidProposalWorkSeconds
+           << " anchor_fit_local_state_evaluation_work_seconds="
+           << fit.localStateEvaluationWorkSeconds
+           << " anchor_fit_local_profiled_work_seconds="
+           << localProfiledWorkSeconds
+           << " anchor_fit_local_control_work_seconds="
+           << std::max(
+                  0.0, fit.localRefinementWorkSeconds -
+                      localProfiledWorkSeconds)
+           << " anchor_fit_peak_search_work_seconds="
+           << fit.peakSearchWorkSeconds
+           << " anchor_fit_final_evaluation_work_seconds="
+           << fit.finalEvaluationWorkSeconds
+           << " anchor_fit_profiled_work_seconds=" << fitProfiledWorkSeconds
+           << " anchor_fit_residual_work_seconds="
+           << std::max(0.0, anchor.fittingWorkSeconds - fitProfiledWorkSeconds)
+           << " anchor_selection_seconds=" << anchor.selectionSeconds
+           << " anchor_initial_diagnostics_seconds="
+           << anchor.initialDiagnosticsSeconds
+           << " anchor_duplicate_suppression_seconds="
+           << anchor.duplicateSuppressionSeconds
+           << " anchor_finalization_seconds=" << anchor.finalizationSeconds
+           << " fiberlet_elapsed_seconds=" << paths.elapsedSeconds
+           << " fiberlet_cpu_seconds=" << paths.elapsedCpuSeconds
+           << " fiberlet_profiled_seconds=" << fiberletProfiledSeconds
+           << " fiberlet_residual_seconds="
+           << std::max(0.0, paths.elapsedSeconds - fiberletProfiledSeconds)
+           << " fiberlet_candidate_predicate_calls="
+           << paths.candidatePointPredicateCalls
+           << " fiberlet_lattice_node_positions=" << paths.latticeNodePositions
+           << " fiberlet_corridor_segment_tests=" << paths.corridorSegmentTests
+           << " fiberlet_corridor_accepted_nodes=" << paths.corridorAcceptedNodes
+           << " fiberlet_node_predicate_calls=" << paths.nodePointPredicateCalls
+           << " fiberlet_retained_search_nodes=" << paths.retainedSearchNodes
+           << " fiberlet_corner_insertion_attempts="
+           << paths.interpolationCornerInsertions
+           << " fiberlet_unique_sampled_voxels=" << paths.sampledVoxels
+           << " fiberlet_interpolated_scoring_points="
+           << paths.interpolatedScoringPoints
+           << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
+           << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups
+           << " fiberlet_dp_reached_state_visits=" << paths.dpReachedStateVisits
+           << " fiberlet_dp_relaxations=" << paths.dpRelaxations
+           << " fiberlet_candidate_generation_seconds="
+           << paths.candidateGenerationSeconds
+           << " fiberlet_candidate_generation_cpu_seconds="
+           << paths.candidateGenerationCpuSeconds
+           << " fiberlet_preparation_seconds=" << paths.preparationSeconds
+           << " fiberlet_preparation_cpu_seconds="
+           << paths.preparationCpuSeconds
+           << " fiberlet_preparation_geometry_work_seconds="
+           << paths.preparationGeometryWorkSeconds
+           << " fiberlet_node_enumeration_work_seconds="
+           << paths.preparationNodeEnumerationWorkSeconds
+           << " fiberlet_corner_collection_work_seconds="
+           << paths.preparationCornerCollectionWorkSeconds
+           << " fiberlet_corner_merge_seconds=" << paths.cornerMergeSeconds
+           << " fiberlet_corner_merge_cpu_seconds="
+           << paths.cornerMergeCpuSeconds
+           << " fiberlet_prediction_sampling_seconds="
+           << paths.predictionSamplingSeconds
+           << " fiberlet_prediction_sampling_cpu_seconds="
+           << paths.predictionSamplingCpuSeconds
+           << " fiberlet_normal_sampling_seconds=" << paths.normalSamplingSeconds
+           << " fiberlet_normal_sampling_cpu_seconds="
+           << paths.normalSamplingCpuSeconds
+           << " fiberlet_materialization_seconds="
+           << paths.samplingMaterializationSeconds
+           << " fiberlet_materialization_cpu_seconds="
+           << paths.samplingMaterializationCpuSeconds
+           << " fiberlet_scoring_index_seconds=" << paths.scoringIndexSeconds
+           << " fiberlet_scoring_index_cpu_seconds="
+           << paths.scoringIndexCpuSeconds
+           << " fiberlet_interpolation_materialization_seconds="
+           << paths.interpolationMaterializationSeconds
+           << " fiberlet_interpolation_materialization_cpu_seconds="
+           << paths.interpolationMaterializationCpuSeconds
+           << " fiberlet_search_seconds=" << paths.searchSeconds
+           << " fiberlet_search_cpu_seconds=" << paths.searchCpuSeconds
+           << " fiberlet_node_index_work_seconds="
+           << paths.searchNodeIndexWorkSeconds
+           << " fiberlet_dp_work_seconds=" << paths.searchDpWorkSeconds << '\n';
+    output.precision(previousPrecision);
+}
+
 TubeExtractionResult extractTubeFiberlets(
     const std::vector<cv::Vec3d>& referenceBase,
     double beginArcBase,
@@ -596,6 +832,8 @@ TubeExtractionResult extractTubeFiberlets(
     result.anchorCpuSeconds = processCpuSeconds() - anchorCpuStart;
 
     vc::fiber_tracer::LoadedFiberAnchorArtifact loaded{result.anchors, {}};
+    const auto containmentQuery = result.tube.makePredictionContainmentQuery(
+        grid.predictionToBaseScale);
     const auto fiberletStart = std::chrono::steady_clock::now();
     const double fiberletCpuStart = processCpuSeconds();
     result.paths = vc::fiber_tracer::traceFiberletPaths(
@@ -605,7 +843,9 @@ TubeExtractionResult extractTubeFiberlets(
         [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
         normalSampler,
         printFiberletProgress,
-        [&](const cv::Vec3d& pointPrediction) { return result.tube.containsPredictionPoint(pointPrediction, grid.predictionToBaseScale); });
+        [&](const cv::Vec3d& pointPrediction) {
+            return containmentQuery.containsPredictionPoint(pointPrediction);
+        });
     result.fiberletSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - fiberletStart).count();
     result.fiberletCpuSeconds = processCpuSeconds() - fiberletCpuStart;
     return result;
@@ -774,6 +1014,7 @@ int main(int argc, char** argv)
                       << " search_effective_cores=" << effectiveCores(extraction.paths.searchCpuSeconds, extraction.paths.searchSeconds)
                       << " total_seconds=" << totalSeconds << " total_cpu_seconds=" << totalCpuSeconds
                       << " total_effective_cores=" << effectiveCores(totalCpuSeconds, totalSeconds) << '\n';
+            printTubeExtractionProfile(std::cout, extraction);
             return 0;
         }
 
@@ -850,6 +1091,7 @@ int main(int argc, char** argv)
                       << " sampling_batches=" << fullExtraction.paths.samplingCoordinateBatches
                       << " sampled_voxels=" << fullExtraction.paths.sampledVoxels << " peak_batch_voxels=" << fullExtraction.paths.peakCoordinateBatchVoxels
                       << " evaluated_dp_nodes=" << fullExtraction.paths.evaluatedDpNodes << '\n';
+            printTubeExtractionProfile(std::cerr, fullExtraction);
             auto fullPaths = std::move(fullExtraction.paths);
             const auto graphStart = std::chrono::steady_clock::now();
             std::cerr << "fiber_replay_stage stage=graph status=started\n";
@@ -1126,6 +1368,9 @@ int main(int argc, char** argv)
                       << " local_window_base_voxels=" << options.anchors.localWindowRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " nms_transverse_radius_base_voxels=" << options.anchors.nmsTransverseRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " nms_longitudinal_radius_base_voxels=" << options.anchors.nmsLongitudinalRadiusPredictionVoxels * grid.predictionToBaseScale
+                      << " robust_max_trim=" << options.anchors.robustMaximumTrimMassFraction
+                      << " robust_mad_multiplier=" << options.anchors.robustMadMultiplier
+                      << " robust_min_angle_deg=" << options.anchors.robustMinimumAngleDegrees
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells
                       << " zero=" << report.diagnostics.zeroAnchorCells << " one=" << report.diagnostics.oneAnchorCells

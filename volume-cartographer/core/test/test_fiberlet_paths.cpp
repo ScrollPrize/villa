@@ -909,6 +909,40 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     REQUIRE(parallel.diagnostics.searchedPairs == 2);
     CHECK(serial.candidateWorkers == 1);
     CHECK(parallel.candidateWorkers == 2);
+    const auto checkProfile = [](const auto& report) {
+        CHECK(report.latticeNodePositions >= report.corridorAcceptedNodes);
+        CHECK(report.corridorAcceptedNodes >= report.retainedSearchNodes);
+        CHECK(report.interpolationCornerInsertions >= report.sampledVoxels);
+        CHECK(report.interpolatedScoringPoints == report.evaluatedDpNodes);
+        CHECK(report.retainedSearchNodes + 2 * report.preparedCandidates ==
+              report.evaluatedDpNodes);
+        CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
+        CHECK(report.dpRelaxations <= report.dpTransitionLookups);
+        CHECK(report.preparationGeometryWorkSeconds >= 0.0);
+        CHECK(report.preparationNodeEnumerationWorkSeconds >= 0.0);
+        CHECK(report.preparationCornerCollectionWorkSeconds >= 0.0);
+        CHECK(report.scoringIndexSeconds >= 0.0);
+        CHECK(report.interpolationMaterializationSeconds >= 0.0);
+        CHECK(report.searchNodeIndexWorkSeconds >= 0.0);
+        CHECK(report.searchDpWorkSeconds >= 0.0);
+    };
+    checkProfile(serial);
+    checkProfile(parallel);
+    CHECK(serial.candidatePointPredicateCalls ==
+          parallel.candidatePointPredicateCalls);
+    CHECK(serial.latticeNodePositions == parallel.latticeNodePositions);
+    CHECK(serial.corridorSegmentTests == parallel.corridorSegmentTests);
+    CHECK(serial.corridorAcceptedNodes == parallel.corridorAcceptedNodes);
+    CHECK(serial.nodePointPredicateCalls == parallel.nodePointPredicateCalls);
+    CHECK(serial.retainedSearchNodes == parallel.retainedSearchNodes);
+    CHECK(serial.interpolationCornerInsertions ==
+          parallel.interpolationCornerInsertions);
+    CHECK(serial.interpolatedScoringPoints ==
+          parallel.interpolatedScoringPoints);
+    CHECK(serial.dpNodeIndexEntries == parallel.dpNodeIndexEntries);
+    CHECK(serial.dpTransitionLookups == parallel.dpTransitionLookups);
+    CHECK(serial.dpReachedStateVisits == parallel.dpReachedStateVisits);
+    CHECK(serial.dpRelaxations == parallel.dpRelaxations);
     REQUIRE_FALSE(progress.empty());
     for (size_t index = 1; index < progress.size(); ++index) {
         if (progress[index - 1].phase == progress[index].phase)
@@ -1423,6 +1457,12 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK_FALSE(loaded.report.nonEmptyCells[0].components[1].retained);
     CHECK(loaded.report.config.nmsTransverseRadiusPredictionVoxels == 2.0);
     CHECK(loaded.report.config.nmsLongitudinalRadiusPredictionVoxels == 1.0);
+    CHECK(loaded.report.config.robustMaximumTrimMassFraction ==
+          anchors.report.config.robustMaximumTrimMassFraction);
+    CHECK(loaded.report.config.robustMadMultiplier ==
+          anchors.report.config.robustMadMultiplier);
+    CHECK(loaded.report.config.robustMinimumAngleDegrees ==
+          anchors.report.config.robustMinimumAngleDegrees);
 
     auto oldCoordinates = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     oldCoordinates["coordinates"]["position_space"] = "stored_prediction_grid";
@@ -1440,13 +1480,40 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
+    auto missingRobustParameter =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingRobustParameter["parameters"].erase("robust_mad_multiplier");
+    {
+        std::ofstream output(path);
+        output << missingRobustParameter.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version-2 schema"), std::runtime_error);
+
+    auto legacyRobustParameters =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    legacyRobustParameters["parameters"].erase(
+        "robust_maximum_trim_mass_fraction");
+    legacyRobustParameters["parameters"].erase("robust_mad_multiplier");
+    legacyRobustParameters["parameters"].erase(
+        "robust_minimum_angle_degrees");
+    legacyRobustParameters["version"] = 1;
+    {
+        std::ofstream output(path);
+        output << legacyRobustParameters.dump(2);
+    }
+    const auto legacyLoaded = vc::fiber_tracer::loadFiberAnchorArtifact(path);
+    CHECK(legacyLoaded.report.config.robustMaximumTrimMassFraction ==
+          vc::fiber_tracer::FiberAnchorConfig{}.robustMaximumTrimMassFraction);
+
     auto missingTransverseNmsParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingTransverseNmsParameter["parameters"].erase("nms_transverse_radius_prediction_voxels");
     {
         std::ofstream output(path);
         output << missingTransverseNmsParameter.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-1 schema"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-2 schema"), std::runtime_error);
 
     auto missingRefinementParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementParameter["parameters"].erase("peak_sigma_prediction_voxels");
@@ -1478,7 +1545,7 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
         std::ofstream output(path);
         output << extraParameter.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-1 schema"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-2 schema"), std::runtime_error);
 
     auto missingRefinementValue = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementValue["cells"][0]["components"][0].erase("refinement_score");
@@ -1521,11 +1588,46 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
     auto json = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
-    json["version"] = 2;
+    json["version"] = 3;
     {
         std::ofstream output(path);
         output << json.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version 1"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version 1 or 2"), std::runtime_error);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("fiberlet adjacent corridor segment fast path matches complete float scan")
+{
+    const std::vector<cv::Vec3f> reference{
+        {0.0f, 0.0f, 0.0f},
+        {2.0f, 0.0f, 0.0f},
+        {4.0f, 1.0f, 0.0f},
+        {6.0f, 1.0f, 1.0f},
+        {8.0f, 2.0f, 1.0f},
+    };
+    constexpr float radius = 1.25f;
+    std::mt19937 generator(12345);
+    std::uniform_real_distribution<float> x(-1.0f, 9.0f);
+    std::uniform_real_distribution<float> yz(-2.0f, 3.0f);
+    for (size_t index = 0; index < 20000; ++index) {
+        const cv::Vec3f point{x(generator), yz(generator), yz(generator)};
+        const auto complete =
+            vc::fiber_tracer::testing::debugFiberletCorridorContains(
+                point, reference, radius);
+        for (size_t adjacent = 0; adjacent + 1 < reference.size(); ++adjacent) {
+            const auto accelerated =
+                vc::fiber_tracer::testing::debugFiberletCorridorContains(
+                    point, reference, radius, adjacent);
+            CHECK(accelerated.inside == complete.inside);
+        }
+    }
+
+    const auto immediate =
+        vc::fiber_tracer::testing::debugFiberletCorridorContains(
+            {3.0f, 1.0f, 0.0f}, reference, radius, 1);
+    CHECK(immediate.inside);
+    CHECK(immediate.segmentTests == 1);
 }

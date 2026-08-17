@@ -42,38 +42,51 @@ g_ik = exp(-|(I - u_k u_k^T)(x_i - p_k)|^2 / (2 sigma^2)).
 
 The Gaussian is truncated at three sigma. A symmetric finite axial slab is
 measured from the plane through the fixed cell pivot normal to `u_k`. Assignment
-uses the larger positive `q_i (d_i dot u_k)^2` among components whose kernels
-contain the sample; unusable and zero-evidence samples remain unassigned. This
-keeps nearby non-orthogonal modes from being assigned solely by which moving
-Gaussian is closer.
+selects the largest positive
+`g_ik q_i abs(d_i dot u_k)^2`, with stable component-index ties. Unusable and
+zero-evidence samples remain unassigned.
 
-Each direction update is the principal eigenvector of its assigned
-`g_ik q_i d_i d_i^T`. The aligned-evidence centroid is projected onto the plane
-through the cell pivot normal to that updated direction and clamped to the
-local transverse window. The constraint plane rotates as the direction is
-refined, while continuing to pass through the fixed pivot. The next iteration
-recomputes the falloff around the new anchor position.
+Assigned projective angular residuals `1-abs(d_i dot u_k)^2` are summarized by
+a deterministic 256-bin weighted median/MAD histogram using `g_ik q_i` mass.
+The cutoff is the larger of median plus three MADs and a five-degree angular
+floor. Trimming is optional and capped at 20% of assigned mass; coherent data
+therefore retains every sample. The complete cutoff bin is retained. The
+limits are configurable with `--robust-max-trim`,
+`--robust-mad-multiplier`, and `--robust-min-angle-deg`.
 
-Only a strict normalized-objective improvement is accepted, with deterministic
-backtracking. Refinement therefore stops at a bounded local response maximum
-instead of migrating across a weak-response valley to a stronger distant
-fiber. Support denominators include all lattice sites in each finite kernel,
-including invalid, zero-presence, and unassigned sites. Empty, degenerate, and
+Each direction update is the principal eigenvector of retained
+`g_ik q_i d_i d_i^T` and is installed directly, without angular interpolation
+or angular line search. A non-unique retained tensor removes that component.
+Supported close components are not merged before refinement; cross-cell NMS
+remains responsible for genuine duplicates.
+
+The retained aligned-evidence centroid is projected onto the plane through the
+cell pivot normal to the updated direction and clamped to the local transverse
+window. Deterministic backtracking changes position only, testing fractions
+`1, 1/2, ...` through the first displacement at or below the configured peak
+grid step. The first strict spatial-objective improvement is accepted;
+otherwise the projected baseline remains. Every sampled lattice site contributes
+the same geometric denominator term while only retained assigned evidence
+contributes positive signal. Because the denominator does not depend on a
+site's presence, direction, assignment, or trim state, rejected observations
+cannot create attractive or repulsive holes in the normalization.
+
+The next outer pass recomputes competitive assignments and robust inliers.
+The default budget is two passes, configurable with `--maximum-iterations`;
+this is deliberately not convergence to exact hard-assignment equality because
+samples at histogram or component boundaries can flicker without a meaningful
+geometry change. An earlier exit is allowed when axis and position updates are
+already below their geometric tolerances. Empty, degenerate, and
 below-threshold components are discarded independently. The output is zero,
 one, or two anchors per cell before duplicate suppression.
 
-After fitting, two valid components are merged when their unoriented angle is
-at most `--merge-angle-deg` (10 degrees by default) and replacing them with a
-joint PCA loses at most
-`max(--merge-abs-loss, --merge-rel-loss * joint_objective)`. The defaults are
-0.01 absolute and 0.05 relative normalized objective loss. The comparison is
-inclusive. A merge refits support, direction, and position through the same
-halo-backed refinement; the joint anchor can still fail the normal
-minimum-support check. Exact
-single-direction cells, where the second fit is empty, are not counted as
-merges.
+The retired pre-refinement merge objective is not used. Its fields remain in
+anchor artifacts for compatibility. New robust artifacts use schema version 2;
+the loader retains strict version-1 support with the original parameter set.
+`--nms-angle-deg` controls duplicate-axis compatibility in downstream NMS.
 
 Finally, local-maximum NMS suppresses cross-cell copies of the same anchor.
+The two supported components from one cell never suppress each other.
 Candidates must agree in unoriented direction and be within both the transverse
 radius of 2 prediction voxels and longitudinal radius of 1 prediction voxel
 around their sign-aligned average axis.
@@ -97,7 +110,7 @@ side. `--window` sets only the transverse refinement radius in base voxels and
 defaults to one cell side. The axial slab defaults to 1.5 cell sides. NMS uses
 independent fixed defaults of 2 prediction voxels transversely and 1 prediction
 voxel longitudinally; CLI reporting converts both to base voxels. The NMS angle
-defaults to the merge angle.
+defaults to 10 degrees.
 The presence floor and aligned support threshold are inclusive.
 `--base-voxel-size-um` adds optional physical reporting metadata but never
 changes the solve.
@@ -198,6 +211,12 @@ positions. Worker-local native-corner sets are derived directly from those
 positions, sorted, and
 merged into one deterministic stored-ZYX ordered global union. Required corners
 remain included even when a replay tube excludes the corner itself.
+
+Local corridor membership is an unordered union of continuous float32 segment
+capsules. Because a node belongs to a known curved-domain layer, preparation
+tests one centerline segment adjacent to that layer first. A miss falls back to
+the remaining segments; an immediate hit avoids the complete scan without
+changing the geometric predicate.
 
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
@@ -452,6 +471,16 @@ policy. Greedy and fiberlet descriptors are generated from it. The earlier
 unpublished ambiguous replay keys `error_base_voxels` and `error_ratio` are not
 supported.
 
+The hot replay-tube point filter snapshots the selected reference interval in
+prediction coordinates. It stores float32 continuous segments in a packed
+Boost.Geometry R-tree using radius-expanded segment bounds, then performs the
+float32 point-to-segment test only for intersecting candidates. Queries are
+immutable and safe to share across preparation workers. The ordinary
+`FiberReplayTube` distance methods remain linear and double precision because
+anchor diagnostics need an actual distance rather than the high-volume boolean
+filter. Float32 classification may differ at the configured radius boundary;
+performance comparisons must report resulting workload and artifact changes.
+
 By default the command publishes only the strict version-2 whole-run bundle.
 `--vis` additionally extracts a local tube for every failure and requires
 `--volume /path/to/ct.ome.zarr/2`. The path must name the concrete uint8 3D
@@ -612,3 +641,88 @@ anchor and path stage rates; aggregate/mean/peak sampled voxels; estimated peak
 batch bytes; evaluated DP-node rate; and separate candidate-generation,
 sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
+
+Benchmark and replay extraction also emit a versioned
+`fiberlet_extraction_profile version=6` row. Both commands use the same field
+names and units. Replay writes the row to stderr after full tube extraction;
+benchmark writes it to stdout after the existing summary. The row separates:
+
+- anchor setup, tile planning, coordinate construction, prediction sampling,
+  observation/gradient construction, fitting, selection, duplicate suppression,
+  and finalization;
+- fiberlet candidate generation, geometry preparation, node enumeration,
+  interpolation-corner collection and merge, prediction/normal sampling,
+  scoring-index construction, interpolation materialization, node-index
+  construction, and dynamic programming;
+- deterministic workload counts including selected/context/work cells, tiles,
+  sampler calls and submitted coordinates, observations and gradients, lattice
+  nodes and corridor tests, corner insertion attempts and globally unique
+  sampled voxels, and DP lookups/visits/relaxations.
+
+Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
+phases for weighted-observation setup, seed generation, seed-pair refinement,
+initialized-component finalization, local direction/position refinement,
+direction-conditioned peak search, and final evaluation. The corresponding
+`anchor_fit_profiled_work_seconds` sum and
+`anchor_fit_residual_work_seconds` expose instrumentation gaps.
+
+Version 3 further partitions local refinement into axis-tensor proposal,
+position-centroid proposal, and refined-state evaluation work. The evaluation
+recomputes each observation's finite axial/Gaussian support, direction
+agreement, component assignment, weighted objective numerator, and Gaussian
+denominator for the initial state and every backtracking candidate.
+`anchor_fit_local_control_work_seconds` is the enclosing local-refinement time
+minus those three kernels, so it includes bounds/setup, interpolation,
+acceptance, convergence, and profiling overhead. The four fields reconcile to
+`anchor_fit_local_refinement_work_seconds`.
+
+Version 4 reports robust components with no detected outliers, trimmed
+components, candidate/actual trimmed and retained mass, components removed for
+non-unique retained tensors, iteration-limit hits, and position candidates tested
+and accepted by halving depth. Its local tensor phase includes competitive
+assignment, histogram cutoff selection, and retained sampled-direction PCA;
+the local state-evaluation phase contains fixed-direction position objectives.
+Component and mass fields count every robust proposal across bounded passes;
+they are work diagnostics, not a deduplicated final component population.
+
+Version 6 distinguishes logical per-cell gradient uses from physical gradient
+computations. Presence gradients are computed once over each dense anchor tile
+and reused by overlapping cell halos. `anchor_gradient_attempts` and
+`anchor_valid_gradients` retain their logical per-observation meaning, while
+`anchor_gradient_computations`, `anchor_valid_gradient_computations`, and
+`anchor_gradient_construction_work_seconds` report the physical tile work.
+Robust residual histograms and retained direction tensors are accumulated
+together, paired spatial objectives share one observation pass, and peak
+responses use an equivalent two-dimensional transverse representation. These
+grouped reductions can introduce small floating-point differences; exact
+numeric identity with version 4 is not a requirement.
+
+Peak-search observations and their transverse response calculations use
+float32. Accepted anchor positions, component state, aggregate diagnostics, and
+serialized output remain double precision. This halves the repeatedly scanned
+peak-search working set; small differences in peak ties and downstream path
+node counts are expected.
+
+Anchor-fit counters distinguish fitter invocations from nonempty cells and
+report seeds, seed pairs, seed-pair iterations, local-refinement attempts and
+accepted steps, and backtracking evaluations. Observation visits are counted
+separately for seed assignment/tensors/objectives, local tensors/centroids,
+refined-state evaluations, peak preparation/responses, and final evaluation.
+They are logical work counts: an exact broad phase can skip detailed kernel
+calculations without reducing the corresponding visit count.
+Peak grid-response requests include cache hits;
+`anchor_fit_peak_computed_grid_responses` counts cache misses, while
+`anchor_fit_peak_acceptance_responses` counts uncached subpixel checks. The
+legacy `anchor_fit_iterations` field remains for compatibility and counts a
+cell's accepted local-refinement steps once per output component; use
+`anchor_fit_local_refinement_accepted_steps` for the unambiguous cell-level
+count.
+
+Fields ending in `_seconds` are enclosing wall phases unless their name contains
+`_work_`; work fields sum per-candidate or per-worker elapsed time and may exceed
+wall time. CPU fields are process CPU time. Corner insertion attempts count all
+positive-weight insertion attempts, while `fiberlet_unique_sampled_voxels` is
+the deterministic global union. `*_profiled_seconds` is the sum of disjoint
+wall phases and `*_residual_seconds` is unassigned elapsed wall time. Existing
+progress callbacks remain inside their enclosing wall phases. Profiling is
+diagnostic only and does not alter extraction decisions, ordering, or artifacts.

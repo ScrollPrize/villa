@@ -43,11 +43,14 @@ struct FiberAnchorConfig {
     double nmsLongitudinalRadiusPredictionVoxels = 1.0;
     double observationPresenceFloor = 0.05;
     double minimumAlignedSupport = 0.05;
+    double robustMaximumTrimMassFraction = 0.20;
+    double robustMadMultiplier = 3.0;
+    double robustMinimumAngleDegrees = 5.0;
     double mergeMaximumAngleDegrees = 10.0;
     double mergeMaximumAbsoluteObjectiveLoss = 0.01;
     double mergeMaximumRelativeObjectiveLoss = 0.05;
     size_t maximumSeedCount = 8;
-    int maximumIterations = 64;
+    int maximumIterations = 2;
     double convergenceTolerance = 1.0e-12;
     size_t maximumConcurrentSampleBytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -148,6 +151,7 @@ struct FiberAnchorComponent {
     std::optional<double> selectionTestedValue;
     std::optional<double> selectionThreshold;
     std::optional<FiberAnchorDiagnosticSuppressor> nmsSuppressor;
+    bool removedDuringRobustRefinement = false;
 };
 
 struct FiberAnchorMergeEvaluation {
@@ -181,6 +185,111 @@ struct FiberAnchorExtractionDiagnostics {
     size_t outsideSelectionComponents = 0;
 };
 
+struct FiberAnchorResidualSample {
+    double residual = 0.0;
+    double mass = 0.0;
+};
+
+struct FiberAnchorRobustCutoff {
+    double cutoffResidual = 1.0;
+    double totalMass = 0.0;
+    double candidateTrimmedMass = 0.0;
+    double trimmedMass = 0.0;
+    double retainedMass = 0.0;
+    bool detectedOutliers = false;
+};
+
+[[nodiscard]] FiberAnchorRobustCutoff selectFiberAnchorRobustCutoff(
+    const std::vector<FiberAnchorResidualSample>& samples,
+    double maximumTrimMassFraction,
+    double madMultiplier,
+    double minimumAngleDegrees);
+
+[[nodiscard]] std::vector<double> fiberAnchorSpatialBacktrackingFractions(
+    double maximumDisplacementPredictionVoxels,
+    double targetStepPredictionVoxels,
+    int maximumHalvings = 8);
+
+struct FiberAnchorFitProfile {
+    size_t invocations = 0;
+    size_t nonemptyCells = 0;
+    size_t weightedObservations = 0;
+    size_t seeds = 0;
+    size_t seedGenerationObservationVisits = 0;
+    size_t seedPairs = 0;
+    size_t seedPairIterations = 0;
+    size_t seedAssignmentObservationVisits = 0;
+    size_t seedTensorObservationVisits = 0;
+    size_t seedObjectiveObservationVisits = 0;
+    size_t initializationObservationVisits = 0;
+    size_t localRefinementAttempts = 0;
+    size_t localRefinementAcceptedSteps = 0;
+    size_t backtrackingEvaluations = 0;
+    size_t robustComponentsWithoutOutliers = 0;
+    size_t robustTrimmedComponents = 0;
+    size_t robustRemovedNonuniqueComponents = 0;
+    size_t robustHardLimitHits = 0;
+    size_t spatialCandidatesTested = 0;
+    std::array<size_t, 9> spatialCandidatesTestedByDepth{};
+    std::array<size_t, 9> spatialCandidatesAcceptedByDepth{};
+    double robustCandidateTrimmedMass = 0.0;
+    double robustTrimmedMass = 0.0;
+    double robustRetainedMass = 0.0;
+    size_t localTensorObservationVisits = 0;
+    size_t localCentroidObservationVisits = 0;
+    size_t refinedEvaluationObservationVisits = 0;
+    size_t peakComponents = 0;
+    size_t peakPreparationObservationVisits = 0;
+    size_t peakGridResponseRequests = 0;
+    size_t peakComputedGridResponses = 0;
+    size_t peakAcceptanceResponses = 0;
+    size_t peakResponseObservationVisits = 0;
+    size_t finalEvaluationObservationVisits = 0;
+    double setupWorkSeconds = 0.0;
+    double seedGenerationWorkSeconds = 0.0;
+    double seedPairRefinementWorkSeconds = 0.0;
+    double initializationWorkSeconds = 0.0;
+    double localRefinementWorkSeconds = 0.0;
+    double localTensorProposalWorkSeconds = 0.0;
+    double localCentroidProposalWorkSeconds = 0.0;
+    double localStateEvaluationWorkSeconds = 0.0;
+    double peakSearchWorkSeconds = 0.0;
+    double finalEvaluationWorkSeconds = 0.0;
+};
+
+struct FiberAnchorExtractionProfile {
+    size_t selectedCells = 0;
+    size_t contextCells = 0;
+    size_t workCells = 0;
+    size_t tiles = 0;
+    size_t workers = 0;
+    size_t predictionSamplerCalls = 0;
+    size_t submittedPredictionVoxels = 0;
+    size_t candidateObservations = 0;
+    size_t retainedObservations = 0;
+    size_t gradientAttempts = 0;
+    size_t validGradients = 0;
+    size_t gradientComputations = 0;
+    size_t validGradientComputations = 0;
+    size_t retainPredicateCalls = 0;
+    size_t fitIterations = 0;
+    double setupSeconds = 0.0;
+    double tilePlanningSeconds = 0.0;
+    double cellProcessingSeconds = 0.0;
+    double cellProcessingCpuSeconds = 0.0;
+    double coordinateConstructionWorkSeconds = 0.0;
+    double predictionSamplingWorkSeconds = 0.0;
+    double gradientConstructionWorkSeconds = 0.0;
+    double observationConstructionWorkSeconds = 0.0;
+    double fittingWorkSeconds = 0.0;
+    double selectionSeconds = 0.0;
+    double initialDiagnosticsSeconds = 0.0;
+    double duplicateSuppressionSeconds = 0.0;
+    double finalizationSeconds = 0.0;
+    double elapsedCpuSeconds = 0.0;
+    FiberAnchorFitProfile fit;
+};
+
 struct FiberAnchorExtractionReport {
     FiberPredictionGridInfo grid;
     FiberAnchorConfig config;
@@ -189,6 +298,7 @@ struct FiberAnchorExtractionReport {
     std::array<size_t, 3> selectedCellEndZYX{0, 0, 0};
     std::vector<std::array<size_t, 3>> selectedCellsZYX;
     FiberAnchorExtractionDiagnostics diagnostics;
+    FiberAnchorExtractionProfile profile;
     std::vector<FiberCellAnchorResult> nonEmptyCells;
     std::array<std::vector<FiberAnchorDiagnosticRecord>,
                kFiberAnchorDiagnosticStageCount> diagnosticStages;
@@ -263,7 +373,8 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX,
     const std::vector<FiberAnchorObservation>& observations,
-    const FiberAnchorConfig& config);
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile = nullptr);
 
 [[nodiscard]] FiberAnchorExtractionReport extractFiberAnchors(
     const FiberPredictionGridInfo& grid,

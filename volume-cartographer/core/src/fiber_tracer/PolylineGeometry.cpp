@@ -46,6 +46,52 @@ size_t segmentAtArc(const PolylineArcGeometry& geometry, double arc)
     return segment;
 }
 
+template <typename Visitor>
+void visitClippedPolylineArcSegments(
+    const PolylineArcGeometry& geometry,
+    double beginArc,
+    double endArc,
+    Visitor&& visitor)
+{
+    if (!std::isfinite(beginArc) || !std::isfinite(endArc) || beginArc > endArc)
+        throw std::invalid_argument("polyline interval is invalid");
+    beginArc = std::clamp(beginArc, 0.0, geometry.length());
+    endArc = std::clamp(endArc, 0.0, geometry.length());
+    bool found = false;
+    for (size_t segment = 0; segment + 1 < geometry.points.size(); ++segment) {
+        const double sourceBegin = geometry.vertexArcs[segment];
+        const double sourceEnd = geometry.vertexArcs[segment + 1];
+        if (!(sourceEnd > sourceBegin + kEpsilon) || sourceEnd < beginArc ||
+            sourceBegin > endArc) {
+            continue;
+        }
+        const double clippedBegin = std::max(beginArc, sourceBegin);
+        const double clippedEnd = std::min(endArc, sourceEnd);
+        const cv::Vec3d delta = geometry.points[segment + 1] - geometry.points[segment];
+        const double edgeLength = sourceEnd - sourceBegin;
+        visitor(PolylineArcSegment{
+            geometry.points[segment] +
+                delta * ((clippedBegin - sourceBegin) / edgeLength),
+            geometry.points[segment] +
+                delta * ((clippedEnd - sourceBegin) / edgeLength),
+            clippedBegin,
+            clippedEnd,
+            segment,
+        });
+        found = true;
+    }
+    if (!found) {
+        const auto sample = samplePolylineArc(geometry, beginArc);
+        visitor(PolylineArcSegment{
+            sample.point,
+            sample.point,
+            sample.arc,
+            sample.arc,
+            sample.segmentIndex,
+        });
+    }
+}
+
 } // namespace
 
 double PolylineArcGeometry::length() const noexcept
@@ -150,6 +196,19 @@ std::vector<cv::Vec3d> slicePolylineArc(
     return result;
 }
 
+std::vector<PolylineArcSegment> clippedPolylineArcSegments(
+    const PolylineArcGeometry& geometry,
+    double beginArc,
+    double endArc)
+{
+    std::vector<PolylineArcSegment> segments;
+    segments.reserve(geometry.points.size());
+    visitClippedPolylineArcSegments(
+        geometry, beginArc, endArc,
+        [&](const PolylineArcSegment& segment) { segments.push_back(segment); });
+    return segments;
+}
+
 PolylineArcProjection projectPointToPolylineArc(
     const PolylineArcGeometry& geometry,
     const cv::Vec3d& point,
@@ -160,46 +219,29 @@ PolylineArcProjection projectPointToPolylineArc(
         beginArc > endArc) {
         throw std::invalid_argument("polyline projection input is invalid");
     }
-    beginArc = std::clamp(beginArc, 0.0, geometry.length());
-    endArc = std::clamp(endArc, 0.0, geometry.length());
     PolylineArcProjection best;
     best.distance = std::numeric_limits<double>::infinity();
     bool found = false;
-    for (size_t segment = 0; segment + 1 < geometry.points.size(); ++segment) {
-        const double sourceBegin = geometry.vertexArcs[segment];
-        const double sourceEnd = geometry.vertexArcs[segment + 1];
-        if (!(sourceEnd > sourceBegin + kEpsilon) || sourceEnd < beginArc ||
-            sourceBegin > endArc) {
-            continue;
-        }
-        const double clippedBegin = std::max(beginArc, sourceBegin);
-        const double clippedEnd = std::min(endArc, sourceEnd);
-        const cv::Vec3d delta = geometry.points[segment + 1] - geometry.points[segment];
-        const double edgeLength = sourceEnd - sourceBegin;
-        const cv::Vec3d clippedStart = geometry.points[segment] +
-            delta * ((clippedBegin - sourceBegin) / edgeLength);
-        const cv::Vec3d clippedFinish = geometry.points[segment] +
-            delta * ((clippedEnd - sourceBegin) / edgeLength);
-        const cv::Vec3d clippedDelta = clippedFinish - clippedStart;
+    visitClippedPolylineArcSegments(
+        geometry, beginArc, endArc, [&](const PolylineArcSegment& segment) {
+        const cv::Vec3d clippedDelta = segment.finish - segment.start;
         const double denominator = clippedDelta.dot(clippedDelta);
         const double fraction = denominator > kEpsilon
-            ? std::clamp((point - clippedStart).dot(clippedDelta) / denominator, 0.0, 1.0)
+            ? std::clamp((point - segment.start).dot(clippedDelta) / denominator, 0.0, 1.0)
             : 0.0;
-        const cv::Vec3d projected = clippedStart + clippedDelta * fraction;
-        const double arc = clippedBegin + (clippedEnd - clippedBegin) * fraction;
+        const cv::Vec3d projected = segment.start + clippedDelta * fraction;
+        const double arc = segment.beginArc +
+            (segment.endArc - segment.beginArc) * fraction;
         const double distance = vectorLength(point - projected);
         if (!found || distance < best.distance - kEpsilon ||
             (std::abs(distance - best.distance) <= kEpsilon &&
              (arc < best.arc - kEpsilon ||
-              (std::abs(arc - best.arc) <= kEpsilon && segment < best.segmentIndex)))) {
-            best = {projected, arc, distance, segment};
+              (std::abs(arc - best.arc) <= kEpsilon &&
+               segment.segmentIndex < best.segmentIndex)))) {
+            best = {projected, arc, distance, segment.segmentIndex};
             found = true;
         }
-    }
-    if (!found) {
-        const auto sample = samplePolylineArc(geometry, beginArc);
-        return {sample.point, sample.arc, vectorLength(point - sample.point), sample.segmentIndex};
-    }
+    });
     return best;
 }
 

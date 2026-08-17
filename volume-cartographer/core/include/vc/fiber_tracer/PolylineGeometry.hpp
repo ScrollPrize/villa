@@ -30,6 +30,14 @@ struct PolylineArcProjection {
     size_t segmentIndex = 0;
 };
 
+struct PolylineArcSegment {
+    cv::Vec3d start{0.0, 0.0, 0.0};
+    cv::Vec3d finish{0.0, 0.0, 0.0};
+    double beginArc = 0.0;
+    double endArc = 0.0;
+    size_t segmentIndex = 0;
+};
+
 struct ForwardPolylineMatch {
     double predictedArc = 0.0;
     double searchBeginArc = 0.0;
@@ -55,6 +63,11 @@ struct ForwardPolylineArcInterval {
     double arc);
 
 [[nodiscard]] std::vector<cv::Vec3d> slicePolylineArc(
+    const PolylineArcGeometry& geometry,
+    double beginArc,
+    double endArc);
+
+[[nodiscard]] std::vector<PolylineArcSegment> clippedPolylineArcSegments(
     const PolylineArcGeometry& geometry,
     double beginArc,
     double endArc);
