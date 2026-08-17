@@ -4,14 +4,22 @@
   sampled-direction aggregation and position-only bounded refinement.
 - Removed pre-refinement close-direction merging, preserved robust membership
   through peak fitting, and added strict configuration/artifact diagnostics.
-- Reduced the default alternating robust update budget to two measured passes;
-  legacy numeric identity is intentionally not required for this fitter.
+- Reduced the default alternating robust update budget to one measured pass;
+  `--maximum-iterations` remains the documented quality/speed knob for
+  difficult overlapping-fiber fits, and legacy numeric identity is
+  intentionally not required for this fitter.
 - Fused robust histogram/tensor work, reused tile gradients, paired spatial
   objectives, and reduced peak-response geometry to transverse coordinates.
 - Increased anchor tiles from four to six cells per axis after measured tile
   sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
 - Stored transient peak-search observations and evaluated transverse peak
   responses in float32, reducing canonical anchor wall time to 9.76 seconds.
+- Paired overlapping anchor tiles into bounded sampling jobs and reused raw
+  prediction samples across pair halos. This reduced canonical sampler
+  submissions by 32.6% with unchanged extraction output.
+- Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
+  reducing canonical replay wall time by 2.1% with unchanged path work and
+  replay quality.
 
 # 2026-08-17: fiberlet extraction profiling
 

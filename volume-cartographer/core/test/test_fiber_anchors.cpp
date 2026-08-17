@@ -104,6 +104,7 @@ FiberAnchorConfig config()
 TEST_CASE("fiber anchor peak kernel defaults integrate across neighboring cells")
 {
     const FiberAnchorConfig value;
+    CHECK(value.maximumIterations == 1);
     CHECK(value.peakSigmaPredictionVoxels == 1.5);
     CHECK(value.peakAxialSigmaPredictionVoxels == 6.0);
     CHECK(std::exp(-0.5 * std::pow(
@@ -114,6 +115,52 @@ TEST_CASE("fiber anchor peak kernel defaults integrate across neighboring cells"
               1.5 * value.cellSizePredictionVoxels /
                   value.peakAxialSigmaPredictionVoxels,
               2.0)) == doctest::Approx(std::exp(-0.5)));
+}
+
+TEST_CASE("normalized float observations preserve anchor geometry")
+{
+    auto value = config();
+    value.peakGradientWeight = 0.0;
+    const auto original = cellObservations(
+        4, directionAtDegrees(20.0), directionAtDegrees(70.0));
+    auto compactEquivalent = original;
+    for (auto& observation : compactEquivalent) {
+        for (int axis = 0; axis < 3; ++axis) {
+            observation.positionPredictionXYZ[axis] = static_cast<double>(
+                static_cast<float>(observation.positionPredictionXYZ[axis]));
+        }
+        const double norm = std::sqrt(
+            observation.direction.dot(observation.direction));
+        REQUIRE(norm > 0.0);
+        observation.direction /= norm;
+        for (int axis = 0; axis < 3; ++axis) {
+            observation.direction[axis] = static_cast<double>(
+                static_cast<float>(observation.direction[axis]));
+        }
+        observation.presence = static_cast<double>(
+            static_cast<float>(observation.presence));
+    }
+
+    const auto baseline = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, original, value);
+    const auto compact = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, compactEquivalent, value);
+
+    CHECK(compact.retainedAnchorCount == baseline.retainedAnchorCount);
+    for (size_t component = 0; component < baseline.components.size();
+         ++component) {
+        const auto& expected = baseline.components[component];
+        const auto& actual = compact.components[component];
+        CHECK(actual.retained == expected.retained);
+        CHECK(actual.rejectionReason == expected.rejectionReason);
+        if (!expected.retained)
+            continue;
+        CHECK(axialDot(actual.anchor.axisXYZ, expected.anchor.axisXYZ) >
+              1.0 - 1.0e-6);
+        CHECK(cv::norm(
+                  actual.anchor.positionPredictionXYZ -
+                  expected.anchor.positionPredictionXYZ) < 1.0e-3);
+    }
 }
 
 std::filesystem::path temporaryDirectory(const std::string& tag)
@@ -1747,9 +1794,17 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
           report.profile.selectedCells + report.profile.contextCells);
     CHECK(report.profile.contextCells > 0);
     CHECK(report.profile.tiles > 0);
+    CHECK(report.profile.samplingGroups > 0);
+    CHECK(report.profile.samplingGroups <= report.profile.tiles);
     CHECK(report.profile.workers > 0);
     CHECK(report.profile.predictionSamplerCalls == report.profile.tiles);
     CHECK(report.profile.submittedPredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels <=
+          report.profile.submittedPredictionVoxels);
+    CHECK(report.profile.submittedPredictionVoxels +
+              report.profile.reusedPredictionVoxels >=
+          report.profile.uniqueTilePredictionVoxels);
     CHECK(report.profile.candidateObservations >=
           report.profile.retainedObservations);
     CHECK(report.profile.retainedObservations > 0);
@@ -1814,6 +1869,33 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
         vc::fiber_tracer::fiberAnchorCellReportObj(report);
     CHECK(occurrenceCount(cellObj, "\np ") == 2);
     CHECK(occurrenceCount(cellObj, "\nl ") == 1);
+}
+
+TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {32, 8, 8};
+    grid.predictionToBaseScale = 1.0;
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    value.parallelThreads = 2;
+
+    const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
+        grid,
+        value,
+        [](const auto& indices, int, auto& samples) {
+            samples.assign(
+                indices.size(),
+                vc::fiber_tracer::FiberStoredPredictionSample{
+                    {1.0, 0.0, 0.0}, 1.0, true});
+        },
+        {{5, 1, 1}, {6, 1, 1}});
+
+    CHECK(report.profile.tiles >= 2);
+    CHECK(report.profile.samplingGroups < report.profile.tiles);
+    CHECK(report.profile.reusedPredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels <=
+          report.profile.submittedPredictionVoxels);
 }
 
 TEST_CASE("anchor diagnostics retain unavailable attempts in zero-anchor cells")

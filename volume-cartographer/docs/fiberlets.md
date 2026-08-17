@@ -71,9 +71,19 @@ contributes positive signal. Because the denominator does not depend on a
 site's presence, direction, assignment, or trim state, rejected observations
 cannot create attractive or repulsive holes in the normalization.
 
-The next outer pass recomputes competitive assignments and robust inliers.
-The default budget is two passes, configurable with `--maximum-iterations`;
-this is deliberately not convergence to exact hard-assignment equality because
+Each additional outer pass recomputes competitive assignments and robust
+inliers from the preceding direction and position update. The default budget
+is one pass.
+
+**Anchor quality knob:** `--maximum-iterations` trades extraction speed for
+additional robust reassignment and refinement. Increase it above `1` when
+nearby or crossing fibers need a second chance to separate after the first
+geometry update. This can materially change anchor positions, directions, and
+the retained anchor population; it is not merely a convergence or debugging
+setting. Two passes cost about 18% more anchor wall time on the canonical
+Paris4 replay and remain the first quality-oriented setting to try.
+
+Refinement deliberately does not seek exact hard-assignment equality because
 samples at histogram or component boundaries can flicker without a meaningful
 geometry change. An earlier exit is allowed when axis and position updates are
 already below their geometric tolerances. Empty, degenerate, and
@@ -643,7 +653,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=6` row. Both commands use the same field
+`fiberlet_extraction_profile version=8` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -702,6 +712,37 @@ float32. Accepted anchor positions, component state, aggregate diagnostics, and
 serialized output remain double precision. This halves the repeatedly scanned
 peak-search working set; small differences in peak ties and downstream path
 node counts are expected.
+
+Production extraction also constructs each sampled tile voxel once as a compact
+float32 observation with a pre-normalized direction. Each overlapping cell
+stores only canonical-order 32-bit indices into that tile plus its cell-local
+gradient-validity byte. The public expanded-observation fitting API uses the
+same templated fitter. Tile observation storage and maximum cell-reference
+scratch are included in the existing concurrent sample-memory budget.
+
+Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
+deterministically by maximum overlapping sample volume while preserving at
+least one independent job per pair. The first tile is sampled normally; the
+second copies bit-identical raw prediction samples from the overlap and submits
+only missing coordinates. Gradient construction, compact observations, and
+cell iteration remain tile-local and unchanged. Group memory includes both the
+active tile working set and retained raw samples and remains bounded by
+`maximumConcurrentSampleBytes`.
+
+`anchor_sampling_groups` counts independent jobs,
+`anchor_reused_prediction_voxels` counts copied overlap,
+`anchor_submitted_prediction_voxels` counts actual sampler coordinates, and
+`anchor_unique_tile_prediction_voxels` is the exact global union of all dense
+tile boxes. The union is measured with a coordinate-compressed box sweep and
+does not alter extraction work.
+
+Version 8 replaces the per-candidate packed-node-key hash map with a direct
+`uint32_t` table over the already validated packed-key range. The table uses an
+invalid sentinel for absent corridor nodes; node generation, transition order,
+DP state, and path-cost evaluation are unchanged. Peak search memory accounting
+uses the direct table's actual payload. `fiberlet_dp_node_index_entries` counts
+stored nodes and `fiberlet_dp_node_index_slots` counts allocated direct-table
+slots, exposing occupancy and sparse-lattice overhead.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

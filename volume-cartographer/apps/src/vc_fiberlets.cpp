@@ -134,7 +134,7 @@ void usage(const char* executable)
               << "  --robust-min-angle-deg N      angular noise floor [5]\n"
               << "  --nms-angle-deg N             maximum duplicate-axis angle [10]\n"
               << "  --maximum-seeds N             deterministic PCA seed count [8]\n"
-              << "  --maximum-iterations N        robust assignment/update pass limit [2]\n"
+              << "  --maximum-iterations N        anchor quality/speed pass limit [1]\n"
               << "  --crop X,Y,Z,W,H,D            base-volume box; selects intersected cells\n"
               << "  --glyph-length-base-voxels N  diagnostic anchor length [16]\n\n"
               << "Path options:\n"
@@ -602,7 +602,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=6"
+           << "fiberlet_extraction_profile version=8"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -612,10 +612,15 @@ void printTubeExtractionProfile(
            << " anchor_context_cells=" << anchor.contextCells
            << " anchor_work_cells=" << anchor.workCells
            << " anchor_tiles=" << anchor.tiles
+           << " anchor_sampling_groups=" << anchor.samplingGroups
            << " anchor_workers=" << anchor.workers
            << " anchor_sampler_calls=" << anchor.predictionSamplerCalls
            << " anchor_submitted_prediction_voxels="
            << anchor.submittedPredictionVoxels
+           << " anchor_unique_tile_prediction_voxels="
+           << anchor.uniqueTilePredictionVoxels
+           << " anchor_reused_prediction_voxels="
+           << anchor.reusedPredictionVoxels
            << " anchor_candidate_observations=" << anchor.candidateObservations
            << " anchor_retained_observations=" << anchor.retainedObservations
            << " anchor_gradient_attempts=" << anchor.gradientAttempts
@@ -752,6 +757,7 @@ void printTubeExtractionProfile(
            << " fiberlet_interpolated_scoring_points="
            << paths.interpolatedScoringPoints
            << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
+           << " fiberlet_dp_node_index_slots=" << paths.dpNodeIndexSlots
            << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups
            << " fiberlet_dp_reached_state_visits=" << paths.dpReachedStateVisits
            << " fiberlet_dp_relaxations=" << paths.dpRelaxations

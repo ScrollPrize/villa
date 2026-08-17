@@ -74,6 +74,7 @@ struct LocalNodeKey {
 struct LocalNodeKeyLayout {
     uint32_t transverseWidth = 0;
     int transverseLimit = 0;
+    size_t keyCount = 0;
 };
 
 struct CurvedLayer {
@@ -136,6 +137,7 @@ struct PreparationProfile {
 
 struct SolveProfile {
     size_t nodeIndexEntries = 0;
+    size_t nodeIndexSlots = 0;
     size_t transitionLookups = 0;
     size_t reachedStateVisits = 0;
     size_t relaxations = 0;
@@ -398,6 +400,11 @@ LocalNodeKeyLayout makeLocalNodeKeyLayout(
         domain.layers.size() > keyCapacity / plane) {
         throw std::overflow_error("fiberlet local node lattice exceeds packed-key limits");
     }
+    const uint64_t keyCount =
+        static_cast<uint64_t>(domain.layers.size()) * plane;
+    if (keyCount > std::numeric_limits<size_t>::max())
+        throw std::overflow_error("fiberlet local node lattice exceeds addressable memory");
+    layout.keyCount = static_cast<size_t>(keyCount);
     return layout;
 }
 
@@ -991,11 +998,17 @@ FiberletCandidateResult solveCandidate(
         return candidate;
     }
     const auto nodeIndexStart = Clock::now();
-    std::unordered_map<uint32_t, size_t> nodeIndex;
-    nodeIndex.reserve(checkedProduct(nodes.size(), 2, "fiberlet DP node hash capacity"));
-    for (size_t index = 0; index < nodes.size(); ++index)
-        nodeIndex.emplace(nodes[index].key, index);
+    constexpr uint32_t missingNode = std::numeric_limits<uint32_t>::max();
+    if (nodes.size() > static_cast<size_t>(missingNode))
+        throw std::overflow_error("fiberlet DP node index exceeds 32 bits");
+    std::vector<uint32_t> nodeIndex(prepared.keyLayout.keyCount, missingNode);
+    for (size_t index = 0; index < nodes.size(); ++index) {
+        auto& slot = nodeIndex[nodes[index].key];
+        if (slot == missingNode)
+            slot = static_cast<uint32_t>(index);
+    }
     profile.nodeIndexEntries = nodes.size();
+    profile.nodeIndexSlots = nodeIndex.size();
     profile.nodeIndexSeconds = std::chrono::duration<double>(
         Clock::now() - nodeIndexStart).count();
 
@@ -1056,11 +1069,11 @@ FiberletCandidateResult solveCandidate(
                         continue;
                     }
                     ++profile.transitionLookups;
-                    const auto found = nodeIndex.find(
-                        packLocalNodeKey(nextKey, prepared.keyLayout));
-                    if (found == nodeIndex.end())
+                    const uint32_t found = nodeIndex[
+                        packLocalNodeKey(nextKey, prepared.keyLayout)];
+                    if (found == missingNode)
                         continue;
-                    const size_t next = found->second;
+                    const size_t next = found;
                     const cv::Vec3d delta = nodePoint(nodes[next]) - currentPoint;
                     const double stepLength = vectorLength(delta);
                     if (!(stepLength > kEpsilon))
@@ -2130,9 +2143,7 @@ FiberletPathReport traceFiberletPaths(
                 "fiberlet DP state byte estimate"),
             sizeof(DpState), "fiberlet DP state byte estimate");
         const size_t nodeIndexBytes = checkedProduct(
-            checkedProduct(item.nodes.size(), 2,
-                "fiberlet DP index byte estimate"),
-            sizeof(uint32_t) + sizeof(size_t),
+            item.keyLayout.keyCount, sizeof(uint32_t),
             "fiberlet DP index byte estimate");
         maximumSearchTransientBytes = std::max(
             maximumSearchTransientBytes,
@@ -2418,6 +2429,9 @@ FiberletPathReport traceFiberletPaths(
         report.dpNodeIndexEntries = checkedSum(
             report.dpNodeIndexEntries, profile.nodeIndexEntries,
             "fiberlet DP node-index entry count");
+        report.dpNodeIndexSlots = checkedSum(
+            report.dpNodeIndexSlots, profile.nodeIndexSlots,
+            "fiberlet DP node-index slot count");
         report.dpTransitionLookups = checkedSum(
             report.dpTransitionLookups, profile.transitionLookups,
             "fiberlet DP transition lookup count");

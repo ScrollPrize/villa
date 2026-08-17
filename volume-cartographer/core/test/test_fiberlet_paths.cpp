@@ -917,6 +917,7 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
         CHECK(report.retainedSearchNodes + 2 * report.preparedCandidates ==
               report.evaluatedDpNodes);
         CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
+        CHECK(report.dpNodeIndexSlots >= report.dpNodeIndexEntries);
         CHECK(report.dpRelaxations <= report.dpTransitionLookups);
         CHECK(report.preparationGeometryWorkSeconds >= 0.0);
         CHECK(report.preparationNodeEnumerationWorkSeconds >= 0.0);
@@ -940,6 +941,7 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     CHECK(serial.interpolatedScoringPoints ==
           parallel.interpolatedScoringPoints);
     CHECK(serial.dpNodeIndexEntries == parallel.dpNodeIndexEntries);
+    CHECK(serial.dpNodeIndexSlots == parallel.dpNodeIndexSlots);
     CHECK(serial.dpTransitionLookups == parallel.dpTransitionLookups);
     CHECK(serial.dpReachedStateVisits == parallel.dpReachedStateVisits);
     CHECK(serial.dpRelaxations == parallel.dpRelaxations);

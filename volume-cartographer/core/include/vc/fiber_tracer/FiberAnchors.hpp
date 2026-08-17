@@ -50,7 +50,7 @@ struct FiberAnchorConfig {
     double mergeMaximumAbsoluteObjectiveLoss = 0.01;
     double mergeMaximumRelativeObjectiveLoss = 0.05;
     size_t maximumSeedCount = 8;
-    int maximumIterations = 2;
+    int maximumIterations = 1;
     double convergenceTolerance = 1.0e-12;
     size_t maximumConcurrentSampleBytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -262,9 +262,12 @@ struct FiberAnchorExtractionProfile {
     size_t contextCells = 0;
     size_t workCells = 0;
     size_t tiles = 0;
+    size_t samplingGroups = 0;
     size_t workers = 0;
     size_t predictionSamplerCalls = 0;
     size_t submittedPredictionVoxels = 0;
+    size_t uniqueTilePredictionVoxels = 0;
+    size_t reusedPredictionVoxels = 0;
     size_t candidateObservations = 0;
     size_t retainedObservations = 0;
     size_t gradientAttempts = 0;

@@ -1,12 +1,9 @@
-# Status: Fiberlet-centered replay strips and indexed overview JPEGs
+# Status: merge fiber-lets2
 
-- [x] Capture task and inspect current overview rendering/publication
-- [x] Write detailed implementation/test/documentation plan
-- [x] Complete independent plan review
-- [x] Extract shared line-view geometry construction
-- [x] Render fiberlet-centered top/side overview strips
-- [x] Split and publish indexed <=65,000-pixel JPEG parts
-- [x] Update strict manifest, CLI output, specification, docs, and changelog
-- [x] Build focused targets with `-j32`
-- [x] Run focused tests and visual replay validation
-- [x] Record validation and deviations
+- [x] Inspect unresolved merge entries
+- [x] Confirm conflicts are limited to task-local planning files
+- [x] Clear stale task-local planning state
+- [x] Stage resolutions and verify the merge index
+- [x] Build merged focused targets with `-j32`
+- [x] Run focused anchor, path, and replay tests
+- [x] Complete the merge commit
