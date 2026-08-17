@@ -1,10 +1,11 @@
-# Task: detailed replay overview and restart markers
+# Task: Lasagna-oriented replay failure threshold
 
-Increase the full replay overview JPEG to eight times its current top/side
-strip resolution so CT and line detail are directly inspectable. Mark every
-greedy and fiberlet failure/restart position with a vertical line so the
-relevant errors are easy to locate. A bounded `--length` run must still show
-only its selected interval.
+Change the replay failure evaluation used by both the classic greedy tracer and
+the fiberlet tracer. Keep the configured base-voxel threshold unchanged along
+the local Lasagna normal, but allow four times that threshold within the local
+Lasagna tangent plane.
 
-Keep the existing per-failure textured strip artifacts unchanged and continue
-to use the existing VC3D surface and shared CT rendering infrastructure.
+The forward reference matching itself remains unchanged. The new threshold is
+used for dense trace-point failure decisions and for fiberlet seed acceptance.
+The result must report enough component information to explain every decision.
+An invalid local normal conservatively retains the existing isotropic threshold.

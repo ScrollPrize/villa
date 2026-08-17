@@ -216,6 +216,28 @@ private:
     cv::Vec3d normal_;
 };
 
+class ReplayNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    ReplayNormalSampler(cv::Vec3d normal, bool valid = true)
+        : normal_(normal), valid_(valid)
+    {
+    }
+
+    vc::lasagna::NormalSample sampleNormal(
+        const cv::Vec3d& point) const override
+    {
+        sampledPoints.push_back(point);
+        return {normal_, valid_, valid_ ? std::string{} : "invalid"};
+    }
+
+    mutable std::vector<cv::Vec3d> sampledPoints;
+
+private:
+    cv::Vec3d normal_;
+    bool valid_ = true;
+};
+
 void setExplicitTargetPlane(vc::fiber_tracer::FiberTraceOneWayRequest& request, const cv::Vec3d& normal)
 {
     request.targetPlanes = {{"explicit", request.targetPoint, normal}};
@@ -1302,6 +1324,111 @@ TEST_CASE("polyline matching is monotone, bounded, and preserves repeated vertic
     CHECK(slice.back()[1] == doctest::Approx(1.0));
 }
 
+TEST_CASE("replay threshold uses a Lasagna-normal ellipsoid in base voxels")
+{
+    constexpr double threshold = 2.0;
+    const cv::Vec3d reference{8.0, 12.0, 16.0};
+    ReplayNormalSampler normals({0.0, 0.0, 2.0});
+
+    const auto normalBoundary =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{0.0, 0.0, threshold}, reference,
+            normals, 4.0, threshold);
+    CHECK(normalBoundary.euclideanErrorBaseVoxels ==
+          doctest::Approx(threshold));
+    REQUIRE(normalBoundary.normalErrorBaseVoxels.has_value());
+    CHECK(*normalBoundary.normalErrorBaseVoxels ==
+          doctest::Approx(threshold));
+    REQUIRE(normalBoundary.tangentialErrorBaseVoxels.has_value());
+    CHECK(*normalBoundary.tangentialErrorBaseVoxels ==
+          doctest::Approx(0.0));
+    CHECK(normalBoundary.thresholdErrorRatio == doctest::Approx(1.0));
+    CHECK_FALSE(vc::fiber_tracer::fiberReplayThresholdExceeded(
+        normalBoundary, threshold));
+
+    const auto tangentBoundary =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{8.0, 0.0, 0.0}, reference,
+            normals, 4.0, threshold);
+    CHECK(tangentBoundary.thresholdErrorBaseVoxels ==
+          doctest::Approx(threshold));
+    CHECK(tangentBoundary.thresholdErrorRatio == doctest::Approx(1.0));
+    CHECK_FALSE(vc::fiber_tracer::fiberReplayThresholdExceeded(
+        tangentBoundary, threshold));
+
+    const auto mixedBoundary =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{6.4, 0.0, 1.2}, reference,
+            normals, 4.0, threshold);
+    CHECK(mixedBoundary.thresholdErrorBaseVoxels ==
+          doctest::Approx(threshold));
+    CHECK_FALSE(vc::fiber_tracer::fiberReplayThresholdExceeded(
+        mixedBoundary, threshold));
+
+    const auto normalOutside =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{0.0, 0.0, 2.01}, reference,
+            normals, 4.0, threshold);
+    const auto tangentOutside =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{8.01, 0.0, 0.0}, reference,
+            normals, 4.0, threshold);
+    CHECK(vc::fiber_tracer::fiberReplayThresholdExceeded(
+        normalOutside, threshold));
+    CHECK(vc::fiber_tracer::fiberReplayThresholdExceeded(
+        tangentOutside, threshold));
+
+    ReplayNormalSampler reversed({0.0, 0.0, -3.0});
+    const auto reversedBoundary =
+        vc::fiber_tracer::measureFiberReplayThreshold(
+            reference + cv::Vec3d{6.4, 0.0, 1.2}, reference,
+            reversed, 4.0, threshold);
+    CHECK(reversedBoundary.thresholdErrorBaseVoxels ==
+          doctest::Approx(mixedBoundary.thresholdErrorBaseVoxels));
+
+    REQUIRE_FALSE(normals.sampledPoints.empty());
+    CHECK(normals.sampledPoints.front() == cv::Vec3d{2.0, 3.0, 4.0});
+}
+
+TEST_CASE("replay threshold falls back isotropically for unusable normals")
+{
+    const cv::Vec3d reference{0.0, 0.0, 0.0};
+    const cv::Vec3d evaluator{0.0, 3.0, 0.0};
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    std::vector<ReplayNormalSampler> samplers;
+    samplers.emplace_back(cv::Vec3d{0.0, 0.0, 1.0}, false);
+    samplers.emplace_back(cv::Vec3d{0.0, 0.0, 0.0});
+    samplers.emplace_back(cv::Vec3d{nan, 0.0, 1.0});
+    samplers.emplace_back(cv::Vec3d{infinity, 0.0, 1.0});
+    for (const auto& sampler : samplers) {
+        const auto measurement =
+            vc::fiber_tracer::measureFiberReplayThreshold(
+                evaluator, reference, sampler, 1.0, 2.0);
+        CHECK_FALSE(measurement.localNormalValid);
+        CHECK_FALSE(measurement.normalErrorBaseVoxels.has_value());
+        CHECK_FALSE(measurement.tangentialErrorBaseVoxels.has_value());
+        CHECK(measurement.euclideanErrorBaseVoxels ==
+              doctest::Approx(3.0));
+        CHECK(measurement.thresholdErrorBaseVoxels ==
+              doctest::Approx(3.0));
+        CHECK(vc::fiber_tracer::fiberReplayThresholdExceeded(
+            measurement, 2.0));
+    }
+
+    ReplayNormalSampler valid({0.0, 0.0, 1.0});
+    const auto zero = vc::fiber_tracer::measureFiberReplayThreshold(
+        reference, reference, valid, 1.0, 0.0);
+    CHECK(zero.thresholdErrorRatio == 0.0);
+    CHECK_FALSE(vc::fiber_tracer::fiberReplayThresholdExceeded(zero, 0.0));
+    const auto nonzero = vc::fiber_tracer::measureFiberReplayThreshold(
+        evaluator, reference, valid, 1.0, 0.0);
+    CHECK(std::isfinite(nonzero.thresholdErrorRatio));
+    CHECK(nonzero.thresholdErrorRatio ==
+          std::numeric_limits<double>::max());
+    CHECK(vc::fiber_tracer::fiberReplayThresholdExceeded(nonzero, 0.0));
+}
+
 TEST_CASE("greedy replay resets after dense-line failures and reaches reference end")
 {
     SlantedPrediction predictions;
@@ -1325,8 +1452,11 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
 
     std::vector<vc::fiber_tracer::FiberReplayFailure> events;
+    ConstantNormalSampler normals;
     const auto result =
-        vc::fiber_tracer::traceFiberReplay(predictions, request, nullptr, {}, [&](const auto& event) { events.push_back(event); });
+        vc::fiber_tracer::traceFiberReplay(
+            predictions, request, normals, 1.0, {},
+            [&](const auto& event) { events.push_back(event); });
 
     CHECK(result.completedReferenceArcBase == doctest::Approx(40.0));
     REQUIRE(result.failures.size() > 1);
@@ -1351,6 +1481,50 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
     }
 }
 
+TEST_CASE("greedy replay allows four times the normal threshold in the tangent plane")
+{
+    SlantedPrediction predictions;
+    vc::fiber_tracer::FiberReplayTraceRequest request;
+    request.fiber.linePointsXyzBase = {
+        {0.0, 0.0, 0.0},
+        {27.8, 0.0, 0.0},
+    };
+    request.fiber.controlPointsXyzBase = request.fiber.linePointsXyzBase;
+    request.fiber.controlPointLineIndices = {0, 1};
+    request.errorThresholdBaseVoxels = 1.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.beamLookaheadSteps = 1;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    ConstantNormalSampler tangentPlaneNormal({0.0, 0.0, 1.0});
+    const auto tangential = vc::fiber_tracer::traceFiberReplay(
+        predictions, request, tangentPlaneNormal, 1.0);
+    CHECK(tangential.failures.empty());
+    REQUIRE_FALSE(tangential.segments.empty());
+    REQUIRE_FALSE(tangential.segments.front().matches.empty());
+    const auto& last =
+        tangential.segments.front().matches.back().thresholdMeasurement;
+    CHECK(last.euclideanErrorBaseVoxels >
+          request.errorThresholdBaseVoxels);
+    CHECK(last.thresholdErrorBaseVoxels <=
+          request.errorThresholdBaseVoxels);
+    CHECK(last.localNormalValid);
+
+    ConstantNormalSampler surfaceNormal({0.0, 1.0, 0.0});
+    const auto normal = vc::fiber_tracer::traceFiberReplay(
+        predictions, request, surfaceNormal, 1.0);
+    REQUIRE_FALSE(normal.failures.empty());
+    CHECK(normal.failures.front().reason == "distance_above_threshold");
+    REQUIRE(normal.failures.front().thresholdMeasurement.has_value());
+    CHECK(normal.failures.front()
+              .thresholdMeasurement->normalErrorBaseVoxels.has_value());
+}
+
 TEST_CASE("greedy replay stops at the selected reference end")
 {
     StraightPrediction predictions;
@@ -1370,8 +1544,9 @@ TEST_CASE("greedy replay stops at the selected reference end")
     request.config.smoothnessTangentWeight = 0.0;
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
 
-    const auto result =
-        vc::fiber_tracer::traceFiberReplay(predictions, request);
+    ConstantNormalSampler normals;
+    const auto result = vc::fiber_tracer::traceFiberReplay(
+        predictions, request, normals, 1.0);
     CHECK(result.referenceEndArcBase == doctest::Approx(10.0));
     CHECK(result.completedReferenceArcBase == doctest::Approx(10.0));
     CHECK(result.failures.empty());
@@ -1397,7 +1572,9 @@ TEST_CASE("replay resets after an invalid initial prediction without throwing")
     request.config.smoothnessTangentWeight = 0.0;
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
 
-    const auto result = vc::fiber_tracer::traceFiberReplay(predictions, request);
+    ConstantNormalSampler normals;
+    const auto result = vc::fiber_tracer::traceFiberReplay(
+        predictions, request, normals, 1.0);
     REQUIRE(result.failures.size() == 1);
     CHECK(result.failures[0].reason == "invalid_initial_prediction");
     CHECK_FALSE(result.failures[0].evaluatorPointBase.has_value());
@@ -1418,7 +1595,9 @@ TEST_CASE("replay bounds repeated invalid resets and covers the logical interval
     request.config.smoothnessTangentWeight = 0.0;
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
 
-    const auto result = vc::fiber_tracer::traceFiberReplay(predictions, request);
+    ConstantNormalSampler normals;
+    const auto result = vc::fiber_tracer::traceFiberReplay(
+        predictions, request, normals, 1.0);
 
     REQUIRE(result.failures.size() == 3);
     CHECK(result.segments.size() == 3);

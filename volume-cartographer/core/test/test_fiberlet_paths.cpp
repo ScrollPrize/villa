@@ -40,6 +40,18 @@ private:
     bool valid_;
 };
 
+const ConstantNormalSampler& replayNormals()
+{
+    static const ConstantNormalSampler sampler;
+    return sampler;
+}
+
+const ConstantNormalSampler& replayYNormals()
+{
+    static const ConstantNormalSampler sampler({0.0, 1.0, 0.0});
+    return sampler;
+}
+
 class CountingNormalSampler final : public vc::lasagna::NormalSampler
 {
 public:
@@ -527,7 +539,8 @@ TEST_CASE("fiberlet graph replay scores joins with the shared local metric")
     config.beamWidth = 4;
     config.lookaheadEdges = 2;
     config.errorThresholdBaseVoxels = 2.0;
-    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {3, 0, 0}}, config);
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config);
     REQUIRE(replay.segments.size() == 1);
     CHECK(replay.segments[0].candidateIndices == std::vector<size_t>{0, 1});
     REQUIRE(replay.segments[0].transitionIndices.size() == 1);
@@ -552,13 +565,44 @@ TEST_CASE("fiberlet graph replay lookahead avoids the greedy dead-end cost")
     config.beamWidth = 4;
     config.lookaheadEdges = 2;
     config.errorThresholdBaseVoxels = 0.5;
-    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, config);
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayNormals(), 1.0, config);
 
     REQUIRE(replay.segments.size() == 1);
     CHECK(replay.segments[0].candidateIndices == std::vector<size_t>{2, 3});
     REQUIRE(replay.segments[0].routePointsBaseXYZ.size() == 3);
     CHECK(replay.segments[0].routePointsBaseXYZ[1][1] == doctest::Approx(0.1));
     CHECK(replay.failures.empty());
+}
+
+TEST_CASE("fiberlet graph replay uses the Lasagna ellipsoid for seeds and route points")
+{
+    auto report = graphPathReport();
+    addGraphPath(
+        report, 0, 1,
+        {{0.0, 1.5, 0.0}, {1.0, 1.5, 0.0}, {2.0, 1.5, 0.0}},
+        0.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 0.5;
+
+    const auto tangential = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayNormals(), 1.0, config);
+    CHECK(tangential.failures.empty());
+    REQUIRE(tangential.segments.size() == 1);
+    REQUIRE_FALSE(tangential.segments.front().matches.empty());
+    const auto& seed =
+        tangential.segments.front().matches.front().thresholdMeasurement;
+    CHECK(seed.euclideanErrorBaseVoxels == doctest::Approx(1.5));
+    CHECK(seed.thresholdErrorBaseVoxels == doctest::Approx(0.375));
+    CHECK(seed.thresholdErrorRatio == doctest::Approx(0.75));
+    CHECK(seed.localNormalValid);
+
+    const auto normal = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(normal.failures.empty());
+    CHECK(normal.failures.front().reason ==
+          "no_usable_seed_for_remaining_reference");
 }
 
 TEST_CASE("fiberlet graph replay completes a failure edge then records an uncovered tail")
@@ -568,7 +612,8 @@ TEST_CASE("fiberlet graph replay completes a failure edge then records an uncove
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
     config.errorThresholdBaseVoxels = 0.5;
-    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {3, 0, 0}}, config);
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config);
 
     REQUIRE(replay.segments.size() == 2);
     CHECK(replay.segments[0].routePointsBaseXYZ.size() == 3);
@@ -588,8 +633,34 @@ TEST_CASE("fiberlet graph replay completes a failure edge then records an uncove
     CHECK(replay.completedReferenceArcBase == doctest::Approx(3.0));
     const auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
     CHECK(json.at("version") == 2);
+    CHECK(json.at("config").at("threshold").at("shape") ==
+          "lasagna_normal_ellipsoid");
+    CHECK(json.at("config").at("threshold").at(
+              "normal_radius_base_voxels") == doctest::Approx(0.5));
+    CHECK(json.at("config").at("threshold").at(
+              "tangential_radius_base_voxels") == doctest::Approx(2.0));
+    CHECK_FALSE(json.at("config").contains(
+        "error_threshold_base_voxels"));
     CHECK(json.at("segments").size() == 2);
     CHECK(json.at("failures").size() == 2);
+    const auto& failedMatch =
+        json.at("segments").at(0).at("matches").back();
+    CHECK(failedMatch.at("euclidean_error_base_voxels") ==
+          doctest::Approx(2.0));
+    CHECK(failedMatch.at("normal_error_base_voxels") ==
+          doctest::Approx(2.0));
+    CHECK(failedMatch.at("tangential_error_base_voxels") ==
+          doctest::Approx(0.0));
+    CHECK(failedMatch.at("threshold_error_base_voxels") ==
+          doctest::Approx(2.0));
+    CHECK(failedMatch.at("threshold_error_ratio") ==
+          doctest::Approx(4.0));
+    CHECK(failedMatch.at("local_normal_valid") == true);
+    CHECK_FALSE(failedMatch.contains("error_base_voxels"));
+    CHECK(json.at("failures").at(0).at("threshold_error_ratio") ==
+          doctest::Approx(4.0));
+    CHECK(json.at("failures").at(1).at(
+              "euclidean_error_base_voxels").is_null());
     const auto obj = vc::fiber_tracer::fiberletGraphReplayObj(replay);
     CHECK(occurrenceCount(obj, "\nv ") == 3);
     CHECK(obj.find("\nl 1 2 3\n") != std::string::npos);
@@ -606,7 +677,7 @@ TEST_CASE("fiberlet graph replay completes on a partial terminal edge")
     config.errorThresholdBaseVoxels = 10.0;
     config.referenceEndArcBase = 1.5;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
-        graph, {{0, 0, 0}, {4, 0, 0}}, config);
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
 
     REQUIRE(replay.segments.size() == 1);
     const auto& segment = replay.segments.front();
@@ -633,7 +704,7 @@ TEST_CASE("fiberlet graph replay reports a boundary failure before completion")
     config.errorThresholdBaseVoxels = 0.5;
     config.referenceEndArcBase = 1.5;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
-        graph, {{0, 0, 0}, {4, 0, 0}}, config);
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
 
     REQUIRE_FALSE(replay.failures.empty());
     CHECK(replay.failures.front().reason == "distance_above_threshold");
@@ -652,7 +723,8 @@ TEST_CASE("fiberlet graph replay reseeds independently after multiple failures")
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
     config.errorThresholdBaseVoxels = 0.5;
-    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {6, 0, 0}}, config);
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {6, 0, 0}}, replayYNormals(), 1.0, config);
 
     REQUIRE(replay.failures.size() >= 3);
     CHECK(replay.failures[0].reason == "distance_above_threshold");
@@ -670,7 +742,8 @@ TEST_CASE("empty fiberlet graph reports one uncovered-tail reset")
 {
     const auto graph = vc::fiber_tracer::buildFiberletGraph(graphPathReport());
     vc::fiber_tracer::FiberletGraphReplayConfig config;
-    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {5, 0, 0}}, config);
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {5, 0, 0}}, replayNormals(), 1.0, config);
 
     REQUIRE(replay.failures.size() == 1);
     CHECK(replay.failures[0].reason == "no_usable_seed_for_remaining_reference");

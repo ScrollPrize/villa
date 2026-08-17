@@ -401,10 +401,26 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --length 4096
 ```
 
-Both evaluators use the same monotone exact reference matcher and the same
-`--fail 20` base-voxel threshold. A failure ends only that evaluator's current
-segment. It restarts from the authoritative reference point and fitted forward
-tangent at a strictly advanced arc, then continues to the selected end. Native
+Both evaluators use the same monotone exact reference matcher. `--fail 20`
+means a 20-base-voxel radius along the local Lasagna surface normal and an
+80-base-voxel radius in its full 2D tangent plane; this tangent plane is not the
+learned fiber direction. For error vector `d` and normalized local normal `n`,
+the evaluator computes
+`dn = abs(dot(d,n))`, `dt = sqrt(length(d)^2-dn^2)`, and
+`threshold_error = sqrt(dn^2+(dt/4)^2)`. It fails only when
+`threshold_error > --fail`; exact equality is accepted. The existing Euclidean
+nearest-reference match remains authoritative.
+
+The normal is sampled at that matched reference point after converting base
+coordinates to the normal manifest's working scale. Invalid, missing,
+non-finite, or zero-length normals use the old Euclidean threshold without the
+4x relaxation. Fiberlet reseeding uses Euclidean `4T` only as a broad phase and
+then applies the exact same evaluator, so accepted seeds and route samples have
+one consistent region.
+
+A failure ends only that evaluator's current segment. It restarts from the
+authoritative reference point and fitted forward tangent at a strictly advanced
+arc, then continues to the selected end. Native
 termination, graph exhaustion, and absence of an admissible graph seed are
 typed failures rather than silent completion. Fiberlet failures complete the
 containing graph edge before reseeding. If the selected end lies inside an edge,
@@ -415,7 +431,11 @@ as separate segments and are never drawn as trace geometry.
 After graph construction, greedy and graph evaluation run concurrently over
 immutable shared reference/graph state. Each command-line failure record
 contains tracer, local index, reason, reference arc and interval fraction,
-optional error, and both current failure counts. Console arrival order is
+Euclidean/normal/tangential/threshold errors, threshold ratio, local-normal
+validity, and both current failure counts. Matches and failures persist these
+same explicit fields; records without an evaluated point use nulls. The strict
+writer recomputes their geometric and numeric consistency before publication.
+Console arrival order is
 diagnostic only. Publication sorts visualization identity by reference arc,
 tracer, and tracer-local index.
 
@@ -425,6 +445,12 @@ use the complete globally deduplicated coordinate union and `--batch` only
 limits coordinates per sampler call, as described above. The final summary
 reports both evaluator failure counts and confirms reference fraction one for
 both.
+
+The root manifest contains one `threshold` descriptor with the normal radius,
+fixed factor and tangential radius, strict comparison, and invalid-normal
+policy. Greedy and fiberlet descriptors are generated from it. The earlier
+unpublished ambiguous replay keys `error_base_voxels` and `error_ratio` are not
+supported.
 
 By default the command publishes only the strict version-2 whole-run bundle.
 `--vis` additionally extracts a local tube for every failure and requires

@@ -67,7 +67,7 @@ struct FiberletGraphReplayMatch {
     cv::Vec3d matchedReferencePointBaseXYZ{0.0, 0.0, 0.0};
     double searchBeginArcBase = 0.0;
     double searchEndArcBase = 0.0;
-    double errorBaseVoxels = 0.0;
+    FiberReplayThresholdMeasurement thresholdMeasurement;
 };
 
 struct FiberletGraphReplaySegment {
@@ -100,6 +100,8 @@ struct FiberletGraphReplayResult {
 [[nodiscard]] FiberletGraphReplayResult traceFiberletGraphReplay(
     const FiberletGraph& graph,
     const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
     const FiberletGraphReplayConfig& config,
     const FiberReplayFailureCallback& failure = {});
 

@@ -152,7 +152,7 @@ void usage(const char* executable)
               << "  --stats                       print path-count and score statistics\n"
               << "  --no-slices                   skip central presence-slice outputs\n";
     std::cerr << "\nReplay options:\n"
-              << "  --fail N                      dense-reference failure distance in base voxels [20]\n"
+              << "  --fail N                      Lasagna-normal failure radius in base voxels; tangent-plane radius is 4N [20]\n"
               << "  --length N                    compared reference length in base voxels [full]\n"
               << "  --vis                         write indexed local failure visualizations\n"
               << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
@@ -875,9 +875,39 @@ int main(int argc, char** argv)
                     count = event.index + 1;
                     std::cerr << std::setprecision(17) << "fiber_replay_failure tracer=" << vc::fiber_tracer::fiberReplayTracerName(tracer)
                               << " index=" << event.index << " reference_arc_base=" << event.referenceArcBase
-                              << " reference_arc_fraction=" << event.referenceArcFraction << " reason=" << event.reason << " error_base_voxels=";
-                    if (event.errorBaseVoxels.has_value())
-                        std::cerr << *event.errorBaseVoxels;
+                              << " reference_arc_fraction=" << event.referenceArcFraction << " reason=" << event.reason;
+                    const auto printOptional = [](const auto& value) {
+                        if (value.has_value())
+                            std::cerr << *value;
+                        else
+                            std::cerr << "n/a";
+                    };
+                    std::cerr << " euclidean_error_base_voxels=";
+                    if (event.thresholdMeasurement.has_value())
+                        std::cerr << event.thresholdMeasurement->euclideanErrorBaseVoxels;
+                    else
+                        std::cerr << "n/a";
+                    std::cerr << " normal_error_base_voxels=";
+                    printOptional(event.thresholdMeasurement.has_value()
+                            ? event.thresholdMeasurement->normalErrorBaseVoxels
+                            : std::optional<double>{});
+                    std::cerr << " tangential_error_base_voxels=";
+                    printOptional(event.thresholdMeasurement.has_value()
+                            ? event.thresholdMeasurement->tangentialErrorBaseVoxels
+                            : std::optional<double>{});
+                    std::cerr << " threshold_error_base_voxels=";
+                    if (event.thresholdMeasurement.has_value())
+                        std::cerr << event.thresholdMeasurement->thresholdErrorBaseVoxels;
+                    else
+                        std::cerr << "n/a";
+                    std::cerr << " threshold_error_ratio=";
+                    if (event.thresholdMeasurement.has_value())
+                        std::cerr << event.thresholdMeasurement->thresholdErrorRatio;
+                    else
+                        std::cerr << "n/a";
+                    std::cerr << " local_normal_valid=";
+                    if (event.thresholdMeasurement.has_value())
+                        std::cerr << (event.thresholdMeasurement->localNormalValid ? "true" : "false");
                     else
                         std::cerr << "n/a";
                     std::cerr << " greedy_failures=" << greedyFailureCount << " fiberlet_failures=" << fiberletFailureCount << '\n';
@@ -890,7 +920,8 @@ int main(int argc, char** argv)
                 return vc::fiber_tracer::traceFiberReplay(
                     traceField,
                     replayRequest,
-                    &traceNormalSampler,
+                    traceNormalSampler,
+                    scales.traceToBaseScale,
                     [&](const vc::fiber_tracer::FiberTraceProgress& event) {
                         if (event.step == event.maxSteps || event.step % 100 == 0) {
                             std::lock_guard lock(outputMutex);
@@ -901,7 +932,11 @@ int main(int argc, char** argv)
                     failurePrinter(vc::fiber_tracer::FiberReplayTracer::Greedy));
             });
             auto fiberletFuture = std::async(std::launch::async, [&]() {
-                return vc::fiber_tracer::traceFiberletGraphReplay(graph, fiber.linePointsXyzBase, options.graphReplay, failurePrinter(vc::fiber_tracer::FiberReplayTracer::Fiberlet));
+                return vc::fiber_tracer::traceFiberletGraphReplay(
+                    graph, fiber.linePointsXyzBase,
+                    canonicalNormalSampler, grid.predictionToBaseScale,
+                    options.graphReplay,
+                    failurePrinter(vc::fiber_tracer::FiberReplayTracer::Fiberlet));
             });
             std::optional<vc::fiber_tracer::FiberReplayTraceResult> greedyReplay;
             std::optional<vc::fiber_tracer::FiberletGraphReplayResult> fiberletReplay;

@@ -4041,7 +4041,8 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
 FiberReplayTraceResult traceFiberReplay(
     const FiberPredictionSource& predictions,
     const FiberReplayTraceRequest& request,
-    const vc::lasagna::NormalSampler* normalSampler,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
     const FiberTraceProgressCallback& progress,
     const FiberReplayFailureCallback& failureCallback)
 {
@@ -4051,6 +4052,11 @@ FiberReplayTraceResult traceFiberReplay(
     if (!(request.errorThresholdBaseVoxels >= 0.0) || !std::isfinite(request.errorThresholdBaseVoxels)) {
         throw std::invalid_argument("fiber replay failure threshold must be finite and non-negative");
     }
+    if (!(normalWorkingToBaseScale > 0.0) ||
+        !std::isfinite(normalWorkingToBaseScale)) {
+        throw std::invalid_argument(
+            "fiber replay normal working-to-base scale must be finite and positive");
+    }
     if (!(request.matchRefineSteps >= 0.0) || !std::isfinite(request.matchRefineSteps)) {
         throw std::invalid_argument("fiber replay match refinement must be finite and non-negative");
     }
@@ -4058,7 +4064,7 @@ FiberReplayTraceResult traceFiberReplay(
         throw std::invalid_argument("fiber replay requires greedy tracing with beam width and lookahead equal to one");
     }
     validateTraceConfig(request.config);
-    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
+    requireNormalSamplerForNormalAwareSmoothness(request.config, &normalSampler);
     if (request.startControlPointIndex >= request.fiber.controlPointsXyzBase.size() ||
         request.startControlPointIndex >= request.fiber.controlPointLineIndices.size()) {
         throw std::invalid_argument("fiber replay start control point is out of range");
@@ -4124,6 +4130,10 @@ FiberReplayTraceResult traceFiberReplay(
                 return false;
             }
             const auto& match = forwardMatch.projection;
+            const auto thresholdMeasurement = measureFiberReplayThreshold(
+                pointBase, match.point, normalSampler,
+                normalWorkingToBaseScale,
+                request.errorThresholdBaseVoxels);
             segment.tracePointsBase.push_back(pointBase);
             segment.cumulativeLosses.push_back(cumulativeLoss);
             segment.matches.push_back({
@@ -4133,13 +4143,12 @@ FiberReplayTraceResult traceFiberReplay(
                 match.point,
                 previousArcBase,
                 forwardMatch.searchEndArc,
-                match.distance,
-                request.errorThresholdBaseVoxels > 0.0 ? match.distance / request.errorThresholdBaseVoxels
-                                                       : (match.distance == 0.0 ? 0.0 : std::numeric_limits<double>::max()),
+                thresholdMeasurement,
             });
             previousArcBase = match.arc;
             segment.endReferenceArcBase = match.arc;
-            distanceFailed = match.distance > request.errorThresholdBaseVoxels;
+            distanceFailed = fiberReplayThresholdExceeded(
+                thresholdMeasurement, request.errorThresholdBaseVoxels);
             if (previousArcBase >= endArcBase - kEpsilon)
                 referenceExhausted = true;
             return !distanceFailed && !referenceExhausted;
@@ -4161,7 +4170,7 @@ FiberReplayTraceResult traceFiberReplay(
         std::string terminationReason;
         try {
             const auto native =
-                traceOneWayCore(predictions, oneWay, normalSampler, progress, "replay", static_cast<double>(maximumSteps) * request.config.stepVoxels, maximumSteps, observe);
+                traceOneWayCore(predictions, oneWay, &normalSampler, progress, "replay", static_cast<double>(maximumSteps) * request.config.stepVoxels, maximumSteps, observe);
             terminationReason = native.reason;
         } catch (const std::invalid_argument& error) {
             if (std::string_view(error.what()) != "fiber trace start point has no valid prediction direction") {
@@ -4190,8 +4199,8 @@ FiberReplayTraceResult traceFiberReplay(
             const auto& match = segment.matches.back();
             replayFailure.evaluatorPointBase = segment.tracePointsBase.back();
             replayFailure.segmentPointIndex = segment.tracePointsBase.size() - 1;
-            replayFailure.errorBaseVoxels = match.errorBaseVoxels;
-            replayFailure.errorRatio = match.errorRatio;
+            replayFailure.thresholdMeasurement =
+                match.thresholdMeasurement;
         }
         segment.terminationReason = replayFailure.reason;
         result.segments.push_back(std::move(segment));

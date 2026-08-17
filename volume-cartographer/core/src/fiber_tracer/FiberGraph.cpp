@@ -392,12 +392,19 @@ FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximum
 }
 
 FiberletGraphReplayResult traceFiberletGraphReplay(
-    const FiberletGraph& graph, const std::vector<cv::Vec3d>& referencePointsBaseXYZ, const FiberletGraphReplayConfig& config, const FiberReplayFailureCallback& failureCallback)
+    const FiberletGraph& graph,
+    const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    const FiberletGraphReplayConfig& config,
+    const FiberReplayFailureCallback& failureCallback)
 {
     if (config.beamWidth < 1 || config.lookaheadEdges < 1 || !(config.errorThresholdBaseVoxels >= 0.0) ||
         !std::isfinite(config.errorThresholdBaseVoxels) || !(config.matchRefineSteps >= 0.0) || !std::isfinite(config.matchRefineSteps) ||
         !(config.minimumResetAdvanceBaseVoxels > 0.0) || !std::isfinite(config.minimumResetAdvanceBaseVoxels) ||
         !(config.referenceBeginArcBase >= 0.0) || !std::isfinite(config.referenceBeginArcBase) ||
+        !(normalWorkingToBaseScale > 0.0) ||
+        !std::isfinite(normalWorkingToBaseScale) ||
         (config.referenceEndArcBase.has_value() &&
          !std::isfinite(*config.referenceEndArcBase))) {
         throw std::invalid_argument("fiberlet graph replay configuration is invalid");
@@ -422,11 +429,15 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const size_t maximumSegments = static_cast<size_t>(std::ceil(intervalLength / config.minimumResetAdvanceBaseVoxels)) + 2;
     const double seedWindowBase =
         std::max(config.minimumResetAdvanceBaseVoxels, static_cast<double>(graph.anchorCellSizePredictionVoxels) * graph.predictionToBaseScale);
+    const double seedBroadPhaseBase =
+        fiberReplayTangentialThresholdBaseVoxels(
+            config.errorThresholdBaseVoxels);
     std::set<size_t> consumedNodes;
 
     struct Seed {
         size_t node = 0;
         PolylineArcProjection projection;
+        FiberReplayThresholdMeasurement thresholdMeasurement;
     };
     const auto selectSeed = [&](double resetArc) -> std::optional<Seed> {
         std::optional<Seed> selected;
@@ -436,17 +447,34 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             const auto projection = projectPointToPolylineArc(
                 reference, graph.nodes[node].positionBaseXYZ, resetArc,
                 referenceEndArcBase);
-            if (projection.arc + kEpsilon < resetArc || projection.distance > config.errorThresholdBaseVoxels)
+            if (projection.arc + kEpsilon < resetArc ||
+                projection.distance > seedBroadPhaseBase)
                 continue;
+            const auto thresholdMeasurement = measureFiberReplayThreshold(
+                graph.nodes[node].positionBaseXYZ, projection.point,
+                normalSampler, normalWorkingToBaseScale,
+                config.errorThresholdBaseVoxels);
+            if (fiberReplayThresholdExceeded(
+                    thresholdMeasurement,
+                    config.errorThresholdBaseVoxels)) {
+                continue;
+            }
             const cv::Vec3d tangent = samplePolylineArc(reference, projection.arc).tangent;
             const bool aligned = std::any_of(graph.nodes[node].outgoingArcs.begin(), graph.nodes[node].outgoingArcs.end(), [&](size_t arc) {
                 return angleDegrees(tangent, arcStartDirection(graph, arc)) < graph.maximumJoinAngleDegrees;
             });
             if (!aligned)
                 continue;
-            if (!selected.has_value() || std::tuple{projection.arc, projection.distance, node} <
-                                             std::tuple{selected->projection.arc, selected->projection.distance, selected->node}) {
-                selected = Seed{node, projection};
+            if (!selected.has_value() ||
+                std::tuple{
+                    projection.arc,
+                    thresholdMeasurement.thresholdErrorRatio,
+                    node} <
+                    std::tuple{
+                        selected->projection.arc,
+                        selected->thresholdMeasurement.thresholdErrorRatio,
+                        selected->node}) {
+                selected = Seed{node, projection, thresholdMeasurement};
             }
         }
         return selected;
@@ -504,7 +532,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             seed->projection.point,
             resetArc,
             seed->projection.arc,
-            seed->projection.distance,
+            seed->thresholdMeasurement,
         });
         size_t currentNode = seed->node;
         std::optional<size_t> incomingArc;
@@ -531,6 +559,10 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     reference, points[index], previousReferenceArc, stepBase,
                     config.matchRefineSteps, referenceEndArcBase);
                 const auto& match = forwardMatch.projection;
+                const auto thresholdMeasurement = measureFiberReplayThreshold(
+                    points[index], match.point, normalSampler,
+                    normalWorkingToBaseScale,
+                    config.errorThresholdBaseVoxels);
                 segment.routePointsBaseXYZ.push_back(points[index]);
                 segment.matches.push_back({
                     segment.routePointsBaseXYZ.size() - 1,
@@ -539,11 +571,14 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     match.point,
                     previousReferenceArc,
                     forwardMatch.searchEndArc,
-                    match.distance,
+                    thresholdMeasurement,
                 });
                 previousReferenceArc = match.arc;
                 segment.endReferenceArcBase = match.arc;
-                if (!distanceFailure.has_value() && match.distance > config.errorThresholdBaseVoxels) {
+                if (!distanceFailure.has_value() &&
+                    fiberReplayThresholdExceeded(
+                        thresholdMeasurement,
+                        config.errorThresholdBaseVoxels)) {
                     FiberReplayFailure event;
                     event.segmentIndex = result.segments.size();
                     event.reason = "distance_above_threshold";
@@ -553,9 +588,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     event.candidateIndex = edge.candidateIndex;
                     event.arcIndex = arc;
                     event.candidatePathPointIndex = index;
-                    event.errorBaseVoxels = match.distance;
-                    event.errorRatio = config.errorThresholdBaseVoxels > 0.0 ? match.distance / config.errorThresholdBaseVoxels
-                                                                             : std::numeric_limits<double>::max();
+                    event.thresholdMeasurement = thresholdMeasurement;
                     distanceFailure = std::move(event);
                 }
                 if (previousReferenceArc >= referenceEndArcBase - kEpsilon) {
@@ -609,9 +642,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 event.evaluatorPointBase = segment.routePointsBaseXYZ.back();
                 event.segmentPointIndex = segment.routePointsBaseXYZ.size() - 1;
                 if (!segment.matches.empty()) {
-                    event.errorBaseVoxels = segment.matches.back().errorBaseVoxels;
-                    if (config.errorThresholdBaseVoxels > 0.0)
-                        event.errorRatio = *event.errorBaseVoxels / config.errorThresholdBaseVoxels;
+                    event.thresholdMeasurement =
+                        segment.matches.back().thresholdMeasurement;
                 }
             }
             distanceFailure = std::move(event);
@@ -732,7 +764,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
          {
              {"beam_width", config.beamWidth},
              {"lookahead_edges", config.lookaheadEdges},
-             {"error_threshold_base_voxels", config.errorThresholdBaseVoxels},
+             {"threshold", fiberReplayThresholdDescriptorJson(
+                 config.errorThresholdBaseVoxels)},
              {"match_refine_steps", config.matchRefineSteps},
              {"minimum_reset_advance_base_voxels", config.minimumResetAdvanceBaseVoxels},
              {"reference_begin_arc_base", config.referenceBeginArcBase},
@@ -750,15 +783,20 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
             points.push_back(pointJson(point));
         nlohmann::json matches = nlohmann::json::array();
         for (const auto& match : segment.matches) {
-            matches.push_back({
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                config.errorThresholdBaseVoxels);
+            auto matchJson = fiberReplayThresholdMeasurementJson(
+                match.thresholdMeasurement);
+            matchJson.update({
                 {"route_point_index", match.routePointIndex},
                 {"predicted_reference_arc_base", match.predictedReferenceArcBase},
                 {"matched_reference_arc_base", match.matchedReferenceArcBase},
                 {"matched_reference_point_base_xyz", pointJson(match.matchedReferencePointBaseXYZ)},
                 {"search_begin_arc_base", match.searchBeginArcBase},
                 {"search_end_arc_base", match.searchEndArcBase},
-                {"error_base_voxels", match.errorBaseVoxels},
             });
+            matches.push_back(std::move(matchJson));
         }
         root["segments"].push_back({
             {"start_reference_arc_base", segment.startReferenceArcBase},
@@ -780,7 +818,10 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         });
     }
     for (const auto& failure : replay.failures) {
-        root["failures"].push_back({
+        auto failureJson = fiberReplayOptionalThresholdMeasurementJson(
+            failure.thresholdMeasurement,
+            config.errorThresholdBaseVoxels);
+        failureJson.update({
             {"index", failure.index},
             {"segment_index", failure.segmentIndex},
             {"reason", failure.reason},
@@ -794,9 +835,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
             {"arc_index", failure.arcIndex.has_value() ? nlohmann::json(*failure.arcIndex) : nlohmann::json(nullptr)},
             {"candidate_path_point_index",
              failure.candidatePathPointIndex.has_value() ? nlohmann::json(*failure.candidatePathPointIndex) : nlohmann::json(nullptr)},
-            {"error_base_voxels", failure.errorBaseVoxels.has_value() ? nlohmann::json(*failure.errorBaseVoxels) : nlohmann::json(nullptr)},
-            {"error_ratio", failure.errorRatio.has_value() ? nlohmann::json(*failure.errorRatio) : nlohmann::json(nullptr)},
         });
+        root["failures"].push_back(std::move(failureJson));
     }
     return root;
 }

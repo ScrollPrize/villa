@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -439,8 +440,7 @@ struct FiberReplayMatch {
     cv::Vec3d matchedReferencePointBase{0.0, 0.0, 0.0};
     double searchBeginArcBase = 0.0;
     double searchEndArcBase = 0.0;
-    double errorBaseVoxels = 0.0;
-    double errorRatio = 0.0;
+    FiberReplayThresholdMeasurement thresholdMeasurement;
 };
 
 struct FiberReplayTraceRequest {
@@ -465,8 +465,7 @@ struct FiberReplayFailure {
     std::optional<size_t> candidateIndex;
     std::optional<size_t> arcIndex;
     std::optional<size_t> candidatePathPointIndex;
-    std::optional<double> errorBaseVoxels;
-    std::optional<double> errorRatio;
+    std::optional<FiberReplayThresholdMeasurement> thresholdMeasurement;
 };
 
 struct FiberReplayTraceSegment {
@@ -593,7 +592,8 @@ struct CandidateScoreDebug {
 [[nodiscard]] FiberReplayTraceResult traceFiberReplay(
     const FiberPredictionSource& predictions,
     const FiberReplayTraceRequest& request,
-    const vc::lasagna::NormalSampler* normalSampler = nullptr,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
     const FiberTraceProgressCallback& progress = {},
     const FiberReplayFailureCallback& failure = {});
 

@@ -556,3 +556,8 @@
   sampling, added full-height pre-reset failure bands, and wrapped long strips
   into deterministic fraction-aligned panels without resampling. Per-failure
   OBJ/MTL/TIFF strips remain at native selected-group sampling.
+- Replaced replay's isotropic failure cutoff with one shared Lasagna-normal
+  ellipsoid for greedy samples, fiberlet samples, and fiberlet reseeding: the
+  configured base-voxel radius remains unchanged normal to the sheet and is 4x
+  in the tangent plane. Replay output now stores explicit component diagnostics
+  and rejects inconsistent measurements before publication.

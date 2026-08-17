@@ -42,6 +42,23 @@ public:
     mutable std::vector<cv::Vec3d> points;
 };
 
+vc::fiber_tracer::FiberReplayThresholdMeasurement tangentMeasurement(
+    double errorBaseVoxels,
+    double normalThresholdBaseVoxels = 20.0)
+{
+    return {
+        errorBaseVoxels,
+        0.0,
+        errorBaseVoxels,
+        errorBaseVoxels /
+            vc::fiber_tracer::kFiberReplayTangentialThresholdFactor,
+        errorBaseVoxels /
+            vc::fiber_tracer::kFiberReplayTangentialThresholdFactor /
+            normalThresholdBaseVoxels,
+        true,
+    };
+}
+
 void attachTestCtValues(vc::fiber_tracer::FiberReplayStripMeshes& strips)
 {
     strips.textureSource = {
@@ -563,6 +580,9 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     greedyFirst.terminationReason = "distance_above_threshold";
     greedyFirst.tracePointsBase = {{0.0, 0.0, 0.0}, {2.0, 1.0, 0.0}};
     greedyFirst.cumulativeLosses = {0.0, 1.0};
+    greedyFirst.matches.push_back({
+        1, 2.0, 2.0, {2.0, 0.0, 0.0}, 0.0, 2.0,
+        tangentMeasurement(1.0)});
     vc::fiber_tracer::FiberReplayTraceSegment greedySecond;
     greedySecond.startReferenceArcBase = 2.0;
     greedySecond.endReferenceArcBase = 4.0;
@@ -597,6 +617,31 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(bundle.at("reference_end_arc_base") == 4.0);
     CHECK(bundle.at("reference_length_base_voxels") == 4.0);
     CHECK(bundle.at("reference_points_base_xyz").size() == 2);
+    CHECK(bundle.at("threshold").at("shape") ==
+          "lasagna_normal_ellipsoid");
+    CHECK(bundle.at("threshold").at("normal_radius_base_voxels") ==
+          doctest::Approx(20.0));
+    CHECK(bundle.at("threshold").at("tangential_factor") ==
+          doctest::Approx(4.0));
+    CHECK(bundle.at("threshold").at("tangential_radius_base_voxels") ==
+          doctest::Approx(80.0));
+    CHECK(bundle.at("greedy").at("threshold") ==
+          bundle.at("threshold"));
+    CHECK(bundle.at("fiberlet_config").at("threshold") ==
+          bundle.at("threshold"));
+    const auto& initialMatch =
+        bundle.at("greedy").at("segments").at(0).at("matches").at(0);
+    CHECK(initialMatch.at("euclidean_error_base_voxels") ==
+          doctest::Approx(1.0));
+    CHECK(initialMatch.at("normal_error_base_voxels") ==
+          doctest::Approx(0.0));
+    CHECK(initialMatch.at("tangential_error_base_voxels") ==
+          doctest::Approx(1.0));
+    CHECK(initialMatch.at("threshold_error_base_voxels") ==
+          doctest::Approx(0.25));
+    CHECK(initialMatch.at("threshold_error_ratio") ==
+          doctest::Approx(0.0125));
+    CHECK_FALSE(initialMatch.contains("error_base_voxels"));
     CHECK(bundle.at("visualizations").empty());
     REQUIRE(bundle.at("artifacts").size() == 5);
     CHECK(bundle.at("artifacts").contains("replay/reference.obj"));
@@ -629,10 +674,15 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
         {"fiber_json", "reference.json"},
         {"fiber_json_content_hash", "fnv1a64:3"},
     };
-    input.greedyReplay.failures.push_back({
-        0, 0, "distance_above_threshold", 2.0, 0.5,
-        {2.0, 0.0, 0.0}, cv::Vec3d{2.0, 1.0, 0.0}, 1,
-    });
+    vc::fiber_tracer::FiberReplayFailure greedyFailure;
+    greedyFailure.reason = "distance_above_threshold";
+    greedyFailure.referenceArcBase = 2.0;
+    greedyFailure.referenceArcFraction = 0.5;
+    greedyFailure.referencePointBase = {2.0, 0.0, 0.0};
+    greedyFailure.evaluatorPointBase = {2.0, 1.0, 0.0};
+    greedyFailure.segmentPointIndex = 1;
+    greedyFailure.thresholdMeasurement = tangentMeasurement(1.0);
+    input.greedyReplay.failures.push_back(greedyFailure);
     vc::fiber_tracer::FiberPredictionGridInfo grid;
     grid.shapeZYX = {8, 8, 8};
     grid.predictionToBaseScale = 1.0;
@@ -688,6 +738,11 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(local.at("trace_strips").at("geometry_builder") ==
           "buildLineViewSurfaces_default");
     CHECK(local.at("trace_strips").at("cross_samples") == 21);
+    CHECK(local.at("failure").at("euclidean_error_base_voxels") ==
+          doctest::Approx(1.0));
+    CHECK(local.at("failure").at("threshold_error_base_voxels") ==
+          doctest::Approx(0.25));
+    CHECK(local.at("failure").at("local_normal_valid") == true);
     const auto& values = local.at("trace_strips").at("values");
     CHECK(values.at("semantic") == "ct_intensity");
     CHECK(values.at("encoding") == "obj_uv_grayscale_tiff_u8");
@@ -739,6 +794,15 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(stripObjText.starts_with(
         "# vc_fiber_replay_reference_strip version 4\n"));
     CHECK(stripObjText.find("mtllib reference_strip.mtl\n") != std::string::npos);
+
+    auto inconsistentMeasurement = input;
+    inconsistentMeasurement.greedyReplay.failures.front()
+        .thresholdMeasurement->thresholdErrorBaseVoxels = 2.0;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::writeFiberReplayBundle(
+            directory, inconsistentMeasurement),
+        doctest::Contains("threshold error or ratio is inconsistent"),
+        std::invalid_argument);
     CHECK(stripObjText.find("vt ") != std::string::npos);
     CHECK(stripObjText.find("f 1/1 ") != std::string::npos);
     const auto referenceTexture = referenceStripPath.parent_path() /

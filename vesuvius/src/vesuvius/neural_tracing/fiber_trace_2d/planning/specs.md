@@ -2947,9 +2947,25 @@
   neither evaluator changes the other one's state.
 - Dense-reference matching is monotone and local. Greedy supplies its nominal
   step and graph replay each actual dense fiberlet edge length. Failure is the
-  first raw Euclidean distance strictly above the threshold. Native
+  first Lasagna-oriented threshold error strictly above `--fail T`; equality is
+  accepted. The already selected Euclidean reference match is not changed.
+  At that matched reference point, the evaluator samples and normalizes the
+  local Lasagna surface normal in the sampler's declared working scale, then
+  decomposes the base-coordinate error into normal magnitude `dn` and full 2D
+  tangent-plane magnitude `dt`. The threshold error is
+  `sqrt(dn^2 + (dt/4)^2)`, giving ellipsoid radii `T` normal and `4T`
+  tangential. Tangential means the plane orthogonal to the Lasagna surface
+  normal, not the learned fiber tangent. A missing, invalid, non-finite, or
+  zero-length normal conservatively uses the old Euclidean error with no
+  relaxation. At `T=0`, exact zero is accepted and every nonzero error fails.
+  Native
   termination, graph exhaustion, and lack of an admissible graph seed are typed
   failures rather than successful termination.
+- Fiberlet seed selection first rejects Euclidean distances above `4T`, then
+  applies the exact same Lasagna-oriented evaluator inclusively and orders
+  usable seeds by reference arc, threshold error ratio, and node ID. The seed's
+  first stored match contains the same complete measurement as later route
+  points.
 - Each failure terminates only the current evaluator segment. Reset advances by
   at least its nominal step, samples the exact authoritative reference point and
   fitted forward nonzero-edge tangent, clears graph incoming-join history, and
@@ -2961,8 +2977,15 @@
   edge's full identity/cost accounting but only route samples through the bound;
   it has no stop anchor and is marked `terminal_partial_edge`. Reset jumps are
   distinct segments and must never be emitted as connecting line geometry.
-- Failure records contain tracer-local index, typed reason, matched reference
-  arc and evaluated-interval fraction, optional evaluator point/index and error,
+- Every evaluated match stores explicit Euclidean, optional normal, optional
+  tangential, threshold-equivalent, ratio, and local-normal-valid fields. A
+  distance failure copies the exact terminal match measurement. Graph exhaustion
+  retains the existing last-match diagnostics; failures without an evaluated
+  point use null diagnostics. Strict publication validates finiteness,
+  non-negativity, component reconstruction, the ellipsoid formula, ratio,
+  invalid-normal fallback, geometry distance, and failure/match identity.
+  Failure records also contain tracer-local index, typed reason, matched reference
+  arc and evaluated-interval fraction, optional evaluator point/index,
   segment index, and segment-local point index. Missing-seed or termination
   events still carry an exact reference reset point. Each callback prints the
   current independent greedy/fiberlet counters. Callback arrival order is only
@@ -2980,6 +3003,11 @@
   reference the current immutable generation. Strict version-1
   single-visualization artifacts remain readable and normalize their trace and
   optional graph route into the current segmented display representation.
+  One authoritative threshold descriptor records the ellipsoid shape, normal
+  radius, fixed tangential factor/radius, strict comparison, and invalid-normal
+  policy; nested greedy and fiberlet descriptors are generated from the same
+  values. The unpublished ambiguous `error_base_voxels` and `error_ratio` replay
+  keys are not emitted and have no repair path.
 - Visualization is disabled by default. `--vis` creates one diagnostic tube per
   failure using exact reference bounds `[failure_arc-along,
   failure_arc+along]` clipped to the evaluated interval and the configured

@@ -1,11 +1,12 @@
-# Status: detailed replay overview and restart markers
+# Status: Lasagna-oriented replay failure threshold
 
-- [x] Capture the task and detailed plan
+- [x] Capture task and inspect current replay failure paths
+- [x] Write detailed implementation/test/documentation plan
 - [x] Complete independent plan review
-- [x] Render full overview strips at 8x
-- [x] Add greedy/fiberlet restart markers
-- [x] Add deterministic JPEG-safe panel wrapping
-- [x] Extend focused regression tests
-- [x] Build and run focused validation with `-j32`
-- [x] Exercise and inspect a bounded Paris4 replay
-- [x] Update specifications, documentation, changelog, and task log
+- [x] Implement shared threshold evaluator
+- [x] Integrate greedy replay and diagnostics
+- [x] Integrate fiberlet replay, seed selection, and diagnostics
+- [x] Update CLI, strict output, specification, docs, and changelog
+- [x] Build focused targets with `-j32`
+- [x] Run focused tests and bounded Paris4 replay
+- [x] Record validation and deviations

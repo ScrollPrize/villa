@@ -48,9 +48,13 @@ nlohmann::json optionalPointJson(const std::optional<cv::Vec3d>& point)
     return point.has_value() ? nlohmann::json(pointJson(*point)) : nlohmann::json(nullptr);
 }
 
-nlohmann::json failureJson(const FiberReplayFailure& failure)
+nlohmann::json failureJson(
+    const FiberReplayFailure& failure,
+    double normalThresholdBaseVoxels)
 {
-    return {
+    auto result = fiberReplayOptionalThresholdMeasurementJson(
+        failure.thresholdMeasurement, normalThresholdBaseVoxels);
+    result.update({
         {"index", failure.index},
         {"segment_index", failure.segmentIndex},
         {"reason", failure.reason},
@@ -63,9 +67,8 @@ nlohmann::json failureJson(const FiberReplayFailure& failure)
         {"arc_index", failure.arcIndex.has_value() ? nlohmann::json(*failure.arcIndex) : nlohmann::json(nullptr)},
         {"candidate_path_point_index",
          failure.candidatePathPointIndex.has_value() ? nlohmann::json(*failure.candidatePathPointIndex) : nlohmann::json(nullptr)},
-        {"error_base_voxels", failure.errorBaseVoxels.has_value() ? nlohmann::json(*failure.errorBaseVoxels) : nlohmann::json(nullptr)},
-        {"error_ratio", failure.errorRatio.has_value() ? nlohmann::json(*failure.errorRatio) : nlohmann::json(nullptr)},
-    };
+    });
+    return result;
 }
 
 std::string lineObj(const char* header, const std::vector<cv::Vec3d>& points, bool pointRecord = false)
@@ -941,6 +944,134 @@ void validateReplayFailures(
     }
 }
 
+bool sameThresholdMeasurement(
+    const FiberReplayThresholdMeasurement& left,
+    const FiberReplayThresholdMeasurement& right)
+{
+    const auto sameOptional = [](const auto& first, const auto& second) {
+        return first.has_value() == second.has_value() &&
+            (!first.has_value() || nearlyEqual(*first, *second));
+    };
+    return nearlyEqual(
+               left.euclideanErrorBaseVoxels,
+               right.euclideanErrorBaseVoxels) &&
+        sameOptional(
+            left.normalErrorBaseVoxels,
+            right.normalErrorBaseVoxels) &&
+        sameOptional(
+            left.tangentialErrorBaseVoxels,
+            right.tangentialErrorBaseVoxels) &&
+        nearlyEqual(
+            left.thresholdErrorBaseVoxels,
+            right.thresholdErrorBaseVoxels) &&
+        nearlyEqual(left.thresholdErrorRatio, right.thresholdErrorRatio) &&
+        left.localNormalValid == right.localNormalValid;
+}
+
+void validateGreedyThresholdData(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    for (const auto& segment : replay.segments) {
+        for (const auto& match : segment.matches) {
+            if (match.tracePointIndex >= segment.tracePointsBase.size()) {
+                throw std::invalid_argument(
+                    "greedy replay threshold match index is invalid");
+            }
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            if (!nearlyEqual(
+                    cv::norm(
+                        segment.tracePointsBase[match.tracePointIndex] -
+                        match.matchedReferencePointBase),
+                    match.thresholdMeasurement.euclideanErrorBaseVoxels)) {
+                throw std::invalid_argument(
+                    "greedy replay threshold Euclidean error differs from geometry");
+            }
+        }
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.thresholdMeasurement.has_value()) {
+            validateFiberReplayThresholdMeasurement(
+                *failure.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+        }
+        if (failure.reason != "distance_above_threshold")
+            continue;
+        if (!failure.thresholdMeasurement.has_value() ||
+            !failure.segmentPointIndex.has_value() ||
+            failure.segmentIndex >= replay.segments.size()) {
+            throw std::invalid_argument(
+                "greedy replay distance failure lacks threshold diagnostics");
+        }
+        const auto& matches = replay.segments[failure.segmentIndex].matches;
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&](const auto& match) {
+                return match.tracePointIndex == *failure.segmentPointIndex;
+            });
+        if (found == matches.end() ||
+            !sameThresholdMeasurement(
+                found->thresholdMeasurement,
+                *failure.thresholdMeasurement)) {
+            throw std::invalid_argument(
+                "greedy replay distance failure differs from its terminal match");
+        }
+    }
+}
+
+void validateFiberletThresholdData(
+    const FiberletGraphReplayResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    for (const auto& segment : replay.segments) {
+        for (const auto& match : segment.matches) {
+            if (match.routePointIndex >= segment.routePointsBaseXYZ.size()) {
+                throw std::invalid_argument(
+                    "fiberlet replay threshold match index is invalid");
+            }
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            if (!nearlyEqual(
+                    cv::norm(
+                        segment.routePointsBaseXYZ[match.routePointIndex] -
+                        match.matchedReferencePointBaseXYZ),
+                    match.thresholdMeasurement.euclideanErrorBaseVoxels)) {
+                throw std::invalid_argument(
+                    "fiberlet replay threshold Euclidean error differs from geometry");
+            }
+        }
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.thresholdMeasurement.has_value()) {
+            validateFiberReplayThresholdMeasurement(
+                *failure.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+        }
+        if (failure.reason != "distance_above_threshold")
+            continue;
+        if (!failure.thresholdMeasurement.has_value() ||
+            !failure.segmentPointIndex.has_value() ||
+            failure.segmentIndex >= replay.segments.size()) {
+            throw std::invalid_argument(
+                "fiberlet replay distance failure lacks threshold diagnostics");
+        }
+        const auto& matches = replay.segments[failure.segmentIndex].matches;
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&](const auto& match) {
+                return match.routePointIndex == *failure.segmentPointIndex;
+            });
+        if (found == matches.end() ||
+            !sameThresholdMeasurement(
+                found->thresholdMeasurement,
+                *failure.thresholdMeasurement)) {
+            throw std::invalid_argument(
+                "fiberlet replay distance failure differs from its terminal match");
+        }
+    }
+}
+
 std::vector<std::vector<cv::Vec3d>> greedySegments(const FiberReplayTraceResult& replay)
 {
     std::vector<std::vector<cv::Vec3d>> result;
@@ -959,7 +1090,9 @@ std::vector<std::vector<cv::Vec3d>> fiberletSegments(const FiberletGraphReplayRe
     return result;
 }
 
-nlohmann::json greedyReplayJson(const FiberReplayTraceResult& replay)
+nlohmann::json greedyReplayJson(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
 {
     nlohmann::json root = {
         {"format", "vc_greedy_fiber_replay"},
@@ -967,22 +1100,28 @@ nlohmann::json greedyReplayJson(const FiberReplayTraceResult& replay)
         {"reference_begin_arc_base", replay.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
         {"completed_reference_arc_base", replay.completedReferenceArcBase},
+        {"threshold", fiberReplayThresholdDescriptorJson(
+             normalThresholdBaseVoxels)},
         {"segments", nlohmann::json::array()},
         {"failures", nlohmann::json::array()},
     };
     for (const auto& segment : replay.segments) {
         nlohmann::json matches = nlohmann::json::array();
         for (const auto& match : segment.matches) {
-            matches.push_back({
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            auto matchJson = fiberReplayThresholdMeasurementJson(
+                match.thresholdMeasurement);
+            matchJson.update({
                 {"trace_point_index", match.tracePointIndex},
                 {"predicted_reference_arc_base", match.predictedReferenceArcBase},
                 {"matched_reference_arc_base", match.matchedReferenceArcBase},
                 {"matched_reference_point_base_xyz", pointJson(match.matchedReferencePointBase)},
                 {"search_begin_arc_base", match.searchBeginArcBase},
                 {"search_end_arc_base", match.searchEndArcBase},
-                {"error_base_voxels", match.errorBaseVoxels},
-                {"error_ratio", match.errorRatio},
             });
+            matches.push_back(std::move(matchJson));
         }
         root["segments"].push_back({
             {"start_reference_arc_base", segment.startReferenceArcBase},
@@ -994,7 +1133,8 @@ nlohmann::json greedyReplayJson(const FiberReplayTraceResult& replay)
         });
     }
     for (const auto& failure : replay.failures)
-        root["failures"].push_back(failureJson(failure));
+        root["failures"].push_back(failureJson(
+            failure, normalThresholdBaseVoxels));
     return root;
 }
 
@@ -1488,8 +1628,18 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         throw std::invalid_argument(
             "fiber replay engine configurations differ from the selected interval");
     }
+    if (!nearlyEqual(
+            input.request.errorThresholdBaseVoxels,
+            input.fiberletReplayConfig.errorThresholdBaseVoxels)) {
+        throw std::invalid_argument(
+            "fiber replay engine thresholds differ");
+    }
     validateReplayFailures(input.greedyReplay, "greedy");
     validateReplayFailures(input.fiberletReplay, "fiberlet");
+    validateGreedyThresholdData(
+        input.greedyReplay, input.request.errorThresholdBaseVoxels);
+    validateFiberletThresholdData(
+        input.fiberletReplay, input.request.errorThresholdBaseVoxels);
 
     std::optional<std::string> overviewJpeg;
     if (input.overview.has_value()) {
@@ -1525,7 +1675,8 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
     const std::filesystem::path staging = outputDirectory / "runs" / (".staging-" + std::to_string(stamp));
     std::filesystem::create_directories(staging / "replay");
 
-    const auto greedyJson = greedyReplayJson(input.greedyReplay);
+    const auto greedyJson = greedyReplayJson(
+        input.greedyReplay, input.request.errorThresholdBaseVoxels);
     const auto fiberletJson = fiberletGraphReplayJson(input.fiberletReplay, input.fiberletReplayConfig);
     vc::core::util::atomicWriteString(staging / "replay/reference.obj", lineObj("# vc_fiber_replay_reference version 2", input.referenceGeometryBase));
     vc::core::util::atomicWriteString(staging / "replay/greedy.json", greedyJson.dump(2) + "\n");
@@ -1651,7 +1802,8 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
             {"coordinates", {{"position_order", "XYZ"}, {"position_space", "base_volume"}, {"distance_unit", "base_voxels"}}},
             {"sources", input.sources},
             {"prediction_binding", input.predictionBinding},
-            {"failure", failureJson(failure)},
+            {"failure", failureJson(
+                 failure, input.request.errorThresholdBaseVoxels)},
             {"tube",
              {
                  {"begin_arc_base", visualization.tube.beginArcBase},
@@ -1768,6 +1920,8 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         {"sources", input.sources},
         {"bindings", {{"trace", input.traceBinding}, {"prediction", input.predictionBinding}}},
         {"trace_config", {{"requested", input.requestedTraceConfig}, {"effective", input.effectiveTraceConfig}}},
+        {"threshold", fiberReplayThresholdDescriptorJson(
+             input.request.errorThresholdBaseVoxels)},
         {"fiberlet_config", fiberletJson.at("config")},
         {"requested_length_base_voxels", input.requestedLengthBaseVoxels.has_value()
              ? nlohmann::json(*input.requestedLengthBaseVoxels)
