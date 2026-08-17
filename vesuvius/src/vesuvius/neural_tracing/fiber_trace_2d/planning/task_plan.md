@@ -48,6 +48,13 @@
 4. Avoid adding large parallel per-observation streams that repeat the prior
    working-set regression.
 
+Measured outcome: rejected. Fusing the fixed-axis spatial baseline with
+centroid accumulation replaced a sparse retained-evidence centroid pass with
+an all-site pass. Three canonical runs showed no wall or CPU improvement, so
+the implementation was removed. The post-refinement membership refresh cannot
+be fused with final support without changing semantics because peak refinement
+changes component positions between those phases.
+
 ## Checkpoint 3: Batched Peak Responses
 
 1. Evaluate multiple peak candidates per observation pass using compact float
@@ -57,6 +64,14 @@
 3. Preserve the same candidate domain and acceptance checks. Compare peak CPU,
    response visits, selected peaks, and replay quality.
 
+Measured outcome: rejected. Batched neighborhood responses reduced physical
+observation scans but increased peak-search time to 39.18 seconds. A 2D CSR
+broad phase reduced candidate visits by 59% but increased peak-search time to
+39.20 seconds. A 1D counting sort retained contiguous ranges but increased
+peak-search time to 42.13 seconds and total wall to 14.91 seconds. All quality
+populations remained unchanged. The compact sequential scan has better
+locality than these alternatives, so all checkpoint-3 code was removed.
+
 ## Checkpoint 4: One Robust Pass
 
 1. Make the measured pass count explicit and run one-pass versus two-pass
@@ -64,6 +79,13 @@
 2. Compare anchor geometry/populations and produce visualization artifacts for
    user inspection. Do not accept this checkpoint solely from replay failure
    counts.
+
+Measured and accepted: one pass improved median total wall by 7.1% and anchor
+wall by 17.7%, while retaining 3.3% more anchors and 8.1% more accepted
+fiberlets. Replay failures stayed at 2 greedy / 1 fiberlet, but local anchor
+comparison had material tails and unmatched candidates. One pass is now the
+default; document `--maximum-iterations` as the explicit quality/speed knob
+for difficult overlapping-fiber data.
 
 ## Checkpoint 5: Shared Tile-Halo Sampling
 

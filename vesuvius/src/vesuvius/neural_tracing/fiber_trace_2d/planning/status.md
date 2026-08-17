@@ -6,7 +6,18 @@
 - [x] Add compact/vector observation parity coverage.
 - [x] Run GCC and Clang focused validation for checkpoint 1.
 - [x] Benchmark checkpoint 1 and report results for user review.
-- [ ] Obtain approval before checkpoint 2 robust-state reuse.
-- [ ] Obtain approval before checkpoint 3 batched peak responses.
-- [ ] Obtain approval before checkpoint 4 one-pass quality experiment.
+- [x] Commit accepted checkpoint 1 as `9ef0876f7`.
+- [x] Obtain approval for checkpoint 2 robust-state reuse.
+- [x] Implement and validate fused centroid/baseline state reuse.
+- [x] Benchmark checkpoint 2 and reject the non-improving variant.
+- [x] Remove the rejected checkpoint 2 implementation.
+- [x] Obtain approval for checkpoint 3 batched peak responses.
+- [x] Test batched-neighborhood, 2D CSR, and 1D counting-sort peak responses.
+- [x] Benchmark and reject all non-improving checkpoint 3 variants.
+- [x] Remove the rejected checkpoint 3 implementations.
+- [x] Obtain approval for checkpoint 4 one-pass quality experiment.
+- [x] Run three clean one-pass canonical benchmarks.
+- [x] Generate matched one-pass/two-pass failure visualizations.
+- [x] Review checkpoint 4 and accept one pass as the default.
+- [x] Document `--maximum-iterations` prominently as an anchor quality knob.
 - [ ] Obtain approval before checkpoint 5 shared tile-halo sampling.

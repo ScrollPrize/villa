@@ -104,6 +104,7 @@ FiberAnchorConfig config()
 TEST_CASE("fiber anchor peak kernel defaults integrate across neighboring cells")
 {
     const FiberAnchorConfig value;
+    CHECK(value.maximumIterations == 1);
     CHECK(value.peakSigmaPredictionVoxels == 1.5);
     CHECK(value.peakAxialSigmaPredictionVoxels == 6.0);
     CHECK(std::exp(-0.5 * std::pow(

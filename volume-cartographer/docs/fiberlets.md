@@ -71,9 +71,19 @@ contributes positive signal. Because the denominator does not depend on a
 site's presence, direction, assignment, or trim state, rejected observations
 cannot create attractive or repulsive holes in the normalization.
 
-The next outer pass recomputes competitive assignments and robust inliers.
-The default budget is two passes, configurable with `--maximum-iterations`;
-this is deliberately not convergence to exact hard-assignment equality because
+Each additional outer pass recomputes competitive assignments and robust
+inliers from the preceding direction and position update. The default budget
+is one pass.
+
+**Anchor quality knob:** `--maximum-iterations` trades extraction speed for
+additional robust reassignment and refinement. Increase it above `1` when
+nearby or crossing fibers need a second chance to separate after the first
+geometry update. This can materially change anchor positions, directions, and
+the retained anchor population; it is not merely a convergence or debugging
+setting. Two passes cost about 18% more anchor wall time on the canonical
+Paris4 replay and remain the first quality-oriented setting to try.
+
+Refinement deliberately does not seek exact hard-assignment equality because
 samples at histogram or component boundaries can flicker without a meaningful
 geometry change. An earlier exit is allowed when axis and position updates are
 already below their geometric tolerances. Empty, degenerate, and

@@ -132,7 +132,7 @@ void usage(const char* executable)
               << "  --robust-min-angle-deg N      angular noise floor [5]\n"
               << "  --nms-angle-deg N             maximum duplicate-axis angle [10]\n"
               << "  --maximum-seeds N             deterministic PCA seed count [8]\n"
-              << "  --maximum-iterations N        robust assignment/update pass limit [2]\n"
+              << "  --maximum-iterations N        anchor quality/speed pass limit [1]\n"
               << "  --crop X,Y,Z,W,H,D            base-volume box; selects intersected cells\n"
               << "  --glyph-length-base-voxels N  diagnostic anchor length [16]\n\n"
               << "Path options:\n"

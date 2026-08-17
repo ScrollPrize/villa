@@ -4,8 +4,10 @@
   sampled-direction aggregation and position-only bounded refinement.
 - Removed pre-refinement close-direction merging, preserved robust membership
   through peak fitting, and added strict configuration/artifact diagnostics.
-- Reduced the default alternating robust update budget to two measured passes;
-  legacy numeric identity is intentionally not required for this fitter.
+- Reduced the default alternating robust update budget to one measured pass;
+  `--maximum-iterations` remains the documented quality/speed knob for
+  difficult overlapping-fiber fits, and legacy numeric identity is
+  intentionally not required for this fitter.
 - Fused robust histogram/tensor work, reused tile gradients, paired spatial
   objectives, and reduced peak-response geometry to transverse coordinates.
 - Increased anchor tiles from four to six cells per axis after measured tile

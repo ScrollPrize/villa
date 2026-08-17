@@ -50,7 +50,7 @@ struct FiberAnchorConfig {
     double mergeMaximumAbsoluteObjectiveLoss = 0.01;
     double mergeMaximumRelativeObjectiveLoss = 0.05;
     size_t maximumSeedCount = 8;
-    int maximumIterations = 2;
+    int maximumIterations = 1;
     double convergenceTolerance = 1.0e-12;
     size_t maximumConcurrentSampleBytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
