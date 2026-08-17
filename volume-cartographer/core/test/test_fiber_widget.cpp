@@ -4,6 +4,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QLineEdit>
 #include <QMetaObject>
@@ -87,6 +88,8 @@ int main(int argc, char** argv)
     first.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38)});
     auto second = makeFiber(2, "kb_20260605T184821587_000002.json", 3, 30, 24.0, {"review"});
     second.alignment = makeMetric(25.0, 50.0, 58);
+    second.linkedFiberCount = 2;
+    second.pendingLinkCount = 1;
     second.spans.push_back({0, 0, 1, 2, 14, 11.0, makeMetric(7.0, 20.0, 26)});
     second.spans.push_back({1, 1, 2, 2, 17, 13.0, makeMetric(31.0, 52.0, 32)});
     auto third = makeFiber(3, "zz_20260605T184821587_000003.json", 4, 40, 36.0);
@@ -104,7 +107,7 @@ int main(int argc, char** argv)
         metrics.horizontalAdvance(QStringLiteral("kb_..._000002")));
     require(adaptedName.endsWith(QStringLiteral("_000002")),
             "Fiber name elision should preserve the sequence suffix");
-    require(treeView->model()->columnCount() == 8, "Fiber tree should expose eight columns");
+    require(treeView->model()->columnCount() == 9, "Fiber tree should expose nine columns");
     require(treeView->header()->sectionResizeMode(0) == QHeaderView::Interactive,
             "Fiber tree header should allow changing column widths");
     require(treeView->model()->index(1, 0).data().toString() ==
@@ -116,10 +119,17 @@ int main(int argc, char** argv)
             "Fiber tree row should not show the runtime fiber ID");
     require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 2,
             "Fiber tree row did not expose span children");
-    require(treeView->model()->index(1, 5).data().toString() == QStringLiteral("review"),
+    require(treeView->model()->index(1, 2).data().toString() == QStringLiteral("2"),
+            "Fiber tree link column did not show the linked fiber count");
+    require(treeView->model()->index(1, 3).data().toString() == QStringLiteral("1"),
+            "Fiber tree pending column did not show the pending link count");
+    require(treeView->model()->index(0, 3).data().toString().isEmpty(),
+            "Fiber tree pending column should be blank when no links are pending");
+    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("review"),
             "Fiber tree tags column did not show fiber tags");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("-"),
-            "Metrics should be hidden before Calc metrics is enabled");
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString().contains(
+                QStringLiteral("Enable Calc metrics")),
+            "Row tooltip should explain metrics before Calc metrics is enabled");
     require(widget.orderedFiberIds() == std::vector<uint64_t>({1, 2, 3}),
             "Initial fiber order should match the sorted list order");
 
@@ -157,14 +167,67 @@ int main(int argc, char** argv)
                      });
     auto* calcMetrics = widget.findChild<QCheckBox*>(QStringLiteral("fiberCalcMetricsCheckBox"));
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
+    auto* showFibers = widget.findChild<QCheckBox*>(QStringLiteral("fiberShowFibersCheckBox"));
+    require(showFibers != nullptr, "Show fibers checkbox was not found");
+    require(!showFibers->isEnabled(), "Show fibers should start disabled");
+    require(!widget.showFibersChecked(), "Show fibers should start unchecked");
+    auto* fiberViewDistance =
+        widget.findChild<QDoubleSpinBox*>(QStringLiteral("fiberViewDistanceSpinBox"));
+    require(fiberViewDistance != nullptr, "Fiber view-distance spinbox was not found");
+    require(widget.fiberViewDistance() == 10.0,
+            "Fiber view distance should default to 10 voxels");
+    int fiberViewDistanceRequests = 0;
+    double requestedFiberViewDistance = 0.0;
+    QObject::connect(&widget,
+                     &CFiberWidget::fiberViewDistanceChanged,
+                     &widget,
+                     [&](double distance) {
+                         ++fiberViewDistanceRequests;
+                         requestedFiberViewDistance = distance;
+                     });
+    widget.setFiberViewDistance(25.0);
+    require(widget.fiberViewDistance() == 25.0,
+            "Programmatic fiber view-distance sync did not update the spinbox");
+    require(fiberViewDistanceRequests == 0,
+            "Programmatic fiber view-distance sync should not emit a request");
+    fiberViewDistance->setValue(30.0);
+    require(fiberViewDistanceRequests == 1 && requestedFiberViewDistance == 30.0,
+            "User fiber view-distance change did not emit the requested distance");
+    int showFiberRequests = 0;
+    bool requestedShowFibers = false;
+    QObject::connect(&widget,
+                     &CFiberWidget::showFibersToggled,
+                     &widget,
+                     [&](bool checked) {
+                         ++showFiberRequests;
+                         requestedShowFibers = checked;
+                     });
+    widget.setShowFibersAvailable(true);
+    require(showFibers->isEnabled(), "Loaded fibers should enable Show fibers");
+    widget.setShowFibersChecked(true);
+    require(widget.showFibersChecked(), "Programmatic Show fibers sync did not update the checkbox");
+    require(showFiberRequests == 0,
+            "Programmatic Show fibers sync should not emit a visibility request");
+    showFibers->setChecked(false);
+    require(showFiberRequests == 1 && !requestedShowFibers,
+            "User Show fibers toggle did not emit the requested state");
+    showFibers->setChecked(true);
+    require(showFiberRequests == 2 && requestedShowFibers,
+            "User Show fibers enable did not emit the requested state");
+    widget.setShowFibersAvailable(false);
+    require(!showFibers->isEnabled(), "Unavailable fibers should disable Show fibers");
+    require(!widget.showFibersChecked(), "Unavailable fibers should reset Show fibers");
+    require(showFiberRequests == 2,
+            "Availability reset should not emit a duplicate visibility request");
+    widget.setShowFibersAvailable(true);
     auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
     require(model != nullptr, "Fiber tree should use a standard item model");
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     require(widget.orderedFiberIds() == std::vector<uint64_t>({3, 2, 1}),
             "Fiber order should track the current sorted list order");
     QStandardItem* secondItemBeforeMetrics = model->item(1, 0);
@@ -174,40 +237,39 @@ int main(int argc, char** argv)
             "Calc metrics request should use the current fiber list order");
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Toggling Calc metrics should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("25.0"),
-            "Mean alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("50.0"),
-            "Max alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7).data(Qt::BackgroundRole).isValid(),
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString() ==
+                QStringLiteral("58 samples"),
+            "Row tooltip should carry the alignment sample count");
+    require(treeView->model()->index(1, 0).data(Qt::BackgroundRole).isValid(),
             "Fiber row with max alignment error > 45 deg was not highlighted");
     const QModelIndex secondParent = treeView->model()->index(1, 0);
-    require(treeView->model()->index(1, 7, secondParent).data().toString() == QStringLiteral("52.0"),
-            "Span max alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7, secondParent).data(Qt::BackgroundRole).isValid(),
+    require(!treeView->model()->index(0, 0, secondParent).data(Qt::BackgroundRole).isValid(),
+            "Span row within the alignment threshold should not be highlighted");
+    require(treeView->model()->index(1, 0, secondParent).data(Qt::BackgroundRole).isValid(),
             "Span row with max alignment error > 45 deg was not highlighted");
     widget.setAlignmentMetricsPending(true);
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Marking metrics pending should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("..."),
-            "Pending metric state should be displayed in-place");
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString().contains(
+                QStringLiteral("Sampling")),
+            "Pending metric state should be reflected in the row tooltip");
     widget.updateAlignmentMetrics(
         2,
         makeMetric(26.0, 51.0, 60),
         {makeMetric(9.0, 21.0, 27), makeMetric(32.0, 53.0, 33)});
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Live metric update should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("26.0"),
-            "Live fiber mean alignment metric was not displayed");
-    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("51.0"),
-            "Live fiber max alignment metric was not displayed");
-    require(treeView->model()->index(1, 7, secondParent).data().toString() == QStringLiteral("53.0"),
-            "Live span alignment metric was not displayed");
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString() ==
+                QStringLiteral("60 samples"),
+            "Live fiber metric update should refresh the row tooltip");
+    require(treeView->model()->index(1, 0, secondParent).data(Qt::BackgroundRole).isValid(),
+            "Live span metric update should keep the over-threshold highlight");
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     require(treeView->model()->index(0, 0).data().toString() ==
                 QStringLiteral("zz_20260605T184821587_000003"),
             "Sorting by length descending should reorder only top-level fibers");
@@ -285,7 +347,10 @@ int main(int argc, char** argv)
     require(requestedRenameFiberId == 2, "Rename JSON file emitted the wrong fiber ID");
 
     auto tagCheckboxes = widget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxes.size() == 3, "Known tags did not create three checkboxes");
+    // Three known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxes.size() == 4, "Known tags did not create four checkboxes");
+    require(tagCheckboxes.front()->text() == QStringLiteral("reviewed"),
+            "The 'reviewed' tag checkbox should be pinned first");
     QCheckBox* reviewCheckbox = nullptr;
     QCheckBox* todoCheckbox = nullptr;
     for (auto* checkbox : tagCheckboxes) {
@@ -300,6 +365,7 @@ int main(int argc, char** argv)
     require(reviewCheckbox->isChecked(), "Selected fiber tag should be checked");
     require(!todoCheckbox->isChecked(), "Unchecked known tag should not be checked");
     todoCheckbox->setChecked(true);
+    QApplication::processEvents();
     require(tagRequests == 1, "Checking a tag did not emit one tag request");
     require(requestedTagFiberId == 2, "Tag check emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("todo"), "Tag check emitted the wrong tag");
@@ -311,6 +377,7 @@ int main(int argc, char** argv)
     require(addTagButton != nullptr, "Add tag button was not found");
     newTagEdit->setText(QStringLiteral("needs-proofread"));
     addTagButton->click();
+    QApplication::processEvents();
     require(tagRequests == 2, "Adding a tag did not emit a second tag request");
     require(requestedTagFiberId == 2, "Added tag emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("needs-proofread"), "Added tag emitted the wrong tag");
@@ -366,7 +433,8 @@ int main(int argc, char** argv)
 
     const auto tagCheckboxesBefore =
         scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxesBefore.size() == 4, "Scrollable fiber widget should expose four tag checkboxes");
+    // Four known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxesBefore.size() == 5, "Scrollable fiber widget should expose five tag checkboxes");
     scrollBar->setValue(scrollBar->maximum());
     QApplication::processEvents();
     const int directSelectionScroll = scrollBar->value();
@@ -440,6 +508,61 @@ int main(int argc, char** argv)
     require(confirmations == 2, "Confirmed delete did not ask for confirmation");
     require(batchDeletes == 1, "Confirmed delete did not emit one batch delete request");
     require(sameIds(deletedIds, {1, 3}), "Batch delete request IDs are wrong");
+
+    // Interpolation-status column.
+    auto legacyFiber = makeFiber(11, "aa_20260605T184821587_000011.json", 2, 20, 12.0);
+    legacyFiber.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38), 'L'});
+    auto tracedFiber = makeFiber(12, "kb_20260605T184821587_000012.json", 3, 30, 24.0);
+    tracedFiber.traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+    tracedFiber.spans.push_back({0, 0, 1, 2, 14, 11.0, makeMetric(7.0, 20.0, 26), 'T'});
+    tracedFiber.spans.push_back({1, 1, 2, 2, 17, 13.0, makeMetric(9.0, 21.0, 28), 'C'});
+    auto mixedFiber = makeFiber(13, "zz_20260605T184821587_000013.json", 2, 20, 12.0);
+    mixedFiber.traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+    widget.setFibers({legacyFiber, tracedFiber, mixedFiber});
+
+    const auto rowOfFiber = [&](uint64_t fiberId) {
+        const auto ordered = widget.orderedFiberIds();
+        for (size_t row = 0; row < ordered.size(); ++row) {
+            if (ordered[row] == fiberId) {
+                return static_cast<int>(row);
+            }
+        }
+        return -1;
+    };
+    require(treeView->model()->index(rowOfFiber(11), 8).data().toString() ==
+                QStringLiteral("legacy"),
+            "Legacy fiber should show 'legacy' in the interp column");
+    require(treeView->model()->index(rowOfFiber(12), 8).data().toString() ==
+                QStringLiteral("predictions"),
+            "Traced fiber should show 'predictions'");
+    require(treeView->model()->index(rowOfFiber(13), 8).data().toString() ==
+                QStringLiteral("mixed"),
+            "Mixed fiber should show 'mixed'");
+    const QModelIndex tracedParent = treeView->model()->index(rowOfFiber(12), 0);
+    require(treeView->model()->index(0, 8, tracedParent).data().toString() ==
+                QStringLiteral("T"),
+            "Traced span row should show its 'T' producer marker");
+    require(treeView->model()->index(1, 8, tracedParent).data().toString() ==
+                QStringLiteral("C"),
+            "Cspline span row should show its 'C' producer marker");
+
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 8));
+    if (widget.orderedFiberIds().front() != 11) {
+        // The first click toggled an existing interp sort to descending;
+        // click again for ascending.
+        QMetaObject::invokeMethod(treeView->header(),
+                                  "sectionClicked",
+                                  Q_ARG(int, 8));
+    }
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({11, 13, 12}),
+            "Ascending interp sort should order legacy, mixed, predictions");
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 8));
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({12, 13, 11}),
+            "Descending interp sort should order predictions, mixed, legacy");
 
     QThreadPool::globalInstance()->waitForDone();
     return 0;

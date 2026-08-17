@@ -4,6 +4,7 @@
 
 #include <curl/curl.h>
 
+#include <array>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -120,6 +121,12 @@ CURL* thread_handle() {
     return tl_handle.get();
 }
 
+HttpClient::DownloadObserver& thread_download_observer()
+{
+    thread_local HttpClient::DownloadObserver observer;
+    return observer;
+}
+
 int xferinfo_callback(void* /*clientp*/,
                       curl_off_t, curl_off_t,
                       curl_off_t, curl_off_t) noexcept
@@ -139,6 +146,13 @@ std::size_t write_callback(char* ptr, std::size_t size,
     auto total = size * nmemb;
     auto* src = reinterpret_cast<const std::byte*>(ptr);
     buf.insert(buf.end(), src, src + total);
+    if (auto& observer = thread_download_observer(); observer) {
+        try {
+            observer(total);
+        } catch (...) {
+            // Exceptions cannot cross libcurl's C callback boundary.
+        }
+    }
     return total;
 }
 
@@ -275,6 +289,8 @@ HttpResponse perform(const HttpClient::Config& config,
         resp = HttpResponse{};
         auto* curl = thread_handle();
         curl_easy_reset(curl);
+        std::array<char, CURL_ERROR_SIZE> error_buffer{};
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
 
         // URL
         curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
@@ -392,6 +408,10 @@ HttpResponse perform(const HttpClient::Config& config,
             return resp;
         }
 
+        resp.error_message = error_buffer.front() != '\0'
+            ? std::string(error_buffer.data())
+            : std::string(curl_easy_strerror(code));
+
         // Retry on network / transient curl errors
         if (attempt < config.max_retries && !HttpClient::isAborted()) {
             thread_local std::mt19937 rng{std::random_device{}()};
@@ -407,6 +427,18 @@ HttpResponse perform(const HttpClient::Config& config,
 }
 
 } // namespace
+
+HttpClient::ScopedDownloadObserver::ScopedDownloadObserver(
+    DownloadObserver observer)
+    : previous_(std::move(thread_download_observer()))
+{
+    thread_download_observer() = std::move(observer);
+}
+
+HttpClient::ScopedDownloadObserver::~ScopedDownloadObserver()
+{
+    thread_download_observer() = std::move(previous_);
+}
 
 // ---------------------------------------------------------------------------
 // HttpClient public API

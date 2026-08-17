@@ -47,6 +47,27 @@ cmake --build --preset ci-windows-mingw
 cpack --config build/ci-windows-mingw/CPackConfig.cmake
 ```
 
+Alternatively, VC3D builds with the **native MSVC / Visual Studio 2022 toolchain**
+using [vcpkg](https://github.com/microsoft/vcpkg) for dependencies, via the
+`windows-msvc` preset. Bootstrap a vcpkg checkout, then from an *x64 Native Tools
+Command Prompt for VS 2022* (so `cl.exe`/Ninja are on `PATH`):
+
+```bat
+set VCPKG_ROOT=C:\path\to\vcpkg
+cmake --preset windows-msvc
+cmake --build build\windows-msvc
+```
+
+The first configure builds the dependency closure (Qt, OpenCV, Ceres, CGAL, ...)
+from source via vcpkg — this takes a while, but later configures restore it from
+vcpkg's binary cache. The result is `build\windows-msvc\bin\VC3D.exe` with the Qt
+plugins and dependency DLLs deployed alongside it, runnable in place. To work in
+the VS2022 IDE, *Open Folder* on `volume-cartographer/`. Note that the VS
+developer environment forces `VCPKG_ROOT` to the port-less bundled vcpkg, so
+create a `CMakeUserPresets.json` (gitignored) that pins `CMAKE_TOOLCHAIN_FILE` to
+your vcpkg and select the resulting local preset — otherwise VS reconfigures
+against the wrong vcpkg and rebuilds every dependency.
+
 Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Windows; Docker or WSL still covers that workflow.
 
 #### macOS
@@ -191,6 +212,7 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 - `Axis overlay opacity` : Modifies the opacity of the plane slice axis overlays
 - `Overlay threshold` : The value of the overlay array below which will not be rendered on the base volume (useful for removing background)
 - `Overlay colormap` : The colormap to use for the overlay volume
+- `Overlay interpolation` : Selects nearest-neighbor (default) or trilinear sampling independently of the base volume
 - `Use axis aligned slices` : by default, vc3d attempts to align your XZ and YZ planes orthogonal to the normal of the current selected surface, this checkbox will instead use the plane normal as the axis to slice along
 - `Show axis overlays in XY view` : if you do not wish to view the axis overlays in the XY view, this checkbox will disable them
 

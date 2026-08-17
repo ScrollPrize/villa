@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -32,7 +33,8 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(size_t cacheSizeBytes, QObject* parent = nullptr);
+    explicit CState(QObject* parent = nullptr,
+                    bool debugDownloadQueue = false);
     ~CState();
 
     // --- VolumePkg ---
@@ -59,14 +61,18 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
 
-    // --- Cache budget ---
-    size_t cacheSizeBytes() const;
+    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
     // --- Teardown ---
     void closeAll();
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    // Apply catalog-style surface additions/replacements/removals atomically
+    // from observers' perspective. Individual surface signals are suppressed
+    // and one empty-name surfaceChanged signal is emitted after the map is final.
+    void setSurfacesBatch(
+        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates);
     std::shared_ptr<Surface> surface(const std::string& name);
     Surface* surfaceRaw(const std::string& name);
     std::string findSurfaceId(Surface* surf);
@@ -79,6 +85,7 @@ public:
     uint64_t surfacesVersion() const { return _surfacesVersion; }
 
     // --- POIs (inlined from CSurfaceCollection) ---
+    std::unique_ptr<POI> createSurfaceFocusPoi(QuadSurface& surface);
     void setPOI(const std::string& name, POI* poi);
     POI* poi(const std::string& name);
     std::vector<POI*> pois();
@@ -96,7 +103,6 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
-    void applyCacheBudget(const std::shared_ptr<Volume>& vol) const;
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
@@ -108,10 +114,12 @@ private:
 
     VCCollection* _pointCollection;
 
-    size_t _cacheSizeBytes;
+    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
     uint64_t _surfacesVersion = 0;
+    int _surfaceBatchDepth = 0;
+    bool _surfaceBatchChanged = false;
 };

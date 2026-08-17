@@ -115,6 +115,23 @@ std::optional<int> intValue(const nlohmann::json& obj,
     return std::nullopt;
 }
 
+std::optional<std::array<std::size_t, 3>> shapeValue(const nlohmann::json& obj)
+{
+    if (!obj.is_object()) return std::nullopt;
+    const auto it = obj.find("shape");
+    if (it == obj.end() || !it->is_array() || it->size() != 3)
+        return std::nullopt;
+    std::array<std::size_t, 3> shape{};
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (!it->at(i).is_number_unsigned() && !it->at(i).is_number_integer())
+            return std::nullopt;
+        const auto value = it->at(i).get<long long>();
+        if (value <= 0) return std::nullopt;
+        shape[i] = static_cast<std::size_t>(value);
+    }
+    return shape;
+}
+
 nlohmann::json objectOrEmpty(const nlohmann::json& obj, const char* key)
 {
     if (!obj.is_object()) {
@@ -329,7 +346,23 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         artifact.raw = itemJson;
         artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
+        artifact.creationInfo = objectOrEmpty(itemJson, "creation_info");
         artifact.type = stringValue(itemJson, {"type"}).value_or("");
+        artifact.modelId = stringValue(artifact.parameters, {"model_id", "modelId"});
+        artifact.lasagnaVersionPresent =
+            artifact.creationInfo.contains("lasagna_version") ||
+            artifact.creationInfo.contains("lasagnaVersion");
+        artifact.lasagnaVersion = intValue(
+            artifact.creationInfo, {"lasagna_version", "lasagnaVersion"});
+        artifact.sourceToBasePresent =
+            artifact.creationInfo.contains("source_to_base") ||
+            artifact.creationInfo.contains("sourceToBase");
+        artifact.sourceToBase = numberValue(
+            artifact.creationInfo, {"source_to_base", "sourceToBase"});
+        if (artifact.sourceToBase &&
+            (!std::isfinite(*artifact.sourceToBase) || *artifact.sourceToBase <= 0.0)) {
+            artifact.sourceToBase.reset();
+        }
         if (const auto levelIt = artifact.parameters.find("level");
             levelIt != artifact.parameters.end()) {
             artifact.levelParameterPresent = true;
@@ -382,6 +415,7 @@ OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
     volume.dataFormat = nestedStringValue(volumeJson, {"data_format", "dataFormat", "format"}).value_or("");
     volume.createdAt = nestedStringValue(volumeJson, {"created_at", "createdAt", "created"}).value_or("");
     volume.properties = objectOrEmpty(volumeJson, "properties");
+    volume.shapeZYX = shapeValue(volume.properties);
     volume.artifacts = parseArtifacts(volumeJson);
     volume.raw = volumeJson.is_object() ? volumeJson : nlohmann::json::object();
     return volume;
@@ -580,6 +614,88 @@ std::size_t OpenDataSample::inkDetectionSegmentCount() const
         segments.begin(), segments.end(), [](const OpenDataSegment& segment) {
             return segment.hasInkDetection();
         }));
+}
+
+std::optional<OpenDataRepresentationKind> classifyDerivedRepresentation(
+    const OpenDataArtifact& artifact)
+{
+    std::string type = lowerCopy(artifact.type);
+    std::replace(type.begin(), type.end(), '_', '-');
+
+    if (type.find("normal-grid") != std::string::npos) {
+        return OpenDataRepresentationKind::NormalGrids;
+    }
+    if (type == "lasagna") {
+        return OpenDataRepresentationKind::Lasagna;
+    }
+    const bool prediction =
+        type.find("prediction") != std::string::npos ||
+        type.starts_with("pred-") || type.ends_with("-pred") ||
+        type.find("-pred-") != std::string::npos;
+    const bool ink3d = type.find("ink-detection") != std::string::npos &&
+                       type.find("3d") != std::string::npos;
+    if (prediction || ink3d)
+        return OpenDataRepresentationKind::Prediction;
+    return std::nullopt;
+}
+
+std::vector<OpenDataRepresentationRef> derivedRepresentations(
+    const OpenDataSample& sample)
+{
+    std::vector<OpenDataRepresentationRef> result;
+    for (std::size_t volumeIndex = 0;
+         volumeIndex < sample.volumes.size(); ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        for (std::size_t artifactIndex = 0;
+             artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+            if (const auto kind =
+                    classifyDerivedRepresentation(volume.artifacts[artifactIndex])) {
+                result.push_back({volumeIndex, artifactIndex, *kind});
+            }
+        }
+    }
+    return result;
+}
+
+bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const
+{
+    if (!volumeIds)
+        return true;
+    return std::find(volumeIds->begin(), volumeIds->end(), volumeId) !=
+           volumeIds->end();
+}
+
+bool OpenDataResourceSelection::allowsRepresentation(
+    std::size_t volumeIndex, std::size_t artifactIndex,
+    OpenDataRepresentationKind kind, const std::string& volumeId) const
+{
+    if (!allowsVolume(volumeId))
+        return false;
+    if (representations) {
+        const bool listed = std::any_of(
+            representations->begin(), representations->end(),
+            [&](const OpenDataRepresentationRef& ref) {
+                return ref.volumeIndex == volumeIndex &&
+                       ref.artifactIndex == artifactIndex;
+            });
+        if (!listed)
+            return false;
+    }
+    if (kinds) {
+        if (std::find(kinds->begin(), kinds->end(), kind) == kinds->end())
+            return false;
+    }
+    return true;
+}
+
+std::string_view representationKindName(OpenDataRepresentationKind kind) noexcept
+{
+    switch (kind) {
+        case OpenDataRepresentationKind::NormalGrids: return "Normal grids";
+        case OpenDataRepresentationKind::Lasagna: return "Lasagna";
+        case OpenDataRepresentationKind::Prediction: return "Prediction";
+    }
+    return "Prediction";
 }
 
 const OpenDataSample* OpenDataManifest::findSample(std::string_view id) const noexcept

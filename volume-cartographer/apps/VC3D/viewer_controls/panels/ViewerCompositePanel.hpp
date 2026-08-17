@@ -1,8 +1,10 @@
 #pragma once
 
+#include <QMetaObject>
 #include <QWidget>
 
 #include <functional>
+#include <vector>
 
 class QCheckBox;
 class QComboBox;
@@ -47,18 +49,20 @@ public:
                                   ViewerManager* viewerManager,
                                   QWidget* parent = nullptr);
 
+    void setViewerManagers(const std::vector<ViewerManager*>& viewerManagers);
     void toggleSegmentationComposite();
     void setSegmentationCompositeChecked(bool checked);
 
 private:
     void setupControls();
-    void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
+    void syncUiFromManager();
     void updateCompositeParamsVisibility();
     void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToPlaneViewers(const std::function<void(VolumeViewerBase*)>& apply);
 
     UiRefs _uiRefs;
-    ViewerManager* _viewerManager{nullptr};
+    std::vector<ViewerManager*> _viewerManagers;
+    std::vector<QMetaObject::Connection> _managerConnections;
 };

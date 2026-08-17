@@ -5,6 +5,7 @@
 #include <QPointF>
 #include <QRectF>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -17,6 +18,7 @@
 
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class CVolumeViewerView;
@@ -126,11 +128,17 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
+    virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
     virtual void setOverlayThreshold(float threshold) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
+
+    // SurfaceCache budgets for the flattened segmentation view (base, overlay).
+    // Zero disables that channel; viewers that are not a flattened
+    // QuadSurface view ignore both.
+    virtual void setSurfaceCacheBudgets(std::size_t, std::size_t) {}
 
     // --- Interaction state ---
     virtual uint64_t highlightedPointId() const = 0;
@@ -178,6 +186,7 @@ public:
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;
     virtual const std::map<std::string, cv::Vec3b>& surfaceOverlays() const = 0;
+    virtual std::uint64_t surfaceOverlaysRevision() const = 0;
     virtual float surfaceOverlapThreshold() const = 0;
     virtual void setSurfaceOverlayEnabled(bool enabled) = 0;
     virtual void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) = 0;

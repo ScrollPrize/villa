@@ -26,6 +26,7 @@ public:
     explicit ViewerNormalVisualizationPanel(const UiRefs& uiRefs,
                                             ViewerManager* viewerManager,
                                             QWidget* parent = nullptr);
+    void setViewerManager(ViewerManager* viewerManager);
 
 signals:
     void statusMessageRequested(QString text, int timeoutMs);

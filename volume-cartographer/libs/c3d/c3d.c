@@ -15,6 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* MSVC lacks the GCC/Clang branch-prediction, prefetch, and alignment builtins
+ * used below. Map them to no-op-equivalent forms (correct results, just without
+ * the optimizer hint). Only defined off the GCC/Clang path. */
+#if !defined(__GNUC__) && !defined(__clang__)
+#  define __builtin_expect(expr, expected)   (expr)
+#  define __builtin_prefetch(...)            ((void)0)
+#  define __builtin_assume_aligned(ptr, ...) (ptr)
+#endif
+
 /* C11 aligned_alloc is missing from the Windows UCRT; _aligned_malloc is the
  * equivalent but its memory must go through _aligned_free (plain free() is
  * undefined on it), so the paired frees route through c3d_aligned_free. */
@@ -27,8 +36,11 @@
 #  define c3d_aligned_free free
 #endif
 
-/* Endianness gate — LE only. */
-#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+/* Endianness gate — LE only. Windows targets (x86/x64/ARM64) are always
+ * little-endian, but MSVC does not define __BYTE_ORDER__, so exempt _WIN32 from
+ * the predefine-based check rather than tripping the #error. */
+#if !defined(_WIN32) && \
+    (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
 #  error "c3d requires a little-endian target"
 #endif
 

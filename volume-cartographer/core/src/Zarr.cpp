@@ -344,7 +344,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
-                    double baseVoxelSize, const std::string& voxelUnit)
+                    double baseVoxelSize, const std::string& voxelUnit,
+                    double pixelsPerVoxel)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -379,9 +380,16 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     axes.push_back(makeAxis("x"));
     ms["axes"] = std::move(axes);
     ms["datasets"] = Json::array();
+    // The two axes scale independently of each other: in-plane, one output
+    // pixel spans 1/pixelsPerVoxel base voxels; through-plane, adjacent output
+    // layers sit sliceStep base voxels apart. Pyramid levels halve only YX.
+    const double px = (std::isfinite(pixelsPerVoxel) && pixelsPerVoxel > 0.0)
+        ? pixelsPerVoxel : 1.0;
+    const double step = (std::isfinite(sliceStep) && sliceStep > 0.0)
+        ? sliceStep : 1.0;
     for (int l = 0; l <= 5; l++) {
-        const double sYX = baseVoxelSize * std::pow(2.0, l);
-        const double sZ = baseVoxelSize;
+        const double sYX = baseVoxelSize / px * std::pow(2.0, l);
+        const double sZ = baseVoxelSize * step;
         Json scale_arr = Json::array();
         scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
         Json trans_arr = Json::array();

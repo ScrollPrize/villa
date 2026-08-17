@@ -2,12 +2,14 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QFutureWatcher>
 
 #include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -15,12 +17,17 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+
+#include <array>
 
 class QMdiArea;
 class QTimer;
+class AxisAlignedSliceController;
 class CChunkedVolumeViewer;
 class CState;
+struct POI;
 class QWidget;
 class VCCollection;
 class SegmentationOverlayController;
@@ -51,6 +58,11 @@ public:
     ViewerManager(CState* state,
                   VCCollection* points,
                   QObject* parent = nullptr);
+    ~ViewerManager() override;
+
+    // All live managers (one per workspace). Use to apply user preferences
+    // uniformly so viewers behave the same across workspaces.
+    static const std::vector<ViewerManager*>& allManagers();
 
     VolumeViewerBase* createViewer(const std::string& surfaceName,
                                    const QString& title,
@@ -77,6 +89,17 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
+    // Re-read the derived surface-cache settings. Called during manager
+    // construction and whenever the settings dialog applies.
+    void applyViewerCacheSettings();
+
+    // --- SurfaceCache budgets (flattened segmentation view) ---
+    //
+    // Zero disables a channel and leaves it on the legacy render path.
+    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
+    std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
+    std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
+
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
@@ -91,6 +114,8 @@ public:
 
     void setOverlayColormap(const std::string& colormapId);
     const std::string& overlayColormap() const { return _overlayColormapId; }
+    void setOverlaySamplingMethod(vc::Sampling method);
+    vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayThreshold(float threshold);
     float overlayThreshold() const { return _overlayWindowLow; }
 
@@ -123,6 +148,73 @@ public:
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
+    // Registered automatically by AxisAlignedSliceController::setViewerManager.
+    void setAxisAlignedSliceController(AxisAlignedSliceController* slices) { _slices = slices; }
+    AxisAlignedSliceController* axisAlignedSliceController() const { return _slices; }
+
+    // --- Focus / navigation policy shared by all workspaces ---
+    // Ensure the "focus" POI exists and lies inside the current volume: a
+    // missing POI (or resetToCenter) is placed at the volume center, an
+    // existing one is clamped to the volume bounds. overridePoint /
+    // overrideNormal (already in the new volume's space) win when provided.
+    // Returns false when no volume is set.
+    bool resetFocusForVolumeChange(bool resetToCenter,
+                                   const std::optional<cv::Vec3f>& overridePoint = std::nullopt,
+                                   const std::optional<cv::Vec3f>& overrideNormal = std::nullopt);
+    // Move the focus POI to a volume position and reorient the slice planes
+    // around it (also nudges the segmentation viewer when the point projects
+    // onto the active surface).
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
+    // centerFocusAt() at the volume position under the mouse cursor: prefers
+    // the viewer under the cursor, then scans all visible viewer viewports.
+    bool centerFocusOnCursor();
+    bool recenterViewersOnCurrentFocus();
+    void recenterPlaneViewersOn(const cv::Vec3f& position);
+    void recenterSegmentationViewerNear(const cv::Vec3f& position);
+    VolumeViewerBase* segmentationViewer() const;
+
+    // Last viewer the user interacted with (mouse press / zoom / cursor move);
+    // null when none or while it is being torn down.
+    VolumeViewerBase* activeViewer() const;
+
+    // Runs before the default volume-click policy (Shift ignored, Ctrl+click
+    // centers the focus); return true to consume the click.
+    using VolumeClickInterceptor = std::function<bool(const cv::Vec3f& volLoc,
+                                                      const cv::Vec3f& normal,
+                                                      Surface* surf,
+                                                      Qt::MouseButton button,
+                                                      Qt::KeyboardModifiers modifiers)>;
+    void setVolumeClickInterceptor(VolumeClickInterceptor interceptor) { _volumeClickInterceptor = std::move(interceptor); }
+
+    // --- Volume-switch policy shared by all workspaces ---
+    // Snapshot of per-viewer cameras and view centers, retargetable through an
+    // affine coordinate transform after a volume switch.
+    struct ViewerNavigationSnapshot;
+    std::shared_ptr<ViewerNavigationSnapshot> captureNavigation() const;
+    void restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
+                           const cv::Matx44d& transform);
+    // Set the volume on the state, re-derive the focus POI (volume-centered
+    // when new/absent, clamped otherwise, transformed when a coordinate
+    // transform is supplied) and retarget the captured viewer navigation.
+    void switchVolume(std::shared_ptr<Volume> volume,
+                      const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+
+    // --- Fleet setters: apply a viewer preference to every viewer ---
+    void setShowDirectionHints(bool show);
+    void setShowSurfaceNormals(bool show);
+    void setPlaneIntersectionLinesVisible(bool visible);
+    void setSurfaceOverlaysEnabled(bool enabled);
+    void setSurfaceOverlapThreshold(float threshold);
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
+
+    // --- Reset-view-on-surface-change policy ---
+    // Store the new default on every viewer, keeping the segmentation viewer
+    // suppressed while a segmentation edit session is active.
+    void setResetViewOnSurfaceChangeDefault(bool enabled);
+    // Temporarily force the segmentation viewers off (true) or restore their
+    // stored defaults (false).
+    void setSegmentationResetViewSuppressed(bool suppressed);
+
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
     void broadcastLinkedCursor(VolumeViewerBase* source,
@@ -150,6 +242,15 @@ public:
 signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
+    void currentVolumeChanged();
+    // Emitted whenever the user explicitly places the focus (Ctrl+click,
+    // focus-on-cursor key, point activation, ...).
+    void focusCenteredByUser(const cv::Vec3f& position);
+    // Emitted on Ctrl+Shift+click in a slice view when a patch lies under the
+    // clicked point; the owner should make that patch the active segment.
+    void surfaceActivationRequested(const std::string& surfaceId);
+    // Aggregated per-viewer cache statistics (RAM / disk / network).
+    void sharedCacheStatsChanged(const QStringList& items);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
@@ -158,6 +259,9 @@ signals:
 
 private slots:
     void onGlobalTick();
+    void handleFocusPoiChanged(std::string name, POI* poi);
+    void handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
+                             Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void handleSurfacePatchIndexPrimeFinished();
     void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -189,9 +293,11 @@ private:
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
     void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
     void startNextSurfacePatchIndexTask();
+    void scheduleSurfacePatchIndexOverlayRefresh();
 
     CState* _state;
     VCCollection* _points;
+    AxisAlignedSliceController* _slices{nullptr};
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
     RawPointsOverlayController* _rawPointsOverlay{nullptr};
@@ -205,6 +311,8 @@ private:
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
+    VolumeViewerBase* _activeViewer{nullptr};
+    VolumeClickInterceptor _volumeClickInterceptor;
     // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
@@ -215,6 +323,7 @@ private:
     std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     int _overlayMaxDisplayedResolution{0};
@@ -226,6 +335,9 @@ private:
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
+
+    std::size_t _surfaceCacheBudgetBytes{0};
+    std::size_t _overlaySurfaceCacheBudgetBytes{0};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
@@ -241,6 +353,9 @@ private:
     QString _surfacePatchIndexCacheKey;
     void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
+    // A first surface entering an empty index has no other builder.
+    bool _surfacePatchIndexPrimeQueued{false};
+    void schedulePrimeSurfacePatchIndices();
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
@@ -248,6 +363,7 @@ private:
     std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
     QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
+    bool _surfacePatchIndexOverlayRefreshPending{false};
 
     // Surfaces currently pinned in the LRU as "highlighted/visible".
     // We track them so we can unpin the right set when highlights change.

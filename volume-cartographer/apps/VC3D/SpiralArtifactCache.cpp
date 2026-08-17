@@ -1,0 +1,564 @@
+#include "SpiralArtifactCache.hpp"
+
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QFutureWatcher>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QRegularExpression>
+#include <QStandardPaths>
+#include <QtConcurrent/QtConcurrent>
+
+namespace {
+constexpr int kManifestTimeoutMs = 30000;
+constexpr int kFileTimeoutMs = 60 * 60 * 1000; // bounded by transfer, effectively
+constexpr qint64 kMaxDeclaredTotalBytes = 64LL * 1024 * 1024 * 1024;
+constexpr int kMaxFiles = 4096;
+// Artifact files are transferred concurrently: the preview's coordinate
+// rasters are large and independent, and a strictly serial chain left the
+// link idle for a whole round trip between them.
+constexpr int kMaxConcurrentFiles = 4;
+const QString kManifestCopyName = QStringLiteral(".artifact-manifest.json");
+
+bool isSafeRelativeName(const QString& name)
+{
+    if (name.isEmpty() || name.size() > 1024 || name.startsWith(QLatin1Char('/'))
+        || name.contains(QLatin1Char('\\')))
+        return false;
+    const QStringList parts = name.split(QLatin1Char('/'));
+    if (parts.size() > 8) return false;
+    for (const QString& part : parts) {
+        if (part.isEmpty() || part == QStringLiteral(".") || part == QStringLiteral(".."))
+            return false;
+        if (part == kManifestCopyName) return false;
+    }
+    return true;
+}
+
+QString hashFileSha256(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file)) return {};
+    return QString::fromLatin1(hash.result().toHex());
+}
+} // namespace
+
+struct SpiralArtifactCache::FetchJob
+{
+    quint64 generation = 0;
+    QString sessionId;
+    QString artifactId;
+    QJsonObject manifest;
+    QString entryPoint;
+    QList<QJsonObject> pendingFiles;
+    int totalFiles = 0;
+    int filesComplete = 0;
+    int inFlight = 0;
+    qint64 totalBytes = 0;
+    qint64 bytesComplete = 0;
+    // Bytes held by transfers that have not been verified yet, so progress
+    // stays monotonic while several files are in flight.
+    qint64 bytesInFlight = 0;
+    // Set by the first outcome, success or failure: with concurrent
+    // transfers several callbacks can still arrive after the job is over.
+    bool settled = false;
+    QString partialDir;
+    QString finalDir;
+    FetchCallback done;
+};
+
+SpiralArtifactCache::SpiralArtifactCache(QObject* parent) : QObject(parent) {}
+
+QString SpiralArtifactCache::cacheRoot() const
+{
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation))
+        .filePath(QStringLiteral("spiral"));
+}
+
+void SpiralArtifactCache::setEndpoint(const QString& fingerprint,
+                                      QNetworkAccessManager* network,
+                                      RequestFactory requestFactory)
+{
+    _fingerprint = fingerprint;
+    _network = network;
+    _requestFactory = std::move(requestFactory);
+    ++_generation;
+}
+
+void SpiralArtifactCache::clearEndpoint()
+{
+    _network = nullptr;
+    _requestFactory = {};
+    ++_generation;
+}
+
+bool SpiralArtifactCache::validateManifest(const QJsonObject& manifest, QString* error)
+{
+    if (manifest.value(QStringLiteral("schema_version")).toInt() != 1) {
+        *error = QObject::tr("Unsupported artifact manifest schema");
+        return false;
+    }
+    const QJsonArray files = manifest.value(QStringLiteral("files")).toArray();
+    if (files.isEmpty() || files.size() > kMaxFiles) {
+        *error = QObject::tr("Artifact manifest has an unreasonable file count");
+        return false;
+    }
+    qint64 total = 0;
+    for (const QJsonValue& value : files) {
+        const QJsonObject entry = value.toObject();
+        const QString name = entry.value(QStringLiteral("name")).toString();
+        const qint64 size = entry.value(QStringLiteral("size")).toInteger(-1);
+        const QString sha = entry.value(QStringLiteral("sha256")).toString();
+        if (!isSafeRelativeName(name) || size < 0 || sha.size() != 64) {
+            *error = QObject::tr("Artifact manifest contains an unsafe or malformed entry (%1)").arg(name);
+            return false;
+        }
+        total += size;
+    }
+    if (total > kMaxDeclaredTotalBytes) {
+        *error = QObject::tr("Artifact manifest declares an unreasonable total size");
+        return false;
+    }
+    const QString entryPoint = manifest.value(QStringLiteral("entry_point")).toString();
+    if (!isSafeRelativeName(entryPoint)) {
+        *error = QObject::tr("Artifact manifest has an unsafe entry point");
+        return false;
+    }
+    return true;
+}
+
+bool SpiralArtifactCache::isDeferredPreviewFile(const QString& name)
+{
+    if (name.startsWith(QStringLiteral("loss-maps/"))) return true;
+    const QString fileName = name.section(QLatin1Char('/'), -1);
+    return fileName == QStringLiteral("model.pt")
+        || fileName == QStringLiteral("flatten-model.pt");
+}
+
+void SpiralArtifactCache::fetchArtifact(const QString& sessionId, const QString& artifactId,
+                                        FetchCallback done)
+{
+    if (!_network || !_requestFactory) {
+        done({}, tr("No Spiral service connection"), false);
+        return;
+    }
+    static const QRegularExpression safeId(QStringLiteral("^[A-Za-z0-9._-]+$"));
+    if (!safeId.match(artifactId).hasMatch() || !safeId.match(sessionId).hasMatch()) {
+        done({}, tr("Malformed artifact reference"), false);
+        return;
+    }
+    auto job = std::make_shared<FetchJob>();
+    job->generation = _generation;
+    job->sessionId = sessionId;
+    job->artifactId = artifactId;
+    job->finalDir = QDir(cacheRoot()).filePath(_fingerprint + QLatin1Char('/')
+                                               + sessionId + QLatin1Char('/') + artifactId);
+    job->partialDir = job->finalDir + QStringLiteral(".partial");
+    job->done = std::move(done);
+
+    // A published cache directory contains the complete core artifact.
+    // Deferred diagnostics may be added later after individual verification;
+    // client-unneeded model checkpoints remain absent.
+    const QString publishedManifest = QDir(job->finalDir).filePath(kManifestCopyName);
+    if (QFileInfo::exists(publishedManifest)) {
+        QFile file(publishedManifest);
+        if (file.open(QIODevice::ReadOnly)) {
+            const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
+            const QString entry = manifest.value(QStringLiteral("entry_point")).toString();
+            if (isSafeRelativeName(entry)
+                && QFileInfo::exists(QDir(job->finalDir).filePath(entry))) {
+                job->done(QDir(job->finalDir).filePath(entry), {}, false);
+                return;
+            }
+        }
+        QDir(job->finalDir).removeRecursively();
+    }
+
+    QNetworkRequest request = _requestFactory(
+        QStringLiteral("/artifacts/%1/manifest").arg(artifactId), kManifestTimeoutMs);
+    auto* reply = _network->get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, job]() {
+        const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray bytes = reply->readAll();
+        const QString networkError =
+            reply->error() == QNetworkReply::NoError ? QString() : reply->errorString();
+        reply->deleteLater();
+        if (job->generation != _generation) return;
+        if (http == 410) { finishJob(job, tr("Artifact was pruned by the service"), true); return; }
+        const QJsonObject manifest = QJsonDocument::fromJson(bytes).object();
+        if (http != 200 || manifest.isEmpty()) {
+            finishJob(job, tr("Could not fetch artifact manifest: %1")
+                               .arg(!networkError.isEmpty()
+                                        ? networkError
+                                        : manifest.value(QStringLiteral("error"))
+                                              .toString(tr("HTTP %1").arg(http))));
+            return;
+        }
+        QString error;
+        if (!validateManifest(manifest, &error)) { finishJob(job, error); return; }
+        job->manifest = manifest;
+        job->entryPoint = manifest.value(QStringLiteral("entry_point")).toString();
+        // Both preview artifacts defer the same files: the surface never
+        // carries overlays, and the diagnostics artifact is almost entirely
+        // overlays, which are fetched only when one is actually displayed.
+        const QString kind = manifest.value(QStringLiteral("kind")).toString();
+        const bool preview = kind == QStringLiteral("spiral-preview")
+            || kind == QStringLiteral("spiral-preview-diagnostics");
+        for (const QJsonValue& value : manifest.value(QStringLiteral("files")).toArray()) {
+            const QJsonObject entry = value.toObject();
+            if (preview
+                && isDeferredPreviewFile(entry.value(QStringLiteral("name")).toString()))
+                continue;
+            job->pendingFiles.push_back(entry);
+            job->totalBytes += entry.value(QStringLiteral("size")).toInteger();
+        }
+        job->totalFiles = job->pendingFiles.size();
+        emit fetchProgress(job->artifactId, QStringLiteral("starting"), QString(),
+                           0, job->totalFiles, 0, job->totalBytes);
+        if (!QDir().mkpath(job->partialDir)) {
+            finishJob(job, tr("Could not create the artifact cache directory"));
+            return;
+        }
+        pumpFiles(job);
+    });
+}
+
+void SpiralArtifactCache::fetchFile(const QString& sessionId, const QString& artifactId,
+                                    const QString& relativeName, FetchFileCallback done)
+{
+    if (!_network || !_requestFactory) {
+        done({}, tr("No Spiral service connection"), false);
+        return;
+    }
+    static const QRegularExpression safeId(QStringLiteral("^[A-Za-z0-9._-]+$"));
+    if (!safeId.match(artifactId).hasMatch() || !safeId.match(sessionId).hasMatch()
+        || !isSafeRelativeName(relativeName)) {
+        done({}, tr("Malformed artifact file reference"), false);
+        return;
+    }
+
+    const quint64 generation = _generation;
+    const QString finalDir =
+        QDir(cacheRoot()).filePath(_fingerprint + QLatin1Char('/')
+                                   + sessionId + QLatin1Char('/') + artifactId);
+    QFile manifestFile(QDir(finalDir).filePath(kManifestCopyName));
+    if (!manifestFile.open(QIODevice::ReadOnly)) {
+        done({}, tr("The Spiral artifact is not available in the local cache"), false);
+        return;
+    }
+    const QJsonObject manifest =
+        QJsonDocument::fromJson(manifestFile.readAll()).object();
+    QJsonObject declared;
+    for (const QJsonValue& value : manifest.value(QStringLiteral("files")).toArray()) {
+        const QJsonObject entry = value.toObject();
+        if (entry.value(QStringLiteral("name")).toString() == relativeName) {
+            declared = entry;
+            break;
+        }
+    }
+    if (declared.isEmpty()) {
+        done({}, tr("The Spiral artifact does not declare file %1").arg(relativeName), false);
+        return;
+    }
+
+    const qint64 declaredSize = declared.value(QStringLiteral("size")).toInteger(-1);
+    const QString declaredSha =
+        declared.value(QStringLiteral("sha256")).toString().toLower();
+    const QString targetPath = QDir(finalDir).filePath(relativeName);
+    const QString partialPath = targetPath + QStringLiteral(".partial");
+    if (!QDir().mkpath(QFileInfo(targetPath).absolutePath())) {
+        done({}, tr("Could not create the artifact file cache directory"), false);
+        return;
+    }
+
+    auto verify = [this, generation, relativeName, declaredSize, declaredSha,
+                   targetPath, done](const QString& path, bool publish) {
+        auto* watcher = new QFutureWatcher<QString>(this);
+        connect(watcher, &QFutureWatcher<QString>::finished, this,
+                [this, watcher, generation, targetPath, path, publish, done]() {
+            const QString error = watcher->result();
+            watcher->deleteLater();
+            if (generation != _generation) return;
+            if (!error.isEmpty()) {
+                QFile::remove(path);
+                done({}, error, false);
+                return;
+            }
+            if (publish) {
+                QFile::remove(targetPath);
+                if (!QFile::rename(path, targetPath)) {
+                    done({}, tr("Could not publish the downloaded artifact file"), false);
+                    return;
+                }
+            }
+            done(targetPath, {}, false);
+        });
+        watcher->setFuture(QtConcurrent::run(
+            [relativeName, declaredSize, declaredSha, path]() -> QString {
+                const qint64 actualSize = QFileInfo(path).size();
+                if (actualSize != declaredSize)
+                    return tr("Artifact file %1 has %2 bytes; the manifest declares %3")
+                        .arg(relativeName).arg(actualSize).arg(declaredSize);
+                if (hashFileSha256(path) != declaredSha)
+                    return tr("Artifact file %1 failed its SHA-256 digest check")
+                        .arg(relativeName);
+                return {};
+            }));
+    };
+
+    if (QFileInfo::exists(targetPath)) {
+        verify(targetPath, false);
+        return;
+    }
+
+    QFile::remove(partialPath);
+    auto file = std::make_shared<QFile>(partialPath);
+    if (!file->open(QIODevice::WriteOnly)) {
+        done({}, tr("Could not open cache file %1").arg(relativeName), false);
+        return;
+    }
+    QNetworkRequest request = _requestFactory(
+        QStringLiteral("/artifacts/%1/files/%2").arg(artifactId, relativeName),
+        kFileTimeoutMs);
+    QNetworkReply* reply = _network->get(request);
+    connect(reply, &QNetworkReply::readyRead, this, [reply, file]() {
+        file->write(reply->readAll());
+    });
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, file, generation, partialPath, verify, done]() {
+        file->write(reply->readAll());
+        file->close();
+        const int http =
+            reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const bool ok = reply->error() == QNetworkReply::NoError && http == 200;
+        const QString errorText = reply->errorString();
+        const bool gone = http == 410;
+        reply->deleteLater();
+        if (generation != _generation) return;
+        if (!ok) {
+            QFile::remove(partialPath);
+            done({}, gone ? tr("Artifact was pruned by the service")
+                          : tr("Downloading artifact file failed: %1").arg(errorText),
+                 gone);
+            return;
+        }
+        verify(partialPath, true);
+    });
+}
+
+void SpiralArtifactCache::pumpFiles(const std::shared_ptr<FetchJob>& job)
+{
+    if (job->generation != _generation || job->settled) return;
+    while (job->inFlight < kMaxConcurrentFiles && !job->pendingFiles.isEmpty()) {
+        const QJsonObject entry = job->pendingFiles.takeFirst();
+        ++job->inFlight;
+        startFile(job, entry);
+        // A local failure (an unopenable cache file) settles the job inside
+        // startFile; nothing further belongs in flight.
+        if (job->settled || job->generation != _generation) return;
+    }
+    if (job->inFlight == 0 && job->pendingFiles.isEmpty()) publishJob(job);
+}
+
+void SpiralArtifactCache::publishJob(const std::shared_ptr<FetchJob>& job)
+{
+    // Publish atomically: write the manifest copy, then rename the
+    // completed directory into place.
+    QFile manifestFile(QDir(job->partialDir).filePath(kManifestCopyName));
+    if (!manifestFile.open(QIODevice::WriteOnly)
+        || manifestFile.write(QJsonDocument(job->manifest).toJson(QJsonDocument::Compact)) < 0) {
+        finishJob(job, tr("Could not write the artifact manifest copy"));
+        return;
+    }
+    manifestFile.close();
+    QDir().mkpath(QFileInfo(job->finalDir).absolutePath());
+    QDir dir;
+    if (QFileInfo::exists(job->finalDir)) QDir(job->finalDir).removeRecursively();
+    if (!dir.rename(job->partialDir, job->finalDir)) {
+        finishJob(job, tr("Could not publish the artifact cache directory"));
+        return;
+    }
+    job->settled = true;
+    emit fetchProgress(job->artifactId, QStringLiteral("finished"), QString(),
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete, job->totalBytes);
+    job->done(QDir(job->finalDir).filePath(job->entryPoint), {}, false);
+}
+
+void SpiralArtifactCache::startFile(const std::shared_ptr<FetchJob>& job,
+                                    const QJsonObject& entry)
+{
+    const QString name = entry.value(QStringLiteral("name")).toString();
+    const qint64 declaredSize = entry.value(QStringLiteral("size")).toInteger();
+    const QString declaredSha = entry.value(QStringLiteral("sha256")).toString().toLower();
+
+    const QString targetPath = QDir(job->partialDir).filePath(name);
+    QDir().mkpath(QFileInfo(targetPath).absolutePath());
+
+    // A complete file from an interrupted earlier attempt is reused after
+    // verification; a shorter one resumes with a Range request.
+    qint64 existing = 0;
+    if (QFileInfo::exists(targetPath)) {
+        existing = QFileInfo(targetPath).size();
+        if (existing > declaredSize) {
+            QFile::remove(targetPath);
+            existing = 0;
+        }
+    }
+    job->bytesInFlight += existing;
+    emit fetchProgress(job->artifactId, QStringLiteral("downloading"), name,
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete + job->bytesInFlight, job->totalBytes);
+
+    auto file = std::make_shared<QFile>(targetPath);
+    if (!file->open(existing > 0 ? (QIODevice::WriteOnly | QIODevice::Append)
+                                 : QIODevice::WriteOnly)) {
+        finishJob(job, tr("Could not open cache file %1").arg(name));
+        return;
+    }
+
+    QNetworkRequest request = _requestFactory(
+        QStringLiteral("/artifacts/%1/files/%2").arg(job->artifactId, name), kFileTimeoutMs);
+    if (existing > 0 && existing < declaredSize)
+        request.setRawHeader("Range", QStringLiteral("bytes=%1-").arg(existing).toUtf8());
+    QNetworkReply* reply = existing == declaredSize ? nullptr : _network->get(request);
+
+    // Bytes this transfer has already contributed to the in-flight total.
+    auto reported = std::make_shared<qint64>(existing);
+    auto streamedDigest = std::make_shared<QString>();
+    auto verifyAndContinue = [this, job, name, declaredSize, declaredSha,
+                              targetPath, streamedDigest, reported]() {
+        emit fetchProgress(job->artifactId, QStringLiteral("verifying"), name,
+                           job->filesComplete, job->totalFiles,
+                           job->bytesComplete + job->bytesInFlight,
+                           job->totalBytes);
+        auto* watcher = new QFutureWatcher<QString>(this);
+        connect(watcher, &QFutureWatcher<QString>::finished, this,
+                [this, watcher, job, name, declaredSize, reported]() {
+            const QString error = watcher->result();
+            watcher->deleteLater();
+            if (job->generation != _generation || job->settled) return;
+            --job->inFlight;
+            job->bytesInFlight -= *reported;
+            if (!error.isEmpty()) { finishJob(job, error); return; }
+            ++job->filesComplete;
+            job->bytesComplete += declaredSize;
+            emit fetchProgress(job->artifactId, QStringLiteral("downloaded"), name,
+                               job->filesComplete, job->totalFiles,
+                               job->bytesComplete + job->bytesInFlight,
+                               job->totalBytes);
+            pumpFiles(job);
+        });
+        watcher->setFuture(QtConcurrent::run(
+            [name, declaredSize, declaredSha, targetPath,
+             streamedDigest]() -> QString {
+            const qint64 actualSize = QFileInfo(targetPath).size();
+            if (actualSize != declaredSize)
+                return tr("Artifact file %1 has %2 bytes; the manifest declares %3")
+                    .arg(name).arg(actualSize).arg(declaredSize);
+            const QString actualSha = streamedDigest->isEmpty()
+                ? hashFileSha256(targetPath)
+                : *streamedDigest;
+            if (actualSha != declaredSha)
+                return tr("Artifact file %1 failed its SHA-256 digest check").arg(name);
+            return {};
+        }));
+    };
+
+    if (!reply) { verifyAndContinue(); return; }
+
+    auto streamHash = existing == 0
+        ? std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256)
+        : std::shared_ptr<QCryptographicHash>();
+    connect(reply, &QNetworkReply::readyRead, this,
+            [reply, file, streamHash]() {
+        const QByteArray bytes = reply->readAll();
+        if (streamHash) streamHash->addData(bytes);
+        file->write(bytes);
+    });
+    connect(reply, &QNetworkReply::downloadProgress, this,
+            [this, job, name, existing, reported](qint64 received, qint64) {
+                const qint64 total = existing + qMax<qint64>(0, received);
+                job->bytesInFlight += total - *reported;
+                *reported = total;
+                emit fetchProgress(
+                    job->artifactId, QStringLiteral("downloading"), name,
+                    job->filesComplete, job->totalFiles,
+                    job->bytesComplete + job->bytesInFlight, job->totalBytes);
+            });
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, file, job, name, verifyAndContinue,
+             streamHash, streamedDigest, reported]() {
+                const QByteArray bytes = reply->readAll();
+                if (streamHash) streamHash->addData(bytes);
+                file->write(bytes);
+                file->close();
+                const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                const bool ok = reply->error() == QNetworkReply::NoError
+                    && (http == 200 || http == 206);
+                const QString errorText = reply->errorString();
+                const bool gone = http == 410;
+                reply->deleteLater();
+                if (job->generation != _generation || job->settled) return;
+                if (gone || !ok) {
+                    --job->inFlight;
+                    job->bytesInFlight -= *reported;
+                }
+                if (gone) { finishJob(job, tr("Artifact was pruned by the service"), true); return; }
+                if (!ok) {
+                    finishJob(job, tr("Downloading artifact file %1 failed: %2").arg(name, errorText));
+                    return;
+                }
+                if (streamHash)
+                    *streamedDigest =
+                        QString::fromLatin1(streamHash->result().toHex());
+                verifyAndContinue();
+            });
+}
+
+void SpiralArtifactCache::finishJob(const std::shared_ptr<FetchJob>& job,
+                                    const QString& error, bool gone)
+{
+    // Concurrent transfers can fail together; only the first outcome is the
+    // job's outcome, and the caller is told once.
+    if (job->settled) return;
+    job->settled = true;
+    // Keep the partial directory: verified complete files resume a later fetch.
+    emit fetchProgress(job->artifactId, QStringLiteral("failed"), QString(),
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete, job->totalBytes);
+    job->done({}, error, gone);
+}
+
+void SpiralArtifactCache::pruneSession(const QString& sessionId, int keep,
+                                       const QStringList& pinned)
+{
+    if (_fingerprint.isEmpty()) return;
+    const QDir sessionDir(QDir(cacheRoot()).filePath(_fingerprint + QLatin1Char('/') + sessionId));
+    if (!sessionDir.exists()) return;
+    QFileInfoList entries = sessionDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
+                                                     QDir::Time); // newest first
+    int kept = 0;
+    for (const QFileInfo& entry : entries) {
+        const QString path = entry.absoluteFilePath();
+        const bool isPartial = path.endsWith(QStringLiteral(".partial"));
+        bool isPinned = false;
+        for (const QString& pin : pinned)
+            if (!pin.isEmpty() && (pin == path || pin.startsWith(path + QLatin1Char('/'))))
+                isPinned = true;
+        if (isPinned) continue;
+        if (!isPartial && kept < keep) { ++kept; continue; }
+        // Partial directories older than a day are abandoned resumes.
+        if (isPartial && entry.lastModified().secsTo(QDateTime::currentDateTime()) < 86400)
+            continue;
+        QDir(path).removeRecursively();
+    }
+}

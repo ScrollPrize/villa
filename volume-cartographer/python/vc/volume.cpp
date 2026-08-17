@@ -4,6 +4,7 @@
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include <Python.h>
@@ -20,7 +21,10 @@
 #include <vector>
 
 #include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/Volume.hpp"
 
 namespace nb = nanobind;
@@ -62,6 +66,15 @@ nb::object jsonToPython(const utils::Json& json)
 nb::tuple tuple3(const std::array<int, 3>& value)
 {
     return nb::make_tuple(value[0], value[1], value[2]);
+}
+
+vc::Sampling parseSampling(const std::string& value)
+{
+    if (value == "nearest")
+        return vc::Sampling::Nearest;
+    if (value == "trilinear")
+        return vc::Sampling::Trilinear;
+    throw std::invalid_argument("sampling must be one of: nearest, trilinear");
 }
 
 template <typename T>
@@ -183,6 +196,103 @@ void copyChunkIntersection(std::vector<T>& out,
 }
 
 template <typename T>
+void sampleBlockChunkIntersection(std::vector<T>& out,
+                                  std::vector<uint8_t>& valid,
+                                  const std::array<size_t, 3>& outShape,
+                                  const std::array<int, 3>& requestOffset,
+                                  const std::array<int, 3>& chunkShape,
+                                  int level,
+                                  int cz,
+                                  int cy,
+                                  int cx,
+                                  vc::render::IChunkedArray& cache,
+                                  bool blocking,
+                                  T fill,
+                                  vc::render::ChunkedPlaneSampler::Stats& stats)
+{
+    const int chunkBaseZ = cz * chunkShape[0];
+    const int chunkBaseY = cy * chunkShape[1];
+    const int chunkBaseX = cx * chunkShape[2];
+
+    const int64_t reqZ0 = requestOffset[0];
+    const int64_t reqY0 = requestOffset[1];
+    const int64_t reqX0 = requestOffset[2];
+    const int64_t reqZ1 = reqZ0 + static_cast<int64_t>(outShape[0]);
+    const int64_t reqY1 = reqY0 + static_cast<int64_t>(outShape[1]);
+    const int64_t reqX1 = reqX0 + static_cast<int64_t>(outShape[2]);
+
+    const int z0 = static_cast<int>(std::max<int64_t>(reqZ0, chunkBaseZ));
+    const int y0 = static_cast<int>(std::max<int64_t>(reqY0, chunkBaseY));
+    const int x0 = static_cast<int>(std::max<int64_t>(reqX0, chunkBaseX));
+    const int z1 = static_cast<int>(std::min<int64_t>(reqZ1, chunkBaseZ + chunkShape[0]));
+    const int y1 = static_cast<int>(std::min<int64_t>(reqY1, chunkBaseY + chunkShape[1]));
+    const int x1 = static_cast<int>(std::min<int64_t>(reqX1, chunkBaseX + chunkShape[2]));
+    if (z0 >= z1 || y0 >= y1 || x0 >= x1)
+        return;
+
+    auto result = blocking
+        ? cache.getChunkBlocking(level, cz, cy, cx)
+        : cache.tryGetChunk(level, cz, cy, cx);
+    if (result.status == vc::render::ChunkStatus::Error) {
+        ++stats.errorChunks;
+        throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+    }
+    if (blocking && result.status == vc::render::ChunkStatus::MissQueued) {
+        ++stats.errorChunks;
+        throw std::runtime_error(
+            "blocking requested-level block sampling received unresolved chunk after getChunkBlocking");
+    }
+    if (result.status == vc::render::ChunkStatus::MissQueued)
+        return;
+    if (result.status == vc::render::ChunkStatus::Missing)
+        ++stats.missingChunks;
+
+    const size_t copyCount = static_cast<size_t>(x1 - x0);
+    const size_t dstStrideY = outShape[2];
+    const size_t dstStrideZ = outShape[1] * dstStrideY;
+
+    const bool fillOnly = result.status == vc::render::ChunkStatus::AllFill ||
+                          result.status == vc::render::ChunkStatus::Missing;
+    const T fillValue = result.status == vc::render::ChunkStatus::Missing ? T{} : fill;
+    const T* srcData = nullptr;
+    size_t srcStrideY = 0;
+    size_t srcStrideZ = 0;
+    if (!fillOnly) {
+        if (!result.bytes)
+            throw std::runtime_error("chunk payload is missing for data chunk");
+        const size_t expectedBytes = static_cast<size_t>(chunkShape[0]) *
+                                     static_cast<size_t>(chunkShape[1]) *
+                                     static_cast<size_t>(chunkShape[2]) *
+                                     sizeof(T);
+        if (result.bytes->size() < expectedBytes)
+            throw std::runtime_error("chunk payload is smaller than expected");
+        srcData = reinterpret_cast<const T*>(result.bytes->data());
+        srcStrideY = static_cast<size_t>(chunkShape[2]);
+        srcStrideZ = static_cast<size_t>(chunkShape[1]) * srcStrideY;
+    }
+
+    for (int z = z0; z < z1; ++z) {
+        const size_t srcZ = static_cast<size_t>(z - chunkBaseZ);
+        const size_t dstZ = static_cast<size_t>(z - requestOffset[0]);
+        for (int y = y0; y < y1; ++y) {
+            const size_t srcY = static_cast<size_t>(y - chunkBaseY);
+            const size_t srcX = static_cast<size_t>(x0 - chunkBaseX);
+            const size_t dstY = static_cast<size_t>(y - requestOffset[1]);
+            const size_t dstX = static_cast<size_t>(x0 - requestOffset[2]);
+            const size_t dst = dstZ * dstStrideZ + dstY * dstStrideY + dstX;
+            if (fillOnly) {
+                std::fill_n(out.data() + dst, copyCount, fillValue);
+            } else {
+                const size_t src = srcZ * srcStrideZ + srcY * srcStrideY + srcX;
+                std::memcpy(out.data() + dst, srcData + src, copyCount * sizeof(T));
+            }
+            std::fill_n(valid.data() + dst, copyCount, uint8_t{1});
+            stats.coveredPixels += static_cast<int>(copyCount);
+        }
+    }
+}
+
+template <typename T>
 nb::object readZYXTypedSlow(Volume& volume,
                             const std::array<int, 3>& offset,
                             const std::array<size_t, 3>& shape,
@@ -291,6 +401,88 @@ nb::object readXYZ(Volume& volume,
     if (volume.dtype() == vc::render::ChunkDtype::UInt8)
         return readXYZTyped<uint8_t>(volume, offset, shape, level, missingPolicy);
     return readXYZTyped<uint16_t>(volume, offset, shape, level, missingPolicy);
+}
+
+std::vector<vc::render::ChunkKey> collectChunkKeys(Volume& volume,
+                                                   const std::array<int, 3>& offset,
+                                                   const std::array<size_t, 3>& shape,
+                                                   int level);
+
+nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats);
+
+template <typename T>
+nb::tuple sampleZYXBlockTyped(Volume& volume,
+                              const std::array<int, 3>& offset,
+                              const std::array<size_t, 3>& shape,
+                              int level,
+                              bool blocking)
+{
+    if (level < 0)
+        throw std::out_of_range("level must be non-negative");
+    if (!volume.hasScaleLevel(level))
+        throw std::out_of_range(
+            "requested missing zarr scale level " + std::to_string(level));
+
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    stats.requestedLevelOnly = true;
+    stats.fallbackLevels = 0;
+
+    std::vector<T> out(shape[0] * shape[1] * shape[2], T{});
+    std::vector<uint8_t> valid(out.size(), uint8_t{0});
+
+    const auto keys = collectChunkKeys(volume, offset, shape, level);
+    stats.requestedChunks = static_cast<int>(keys.size());
+    if (keys.empty()) {
+        nb::dict statsDict = statsToDict(stats);
+        statsDict["blocking_prefetch_chunks"] = 0;
+        return nb::make_tuple(
+            makeNumpyArray(std::move(out), shape),
+            makeNumpyArray(std::move(valid), shape),
+            statsDict);
+    }
+
+    {
+        nb::gil_scoped_release release;
+        auto* cache = volume.chunkedCache();
+        if (blocking)
+            cache->prefetchChunks(keys, false);
+        const auto chunkShape = cache->chunkShape(level);
+        const T fill = typedFill<T>(cache->fillValue());
+        for (const auto& key : keys) {
+            sampleBlockChunkIntersection(
+                out,
+                valid,
+                shape,
+                offset,
+                chunkShape,
+                level,
+                key.iz,
+                key.iy,
+                key.ix,
+                *cache,
+                blocking,
+                fill,
+                stats);
+        }
+    }
+
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
+    return nb::make_tuple(
+        makeNumpyArray(std::move(out), shape),
+        makeNumpyArray(std::move(valid), shape),
+        statsDict);
+}
+
+nb::tuple sampleZYXBlock(Volume& volume,
+                         const std::array<int, 3>& offset,
+                         const std::array<size_t, 3>& shape,
+                         int level,
+                         bool blocking)
+{
+    if (volume.dtype() == vc::render::ChunkDtype::UInt8)
+        return sampleZYXBlockTyped<uint8_t>(volume, offset, shape, level, blocking);
+    return sampleZYXBlockTyped<uint16_t>(volume, offset, shape, level, blocking);
 }
 
 std::array<size_t, 3> checkedSizeArray(const std::array<int, 3>& value, const char* name)
@@ -454,11 +646,308 @@ nb::object readChunk(Volume& volume,
     return chunkResultToArray<uint16_t>(result, volume.fillValue());
 }
 
+using FloatCoords = nb::ndarray<float, nb::numpy, nb::c_contig>;
+using BoolMask = nb::ndarray<bool, nb::numpy, nb::c_contig>;
+
+void validatePlaneVectors(const FloatCoords& values,
+                          size_t planeCount,
+                          const char* name)
+{
+    if (values.ndim() != 2 || values.shape(0) != planeCount || values.shape(1) != 3) {
+        throw nb::value_error(
+            (std::string(name) + " must have shape [N, 3]").c_str());
+    }
+}
+
+cv::Mat_<cv::Vec3f> coordsArrayToMat(const FloatCoords& coords)
+{
+    if (coords.ndim() != 3 || coords.shape(2) != 3)
+        throw nb::value_error("coords_xyz must have shape [H, W, 3]");
+    const int h = static_cast<int>(coords.shape(0));
+    const int w = static_cast<int>(coords.shape(1));
+    cv::Mat_<cv::Vec3f> mat(h, w);
+    const float* src = coords.data();
+    for (int y = 0; y < h; ++y) {
+        auto* row = mat.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 3;
+            row[x] = cv::Vec3f(src[idx + 0], src[idx + 1], src[idx + 2]);
+        }
+    }
+    return mat;
+}
+
+cv::Mat_<uint8_t> skipCoverageFromValidMask(const BoolMask& validMask, int h, int w)
+{
+    if (validMask.ndim() != 2 || validMask.shape(0) != static_cast<size_t>(h) ||
+        validMask.shape(1) != static_cast<size_t>(w)) {
+        throw nb::value_error("valid_mask must have shape [H, W] matching coords");
+    }
+    cv::Mat_<uint8_t> coverage(h, w);
+    const bool* src = validMask.data();
+    for (int y = 0; y < h; ++y) {
+        auto* row = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+            row[x] = src[idx] ? uint8_t{0} : uint8_t{1};
+        }
+    }
+    return coverage;
+}
+
+nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats)
+{
+    nb::dict out;
+    out["covered_pixels"] = stats.coveredPixels;
+    out["requested_chunks"] = stats.requestedChunks;
+    out["error_chunks"] = stats.errorChunks;
+    out["missing_chunks"] = stats.missingChunks;
+    out["fallback_levels"] = stats.fallbackLevels;
+    out["requested_level_only"] = stats.requestedLevelOnly;
+    return out;
+}
+
+nb::tuple sampleCoords(Volume& volume,
+                       const FloatCoords& coordsXyz,
+                       const BoolMask& validMask,
+                       int level,
+                       const std::string& sampling,
+                       int tileSize,
+                       bool blocking)
+{
+    auto coords = coordsArrayToMat(coordsXyz);
+    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
+    cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    {
+        nb::gil_scoped_release release;
+        const vc::render::ChunkedPlaneSampler::Options options(
+            parseSampling(sampling), tileSize);
+        if (blocking) {
+            stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+                *volume.chunkedCache(),
+                level,
+                coords,
+                out,
+                coverage,
+                options);
+        } else {
+            stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                *volume.chunkedCache(),
+                level,
+                coords,
+                out,
+                coverage,
+                options);
+        }
+    }
+
+    std::vector<uint8_t> image(static_cast<size_t>(coords.rows) * static_cast<size_t>(coords.cols));
+    std::vector<uint8_t> sampledValid(image.size());
+    const bool* validSrc = validMask.data();
+    for (int y = 0; y < coords.rows; ++y) {
+        const auto* outRow = out.ptr<uint8_t>(y);
+        const auto* covRow = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < coords.cols; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(coords.cols) + static_cast<size_t>(x);
+            image[idx] = outRow[x];
+            sampledValid[idx] = (validSrc[idx] && covRow[x]) ? uint8_t{1} : uint8_t{0};
+        }
+    }
+
+    auto imageArr = makeNumpyArray<uint8_t>(std::move(image), {
+        static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
+    auto validArr = makeNumpyArray<uint8_t>(std::move(sampledValid), {
+        static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
+    return nb::make_tuple(imageArr, validArr, statsDict);
+}
+
+nb::tuple samplePlanes(Volume& volume,
+                       const FloatCoords& originsXyz,
+                       const FloatCoords& xStepsXyz,
+                       const FloatCoords& yStepsXyz,
+                       const std::array<int, 2>& shape,
+                       int level,
+                       const std::string& sampling,
+                       int tileSize)
+{
+    if (originsXyz.ndim() != 2 || originsXyz.shape(1) != 3)
+        throw nb::value_error("origins_xyz must have shape [N, 3]");
+    const size_t planeCount = originsXyz.shape(0);
+    if (planeCount == 0)
+        throw nb::value_error("at least one plane is required");
+    validatePlaneVectors(xStepsXyz, planeCount, "x_steps_xyz");
+    validatePlaneVectors(yStepsXyz, planeCount, "y_steps_xyz");
+    if (shape[0] <= 0 || shape[1] <= 0)
+        throw nb::value_error("shape must contain positive [height, width]");
+    if (level < 0)
+        throw std::out_of_range("level must be non-negative");
+    if (!volume.hasScaleLevel(level))
+        throw std::out_of_range("requested missing zarr scale level " + std::to_string(level));
+
+    const size_t height = static_cast<size_t>(shape[0]);
+    const size_t width = static_cast<size_t>(shape[1]);
+    if (planeCount > static_cast<size_t>(std::numeric_limits<int>::max()) / height)
+        throw std::overflow_error("stacked plane height exceeds OpenCV limits");
+
+    // Stack every plane into one coordinate image. The chunk sampler can then
+    // deduplicate and pin the union of dependencies once, which is substantially
+    // cheaper than one Python/native transition and one dependency walk per plane.
+    cv::Mat_<cv::Vec3f> coords(static_cast<int>(planeCount * height), shape[1]);
+    const float* origins = originsXyz.data();
+    const float* xSteps = xStepsXyz.data();
+    const float* ySteps = yStepsXyz.data();
+    for (size_t plane = 0; plane < planeCount; ++plane) {
+        const cv::Vec3f origin(
+            origins[3 * plane], origins[3 * plane + 1], origins[3 * plane + 2]);
+        const cv::Vec3f xStep(
+            xSteps[3 * plane], xSteps[3 * plane + 1], xSteps[3 * plane + 2]);
+        const cv::Vec3f yStep(
+            ySteps[3 * plane], ySteps[3 * plane + 1], ySteps[3 * plane + 2]);
+        for (size_t y = 0; y < height; ++y) {
+            auto* row = coords.ptr<cv::Vec3f>(static_cast<int>(plane * height + y));
+            const cv::Vec3f rowOrigin = origin + static_cast<float>(y) * yStep;
+            for (size_t x = 0; x < width; ++x)
+                row[x] = rowOrigin + static_cast<float>(x) * xStep;
+        }
+    }
+
+    const size_t pixelCount = planeCount * height * width;
+    std::vector<uint8_t> images(pixelCount, uint8_t{0});
+    std::vector<uint8_t> valid(pixelCount, uint8_t{0});
+    cv::Mat_<uint8_t> out(coords.rows, coords.cols, images.data());
+    cv::Mat_<uint8_t> coverage(coords.rows, coords.cols, valid.data());
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    {
+        nb::gil_scoped_release release;
+        stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            out,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = stats.requestedChunks;
+    const std::array<size_t, 3> outShape{planeCount, height, width};
+    return nb::make_tuple(
+        makeNumpyArray(std::move(images), outShape),
+        makeNumpyArray(std::move(valid), outShape),
+        statsDict);
+}
+
+std::string joinUrl(std::string base, const std::string& key)
+{
+    while (!base.empty() && base.back() == '/')
+        base.pop_back();
+    return base.empty() ? std::string{} : base + "/" + key;
+}
+
+nb::list chunkDependenciesToPython(
+    Volume& volume,
+    const std::vector<vc::render::ChunkKey>& keys)
+{
+    nb::list out;
+    const std::string remoteUrl = volume.remoteUrl();
+    auto* cache = dynamic_cast<vc::render::ChunkCache*>(volume.chunkedCache());
+    if (!cache)
+        throw std::runtime_error("VC3D dependency metadata requires a ChunkCache-backed volume");
+    for (const auto& key : keys) {
+        const auto dependency = cache->persistentChunkDependency(
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix);
+        nb::dict item;
+        item["level"] = key.level;
+        item["iz"] = key.iz;
+        item["iy"] = key.iy;
+        item["ix"] = key.ix;
+        item["key"] = std::to_string(key.level) + "/" +
+                      std::to_string(key.iz) + "/" +
+                      std::to_string(key.iy) + "/" +
+                      std::to_string(key.ix);
+        item["valid"] = dependency.valid;
+        item["remote_chunk_key"] = dependency.sourceChunkKey
+            ? *dependency.sourceChunkKey
+            : std::string{};
+        item["remote_url"] = dependency.sourceChunkKey
+            ? joinUrl(remoteUrl, *dependency.sourceChunkKey)
+            : std::string{};
+        item["cache_path"] = dependency.persistentPath.string();
+        item["empty_path"] = dependency.persistentEmptyPath.string();
+        item["persistent_extension"] = dependency.persistentExtension;
+        item["cache_payload_format"] = dependency.sourcePayloadMatchesPersistentCache
+            ? std::string{"source_bytes"}
+            : std::string{"unsupported"};
+        item["source_payload_matches_cache"] = dependency.sourcePayloadMatchesPersistentCache;
+        out.append(std::move(item));
+    }
+    return out;
+}
+
+nb::list collectCoordsDependencies(
+    Volume& volume,
+    const FloatCoords& coordsXyz,
+    const BoolMask& validMask,
+    int level,
+    const std::string& sampling,
+    int tileSize)
+{
+    auto coords = coordsArrayToMat(coordsXyz);
+    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
+    std::vector<vc::render::ChunkKey> keys;
+    {
+        nb::gil_scoped_release release;
+        keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+    return chunkDependenciesToPython(volume, keys);
+}
+
+nb::list collectBBoxDependencies(
+    Volume& volume,
+    const std::array<int, 3>& offset,
+    const std::array<size_t, 3>& shape,
+    int level)
+{
+    return chunkDependenciesToPython(
+        volume,
+        collectChunkKeys(volume, offset, shape, level));
+}
+
 } // namespace
 
 NB_MODULE(volume, m)
 {
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
+
+    m.def("set_chunk_cache_budget",
+          [](std::size_t bytes) {
+              if (bytes == 0)
+                  throw std::invalid_argument("bytes must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureDecodedByteCapacity(bytes);
+          },
+          "bytes"_a,
+          "Set the process-wide decoded regular-chunk cache capacity.");
+    m.def("set_chunk_cache_io_threads",
+          [](std::size_t count) {
+              if (count == 0)
+                  throw std::invalid_argument("count must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureFetchConcurrency(count, false);
+          },
+          "count"_a,
+          "Set fixed process-wide regular chunk source-read concurrency.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",
@@ -495,14 +984,17 @@ NB_MODULE(volume, m)
         .def("chunk_count", &Volume::chunkCount, "level"_a = 0)
         .def("has_scale_level", &Volume::hasScaleLevel, "level"_a)
         .def("present_scale_levels", &Volume::presentScaleLevels)
-        .def("set_cache_budget", &Volume::setCacheBudget, "bytes"_a)
-        .def("set_io_threads", &Volume::setIOThreads, "count"_a)
         .def("invalidate_cache", &Volume::invalidateCache)
         .def("read_zyx", &readZYX,
             "offset"_a,
             "shape"_a,
             "level"_a = 0,
             "missing_policy"_a = "error")
+        .def("sample_zyx_block", &sampleZYXBlock,
+            "offset"_a,
+            "shape"_a,
+            "level"_a = 0,
+            "blocking"_a = true)
         .def("read_xyz", &readXYZ,
             "offset"_a,
             "shape"_a,
@@ -517,6 +1009,34 @@ NB_MODULE(volume, m)
             "level"_a,
             "chunk_zyx"_a,
             "blocking"_a = true)
+        .def("sample_coords", &sampleCoords,
+            "coords_xyz"_a,
+            "valid_mask"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32,
+            "blocking"_a = true)
+        .def("sample_planes", &samplePlanes,
+            "origins_xyz"_a,
+            "x_steps_xyz"_a,
+            "y_steps_xyz"_a,
+            "shape"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32,
+            "Sample several arbitrary affine planes in one blocking, chunk-aware call. "
+            "Origins and step vectors use logical level-0 XYZ voxel coordinates; "
+            "returns (images, valid, stats) with image shape [N, H, W].")
+        .def("collect_coords_dependencies", &collectCoordsDependencies,
+            "coords_xyz"_a,
+            "valid_mask"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32)
+        .def("collect_bbox_dependencies", &collectBBoxDependencies,
+            "offset"_a,
+            "shape"_a,
+            "level"_a = 0)
         .def("__getitem__",
             [](Volume& self, const nb::object& key) {
                 const auto region = parseSliceKey(key, self.shape());

@@ -64,6 +64,16 @@ function metaDescription(scroll) {
   return plain.slice(0, 152).trimEnd() + "…";
 }
 
+
+// Distinct scan pixel sizes, finest first — "2.4 µm / 7.91 µm / …".
+function pixelSizesText(scroll) {
+  const px = [...new Set((scroll.scans || []).map((s) => s.px).filter((v) => v != null))].sort(
+    (a, b) => a - b,
+  );
+  if (!px.length) return scroll.min_px ? `${scroll.min_px} µm` : "—";
+  return px.map((v) => `${v} µm`).join(" / ");
+}
+
 export default function ScrollDetailPage(props) {
   useDarkModeGuard();
   // Seed from the build-time prop (SSR/instant paint), then refresh from live
@@ -114,8 +124,9 @@ export default function ScrollDetailPage(props) {
   const canonical = `${SITE}/data_browser/${scroll.id}`;
   const metaDesc = metaDescription(scroll);
   // Identify scrolls by their PHerc inventory name; keep "Scroll N" as a tag.
+  const label = scroll.label || scroll.id;
   const nick = scroll.display && scroll.display !== scroll.id ? scroll.display : null;
-  const pageTitle = `${scroll.id}${nick ? ` (${nick})` : ""} — Vesuvius Challenge`;
+  const pageTitle = `${label}${nick ? ` (${nick})` : ""} — Vesuvius Challenge`;
 
   // og:image: scroll photo, else the first readings image if present.
   const firstReading =
@@ -152,7 +163,7 @@ export default function ScrollDetailPage(props) {
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "Dataset",
-    name: scroll.id,
+    name: label,
     alternateName: scroll.display,
     description: metaDesc,
     url: canonical,
@@ -187,7 +198,7 @@ export default function ScrollDetailPage(props) {
             ← all scrolls
           </Link>
           <h1>
-            {scroll.id}
+            {label}
             {nick ? <span className="nick">{nick}</span> : null}
             <span
               className={`type ${scroll.type === "scroll" ? "" : "fragment"}`}
@@ -248,7 +259,7 @@ export default function ScrollDetailPage(props) {
                 <div className="fragview">
                   <img
                     src={photoThumb(photo, 1400)}
-                    alt={`Photograph of ${scroll.id}`}
+                    alt={`Photograph of ${label}`}
                     loading="lazy"
                     onError={(e) => {
                       e.currentTarget.src = photo;
@@ -304,17 +315,9 @@ export default function ScrollDetailPage(props) {
                   {unrolledPctTxt}
                 </dd>
                 <dt>Segments</dt>
-                <dd>
-                  {segmentsTxt}
-                  {progress.patches ? (
-                    <span style={{ color: "var(--dim)", fontSize: "12px" }}>
-                      {" "}
-                      / {Number(progress.patches).toLocaleString()} patches
-                    </span>
-                  ) : null}
-                </dd>
-                <dt>Min pixel size</dt>
-                <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
+                <dd>{segmentsTxt}</dd>
+                <dt>Available pixel sizes</dt>
+                <dd>{pixelSizesText(scroll)}</dd>
                 <dt>Scans</dt>
                 <dd>{scroll.n_scans}</dd>
                 <dt>Volumes</dt>
@@ -379,7 +382,7 @@ export default function ScrollDetailPage(props) {
             {/* About panel */}
             {scroll.note || scroll.desc ? (
               <div className="panel">
-                <h2>About this scroll</h2>
+                <h2>About this {scroll.type === "fragment" ? "fragment" : "scroll"}</h2>
                 {scroll.note ? (
                   <p className="txt">{stripMarkdown(scroll.note)}</p>
                 ) : null}
@@ -404,25 +407,6 @@ export default function ScrollDetailPage(props) {
               display={scroll.display}
             />
 
-            {/* Footer */}
-            <div className="footer">
-              {scroll._general || ""} &nbsp;·&nbsp;{" "}
-              <a
-                href="https://dl.ash2txt.org/"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                ash2txt data browser
-              </a>{" "}
-              ·{" "}
-              <a
-                href="/data"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                scrollprize.org/data
-              </a>
-            </div>
           </div>
         </div>
       </div>

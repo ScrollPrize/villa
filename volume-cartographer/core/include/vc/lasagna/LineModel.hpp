@@ -2,6 +2,7 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,19 @@ struct NormalSampleWithDerivative {
 struct NormalPrefetchReport {
     uint64_t requestedChunks = 0;
     uint64_t chunksRead = 0;
+    double cornerPrepareSeconds = 0.0;
+    double cornerLayoutSeconds = 0.0;
+    double cornerPinSeconds = 0.0;
+    double cornerGatherSeconds = 0.0;
+    uint64_t cornerLayoutChunkRuns = 0;
+    uint64_t cornerBoundaryPoints = 0;
+    uint64_t cornerDependencies = 0;
+    uint64_t cornerPointCount = 0;
+    uint64_t cornerUniqueVoxelCubes = 0;
+    uint64_t cornerWorkerTasks = 0;
+    uint64_t cornerMaxCandidatesPerCube = 0;
+    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+    std::vector<uint64_t> cornerDependencyIds;
 };
 
 struct NormalBatchReport {
@@ -36,6 +50,10 @@ struct NormalBatchReport {
 class NormalSampler {
 public:
     virtual ~NormalSampler() = default;
+    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
+    {
+        return false;
+    }
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
     [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const

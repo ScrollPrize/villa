@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/TifxyzIdentity.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -304,13 +305,14 @@ private:
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3 || argc > 4) {
-        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size]" << std::endl;
+    if (argc < 3) {
+        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size] [--uuid=<id>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
         std::cout << "  step_size: UV units per grid cell (default: 20)" << std::endl;
         std::cout << "             Scale will be 1/step_size (default: 0.05)" << std::endl;
+        std::cout << "  --uuid=<id>: Metadata UUID. Defaults to the output-directory basename." << std::endl;
         std::cout << std::endl;
         std::cout << "Example: " << argv[0] << " mesh.obj output_dir" << std::endl;
         std::cout << "Example: " << argv[0] << " mesh.obj output_dir 10" << std::endl;
@@ -320,13 +322,29 @@ int main(int argc, char *argv[])
     std::filesystem::path obj_path = argv[1];
     std::filesystem::path output_dir = argv[2];
     float step_size = 20.0f;
+    std::string uuid_override;
 
-    if (argc >= 4) {
-        step_size = std::atof(argv[3]);
-        if (step_size <= 0) {
-            std::cerr << "Invalid step size: " << step_size << std::endl;
+    bool consumed_step_size = false;
+    for (int i = 3; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg.rfind("--uuid=", 0) == 0) {
+            uuid_override = arg.substr(std::string("--uuid=").size());
+            if (uuid_override.empty()) {
+                std::cerr << "Invalid value for --uuid (must be non-empty)" << std::endl;
+                return EXIT_FAILURE;
+            }
+            continue;
+        }
+        if (consumed_step_size) {
+            std::cerr << "Unknown argument: " << arg << std::endl;
             return EXIT_FAILURE;
         }
+        step_size = std::atof(arg.c_str());
+        if (step_size <= 0) {
+            std::cerr << "Invalid step size: " << arg << std::endl;
+            return EXIT_FAILURE;
+        }
+        consumed_step_size = true;
     }
 
     if (!std::filesystem::exists(obj_path)) {
@@ -358,10 +376,8 @@ int main(int argc, char *argv[])
     }
     
     // Generate a UUID for the surface
-    std::string uuid = output_dir.filename().string();
-    if (uuid.empty()) {
-        uuid = obj_path.stem().string();
-    }
+    const std::string uuid =
+        vc::util::resolveTifxyzUuid(output_dir, obj_path, uuid_override);
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     

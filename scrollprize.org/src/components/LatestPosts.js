@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from "react";
-import TopCard from "./TopCard";
 
-// Displays 4 TopCards: 1 permanent "Get Started" + 3 latest Substack posts
+// Dense "Updates" strip: the 4 latest Substack posts, one compact row per
+// entry (title + date).
+// Layout/skin lives in chrome.css (.vc-updates): 4-up >=1280px, 2-up >=480px,
+// single column below 480px, hairline separators, no shadows.
 // Fetches posts from /data/latestPosts.json (generated at build time by fetchLatestPosts.js)
 // RSS feed is fetched from https://scrollprize.substack.com/feed during build
 
@@ -21,6 +23,11 @@ const FALLBACK_POSTS = [
     title: "New Prizes and Progress Update",
     href: "https://scrollprize.substack.com/p/new-prizes-and-an-update-on-progress",
     subtext: "February 27"
+  },
+  {
+    title: "First Letters Found in New Scroll",
+    href: "https://scrollprize.substack.com/p/first-letters-found-in-new-scroll",
+    subtext: "February 5"
   }
 ];
 
@@ -43,7 +50,7 @@ const LatestPosts = () => {
           const data = await response.json();
           if (data.posts && data.posts.length > 0) {
             // Format the posts data
-            const formattedPosts = data.posts.slice(0, 3).map(post => ({
+            const formattedPosts = data.posts.slice(0, 4).map(post => ({
               title: post.title,
               href: post.link,
               subtext: formatDate(post.pubDate)
@@ -63,20 +70,17 @@ const LatestPosts = () => {
   }, []);
 
   return (
-    <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 max-w-9xl pb-3">
-      <TopCard
-        title="Get Started"
-        href="/get_started"
-        subtext="$1.8M+ already awarded"
-        useArrow={true}
-      />
+    <div className="vc-updates" role="list">
       {posts.map((post, index) => (
-        <TopCard
+        <a
           key={index}
-          title={post.title}
+          className="vc-updates__item"
           href={post.href}
-          subtext={post.subtext}
-        />
+          role="listitem"
+        >
+          <span className="vc-updates__title">{post.title}</span>
+          <span className="vc-updates__meta">{post.subtext}</span>
+        </a>
       ))}
     </div>
   );
