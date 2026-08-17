@@ -60,7 +60,21 @@ class TrackCrossingCacheTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 cache['offsets'][1:] - cache['offsets'][:-1], [1, 0, 1])
 
+    def require_native_crossings(self):
+        """Skip when the default crossing mode cannot run.
+
+        prepare_main_phase_tracks defaults to track_crossing_mode='track_walk'
+        (config.py), which raises without vc.track_crossings. That module comes
+        from the volume-cartographer package, which scripts/spiral does not
+        depend on, so `uv sync` here -- the install CONTRIBUTING.md describes --
+        produces an environment without it. Skip as the native kernel tests
+        already do, rather than reporting a failure the checkout did not cause.
+        """
+        if _load_native_track_crossings() is None:
+            self.skipTest('VC native crossing extension is not built')
+
     def test_fit_remaps_whole_db_cache_after_z_filtering(self):
+        self.require_native_crossings()
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
             build_cache(path, show_progress=False)
@@ -96,6 +110,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 sample['sampled_scroll'][sample['partner_cross_flat'][0]].numpy())
 
     def test_packed_store_loads_and_prepares_without_track_objects(self):
+        self.require_native_crossings()
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
             build_cache(path, show_progress=False)
@@ -132,6 +147,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 int(prepared['crossing_index_stats']['directed_crossings']), 2)
 
     def test_builder_limits_cache_to_half_open_z_range(self):
+        self.require_native_crossings()
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
             build_cache(
