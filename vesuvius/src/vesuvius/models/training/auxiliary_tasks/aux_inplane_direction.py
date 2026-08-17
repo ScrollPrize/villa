@@ -70,8 +70,8 @@ def _eigh2x2(a11, a12, a22):
     l2 = tr / 2 + tmp
     # eigenvectors for l1
     # Solve (A - lI)v = 0; pick vector orthogonal to [a12, l1 - a11]
-    v1x = np.where(np.abs(a12) > np.abs(l1 - a11), - (l1 - a11), -a12)
-    v1y = np.where(np.abs(a12) > np.abs(l1 - a11), a12, (a11 - l1))
+    v1x = np.where(np.abs(a12) > np.abs(l1 - a11), a12, -a12)
+    v1y = np.where(np.abs(a12) > np.abs(l1 - a11), l1 - a11, (a11 - l1))
     norm = np.sqrt(v1x * v1x + v1y * v1y) + 1e-12
     v1x /= norm
     v1y /= norm

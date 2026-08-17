@@ -513,6 +513,13 @@ private:
 
 class ZarrArray final {
 public:
+    struct StorageObjectLocation {
+        std::string key;
+        std::vector<std::size_t> outer_indices;
+        std::vector<std::size_t> inner_indices;
+        std::vector<std::size_t> inner_chunks_per_object;
+    };
+
     /// Codec callback struct: compress and decompress functions.
     /// `decompress_into` is optional; when provided, callers can avoid the
     /// per-call decompressed-buffer heap allocation by passing a reusable
@@ -596,6 +603,32 @@ public:
 
     [[nodiscard]] std::string
     chunk_store_key(std::span<const std::size_t> chunk_indices) const;
+
+    /// Map logical chunk-grid indices to the physical object in the backing
+    /// store. For unsharded arrays this is the chunk itself. For sharded
+    /// arrays this is the complete outer shard and inner_indices identifies
+    /// the requested logical chunk within it.
+    [[nodiscard]] StorageObjectLocation
+    storage_object_location(std::span<const std::size_t> chunk_indices) const;
+
+    /// Read the complete encoded physical storage object containing the
+    /// logical chunk. Unlike read_chunk_encoded(), sharded arrays return the
+    /// whole shard rather than a byte range for one inner chunk.
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    read_storage_object(std::span<const std::size_t> chunk_indices) const;
+
+    /// Extract and decode one logical chunk from complete physical-object
+    /// bytes. A missing inner shard-index entry returns std::nullopt.
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    decode_chunk_from_storage_object(
+        std::span<const std::size_t> chunk_indices,
+        std::span<const std::byte> object_bytes) const;
+
+    /// Reverse an exact source-relative storage-object key to the first
+    /// logical chunk covered by that object. Returns nullopt for metadata,
+    /// malformed keys, and keys belonging to another array.
+    [[nodiscard]] std::optional<std::vector<std::size_t>>
+    logical_chunk_for_storage_object_key(std::string_view key) const;
 
     [[nodiscard]] bool direct_chunk_payload_is_decoded_bytes() const noexcept;
 

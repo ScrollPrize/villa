@@ -238,8 +238,6 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
             f["traceState"] = "legacy";
             break;
         }
-        f["traceNeedsReview"] = s.traceNeedsReview;
-        f["traceVerified"] = s.traceVerified;
         QJsonArray tags;
         for (const auto& tag : s.tags)
             tags.push_back(QString::fromStdString(tag));

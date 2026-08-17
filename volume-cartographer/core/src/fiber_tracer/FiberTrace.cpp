@@ -3498,8 +3498,6 @@ public:
             throw std::runtime_error(
                 "fiber inference dataset must contain presence/nx/ny channels");
 
-        cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(
-            maxCachedBytes);
         options_.reserve(prefixes.size());
         for (const auto& prefix : prefixes) {
             const auto channels = predictionChannelNames(prefix);
@@ -3514,13 +3512,13 @@ public:
             if (cornerCompatible) {
                 option.presenceCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.presence, maxCachedBytes, cornerBudget_);
+                        option.presence);
                 option.nxCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.nx, maxCachedBytes, cornerBudget_);
+                        option.nx);
                 option.nyCorners =
                     std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(
-                        option.ny, maxCachedBytes, cornerBudget_);
+                        option.ny);
             } else {
                 cornerSamplingAvailable_ = false;
             }
@@ -4452,7 +4450,6 @@ private:
     std::vector<Option> options_;
     std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
     bool cornerSamplingAvailable_ = true;
 };
 
