@@ -16,7 +16,9 @@ import zarr
 
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
+    Block,
     ChunkAccumulator,
+    FlatBlockDataset,
     FlatPatchReader,
     choose_pyramid_array,
     compute_chunk_contribution_counts,
@@ -199,6 +201,45 @@ def test_flat_axes_layers_reverse_and_short_depth_padding(tmp_path):
         output_depth=6,
         direction="reverse",
     ).tolist() == [5, 4, 3, 2, 1, 0]
+
+
+def test_flat_robust_normalization_excludes_reader_padding(tmp_path):
+    input_path = tmp_path / "short-source.zarr"
+    values_ZYX = np.arange(100, 136, dtype=np.uint8).reshape(3, 3, 4)
+    source = zarr.open(
+        input_path,
+        mode="w",
+        shape=values_ZYX.shape,
+        chunks=values_ZYX.shape,
+        dtype="u1",
+        zarr_format=2,
+    )
+    source[:] = values_ZYX
+    reader = FlatPatchReader(
+        input_path=input_path,
+        resolution="0",
+        depth_axis_first=True,
+        height=3,
+        width=4,
+        layer_indices=np.arange(3),
+        output_depth=5,
+        preprocessing="tifxyz_robust",
+    )
+    dataset = FlatBlockDataset(
+        reader=reader,
+        blocks=[Block(y0=0, x0=0, valid_h=3, valid_w=4)],
+        patch_size=5,
+        preprocessing="tifxyz_robust",
+    )
+
+    image_CZYX, metadata = dataset[0]
+    expected = np.zeros((1, 5, 5, 5), dtype=np.float32)
+    expected[0, 1:4, :3, :4] = normalize_flat_patch(
+        values_ZYX.copy(), "tifxyz_robust"
+    )
+
+    np.testing.assert_array_equal(image_CZYX.numpy(), expected)
+    np.testing.assert_array_equal(metadata.numpy(), [0, 0, 3, 4, 1])
 
 
 def test_blocks_occupancy_blend_accumulation_and_truncating_tiles():
