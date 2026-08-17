@@ -1,62 +1,61 @@
-# VC3D short line-segment task log
+# VC3D control-point collapse rollback task log
 
 ## Findings
 
-- Current strip subdivision already retains every original endpoint and keeps a
-  short span as one interval.
-- Current strip scale is derived from total arclength divided by total interval
-  count, so mixed short/long spans distort one another's displayed pitch.
-- Current generated-click replacement uses `abs(linePosition difference) <=
-  0.5`, which depends on producer point density rather than physical arclength.
-- The local control update API supports one inserted/moved control, not several
-  simultaneous removals.
-- Branch links are indexed by the live control vector and therefore require an
-  explicit old-to-new index remap during a multi-control collapse.
-- The initial implementation incorrectly made every optimized line point a
-  strip support. Production now supplies the annotation control positions, and
-  only those controls plus line endpoints are fixed supports; each intervening
-  optimized polyline is resampled by arclength.
-- The generated ribbons have no physical fiber-width input. Main's default
-  cross width was typically about 200 base voxels.
-- `surfaceHalfWidth`, `sideSliceHalfDepth`, and `crossSamples` have no production
-  overrides; only `test_lasagna_line_view_surfaces` changes them.
-- The unused cross configuration fields and median-step helper are removed.
-  Seven rows at 32 voxels give a fixed 192-vx extent close to main's typical
-  physical width. The generated-pane camera fitting passed scale-adjusted
-  `QuadSurface::size()` values back as grid indices; this task corrects that
-  related pre-existing extent calculation with `gridSize()`.
+- After `collapseControlPointsAtClick()`, all click-edit cases have exactly one
+  changed replacement control and a valid replacement index. Removing multiple
+  controls does not require a multi-control line-update API.
+- The existing local updater rebuilds both spans adjacent to its changed
+  control and places that control directly into the updated line before fiber
+  optimization.
+- The PR 1484 multi-collapse branch bypasses this updater and passes the
+  replacement plus unchanged old line to the fiber optimizer, whose independent
+  nearest-3-D control lookup can select another winding.
+- Multi-collapse already carries a complete asynchronous rollback object. The
+  ordinary synchronous update catch captures but fails to restore the previous
+  optimization state.
+- Independent review found that reusing the existing local-update controller
+  block verbatim would mutate reciprocal branches and schedule saves before the
+  asynchronous result is known. Multi-collapse must keep only its session-local
+  branch remap before success and defer reciprocal synchronization as it does
+  today.
+- Independent review also found that all-control collapse leaves one replacement
+  with no adjacent span. The local updater returns the old line unchanged in
+  that case, and the one-control optimizer currently derives its tangent by
+  nearest 3-D lookup. The targeted fix will use authoritative line position for
+  that tangent.
+- To cover the production regression rather than manually composing two helpers
+  only in tests, automatic collapse plus local reconstruction will be extracted
+  into one reusable preparation helper used by controller and tests. Session
+  mutation will occur only after that helper succeeds.
+- Independent implementation review found that segment metadata was still
+  merged back by equal 3-D position. The merge now follows stable ordered
+  control identity, with duplicate-position coverage for exact crossings.
+- The same review found that multi-collapse invalidated cached metrics before
+  asynchronous commit and that generated-view failure could leave the new
+  optimization report/flags behind. Metric invalidation is now deferred until
+  successful materialization, and the rollback snapshot includes the previous
+  report, manifest, optimization flag, and metric-match flag.
+- Legacy fiber loading and other optimizer entry points still reconstruct some
+  control locations with nearest-3-D matching. That broader persisted topology
+  issue is intentionally deferred because this task is limited to the two PR
+  1484 regressions and does not change the fiber format.
 
 ## Deviations
 
-- The private Qt controller has no isolated interaction-test target. The pure
-  collapse operation and its old-to-new mapping are unit tested, reciprocal
-  branch synchronization was reviewed and compiled in the full VC3D target,
-  but modal confirmation and asynchronous UI orchestration are not directly
-  exercised by an automated test.
-- The related generated-pane camera-fit correction is compiled in the full
-  VC3D target but its private dialog helper has no isolated unit-test seam.
+- The private Qt `LineAnnotationSession` still has no isolated controller test
+  seam for forcing asynchronous optimization or generated-view failure.
+  Existing multi-collapse rollback is retained and reviewed through its shared
+  rollback object and full VC3D compile, while focused tests cover the newly
+  extracted production preparation path and synchronous failure atomicity.
+- The installed `clang-format` configuration did not match repository style and
+  reformatted thousands of unrelated lines. That mechanical rewrite was fully
+  removed; only focused semantic edits remain.
 
 ## Validation
 
 - Built with all 32 cores:
-  `cmake --build volume-cartographer/build --parallel 32 --target test_lasagna_line_view_surfaces test_fiber_slice_geometry test_line_annotation_generated_views VC3D`
-- `test_lasagna_line_view_surfaces`: 24 test cases passed.
-- `test_fiber_slice_geometry`: 10 test cases passed.
-- `test_line_annotation_generated_views`: 76 test cases passed.
-- `git diff --check`: passed.
-
-## Strip sampling follow-up
-
-- Removed `surfaceHalfWidth`, `sideSliceHalfDepth`, `crossSamples`, and the
-  median optimized-point cross spacing. Both ribbons use seven rows at 32
-  voxels for a fixed 192-vx extent.
-- Generated strips preserve exact annotation controls and line endpoints, and
-  resample the optimized polyline by arclength between those supports.
-- Generated-pane initial fitting now converts actual `gridSize()` endpoints to
-  surface coordinates instead of reusing scale-adjusted `size()` as grid
-  indices.
-- Rebuilt `test_lasagna_line_view_surfaces` and `VC3D` with 32 cores.
-- `test_lasagna_line_view_surfaces`: 24 test cases passed.
-- `test_fiber_slice_geometry`: 10 test cases passed.
-- `test_line_annotation_generated_views`: 76 test cases passed.
-- Final `git diff --check`: passed.
+  `cmake --build volume-cartographer/build --parallel 32 --target test_lasagna_line_optimizer test_line_annotation_generated_views VC3D`
+- `test_lasagna_line_optimizer`: 35 test cases passed.
+- `test_line_annotation_generated_views`: 79 test cases passed.
+- Full `VC3D` target compiled successfully.
