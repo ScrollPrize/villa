@@ -57,7 +57,7 @@ INK_SUMMARY_KEYS = (
 
 # Each torchrun rank owns one GPU.  Keep its host-side Torch pools bounded so
 # concurrent sweep fits do not each consume a full machine's CPU threads.
-SWEEP_THREADS_PER_GPU = 4
+SWEEP_THREADS_PER_GPU = 10
 SEED_RESULT_SCHEMA_VERSION = 1
 
 # A seed process must not inherit any identity that could attach it to the
@@ -377,22 +377,27 @@ def wandb_available():
             and os.environ.get('WANDB_MODE', 'online') != 'disabled')
 
 
-def log_to_run(payload, files=(), run_name=None):
-    """Attach once to the agent-created run and log aggregate results.
+def init_aggregate_run(run_name):
+    """Start the one online run before local seed work begins."""
+    if not wandb_available():
+        return None
+    import wandb
+    os.environ.setdefault('WANDB_RESUME', 'allow')
+    return wandb.init(name=run_name)
+
+
+def log_to_run(run, payload, files=()):
+    """Log aggregate results to the already-active sweep run.
 
     Project/entity/run id all come from the agent's environment; the last
     logged values populate run.summary, which the sweep optimizer reads.
     """
-    if not wandb_available():
+    if run is None:
         print(f'[sweep_run_wrapper] wandb disabled; payload: {payload}', flush=True)
         return
-    import wandb
-    os.environ.setdefault('WANDB_RESUME', 'allow')
-    run = wandb.init(name=run_name)
     run.log(payload)
     for path in files:
         run.save(str(path), base_path=str(Path(path).parent), policy='now')
-    run.finish()
 
 
 def combined_objective(objective, seed, per_seed_final, per_seed_ink):
@@ -429,6 +434,165 @@ def aggregate_across_seeds(per_seed, prefix):
             payload[f'{prefix}/{key}_std'] = (
                 sum((v - mean) ** 2 for v in values) / (len(values) - 1)) ** 0.5
     return payload
+
+
+def execute_sweep(args, seeds, params, overrides, resolved_config, reuse_roots,
+                  run_name, run_id, sweep_id, out_base, aggregate_run):
+    """Run/reuse all seeds and publish their aggregate to an active W&B run."""
+    per_seed_final = {}
+    per_seed_ink = {}
+    seed_provenance = {}
+    for seed in seeds:
+        seed_overrides = overrides | {'optimizer_random_seed': seed}
+        seed_config = Config(seed_overrides).as_dict()
+        seed_out = out_base / f'seed_{seed}'
+        seed_out.mkdir(exist_ok=True)
+        write_json_atomic(seed_out / 'config.json', seed_config)
+
+        reused = select_reusable_seed(
+            reuse_roots, resolved_config, seed, seed_config,
+            require_ink=not args.skip_eval)
+        if reused is not None:
+            per_seed_final[seed] = reused['final']
+            per_seed_ink[seed] = reused['ink']
+            seed_provenance[seed] = {
+                'kind': 'reused',
+                'selected_source': reused['source'],
+                'source_kind': reused['source_kind'],
+                'candidate_sources': reused['candidate_sources'],
+            }
+            write_json_atomic(seed_out / 'result.json', make_seed_result(
+                seed, seed_config, reused['final'], reused['ink'],
+                seed_provenance[seed]))
+            print(f'[sweep_run_wrapper] reuse hit seed={seed}: '
+                  f'{reused["source"]} ({len(reused["candidate_sources"])} '
+                  f'candidate(s))', flush=True)
+            continue
+
+        print(f'[sweep_run_wrapper] reuse miss seed={seed}; running locally',
+              flush=True)
+        fit_env = seed_fit_environment(
+            os.environ, seed_overrides, seed_out)
+
+        nproc = len([t for t in fit_env.get('CUDA_VISIBLE_DEVICES', '0').split(',')
+                     if t.strip()])
+        fit_cmd = [sys.executable]
+        if nproc > 1:
+            fit_cmd += ['-m', 'torch.distributed.run', '--standalone',
+                        f'--nproc-per-node={nproc}']
+        fit_cmd += [str(SPIRAL_DIR / 'fit_spiral.py'), '--dataset', args.dataset]
+        if args.scroll_spec:
+            fit_cmd += ['--scroll-spec', args.scroll_spec]
+        if args.cache:
+            fit_cmd += ['--cache', args.cache]
+        run_stage(f'fit[seed={seed}]', fit_cmd, env=fit_env)
+
+        run_dir = resolve_run_dir(seed_out)
+        satisfaction_path = run_dir / 'satisfaction_summary.json'
+        satisfaction = numeric_metrics(read_json(satisfaction_path))
+        if not satisfaction:
+            raise SystemExit(f'fit produced no valid satisfaction summary at '
+                             f'{satisfaction_path}')
+        per_seed_final[seed] = satisfaction
+
+        if args.skip_eval:
+            per_seed_ink[seed] = {}
+            seed_provenance[seed] = {
+                'kind': 'computed',
+                'fit_run_dir': str(run_dir.resolve()),
+            }
+            write_json_atomic(seed_out / 'result.json', make_seed_result(
+                seed, seed_config, satisfaction, {}, seed_provenance[seed]))
+            continue
+
+        meshes_dir = resolve_meshes_dir(run_dir)
+        render_cmd = [sys.executable, str(SPIRAL_DIR / 'render_ink.py'), str(meshes_dir),
+                      '--volume', args.ink_volume,
+                      '-j', str(args.render_procs),
+                      '--flatboi-threads', str(args.flatboi_threads)]
+        if args.vc_render_bin:
+            render_cmd += ['--vc-render-bin', args.vc_render_bin]
+        run_stage(f'render_ink[seed={seed}]', render_cmd)
+
+        # render_ink exits 0 even when the lasagna flatten fails (it warns and
+        # skips the render), so the absence of flat strips is the failure signal.
+        ink_dir = meshes_dir / 'ink'
+        if not glob.glob(str(ink_dir / '*_flat*.jpg')):
+            log_to_run(aggregate_run, {
+                'eval/flatten_failed': 1,
+                'eval/flatten_failed_seed': seed,
+            })
+            raise SystemExit(f'lasagna flatten produced no ink strips in {ink_dir}')
+
+        if args.ink_preview_downsample > 0:
+            save_ink_preview(
+                ink_dir,
+                out_base / f'seed_{seed}_ink_flat_{args.ink_preview_downsample}x.jpg',
+                args.ink_preview_downsample)
+
+        ink_cmd = [args.ink_python, str(SPIRAL_DIR / 'get_ink_metrics.py'), str(ink_dir)]
+        if not args.tta:
+            ink_cmd.append('--no-tta')
+        run_stage(f'get_ink_metrics[seed={seed}]', ink_cmd)
+
+        metrics_path = meshes_dir / 'ink_metric' / 'metrics.json'
+        ink_summary = json.loads(metrics_path.read_text())['summary']
+        per_seed_ink[seed] = {k: ink_summary[k] for k in INK_SUMMARY_KEYS
+                              if k in ink_summary}
+        seed_provenance[seed] = {
+            'kind': 'computed',
+            'fit_run_dir': str(run_dir.resolve()),
+            'metrics_path': str(metrics_path.resolve()),
+        }
+        write_json_atomic(seed_out / 'result.json', make_seed_result(
+            seed, seed_config, satisfaction, per_seed_ink[seed],
+            seed_provenance[seed]))
+
+    payload = aggregate_across_seeds(per_seed_final, 'final')
+    payload.update(aggregate_across_seeds(per_seed_ink, 'ink'))
+    if args.objective_json:
+        objective = json.loads(args.objective_json)
+        per_seed_obj = {s: combined_objective(objective, s, per_seed_final,
+                                              per_seed_ink) for s in seeds}
+        mean = sum(per_seed_obj.values()) / len(per_seed_obj)
+        payload['objective'] = mean
+        if len(per_seed_obj) > 1:
+            payload['objective_std'] = (
+                sum((v - mean) ** 2 for v in per_seed_obj.values())
+                / (len(per_seed_obj) - 1)) ** 0.5
+    if not args.skip_eval:
+        payload['eval/flatten_failed'] = 0
+    aggregate_path = out_base / 'aggregate_results.json'
+    write_json_atomic(aggregate_path, {
+        'schema_version': SEED_RESULT_SCHEMA_VERSION,
+        'sweep_id': sweep_id,
+        'run_id': run_id,
+        'run_name': run_name,
+        'config': resolved_config,
+        'params': params,
+        'seeds': seeds,
+        'inputs': {
+            'dataset': str(Path(args.dataset).resolve()),
+            'scroll_spec': (str(Path(args.scroll_spec).resolve())
+                            if args.scroll_spec else None),
+            'ink_volume': (str(Path(args.ink_volume).resolve())
+                           if args.ink_volume else None),
+            'tta': args.tta,
+            'skip_eval': args.skip_eval,
+        },
+        'per_seed': {
+            str(seed): {
+                'final': per_seed_final[seed],
+                'ink': per_seed_ink[seed],
+                'provenance': seed_provenance[seed],
+            }
+            for seed in seeds
+        },
+        'wandb_metrics': payload,
+    })
+    log_to_run(aggregate_run, payload, files=[aggregate_path])
+    print(f'[sweep_run_wrapper] done ({len(seeds)} seeds): {json.dumps(payload)}',
+          flush=True)
 
 
 def main():
@@ -509,158 +673,22 @@ def main():
         'reuse_roots': [str(path) for path in reuse_roots],
     })
 
-    per_seed_final = {}
-    per_seed_ink = {}
-    seed_provenance = {}
-    for seed in seeds:
-        seed_overrides = overrides | {'optimizer_random_seed': seed}
-        seed_config = Config(seed_overrides).as_dict()
-        seed_out = out_base / f'seed_{seed}'
-        seed_out.mkdir(exist_ok=True)
-        write_json_atomic(seed_out / 'config.json', seed_config)
-
-        reused = select_reusable_seed(
-            reuse_roots, resolved_config, seed, seed_config,
-            require_ink=not args.skip_eval)
-        if reused is not None:
-            per_seed_final[seed] = reused['final']
-            per_seed_ink[seed] = reused['ink']
-            seed_provenance[seed] = {
-                'kind': 'reused',
-                'selected_source': reused['source'],
-                'source_kind': reused['source_kind'],
-                'candidate_sources': reused['candidate_sources'],
-            }
-            write_json_atomic(seed_out / 'result.json', make_seed_result(
-                seed, seed_config, reused['final'], reused['ink'],
-                seed_provenance[seed]))
-            print(f'[sweep_run_wrapper] reuse hit seed={seed}: '
-                  f'{reused["source"]} ({len(reused["candidate_sources"])} '
-                  f'candidate(s))', flush=True)
-            continue
-
-        print(f'[sweep_run_wrapper] reuse miss seed={seed}; running locally',
-              flush=True)
-        fit_env = seed_fit_environment(
-            os.environ, seed_overrides, seed_out)
-
-        nproc = len([t for t in fit_env.get('CUDA_VISIBLE_DEVICES', '0').split(',')
-                     if t.strip()])
-        fit_cmd = [sys.executable]
-        if nproc > 1:
-            fit_cmd += ['-m', 'torch.distributed.run', '--standalone',
-                        f'--nproc-per-node={nproc}']
-        fit_cmd += [str(SPIRAL_DIR / 'fit_spiral.py'), '--dataset', args.dataset]
-        if args.scroll_spec:
-            fit_cmd += ['--scroll-spec', args.scroll_spec]
-        if args.cache:
-            fit_cmd += ['--cache', args.cache]
-        run_stage(f'fit[seed={seed}]', fit_cmd, env=fit_env)
-
-        run_dir = resolve_run_dir(seed_out)
-        satisfaction_path = run_dir / 'satisfaction_summary.json'
-        satisfaction = numeric_metrics(read_json(satisfaction_path))
-        if not satisfaction:
-            raise SystemExit(f'fit produced no valid satisfaction summary at '
-                             f'{satisfaction_path}')
-        per_seed_final[seed] = satisfaction
-
-        if args.skip_eval:
-            per_seed_ink[seed] = {}
-            seed_provenance[seed] = {
-                'kind': 'computed',
-                'fit_run_dir': str(run_dir.resolve()),
-            }
-            write_json_atomic(seed_out / 'result.json', make_seed_result(
-                seed, seed_config, satisfaction, {}, seed_provenance[seed]))
-            continue
-
-        meshes_dir = resolve_meshes_dir(run_dir)
-        render_cmd = [sys.executable, str(SPIRAL_DIR / 'render_ink.py'), str(meshes_dir),
-                      '--volume', args.ink_volume,
-                      '-j', str(args.render_procs),
-                      '--flatboi-threads', str(args.flatboi_threads)]
-        if args.vc_render_bin:
-            render_cmd += ['--vc-render-bin', args.vc_render_bin]
-        run_stage(f'render_ink[seed={seed}]', render_cmd)
-
-        # render_ink exits 0 even when the lasagna flatten fails (it warns and
-        # skips the render), so the absence of flat strips is the failure signal.
-        ink_dir = meshes_dir / 'ink'
-        if not glob.glob(str(ink_dir / '*_flat*.jpg')):
-            log_to_run({'eval/flatten_failed': 1, 'eval/flatten_failed_seed': seed},
-                       run_name=run_name)
-            raise SystemExit(f'lasagna flatten produced no ink strips in {ink_dir}')
-
-        if args.ink_preview_downsample > 0:
-            save_ink_preview(
-                ink_dir,
-                out_base / f'seed_{seed}_ink_flat_{args.ink_preview_downsample}x.jpg',
-                args.ink_preview_downsample)
-
-        ink_cmd = [args.ink_python, str(SPIRAL_DIR / 'get_ink_metrics.py'), str(ink_dir)]
-        if not args.tta:
-            ink_cmd.append('--no-tta')
-        run_stage(f'get_ink_metrics[seed={seed}]', ink_cmd)
-
-        metrics_path = meshes_dir / 'ink_metric' / 'metrics.json'
-        ink_summary = json.loads(metrics_path.read_text())['summary']
-        per_seed_ink[seed] = {k: ink_summary[k] for k in INK_SUMMARY_KEYS
-                              if k in ink_summary}
-        seed_provenance[seed] = {
-            'kind': 'computed',
-            'fit_run_dir': str(run_dir.resolve()),
-            'metrics_path': str(metrics_path.resolve()),
-        }
-        write_json_atomic(seed_out / 'result.json', make_seed_result(
-            seed, seed_config, satisfaction, per_seed_ink[seed],
-            seed_provenance[seed]))
-
-    payload = aggregate_across_seeds(per_seed_final, 'final')
-    payload.update(aggregate_across_seeds(per_seed_ink, 'ink'))
-    if args.objective_json:
-        objective = json.loads(args.objective_json)
-        per_seed_obj = {s: combined_objective(objective, s, per_seed_final,
-                                              per_seed_ink) for s in seeds}
-        mean = sum(per_seed_obj.values()) / len(per_seed_obj)
-        payload['objective'] = mean
-        if len(per_seed_obj) > 1:
-            payload['objective_std'] = (
-                sum((v - mean) ** 2 for v in per_seed_obj.values())
-                / (len(per_seed_obj) - 1)) ** 0.5
-    if not args.skip_eval:
-        payload['eval/flatten_failed'] = 0
-    aggregate_path = out_base / 'aggregate_results.json'
-    write_json_atomic(aggregate_path, {
-        'schema_version': SEED_RESULT_SCHEMA_VERSION,
-        'sweep_id': sweep_id,
-        'run_id': run_id,
-        'run_name': run_name,
-        'config': resolved_config,
-        'params': params,
-        'seeds': seeds,
-        'inputs': {
-            'dataset': str(Path(args.dataset).resolve()),
-            'scroll_spec': (str(Path(args.scroll_spec).resolve())
-                            if args.scroll_spec else None),
-            'ink_volume': (str(Path(args.ink_volume).resolve())
-                           if args.ink_volume else None),
-            'tta': args.tta,
-            'skip_eval': args.skip_eval,
-        },
-        'per_seed': {
-            str(seed): {
-                'final': per_seed_final[seed],
-                'ink': per_seed_ink[seed],
-                'provenance': seed_provenance[seed],
-            }
-            for seed in seeds
-        },
-        'wandb_metrics': payload,
-    })
-    log_to_run(payload, files=[aggregate_path], run_name=run_name)
-    print(f'[sweep_run_wrapper] done ({len(seeds)} seeds): {json.dumps(payload)}',
-          flush=True)
+    aggregate_run = init_aggregate_run(run_name)
+    try:
+        execute_sweep(
+            args, seeds, params, overrides, resolved_config, reuse_roots,
+            run_name, run_id, sweep_id, out_base, aggregate_run)
+    except BaseException:
+        if aggregate_run is not None:
+            try:
+                aggregate_run.finish(exit_code=1)
+            except Exception as finish_error:
+                print(f'[sweep_run_wrapper] wandb failure finish also failed: '
+                      f'{finish_error}', file=sys.stderr, flush=True)
+        raise
+    else:
+        if aggregate_run is not None:
+            aggregate_run.finish(exit_code=0)
 
 
 if __name__ == '__main__':
