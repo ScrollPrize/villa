@@ -12,16 +12,19 @@ class QuadSurface;
 namespace vc::lasagna {
 
 inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
-inline constexpr int kLineViewCrossSampleCount = 21;
+inline constexpr int kLineViewCrossSampleCount = 7;
 
 struct LineViewConfig {
-    // Derived ribbons retain every optimized line point and subdivide each
-    // consecutive span as closely as possible to this spacing. The declared
-    // along-strip scale always uses this target, so shorter spans occupy one
-    // full display interval. This is a view parameter in level-0/base-volume
-    // voxels, independent of stored point or optimizer spacing.
+    // Derived ribbons retain every annotation control point and subdivide the
+    // optimized polyline between adjacent controls as closely as possible to
+    // this spacing. The declared along-strip scale always uses this target, so
+    // a shorter control-point span occupies one full display interval.
     double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
-    // Optional per-control-point oriented sheet normals, indexed like
+    // Fractional indices into LineModel::points. Line endpoints are always
+    // retained as additional supports. Empty retains every line point for
+    // callers that do not have separate annotation-control metadata.
+    std::vector<double> controlPointLinePositions;
+    // Optional per-line-point oriented sheet normals, indexed like
     // LineModel::points (entries may be NaN/zero where unavailable).
     // When non-empty and size-matched, one global sign flip is applied so the
     // frame mesh normals AND the display up vectors agree with these on a
@@ -30,10 +33,11 @@ struct LineViewConfig {
 };
 
 // Maps the original LineModel point-index coordinate to the ribbon grid and
-// back. Each distinct control point is a grid support, with segment-local
-// subdivisions between supports. Fractional original positions interpolate
-// within an original segment. Consecutive duplicate points share one arclength;
-// inversion at that arclength returns the first point in the duplicate run.
+// back. Each configured annotation control point and each line endpoint is a
+// grid support, with span-local subdivisions between supports. Fractional
+// original positions interpolate within an optimized-line segment. Consecutive
+// duplicate line points share one arclength; inversion at that arclength
+// returns the first point in the duplicate run.
 struct LineStripPositionMap {
     std::vector<double> originalArclengths;
     std::vector<double> stripGridArclengths;

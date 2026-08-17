@@ -5,16 +5,17 @@ point click replacement.
 
 Requirements:
 
-- Keep every original line/control-point endpoint as an exact strip support.
-- Subdivide spans longer than 32 base voxels using the existing nearest-spacing
-  interval selection.
-- Keep spans at or below 32 base voxels as one strip interval.
+- Keep every annotation control point and both line endpoints as exact strip
+  supports. Internal optimized line points define the path but are not supports.
+- Resample each control-point span by optimized-polyline arclength using the
+  interval count whose physical spacing is closest to 32.
+- Keep control-point spans at or below 32 base voxels as one strip interval.
 - Declare the generated strip's along-line scale as exactly `1/32`, so short
   physical spans are expanded to one nominal display interval.
-- Use exactly 21 cross-strip samples at 32 base voxels for both the line
-  surface and side slice, producing a fixed 640-base-voxel cross extent.
-- Remove the unused configurable cross extents and cross-sample count; generated
-  strip width must not depend on optimized-line point spacing.
+- Use exactly seven cross-strip samples at 32 base voxels for both the line
+  surface and side slice, giving a fixed 192-base-voxel extent close to the
+  previous typical width.
+- Remove the unused configurable cross extents and cross-sample count.
 - On generated-view clicks, compare existing controls by optimized-polyline
   arclength rather than line-index distance.
 - Collapse every existing control within an inclusive 32-base-voxel arclength

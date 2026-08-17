@@ -4,11 +4,12 @@
 
 1. Define one public 32-base-voxel generated-line sampling constant and make it
    the default `LineViewConfig` target.
-2. Retain per-consecutive-optimized-point nearest-spacing subdivision and every
-   exact optimized-point support, but declare only the along-strip grid density
-   from the configured target rather than the mean physical source interval.
-   Remove cross-direction configuration and the median-point-spacing heuristic;
-   build both ribbons with exactly 21 rows at the shared 32-base-voxel pitch.
+2. Retain exact annotation control-point supports and resample the optimized
+   polyline by arclength independently between adjacent controls using the
+   existing closest-spacing interval selection. Declare the along-strip grid
+   density from the configured target rather than the mean physical source
+   interval. Remove cross-direction configuration and use seven rows at the
+   shared 32-base-voxel pitch for a fixed 192-vx cross extent.
 3. Add one reusable cumulative-arclength mapping for fractional line positions,
    inverse mapping, and inclusive radius matching. Use it for both deduplication
    and the existing maximum-control-distance gate, whose setting is also in
@@ -33,22 +34,21 @@
 ## Specification updates
 
 - Change the generated-line strip invariant from a 50-vx mean-density model to
-  a fixed 32-vx display pitch with exact supports and segment-local subdivision.
-- Require a fixed 21-row, 640-base-voxel cross extent for both generated
-  ribbons, independent of optimized-line sampling.
+  a fixed 32-vx along-strip display pitch with exact control-point supports and
+  control-span-local subdivision.
+- Require seven cross rows at 32 voxels for a fixed 192-vx cross extent.
 - Add the 32-vx arclength replacement/collapse rule.
 
 ## Documentation updates
 
-- Update the line-annotation fiber documentation to describe fixed 32-vx strip
-  display pitch in both directions, fixed cross extent, and arclength-based
-  control replacement.
+- Update the line-annotation fiber documentation to describe the fixed 32-vx
+  along-strip pitch, legacy cross width, and arclength-based control replacement.
 
 ## Testing and validation
 
-- Extend `test_lasagna_line_view_surfaces` for fixed `1/32` scale in both
-  directions, fixed 21-row/640-vx cross extents, exact short endpoints, and
-  unchanged long-span subdivision. Remove tests for obsolete cross overrides.
+- Extend `test_lasagna_line_view_surfaces` for fixed `1/32` along-strip scale,
+  exact short control-point spans, control-span arclength subdivision, and the
+  fixed seven-row cross width. Remove tests for obsolete cross overrides.
 - Extend `test_fiber_slice_geometry` for forward/inverse fractional arclength
   conversion, inclusive multi-match selection, and maximum-distance behavior
   on nonuniform/curved polylines.

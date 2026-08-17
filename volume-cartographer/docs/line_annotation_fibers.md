@@ -50,18 +50,20 @@ show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
 The rendered strips are derived views, not stored line geometry. Their columns
-retain every distinct optimized line point. Consecutive spans are subdivided at
-the interval count whose spacing is closest to the 32-base-voxel target, while
-short spans remain one interval with their endpoints unchanged. Explicit
+retain every annotation control point and both line endpoints. The optimized
+line points between adjacent controls define the polyline path but are not
+mandatory columns. Each control-point span is resampled by polyline arclength
+using the interval count whose physical spacing is closest to the
+32-base-voxel target; a short span remains one interval with both controls
+unchanged. Explicit
 support arclengths provide a bidirectional mapping that keeps control points,
 span labels, hover positions, cut planes, and saved line positions in the
 original fractional point-index coordinate. The strip grid always declares an
-along-line scale of `1/32`, so a short physical span expands to one nominal
-display interval instead of changing the scale of the rest of the strip. Exact
-geometry and interaction still use the point grid and support arclengths.
-Both generated ribbons have exactly 21 cross rows spaced 32 base voxels apart.
-Their cross scale is therefore always `1/32` and their first-to-last row extent
-is 640 base voxels, independent of optimized line-point spacing.
+along-line scale of `1/32`, so a short physical control-point span expands to
+one nominal display interval instead of changing the scale of the rest of the
+strip. Both ribbons have a fixed seven-row cross grid at 32 voxels per row,
+giving a 192-base-voxel first-to-last-row extent close to the previous typical
+width without depending on optimized-line spacing.
 
 Clicking to place a control point uses optimized-polyline arclength in base
 voxels. Every existing control within an inclusive 32-voxel radius is collapsed

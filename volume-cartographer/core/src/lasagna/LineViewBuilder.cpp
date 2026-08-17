@@ -87,7 +87,7 @@ std::vector<double> crossOffsets()
     return offsets;
 }
 
-std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
+std::vector<SegmentNormalSample> lineSamples(const LineModel& line)
 {
     std::vector<SegmentNormalSample> samples;
     samples.reserve(line.points.size());
@@ -97,8 +97,49 @@ std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
     return samples;
 }
 
+double arclengthAtLinePosition(const std::vector<double>& arclengths,
+                               double linePosition)
+{
+    linePosition = std::clamp(
+        linePosition, 0.0, static_cast<double>(arclengths.size() - 1));
+    const size_t first = static_cast<size_t>(std::floor(linePosition));
+    const size_t second = std::min(first + 1, arclengths.size() - 1);
+    const double t = linePosition - static_cast<double>(first);
+    return arclengths[first] * (1.0 - t) + arclengths[second] * t;
+}
+
+std::vector<double> resamplingSupportPositions(
+    size_t linePointCount,
+    const std::vector<double>& controlPointLinePositions)
+{
+    const double lastPosition = static_cast<double>(linePointCount - 1);
+    if (controlPointLinePositions.empty()) {
+        std::vector<double> positions;
+        positions.reserve(linePointCount);
+        for (size_t index = 0; index < linePointCount; ++index) {
+            positions.push_back(static_cast<double>(index));
+        }
+        return positions;
+    }
+    std::vector<double> positions{0.0, lastPosition};
+    positions.reserve(controlPointLinePositions.size() + 2);
+    for (const double position : controlPointLinePositions) {
+        if (std::isfinite(position)) {
+            positions.push_back(std::clamp(position, 0.0, lastPosition));
+        }
+    }
+    std::sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(positions.begin(), positions.end(), [](double lhs, double rhs) {
+            return std::abs(lhs - rhs) <= kEpsilon;
+        }),
+        positions.end());
+    return positions;
+}
+
 LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& samples,
-                                      double targetSpacingBaseVoxels)
+                                      double targetSpacingBaseVoxels,
+                                      const std::vector<double>& controlPointLinePositions)
 {
     LineStripPositionMap map;
     map.originalArclengths.resize(samples.size(), 0.0);
@@ -114,31 +155,40 @@ LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& sa
         throw std::invalid_argument("Cannot build line annotation views for a zero-length LineModel");
     }
 
+    const std::vector<double> supportPositions = resamplingSupportPositions(
+        samples.size(), controlPointLinePositions);
+    std::vector<double> supportArclengths;
+    supportArclengths.reserve(supportPositions.size());
+    for (const double position : supportPositions) {
+        supportArclengths.push_back(
+            arclengthAtLinePosition(map.originalArclengths, position));
+    }
+
     map.stripGridArclengths.push_back(0.0);
-    for (size_t i = 1; i < samples.size(); ++i) {
-        const double segmentStart = map.originalArclengths[i - 1];
-        const double segmentEnd = map.originalArclengths[i];
-        const double segmentLength = segmentEnd - segmentStart;
-        if (segmentLength <= kEpsilon) {
+    for (size_t i = 1; i < supportArclengths.size(); ++i) {
+        const double spanStart = supportArclengths[i - 1];
+        const double spanEnd = supportArclengths[i];
+        const double spanLength = spanEnd - spanStart;
+        if (spanLength <= kEpsilon) {
             continue;
         }
 
-        const double idealIntervals = segmentLength / targetSpacingBaseVoxels;
+        const double idealIntervals = spanLength / targetSpacingBaseVoxels;
         const size_t lowerIntervals = std::max<size_t>(
             1, static_cast<size_t>(std::floor(idealIntervals)));
         const size_t upperIntervals = lowerIntervals + 1;
         const double lowerError = std::abs(
-            segmentLength / static_cast<double>(lowerIntervals) - targetSpacingBaseVoxels);
+            spanLength / static_cast<double>(lowerIntervals) - targetSpacingBaseVoxels);
         const double upperError = std::abs(
-            segmentLength / static_cast<double>(upperIntervals) - targetSpacingBaseVoxels);
+            spanLength / static_cast<double>(upperIntervals) - targetSpacingBaseVoxels);
         const size_t intervalCount = upperError < lowerError
             ? upperIntervals
             : lowerIntervals;
 
         for (size_t interval = 1; interval <= intervalCount; ++interval) {
             const double arclength = interval == intervalCount
-                ? segmentEnd
-                : segmentStart + segmentLength *
+                ? spanEnd
+                : spanStart + spanLength *
                     static_cast<double>(interval) / static_cast<double>(intervalCount);
             map.stripGridArclengths.push_back(arclength);
         }
@@ -165,7 +215,7 @@ NormalSample interpolatedNormal(const NormalSample& a, const NormalSample& b, do
     return b;
 }
 
-std::vector<SegmentNormalSample> resampleControlPoints(
+std::vector<SegmentNormalSample> resampleLine(
     const std::vector<SegmentNormalSample>& samples,
     const LineStripPositionMap& map)
 {
@@ -680,11 +730,11 @@ struct LineViewFrameData {
     std::vector<cv::Vec3d> transportedUpVectors;
 };
 
-LineViewFrameData buildControlFrameData(const LineModel& line,
-                                        const std::vector<cv::Vec3f>& orientedPointNormals)
+LineViewFrameData buildLineFrameData(const LineModel& line,
+                                     const std::vector<cv::Vec3f>& orientedPointNormals)
 {
     LineViewFrameData data;
-    data.samples = controlPointSamples(line);
+    data.samples = lineSamples(line);
     if (data.samples.empty()) {
         return data;
     }
@@ -825,17 +875,19 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         throw std::invalid_argument(
             "LineViewConfig::targetSpacingBaseVoxels must be finite and positive");
     }
-    const auto frameData = buildControlFrameData(line, config.orientedPointNormals);
+    const auto frameData = buildLineFrameData(line, config.orientedPointNormals);
     if (frameData.samples.empty()) {
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
 
     const LineStripPositionMap positionMap =
-        buildPositionMap(frameData.samples, config.targetSpacingBaseVoxels);
-    const auto ribbonSamples = resampleControlPoints(frameData.samples, positionMap);
+        buildPositionMap(frameData.samples,
+                         config.targetSpacingBaseVoxels,
+                         config.controlPointLinePositions);
+    const auto ribbonSamples = resampleLine(frameData.samples, positionMap);
     const auto ribbonNormals = resolvedNormals(ribbonSamples);
     auto ribbonFrames = buildFrames(ribbonSamples, ribbonNormals);
-    // Control-point frames own the persistent orientation decision (including
+    // Original line-point frames own the persistent orientation decision (including
     // the caller's whole-line hint vote). Pin the derived ribbon to that same
     // global sign without changing the original cut-plane frames.
     double frameAgreement = 0.0;
@@ -887,7 +939,7 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
 
 LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const LineViewConfig& config)
 {
-    const auto frameData = buildControlFrameData(line, config.orientedPointNormals);
+    const auto frameData = buildLineFrameData(line, config.orientedPointNormals);
     LineViewFrameDiagnostics diagnostics;
     diagnostics.frameCount = frameData.frames.size();
     if (frameData.frames.size() < 2) {

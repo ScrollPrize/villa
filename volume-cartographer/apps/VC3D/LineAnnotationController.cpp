@@ -4334,6 +4334,11 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                 lineModelFromPoints(side.fiber->linePoints,
                                     side.editSession->normalSampler.get());
             vc::lasagna::LineViewConfig sideConfig;
+            sideConfig.controlPointLinePositions.reserve(
+                side.editSession->controlPoints.size());
+            for (const auto& control : side.editSession->controlPoints) {
+                sideConfig.controlPointLinePositions.push_back(control.linePosition);
+            }
             // Same orientation pin as the annotation views, so the inspection
             // strip's vertical does not flip between fibers or rebuilds.
             sideConfig.orientedPointNormals =
@@ -9684,6 +9689,10 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     vc::lasagna::LineViewSurfaces views;
     try {
         vc::lasagna::LineViewConfig viewConfig;
+        viewConfig.controlPointLinePositions.reserve(session.controlPoints.size());
+        for (const auto& control : session.controlPoints) {
+            viewConfig.controlPointLinePositions.push_back(control.linePosition);
+        }
         viewConfig.orientedPointNormals = orientedNormals;
         views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine, viewConfig);
     } catch (const std::exception& ex) {

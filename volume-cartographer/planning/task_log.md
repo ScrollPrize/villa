@@ -12,17 +12,17 @@
   simultaneous removals.
 - Branch links are indexed by the live control vector and therefore require an
   explicit old-to-new index remap during a multi-control collapse.
-- Independent review identified that strip supports are optimized line points,
-  the maximum-control-distance gate also needs physical arclength conversion,
-  and multi-collapse needs explicit metadata ownership, branch remapping,
-  adjacent dirty spans, and asynchronous rollback state.
-- The generated ribbons have no physical fiber-width input. Their default cross
-  spacing is currently the median distance between optimized line points.
+- The initial implementation incorrectly made every optimized line point a
+  strip support. Production now supplies the annotation control positions, and
+  only those controls plus line endpoints are fixed supports; each intervening
+  optimized polyline is resampled by arclength.
+- The generated ribbons have no physical fiber-width input. Main's default
+  cross width was typically about 200 base voxels.
 - `surfaceHalfWidth`, `sideSliceHalfDepth`, and `crossSamples` have no production
   overrides; only `test_lasagna_line_view_surfaces` changes them.
-- Independent review confirmed those fields and their median helper can be
-  removed, while the orientation tests using them must retain fixed-grid
-  equivalents. It also found generated-pane camera fitting passed scale-adjusted
+- The unused cross configuration fields and median-step helper are removed.
+  Seven rows at 32 voxels give a fixed 192-vx extent close to main's typical
+  physical width. The generated-pane camera fitting passed scale-adjusted
   `QuadSurface::size()` values back as grid indices; this task corrects that
   related pre-existing extent calculation with `gridSize()`.
 
@@ -40,23 +40,23 @@
 
 - Built with all 32 cores:
   `cmake --build volume-cartographer/build --parallel 32 --target test_lasagna_line_view_surfaces test_fiber_slice_geometry test_line_annotation_generated_views VC3D`
-- `test_lasagna_line_view_surfaces`: 22 test cases passed.
+- `test_lasagna_line_view_surfaces`: 24 test cases passed.
 - `test_fiber_slice_geometry`: 10 test cases passed.
 - `test_line_annotation_generated_views`: 76 test cases passed.
 - `git diff --check`: passed.
 
-## Fixed cross-strip follow-up
+## Strip sampling follow-up
 
 - Removed `surfaceHalfWidth`, `sideSliceHalfDepth`, `crossSamples`, and the
-  median optimized-point-spacing fallback.
-- Both generated ribbons now contain 21 rows at a fixed 32-base-voxel cross
-  spacing: offsets `-320` through `+320`, a 640-vx vertex-to-vertex extent, and
-  `scale()[1] == 1/32`.
+  median optimized-point cross spacing. Both ribbons use seven rows at 32
+  voxels for a fixed 192-vx extent.
+- Generated strips preserve exact annotation controls and line endpoints, and
+  resample the optimized polyline by arclength between those supports.
 - Generated-pane initial fitting now converts actual `gridSize()` endpoints to
   surface coordinates instead of reusing scale-adjusted `size()` as grid
   indices.
 - Rebuilt `test_lasagna_line_view_surfaces` and `VC3D` with 32 cores.
-- `test_lasagna_line_view_surfaces`: 22 test cases passed.
+- `test_lasagna_line_view_surfaces`: 24 test cases passed.
 - `test_fiber_slice_geometry`: 10 test cases passed.
 - `test_line_annotation_generated_views`: 76 test cases passed.
 - Final `git diff --check`: passed.
