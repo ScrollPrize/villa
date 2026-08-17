@@ -290,6 +290,17 @@ public:
     // Resolves the package's umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
     [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
+    // The frame line points and control points are expressed in: the current
+    // volume's grid carried to the resolution the fibers were annotated at.
+    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
+    // Holders of derived geometry compare it to know whether what they built is
+    // still in a frame that means anything.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Opaque token that changes when the umbilicus a rebuild would resolve
+    // changes. Attaching, detaching or repointing it emits no signal, so holders
+    // of derived geometry have to compare this instead. Cheap by construction:
+    // the project's field plus a stat(), never the resolver's directory search.
+    [[nodiscard]] QString umbilicusFingerprint() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
     // edits that refresh the fiber summaries). Holders of derived data compare
@@ -618,10 +629,6 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
-    // The frame line points and control points are expressed in: the current
-    // volume's grid carried to the resolution the fibers were annotated at.
-    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
-    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
     // Drops the cached scroll umbilicus and everything describing it, so the next
     // use resolves again.
     void invalidateScrollUmbilicus();

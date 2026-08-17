@@ -6144,6 +6144,38 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     return summaries;
 }
 
+QString LineAnnotationController::umbilicusFingerprint() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    // Deliberately cheap: this is compared whenever a derived view is about to
+    // be trusted, so it must not run the resolver's directory search or parse
+    // any JSON. The project's field covers attaching, detaching and repointing —
+    // none of which emits a signal — and stat()ing the file it names covers the
+    // file being rewritten in place.
+    QString fingerprint = QString::fromStdString(pkg.umbilicus());
+    std::error_code ec;
+    const std::filesystem::path path = pkg.umbilicusPath();
+    if (!path.empty()) {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (!ec) {
+            fingerprint += QStringLiteral("|%1").arg(size);
+        }
+        const auto written = std::filesystem::last_write_time(path, ec);
+        if (!ec) {
+            fingerprint += QStringLiteral("|%1").arg(
+                static_cast<qlonglong>(written.time_since_epoch().count()));
+        }
+    }
+    // A file found by discovery rather than named by the project is not covered:
+    // noticing one appear would need the directory search this exists to avoid.
+    // Rebuild re-resolves regardless, so the cost of missing it is a stale
+    // banner that does not appear, not wrong geometry.
+    return fingerprint;
+}
+
 LineAnnotationController::UmbilicusStatus
 LineAnnotationController::umbilicusStatus() const
 {
@@ -6190,67 +6222,27 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     FiberMapSnapshot snapshot;
     snapshot.generation = _fiberDataGeneration;
 
-    // Fibers are annotated in the volume's level-0 source frame, so the
-    // annotation voxel size is the source resolution, not the (possibly
-    // downsampled) current volume's own voxel size.
-    const auto coordinateIdentity = coordinateIdentityForState(_state);
-    if (coordinateIdentity) {
-        if (coordinateIdentity->sourceOriginalResolution > 0.0 &&
-            std::isfinite(coordinateIdentity->sourceOriginalResolution)) {
-            snapshot.voxelSizeUm = coordinateIdentity->sourceOriginalResolution;
-            Logger()->info(
-                "Fiber map: annotation voxel size {:g} um from the open-data "
-                "coordinate identity",
-                *snapshot.voxelSizeUm);
-        }
-    }
-    // Fallback for a volume that carries no downsample tags: with nothing to
-    // say otherwise, the store's own level-0 resolution *is* the frame the
-    // fibers are annotated in. This is not equivalent to the identity above and
-    // must never be preferred over it: a tagged store can report
-    // baseScaleLevel() == 0 while its coordinates are a finer grid than its own
-    // voxel size describes, and only sourceOriginalResolution knows that. The
-    // fallback is therefore reached exactly when (1) is unavailable, which is
-    // also the only case in which it is right.
-    if (!snapshot.voxelSizeUm && _state) {
-        try {
-            if (const auto volume = _state->currentVolume()) {
-                const double level0Um =
-                    volume->voxelSize() / std::pow(2.0, volume->baseScaleLevel());
-                if (level0Um > 0.0 && std::isfinite(level0Um)) {
-                    snapshot.voxelSizeUm = level0Um;
-                    Logger()->info(
-                        "Fiber map: annotation voxel size {:g} um from the "
-                        "current volume's level-0 resolution ({:g} um at base "
-                        "scale level {})",
-                        level0Um,
-                        volume->voxelSize(),
-                        volume->baseScaleLevel());
-                }
-            }
-        } catch (...) {
-        }
-    }
-    if (!snapshot.voxelSizeUm) {
+    // Fibers are annotated in a source frame the current volume may only
+    // describe indirectly, so the resolution and the voxel counts both come from
+    // one derivation — deriving them separately is what let a rebased store pair
+    // a level-0 resolution with level-N counts.
+    const auto frame = annotationFrame();
+    snapshot.voxelSizeUm = frame.voxelSizeUm;
+    if (snapshot.voxelSizeUm) {
+        Logger()->info(
+            "Fiber map: annotation voxel size {:g} um, volume grid scaled by "
+            "x{:g} into the annotation frame",
+            *snapshot.voxelSizeUm,
+            frame.factor);
+    } else {
         Logger()->info("Fiber map: no voxel size available; the map will report "
                        "lengths in voxels");
     }
 
-    // The scroll's z extent, scaled into that same source frame so it pairs with
-    // voxelSizeUm.
-    if (_state && _state->currentVolume()) {
-        try {
-            const int slices = _state->currentVolume()->numSlices();
-            if (slices > 0) {
-                double sourceSlices = static_cast<double>(slices);
-                if (coordinateIdentity) {
-                    sourceSlices *= static_cast<double>(
-                        coordinateIdentity->sourceCoordinateScaleFactor);
-                }
-                snapshot.annotationZSlices = static_cast<int>(std::llround(sourceSlices));
-            }
-        } catch (...) {
-        }
+    // The scroll's z extent in that same frame, so it pairs with voxelSizeUm.
+    if (frame.extentXyz[2] > 0.0) {
+        snapshot.annotationZSlices =
+            static_cast<int>(std::llround(frame.extentXyz[2]));
     }
 
     std::unordered_set<uint64_t> loadedIds;
@@ -6340,26 +6332,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // grid the points actually fit inside. Fiber geometry is never consulted:
     // where the annotation happens to reach says nothing about the grid the
     // umbilicus was drawn on, and using it got this wrong in both directions.
-    std::array<double, 3> fiberGridXyz{0.0, 0.0, 0.0};
-    if (_state) {
-        try {
-            if (const auto volume = _state->currentVolume()) {
-                // The identity's scale factor lifts the volume's own base grid
-                // to the finer frame the fibers are annotated in.
-                double factor = 1.0;
-                if (coordinateIdentity &&
-                    coordinateIdentity->sourceCoordinateScaleFactor > 0) {
-                    factor = static_cast<double>(
-                        coordinateIdentity->sourceCoordinateScaleFactor);
-                }
-                fiberGridXyz = {volume->sliceWidth() * factor,
-                                volume->sliceHeight() * factor,
-                                volume->numSlices() * factor};
-            }
-        } catch (...) {
-            fiberGridXyz = {0.0, 0.0, 0.0};
-        }
-    }
+    const std::array<double, 3>& fiberGridXyz = frame.extentXyz;
     const bool haveFiberGrid = fiberGridXyz[0] > 0.0 && fiberGridXyz[1] > 0.0 &&
                                fiberGridXyz[2] > 0.0;
 
