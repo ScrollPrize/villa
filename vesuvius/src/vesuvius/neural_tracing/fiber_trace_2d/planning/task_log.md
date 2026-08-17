@@ -133,3 +133,46 @@
 - User visual review remains pending.
 - A separate `--vis` replay wrote three reloadable failure manifests under
   `/tmp/fiberlet-replay-robust-final-vis`: two greedy and one fiberlet view.
+
+## 2026-08-17 Follow-up Anchor Profile
+
+- Committed the robust sampled-direction checkpoint as `d89b0aba0`.
+- The idle-host profile attributes 122.40 worker-seconds to local refinement:
+  54.04 seconds to robust tensor proposals, 60.96 seconds to spatial state
+  evaluation, 1.63 seconds to centroids, and 5.77 seconds to control overhead.
+- Outside local refinement, the largest anchor costs are prediction sampling
+  (81.86 worker-seconds), observation construction (65.93 worker-seconds), and
+  peak search (47.29 worker-seconds).
+- The first follow-up optimization will remove repeated normalization,
+  Gaussian, residual, and component-scan work inside each robust proposal and
+  omit the unused PCA tensor from final membership refresh. It intentionally
+  does not change the estimator or spatial search.
+
+## 2026-08-17 Follow-up Anchor Optimization
+
+- Canonical command:
+  `vc_fiberlets fiberlet-replay fiber_s1_002.lasagna.json dj_20260805T025256484_000003.json /tmp/fiberlet-replay --normal-manifest las_008.lasagna.json --threads 32 --length 5000 --maximum-iterations 2`.
+- The committed `d89b0aba0` checkpoint completed in 18.17 seconds wall and
+  512.77 seconds CPU. Anchor extraction used 11.59 seconds wall and 349.78
+  seconds CPU.
+- Fusing robust residual histograms with retained tensor accumulation, omitting
+  the unused final-membership tensor, caching gradients once per tile, pairing
+  baseline/first-candidate spatial objectives, and representing peak geometry
+  in transverse 2D reduced the canonical run to 17.11 seconds wall and anchor
+  extraction to 10.37 seconds with four-cell tiles.
+- Six-cell tiles were the best measured balance between halo duplication and
+  32-worker load balance: 16.96 seconds total wall, 461.19 seconds total CPU,
+  10.34 seconds anchor wall, and 298.57 seconds anchor CPU. Submitted anchor
+  samples fell from about 69.9 million to 39.7 million and physical gradient
+  computations to 35.8 million.
+- The final run produced 2520 anchors, 48,972 searched / 24,518 accepted
+  fiberlets, 47,924,048 evaluated DP nodes, 2 greedy failures, and 1 fiberlet
+  failure. Small population and DP differences are accepted for the regrouped
+  floating-point reductions; visual quality review remains required.
+- Eight-cell tiles reduced aggregate CPU but regressed wall time from poorer
+  load balance. Sorting those tiles by descending size regressed further.
+  Explicit Gaussian caches and a linked-bin peak broad phase also regressed and
+  were removed; the latter cut response visits but lost locality. Replacing
+  compensated hot-loop sums with ordinary double reductions was neutral to
+  slightly slower (10.45 seconds anchor wall, 298.30 seconds anchor CPU) and
+  was also removed.

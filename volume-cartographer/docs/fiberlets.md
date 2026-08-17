@@ -525,7 +525,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=4` row. Both commands use the same field
+`fiberlet_extraction_profile version=6` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -566,6 +566,18 @@ assignment, histogram cutoff selection, and retained sampled-direction PCA;
 the local state-evaluation phase contains fixed-direction position objectives.
 Component and mass fields count every robust proposal across bounded passes;
 they are work diagnostics, not a deduplicated final component population.
+
+Version 6 distinguishes logical per-cell gradient uses from physical gradient
+computations. Presence gradients are computed once over each dense anchor tile
+and reused by overlapping cell halos. `anchor_gradient_attempts` and
+`anchor_valid_gradients` retain their logical per-observation meaning, while
+`anchor_gradient_computations`, `anchor_valid_gradient_computations`, and
+`anchor_gradient_construction_work_seconds` report the physical tile work.
+Robust residual histograms and retained direction tensors are accumulated
+together, paired spatial objectives share one observation pass, and peak
+responses use an equivalent two-dimensional transverse representation. These
+grouped reductions can introduce small floating-point differences; exact
+numeric identity with version 4 is not a requirement.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

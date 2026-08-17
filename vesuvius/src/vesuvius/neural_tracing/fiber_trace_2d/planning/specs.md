@@ -2658,7 +2658,7 @@
   serialization sign are deterministic. Parallel work cannot change a
   within-cell reduction. After serial cell selection, extraction forms the
   selected cells plus every conservative direct-NMS-context cell, partitions
-  them into deterministic four-cell-per-axis spatial tiles, and samples one
+  them into deterministic six-cell-per-axis spatial tiles, and samples one
   dense ZYX box per tile with the complete fitting/peak/gradient halo. Cell
   fits traverse indexed tile storage in the same canonical ZYX order as an
   independent halo. Tile halos may overlap, but the decoded chunk cache avoids
@@ -3021,7 +3021,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=4` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=6` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3065,6 +3065,12 @@
   aggregation. State-evaluation time contains fixed-direction spatial
   objectives. Robust component and mass counters accumulate proposals across
   bounded passes and are not final-population counts.
+- Version 6 separately reports logical gradient attempts and physical
+  tile-gradient computations. Tile gradients are constructed once and reused
+  by overlapping cell halos. Robust histogram/tensor accumulation, paired
+  spatial objectives, and transverse peak evaluation may regroup otherwise
+  equivalent floating-point operations; small numeric differences from
+  version 4 are accepted for this anchor fitter.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's

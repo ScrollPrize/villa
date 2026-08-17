@@ -1,5 +1,30 @@
 # Plan: robust sampled-direction anchor refinement
 
+## Follow-up Performance Checkpoint
+
+1. Treat commit `d89b0aba0` as the behavior and performance baseline. Its
+   idle-host canonical replay takes 18.17 seconds wall: 11.59 seconds in anchor
+   extraction and 5.95 seconds in fiberlet extraction.
+2. Optimize `robustDirectionProposal()` without changing assignment, trimming,
+   direction, or spatial-objective semantics:
+   - store each assigned observation's residual bin temporarily in the existing
+     retained-membership byte;
+   - derive the weighted deviation histogram directly from the residual-mass
+     histogram instead of rescanning observations;
+   - accumulate symmetric direction tensors by component and residual bin in
+     the assignment pass, then combine retained bins after choosing the cutoff;
+   - avoid a separate normalized-direction or Gaussian-mass memory stream.
+3. Let the final post-iteration membership refresh omit principal-axis tensor
+   construction because that call consumes only assignments and retained
+   membership; the fitted axes are deliberately fixed at that point.
+4. Increment the extraction-profile schema because tensor-visit counters now
+   describe the reduced implementation work. Add focused equivalence coverage,
+   run GCC and Clang focused tests, and compare canonical anchor/fiberlet
+   populations and replay failures before accepting the checkpoint.
+5. Measure this checkpoint before considering the independent follow-ups:
+   pre-normalized per-cell observations, tile-level presence-gradient reuse,
+   or peak-search optimization.
+
 ## Baseline And Invariants
 
 1. Use the current version-3 canonical 5,000-base-voxel replay profile as the
@@ -145,7 +170,7 @@
    - spatial candidates tested and accepted by depth;
    - iterations reaching the hard limit.
 3. Keep existing phase timings and logical visit counters and advance emitted
-   diagnostics to `fiberlet_extraction_profile version=4`. Aggregate every new
+   diagnostics to `fiberlet_extraction_profile version=6`. Aggregate every new
    field through worker profiles and cover aggregation in tests.
 
 ## Implementation Structure

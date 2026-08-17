@@ -455,12 +455,18 @@ struct RobustDirectionProposal {
     size_t activeComponents,
     const cv::Vec3d& pivot,
     const FiberAnchorConfig& config,
-    FiberAnchorFitProfile* profile)
+    FiberAnchorFitProfile* profile,
+    bool computeAxes)
 {
     RobustDirectionProposal proposal;
     proposal.assignments.assign(observations.size(), kUnassignedComponent);
     proposal.retainedInliers.assign(observations.size(), 0);
     std::array<std::array<double, kRobustHistogramBins>, 2> residualHistograms{};
+    using SymmetricTensor = std::array<CompensatedSum, 6>;
+    using TensorHistogram = std::array<SymmetricTensor, kRobustHistogramBins>;
+    std::optional<std::array<TensorHistogram, 2>> tensorHistograms;
+    if (computeAxes)
+        tensorHistograms.emplace();
     std::array<double, 2> totalMass{0.0, 0.0};
 
     for (size_t index = 0; index < observations.size(); ++index) {
@@ -492,8 +498,19 @@ struct RobustDirectionProposal {
             continue;
         const double mass = gaussian[assigned] * observation.presence;
         const double residual = std::clamp(1.0 - alignment[assigned], 0.0, 1.0);
-        residualHistograms[assigned][robustHistogramBin(residual)] += mass;
+        const size_t residualBin = robustHistogramBin(residual);
+        proposal.retainedInliers[index] = static_cast<uint8_t>(residualBin);
+        residualHistograms[assigned][residualBin] += mass;
         totalMass[assigned] += mass;
+        if (tensorHistograms.has_value()) {
+            auto& tensor = (*tensorHistograms)[assigned][residualBin];
+            tensor[0].add(mass * direction[0] * direction[0]);
+            tensor[1].add(mass * direction[0] * direction[1]);
+            tensor[2].add(mass * direction[0] * direction[2]);
+            tensor[3].add(mass * direction[1] * direction[1]);
+            tensor[4].add(mass * direction[1] * direction[2]);
+            tensor[5].add(mass * direction[2] * direction[2]);
+        }
     }
     if (profile != nullptr)
         profile->localTensorObservationVisits += observations.size();
@@ -511,22 +528,12 @@ struct RobustDirectionProposal {
             residualHistograms[component], totalMass[component], 0.5);
         const double median = robustHistogramCenter(medianBin);
         std::array<double, kRobustHistogramBins> deviationHistogram{};
-        for (size_t index = 0; index < observations.size(); ++index) {
-            if (proposal.assignments[index] != component)
-                continue;
-            const auto& observation = observations[index];
-            cv::Vec3d direction;
-            if (!usableDirectionObservation(observation, config, direction))
-                continue;
-            const double gaussian = transverseGaussian(
-                observation, components[component], pivot, config);
-            const double dot = direction.dot(components[component].axis);
-            const double residual = std::clamp(1.0 - dot * dot, 0.0, 1.0);
-            deviationHistogram[robustHistogramBin(std::abs(residual - median))] +=
-                gaussian * observation.presence;
+        for (size_t residualBin = 0; residualBin < kRobustHistogramBins;
+             ++residualBin) {
+            deviationHistogram[robustHistogramBin(std::abs(
+                robustHistogramCenter(residualBin) - median))] +=
+                residualHistograms[component][residualBin];
         }
-        if (profile != nullptr)
-            profile->localTensorObservationVisits += observations.size();
         const RobustHistogramCutoff cutoff = selectRobustHistogramCutoff(
             residualHistograms[component], deviationHistogram,
             totalMass[component], median,
@@ -551,40 +558,30 @@ struct RobustDirectionProposal {
         }
     }
 
-    std::array<std::array<CompensatedSum, 9>, 2> tensorSums;
     for (size_t index = 0; index < observations.size(); ++index) {
         const uint8_t assigned = proposal.assignments[index];
-        if (assigned >= activeComponents)
-            continue;
-        const auto& observation = observations[index];
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
-            continue;
-        const double gaussian = transverseGaussian(
-            observation, components[assigned], pivot, config);
-        const double dot = direction.dot(components[assigned].axis);
-        const double residual = std::clamp(1.0 - dot * dot, 0.0, 1.0);
-        if (robustHistogramBin(residual) > cutoffBins[assigned])
-            continue;
-        proposal.retainedInliers[index] = 1;
-        const double mass = gaussian * observation.presence;
-        for (int row = 0; row < 3; ++row) {
-            for (int column = 0; column < 3; ++column) {
-                tensorSums[assigned][static_cast<size_t>(row * 3 + column)].add(
-                    mass * direction[row] * direction[column]);
-            }
-        }
+        proposal.retainedInliers[index] = static_cast<uint8_t>(
+            assigned < activeComponents &&
+            proposal.retainedInliers[index] <= cutoffBins[assigned]);
     }
     if (profile != nullptr)
         profile->localTensorObservationVisits += observations.size();
+    if (!computeAxes)
+        return proposal;
     for (size_t component = 0; component < activeComponents; ++component) {
-        cv::Matx33d tensor;
-        for (int row = 0; row < 3; ++row) {
-            for (int column = 0; column < 3; ++column) {
-                tensor(row, column) = tensorSums[component][
-                    static_cast<size_t>(row * 3 + column)].sum;
+        SymmetricTensor sums;
+        for (size_t residualBin = 0;
+             residualBin <= cutoffBins[component]; ++residualBin) {
+            for (size_t entry = 0; entry < sums.size(); ++entry) {
+                sums[entry].add(
+                    (*tensorHistograms)[component][residualBin][entry].sum);
             }
         }
+        const cv::Matx33d tensor{
+            sums[0].sum, sums[1].sum, sums[2].sum,
+            sums[1].sum, sums[3].sum, sums[4].sum,
+            sums[2].sum, sums[4].sum, sums[5].sum,
+        };
         const FiberPrincipalAxis principal = principalFiberAxis(tensor);
         proposal.unique[component] = principal.unique;
         if (principal.unique)
@@ -621,6 +618,53 @@ struct RobustDirectionProposal {
         numerator.add(gaussian * observations[index].presence * dot * dot);
     }
     return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+}
+
+[[nodiscard]] std::array<double, 2> retainedSpatialObjectivePair(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& first,
+    const std::array<RefinedComponentState, 2>& second,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    std::array<CompensatedSum, 2> numerators;
+    std::array<CompensatedSum, 2> denominators;
+    for (size_t index = 0; index < observations.size(); ++index) {
+        const auto& observation = observations[index];
+        for (size_t component = 0; component < activeComponents; ++component) {
+            denominators[0].add(transverseGaussian(
+                observation, first[component], pivot, config));
+            denominators[1].add(transverseGaussian(
+                observation, second[component], pivot, config));
+        }
+        const uint8_t component = assignments[index];
+        if (!retainedInliers[index] || component >= activeComponents)
+            continue;
+        cv::Vec3d direction;
+        if (!usableDirectionObservation(observation, config, direction))
+            continue;
+        const double firstGaussian = transverseGaussian(
+            observation, first[component], pivot, config);
+        const double secondGaussian = transverseGaussian(
+            observation, second[component], pivot, config);
+        const double firstDot = direction.dot(first[component].axis);
+        const double secondDot = direction.dot(second[component].axis);
+        numerators[0].add(
+            firstGaussian * observation.presence * firstDot * firstDot);
+        numerators[1].add(
+            secondGaussian * observation.presence * secondDot * secondDot);
+    }
+    return {
+        denominators[0].sum > 0.0
+            ? numerators[0].sum / denominators[0].sum
+            : 0.0,
+        denominators[1].sum > 0.0
+            ? numerators[1].sum / denominators[1].sum
+            : 0.0,
+    };
 }
 
 [[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
@@ -719,7 +763,7 @@ struct RobustDirectionProposal {
             : RefinementClock::time_point{};
         RobustDirectionProposal robust = robustDirectionProposal(
             observations, state.components, state.activeComponents, pivot,
-            config, profile);
+            config, profile, true);
         if (profile != nullptr) {
             profile->localTensorProposalWorkSeconds +=
                 std::chrono::duration<double>(
@@ -845,14 +889,12 @@ struct RobustDirectionProposal {
             : RefinementClock::time_point{};
         if (profile != nullptr)
             profile->refinedEvaluationObservationVisits += observations.size();
-        const double baselineObjective = retainedSpatialObjective(
-            observations, baseline, state.activeComponents,
-            robust.assignments, robust.retainedInliers, pivot, config);
         auto acceptedComponents = baseline;
         double acceptedPositionUpdate = 0.0;
         const auto fractions = fiberAnchorSpatialBacktrackingFractions(
             maximumTargetDisplacement,
             config.peakGridStepPredictionVoxels);
+        double baselineObjective = 0.0;
         for (size_t depth = 0; depth < fractions.size(); ++depth) {
             if (profile != nullptr) {
                 ++profile->backtrackingEvaluations;
@@ -870,9 +912,18 @@ struct RobustDirectionProposal {
                     pivot, candidate[component].axis,
                     config.localWindowRadiusPredictionVoxels, lower, upper);
             }
-            const double objective = retainedSpatialObjective(
-                observations, candidate, state.activeComponents,
-                robust.assignments, robust.retainedInliers, pivot, config);
+            double objective = 0.0;
+            if (depth == 0) {
+                const auto objectives = retainedSpatialObjectivePair(
+                    observations, baseline, candidate, state.activeComponents,
+                    robust.assignments, robust.retainedInliers, pivot, config);
+                baselineObjective = objectives[0];
+                objective = objectives[1];
+            } else {
+                objective = retainedSpatialObjective(
+                    observations, candidate, state.activeComponents,
+                    robust.assignments, robust.retainedInliers, pivot, config);
+            }
             const double tolerance = config.convergenceTolerance *
                 std::max(1.0, std::abs(baselineObjective));
             if (objective <= baselineObjective + tolerance)
@@ -915,7 +966,7 @@ struct RobustDirectionProposal {
             : RefinementClock::time_point{};
         const RobustDirectionProposal finalMembership = robustDirectionProposal(
             observations, state.components, state.activeComponents, pivot,
-            config, profile);
+            config, profile, false);
         state.evaluation.assignments = finalMembership.assignments;
         state.evaluation.retainedInliers = finalMembership.retainedInliers;
         if (profile != nullptr) {
@@ -1008,10 +1059,14 @@ struct DirectionConditionedPeak {
          config.peakAxialSigmaPredictionVoxels);
 
     struct PeakObservation {
-        cv::Vec3d position{0.0, 0.0, 0.0};
+        double first = 0.0;
+        double second = 0.0;
+        double axialGaussian = 0.0;
         double signal = 0.0;
         double directionAlignmentSquared = 0.0;
-        cv::Vec3d presenceGradient{0.0, 0.0, 0.0};
+        double gradientFirst = 0.0;
+        double gradientSecond = 0.0;
+        double gradientNorm = 0.0;
         bool presenceGradientValid = false;
     };
     std::vector<PeakObservation> peakObservations;
@@ -1033,6 +1088,8 @@ struct DirectionConditionedPeak {
         const cv::Vec3d transverse = pivotOffset - axis * axial;
         if (transverse.dot(transverse) > unionRadius * unionRadius)
             continue;
+        const double first = transverse.dot(basis[0]);
+        const double second = transverse.dot(basis[1]);
 
         cv::Vec3d direction;
         const bool usablePositive = usableDirectionObservation(
@@ -1047,16 +1104,31 @@ struct DirectionConditionedPeak {
             selectedAlignment = dot * dot;
             signal = observation.presence * selectedAlignment;
         }
-        peakObservations.push_back({
-            observation.positionPredictionXYZ,
-            signal,
-            selectedAlignment,
-            observation.presenceGradientPredictionXYZ,
-            observation.presenceGradientValid,
-        });
+        PeakObservation peakObservation;
+        peakObservation.first = first;
+        peakObservation.second = second;
+        peakObservation.axialGaussian = std::exp(
+            -axial * axial * invTwoAxialSigma2);
+        peakObservation.signal = signal;
+        peakObservation.directionAlignmentSquared = selectedAlignment;
+        if (observation.presenceGradientValid &&
+            finiteVector(observation.presenceGradientPredictionXYZ)) {
+            peakObservation.gradientFirst =
+                observation.presenceGradientPredictionXYZ.dot(basis[0]);
+            peakObservation.gradientSecond =
+                observation.presenceGradientPredictionXYZ.dot(basis[1]);
+            const double gradientNorm2 =
+                peakObservation.gradientFirst * peakObservation.gradientFirst +
+                peakObservation.gradientSecond * peakObservation.gradientSecond;
+            if (gradientNorm2 > kMatrixEpsilon) {
+                peakObservation.gradientNorm = std::sqrt(gradientNorm2);
+                peakObservation.presenceGradientValid = true;
+            }
+        }
+        peakObservations.push_back(peakObservation);
     }
 
-    const auto responseAt = [&](const cv::Vec3d& candidate, bool acceptance) {
+    const auto responseAt = [&](double candidateFirst, double candidateSecond, bool acceptance) {
         if (profile != nullptr) {
             if (acceptance)
                 ++profile->peakAcceptanceResponses;
@@ -1071,87 +1143,60 @@ struct DirectionConditionedPeak {
         CompensatedSum inward;
         CompensatedSum outward;
         for (const auto& observation : peakObservations) {
-            const cv::Vec3d offset = observation.position - candidate;
-            const double axial = offset.dot(axis);
-            if (std::abs(axial) > axialCutoff)
-                continue;
-            const cv::Vec3d transverse = offset - axis * axial;
-            const double distanceSquared = transverse.dot(transverse);
+            const double radialFirst = candidateFirst - observation.first;
+            const double radialSecond = candidateSecond - observation.second;
+            const double distanceSquared = radialFirst * radialFirst + radialSecond * radialSecond;
             if (distanceSquared > cutoff * cutoff)
                 continue;
-            const double gaussian = std::exp(
-                -distanceSquared * invTwoTransverseSigma2 -
-                axial * axial * invTwoAxialSigma2);
+            const double gaussian = observation.axialGaussian * std::exp(-distanceSquared * invTwoTransverseSigma2);
             denominator.add(gaussian);
             numerator.add(gaussian * observation.signal);
             if (!(observation.directionAlignmentSquared > 0.0))
                 continue;
-            const double eligibleWeight =
-                gaussian * observation.directionAlignmentSquared;
+            const double eligibleWeight = gaussian * observation.directionAlignmentSquared;
             eligibleGradientWeight.add(eligibleWeight);
-            if (!observation.presenceGradientValid ||
-                !finiteVector(observation.presenceGradient)) {
+            if (!observation.presenceGradientValid) {
                 continue;
             }
-            const cv::Vec3d radial =
-                (candidate - observation.position) -
-                axis * (candidate - observation.position).dot(axis);
-            const cv::Vec3d gradient = observation.presenceGradient -
-                axis * observation.presenceGradient.dot(axis);
-            const double radialNorm2 = radial.dot(radial);
-            const double gradientNorm2 = gradient.dot(gradient);
-            if (!(radialNorm2 > kMatrixEpsilon) ||
-                !(gradientNorm2 > kMatrixEpsilon)) {
+            if (!(distanceSquared > kMatrixEpsilon)) {
                 continue;
             }
             validGradientWeight.add(eligibleWeight);
-            const double cosine = std::clamp(
-                gradient.dot(radial) /
-                    std::sqrt(gradientNorm2 * radialNorm2),
-                -1.0,
-                1.0);
-            const double vote = eligibleWeight *
-                std::sqrt(gradientNorm2) *
-                config.peakSigmaPredictionVoxels * cosine * cosine;
+            const double cosine =
+                std::clamp((observation.gradientFirst * radialFirst + observation.gradientSecond * radialSecond) / (observation.gradientNorm * std::sqrt(distanceSquared)), -1.0, 1.0);
+            const double vote = eligibleWeight * observation.gradientNorm * config.peakSigmaPredictionVoxels * cosine * cosine;
             if (cosine > 0.0)
                 inward.add(vote);
             else if (cosine < 0.0)
                 outward.add(vote);
         }
-        const double presenceResponse = denominator.sum > 0.0
-            ? numerator.sum / denominator.sum
-            : 0.0;
-        if (!(config.peakGradientWeight > 0.0) ||
-            !(eligibleGradientWeight.sum > 0.0) ||
-            !(validGradientWeight.sum > 0.0)) {
+        const double presenceResponse = denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+        if (!(config.peakGradientWeight > 0.0) || !(eligibleGradientWeight.sum > 0.0) || !(validGradientWeight.sum > 0.0)) {
             return presenceResponse;
         }
         const double voteMass = inward.sum + outward.sum;
         if (!(voteMass > 0.0))
             return presenceResponse;
-        const double coverage = std::clamp(
-            validGradientWeight.sum / eligibleGradientWeight.sum, 0.0, 1.0);
-        const double radialGradient =
-            voteMass / validGradientWeight.sum;
-        const double reliability = coverage * radialGradient /
-            (radialGradient + config.peakGradientReliabilityScale);
-        const double signedVote =
-            (inward.sum - outward.sum) / voteMass;
-        return presenceResponse +
-            config.peakGradientWeight * reliability * signedVote;
+        const double coverage = std::clamp(validGradientWeight.sum / eligibleGradientWeight.sum, 0.0, 1.0);
+        const double radialGradient = voteMass / validGradientWeight.sum;
+        const double reliability = coverage * radialGradient / (radialGradient + config.peakGradientReliabilityScale);
+        const double signedVote = (inward.sum - outward.sum) / voteMass;
+        return presenceResponse + config.peakGradientWeight * reliability * signedVote;
     };
 
     using GridIndex = std::pair<int, int>;
-    const int extent = static_cast<int>(std::floor(
-        config.localWindowRadiusPredictionVoxels /
-        config.peakGridStepPredictionVoxels));
+    const int extent = static_cast<int>(std::floor(config.localWindowRadiusPredictionVoxels / config.peakGridStepPredictionVoxels));
     const auto pointAt = [&](const GridIndex& index) {
-        return pivot + basis[0] *
-                (static_cast<double>(index.first) *
-                 config.peakGridStepPredictionVoxels) +
-            basis[1] *
-                (static_cast<double>(index.second) *
-                 config.peakGridStepPredictionVoxels);
+        return pivot + basis[0] * (static_cast<double>(index.first) * config.peakGridStepPredictionVoxels) +
+               basis[1] * (static_cast<double>(index.second) * config.peakGridStepPredictionVoxels);
+    };
+    const auto responseAtIndex = [&](const GridIndex& index, bool acceptance) {
+        return responseAt(
+            static_cast<double>(index.first) *
+                config.peakGridStepPredictionVoxels,
+            static_cast<double>(index.second) *
+                config.peakGridStepPredictionVoxels,
+            acceptance);
     };
     const auto feasible = [&](const GridIndex& index) {
         return std::abs(index.first) <= extent &&
@@ -1168,7 +1213,7 @@ struct DirectionConditionedPeak {
         const auto found = responseCache.find(index);
         if (found != responseCache.end())
             return found->second;
-        return responseCache.emplace(index, responseAt(pointAt(index), false))
+        return responseCache.emplace(index, responseAtIndex(index, false))
             .first->second;
     };
 
@@ -1222,10 +1267,12 @@ struct DirectionConditionedPeak {
     const double tolerance =
         1.0e-12 * std::max(1.0, std::abs(centerResponse));
     const auto acceptedPosition = [&](const cv::Vec3d& candidate) {
+        const cv::Vec3d offset = candidate - pivot;
         return insidePeakDomain(
                    candidate, pivot, owner,
                    config.localWindowRadiusPredictionVoxels) &&
-            responseAt(candidate, true) + tolerance >= centerResponse;
+            responseAt(offset.dot(basis[0]), offset.dot(basis[1]), true) +
+                tolerance >= centerResponse;
     };
 
     std::array<double, 2> separableOffsetGridSteps{0.0, 0.0};
@@ -2526,13 +2573,17 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             return std::pair{sampleBegin, sampleEnd};
         };
 
+        struct CachedPresenceGradient {
+            cv::Vec3d value{0.0, 0.0, 0.0};
+            bool valid = false;
+        };
         struct Tile {
             std::vector<size_t> cells;
             CellIndex sampleBegin{};
             CellIndex sampleEnd{};
             size_t estimatedBytes = 0;
         };
-        constexpr size_t kTileCellsPerAxis = 4;
+        constexpr size_t kTileCellsPerAxis = 6;
         std::map<CellIndex, std::vector<size_t>> tileCells;
         for (size_t index = 0; index < requestedCells.size(); ++index) {
             const auto& cell = requestedCells[index];
@@ -2567,8 +2618,11 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             };
             const size_t tileSamples =
                 checkedProduct(tileShape, "fiber anchor tile sample");
-            constexpr size_t denseBytes =
-                sizeof(CellIndex) + sizeof(FiberStoredPredictionSample);
+            const size_t denseBytes =
+                sizeof(CellIndex) + sizeof(FiberStoredPredictionSample) +
+                (config.peakGradientWeight > 0.0
+                    ? sizeof(CachedPresenceGradient)
+                    : 0);
             tile.estimatedBytes = tileSamples >
                     std::numeric_limits<size_t>::max() / denseBytes
                 ? std::numeric_limits<size_t>::max()
@@ -2663,9 +2717,12 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             size_t retainedObservations = 0;
             size_t gradientAttempts = 0;
             size_t validGradients = 0;
+            size_t gradientComputations = 0;
+            size_t validGradientComputations = 0;
             size_t fitIterations = 0;
             double coordinateConstructionSeconds = 0.0;
             double predictionSamplingSeconds = 0.0;
+            double gradientConstructionSeconds = 0.0;
             double observationConstructionSeconds = 0.0;
             double fittingSeconds = 0.0;
             FiberAnchorFitProfile fit;
@@ -2675,6 +2732,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             (const CellIndex& cellZYX,
              const Tile& tile,
              const std::vector<FiberStoredPredictionSample>& samples,
+             const std::vector<CachedPresenceGradient>& gradients,
              const std::array<size_t, 3>& sampleShape,
              WorkerProfile& workerProfile) {
             const auto observationStart = std::chrono::steady_clock::now();
@@ -2712,36 +2770,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     x == cellSampleBegin[2] || x + 1 >= cellSampleEnd[2]) {
                     return std::optional<cv::Vec3d>{};
                 }
-                constexpr std::array<double, 3> smooth{0.25, 0.5, 0.25};
-                constexpr std::array<double, 3> derivative{-0.5, 0.0, 0.5};
-                cv::Vec3d gradient{0.0, 0.0, 0.0};
-                for (int dz = -1; dz <= 1; ++dz) {
-                    for (int dy = -1; dy <= 1; ++dy) {
-                        for (int dx = -1; dx <= 1; ++dx) {
-                            const size_t index = tileIndex(z, y, x);
-                            const size_t neighbor = static_cast<size_t>(
-                                static_cast<std::ptrdiff_t>(index) +
-                                static_cast<std::ptrdiff_t>(dz) *
-                                    static_cast<std::ptrdiff_t>(plane) +
-                                static_cast<std::ptrdiff_t>(dy) *
-                                    static_cast<std::ptrdiff_t>(sampleShape[2]) +
-                                dx);
-                            const auto& sample = samples[neighbor];
-                            if (!(sample.presenceValid || sample.valid) ||
-                                !std::isfinite(sample.presence)) {
-                                return std::optional<cv::Vec3d>{};
-                            }
-                            const double presence = sample.presence;
-                            gradient[0] += presence * derivative[dx + 1] *
-                                smooth[dy + 1] * smooth[dz + 1];
-                            gradient[1] += presence * smooth[dx + 1] *
-                                derivative[dy + 1] * smooth[dz + 1];
-                            gradient[2] += presence * smooth[dx + 1] *
-                                smooth[dy + 1] * derivative[dz + 1];
-                        }
-                    }
-                }
-                return std::optional<cv::Vec3d>{gradient};
+                const auto& gradient = gradients[tileIndex(z, y, x)];
+                return gradient.valid
+                    ? std::optional<cv::Vec3d>{gradient.value}
+                    : std::nullopt;
             };
             std::vector<FiberAnchorObservation> cellObservations;
             const std::array<size_t, 3> cellSampleShape{
@@ -2857,10 +2889,72 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                     indices.clear();
                     indices.shrink_to_fit();
+                    std::vector<CachedPresenceGradient> gradients;
+                    if (config.peakGradientWeight > 0.0) {
+                        const auto gradientStart = std::chrono::steady_clock::now();
+                        gradients.resize(sampleCount);
+                        constexpr std::array<double, 3> smooth{0.25, 0.5, 0.25};
+                        constexpr std::array<double, 3> derivative{-0.5, 0.0, 0.5};
+                        const size_t plane = sampleShape[1] * sampleShape[2];
+                        const auto localIndex = [&](size_t z, size_t y, size_t x) {
+                            return (z - tile.sampleBegin[0]) * plane +
+                                (y - tile.sampleBegin[1]) * sampleShape[2] +
+                                (x - tile.sampleBegin[2]);
+                        };
+                        for (size_t z = tile.sampleBegin[0] + 1;
+                             z + 1 < tile.sampleEnd[0]; ++z) {
+                            for (size_t y = tile.sampleBegin[1] + 1;
+                                 y + 1 < tile.sampleEnd[1]; ++y) {
+                                for (size_t x = tile.sampleBegin[2] + 1;
+                                     x + 1 < tile.sampleEnd[2]; ++x) {
+                                    ++workerProfile.gradientComputations;
+                                    const size_t index = localIndex(z, y, x);
+                                    auto& cached = gradients[index];
+                                    bool valid = true;
+                                    for (int dz = -1; dz <= 1 && valid; ++dz) {
+                                        for (int dy = -1; dy <= 1 && valid; ++dy) {
+                                            for (int dx = -1; dx <= 1; ++dx) {
+                                                const size_t neighbor = static_cast<size_t>(
+                                                    static_cast<std::ptrdiff_t>(index) +
+                                                    static_cast<std::ptrdiff_t>(dz) *
+                                                        static_cast<std::ptrdiff_t>(plane) +
+                                                    static_cast<std::ptrdiff_t>(dy) *
+                                                        static_cast<std::ptrdiff_t>(sampleShape[2]) +
+                                                    dx);
+                                                const auto& sample = samples[neighbor];
+                                                if (!(sample.presenceValid || sample.valid) ||
+                                                    !std::isfinite(sample.presence)) {
+                                                    valid = false;
+                                                    break;
+                                                }
+                                                const double presence = sample.presence;
+                                                cached.value[0] +=
+                                                    presence * derivative[dx + 1] *
+                                                    smooth[dy + 1] * smooth[dz + 1];
+                                                cached.value[1] +=
+                                                    presence * smooth[dx + 1] *
+                                                    derivative[dy + 1] * smooth[dz + 1];
+                                                cached.value[2] +=
+                                                    presence * smooth[dx + 1] *
+                                                    smooth[dy + 1] * derivative[dz + 1];
+                                            }
+                                        }
+                                    }
+                                    cached.valid = valid;
+                                    if (valid)
+                                        ++workerProfile.validGradientComputations;
+                                }
+                            }
+                        }
+                        const double elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - gradientStart).count();
+                        workerProfile.gradientConstructionSeconds += elapsed;
+                        workerProfile.observationConstructionSeconds += elapsed;
+                    }
                     for (const size_t cellIndex : tile.cells) {
                         jobResults[cellIndex] = processCell(
                             requestedCells[cellIndex], tile, samples,
-                            sampleShape, workerProfile);
+                            gradients, sampleShape, workerProfile);
                         const size_t completed = completedJobs.fetch_add(1) + 1;
                         if (progressCallback) {
                             const auto now = std::chrono::steady_clock::now();
@@ -2912,11 +3006,17 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 workerProfile.retainedObservations;
             report.profile.gradientAttempts += workerProfile.gradientAttempts;
             report.profile.validGradients += workerProfile.validGradients;
+            report.profile.gradientComputations +=
+                workerProfile.gradientComputations;
+            report.profile.validGradientComputations +=
+                workerProfile.validGradientComputations;
             report.profile.fitIterations += workerProfile.fitIterations;
             report.profile.coordinateConstructionWorkSeconds +=
                 workerProfile.coordinateConstructionSeconds;
             report.profile.predictionSamplingWorkSeconds +=
                 workerProfile.predictionSamplingSeconds;
+            report.profile.gradientConstructionWorkSeconds +=
+                workerProfile.gradientConstructionSeconds;
             report.profile.observationConstructionWorkSeconds +=
                 workerProfile.observationConstructionSeconds;
             report.profile.fittingWorkSeconds += workerProfile.fittingSeconds;

@@ -16,3 +16,10 @@
 - [x] Complete independent implementation review and address high-severity
   findings; record the remaining forced-removal fixture limitation.
 - [x] Finish specs, docs, task log, status, and changelog.
+- [x] Fuse robust residual and tensor accumulation and avoid the deviation
+  rescan.
+- [x] Skip unused tensor construction during final membership refresh.
+- [x] Reuse tile gradients, pair spatial objectives, and evaluate peak responses
+  in transverse coordinates.
+- [x] Tune anchor tiles and measure the follow-up checkpoint.
+- [x] Complete final GCC/Clang focused validation and documentation review.

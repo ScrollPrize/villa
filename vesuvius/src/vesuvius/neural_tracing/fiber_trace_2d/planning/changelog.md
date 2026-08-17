@@ -6,6 +6,10 @@
   through peak fitting, and added strict configuration/artifact diagnostics.
 - Reduced the default alternating robust update budget to two measured passes;
   legacy numeric identity is intentionally not required for this fitter.
+- Fused robust histogram/tensor work, reused tile gradients, paired spatial
+  objectives, and reduced peak-response geometry to transverse coordinates.
+- Increased anchor tiles from four to six cells per axis after measured tile
+  sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
 
 # 2026-08-17: fiberlet extraction profiling
 

@@ -269,6 +269,8 @@ struct FiberAnchorExtractionProfile {
     size_t retainedObservations = 0;
     size_t gradientAttempts = 0;
     size_t validGradients = 0;
+    size_t gradientComputations = 0;
+    size_t validGradientComputations = 0;
     size_t retainPredicateCalls = 0;
     size_t fitIterations = 0;
     double setupSeconds = 0.0;
@@ -277,6 +279,7 @@ struct FiberAnchorExtractionProfile {
     double cellProcessingCpuSeconds = 0.0;
     double coordinateConstructionWorkSeconds = 0.0;
     double predictionSamplingWorkSeconds = 0.0;
+    double gradientConstructionWorkSeconds = 0.0;
     double observationConstructionWorkSeconds = 0.0;
     double fittingWorkSeconds = 0.0;
     double selectionSeconds = 0.0;
