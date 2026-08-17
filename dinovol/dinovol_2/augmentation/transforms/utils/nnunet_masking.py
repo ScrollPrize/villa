@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 from typing import List
 
 from dinovol_2.augmentation.transforms.base.basic_transform import BasicTransform
@@ -19,4 +25,3 @@ class MaskImageTransform(BasicTransform):
         for c in range(data_dict['image'].shape[0]):
             data_dict['image'][c][mask] = self.set_outside_to
         return data_dict
-

@@ -1,3 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the Apache License, Version 2.0
+# found in LICENSES/Apache-2.0.txt.
+#
+# Modified for Dinovol's three-dimensional training pipeline.
+
 from __future__ import annotations
 
 import argparse
@@ -64,7 +71,7 @@ def dino_loss_term_count(n_local_views: int, n_global_views: int = 2) -> int:
         raise ValueError(f"n_local_views must be non-negative, got {n_local_views}")
     if n_global_views <= 0:
         raise ValueError(f"n_global_views must be positive, got {n_global_views}")
-    
+
     n_local_terms = n_local_views * n_global_views
     n_global_terms = (n_global_views - 1) * n_global_views
     return n_global_terms + n_local_terms
@@ -83,17 +90,17 @@ class CosineScheduler:
     ) -> None:
         self.final_value = float(final_value)
         self.total_iters = int(total_iters)
-        
+
         if self.total_iters <= 0:
             self.schedule = np.zeros((0,), dtype=np.float64)
             return
-        
+
         freeze_iters = max(0, min(int(freeze_iters), self.total_iters))
         warmup_iters = max(0, min(int(warmup_iters), self.total_iters - freeze_iters))
-        
+
         freeze_schedule = np.zeros((freeze_iters,), dtype=np.float64)
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters, dtype=np.float64)
-        
+
         cosine_iters = self.total_iters - warmup_iters - freeze_iters
         if cosine_iters > 0:
             iters = np.arange(cosine_iters, dtype=np.float64)
@@ -101,11 +108,11 @@ class CosineScheduler:
                         1.0 + np.cos(np.pi * iters / len(iters)))
         else:
             cosine_schedule = np.zeros((0,), dtype=np.float64)
-        
+
         self.schedule = np.concatenate((freeze_schedule, warmup_schedule, cosine_schedule))
         if len(self.schedule) != self.total_iters:
             raise AssertionError("invalid scheduler length")
-    
+
     def __getitem__(self, step: int) -> float:
         if step >= self.total_iters:
             return self.final_value
@@ -161,7 +168,7 @@ class DinoIBOTPretrainer:
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
         self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
-        
+
         warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
         if self.total_steps > 0 and warmup_ratio > 0.0:
@@ -186,7 +193,7 @@ class DinoIBOTPretrainer:
                 )
             self.model = DDP(self.model, **ddp_kwargs)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
-        
+
         dino_out_dim = int(self.model_config.get("dino_out_dim", 131072))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
@@ -209,7 +216,7 @@ class DinoIBOTPretrainer:
             if self.do_gram
             else None
         )
-        
+
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
@@ -231,7 +238,7 @@ class DinoIBOTPretrainer:
             else:
                 self._refresh_gram_teacher_from_teacher()
             self.gram_teacher_backbone.eval()
-        
+
         self.teacher_temp = float(self.config.get("teacher_temp", 0.07))
         self.warmup_teacher_temp = float(self.config.get("warmup_teacher_temp", 0.04))
         self.warmup_teacher_temp_steps = int(
@@ -246,7 +253,7 @@ class DinoIBOTPretrainer:
             self.teacher_temp_schedule,
             self.last_layer_lr_schedule,
         ) = self._build_schedulers()
-        
+
         self.log_every = int(self.config.get("log_every", 20))
         self.val_every_n = int(self.config.get("val_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
@@ -335,7 +342,7 @@ class DinoIBOTPretrainer:
         if ((step + 1) - self.gram_teacher_refresh_start_step) % self.gram_teacher_refresh_every != 0:
             return
         self._refresh_gram_teacher_from_teacher()
-    
+
     def _resolve_step_count(self, steps_key: str, epochs_key: str, *, default: int) -> int:
         if steps_key in self.config:
             return int(self.config[steps_key])
@@ -434,7 +441,7 @@ class DinoIBOTPretrainer:
         if run_id:
             return str(run_id)
         return None
-    
+
     def _build_optimizer(self) -> torch.optim.Optimizer:
         param_groups = self.model.get_params_groups(
             lr_decay_rate=self.layer_decay,
@@ -445,7 +452,7 @@ class DinoIBOTPretrainer:
             lr=self.base_lr,
             betas=self.betas,
         )
-    
+
     def _build_schedulers(self) -> tuple[
         CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
         lr_schedule = CosineScheduler(
@@ -818,7 +825,7 @@ class DinoIBOTPretrainer:
     def _finish_wandb(self) -> None:
         if self._wandb_enabled():
             self._wandb.finish()
-    
+
     def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
             monitor_dataset_config = self.config.get("monitor_dataset")
@@ -838,7 +845,7 @@ class DinoIBOTPretrainer:
             self._monitor_dataset = dataset
             self._monitor_collate_fn = collate_fn
         return self._monitor_dataset, self._monitor_collate_fn
-    
+
     def build_monitor_batch(self, seed: int | None = None) -> dict[str, Any]:
         dataset, collate_fn = self._get_monitor_source()
         python_state = random.getstate()
@@ -861,16 +868,16 @@ class DinoIBOTPretrainer:
             torch.set_rng_state(torch_state)
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
-    
+
     def _next_monitor_seed(self) -> int:
         return self._monitor_seed_pool[self._monitor_selection_rng.randrange(len(self._monitor_seed_pool))]
-    
+
     def sample_monitor_batch(self) -> dict[str, Any]:
         return self.build_monitor_batch(seed=self._next_monitor_seed())
-    
+
     def _teacher_temp(self, step: int) -> float:
         return self.teacher_temp_schedule[step]
-    
+
     def _apply_optim_scheduler(self, step: int) -> tuple[float, float, float, float]:
         lr = self.lr_schedule[step]
         weight_decay = self.wd_schedule[step]
@@ -880,7 +887,7 @@ class DinoIBOTPretrainer:
             group["weight_decay"] = weight_decay * group.get("wd_multiplier", 1.0)
             group["lr"] = (last_layer_lr if group.get("is_last_layer", False) else lr) * group.get("lr_multiplier", 1.0)
         return lr, weight_decay, self.momentum_schedule[step], teacher_temp
-    
+
     def _center_teacher_cls(
             self,
             teacher_cls: torch.Tensor,
@@ -1013,7 +1020,7 @@ class DinoIBOTPretrainer:
             img_level=self.gram_img_level,
         )
         return gram_loss, gram_teacher_patch_tokens, resized_teacher_patch_tokens
-    
+
     @staticmethod
     def _tensor_stats(tensor: torch.Tensor) -> dict[str, Any]:
         stats: dict[str, Any] = {
@@ -1029,13 +1036,13 @@ class DinoIBOTPretrainer:
             stats["mean"] = None
             stats["std"] = None
             return stats
-        
+
         if tensor.dtype == torch.bool:
             stats["finite"] = True
             stats["true_count"] = int(tensor.sum().item())
             stats["false_count"] = int((~tensor).sum().item())
             return stats
-        
+
         finite = torch.isfinite(tensor)
         stats["finite"] = bool(finite.all().item())
         values = tensor.detach().float()
@@ -1190,7 +1197,7 @@ class DinoIBOTPretrainer:
         except ValueError:
             local_feature_map_shape = None
             local_input_supported = False
-        
+
         checks = {
             "global_rows_match_views": global_crops.shape[0] == batch_size * n_global_views,
             "local_rows_match_views": local_crops.shape[0] == batch_size * n_local_views,
@@ -1221,7 +1228,7 @@ class DinoIBOTPretrainer:
         else:
             checks["gram_teacher_rows_match_views"] = True
             checks["gram_loss_is_finite"] = True
-        
+
         teacher_cls_row_sums = None
         teacher_patch_row_sums = None
         if teacher_cls_0 is not None and teacher_cls_1 is not None:
@@ -1252,9 +1259,9 @@ class DinoIBOTPretrainer:
             ))
         else:
             checks["teacher_patch_targets_sum_to_one"] = True
-        
+
         checks["all_passed"] = all(checks.values())
-        
+
         report: dict[str, Any] = {
             "step": int(step),
             "teacher_temp": float(teacher_temp),
@@ -1304,7 +1311,7 @@ class DinoIBOTPretrainer:
             "checks": checks,
         }
         return report
-    
+
     def verify_train_step(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
         forward_report = self.verify_batch_pipeline(batch, step=step)
 
@@ -1387,7 +1394,7 @@ class DinoIBOTPretrainer:
                 "checks": update_checks,
             },
         }
-    
+
     def train_step(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
         self.model.train()
         lr, weight_decay, teacher_momentum, teacher_temp = self._apply_optim_scheduler(step)
@@ -1502,7 +1509,7 @@ class DinoIBOTPretrainer:
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
         }
-    
+
     @staticmethod
     def _capture_rng_state() -> dict[str, Any]:
         state: dict[str, Any] = {
@@ -1513,7 +1520,7 @@ class DinoIBOTPretrainer:
         if torch.cuda.is_available():
             state["cuda"] = torch.cuda.get_rng_state_all()
         return state
-    
+
     @staticmethod
     def _restore_rng_state(state: Mapping[str, Any]) -> None:
         if "python" in state:
@@ -1524,13 +1531,13 @@ class DinoIBOTPretrainer:
             torch.set_rng_state(state["torch"])
         if "cuda" in state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda"])
-    
+
     def _optimizer_to_device(self) -> None:
         for optimizer_state in self.optimizer.state.values():
             for key, value in optimizer_state.items():
                 if torch.is_tensor(value):
                     optimizer_state[key] = value.to(self.device)
-    
+
     def save_checkpoint(self, step: int) -> Path:
         path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
         torch.save(
@@ -1581,13 +1588,13 @@ class DinoIBOTPretrainer:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
             self.config["wandb_run_id"] = self.wandb_run_id
         return int(checkpoint.get("step", -1))
-    
+
     def _find_latest_checkpoint(self) -> Path | None:
         checkpoints = sorted(self.output_dir.glob("checkpoint_step_*.pt"))
         if not checkpoints:
             return None
         return checkpoints[-1]
-    
+
     def _resolve_resume_path(self) -> Path | None:
         resume_from = self.config.get("resume_from")
         if resume_from:
@@ -1595,7 +1602,7 @@ class DinoIBOTPretrainer:
         if self.auto_resume:
             return self._find_latest_checkpoint()
         return None
-    
+
     @staticmethod
     def _normalize_image(array: np.ndarray) -> np.ndarray:
         array = array.astype(np.float32)
@@ -1605,7 +1612,7 @@ class DinoIBOTPretrainer:
             return np.zeros_like(array, dtype=np.uint8)
         scaled = (array - min_value) / (max_value - min_value)
         return np.clip(np.round(scaled * 255.0), 0, 255).astype(np.uint8)
-    
+
     @staticmethod
     def _center_slice(volume: torch.Tensor) -> np.ndarray:
         array = volume.detach().cpu().float()
@@ -1615,7 +1622,7 @@ class DinoIBOTPretrainer:
         if array.ndim == 3:
             return array[0].numpy()
         raise ValueError(f"unexpected tensor shape for visualization: {tuple(array.shape)}")
-    
+
     def _patch_pca_slice(
         self,
         patch_tokens: torch.Tensor,
@@ -1644,7 +1651,7 @@ class DinoIBOTPretrainer:
             align_corners=False,
         )
         return resized[0].permute(1, 2, 0).numpy().astype(np.uint8)
-    
+
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
         with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
@@ -1686,7 +1693,7 @@ class DinoIBOTPretrainer:
             f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}"
         )
         return image_path
-    
+
     def validate(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
         self.model.eval()
         teacher_temp = self._teacher_temp(step)
@@ -1825,13 +1832,13 @@ class DinoIBOTPretrainer:
                     else None
                 ),
             )
-    
+
     def fit(self) -> None:
         start_step = 0
         resume_path = self.resume_path
         if resume_path is not None:
             start_step = self.load_checkpoint(resume_path) + 1
-        
+
         dataloader = self.build_dataloader()
         self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
         dataloader_iter: Iterator[Any] = iter(dataloader)
@@ -1850,7 +1857,7 @@ class DinoIBOTPretrainer:
                     self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
                     dataloader_iter = iter(dataloader)
                     batch = next(dataloader_iter)
-                
+
                 metrics = self._average_metrics(self.train_step(batch, step))
                 if progress is not None:
                     progress.set_postfix(
@@ -1864,7 +1871,7 @@ class DinoIBOTPretrainer:
                     progress.update(1)
                 if self.is_main_process:
                     self._log_wandb_metrics("train", metrics, step=step)
-                
+
                 if self.is_main_process and step % self.log_every == 0:
                     print(
                         f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} "
@@ -1912,10 +1919,10 @@ def main() -> None:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
-    
+
     with open(args.config, 'r') as f:
         config = json.load(f)
-    
+
     if args.resume_from is not None:
         config["resume_from"] = args.resume_from
         config["resume"] = True
@@ -1925,7 +1932,7 @@ def main() -> None:
         config.pop("resume_from", None)
     if args.ddp:
         config["use_ddp"] = True
-    
+
     trainer = DinoIBOTPretrainer(config)
     try:
         trainer.fit()

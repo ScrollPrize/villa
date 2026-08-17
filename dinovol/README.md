@@ -1,12 +1,15 @@
-an attempt at a faithful implementation of dinov2-style pretraining on 3d volumes. 
+# Dinovol
 
-- the dinov2_eva is from [dynamic-network-architectures](github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py) , with some minimal changes
-- the augmentation library is a loosely modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2)
-- normalization is mostly borrowed from [nnunetv2](https://github.com/MIC-DKFZ/nnUNet)
-- rope is from the [dinov3 impl](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py), extended to support 3d
+Dinovol is an implementation of DINO-style self-supervised pretraining on 3D
+volumes.
 
+- `dinov2_eva` is adapted from [dynamic-network-architectures](https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py), with minimal changes.
+- The augmentation library is a modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2).
+- Normalization is mostly borrowed from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet).
+- RoPE is adapted from the [DINOv3 implementation](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py) and extended to support 3D.
 
-this implementation is still incomplete. pretraining works but no finetuning yet written. 
+This implementation is still incomplete. Pretraining works, but finetuning has
+not yet been implemented.
 
 NOTE: a newer `v2` backbone config exists and should generally be preferred for new runs, but the default remains the older config so older checkpoints continue to load without config changes
 To select the newer defaults explicitly, set `model.model_type` to `v2` in the config:
@@ -21,6 +24,12 @@ To select the newer defaults explicitly, set `model.model_type` to `v2` in the c
   }
 }
 ```
+
+## License
+
+Original Dinovol code is available under the [MIT License](LICENSE).
+Third-party code retains its upstream terms; see
+[Third-Party Notices](THIRD_PARTY_NOTICES.md).
 
 ## Gram Anchoring And HR Adaptation
 

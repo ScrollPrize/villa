@@ -1,3 +1,6 @@
+# Adapted from dynamic-network-architectures for Dinovol.
+# See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt.
+
 from collections import OrderedDict
 import math
 from typing import Callable, Optional, Tuple
@@ -34,7 +37,7 @@ class InitWeights_He(object):
 
 class EvaAttention(nn.Module):
     fused_attn: torch.jit.Final[bool]
-    
+
     def __init__(
             self,
             dim: int,
@@ -72,7 +75,7 @@ class EvaAttention(nn.Module):
         self.num_prefix_tokens = num_prefix_tokens
         self.fused_attn = use_fused_attn()
         self.qkv_bias_separate = qkv_bias_separate
-        
+
         if qkv_fused:
             self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
             self.q_proj = self.k_proj = self.v_proj = None
@@ -88,12 +91,12 @@ class EvaAttention(nn.Module):
             self.v_proj = nn.Linear(dim, all_head_dim, bias=qkv_bias)
             self.qkv = None
             self.q_bias = self.k_bias = self.v_bias = None
-        
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
         self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-    
+
     def forward(
             self,
             x,
@@ -101,7 +104,7 @@ class EvaAttention(nn.Module):
             attn_mask: Optional[torch.Tensor] = None,
     ):
         B, N, C = x.shape
-        
+
         if self.qkv is not None:
             if self.q_bias is None:
                 qkv = self.qkv(x)
@@ -118,11 +121,11 @@ class EvaAttention(nn.Module):
             q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
-        
+
         if rope is not None:
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
-        
+
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
@@ -133,15 +136,15 @@ class EvaAttention(nn.Module):
             raise RuntimeError("Fused attention should be used.")
             q = q * self.scale
             attn = (q @ k.transpose(-2, -1))
-            
+
             if attn_mask is not None:
                 attn_mask = attn_mask.to(torch.bool)
                 attn = attn.masked_fill(~attn_mask[:, None, None, :], float("-inf"))
             attn = attn.softmax(dim=-1)
-            
+
             attn = self.attn_drop(attn)
             x = attn @ v
-        
+
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.norm(x)
         x = self.proj(x)
@@ -150,7 +153,7 @@ class EvaAttention(nn.Module):
 
 
 class EvaBlock(nn.Module):
-    
+
     def __init__(
             self,
             dim: int,
@@ -222,7 +225,7 @@ class EvaBlock(nn.Module):
             )
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path1 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
-        
+
         self.norm2 = norm_layer(dim)
         hidden_features = int(dim * mlp_ratio)
         if swiglu_mlp:
@@ -254,7 +257,7 @@ class EvaBlock(nn.Module):
             )
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path2 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
-    
+
     def forward(
             self,
             x,
@@ -288,7 +291,7 @@ class Eva(nn.Module):
 
 
     """
-    
+
     @staticmethod
     def _assert_patch_aligned(
             spatial_shape: Tuple[int, ...],
@@ -385,7 +388,7 @@ class Eva(nn.Module):
         - removed postnorm block support
         """
         super().__init__()
-        
+
         self.input_channels = input_channels
         self.patch_size = [patch_size] * 3 if isinstance(patch_size, int) else patch_size
         self.ndim = len(self.patch_size)
@@ -436,24 +439,24 @@ class Eva(nn.Module):
             raise ValueError(
                 f"unsupported embedding_type={embedding_type!r}; expected 'default' or 'deeper'"
             )
-        
+
         if rope_kwargs is None:
             rope_kwargs = {}
-        
+
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = grad_checkpointing
-        
+
         self.num_reg_tokens = num_reg_tokens
         self.num_class_tokens = (1 if class_token else 0)
         self.num_prefix_tokens = self.num_class_tokens + self.num_reg_tokens
-        
+
         num_patches = np.prod(self.global_ref_feat_shape)
-        
+
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if class_token else None
         self.reg_token = nn.Parameter(torch.zeros(1, num_reg_tokens, embed_dim)) if num_reg_tokens else None
         self.cls_embed = class_token and self.reg_token is None
-        
+
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches + self.num_class_tokens, embed_dim)) if use_abs_pos_emb else None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
@@ -476,12 +479,12 @@ class Eva(nn.Module):
             )
         else:
             self.rope_embed = None
-        
+
         if drop_path_uniform is True:
             dpr = [drop_path_rate] * depth
         else:
             dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        
+
         block_fn = EvaBlock
         self.blocks = nn.ModuleList([
             block_fn(
@@ -505,22 +508,22 @@ class Eva(nn.Module):
                 ndim=self.ndim,
             )
             for i in range(depth)])
-        
+
         self.norm = norm_layer(embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        
+
         self._init_weights()
-    
+
     def _init_weights(self):
         def init_fn(m):
             if isinstance(m, nn.Linear):
                 trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        
+
         self.apply(init_fn)
         self.down_projection.apply(InitWeights_He(1e-2))
-        
+
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
         if self.cls_token is not None:
@@ -529,26 +532,26 @@ class Eva(nn.Module):
             trunc_normal_(self.reg_token, std=.02)
         if self.mask_token is not None:
             nn.init.zeros_(self.mask_token)
-        
+
         # Inline fix_init_weight
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
-        
+
         for layer_id, layer in enumerate(self.blocks):
             if hasattr(layer.attn.proj, 'weight'):
                 rescale(layer.attn.proj.weight.data, layer_id + 1)
             if hasattr(layer.mlp.fc2, 'weight'):
                 rescale(layer.mlp.fc2.weight.data, layer_id + 1)
-    
+
     @torch.jit.ignore
     def no_weight_decay(self):
         nwd = {'pos_embed', 'cls_token'}
         return nwd
-    
+
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
-    
+
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
         matcher = dict(
@@ -556,7 +559,7 @@ class Eva(nn.Module):
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))],
         )
         return matcher
-    
+
     def _pos_embed(self, x, *spatial) -> Tuple[torch.Tensor, Optional[RopeEmbedding]]:
         """
         Computes positional embeddings with interpolation if needed.
@@ -571,10 +574,10 @@ class Eva(nn.Module):
         pos_embed = self.pos_embed
         if self.cls_token is not None:
             x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        
+
         source_size = tuple(self.global_ref_feat_shape)
         target_size = tuple(dim // patch for dim, patch in zip(spatial, self.patch_size))
-        
+
         # If needed, interpolate only patch embeddings
         if source_size != target_size:
             if pos_embed is not None:
@@ -585,7 +588,7 @@ class Eva(nn.Module):
                     num_prefix_tokens=self.num_class_tokens
                 )
         rot_pos_embed = self._get_rot_pos_embed(target_size)
-        
+
         # Add interpolated positional embeddings
         if pos_embed is not None:
             x = x + pos_embed
@@ -596,9 +599,9 @@ class Eva(nn.Module):
                 x = torch.cat((x[:, :1], reg_tokens, x[:, 1:]), dim=1)
             else:
                 x = torch.cat((reg_tokens, x), dim=1)
-        
+
         x = self.pos_drop(x)
-        
+
         return x, rot_pos_embed
 
     def _get_rot_pos_embed(self, target_size: Tuple[int, ...]) -> Optional[RopeEmbedding]:
@@ -617,7 +620,7 @@ class Eva(nn.Module):
                     if hasattr(inner_block, "rope_embed") and inner_block.rope_embed is not None:
                         return inner_block.rope_embed.get_coords(target_size)
         return None
-    
+
     def interpolate_pos_encoding_nd(
             self,
             pos_embed: torch.Tensor,
@@ -722,7 +725,7 @@ class Eva(nn.Module):
             starts.append(delta // 2)
         slices = tuple(slice(start, start + size) for start, size in zip(starts, target_patch_shape))
         return x[(slice(None), slice(None), *slices)]
-    
+
     def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
         spatial = tuple(x.shape[2:])
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
@@ -749,15 +752,15 @@ class Eva(nn.Module):
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
-        
+
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
-        
+
         target_patch_shape = tuple(dim // patch for dim, patch in zip(target_spatial, self.patch_size))
         x, rot_pos_embed = self._pos_embed(x, *target_spatial)
-        
+
         return x, rot_pos_embed, target_patch_shape
-    
+
     def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
         if not isinstance(x_list, list):
             return self.forward_features(x_list, masks_list, view_kind=view_kind)
@@ -766,7 +769,7 @@ class Eva(nn.Module):
             x_out = self.forward_features(x, masks, view_kind=view_kind)
             output.append(x_out)
         return output
-    
+
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
@@ -784,10 +787,10 @@ class Eva(nn.Module):
             "masks": masks,
         }
         return outputs
-    
+
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)
-    
+
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
             state_dict = torch.load(state_dict, map_location="cpu", weights_only=False)['teacher']
@@ -798,7 +801,7 @@ class Eva(nn.Module):
                 new_key = k.replace("backbone.", "", 1)
                 new_state_dict[new_key] = v
             state_dict = new_state_dict
-        
+
         if unchunk:
             state_dict = self.unchunk_state_dict(state_dict)
         state_dict = dict(state_dict)
@@ -836,7 +839,7 @@ class Eva(nn.Module):
             raise RuntimeError("failed to load pretrained backbone weights cleanly: " + "; ".join(details))
 
         return load_result
-    
+
     def unchunk_state_dict(self, state_dict):
         """
         Convert a state_dict from EvaWithChunking (nested blocks)
@@ -844,7 +847,7 @@ class Eva(nn.Module):
         """
         if not any([key.startswith("blocks.0.0") for key in state_dict.keys()]):
             return state_dict
-        
+
         new_state_dict = OrderedDict()
         for key, val in state_dict.items():
             if key.startswith("blocks."):
@@ -864,7 +867,7 @@ class Eva(nn.Module):
                     new_state_dict[key] = val
             else:
                 new_state_dict[key] = val
-        
+
         # Fix flat indices back to consecutive 0..N
         # because above we used a stride
         mapping = {old: new for new, old in enumerate(sorted(set(
@@ -878,7 +881,7 @@ class Eva(nn.Module):
                 final_state_dict[".".join(parts)] = val
             else:
                 final_state_dict[key] = val
-        
+
         return final_state_dict
 
 
@@ -892,13 +895,13 @@ class BlockChunk(nn.ModuleList):
 class EvaWithChunking(Eva):
     def __init__(self, *args, block_chunks: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
-        
+
         self.block_chunks = block_chunks
         self.chunked_blocks = block_chunks > 0 and block_chunks < len(self.blocks)
-        
+
         if self.chunked_blocks:
             self._apply_block_chunking()
-    
+
     def _apply_block_chunking(self):
         depth = len(self.blocks)
         chunksize = depth // self.block_chunks
@@ -907,11 +910,11 @@ class EvaWithChunking(Eva):
             block_chunk = BlockChunk(self.blocks[i: i + chunksize])
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
-    
+
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
-        
+
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -924,7 +927,7 @@ class EvaWithChunking(Eva):
                     x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        
+
         x = self.norm(x)
         outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
@@ -934,7 +937,7 @@ class EvaWithChunking(Eva):
             "masks": masks,
         }
         return outputs
-    
+
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)
 

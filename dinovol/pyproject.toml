@@ -27,3 +27,6 @@ dependencies = [
     "imagecodecs>=2026.3.6",
     "numcodecs>=0.16.5",
 ]
+
+[tool.setuptools.packages.find]
+include = ["dinovol_2*"]

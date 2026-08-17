@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 import torch
 
 
@@ -70,4 +76,3 @@ def center_crop(input_tensor, crop_size, pad_mode='constant', pad_kwargs=None):
 
     # Use the previously defined function for cropping and padding
     return crop_tensor(input_tensor, center, crop_size, pad_mode, pad_kwargs)
-

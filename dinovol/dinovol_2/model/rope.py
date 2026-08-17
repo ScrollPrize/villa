@@ -1,3 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This software may be used and distributed in accordance with
+# the terms of the DINOv3 License Agreement.
+#
+# Modified for Dinovol to support three-dimensional position encoding.
+
 import math
 from typing import Literal, Sequence
 

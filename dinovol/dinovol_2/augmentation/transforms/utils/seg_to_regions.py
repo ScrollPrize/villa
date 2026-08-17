@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 from typing import Union, List, Tuple
 import torch
 
@@ -21,4 +27,3 @@ class ConvertSegmentationToRegionsTransform(SegOnlyTransform):
         # we return bool here and leave it to the loss function to cast it to whatever it needs. Transferring bool to
         # device followed by cast on device should be faster than having fp32 here and transferring that
         return region_output
-
