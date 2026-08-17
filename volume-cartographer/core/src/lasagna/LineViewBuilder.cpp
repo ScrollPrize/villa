@@ -659,10 +659,12 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
                                      + direction * offsets[static_cast<size_t>(row)]);
         }
     }
-    return std::make_shared<QuadSurface>(
+    auto surface = std::make_shared<QuadSurface>(
         points,
         cv::Vec2f{static_cast<float>(1.0 / alongSpacing),
                   static_cast<float>(1.0 / crossSpacing)});
+    surface->setStrictQuadRenderValidity(true);
+    return surface;
 }
 
 std::vector<LineFrame> framesAtControlPoints(const std::vector<SegmentNormalSample>& controlSamples,

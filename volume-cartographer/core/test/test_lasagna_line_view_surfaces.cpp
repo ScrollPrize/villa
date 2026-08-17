@@ -122,6 +122,8 @@ TEST_CASE("LineViewBuilder uses a fixed seven-row cross strip")
     CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 32.0));
     CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 32.0));
     CHECK(views.lineSideSlice->scale()[1] == doctest::Approx(1.0 / 32.0));
+    CHECK(views.lineSurface->strictQuadRenderValidity());
+    CHECK(views.lineSideSlice->strictQuadRenderValidity());
     const cv::Vec2d surfaceFirst = views.lineSurface->gridToSurface({0.0, 0.0});
     const cv::Vec2d surfaceLast = views.lineSurface->gridToSurface({0.0, 6.0});
     const cv::Vec2d sideFirst = views.lineSideSlice->gridToSurface({0.0, 0.0});
