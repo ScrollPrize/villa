@@ -251,7 +251,6 @@ public:
     }
 
     void reloadPerfSettings() override;
-    void refreshChunkSource() override;
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
 
 protected:
@@ -327,19 +326,13 @@ private:
     void notifyNormalOffsetChanged();
     void setZOffset(float value);
     void rebuildChunkArray();
+    void refreshDownloadQueueDebugOverlay();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
-    // Chunks one frame of this view touches, used to raise the private pool's
-    // floor so a single render cannot thrash its own cap.
-    std::size_t estimatedFrameChunkFootprintBytes() const;
-    // Chunks one round of concurrent surface-tile fills touches, for the
-    // filler's own pool.
-    std::size_t estimatedSurfaceTileChunkFootprintBytes() const;
-    void noteChunkCacheFootprint();
     // Build/drop the base and overlay SurfaceCache to match the current
     // (volume, surface, geometry epoch) identity and the configured budgets.
     void ensureSurfaceCaches();
@@ -359,6 +352,8 @@ private:
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
+        vc::render::ChunkRequestContext chunkRequest;
+        std::array<float, 2> renderFocus{};
         int fbW = 0;
         int fbH = 0;
         float surfacePtrX = 0.0f;
@@ -405,7 +400,6 @@ private:
         int fbW,
         int fbH,
         std::chrono::steady_clock::time_point submittedAt);
-    void requestSurfaceViewForJob(const PendingRenderJob& job);
     void startRenderJob(PendingRenderJob job);
     void submitPendingRenderJobIfNeeded();
     void updateDisplayedFramebufferMapping();
@@ -422,6 +416,7 @@ private:
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
+    void markChunkRequestViewActive();
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -479,6 +474,7 @@ private:
     std::string _surfName;
     std::shared_ptr<vc::render::ChunkCache> _chunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
+    std::uint64_t _chunkRemoteFetchCbId = 0;
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
@@ -491,6 +487,8 @@ private:
     std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
+    std::uint64_t _chunkViewId = 0;
+    bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
@@ -514,7 +512,6 @@ private:
     std::uint64_t _surfaceCacheGeometryEpoch = 0;
     Volume* _overlaySurfaceCacheVolume = nullptr;
     std::uint64_t _surfaceCacheEpoch = 0;
-    std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
     // Last frame fell outside the stored band and used the legacy path, so the
@@ -537,10 +534,9 @@ private:
     std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
-    // The final viewer lease invalidates the overlay cache even if an
-    // obsolete render job still holds the cache object.
-    std::shared_ptr<void> _overlayChunkCacheOwner;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
+    std::uint64_t _overlayRemoteFetchCbId = 0;
+    std::atomic<std::uint64_t> _overlayGeneration{1};
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;

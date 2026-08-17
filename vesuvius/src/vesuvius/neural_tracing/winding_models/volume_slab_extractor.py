@@ -142,9 +142,9 @@ class VolumeSlabExtractor:
         if volume is None:
             volume = vc.Volume.open(str(self.volume_paths[volume_idx]))
             if self.cache_bytes > 0:
-                volume.set_cache_budget(self.cache_bytes)
+                vc.set_chunk_cache_budget(self.cache_bytes)
             if self.io_threads > 0:
-                volume.set_io_threads(self.io_threads)
+                vc.set_chunk_cache_io_threads(self.io_threads)
             self._volume_handles[key] = volume
         return volume
 

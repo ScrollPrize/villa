@@ -83,12 +83,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // The state shares Main's process-wide default budget for non-viewer uses;
-    // ViewerManager gives this workspace independent bounded viewer caches.
+    // Regular volume chunks use the process service. Derived surface tiles
+    // remain local to each ViewerManager.
     _state = new CState(
-        _mainState ? _mainState->cacheSizeBytes() : 0,
-        this,
-        _mainState ? _mainState->decodedCacheBudget() : nullptr);
+        this, _mainState && _mainState->debugDownloadQueueEnabled());
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
@@ -157,7 +155,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     auto* cacheStatsLabel = new QLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
-    cacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged, cacheStatsLabel,
             [cacheStatsLabel](const QStringList& items) {

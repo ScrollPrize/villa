@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vc/lasagna/LineViewBuilder.hpp"
+
 #include <opencv2/core/types.hpp>
 
 #include <QPoint>
@@ -133,6 +135,9 @@ struct GeneratedOverlay {
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
+    // Present for strip overlays. Line positions above remain in original
+    // LineModel point-index coordinates and are mapped only while projecting.
+    vc::lasagna::LineStripPositionMap stripPositionMap;
 };
 
 struct GeneratedSpanAlignmentMetric {
@@ -177,6 +182,7 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
@@ -1244,6 +1250,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1257,6 +1264,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1269,6 +1277,7 @@ inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1353,6 +1362,7 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
     bool mergeWithCandidateEnabled = false;
@@ -1381,9 +1391,11 @@ struct GeneratedControlPointContextMenuOptions {
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
-                                          double linePosition);
+                                          double linePosition,
+                                          const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint);
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 std::optional<float> generatedCrossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer);
 GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& views,
                                                         double linePosition,
