@@ -332,6 +332,10 @@ namespace line_annotation {
     constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    // Shared cursor cross across the four generated panes. Independent of the
+    // app-global "Sync cursor across views" toggle.
+    constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
+    constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
