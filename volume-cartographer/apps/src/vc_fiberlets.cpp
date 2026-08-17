@@ -1003,8 +1003,11 @@ int main(int argc, char** argv)
                 std::cout.flush();
                 std::cerr << "fiber_replay_stage stage=overview status=completed"
                           << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - overviewStart).count()
-                          << " top_shape_yx=" << bundle.overview->topShapeYX[0] << ',' << bundle.overview->topShapeYX[1]
-                          << " side_shape_yx=" << bundle.overview->sideShapeYX[0] << ',' << bundle.overview->sideShapeYX[1] << '\n';
+                          << " reference_top_shape_yx=" << bundle.overview->referenceTopShapeYX[0] << ',' << bundle.overview->referenceTopShapeYX[1]
+                          << " reference_side_shape_yx=" << bundle.overview->referenceSideShapeYX[0] << ',' << bundle.overview->referenceSideShapeYX[1]
+                          << " fiberlet_top_shape_yx=" << bundle.overview->fiberletTopShapeYX[0] << ',' << bundle.overview->fiberletTopShapeYX[1]
+                          << " fiberlet_side_shape_yx=" << bundle.overview->fiberletSideShapeYX[0] << ',' << bundle.overview->fiberletSideShapeYX[1]
+                          << " pages=" << bundle.overview->pages.size() << '\n';
                 const auto addVisualizations = [&](vc::fiber_tracer::FiberReplayTracer tracer, const auto& failures) {
                     for (const auto& failure : failures) {
                         const auto visualStart = std::chrono::steady_clock::now();
@@ -1062,11 +1065,17 @@ int main(int argc, char** argv)
             std::cerr << "fiber_replay_stage stage=publish status=completed"
                       << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - publishStart).count() << '\n';
             if (resultBundle.contains("overview")) {
-                std::cout << "fiber_replay_overview image="
-                          << std::filesystem::absolute(options.outputDirectory / resultBundle.at("overview").at("stable_path").get<std::string>())
-                                 .lexically_normal()
-                                 .string()
-                          << '\n';
+                for (const auto& page : resultBundle.at("overview").at("pages")) {
+                    std::cout << "fiber_replay_overview"
+                              << " index=" << page.at("index")
+                              << " image="
+                              << std::filesystem::absolute(
+                                     options.outputDirectory /
+                                     page.at("stable_path").get<std::string>())
+                                     .lexically_normal()
+                                     .string()
+                              << '\n';
+                }
             }
             for (const auto& visualization : resultBundle.at("visualizations")) {
                 std::cout << "fiber_replay_visualization"

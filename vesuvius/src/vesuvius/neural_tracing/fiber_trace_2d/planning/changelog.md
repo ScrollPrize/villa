@@ -561,3 +561,7 @@
   configured base-voxel radius remains unchanged normal to the sheet and is 4x
   in the tangent plane. Replay output now stores explicit component diagnostics
   and rejects inconsistent measurements before publication.
+- Extended the full replay overview with fiberlet-centered top/side CT strips,
+  preserved reset components with explicit raster placement, and changed long
+  output to complete four-strip blocks packed across indexed JPEGs capped at
+  65,000 pixels per dimension.

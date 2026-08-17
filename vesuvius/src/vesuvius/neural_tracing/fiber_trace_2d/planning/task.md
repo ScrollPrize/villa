@@ -1,11 +1,9 @@
-# Task: Lasagna-oriented replay failure threshold
+# Task: Fiberlet-centered replay strips and indexed overview JPEGs
 
-Change the replay failure evaluation used by both the classic greedy tracer and
-the fiberlet tracer. Keep the configured base-voxel threshold unchanged along
-the local Lasagna normal, but allow four times that threshold within the local
-Lasagna tangent plane.
+Extend the full-fiber replay visualization with a second top/side CT strip pair
+whose line-view geometry follows the new fiberlet trace, so its refinement can
+be inspected in the fiberlet frame as well as in the existing reference frame.
 
-The forward reference matching itself remains unchanged. The new threshold is
-used for dense trace-point failure decisions and for fiberlet seed acceptance.
-The result must report enough component information to explain every decision.
-An invalid local normal conservatively retains the existing isotropic threshold.
+Wrap long selected intervals into vertically stacked four-strip blocks in the
+same image. If all complete blocks cannot fit below the JPEG limit, continue in
+indexed JPEG parts so no output image dimension exceeds 65,000 pixels.

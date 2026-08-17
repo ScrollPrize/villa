@@ -405,15 +405,22 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     vc::fiber_tracer::FiberletGraphReplaySegment route;
     route.routePointsBaseXYZ = {
         {6.0, 16.0, 18.0},
-        {14.0, 16.0, 18.0},
-        {22.0, 16.0, 18.0},
+        {18.0, 16.0, 18.0},
     };
     route.matches = {
         {0, 10.0, 10.0, {6.0, 16.0, 16.0}},
-        {1, 18.0, 18.0, {14.0, 16.0, 16.0}},
-        {2, 26.0, 26.0, {22.0, 16.0, 16.0}},
+        {1, 22.0, 22.0, {18.0, 16.0, 16.0}},
     };
-    fiberlet.segments = {route};
+    vc::fiber_tracer::FiberletGraphReplaySegment routeAfterReset;
+    routeAfterReset.routePointsBaseXYZ = {
+        {14.0, 16.0, 18.0},
+        {22.0, 16.0, 18.0},
+    };
+    routeAfterReset.matches = {
+        {0, 18.0, 18.0, {14.0, 16.0, 16.0}},
+        {1, 26.0, 26.0, {22.0, 16.0, 16.0}},
+    };
+    fiberlet.segments = {route, routeAfterReset};
     vc::fiber_tracer::FiberReplayFailure fiberletFailure;
     fiberletFailure.reason = "distance_above_threshold";
     fiberletFailure.referenceArcBase = 18.0;
@@ -421,6 +428,7 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     fiberletFailure.referencePointBase = {14.0, 16.0, 16.0};
     fiberlet.failures.push_back(fiberletFailure);
     fiberletFailure.index = 1;
+    fiberletFailure.segmentIndex = 1;
     fiberletFailure.referenceArcBase = 22.0;
     fiberletFailure.referenceArcFraction = 0.75;
     fiberletFailure.referencePointBase = {18.0, 16.0, 16.0};
@@ -433,16 +441,32 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     CHECK(overview.markerWidthPixels == 3);
     CHECK(overview.textureSource.scaleFromBaseXYZ ==
           std::array<double, 3>{0.5, 0.5, 0.5});
-    CHECK(overview.topShapeYX[0] == 328);
-    CHECK(overview.topShapeYX[1] == 72);
-    CHECK(overview.sideShapeYX[0] == 328);
-    CHECK(overview.sideShapeYX[1] == 72);
-    REQUIRE(overview.panels.size() == 1);
+    CHECK(overview.referenceTopShapeYX == std::array<int, 2>{328, 72});
+    CHECK(overview.referenceSideShapeYX == std::array<int, 2>{328, 72});
+    CHECK(overview.fiberletTopShapeYX[0] >= 648);
+    CHECK(overview.fiberletSideShapeYX[0] >= 648);
+    REQUIRE(overview.fiberletComponents.size() == 2);
+    CHECK(overview.fiberletComponents[0].sourceSegmentIndex == 0);
+    CHECK(overview.fiberletComponents[0].referenceArcBeginBase == 10.0);
+    CHECK(overview.fiberletComponents[0].referenceArcEndBase == 22.0);
+    CHECK(overview.fiberletComponents[1].sourceSegmentIndex == 1);
+    CHECK(overview.fiberletComponents[1].referenceArcBeginBase == 18.0);
+    CHECK(overview.fiberletComponents[1].referenceArcEndBase == 26.0);
+    CHECK(overview.fiberletComponents[1].topColumns[0] -
+              overview.fiberletComponents[0].topColumns[1] ==
+          8);
+    CHECK(overview.fiberletComponents[1].sideColumns[0] -
+              overview.fiberletComponents[0].sideColumns[1] ==
+          8);
+    REQUIRE(overview.pages.size() == 1);
+    REQUIRE(overview.pages[0].panels.size() == 1);
+    const auto& page = overview.pages[0];
+    const auto& panel = page.panels[0];
     CHECK(normals.points.front()[0] == doctest::Approx(3.0));
 
     size_t redPixels = 0;
     size_t cyanPixels = 0;
-    for (const auto& pixel : overview.image) {
+    for (const auto& pixel : page.image) {
         redPixels += redDominant(pixel) ? 1 : 0;
         cyanPixels += cyanDominant(pixel) ? 1 : 0;
     }
@@ -450,7 +474,7 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     CHECK(cyanPixels > 0);
 
     std::vector<uint8_t> encoded;
-    REQUIRE(cv::imencode(".jpg", overview.image, encoded, {cv::IMWRITE_JPEG_QUALITY, 95, cv::IMWRITE_JPEG_PROGRESSIVE, 0, cv::IMWRITE_JPEG_OPTIMIZE, 0}));
+    REQUIRE(cv::imencode(".jpg", page.image, encoded, {cv::IMWRITE_JPEG_QUALITY, 95, cv::IMWRITE_JPEG_PROGRESSIVE, 0, cv::IMWRITE_JPEG_OPTIMIZE, 0}));
     const cv::Mat_<cv::Vec3b> decoded = cv::imdecode(encoded, cv::IMREAD_COLOR);
     size_t decodedRedPixels = 0;
     size_t decodedCyanPixels = 0;
@@ -472,29 +496,62 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
             count += predicate(decoded(row, column)) ? 1 : 0;
         return count;
     };
-    for (const auto& rows : {overview.panels[0].topRows,
-                             overview.panels[0].sideRows}) {
+    for (const auto& rows : {panel.referenceTopRows,
+                             panel.referenceSideRows}) {
         CHECK(countColumn(
-                  rows, markerColumn(14.0, overview.topShapeYX[1]),
+                  rows, markerColumn(14.0, overview.referenceTopShapeYX[1]),
                   redDominant) >
               static_cast<size_t>((rows[1] - rows[0]) * 3 / 4));
         CHECK(countColumn(
-                  rows, markerColumn(18.0, overview.topShapeYX[1]),
+                  rows, markerColumn(18.0, overview.referenceTopShapeYX[1]),
                   cyanDominant) >
               static_cast<size_t>((rows[1] - rows[0]) * 3 / 4));
         CHECK(countColumn(
-                  rows, markerColumn(22.0, overview.topShapeYX[1]),
+                  rows, markerColumn(22.0, overview.referenceTopShapeYX[1]),
                   magentaDominant) >
               static_cast<size_t>((rows[1] - rows[0]) * 3 / 4));
     }
 
-    const int gapColumn = markerColumn(18.0, overview.topShapeYX[1]);
+    const int gapColumn = markerColumn(18.0, overview.referenceTopShapeYX[1]);
     size_t redGapPixels = 0;
-    for (int row = overview.panels[0].topRows[0];
-         row < overview.panels[0].topRows[1]; ++row) {
-        redGapPixels += redDominant(overview.image(row, gapColumn)) ? 1 : 0;
+    for (int row = panel.referenceTopRows[0];
+         row < panel.referenceTopRows[1]; ++row) {
+        redGapPixels += redDominant(page.image(row, gapColumn)) ? 1 : 0;
     }
     CHECK(redGapPixels == 0);
+
+    size_t fiberletFrameYellow = 0;
+    size_t fiberletFrameCyan = 0;
+    for (int row = panel.fiberletTopRows[0];
+         row < panel.fiberletTopRows[1]; ++row) {
+        for (int column = 0; column < page.image.cols; ++column) {
+            const auto& pixel = page.image(row, column);
+            fiberletFrameYellow +=
+                pixel[1] > 160 && pixel[2] > 160 && pixel[0] < 120 ? 1 : 0;
+            fiberletFrameCyan += cyanDominant(pixel) ? 1 : 0;
+        }
+    }
+    CHECK(fiberletFrameYellow > 0);
+    CHECK(fiberletFrameCyan > 0);
+    for (const auto& component : overview.fiberletComponents) {
+        size_t componentRed = 0;
+        for (int row = panel.fiberletTopRows[0] + component.topRows[0];
+             row < panel.fiberletTopRows[0] + component.topRows[1]; ++row) {
+            for (int column = component.topColumns[0];
+                 column < component.topColumns[1]; ++column) {
+                componentRed += redDominant(page.image(row, column)) ? 1 : 0;
+            }
+        }
+        CHECK(componentRed > 0);
+    }
+    for (int row = panel.fiberletTopRows[0];
+         row < panel.fiberletTopRows[1]; ++row) {
+        for (int column = overview.fiberletComponents[0].topColumns[1];
+             column < overview.fiberletComponents[1].topColumns[0];
+             ++column) {
+            CHECK(page.image(row, column) == cv::Vec3b{0, 0, 0});
+        }
+    }
 
     auto malformed = greedy;
     malformed.segments.front().matches.pop_back();
@@ -506,59 +563,76 @@ TEST_CASE("full replay overview renders selected top and side strips with discon
     std::filesystem::remove_all(directory.parent_path());
 }
 
-TEST_CASE("full replay overview compositor wraps proportional ranges without resampling")
+TEST_CASE("full replay overview compositor keeps four-strip blocks intact across pages")
 {
-    cv::Mat_<cv::Vec3b> top(3, 32002, cv::Vec3b{1, 2, 3});
-    cv::Mat_<cv::Vec3b> side(2, 16001, cv::Vec3b{4, 5, 6});
-    top.col(16000) = cv::Vec3b{10, 20, 30};
-    top.col(16001) = cv::Vec3b{40, 50, 60};
-    side.col(7999) = cv::Vec3b{70, 80, 90};
-    side.col(8000) = cv::Vec3b{100, 110, 120};
+    cv::Mat_<cv::Vec3b> referenceTop(3, 32002, cv::Vec3b{1, 2, 3});
+    cv::Mat_<cv::Vec3b> referenceSide(2, 16001, cv::Vec3b{4, 5, 6});
+    cv::Mat_<cv::Vec3b> fiberletTop(4, 24002, cv::Vec3b{7, 8, 9});
+    cv::Mat_<cv::Vec3b> fiberletSide(5, 8001, cv::Vec3b{10, 11, 12});
+    referenceTop.col(16000) = cv::Vec3b{10, 20, 30};
+    referenceTop.col(16001) = cv::Vec3b{40, 50, 60};
+    referenceSide.col(7999) = cv::Vec3b{70, 80, 90};
+    referenceSide.col(8000) = cv::Vec3b{100, 110, 120};
+    fiberletTop.col(12000) = cv::Vec3b{20, 40, 60};
+    fiberletTop.col(12001) = cv::Vec3b{80, 100, 120};
+    fiberletSide.col(4000) = cv::Vec3b{30, 60, 90};
 
     const auto overview =
         vc::fiber_tracer::testing::composeFiberReplayOverviewForTesting(
-            top, side);
-    REQUIRE(overview.panels.size() == 2);
-    CHECK(overview.topShapeYX == std::array<int, 2>{3, 32002});
-    CHECK(overview.sideShapeYX == std::array<int, 2>{2, 16001});
-    CHECK(overview.panels[0].topColumns ==
+            referenceTop, referenceSide, fiberletTop, fiberletSide, 156);
+    REQUIRE(overview.pages.size() == 2);
+    REQUIRE(overview.pages[0].panels.size() == 1);
+    REQUIRE(overview.pages[1].panels.size() == 1);
+    CHECK(overview.referenceTopShapeYX == std::array<int, 2>{3, 32002});
+    CHECK(overview.referenceSideShapeYX == std::array<int, 2>{2, 16001});
+    CHECK(overview.fiberletTopShapeYX == std::array<int, 2>{4, 24002});
+    CHECK(overview.fiberletSideShapeYX == std::array<int, 2>{5, 8001});
+    const auto& first = overview.pages[0].panels[0];
+    const auto& second = overview.pages[1].panels[0];
+    CHECK(first.referenceTopColumns ==
           std::array<int, 2>{0, 16001});
-    CHECK(overview.panels[1].topColumns ==
+    CHECK(second.referenceTopColumns ==
           std::array<int, 2>{16001, 32002});
-    CHECK(overview.panels[0].sideColumns ==
+    CHECK(first.referenceSideColumns ==
           std::array<int, 2>{0, 8000});
-    CHECK(overview.panels[1].sideColumns ==
+    CHECK(second.referenceSideColumns ==
           std::array<int, 2>{8000, 16001});
-    CHECK(
-        (overview.panels[0].topColumns[1] -
-         overview.panels[0].topColumns[0]) +
-            (overview.panels[1].topColumns[1] -
-             overview.panels[1].topColumns[0]) ==
-        top.cols);
-    CHECK(
-        (overview.panels[0].sideColumns[1] -
-         overview.panels[0].sideColumns[0]) +
-            (overview.panels[1].sideColumns[1] -
-             overview.panels[1].sideColumns[0]) ==
-        side.cols);
-    CHECK(overview.image.cols == 16001);
-    CHECK(overview.image.rows == 156);
-    CHECK(overview.image(
-              overview.panels[0].topRows[0], 16000) ==
+    CHECK(first.fiberletTopColumns == std::array<int, 2>{0, 12001});
+    CHECK(second.fiberletTopColumns == std::array<int, 2>{12001, 24002});
+    CHECK(first.fiberletSideColumns == std::array<int, 2>{0, 4000});
+    CHECK(second.fiberletSideColumns == std::array<int, 2>{4000, 8001});
+    CHECK(overview.pages[0].image.cols == 16001);
+    CHECK(overview.pages[0].image.rows == 156);
+    CHECK(overview.pages[1].image.rows == 156);
+    CHECK(overview.pages[0].image(
+              first.referenceTopRows[0], 16000) ==
           cv::Vec3b{10, 20, 30});
-    CHECK(overview.image(
-              overview.panels[1].topRows[0], 0) ==
+    CHECK(overview.pages[1].image(
+              second.referenceTopRows[0], 0) ==
           cv::Vec3b{40, 50, 60});
-    CHECK(overview.image(
-              overview.panels[0].sideRows[0], 7999) ==
+    CHECK(overview.pages[0].image(
+              first.referenceSideRows[0], 7999) ==
           cv::Vec3b{70, 80, 90});
-    CHECK(overview.image(
-              overview.panels[1].sideRows[0], 0) ==
+    CHECK(overview.pages[1].image(
+              second.referenceSideRows[0], 0) ==
           cv::Vec3b{100, 110, 120});
-    const int gapBegin = overview.panels[0].sideRows[1];
-    const int nextPanelLabelBegin = overview.panels[1].topRows[0] - 20;
-    for (int row = gapBegin; row < nextPanelLabelBegin; ++row)
-        CHECK(cv::countNonZero(overview.image.row(row).reshape(1)) == 0);
+    CHECK(overview.pages[0].image(
+              first.fiberletTopRows[0], 12000) ==
+          cv::Vec3b{20, 40, 60});
+    CHECK(overview.pages[1].image(
+              second.fiberletTopRows[0], 0) ==
+          cv::Vec3b{80, 100, 120});
+    CHECK(overview.pages[1].image(
+              second.fiberletSideRows[0], 0) ==
+          cv::Vec3b{30, 60, 90});
+    CHECK_NOTHROW(
+        vc::fiber_tracer::testing::composeFiberReplayOverviewForTesting(
+            referenceTop, referenceSide, fiberletTop, fiberletSide, 156));
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::testing::composeFiberReplayOverviewForTesting(
+            referenceTop, referenceSide, fiberletTop, fiberletSide, 155),
+        doctest::Contains("exceeds the JPEG height limit"),
+        std::invalid_argument);
 }
 
 TEST_CASE("dual replay publication is deterministic and no-vis has only full traces")
@@ -597,6 +671,15 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     fiberlet.endReferenceArcBase = 4.0;
     fiberlet.terminationReason = "reference_end";
     fiberlet.routePointsBaseXYZ = {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
+    vc::fiber_tracer::FiberletGraphReplayMatch fiberletBeginMatch;
+    fiberletBeginMatch.routePointIndex = 0;
+    fiberletBeginMatch.matchedReferencePointBaseXYZ = {0.0, 0.0, 0.0};
+    vc::fiber_tracer::FiberletGraphReplayMatch fiberletEndMatch;
+    fiberletEndMatch.routePointIndex = 1;
+    fiberletEndMatch.predictedReferenceArcBase = 4.0;
+    fiberletEndMatch.matchedReferenceArcBase = 4.0;
+    fiberletEndMatch.matchedReferencePointBaseXYZ = {4.0, 0.0, 0.0};
+    fiberlet.matches = {fiberletBeginMatch, fiberletEndMatch};
     input.fiberletReplay.segments = {fiberlet};
     input.fiberletReplayConfig.referenceEndArcBase = 4.0;
     input.referenceGeometryBase = {{0.0, 0.0, 0.0}, {4.0, 0.0, 0.0}};
@@ -722,7 +805,9 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
         2, 2, cv::Vec3b{32, 64, 96});
     auto overview =
         vc::fiber_tracer::testing::composeFiberReplayOverviewForTesting(
-            overviewTop, overviewSide);
+            overviewTop, overviewSide, overviewTop, overviewSide);
+    overview.fiberletComponents.push_back({
+        0, 0.0, 4.0, {0, 2}, {0, 2}, {0, 2}, {0, 2}});
     overview.textureSource = *visualization.strips->textureSource;
     input.overview = std::move(overview);
     input.visualizations.push_back(std::move(visualization));
@@ -754,24 +839,37 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(values.at("source_group_scale_from_base_xyz") ==
           std::array<double, 3>{0.25, 0.25, 0.25});
     REQUIRE(visualBundle.contains("overview"));
-    CHECK(visualBundle.at("overview").at("stable_path") == "fiber_replay.jpg");
     CHECK(visualBundle.at("overview").at("reference_begin_arc_base") == 0.0);
     CHECK(visualBundle.at("overview").at("reference_end_arc_base") == 4.0);
     CHECK(visualBundle.at("overview").at("reference_point_count") == 2);
-    CHECK(visualBundle.at("overview").at("top_shape_yx") == std::array<int, 2>{2, 2});
-    CHECK(visualBundle.at("overview").at("image_shape_yx") == std::array<int, 2>{98, 90});
+    CHECK(visualBundle.at("overview").at("reference_top_shape_yx") == std::array<int, 2>{2, 2});
+    CHECK(visualBundle.at("overview").at("fiberlet_top_shape_yx") == std::array<int, 2>{2, 2});
     CHECK(visualBundle.at("overview").at("render_scale") == 8);
     CHECK(visualBundle.at("overview").at("layout").at("panel_count") == 1);
+    CHECK(visualBundle.at("overview").at("layout").at("page_count") == 1);
+    REQUIRE(visualBundle.at("overview").at("pages").size() == 1);
+    CHECK(visualBundle.at("overview").at("pages").at(0).at("stable_path") ==
+          "fiber_replay.000000.jpg");
+    CHECK(visualBundle.at("overview").at("pages").at(0).at("image_shape_yx") ==
+          std::array<int, 2>{150, 90});
     CHECK(visualBundle.at("overview").at("failure_markers").at("width_pixels") == 3);
-    CHECK(visualBundle.at("artifacts").contains("replay/full_strip.jpg"));
-    const auto immutableOverview = directory / visualBundle.at("artifacts").at("replay/full_strip.jpg").at("path").get<std::string>();
+    const auto& overviewComponent = visualBundle.at("overview")
+                                        .at("fiberlet_components")
+                                        .at("placements")
+                                        .at(0);
+    CHECK(overviewComponent.at("source_segment_index") == 0);
+    CHECK(overviewComponent.at("reference_arc_begin_base") == 0.0);
+    CHECK(overviewComponent.at("reference_arc_end_base") == 4.0);
+    CHECK(overviewComponent.at("top_columns") == std::array<int, 2>{0, 2});
+    CHECK(visualBundle.at("artifacts").contains("replay/full_strip.000000.jpg"));
+    const auto immutableOverview = directory / visualBundle.at("artifacts").at("replay/full_strip.000000.jpg").at("path").get<std::string>();
     REQUIRE(std::filesystem::exists(immutableOverview));
-    REQUIRE(std::filesystem::exists(directory / "fiber_replay.jpg"));
-    CHECK(readText(immutableOverview) == readText(directory / "fiber_replay.jpg"));
-    const cv::Mat decodedOverview = cv::imread((directory / "fiber_replay.jpg").string(), cv::IMREAD_COLOR);
+    REQUIRE(std::filesystem::exists(directory / "fiber_replay.000000.jpg"));
+    CHECK(readText(immutableOverview) == readText(directory / "fiber_replay.000000.jpg"));
+    const cv::Mat decodedOverview = cv::imread((directory / "fiber_replay.000000.jpg").string(), cv::IMREAD_COLOR);
     REQUIRE_FALSE(decodedOverview.empty());
     CHECK(decodedOverview.type() == CV_8UC3);
-    CHECK(decodedOverview.rows == 98);
+    CHECK(decodedOverview.rows == 150);
     CHECK(decodedOverview.cols == 90);
     CHECK(local.at("artifacts").contains("replay/reference_strip.obj"));
     CHECK(local.at("artifacts").contains("replay/reference_strip.mtl"));
@@ -815,10 +913,16 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK_FALSE(texture.empty());
     CHECK(texture.type() == CV_8UC1);
 
-    const std::string firstOverview = readText(directory / "fiber_replay.jpg");
+    const std::string firstOverview = readText(directory / "fiber_replay.000000.jpg");
+    {
+        std::ofstream(directory / "fiber_replay.000001.jpg") << "stale";
+        std::ofstream(directory / "fiber_replay.jpg") << "legacy";
+    }
     const auto repeatedVisual = vc::fiber_tracer::writeFiberReplayBundle(directory, input);
     CHECK(repeatedVisual == visualBundle);
-    CHECK(readText(directory / "fiber_replay.jpg") == firstOverview);
+    CHECK(readText(directory / "fiber_replay.000000.jpg") == firstOverview);
+    CHECK_FALSE(std::filesystem::exists(directory / "fiber_replay.000001.jpg"));
+    CHECK_FALSE(std::filesystem::exists(directory / "fiber_replay.jpg"));
 
     input.visualizations.clear();
     input.greedyReplay.failures.clear();
@@ -828,6 +932,6 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(noVisualBundle.at("visualizations").empty());
     CHECK_FALSE(noVisualBundle.contains("overview"));
     CHECK_FALSE(std::filesystem::exists(directory / alias));
-    CHECK_FALSE(std::filesystem::exists(directory / "fiber_replay.jpg"));
+    CHECK_FALSE(std::filesystem::exists(directory / "fiber_replay.000000.jpg"));
     std::filesystem::remove_all(directory);
 }

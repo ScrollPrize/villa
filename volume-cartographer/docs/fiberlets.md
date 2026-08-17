@@ -500,29 +500,42 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
 For the current sparse Paris4 CT store, group `/2` is the first fully stored
 scale and must be passed directly as shown above.
 
-The same `--vis` run also writes `fiber_replay.jpg` for immediate inspection,
-even when neither evaluator fails. It contains the selected reference fiber's
-existing VC3D top strip and side strip, with the reference centerline in
-yellow, the regular greedy trace in red, and the fiberlet trace in cyan. Trace
-reset segments are disconnected. The image uses the same concrete CT group,
-default line-view surfaces, and shared fine-to-coarse renderer as the
-per-failure strips, but requests an 8x render scale from that renderer for
-detailed inspection. This does not resize or change the native-resolution
-per-failure OBJ/MTL/TIFF artifacts. Greedy failures are marked by three-pixel
-vertical red bands at the pre-reset error arc; fiberlet failures use cyan, and
-coincident bands are magenta. The later reset seed is intentionally not marked.
+The same `--vis` run also writes indexed `fiber_replay.NNNNNN.jpg` files for
+immediate inspection, even when neither evaluator fails. Every wrapped range
+contains four rows: the reference fiber's VC3D top and side strips followed by
+top and side strips built from the actual fiberlet replay geometry. The latter
+make the fiberlet refinement visible in its own transported frame instead of
+only projected into the reference frame. The reference centerline is yellow,
+the regular greedy trace is red, and the fiberlet trace is cyan. Fiberlet reset
+segments are rendered by separate default `buildLineViewSurfaces()` calls and
+placed in source-segment order with an eight-column black gap. Their matched
+reference geometry and covered greedy geometry are projected through stored
+match arcs; no new nearest-point matching is performed.
+
+All four strips use the same concrete CT group, default line-view surfaces, and
+shared fine-to-coarse renderer as the per-failure strips, but request an 8x
+render scale from that renderer for detailed inspection. This does not resize
+or change the native-resolution per-failure OBJ/MTL/TIFF artifacts. Greedy
+failures are marked by three-pixel vertical red bands at the pre-reset error
+arc; fiberlet failures use cyan, and coincident bands are magenta. The later
+reset seed is intentionally not marked.
 An explicit `--length N` limits this JPEG
 to that same selected `N`-base-voxel interval; without `--length`, it covers the
-remaining reference fiber. Long 8x strips are split at equal reference-arc
-fractions into at most 32,000-column ranges and stacked as labeled panels in
-the same JPEG; the top and side ranges are mapped independently so neither is
-resampled or loses columns.
+remaining reference fiber. Long 8x strips are split at equal progress fractions
+into at most 32,000-column ranges. Each range is one labeled four-strip block.
+Complete blocks stack in the same JPEG until another would exceed 65,000 rows;
+then publication continues in the next indexed JPEG. Every JPEG dimension is
+at most 65,000 pixels. Each of the four source rasters maps independently to
+exact half-open ranges, so no raster is resampled and no column is lost.
 
-The immutable copy is `runs/<content-hash>/replay/full_strip.jpg`; the root
-`fiber_replay.json` records its hash, selected arcs, reference-point count, CT
-group transform, full unwrapped top/side dimensions, 8x scale, marker
-semantics, exact panel ranges, layout, and colors. The stable
-`fiber_replay.jpg` is direct-inspection output, not a napari replay manifest.
+The immutable copies are
+`runs/<content-hash>/replay/full_strip.NNNNNN.jpg`; the root
+`fiber_replay.json` records their hashes and stable aliases, selected arcs,
+reference-point count, CT group transform, all four unwrapped dimensions, 8x
+scale, marker semantics, exact page/block ranges, fiberlet component placement,
+layout, and colors. The stable indexed JPEGs are direct-inspection output, not
+napari replay manifests. The command prints every indexed path after
+publication. Stale higher indices are removed when a later run has fewer pages.
 The separate per-failure OBJ/MTL/TIFF artifacts and their direct manifests are
 unchanged.
 

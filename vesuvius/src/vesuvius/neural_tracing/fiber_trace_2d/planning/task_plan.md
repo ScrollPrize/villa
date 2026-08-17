@@ -1,99 +1,78 @@
-# Plan: Lasagna-oriented replay failure threshold
+# Plan: Fiberlet-centered replay strips and indexed overview JPEGs
 
-## Behavior and shared implementation
+## Geometry and rendering
 
-1. Add one reusable replay-threshold evaluator to `vc_fiber_tracer`. Given an
-   evaluator point and its already selected reference match in base coordinates,
-   it samples the Lasagna normal at the matched reference point after converting
-   that point to the sampler's working scale.
-2. For a valid normalized local normal, decompose the base-coordinate error into
-   absolute normal magnitude `dn` and tangent-plane magnitude `dt`. Compute the
-   normal-equivalent threshold error as
-   `sqrt(dn^2 + (dt / 4)^2)` and compare that value with the existing `--fail`
-   threshold. This creates an ellipsoid with radii `T` normal and `4T`
-   tangential. Normal sign has no effect.
-3. If the local normal is missing, invalid, non-finite, or zero-length, use the
-   old Euclidean error as the threshold error. Do not grant tangential relaxation
-   without valid Lasagna evidence.
-4. Keep `matchForwardPolylinePoint()` and its Euclidean closest-point selection
-   unchanged. Store `euclidean_error_base_voxels`, optional
-   `normal_error_base_voxels`, optional `tangential_error_base_voxels`,
-   `threshold_error_base_voxels`, `threshold_error_ratio`, and
-   `local_normal_valid` for every evaluated match. Remove the ambiguous
-   unpublished `error_base_voxels`/`error_ratio` keys atomically.
-5. The comparison remains strict: `threshold_error > T` fails, so exact pure
-   normal error `T` and pure tangent-plane error `4T` are accepted. For `T=0`,
-   exact zero error has ratio zero and any nonzero error fails with the finite
-   maximum-double ratio used by the current replay code.
+1. Extract the existing batched normal sampling plus default
+   `buildLineViewSurfaces()` construction into one file-local helper used by
+   both failure-local strip generation and the full replay overview. Do not add
+   an alternate strip geometry or renderer.
+2. Keep the current reference-centered top and side strips and their yellow
+   reference, red greedy, cyan fiberlet, and restart-marker overlays.
+3. Build an additional top and side surface for every fiberlet replay segment
+   with at least two route points. Preserve reset boundaries as disconnected
+   components, render each component through the same native-group coordinate
+   conversion and fine-to-coarse CT renderer at overview scale eight, and join
+   rendered components only in the 2D inspection raster with explicit black
+   separators. Persist a deterministic component placement table containing
+   source segment index, matched reference-arc interval, and top/side raster
+   column ranges, including separator semantics.
+4. In the fiberlet-centered pair, draw the fiberlet centerline in cyan and the
+   stored matched reference points in yellow. Map greedy trace points and both
+   tracers' failure arcs through the fiberlet segment's stored monotonic match
+   arcs so the comparison and restart diagnostics remain visible without new
+   nearest-point matching. Greedy samples outside a component's covered arc are
+   omitted; samples in overlapping component intervals are shown in each such
+   component. Fiberlet failures are assigned to their recorded source segment.
 
-## Tracer integration
+## Indexed JPEG parts
 
-1. Make a normal sampler and its positive finite working-to-base scale explicit
-   mandatory API arguments for both replay evaluators. Greedy replay reuses its
-   trace Lasagna sampler and passes `traceToBaseScale`; the shared evaluator
-   samples `matched_reference_point_base / normalWorkingToBaseScale`.
-2. Extend fiberlet graph replay with the canonical Lasagna normal sampler and
-   its working-to-base scale. Use the shared evaluator for every route sample.
-3. Apply the same anisotropic decision to fiberlet seed selection. Retain a
-   cheap inclusive Euclidean `4T` broad-phase before sampling normals (including
-   the exact-zero-only behavior at `T=0`), then rank usable seeds by reference
-   arc, normalized threshold error, and node index so seed ordering uses the
-   same metric as acceptance. The initial seed match stores the full shared
-   measurement.
-4. Keep graph costs, beam routing, trace losses, reset advancement, reference
-   matching, and all non-distance failure reasons unchanged.
-
-## Output and CLI
-
-1. Clarify that `--fail N` is the normal-direction radius in base voxels and
-   that the fixed tangent-plane radius is `4N`.
-2. Persist one authoritative aggregate threshold descriptor containing shape,
-   normal radius, tangential factor/radius, comparison, and invalid-normal
-   policy. Generate nested greedy/fiberlet descriptors from the same shared
-   serializer and validate that both engine thresholds equal the root value.
-3. Emit all explicit component diagnostics for greedy/fiberlet matches and
-   failures, and include them in command-line distance-failure output.
-   Graph-exhausted failures preserve their existing last-match diagnostics;
-   failures without an evaluated point retain null diagnostics.
-4. Keep current replay artifact versions because this is an unpublished
-   diagnostic format and update its strict writer atomically; add no repair or
-   compatibility path.
+1. Extend the current wrapped compositor so every horizontal interval is one
+   vertically stacked four-strip block ordered reference top, reference side,
+   fiberlet top, fiberlet side. Preserve the existing 32,000-column proportional
+   wrap-range construction and validate that each complete block independently
+   fits within 65,000 rows and columns.
+2. Split every strip into proportional, exact half-open column ranges for each
+   block. Copy every raster column exactly once without resizing. Stack as many
+   complete four-strip blocks as fit below 65,000 rows in one image; continue
+   with another indexed image only when the next complete block would exceed
+   that limit.
+3. Publish immutable `replay/full_strip.NNNNNN.jpg` artifacts and stable
+   `fiber_replay.NNNNNN.jpg` aliases for every part. Record ordered part paths,
+   hashes, image shapes, progress fractions, page index, and the four source-
+   column/row ranges for every ordered block in the strict version-2 replay
+   root. Remove the unpublished singular JPEG path and clean stale indexed
+   aliases after shorter or non-visual runs.
+4. Print every stable overview part path after publication.
 
 ## Tests and validation
 
-1. Unit-test the shared evaluator with pure normal, pure tangential, mixed,
-   reversed-normal, scaled-sampler-coordinate, and invalid-normal inputs.
-2. Update greedy replay tests to supply a normal sampler and verify a displacement
-   between `T` and `4T` survives tangentially but fails normally.
-3. Update fiberlet graph replay tests for the same decisions, including a seed
-   that is accepted only by the tangent-plane allowance.
-4. Verify serialized matches, failures, and threshold descriptors contain
-   finite consistent component values and normalized ratios. Strict producer
-   validation must recompute `dn^2 + dt^2 ~= euclidean^2`, the ellipse formula,
-   the ratio and invalid-normal fallback, and prove distance failures exactly
-   copy their terminal match measurement.
-5. Test exact-boundary and zero-threshold behavior, invalid, zero, NaN and
-   infinite normals, and clarify that tangent means the full 2D plane normal to
-   the Lasagna surface normal rather than the learned fiber tangent.
-6. Build `test_fiber_trace3d`, `test_fiberlet_paths`, `test_fiber_replay`, and
-   `vc_fiberlets` with `-j32`; run the three focused suites and `git diff --check`.
-7. Run a bounded Paris4 replay and compare failure counts/output against the
-   prior isotropic run, recording the exact command and result.
+1. Extend overview rendering coverage to prove both fiberlet-centered CT strips
+   are rendered, use the fiberlet route as their centerline, retain overlays,
+   and preserve disconnected replay components.
+2. Replace the panel-wrapping compositor test with exact 65,000-boundary and
+   multi-part tests that verify all four rasters are copied once without
+   resampling, no four-strip block is split across pages, and every output
+   dimension remains within the limit.
+3. Update replay publication tests for indexed immutable/stable JPEGs,
+   deterministic rewrites, manifest metadata, and stale-alias cleanup.
+4. Build `test_fiber_replay` and `vc_fiberlets` with `-j32`, run the focused
+   suite, run `git diff --check`, and, if available, run a bounded Paris4 visual
+   replay to inspect the generated part count and dimensions.
 
 ## Spec update
 
-- Change the replay failure-distance contract from an isotropic Euclidean ball
-  to the Lasagna-normal ellipsoid above, including invalid-normal fallback,
-  unchanged matching, exact boundary behavior, full tangent-plane terminology,
-  seed behavior, strict producer validation, and persisted diagnostics.
+- Replace each reference-only wrapped block with four reference-/fiberlet-
+  centered strips, retain vertical wrapping within an image, and spill complete
+  blocks across indexed <=65,000-pixel JPEG parts only when required. Specify
+  default line-view geometry, segment separation, stored match-based overlays,
+  indexed artifact naming, metadata, and stale cleanup.
 
 ## Documentation update
 
-- Update `volume-cartographer/docs/fiberlets.md` with the formula, `--fail`
-  semantics, normal sampling coordinate conversion, seed behavior, and output
-  fields.
+- Update `volume-cartographer/docs/fiberlets.md` with the four-strip layout,
+  fiberlet-centered interpretation, indexed paths, size bound, manifest fields,
+  and command-line output.
 
 ## Changelog update
 
-- Record the shared anisotropic failure evaluator and its use by both replay
-  tracers.
+- Record the fiberlet-centered overview pair and indexed JPEG publication.

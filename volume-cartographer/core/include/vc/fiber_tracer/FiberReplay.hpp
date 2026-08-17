@@ -58,8 +58,27 @@ struct FiberReplayStripMeshes {
 };
 
 struct FiberReplayOverviewPanel {
-    double referenceFractionBegin = 0.0;
-    double referenceFractionEnd = 0.0;
+    double progressFractionBegin = 0.0;
+    double progressFractionEnd = 0.0;
+    std::array<int, 2> referenceTopColumns{};
+    std::array<int, 2> referenceSideColumns{};
+    std::array<int, 2> fiberletTopColumns{};
+    std::array<int, 2> fiberletSideColumns{};
+    std::array<int, 2> referenceTopRows{};
+    std::array<int, 2> referenceSideRows{};
+    std::array<int, 2> fiberletTopRows{};
+    std::array<int, 2> fiberletSideRows{};
+};
+
+struct FiberReplayOverviewPage {
+    cv::Mat_<cv::Vec3b> image;
+    std::vector<FiberReplayOverviewPanel> panels;
+};
+
+struct FiberReplayOverviewFiberletComponent {
+    size_t sourceSegmentIndex = 0;
+    double referenceArcBeginBase = 0.0;
+    double referenceArcEndBase = 0.0;
     std::array<int, 2> topColumns{};
     std::array<int, 2> sideColumns{};
     std::array<int, 2> topRows{};
@@ -67,13 +86,16 @@ struct FiberReplayOverviewPanel {
 };
 
 struct FiberReplayOverview {
-    cv::Mat_<cv::Vec3b> image;
     FiberReplayStripTextureSource textureSource;
-    std::array<int, 2> topShapeYX{};
-    std::array<int, 2> sideShapeYX{};
+    std::array<int, 2> referenceTopShapeYX{};
+    std::array<int, 2> referenceSideShapeYX{};
+    std::array<int, 2> fiberletTopShapeYX{};
+    std::array<int, 2> fiberletSideShapeYX{};
     int renderScale = 1;
     int markerWidthPixels = 0;
-    std::vector<FiberReplayOverviewPanel> panels;
+    int fiberletComponentGapColumns = 0;
+    std::vector<FiberReplayOverviewFiberletComponent> fiberletComponents;
+    std::vector<FiberReplayOverviewPage> pages;
 };
 
 [[nodiscard]] FiberReplayTube makeFiberReplayTube(
@@ -151,8 +173,11 @@ struct FiberReplayBundleInput {
 namespace testing
 {
 [[nodiscard]] FiberReplayOverview composeFiberReplayOverviewForTesting(
-    const cv::Mat_<cv::Vec3b>& top,
-    const cv::Mat_<cv::Vec3b>& side);
+    const cv::Mat_<cv::Vec3b>& referenceTop,
+    const cv::Mat_<cv::Vec3b>& referenceSide,
+    const cv::Mat_<cv::Vec3b>& fiberletTop,
+    const cv::Mat_<cv::Vec3b>& fiberletSide,
+    int maximumPageRows = 65000);
 }  // namespace testing
 #endif
 
