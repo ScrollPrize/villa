@@ -28,9 +28,11 @@ Standalone smoke test (no agent, no sweep):
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -68,6 +70,61 @@ SEED_WANDB_IDENTITY_VARS = (
     'WANDB_SWEEP_ID',
     'WANDB_SWEEP_PARAM_PATH',
 )
+
+RUN_NAME_LABELS = {
+    'patch_uuid_filter_regex': 'patch',
+    'patch_2d_sampling_max_area': 'cap',
+    'patch_strip_sampling': 'strip',
+    'loss_weight_dense_spacing': 'dense',
+    'patch_sampling_area_exponent': 'areaexp',
+    'pcl_stratified_pcl_sampling': 'strat',
+    'input_disable_tracks': 'tracks',
+    'input_disable_fibers': 'fibers',
+    'pcl_use_fiber_links': 'links',
+}
+MAX_RUN_NAME_LENGTH = 128
+
+
+def _short_run_name_value(key, value):
+    if key in ('input_disable_tracks', 'input_disable_fibers'):
+        return 'off' if value else 'on'
+    if isinstance(value, bool):
+        return 'on' if value else 'off'
+    if key == 'patch_uuid_filter_regex':
+        if value is None:
+            return 'all'
+        if value == '^(?!.*band-seed).*$':
+            return 'no-band-seed'
+    if key == 'patch_2d_sampling_max_area' and value is None:
+        return 'unlimited'
+    if value is None:
+        return 'none'
+    if isinstance(value, float):
+        return f'{value:g}'
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, sort_keys=True, separators=(',', ':'))
+    text = re.sub(r'[^A-Za-z0-9_.+-]+', '-', str(value)).strip('-') or 'empty'
+    if len(text) > 24:
+        digest = hashlib.sha256(str(value).encode()).hexdigest()[:6]
+        text = f'{text[:17]}~{digest}'
+    return text
+
+
+def format_run_name(keys, resolved_config):
+    """Readable deterministic display name from the dimensions that vary."""
+    parts = []
+    for key in keys:
+        if key not in resolved_config:
+            continue
+        label = RUN_NAME_LABELS.get(key, key)
+        parts.append(f'{label}={_short_run_name_value(key, resolved_config[key])}')
+    if not parts:
+        return None
+    full_name = ','.join(parts)
+    if len(full_name) <= MAX_RUN_NAME_LENGTH:
+        return full_name
+    digest = hashlib.sha256(full_name.encode()).hexdigest()[:8]
+    return f'{full_name[:MAX_RUN_NAME_LENGTH - len(digest) - 1]}~{digest}'
 
 
 def write_json_atomic(path, value):
@@ -320,7 +377,7 @@ def wandb_available():
             and os.environ.get('WANDB_MODE', 'online') != 'disabled')
 
 
-def log_to_run(payload, files=()):
+def log_to_run(payload, files=(), run_name=None):
     """Attach once to the agent-created run and log aggregate results.
 
     Project/entity/run id all come from the agent's environment; the last
@@ -331,7 +388,7 @@ def log_to_run(payload, files=()):
         return
     import wandb
     os.environ.setdefault('WANDB_RESUME', 'allow')
-    run = wandb.init()
+    run = wandb.init(name=run_name)
     run.log(payload)
     for path in files:
         run.save(str(path), base_path=str(Path(path).parent), policy='now')
@@ -388,6 +445,9 @@ def main():
     ap.add_argument('--reuse-root', action='append', default=[],
                     help='old sweep output directory searched for exact matching '
                          'completed seeds; repeat for multiple sources')
+    ap.add_argument('--run-name-keys-json', default='[]',
+                    help='internal JSON list of varying Config keys included in '
+                         'the aggregate wandb run display name')
     ap.add_argument('--seeds', default='1,2,3',
                     help='comma list of optimizer_random_seed values; the full '
                          'fit+eval chain runs once per seed and the sweep '
@@ -432,6 +492,11 @@ def main():
         raise SystemExit('optimizer_random_seed cannot be a sweep param or base-config '
                          'override: the wrapper assigns it per seed (--seeds)')
     resolved_config = Config(overrides).as_dict()  # fail fast before any GPU work
+    run_name_keys = json.loads(args.run_name_keys_json)
+    if (not isinstance(run_name_keys, list)
+            or any(not isinstance(key, str) for key in run_name_keys)):
+        ap.error('--run-name-keys-json must be a JSON list of strings')
+    run_name = format_run_name(run_name_keys, resolved_config)
 
     run_id = os.environ.get('WANDB_RUN_ID') or f'local-{uuid.uuid4().hex[:8]}'
     sweep_id = os.environ.get('WANDB_SWEEP_ID', 'nosweep')
@@ -523,7 +588,8 @@ def main():
         # skips the render), so the absence of flat strips is the failure signal.
         ink_dir = meshes_dir / 'ink'
         if not glob.glob(str(ink_dir / '*_flat*.jpg')):
-            log_to_run({'eval/flatten_failed': 1, 'eval/flatten_failed_seed': seed})
+            log_to_run({'eval/flatten_failed': 1, 'eval/flatten_failed_seed': seed},
+                       run_name=run_name)
             raise SystemExit(f'lasagna flatten produced no ink strips in {ink_dir}')
 
         if args.ink_preview_downsample > 0:
@@ -569,6 +635,7 @@ def main():
         'schema_version': SEED_RESULT_SCHEMA_VERSION,
         'sweep_id': sweep_id,
         'run_id': run_id,
+        'run_name': run_name,
         'config': resolved_config,
         'params': params,
         'seeds': seeds,
@@ -591,7 +658,7 @@ def main():
         },
         'wandb_metrics': payload,
     })
-    log_to_run(payload, files=[aggregate_path])
+    log_to_run(payload, files=[aggregate_path], run_name=run_name)
     print(f'[sweep_run_wrapper] done ({len(seeds)} seeds): {json.dumps(payload)}',
           flush=True)
 

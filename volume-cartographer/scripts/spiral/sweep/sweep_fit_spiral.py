@@ -24,6 +24,8 @@ get_ink_metrics chain (see paris4_sweep.json in this directory).
 ``--reuse-root`` may be repeated on ``create``/``run`` to reuse exact-matching
 completed seeds from older local sweep output directories.  It is independent
 of the new wandb sweep id: ``run`` always creates a new sweep before launch.
+Aggregate run display names list only the Config dimensions that actually vary
+in the sweep, rather than using wandb's generated adjective-noun names.
 
 Example (from scripts/spiral/):
 
@@ -183,6 +185,48 @@ def validate_extra_configs(extras, fixed):
     raise_if_errors(errors)
 
 
+def varying_run_name_keys(spec):
+    """Config keys that genuinely vary, preserving sweep-spec order."""
+    fields = Config.catalog()['schema']['fields']
+    selected = []
+
+    def add(key):
+        if key not in selected:
+            selected.append(key)
+
+    for key, param in spec.get('parameters', {}).items():
+        values = parameter_values(param)
+        if key in fields:
+            # A distribution, or multiple distinct enumerated values, varies.
+            fingerprints = {json.dumps(value, sort_keys=True) for value in values}
+            if not values or len(fingerprints) > 1:
+                add(key)
+            continue
+        if not is_group_parameter(fields, key, param):
+            continue
+        inner_keys = []
+        for branch in values:
+            for inner_key in branch:
+                if inner_key not in inner_keys:
+                    inner_keys.append(inner_key)
+        missing = object()
+        for inner_key in inner_keys:
+            observed = [branch.get(inner_key, missing) for branch in values]
+            fingerprints = {
+                '<missing>' if value is missing else json.dumps(value, sort_keys=True)
+                for value in observed
+            }
+            if len(fingerprints) > 1:
+                add(inner_key)
+
+    # Explicit extra configs may introduce dimensions outside the crossed grid.
+    for extra in spec.get('extra_configs', []):
+        if isinstance(extra, dict):
+            for key in extra:
+                add(key)
+    return selected
+
+
 def build_wrapper_command(spec, args):
     cmd = [sys.executable, str(SCRIPT_DIR / 'sweep_run_wrapper.py'),
            '--dataset', str(Path(args.dataset).resolve()),
@@ -195,6 +239,9 @@ def build_wrapper_command(spec, args):
         cmd += ['--base-config', str(Path(args.base_config).resolve())]
     for reuse_root in args.reuse_root:
         cmd += ['--reuse-root', str(Path(reuse_root).resolve())]
+    run_name_keys = varying_run_name_keys(spec)
+    if run_name_keys:
+        cmd += ['--run-name-keys-json', json.dumps(run_name_keys)]
     eval_cfg = spec.get('eval', {})
     unknown = set(eval_cfg) - set(EVAL_OPTION_FLAGS) - set(EVAL_BOOL_FLAGS)
     if unknown:

@@ -186,6 +186,49 @@ def test_wrapper_command_propagates_reuse_roots(tmp_path):
     ]
 
 
+def test_paris_run_name_uses_only_varying_dimensions():
+    spec = json.loads((SWEEP_DIR / 'paris4_sweep.json').read_text())
+
+    keys = sweep.varying_run_name_keys(spec)
+
+    assert keys == [
+        'patch_uuid_filter_regex',
+        'patch_2d_sampling_max_area',
+        'patch_strip_sampling',
+        'loss_weight_dense_spacing',
+        'patch_sampling_area_exponent',
+        'pcl_stratified_pcl_sampling',
+        'input_disable_tracks',
+        'input_disable_fibers',
+        'pcl_use_fiber_links',
+    ]
+    config = wrapper.Config({
+        'patch_uuid_filter_regex': None,
+        'patch_2d_sampling_max_area': None,
+        'patch_strip_sampling': 'dijkstra',
+        'loss_weight_dense_spacing': 12.0,
+        'patch_sampling_area_exponent': 0.25,
+        'pcl_stratified_pcl_sampling': True,
+        'input_disable_tracks': False,
+        'input_disable_fibers': False,
+        'pcl_use_fiber_links': True,
+    }).as_dict()
+    assert wrapper.format_run_name(keys, config) == (
+        'patch=all,cap=unlimited,strip=dijkstra,dense=12,areaexp=0.25,'
+        'strat=on,tracks=on,fibers=on,links=on')
+    args = Namespace(
+        dataset='/dataset',
+        out_root='/output',
+        scroll_spec=None,
+        cache=None,
+        base_config=None,
+        reuse_root=[],
+    )
+    command = sweep.build_wrapper_command(spec, args)
+    name_arg = command.index('--run-name-keys-json')
+    assert json.loads(command[name_arg + 1]) == keys
+
+
 def test_run_creates_then_launches_returned_new_sweep_id(monkeypatch):
     calls = []
     args = object()
@@ -216,8 +259,10 @@ def test_all_reused_seeds_produce_one_aggregate_log_and_manifest(
             reuse_root, 'old-run', root_config, seed_config, seed, score)
 
     logged = []
-    monkeypatch.setattr(wrapper, 'log_to_run',
-                        lambda payload, files=(): logged.append((payload, list(files))))
+    monkeypatch.setattr(
+        wrapper, 'log_to_run',
+        lambda payload, files=(), run_name=None:
+            logged.append((payload, list(files), run_name)))
     monkeypatch.setenv('WANDB_RUN_ID', 'new-run')
     monkeypatch.setenv('WANDB_SWEEP_ID', 'new-sweep')
     monkeypatch.setattr(sys, 'argv', [
@@ -232,13 +277,14 @@ def test_all_reused_seeds_produce_one_aggregate_log_and_manifest(
     wrapper.main()
 
     assert len(logged) == 1
-    payload, files = logged[0]
+    payload, files, run_name = logged[0]
     assert payload['final/satisfied_patch_ratio'] == pytest.approx(0.4)
     assert payload['final/satisfied_patch_ratio_std'] == pytest.approx(0.2)
     assert not any(key.startswith('seed') for key in payload)
     aggregate_path = (tmp_path / 'new-output' / 'new-sweep' / 'new-run'
                       / 'aggregate_results.json')
     assert files == [aggregate_path]
+    assert run_name is None
     manifest = json.loads(aggregate_path.read_text())
     assert manifest['sweep_id'] == 'new-sweep'
     assert manifest['run_id'] == 'new-run'
