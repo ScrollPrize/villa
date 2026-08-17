@@ -33,6 +33,7 @@ set(srcs
     FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
+    AnnotationFrame.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp

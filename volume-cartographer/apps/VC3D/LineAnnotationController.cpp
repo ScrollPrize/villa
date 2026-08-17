@@ -9509,27 +9509,30 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
-std::array<double, 3> LineAnnotationController::annotationFrameExtentXyz() const
+vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
 {
     if (!_state) {
-        return {0.0, 0.0, 0.0};
+        return {};
     }
     try {
         const auto volume = _state->currentVolume();
         if (!volume) {
-            return {0.0, 0.0, 0.0};
+            return {};
         }
-        double factor = 1.0;
+        std::optional<double> stampedResolution;
         if (const auto identity = coordinateIdentityForState(_state);
-            identity && identity->sourceCoordinateScaleFactor > 0) {
-            factor =
-                static_cast<double>(identity->sourceCoordinateScaleFactor);
+            identity && identity->sourceOriginalResolution > 0.0) {
+            stampedResolution = identity->sourceOriginalResolution;
         }
-        return {volume->sliceWidth() * factor,
-                volume->sliceHeight() * factor,
-                volume->numSlices() * factor};
+        return vc3d::annotation::deriveAnnotationFrame(
+            volume->voxelSize(),
+            volume->baseScaleLevel(),
+            stampedResolution,
+            {static_cast<double>(volume->sliceWidth()),
+             static_cast<double>(volume->sliceHeight()),
+             static_cast<double>(volume->numSlices())});
     } catch (...) {
-        return {0.0, 0.0, 0.0};
+        return {};
     }
 }
 
@@ -9577,15 +9580,11 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     // umbilicus has to be too, and the dense per-slice centres
                     // have to be built at that frame's extent rather than the
                     // volume's own.
-                    const std::array<double, 3> annotationGrid =
-                        annotationFrameExtentXyz();
-                    std::optional<double> annotationVoxelUm;
-                    if (const auto identity = coordinateIdentityForState(_state);
-                        identity && identity->sourceOriginalResolution > 0.0) {
-                        annotationVoxelUm = identity->sourceOriginalResolution;
-                    }
+                    const auto frame = annotationFrame();
+                    const std::array<double, 3>& annotationGrid =
+                        frame.extentXyz;
                     const auto scale = vc::core::util::deriveUmbilicusScale(
-                        resolved.info, annotationGrid, annotationVoxelUm);
+                        resolved.info, annotationGrid, frame.voxelSizeUm);
 
                     const bool stamped =
                         scale && scale->source !=
