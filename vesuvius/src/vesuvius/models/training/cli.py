@@ -13,6 +13,22 @@ from vesuvius.models.datasets.intensity_properties import load_intensity_props_f
 from vesuvius.models.utilities.cli_utils import update_config_from_args
 
 
+def _add_training_control_args(group):
+    """Add schedule controls whose omitted values must remain config-owned."""
+    group.add_argument("--max-epoch", type=int, default=None,
+                       help="Maximum number of epochs (overrides YAML when set)")
+    group.add_argument("--max-steps-per-epoch", type=int, default=None,
+                       help="Max training steps per epoch (use all data if unset; overrides YAML when set)")
+    group.add_argument("--max-val-steps-per-epoch", type=int, default=None,
+                       help="Max validation steps per epoch (use all data if unset; overrides YAML when set)")
+    group.add_argument("--full-epoch", action="store_true",
+                       help="Iterate over entire train/val set per epoch (overrides max-steps)")
+    group.add_argument("--early-stopping-patience", type=int, default=0,
+                       help="Epochs to wait for val loss improvement (0 disables)")
+    group.add_argument("--val-every-n", dest="val_every_n", type=int, default=None,
+                       help="Perform validation every N epochs (1=every epoch; overrides YAML when set)")
+
+
 def _maybe_set_spawn_start_method(argv):
     # s3fs/fsspec can misbehave with fork; force spawn if s3/config is present.
     if not argv:
@@ -104,20 +120,9 @@ def main(argv=None):
                            help="Type of pooling in encoder ('conv' = strided conv)")
 
     # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=1000,
-                           help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=250,
-                           help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=50,
-                           help="Max validation steps per epoch (use all data if unset)")
-    grp_train.add_argument("--full-epoch", action="store_true",
-                           help="Iterate over entire train/val set per epoch (overrides max-steps)")
-    grp_train.add_argument("--early-stopping-patience", type=int, default=0,
-                           help="Epochs to wait for val loss improvement (0 disables)")
+    _add_training_control_args(grp_train)
     grp_train.add_argument("--ddp", action="store_true",
                            help="Enable DistributedDataParallel (use with torchrun)")
-    grp_train.add_argument("--val-every-n", dest="val_every_n", type=int, default=1,
-                           help="Perform validation every N epochs (1=every epoch)")
     grp_train.add_argument("--gpus", type=str, default=None,
                            help="Comma-separated GPU device IDs to use, e.g. '0,1,3'. With DDP, length must equal WORLD_SIZE")
     grp_train.add_argument("--nproc-per-node", type=int, default=None,
