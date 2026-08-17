@@ -4,6 +4,12 @@ import { buildIndex } from "./buildIndex";
 import { rewrites } from "./dataAccess";
 import overlay from "@site/src/data/atlasOverlay.json";
 import meshManifest from "@site/static/img/data_browser/meshes/manifest.json";
+// Byte sizes of the multi-variant downsampled renders, generated alongside
+// index.json by scripts/genAtlasData.js. Passing the same map here keeps the
+// live derivation's primary-render choice identical to the build-time one
+// (a variant published after the last build simply falls back to the
+// finest-um-first order until the next build refreshes this file).
+import renderSizes from "@site/static/data_browser/renderSizes.json";
 
 // useAtlasData — load the data-browser index at runtime.
 //
@@ -47,7 +53,7 @@ export async function loadAtlasIndex(routedIds) {
       );
     }
     return {
-      index: buildIndex(samples, { overlay, meshManifest, rewrites }),
+      index: buildIndex(samples, { overlay, meshManifest, rewrites, renderSizes }),
       source: "live",
     };
   } catch (liveErr) {

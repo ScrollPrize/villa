@@ -18,6 +18,8 @@ struct OpenDataSampleProjectResult {
     int attachedVolumeEntries = 0;
     int skippedVolumes = 0;
     int failedVolumes = 0;
+    int attachedLasagnaDatasets = 0;
+    int attachedNormalGrids = 0;
     int supportedTifxyzSegments = 0;
     int cachedTifxyzSegments = 0;
     int attachedSegmentEntries = 0;
@@ -29,15 +31,19 @@ struct OpenDataSampleProjectResult {
     std::vector<std::string> messages;
 };
 
+// selection optionally restricts attached volumes and derived
+// representations; nullptr attaches everything.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut = nullptr,
-    const OpenDataSampleProgressCallback& progressCallback = {});
+    const OpenDataSampleProgressCallback& progressCallback = {},
+    const OpenDataResourceSelection* selection = nullptr);
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample);
+    const OpenDataSample& sample,
+    const OpenDataResourceSelection* selection = nullptr);
 
 void attachOpenDataSampleSegments(
     VolumePkg& pkg,

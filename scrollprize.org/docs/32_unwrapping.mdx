@@ -1,6 +1,5 @@
 ---
 title: "Virtual Unwrapping"
-hide_table_of_contents: true
 math: true
 ---
 import BeforeAfter from '@site/src/components/BeforeAfter';
@@ -25,6 +24,12 @@ import Head from '@docusaurus/Head';
 </Head>
 
 # Virtual Unwrapping
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
 
 The image data of the Herculaneum scrolls (PHerc 172) look like this:
 <iframe 
@@ -133,8 +138,8 @@ Spiral fitting was submitted by Prof Paul Henderson for the First Automated Segm
 Although it did not meet the needed quality criteria to win, it was the most elegant solution according to the Vesuvius Challenge Team.
 
 <div className="mb-4">
-  <a href="/img/virtual-unwrapping/fasp-spiral-fitting.jpg" target="_blank" rel="noopener noreferrer">
-    <img src="/img/virtual-unwrapping/fasp-spiral-fitting.jpg" className="w-[70%] cursor-pointer" />
+  <a href="/img/virtual-unwrapping/fasp-spiral-fitting.webp" target="_blank" rel="noopener noreferrer">
+    <img src="/img/virtual-unwrapping/fasp-spiral-fitting.webp" className="w-[70%] cursor-pointer" />
   </a>
   <figcaption className="mt-[-6px]">FASP - Spiral Fitting submission (almost zero human input)</figcaption>
 </div>
@@ -177,7 +182,7 @@ where:
 Every *n* iterations, the mesh is smoothed to better approximate a developable surface. Because growing a single mesh is slow, multiple patches are grown in parallel and then merged via a consensus algorithm.
 
 <figure>
-  <iframe src="/vid/big_patch.mp4" width="600" height="400" allow="autoplay; encrypted-media" allowFullScreen></iframe>
+  <iframe src="/vid/big_patch-c.mp4" width="100%" style={{maxWidth: "600px", aspectRatio: "3/2"}} allow="autoplay; encrypted-media" allowFullScreen></iframe>
   <figcaption>The surface tracer in action.</figcaption>
 </figure>
 

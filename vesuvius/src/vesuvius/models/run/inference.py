@@ -2,7 +2,12 @@ import torch
 import numpy as np
 import zarr
 import os
-import fcntl
+import errno
+try:
+    import fcntl  # POSIX-only; used to serialize model-cache downloads
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+    import msvcrt
 import hashlib
 import multiprocessing
 import subprocess
@@ -23,6 +28,7 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -103,6 +109,87 @@ def _checkpoint_normalization_scheme(checkpoint_data):
     return image_normalization
 
 
+_NNUNET_NORMALIZATION_MAP = {
+    'CTNormalization': 'ct',
+    'ZScoreNormalization': 'instance_zscore',
+    'NoNormalization': 'none',
+    'RescaleTo01Normalization': 'instance_minmax',
+}
+
+
+def _nnunet_normalization_from_model_info(model_info):
+    """Return the normalization declared by an nnU-Net model's plans.
+
+    ``load_model_for_inference`` already returns the nnU-Net configuration and
+    plans managers.  Keep their native metadata authoritative rather than
+    silently falling back to the CLI's per-patch z-score default.
+
+    VCDataset currently accepts one normalization contract for the entire
+    input, so reject multi-channel plans instead of applying one channel's
+    fingerprint to another.
+    """
+    configuration_manager = model_info.get('configuration_manager')
+    plans_manager = model_info.get('plans_manager')
+    if configuration_manager is None or plans_manager is None:
+        return None, None
+
+    schemes = getattr(configuration_manager, 'normalization_schemes', None)
+    if schemes is None:
+        return None, None
+    if isinstance(schemes, str):
+        schemes = [schemes]
+    else:
+        schemes = list(schemes)
+    if len(schemes) != 1:
+        raise ValueError(
+            'vesuvius.predict cannot reproduce nnU-Net normalization for '
+            f'{len(schemes)} input channels; expected exactly one scheme')
+
+    native_scheme = schemes[0]
+    if not isinstance(native_scheme, str):
+        native_scheme = getattr(native_scheme, '__name__', str(native_scheme))
+    native_scheme = native_scheme.rsplit('.', 1)[-1]
+    try:
+        scheme = _NNUNET_NORMALIZATION_MAP[native_scheme]
+    except KeyError as exc:
+        raise ValueError(
+            'Unsupported nnU-Net normalization scheme in plans.json: '
+            f'{native_scheme!r}') from exc
+
+    use_mask = getattr(configuration_manager, 'use_mask_for_norm', None)
+    if isinstance(use_mask, (list, tuple)):
+        use_mask = use_mask[0] if use_mask else None
+    if scheme == 'instance_zscore' and bool(use_mask):
+        raise ValueError(
+            'nnU-Net plans require masked Z-score normalization, which '
+            'vesuvius.predict cannot reproduce without the preprocessing mask')
+
+    intensity_properties = None
+    if scheme == 'ct':
+        per_channel = getattr(
+            plans_manager, 'foreground_intensity_properties_per_channel', None)
+        if not isinstance(per_channel, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires '
+                'foreground_intensity_properties_per_channel in plans.json')
+        intensity_properties = per_channel.get('0', per_channel.get(0))
+        required = {
+            'mean', 'std', 'percentile_00_5', 'percentile_99_5',
+        }
+        if not isinstance(intensity_properties, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires intensity properties for '
+                'input channel 0')
+        missing = sorted(required.difference(intensity_properties))
+        if missing:
+            raise ValueError(
+                'nnU-Net CTNormalization channel-0 intensity properties are '
+                f'missing: {", ".join(missing)}')
+        intensity_properties = dict(intensity_properties)
+
+    return scheme, intensity_properties
+
+
 def _select_evenly_spaced_middle_indices(candidate_indices, limit):
     """Select a deterministic, small representative subset of patch indices."""
     candidates = list(candidate_indices)
@@ -156,13 +243,34 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
 DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
 
 
+def _lock_file_exclusive(fh):
+    """Take an exclusive advisory lock on an open file, on POSIX or Windows.
+
+    Released when the handle closes, matching the previous fcntl.flock usage.
+    """
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    else:
+        # msvcrt locks a byte range; one byte suffices for a lockfile. LK_LOCK
+        # retries for ~10 s and then raises, so loop to mirror LOCK_EX's
+        # blocking. Only contention is worth retrying: anything else (a bad
+        # descriptor, a full disk) would spin here forever, so re-raise it.
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+
+
 def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
     """Resolve a model_path, downloading from S3 to a local cache if needed.
 
     For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
     returns the local directory path. A `.done` sentinel marks successful
     completion so re-runs reuse the cache. Concurrent downloads of the same
-    model are serialized with fcntl.flock on a per-model lockfile.
+    model are serialized with an exclusive lock on a per-model lockfile.
 
     For non-S3 paths, returns the input unchanged.
     """
@@ -181,7 +289,7 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
         return target
 
     with open(lock_path, 'w') as lock_fh:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _lock_file_exclusive(lock_fh)
         # Re-check after acquiring the lock in case another process completed.
         if os.path.exists(done):
             if verbose:
@@ -238,8 +346,10 @@ class Inferer():
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
+                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
+                 bbox: [list, tuple] = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -273,8 +383,10 @@ class Inferer():
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
+        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
+        self.bbox = tuple(bbox) if bbox is not None else None
         self.model_patch_size = None
         self.num_classes = None
 
@@ -404,7 +516,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -416,6 +528,26 @@ class Inferer():
                     verbose=self.verbose
                 )
         
+        # Prefer normalization metadata returned directly by train.py/external
+        # loaders. For nnU-Net, derive it from the plans managers that the
+        # loader already returns.
+        model_scheme = model_info.get('normalization_scheme')
+        model_intensity_properties = model_info.get('intensity_properties')
+        if model_scheme is None:
+            model_scheme, nnunet_intensity_properties = \
+                _nnunet_normalization_from_model_info(model_info)
+            if model_intensity_properties is None:
+                model_intensity_properties = nnunet_intensity_properties
+        if model_scheme is not None:
+            self.model_normalization_scheme = model_scheme
+            if model_scheme != self.normalization_scheme:
+                print(
+                    'Using model-declared normalization '
+                    f'{model_scheme!r} instead of CLI/default '
+                    f'{self.normalization_scheme!r}.')
+        if model_intensity_properties is not None:
+            self.model_intensity_properties = model_intensity_properties
+
         # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
@@ -696,6 +828,7 @@ class Inferer():
             normalization_scheme=normalization_scheme,
             global_mean=global_mean,
             global_std=global_std,
+            intensity_props=self.model_intensity_properties,
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -705,6 +838,16 @@ class Inferer():
             energy=self.energy,
             resolution=self.resolution,
             anon=self.input_anon,
+            bbox=self.bbox,
+            read_retries=self.read_retries,
+            # The float16 default suits the CUDA autocast path. CPU convolutions
+            # have no float16 kernels, so half patches meet float32 weights and
+            # raise "Input type (c10::Half) and bias type (float) should be the
+            # same". Ask for the dtype the CPU model can actually consume.
+            return_as_type=(
+                "np.float32" if self.device.type == "cpu"
+                else "np.float16"
+            ),
         )
 
         expected_attr_name = 'all_positions'
@@ -786,16 +929,20 @@ class Inferer():
         return concatenated
         
     def _get_zarr_compressor(self):
-        if self.compressor_name.lower() == 'zstd':
-            return zarr.Blosc(cname='zstd', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'lz4':
-            return zarr.Blosc(cname='lz4', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'zlib':
-            return zarr.Blosc(cname='zlib', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'none':
+        # numcodecs.Blosc, not zarr.Blosc: zarr 3 dropped that re-export, and the rest
+        # of the package (blending, finalize_outputs) already builds compressors here.
+        shuffle = numcodecs.blosc.SHUFFLE
+        name = self.compressor_name.lower()
+        if name == 'zstd':
+            return numcodecs.Blosc(cname='zstd', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'lz4':
+            return numcodecs.Blosc(cname='lz4', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'zlib':
+            return numcodecs.Blosc(cname='zlib', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'none':
             return None
         else:
-            return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+            return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
@@ -861,6 +1008,17 @@ class Inferer():
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            # Record whether test-time augmentation was used. Patch size and overlap are
+            # already here, but TTA is the setting that changes the output most and it
+            # leaves no trace otherwise, so a stored prediction cannot be reproduced from
+            # itself without guessing it.
+            self.output_store.attrs['tta'] = bool(self.do_tta)
+            if self.do_tta:
+                self.output_store.attrs['tta_type'] = self.tta_type
+            if self.bbox is not None:
+                # Record the requested ROI (global voxel coords, half-open) so the
+                # output is self-describing about which region was processed.
+                self.output_store.attrs['bbox'] = list(self.bbox)
             
             # Store multi-task metadata if applicable
             if self.is_multi_task and self.target_info:
@@ -971,8 +1129,9 @@ class Inferer():
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
-                        with torch.inference_mode(), torch.amp.autocast('cuda'):
+
+                        with torch.inference_mode(), torch.amp.autocast(
+                                self.device.type, enabled=(self.device.type == 'cuda')):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -1052,11 +1211,40 @@ class Inferer():
             traceback.print_exc() 
 
 
-def main():
+def _parse_bbox_arg(value):
+    """Parse "z0:z1,y0:y1,x0:x1" (half-open, global voxel coords) into a 6-tuple.
+
+    An omitted bound becomes None and is resolved to the volume edge once the
+    dataset opens the volume, so "1000:1400,:,2000:" is valid.
+    """
+    parts = value.split(',')
+    if len(parts) != 3:
+        raise ValueError(
+            f"--bbox expects three comma-separated ranges 'z0:z1,y0:y1,x0:x1', got '{value}'"
+        )
+    bounds = []
+    for axis_label, part in zip('zyx', parts):
+        piece = part.strip()
+        if ':' not in piece:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' must contain ':' "
+                f"(use ':' alone for the full axis)"
+            )
+        lo_s, hi_s = piece.split(':', 1)
+        try:
+            bounds.append(int(lo_s) if lo_s.strip() else None)
+            bounds.append(int(hi_s) if hi_s.strip() else None)
+        except ValueError:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' has a non-integer bound"
+            ) from None
+    return tuple(bounds)
+
+
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1077,7 +1265,7 @@ def main():
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
-                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
+                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
@@ -1085,17 +1273,17 @@ def main():
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
@@ -1106,18 +1294,35 @@ def main():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--read_retries', type=int, default=4,
+                      help='Attempts per patch read (default 4). Transient remote failures '
+                           '(dropped connections, truncated payloads, 429/5xx) are retried '
+                           'with exponential backoff so one hiccup does not abort a long '
+                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
-    
-    args = parser.parse_args()
+    parser.add_argument('--bbox', type=str, default=None,
+                      help='Restrict inference to a region of interest given as '
+                           '"z0:z1,y0:y1,x0:x1" in global voxel coordinates (half-open). '
+                           'Omit a bound to reach the volume edge, e.g. "1000:1400,:,2000:". '
+                           'Patch coordinates stay in the global frame, so blend_logits and '
+                           'finalize_outputs need no extra flags. When streaming a remote '
+                           'volume only the chunks intersecting the ROI are fetched.')
+    return parser
+
+
+def main():
+    import sys
+
+    args = build_parser().parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
@@ -1130,6 +1335,14 @@ def main():
             print("Expected format: comma-separated integers, e.g. '192,192,192'")
             print("Using model's default patch size instead.")
     
+    bbox = None
+    if args.bbox:
+        try:
+            bbox = _parse_bbox_arg(args.bbox)
+        except ValueError as e:
+            parser.error(str(e))
+        print(f"Restricting inference to bbox (z0,z1,y0,y1,x0,x1): {bbox}")
+
     # Convert scroll_id and segment_id if needed
     scroll_id = args.scroll_id
     segment_id = args.segment_id
@@ -1172,8 +1385,10 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
+        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
+        bbox=bbox,
     )
 
     try:

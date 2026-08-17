@@ -42,6 +42,11 @@ This runs five substeps internally:
 4. **Compute pred_dt** — euclidean distance transform of inverted binary mask at full resolution (distance from each voxel to nearest foreground surface; 0 on surface, increasing away), mean-pooled to step resolution, raw distance clamped to 255 uint8.
 5. **Assemble lasagna zarr** — Python reads ngrids `x/0`, `y/0` + binary prediction + pred_dt, writes a flat `zarr.Array` (5, Z, Y, X) uint8:
 
+This flat CZYX array is an older Lasagna preprocessing/fit intermediate. It is
+consumed by the Python fitting workflow below; it is not a VC3D project volume.
+Use `convert_fit_zarr_to_vc3d_omezarr.py` to produce separate per-channel 3D
+OME-Zarr volumes before attaching the data to a VC3D project.
+
 | Channel | Name     | Value                                              |
 |---------|----------|----------------------------------------------------|
 | 0       | cos      | 255 where binary pred at step resolution, 0 elsewhere |

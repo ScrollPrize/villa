@@ -64,7 +64,10 @@ inline QString remoteCachePath(const QString& suggestion = {})
 inline QString settingsFilePath()
 {
     // Settings must stay in the user's home — /ephemeral is lost on stop.
-    const QString configDir = QDir::homePath() + "/.VC3D";
+    // Tests may redirect the otherwise fixed per-user directory without
+    // changing production behavior.
+    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
+    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
     QDir dir;
     if (!dir.exists(configDir)) {
         dir.mkpath(configDir);
@@ -233,20 +236,12 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true, raw chunks downloaded from remote volumes are stored in the
-    // persistent disk cache compressed at the configured quantization width.
-    // Reading understands both formats regardless of this flag; it only
-    // controls the write format. Requires restart.
-    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
-    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
-
-    // Quantization bin width for compressed disk-cache writes
-    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
-    // Only affects newly written chunks; reading is unaffected. Requires
-    // restart, except for the explicit "recompress existing cache" action.
-    // Default lossless: compression saves space without changing voxels.
-    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
-    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
+    // Shared budget for every managed remote Zarr chunk beneath the resolved
+    // vc3d cache root. Zero maximum means unlimited.
+    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
@@ -259,8 +254,51 @@ namespace perf {
     constexpr auto LOD_METHOD = "perf/lod_method";
     constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
-    // IO thread count is not configurable — it tracks
-    // std::thread::hardware_concurrency() at runtime.
+    // Process-wide remote source-download admission. Automatic mode adapts
+    // between 2 and the fixed worker capacity. Manual mode admits exactly the
+    // configured number of simultaneous downloads. Decode workers are managed
+    // separately.
+    constexpr auto REMOTE_DOWNLOAD_AUTOMATIC =
+        "perf/remote_download_automatic";
+    constexpr bool REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT = true;
+    constexpr auto REMOTE_DOWNLOAD_PARALLELISM =
+        "perf/remote_download_parallelism";
+    constexpr int REMOTE_DOWNLOAD_PARALLELISM_DEFAULT = 16;
+    constexpr int REMOTE_DOWNLOAD_WORKER_CAPACITY = 64;
+
+    // Reusable adaptive-download capacity model. Runtime probe phase and
+    // stability timing are reset on every launch.
+    constexpr auto REMOTE_DOWNLOAD_STATE_VERSION =
+        "perf/remote_download_state/version";
+    constexpr int REMOTE_DOWNLOAD_STATE_VERSION_CURRENT = 1;
+    constexpr auto REMOTE_DOWNLOAD_SETTLED_ADMISSION =
+        "perf/remote_download_state/settled_admission";
+    constexpr auto REMOTE_DOWNLOAD_LONG_TERM_BYTES_PER_SECOND =
+        "perf/remote_download_state/long_term_bytes_per_second";
+    constexpr auto REMOTE_DOWNLOAD_MAX_SATURATED_PARALLELISM =
+        "perf/remote_download_state/max_saturated_parallelism";
+    constexpr auto REMOTE_DOWNLOAD_SATURATED_BYTES_PER_SECOND_PER_WORKER =
+        "perf/remote_download_state/saturated_bytes_per_second_per_worker";
+
+}
+
+// -----------------------------------------------------------------------------
+// Viewer Cache Settings
+//
+// Each ViewerManager owns independent derived surface-tile caches. Raw decoded
+// volume chunks use the application-wide cache. These settings apply without a
+// restart.
+// -----------------------------------------------------------------------------
+namespace viewer_cache {
+    // Per-workspace budget for the flattened segmentation view's cache of
+    // resampled surface space. 0 selects the legacy direct-sampling path.
+    constexpr auto SURFACE_CACHE_GB = "viewer_cache/surface_cache_gb";
+    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
+
+    // Per-workspace budget for the overlay volume's surface-space cache. 0
+    // leaves the overlay channel on its legacy resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
 }
 
@@ -279,11 +317,25 @@ namespace window {
 
 namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
+    constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
+    constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
+    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";
+    // Cruise speed of the Left/Right arrow pan between control points, in line
+    // positions per second (1 unit ~ 30 voxels of arc length). Up/Down adjust it.
+    constexpr auto ARROW_PAN_SPEED = "lineAnnotation/arrow_pan_speed";
+    constexpr double ARROW_PAN_SPEED_DEFAULT = 12.0;
+    // "_v2" retires ratios saved before the fixed top strip / smaller bottom
+    // strip layout; old values would override the new default proportions.
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
+    // Shared cursor cross across the four generated panes. Independent of the
+    // app-global "Sync cursor across views" toggle.
+    constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
+    constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
@@ -449,6 +501,7 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";
     constexpr auto COMPOSITE_METHOD = "composite_method";
@@ -456,6 +509,7 @@ namespace volume_overlay {
     constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr auto SAMPLING_METHOD_DEFAULT = "nearest";
     constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
     constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
     constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;

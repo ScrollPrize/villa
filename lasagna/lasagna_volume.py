@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 
@@ -17,10 +21,10 @@ LASAGNA_VOLUME_VERSION = 2
 
 @dataclass
 class ChannelGroup:
-	"""One zarr array containing one or more channels at a common resolution."""
+	"""One channel array, or an older flat CZYX preprocessing/fit group."""
 	zarr_path: str          # relative to the .lasagna.json file
 	scaledown: int          # OME-Zarr pyramid level; actual factor = 2**scaledown
-	channels: list[str]     # ordered; index = position in CZYX zarr
+	channels: list[str]     # current: one 3D channel; older CZYX: channel order
 
 	@property
 	def sd_fac(self) -> int:
@@ -56,6 +60,8 @@ class LasagnaVolume:
 	umbilicus_json: str = ""
 	init_shell_dir: str = ""
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
+	provenance_json: str = ""
+	extra_fields: dict = field(default_factory=dict)
 
 	# --- queries ---
 
@@ -80,7 +86,7 @@ class LasagnaVolume:
 		return self.path.parent / g.zarr_path
 
 	def umbilicus_abs_path(self) -> Path:
-		"""Absolute path to the required umbilicus control-point JSON."""
+		"""Absolute path to the optional umbilicus control-point JSON."""
 		if not self.umbilicus_json:
 			raise ValueError(f"lasagna volume {self.path} missing required 'umbilicus_json'")
 		return self.path.parent / self.umbilicus_json
@@ -93,17 +99,35 @@ class LasagnaVolume:
 
 	# --- persistence ---
 
-	def save(self) -> None:
-		"""Write JSON to self.path."""
+	def _backup_path(self, backup_suffix: str | None) -> Path:
+		suffix = backup_suffix or datetime.now().strftime("%Y%m%d_%H%M%S")
+		stem = self.path.name
+		if stem.endswith(".lasagna.json"):
+			stem = stem[:-len(".lasagna.json")]
+		else:
+			stem = self.path.stem
+		candidate = self.path.with_name(f"{stem}_old.{suffix}.lasagna.json")
+		i = 1
+		while candidate.exists():
+			candidate = self.path.with_name(f"{stem}_old.{suffix}.{i}.lasagna.json")
+			i += 1
+		return candidate
+
+	def save(self, *, backup_existing: bool = False, backup_suffix: str | None = None) -> None:
+		"""Write JSON to self.path atomically."""
 		self.version = LASAGNA_VOLUME_VERSION
 		d: dict = {
 			"version": LASAGNA_VOLUME_VERSION,
 			"source_to_base": self.source_to_base,
 			"grad_mag_encode_scale": self.grad_mag_encode_scale,
 			"grad_mag_factor": self.grad_mag_factor,
-			"umbilicus_json": self.umbilicus_json,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
+		d.update(self.extra_fields)
+		if self.provenance_json:
+			d["provenance"] = self.provenance_json
+		if self.umbilicus_json:
+			d["umbilicus_json"] = self.umbilicus_json
 		if self.init_shell_dir:
 			d["init_shell_dir"] = self.init_shell_dir
 		if self.crops:
@@ -111,10 +135,41 @@ class LasagnaVolume:
 		if self.base_shape_zyx is not None:
 			d["base_shape_zyx"] = list(self.base_shape_zyx)
 		self.path.parent.mkdir(parents=True, exist_ok=True)
-		self.path.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+		payload = json.dumps(d, indent=2) + "\n"
+		tmp_path: Path | None = None
+		try:
+			for _ in range(100):
+				tmp_path = self.path.with_name(
+					f".{self.path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+				)
+				try:
+					fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+					break
+				except FileExistsError:
+					continue
+			else:
+				raise FileExistsError(f"could not create temporary manifest next to {self.path}")
+			with os.fdopen(fd, "w", encoding="utf-8") as f:
+				f.write(payload)
+				f.flush()
+				os.fsync(f.fileno())
+			if self.path.exists():
+				try:
+					shutil.copymode(self.path, tmp_path)
+				except OSError:
+					pass
+			if backup_existing and self.path.exists():
+				shutil.copy2(self.path, self._backup_path(backup_suffix))
+			tmp_path.replace(self.path)
+		finally:
+			if tmp_path is not None:
+				try:
+					tmp_path.unlink()
+				except FileNotFoundError:
+					pass
 
 	@staticmethod
-	def load(path: str | Path) -> LasagnaVolume:
+	def load(path: str | Path, *, require_umbilicus: bool = False) -> LasagnaVolume:
 		"""Load a .lasagna.json file. Raises on any problem."""
 		p = Path(path)
 		if not p.name.endswith(".lasagna.json"):
@@ -123,9 +178,15 @@ class LasagnaVolume:
 				"Lasagna volumes must be described by a .lasagna.json manifest."
 			)
 		d = json.loads(p.read_text(encoding="utf-8"))
+		known_fields = {
+			"version", "source_to_base", "grad_mag_encode_scale", "grad_mag_factor",
+			"groups", "umbilicus_json", "init_shell_dir", "crops", "base_shape_zyx",
+			"crop_xyzwhd", "provenance",
+		}
 		version = int(d.get("version", 1))
-		umbilicus_json = str(d.get("umbilicus_json", "")).strip()
-		if not umbilicus_json:
+		umbilicus_raw = d.get("umbilicus_json", "")
+		umbilicus_json = "" if umbilicus_raw is None else str(umbilicus_raw).strip()
+		if require_umbilicus and not umbilicus_json:
 			raise ValueError(f"lasagna volume {p} missing required 'umbilicus_json'")
 		init_shell_dir = str(d.get("init_shell_dir", "")).strip()
 		# Load crops list (new format) or migrate from single crop_xyzwhd (old)
@@ -163,6 +224,8 @@ class LasagnaVolume:
 			umbilicus_json=umbilicus_json,
 			init_shell_dir=init_shell_dir,
 			groups=groups,
+			provenance_json=str(d.get("provenance", "")).strip(),
+			extra_fields={key: value for key, value in d.items() if key not in known_fields},
 		)
 
 	def add_crop(self, crop: tuple[int, int, int, int, int, int]) -> None:

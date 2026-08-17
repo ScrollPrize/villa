@@ -41,6 +41,7 @@ struct MaxflowManifestBuildOptions {
     std::vector<MaxflowDouble3> sinksBase;
     int64_t marginBaseVoxels = 1000;
     uint8_t threshold = 110;
+    double workingToBaseScale = 1.0;
 };
 
 enum class MaxflowNodeKind : uint8_t {

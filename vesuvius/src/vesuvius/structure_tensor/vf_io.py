@@ -49,7 +49,7 @@ def load_eigenvector_field(
         storage_options={'anon': False} if eigen_zarr.startswith('s3://') else None
     )
     
-    if isinstance(root, zarr.hierarchy.Group):
+    if isinstance(root, zarr.Group):
         try:
             arr = root['eigenvectors']
         except KeyError:

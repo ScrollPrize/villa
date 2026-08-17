@@ -171,12 +171,12 @@ def _eigendecompose_2d_torch(
     # Eigenvectors
     v1x = torch.where(
         torch.abs(Jyx) > torch.abs(lam1 - Jxx),
-        -(lam1 - Jxx),
+        Jyx,
         -Jyx,
     )
     v1y = torch.where(
         torch.abs(Jyx) > torch.abs(lam1 - Jxx),
-        Jyx,
+        lam1 - Jxx,
         Jxx - lam1,
     )
     norm = torch.sqrt(v1x * v1x + v1y * v1y).clamp_min(1e-12)
@@ -215,12 +215,12 @@ def _eigendecompose_2d_numpy(
 
     v1x = np.where(
         np.abs(Jyx) > np.abs(lam1 - Jxx),
-        -(lam1 - Jxx),
+        Jyx,
         -Jyx,
     )
     v1y = np.where(
         np.abs(Jyx) > np.abs(lam1 - Jxx),
-        Jyx,
+        lam1 - Jxx,
         Jxx - lam1,
     )
     norm = np.sqrt(v1x * v1x + v1y * v1y) + 1e-12

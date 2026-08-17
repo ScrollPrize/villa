@@ -1,5 +1,150 @@
 # 2D TIFF layer UNet trainer
 
+## Installation
+
+Lasagna requires [`uv`](https://docs.astral.sh/uv/) and currently targets
+Python 3.14. The recommended installer creates an editable virtual environment,
+selects a driver-compatible official PyTorch build, and installs the fit
+service, downloader, and full 2D/3D preprocessing stack.
+
+```bash
+cd /path/to/villa/lasagna
+python3 scripts/bootstrap_venv.py --venv .venv
+source .venv/bin/activate
+```
+
+The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
+CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
+`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+
+```bash
+python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
+```
+
+Verify the selected PyTorch build and GPU access:
+
+```bash
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+```
+
+The install exposes these commands:
+
+```bash
+lasagna-fit-service --help
+lasagna-download --help
+lasagna-download-list --help
+lasagna-preprocess --help
+lasagna-preprocess integrate --help
+lasagna-preprocess predict3d --help
+las_manager --help
+```
+
+The bootstrap installs Lasagna with `-e`, so changes in this checkout are
+immediately visible in the environment without reinstalling. The distribution
+also exposes the sibling Vesuvius Fiber packages and canonical `lasagna.*`
+modules; direct and managed inference do not require `PYTHONPATH`.
+
+### Inference manager
+
+`las_manager` provides configuration, discovery, prefetch, and durable tmux
+execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
+in `cache_dir`, `output_dir`, `venv`, and one or more `snapshot_dirs`, then:
+
+```bash
+las_manager config init
+${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/las_manager/config.toml"
+las_manager fetch
+las_manager volume ls --sample PHerc0332
+las_manager snapshot ls
+las_manager volume prefetch <volume> 1 --workers 512
+las_manager inference run <snapshot> <volume> 1 -- --devices all
+las_manager inference ls
+```
+
+Fresh configs include shared inference defaults equivalent to
+`--tile-size 512 --border 32 --overlap 96 --devices all` in the `params` token
+array. Edit that array globally or append arguments after `--` for a single-run
+override.
+
+`inference run` returns as soon as its run directory and detached tmux session
+are created. The tmux workflow performs automatic prefetch first and inference
+second; use `las_manager run ls`, `las_manager tmux attach <run>`, or follow the
+printed run directory's `run.log`. Passing `--no-prefetch` writes only the
+source descriptor and lets the inference backend download missing chunks on
+demand for its crop; this download belongs to the inference lifecycle.
+
+Current Fiber checkpoints carry their authoritative inference config, so no
+separate config argument is needed. Direct inference uses the same rule:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
+  --input /path/to/volume.ome.zarr/1 \
+  --output /path/to/artifacts/fiber.lasagna.json \
+  --checkpoint /path/to/snapshots/best.pt
+```
+
+Pass a config JSON as the optional positional argument only for a legacy
+checkpoint without embedded config. Every run writes portable
+`inference.json` next to the output manifest, including the exact Villa Git
+commit in `inference.code_commit`.
+
+Direct Lasagna checkpoints are listed under `lasagna/...` selectors and use
+the same command shape:
+
+```bash
+las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices all
+```
+
+The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
+and managed Lasagna inference write portable provenance and remain compatible
+with the existing Atlas `lasagna` artifact type.
+
+Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
+same as `las_manager snapshot ls`. Install path-aware Bash completion once with
+`las_manager completion install`; it follows whichever registered venv's
+`las_manager` is currently selected by `PATH`. Configuration, cache semantics,
+and selector details are documented in [`docs/manager.md`](docs/manager.md).
+Cached volumes, snapshots, runs, option values, and locally known OME scale
+indices are completed contextually. A final `help` token shows help for the
+longest recognized command prefix, for example `las_manager vol pre help`.
+
+This installation currently expects the `villa` monorepo layout: Lasagna
+packages the sibling `vesuvius/src` implementation and installs its declared
+model dependencies. It deliberately does not build Volume Cartographer, which
+is not needed for preprocessing. Copying only the `lasagna/` directory is
+therefore not yet a supported standalone installation.
+
+### Batch-download the PHerc scale-0 volumes
+
+Pass a one-S3-URI-per-line list from the directory that should contain the
+scroll directories:
+
+```bash
+cd /path/to/scrolls
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt
+```
+
+This processes one volume at a time and uses 512 parallel chunk-transfer
+workers inside each volume. The resulting layout is:
+
+```text
+scrolls/
+  PHerc0125/
+    info.json
+    volumes/
+      20250821151825-9.362um-1.2m-113keV-masked.zarr/
+```
+
+Use `--dry-run` to inspect a run without writing anything:
+
+```bash
+lasagna-download-list /path/to/other-volumes.txt
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt --dry-run
+```
+
+CuPy remains an optional acceleration path and is not required for the
+preprocessing commands above.
+
 ## Design decisions
 
 - Minimal dependencies: PyTorch, tifffile, TensorBoard, single in-repo U-Net implementation.
@@ -112,6 +257,80 @@ Notes:
 
 Runs tiled UNet inference on an OME-Zarr volume and writes an 8-bit OME-Zarr with
 cos, gradient-magnitude, direction, and validity channels.
+
+The `predict3d` subcommand is the Lasagna cos/normal wrapper around the shared
+3D tiled inference code in `tiled_predict3d.py`. It keeps the existing CLI,
+manifest, fixed-depth circular Z accumulation, chunk-resume, and OME-Zarr pyramid
+behavior; product-specific Lasagna logic remains in
+`preprocess_cos_omezarr.py`.
+
+Whole-volume predict3d can use every visible CUDA device through the shared
+runner:
+
+```bash
+lasagna-preprocess predict3d ... --devices all
+```
+
+New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
+Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
+Existing arrays keep their compressor when inference resumes; a mismatch is
+reported. Use `--ome-compressor none` only when uncompressed compatibility
+output is required.
+
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
+TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+is generated lazily and read-ahead is bounded independently from reusable GPU
+shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
+buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
+tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
+decode/copy threads, configurable with `--input-cache-gib`,
+`--input-io-threads`, and `--input-copy-threads`. Use
+`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
+only its reader threads. Existing `--device` selects single-device inference,
+which also maintains bounded TensorStore read-ahead during GPU forwards.
+
+Add `--profile-pipeline` to a multi-device run for bounded loader/worker
+diagnostics. It reports backend read service, active wall span, throughput and
+effective outstanding-request concurrency, completion polling and ready-queue delay, shared-memory copy, CPU
+conversion, compact integer H2D, CUDA conversion, adapter preprocessing, model inference, output/D2H, result
+receipt, and commit time. Stage sums overlap across tiles/workers and are not
+elapsed wall time. CUDA events add diagnostic overhead, so disable the flag for
+final throughput measurements.
+
+CUDA inference transfers source `uint8`/`uint16` tiles without CPU float
+expansion and performs the historical normalization on-device in FP32. The CPU
+fallback retains the NumPy conversion path. Model-specific AMP remains owned by
+the model adapter; shared weighting, pyramid filtering, D2H results, and
+accumulation remain FP32.
+
+The same shared runner overlaps output flushing with subsequent inference using
+one enlarged circular mmap ring and persistent spawned writer processes. Each
+worker reopens the frozen mmap read-only and handles one output chunk, so no
+band-sized RAM snapshot crosses process boundaries and each worker has an
+independent Python GIL. `--flush-workers` defaults to the available CPU count
+capped at 64; use
+`--flush-workers 0` for the synchronous, immediate-release A/B baseline. Only
+one flush batch may be outstanding, so the next frontier waits if writers fall
+behind. The final `flush stats workers=... chunks=... work_sum=... wait=...`
+line reports that backpressure.
+
+Raw product rings default to float16, intentionally permitting small rounding
+differences while halving product-ring backing. The shared geometric weight
+ring and flush normalization remain float32; pass
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+
+On multi-device runs, chunk accumulation is itself process-parallel. Persistent
+workers add directly from retained result shared-memory slots into the rolling
+mmap, with deterministic per-chunk ownership and FIFO update order.
+`--accumulator-workers` defaults to the CPU count capped at 32; zero restores
+the synchronous A/B baseline. The native `accumulator_add` module runtime-
+dispatches an AVX-512F+F16C row kernel where available and uses a portable
+fallback elsewhere; the package is never globally compiled for AVX-512.
+
+Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
+from inference prefetch with, for example, `--download-workers 256`. Interrupted
+or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
+with a warning and rewritten atomically rather than aborting inference.
 
 ### Multi-axis processing
 

@@ -674,66 +674,73 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="2">
-           <widget class="QCheckBox" name="chkCompressRemoteCache">
+          <item row="4" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMaximum">
             <property name="text">
-             <string>Compress remote volume disk cache</string>
+             <string>Remote Zarr cache maximum (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMaximumGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="specialValueText"><string>Unlimited</string></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Maximum managed data bytes shared by all remote volume and Lasagna Zarr caches in this cache directory. Metadata is excluded. 0 means unlimited. Applied immediately.</string></property>
+           </widget>
+          </item>
+          <item row="5" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMinimumFree">
+            <property name="text">
+             <string>Minimum free disk space (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMinimumFreeGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Prevent cache growth when writing would cross this free-space reserve. 0 disables the reserve warning. Applied immediately.</string></property>
+           </widget>
+          </item>
+          <item row="6" column="0">
+           <widget class="QLabel" name="lblIOThreads">
+            <property name="text">
+             <string>Download parallelism</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks downloaded from remote volumes are stored compressed in the disk cache using the selected accuracy below. Existing cache entries stay readable either way. Requires restart.</string>
+             <string>Automatically tune simultaneous remote downloads, or use the fixed number.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="1">
+           <widget class="QCheckBox" name="chkAutoDownloadParallelism">
+            <property name="text">
+             <string>Automatic</string>
+            </property>
+            <property name="toolTip">
+             <string>Adapt download parallelism to measured bandwidth and chunk transfer behavior. Applied immediately.</string>
             </property>
             <property name="checked">
              <bool>true</bool>
             </property>
            </widget>
           </item>
-          <item row="2" column="2">
-           <widget class="QPushButton" name="btnCompressExistingCache">
-            <property name="text">
-             <string>Compress existing cache...</string>
-            </property>
-            <property name="toolTip">
-             <string>Compress the already-downloaded chunks in the disk cache of the currently shown volume using the compression accuracy selected below. Runs with multiple workers and can be cancelled.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="3" column="0">
-           <widget class="QLabel" name="labelCacheQuantization">
-            <property name="text">
-             <string>Cache compression accuracy</string>
-            </property>
-           </widget>
-          </item>
-          <item row="3" column="1">
-           <widget class="QComboBox" name="cmbCacheQuantization">
-            <property name="toolTip">
-             <string>Accuracy of compressed disk-cache chunks. Lossless preserves exact voxel values. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels) and shrink the cache further. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="6" column="0">
-           <widget class="QLabel" name="lblIOThreads">
-            <property name="text">
-             <string>Download threads</string>
-            </property>
-            <property name="toolTip">
-             <string>Number of background threads for downloading remote chunks. More threads = faster downloads but more network/CPU usage. Requires restart.</string>
-            </property>
-           </widget>
-          </item>
-          <item row="6" column="1">
+          <item row="6" column="2">
            <widget class="QSpinBox" name="spinIOThreads">
             <property name="minimum">
              <number>1</number>
             </property>
             <property name="maximum">
-             <number>100</number>
+             <number>64</number>
             </property>
             <property name="value">
-             <number>8</number>
+             <number>16</number>
             </property>
             <property name="toolTip">
-             <string>Number of background threads for downloading remote chunks (1-100). Requires restart.</string>
+             <string>Fixed number of simultaneous remote downloads when Automatic is disabled. Applied immediately.</string>
             </property>
            </widget>
           </item>
@@ -760,6 +767,64 @@
             </property>
             <property name="toolTip">
              <string>Number of rotating snapshots kept per segment (0 disables). Throttled to at most one snapshot per segment every 2 minutes.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="0">
+           <widget class="QLabel" name="labelViewerSurfaceCache">
+            <property name="text">
+             <string>Viewer surface cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>Per-workspace RAM budget for the flattened segmentation view's cache of resampled surface space. Main and Spiral have independent caches. 0 disables tiled caching and falls back to sampling the volume every frame.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="1">
+           <widget class="QSpinBox" name="spinViewerSurfaceCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>4</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>Per-workspace RAM budget for the flattened segmentation view's surface tiles. 0 disables tiled caching. Applies without restart.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="0">
+           <widget class="QLabel" name="labelViewerOverlaySurfaceCache">
+            <property name="text">
+             <string>Viewer overlay surface cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>Per-workspace budget for the overlay volume's surface cache in the flattened segmentation view. 0 disables it and leaves the overlay on its existing resident-only sampling path.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="1">
+           <widget class="QSpinBox" name="spinViewerOverlaySurfaceCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>2</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>Per-workspace budget for overlay surface tiles in the flattened segmentation view. 0 disables it. Applies without restart.</string>
             </property>
            </widget>
           </item>

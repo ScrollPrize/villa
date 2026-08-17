@@ -30,6 +30,8 @@ class ExportConfig:
 	voxel_size_um: float | None = None
 	target_volume_shape_zyx: tuple[int, int, int] | None = None
 	flow_gate_channels: str = "auto"
+	omit_model: bool = False
+	flatten_map_output: str | None = None
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -52,6 +54,10 @@ def _build_parser() -> argparse.ArgumentParser:
 		help="Export all windings into a single tifxyz")
 	g.add_argument("--copy-model", action="store_true", default=False,
 		help="Deprecated no-op; model checkpoints are always copied")
+	g.add_argument("--omit-model", action="store_true", default=False,
+		help="Do not copy the model checkpoint into exported tifxyz directories")
+	g.add_argument("--flatten-map-output", default=None,
+		help="For flatten checkpoints, write the output-to-source map as a .npy sidecar")
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
 	g.add_argument("--voxel-size-um", type=float, default=None,
 		help="Voxel size in micrometers (for area calculation)")
@@ -1001,6 +1007,10 @@ def _export_flatten_checkpoint(
 	map_yx = _as_numpy_float32(st["flatten_map_flat"], name="flatten_map_flat")
 	if map_yx.ndim != 3 or map_yx.shape[-1] != 2:
 		raise ValueError("flatten_map_flat must have shape (H, W, 2)")
+	if cfg.flatten_map_output:
+		map_output = Path(cfg.flatten_map_output)
+		map_output.parent.mkdir(parents=True, exist_ok=True)
+		np.save(str(map_output), map_yx, allow_pickle=False)
 
 	mesh = st.get("mesh_flat")
 	if mesh is None:
@@ -1030,10 +1040,16 @@ def _export_flatten_checkpoint(
 		y = np.where(mask_np, y, -1.0).astype(np.float32, copy=False)
 		z = np.where(mask_np, z, -1.0).astype(np.float32, copy=False)
 
-	mesh_step = 100
+	xy_step_fullres = 100.0
 	if model_params is not None:
-		mesh_step = int(model_params.get("mesh_step", 100))
-	xy_step_fullres = float(mesh_step)
+		xy_step_fullres = float(
+			model_params.get(
+				"flatten_output_step",
+				model_params.get("mesh_step", 100),
+			)
+		)
+	if not math.isfinite(xy_step_fullres) or xy_step_fullres <= 0.0:
+		raise ValueError("flatten output step must be finite and positive")
 	xy_step_export = xy_step_fullres * float(export_factor)
 	meta_scale = 1.0 / xy_step_export
 
@@ -1062,7 +1078,7 @@ def _export_flatten_checkpoint(
 		z=z,
 		d=d,
 		scale=meta_scale,
-		model_source=Path(cfg.input),
+		model_source=None if cfg.omit_model else Path(cfg.input),
 		copy_model=cfg.copy_model,
 		fit_config=fit_config,
 		job_spec=job_spec,
@@ -1100,6 +1116,11 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			else tuple(int(v) for v in args.target_volume_shape_zyx)
 		),
 		flow_gate_channels=str(args.flow_gate_channels),
+		omit_model=bool(args.omit_model),
+		flatten_map_output=(
+			None if args.flatten_map_output in (None, "")
+			else str(args.flatten_map_output)
+		),
 	)
 
 	dev = torch.device(cfg.device)
@@ -1265,7 +1286,8 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			single_segment_border=BORDER_W,
 		)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
-					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
+					  model_source=None if cfg.omit_model else Path(cfg.input),
+					  copy_model=cfg.copy_model, fit_config=fit_config,
 					  job_spec=job_spec,
 					  object_refs=object_refs,
 					  area=area, components=components if D > 1 else None,
@@ -1337,7 +1359,8 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				layer_index=d,
 			)
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
-						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
+						  model_source=None if cfg.omit_model else Path(cfg.input),
+						  copy_model=cfg.copy_model, fit_config=fit_config,
 						  job_spec=job_spec,
 						  object_refs=object_refs,
 						  area=area,

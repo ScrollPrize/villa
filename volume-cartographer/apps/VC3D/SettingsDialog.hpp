@@ -15,8 +15,8 @@ class VolumePkg;
 class Volume;
 
 
-// Chunk geometry of the currently shown volume, needed to apply the
-// delta-zyx compression filter when compacting its disk cache.
+// Chunk geometry of the currently shown volume, used to map legacy cache
+// entries back to logical chunks for redownload.
 // levelChunkShapes is indexed by pyramid level ({0,0,0} = unknown).
 struct CacheChunkLayout {
     std::vector<std::array<int, 3>> levelChunkShapes;
@@ -43,15 +43,14 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
     private:
         void setupOutputSegmentsControl();
         void setupCacheActionControls();
-        void compressExistingCache();
         void redownloadExistingCache();
 
         std::shared_ptr<VolumePkg> _volumePackage;
         std::shared_ptr<Volume> _currentVolume;
         std::filesystem::path _currentVolumeCacheDir;
+        std::filesystem::path _activeRemoteCacheRoot;
         CacheChunkLayout _currentVolumeChunkLayout;
         QComboBox* _outputSegmentsCombo{nullptr};
         QPushButton* _redownloadCacheButton{nullptr};
-        QSpinBox* _cacheActionWorkersSpin{nullptr};
         bool _outputSegmentsChanged{false};
 };

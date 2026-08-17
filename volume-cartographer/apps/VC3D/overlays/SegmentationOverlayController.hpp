@@ -274,10 +274,10 @@ private:
     // Surface overlap overlay cache
     struct OverlapCache {
         QImage image;                                       // ARGB32 overlap image (grid-sized)
-        std::map<std::string, cv::Vec3b> overlays;          // Overlay config when image was built
+        std::uint64_t overlaysRevision{0};                  // Selected overlay-set revision
+        std::uint64_t indexGeneration{0};                   // Index-wide mutation revision
         float threshold{0.0f};                              // Threshold when image was built
         QuadSurface* surface{nullptr};                      // Current surface when image was built
-        std::size_t generationHash{0};                      // Surface/index generations when image was built
         int sampleStride{1};                                // Raw grid stride represented by one image pixel
     };
     mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;

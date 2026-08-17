@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Representation"
 sidebar_label: "Representation"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -37,11 +36,16 @@ hide_table_of_contents: true
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={3} />
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
+
 
 The micro-CT scan converts the scroll into a volumetric grid of density measurements, providing a mathematical description with integer coordinates and average material densities in small adjacent cubes known as voxels.
 
@@ -111,7 +115,7 @@ For this tutorial, we'll be using a library/framework known as [nnUNetv2](https:
 
 nnUNet is a well regarded and highly performant machine learning library with a focus on volumetric data within the medical domain, which has many parallels to our imaging modalities (namely xray tomography), and provides us with a fantastic baseline and starting point for experimentation.
 
-This is a simplified guide, it is highly recommended to visit [the repository](https://github.com/MIC-DKFZ/nnUNet)and read further after following this!
+This is a simplified guide, it is highly recommended to visit [the repository](https://github.com/MIC-DKFZ/nnUNet) and read further after following this!
 
 ### Installing nnUNet and its Dependencies
 **Requirements**
@@ -142,7 +146,7 @@ Install PyTorch
 ```bash
 pip install torch torchvision
 ```
-Install nnUNetv2. if you wish to extend nnUNet, you can install in editable mode by following [these instructions](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/installation_instructions.md#installation-instructions)
+Install nnUNetv2. If you wish to extend nnUNet, you can install in editable mode by following [these instructions](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/installation_instructions.md#installation-instructions)
 ```bash
 pip install nnunetv2
 ```

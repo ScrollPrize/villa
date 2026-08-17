@@ -374,6 +374,19 @@ TEST_CASE("Laplace snap ranking accepts max parallel jobs option")
     CHECK(response["options"]["max_parallel_jobs"] == 1);
 }
 
+TEST_CASE("Laplace snap ranking validates the caller coordinate scale")
+{
+    nlohmann::json request = {
+        {"manifest", "missing.lasagna.json"},
+        {"working_to_base_scale", 8.0},
+        {"jobs", nlohmann::json::array()},
+    };
+    CHECK_NOTHROW(vc::lasagna::rankSnapPairsJson(request));
+    request["working_to_base_scale"] = 0.0;
+    CHECK_THROWS_AS(
+        vc::lasagna::rankSnapPairsJson(request), std::invalid_argument);
+}
+
 TEST_CASE("Laplace snap ranking selects one synchronized lambda per pair-set")
 {
     std::vector<double> probes;
