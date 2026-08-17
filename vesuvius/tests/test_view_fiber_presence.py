@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -100,7 +101,6 @@ def _fnv1a64(data: bytes) -> str:
 def _straight_strip_files(stem, header, length, *, origin=0.0):
     cross_samples = 21
     longitudinal_samples = 2
-    render_scale = 4
     lines = [
         header,
         f"mtllib {stem}.mtl",
@@ -113,8 +113,8 @@ def _straight_strip_files(stem, header, length, *, origin=0.0):
             vertex_x = float(np.float32(origin + column * length))
             vertex_z = float(np.float32(origin))
             lines.append(f"v {vertex_x} {y} {vertex_z}")
-    texture_rows = cross_samples * render_scale
-    texture_columns = longitudinal_samples * render_scale
+    texture_rows = 6
+    texture_columns = max(2, math.ceil(length * 0.25) + 1)
     texture_values = (
         np.arange(texture_rows * texture_columns, dtype=np.uint16)
         .reshape(texture_rows, texture_columns)
@@ -302,7 +302,7 @@ def _write_visual_replay(tmp_path, *, with_strips=False):
                 "semantic": "ct_intensity",
                 "encoding": "obj_uv_grayscale_tiff_u8",
                 "renderer": "vc_line_probe_fine_to_coarse",
-                "render_scale": 4,
+                "sampling_grid": "source_group_voxel_pitch",
                 "atlas_padding_pixels": 1,
                 "texture_format": "tiff_gray_u8_uncompressed",
                 "source_locator": "/data/ct.zarr/2",
@@ -438,14 +438,15 @@ def test_loads_three_strict_disconnected_replay_strip_meshes(tmp_path):
     assert strips.reference.component_count == 1
     assert strips.greedy.component_count == 1
     assert strips.fiberlet.component_count == 1
-    assert strips.reference.vertices_zyx.shape == (21 * 2, 3)
-    assert strips.reference.triangles.shape == (20 * 1 * 2, 3)
-    assert strips.reference.normalized_ct_intensity.shape == (21 * 2,)
+    assert strips.reference.vertices_zyx.shape == (6 * 3, 3)
+    assert strips.reference.triangles.shape == (5 * 2 * 2, 3)
+    assert strips.reference.normalized_ct_intensity.shape == (6 * 3,)
     assert replay_strip_contrast_limits(strips)[0] > 0.0
     np.testing.assert_allclose(
-        strips.reference.vertices_zyx[10 * 2 : 11 * 2],
-        np.asarray([[0, 0, 0], [0, 0, 8]]),
+        np.unique(strips.reference.vertices_zyx[:, 2]), [0, 4, 8]
     )
+    assert strips.reference.vertices_zyx[:, 1].min() == -10
+    assert strips.reference.vertices_zyx[:, 1].max() == 10
 
 
 def test_replay_strip_artifacts_must_be_all_present_or_all_absent(tmp_path):
@@ -499,7 +500,7 @@ def test_replay_strip_parser_accepts_float_mesh_precision_at_large_coordinates(
         (source,),
         {
             "cross_samples": 21,
-            "values": {"render_scale": 4},
+            "values": {"sampling_grid": "source_group_voxel_pitch"},
         },
     )
 
@@ -519,7 +520,7 @@ def test_replay_strip_parser_accepts_a_strict_empty_textured_layer(tmp_path):
         (),
         {
             "cross_samples": 21,
-            "values": {"render_scale": 4},
+            "values": {"sampling_grid": "source_group_voxel_pitch"},
         },
     )
 
@@ -546,7 +547,7 @@ def test_replay_strip_parser_rejects_invalid_material(tmp_path):
             (np.column_stack((np.arange(9), np.zeros(9), np.zeros(9))),),
             {
                 "cross_samples": 21,
-                "values": {"render_scale": 4},
+                "values": {"sampling_grid": "source_group_voxel_pitch"},
             },
         )
 
@@ -572,7 +573,7 @@ def test_replay_strip_parser_rejects_invalid_texture_coordinates(tmp_path, uv):
             (np.column_stack((np.arange(9), np.zeros(9), np.zeros(9))),),
             {
                 "cross_samples": 21,
-                "values": {"render_scale": 4},
+                "values": {"sampling_grid": "source_group_voxel_pitch"},
             },
         )
 

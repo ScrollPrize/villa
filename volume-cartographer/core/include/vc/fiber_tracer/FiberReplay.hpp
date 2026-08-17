@@ -45,7 +45,6 @@ struct FiberReplayStripComponent {
 
 struct FiberReplayStripTextureSource {
     std::string locator;
-    int renderScale = 1;
     std::array<int, 3> shapeZYX{};
     std::array<double, 3> scaleFromBaseXYZ{};
     std::array<double, 3> offsetFromBaseXYZ{};
@@ -84,13 +83,11 @@ enum class FiberReplayTracer {
 void renderFiberReplayStripTextures(
     FiberReplayStripMeshes& meshes,
     ::Volume& volume,
-    const std::string& sourceLocator,
-    int renderScale);
+    const std::string& sourceLocator);
 
 [[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     ::Volume& volume,
-    const std::string& sourceLocator,
-    int renderScale);
+    const std::string& sourceLocator);
 
 struct FiberReplayVisualizationInput {
     FiberReplayTracer tracer = FiberReplayTracer::Greedy;

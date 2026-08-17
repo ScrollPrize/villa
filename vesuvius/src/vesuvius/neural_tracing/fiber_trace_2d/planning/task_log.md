@@ -31,7 +31,8 @@
   existing failure behavior; do not retain replay-specific strip geometry.
 - Resolve the selected group against its parent OME `multiscales` metadata,
   transform only the sampling coordinates, and persist that mapping.
-- Expose the line probe's `--strip-render-scale` option and default four.
+- Derive replay texture resolution from the selected Zarr group's voxel pitch;
+  replay does not expose the line probe's fixed supersampling control.
 - Extract existing `TexturedMesh`, OBJ/MTL, and TIFF conventions too. The only
   new packaging is an affine atlas transform of existing component UVs.
 - Delete every alternate symbol/state/test rather than leaving compatibility
@@ -55,10 +56,25 @@
   18 fiberlet atlases were the expected empty 1x1 textures because that replay
   had no local fiberlet surface components.
 - Every Paris4 sampler report used the explicitly opened `/2` group, render
-  scale 4, complete coverage, and zero error chunks.
+  scale 1, complete coverage, and zero error chunks.
 - Normalized concrete OME-Zarr group directory identity for metadata matching;
   the replay renderer regression now passes the same group with a trailing `/`.
 
 ## Deviations
 
 - None.
+
+## Native-resolution correction
+
+- The first implementation rendered every default 21-by-N surface at a fixed
+  fourfold matrix scale, even after its coordinates were mapped into a coarser
+  selected Zarr group. Napari then retained only values corresponding to the
+  original OBJ vertices, discarding almost all stored texels.
+- Each component now derives endpoint-inclusive width and height from maximum
+  surface arc in selected-group voxel coordinates and calls the unchanged
+  renderer at scale one. The napari adapter validates the standard OBJ/UV/TIFF
+  atlas and tessellates it in memory to one surface vertex per stored texel.
+- Focused validation passed: 7 C++ replay tests and 67 Python viewer tests. A
+  512-base-voxel Paris4 run with `/2/`, `--fail 1`, and `--along 64` generated
+  18 visualizations. Strict reload accepted all 18; all 36 nonempty CT textures
+  contained signal and the 18 empty fiberlet textures remained valid.

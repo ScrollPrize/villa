@@ -11,3 +11,11 @@
 - [x] Run focused C++ and Python validation
 - [x] Regenerate Paris4 output from explicit level 2
 - [x] Update specifications, documentation, and task log
+
+# Status: native-resolution replay strip textures
+
+- [x] Measure trace-grid spacing against the selected Zarr group
+- [x] Render at automatic source-group voxel pitch
+- [x] Display every stored strip texel in napari
+- [x] Run focused C++ and Python validation
+- [x] Update specifications and usage documentation

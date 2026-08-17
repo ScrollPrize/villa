@@ -543,3 +543,7 @@
 - Removed the unpublished replay-only ribbon, mask, uint16, and PNG paths.
 - Accepted equivalent concrete-group paths with or without a trailing directory
   separator when resolving OME-Zarr multiscales metadata.
+- Replaced fixed replay strip supersampling with automatic endpoint-inclusive
+  source-group voxel resolution. Napari now tessellates the validated textured
+  OBJ to every stored TIFF texel instead of displaying only coarse OBJ-vertex
+  samples.

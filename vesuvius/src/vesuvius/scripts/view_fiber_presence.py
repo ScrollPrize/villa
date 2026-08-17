@@ -854,6 +854,36 @@ def _read_segmented_replay_obj(path: Path, header: str) -> tuple[np.ndarray, ...
     return tuple(result)
 
 
+def _resize_coordinate_grid_linear(
+    grid: np.ndarray, rows: int, columns: int
+) -> np.ndarray:
+    """Bilinearly resample a 3D coordinate grid while retaining its boundary."""
+    source = np.asarray(grid, dtype=np.float64)
+    if source.ndim != 3 or source.shape[2] != 3 or rows < 2 or columns < 2:
+        raise ValueError("strip coordinate resize arguments are invalid")
+
+    def axis_indices(source_size: int, target_size: int):
+        coordinates = np.linspace(0.0, source_size - 1.0, target_size)
+        lower = np.floor(coordinates).astype(np.int64)
+        upper = np.minimum(lower + 1, source_size - 1)
+        fraction = coordinates - lower
+        return lower, upper, fraction
+
+    row_low, row_high, row_fraction = axis_indices(source.shape[0], rows)
+    column_low, column_high, column_fraction = axis_indices(
+        source.shape[1], columns
+    )
+    top_left = source[row_low[:, None], column_low[None, :]]
+    top_right = source[row_low[:, None], column_high[None, :]]
+    bottom_left = source[row_high[:, None], column_low[None, :]]
+    bottom_right = source[row_high[:, None], column_high[None, :]]
+    column_weight = column_fraction[None, :, None]
+    row_weight = row_fraction[:, None, None]
+    top = top_left + (top_right - top_left) * column_weight
+    bottom = bottom_left + (bottom_right - bottom_left) * column_weight
+    return top + (bottom - top) * row_weight
+
+
 def _read_replay_strip_obj(
     artifacts: tuple[Path, Path, Path],
     header: str,
@@ -909,7 +939,6 @@ def _read_replay_strip_obj(
         raise ValueError(f"cannot read replay strip texture {texture_path}: {exc}") from exc
 
     expected_cross = int(metadata["cross_samples"])
-    render_scale = int(metadata["values"]["render_scale"])
     expected_sources = [
         (index, np.asarray(segment, dtype=np.float64))
         for index, segment in enumerate(source_segments_xyz)
@@ -935,7 +964,6 @@ def _read_replay_strip_obj(
 
     vertices: list[list[float]] = []
     texture_coordinates: list[list[float]] = []
-    triangles: list[list[int]] = []
     faces: list[tuple[list[int], list[int], int]] = []
     section = "vertices"
     for line_number, raw in enumerate(
@@ -993,16 +1021,21 @@ def _read_replay_strip_obj(
 
     vertex_array = np.asarray(vertices, dtype=np.float64).reshape((-1, 3))
     texture_array = np.asarray(texture_coordinates, dtype=np.float64).reshape((-1, 2))
-    expected_texture_height = expected_cross * render_scale + 2 if expected_sources else 1
-    expected_texture_width = (
-        sum(len(points) * render_scale + 2 for _, points in expected_sources)
-        if expected_sources
-        else 1
-    )
-    if texture.shape != (expected_texture_height, expected_texture_width):
-        raise ValueError(f"{texture_path}: replay strip atlas dimensions are invalid")
+    if not expected_sources:
+        if texture.shape != (1, 1):
+            raise ValueError(f"{texture_path}: empty replay strip texture is invalid")
+        return SurfaceObjGeometry(
+            vertices_zyx=np.empty((0, 3), dtype=np.float64),
+            triangles=np.empty((0, 3), dtype=np.int64),
+            normalized_ct_intensity=np.empty(0, dtype=np.float32),
+            component_count=0,
+        )
+
+    dense_vertices: list[np.ndarray] = []
+    dense_triangles: list[np.ndarray] = []
     intensities: list[float] = []
     atlas_column = 0
+    maximum_texture_rows = 0
     vertex_offset = 0
     face_offset = 0
     for _, source in expected_sources:
@@ -1019,14 +1052,31 @@ def _read_replay_strip_obj(
         ].reshape(
             (expected_cross, longitudinal, 2)
         )
-        texture_columns = longitudinal * render_scale
-        texture_rows = expected_cross * render_scale
+        u_min = float(np.min(uv_grid[:, :, 0]))
+        u_max = float(np.max(uv_grid[:, :, 0]))
+        v_min = float(np.min(uv_grid[:, :, 1]))
+        v_max = float(np.max(uv_grid[:, :, 1]))
+        texture_left = round(u_min * texture.shape[1] - 0.5)
+        texture_right = round(u_max * texture.shape[1] - 0.5)
+        texture_top = round((1.0 - v_max) * texture.shape[0] - 0.5)
+        texture_bottom = round((1.0 - v_min) * texture.shape[0] - 0.5)
+        texture_columns = texture_right - texture_left + 1
+        texture_rows = texture_bottom - texture_top + 1
+        if (
+            texture_left != atlas_column + 1
+            or texture_top != 1
+            or texture_columns < 2
+            or texture_rows < 2
+            or texture_right + 1 >= texture.shape[1]
+            or texture_bottom + 1 >= texture.shape[0]
+        ):
+            raise ValueError(f"{texture_path}: replay strip atlas tile is invalid")
         local_u = np.linspace(0.0, 1.0, longitudinal)
         local_v = np.linspace(1.0, 0.0, expected_cross)
-        left = (atlas_column + 1.5) / expected_texture_width
-        right = (atlas_column + 0.5 + texture_columns) / expected_texture_width
-        bottom = 1.0 - (texture_rows + 0.5) / expected_texture_height
-        top = 1.0 - 1.5 / expected_texture_height
+        left = (texture_left + 0.5) / texture.shape[1]
+        right = (texture_right + 0.5) / texture.shape[1]
+        bottom = 1.0 - (texture_bottom + 0.5) / texture.shape[0]
+        top = 1.0 - (texture_top + 0.5) / texture.shape[0]
         expected_u = left + local_u * (right - left)
         expected_v = bottom + local_v * (top - bottom)
         if not np.allclose(
@@ -1051,18 +1101,13 @@ def _read_replay_strip_obj(
                 raise ValueError(
                     f"{path}:{line_number}: strip face crosses or scrambles components"
                 )
-            zero = [item - 1 for item in face]
-            triangles.extend(
-                ([zero[0], zero[1], zero[2]], [zero[0], zero[2], zero[3]])
-            )
-
         tile = texture[
-            1 : texture_rows + 1,
-            atlas_column + 1 : atlas_column + texture_columns + 1,
+            texture_top : texture_bottom + 1,
+            texture_left : texture_right + 1,
         ]
         padded = texture[
-            : texture_rows + 2,
-            atlas_column : atlas_column + texture_columns + 2,
+            texture_top - 1 : texture_bottom + 2,
+            texture_left - 1 : texture_right + 2,
         ]
         if (
             not np.array_equal(padded[0, 1:-1], tile[0])
@@ -1075,24 +1120,34 @@ def _read_replay_strip_obj(
             or padded[-1, -1] != tile[-1, -1]
         ):
             raise ValueError(f"{texture_path}: replay strip atlas padding is invalid")
-        sample_rows = np.rint(
-            np.linspace(0, texture_rows - 1, expected_cross)
-        ).astype(np.int64)
-        sample_columns = np.rint(
-            np.linspace(0, texture_columns - 1, longitudinal)
-        ).astype(np.int64)
-        intensities.extend(
-            (tile[np.ix_(sample_rows, sample_columns)].astype(np.float32) / 255.0)
-            .reshape(-1)
-            .tolist()
+        dense_grid = _resize_coordinate_grid_linear(
+            grid, texture_rows, texture_columns
         )
+        dense_offset = sum(len(value) for value in dense_vertices)
+        dense_vertices.append(dense_grid.reshape((-1, 3)))
+        component_triangles = []
+        for row in range(texture_rows - 1):
+            for column in range(texture_columns - 1):
+                zero = dense_offset + row * texture_columns + column
+                one = zero + 1
+                below = zero + texture_columns
+                below_one = below + 1
+                component_triangles.extend(
+                    ([zero, one, below_one], [zero, below_one, below])
+                )
+        dense_triangles.append(np.asarray(component_triangles, dtype=np.int64))
+        intensities.extend((tile.astype(np.float32) / 255.0).reshape(-1).tolist())
         atlas_column += texture_columns + 2
+        maximum_texture_rows = max(maximum_texture_rows, texture_rows)
         vertex_offset += component_vertices
         face_offset += component_faces
 
+    if atlas_column != texture.shape[1] or texture.shape[0] != maximum_texture_rows + 2:
+        raise ValueError(f"{texture_path}: replay strip atlas dimensions are invalid")
+
     return SurfaceObjGeometry(
-        vertices_zyx=vertex_array[:, ::-1].copy(),
-        triangles=np.asarray(triangles, dtype=np.int64).reshape((-1, 3)),
+        vertices_zyx=np.concatenate(dense_vertices, axis=0)[:, ::-1].copy(),
+        triangles=np.concatenate(dense_triangles, axis=0).reshape((-1, 3)),
         normalized_ct_intensity=np.asarray(intensities, dtype=np.float32),
         component_count=len(expected_sources),
     )
@@ -1496,7 +1551,7 @@ def load_fiber_replay_bundle(
             "semantic",
             "encoding",
             "renderer",
-            "render_scale",
+            "sampling_grid",
             "atlas_padding_pixels",
             "texture_format",
             "source_locator",
@@ -1522,9 +1577,7 @@ def load_fiber_replay_bundle(
             or values.get("semantic") != "ct_intensity"
             or values.get("encoding") != "obj_uv_grayscale_tiff_u8"
             or values.get("renderer") != "vc_line_probe_fine_to_coarse"
-            or not isinstance(values.get("render_scale"), int)
-            or isinstance(values.get("render_scale"), bool)
-            or values["render_scale"] < 1
+            or values.get("sampling_grid") != "source_group_voxel_pitch"
             or values.get("atlas_padding_pixels") != 1
             or values.get("texture_format") != "tiff_gray_u8_uncompressed"
             or not isinstance(values.get("source_locator"), str)

@@ -46,7 +46,6 @@ void attachTestCtValues(vc::fiber_tracer::FiberReplayStripMeshes& strips)
 {
     strips.textureSource = {
         "/data/ct.zarr/2",
-        4,
         {16, 16, 16},
         {0.25, 0.25, 0.25},
         {0.0, 0.0, 0.0},
@@ -58,9 +57,26 @@ void attachTestCtValues(vc::fiber_tracer::FiberReplayStripMeshes& strips)
             REQUIRE(component.lineSurface);
             const auto* points = component.lineSurface->rawPointsPtr();
             REQUIRE(points);
-            component.texture.create(
-                points->rows * strips.textureSource->renderScale,
-                points->cols * strips.textureSource->renderScale);
+            const auto maximumArc = [&](bool rows) {
+                double maximum = 0.0;
+                const int outer = rows ? points->cols : points->rows;
+                const int inner = rows ? points->rows : points->cols;
+                for (int outerIndex = 0; outerIndex < outer; ++outerIndex) {
+                    double arc = 0.0;
+                    for (int innerIndex = 1; innerIndex < inner; ++innerIndex) {
+                        const auto& previous = rows
+                            ? (*points)(innerIndex - 1, outerIndex)
+                            : (*points)(outerIndex, innerIndex - 1);
+                        const auto& current = rows
+                            ? (*points)(innerIndex, outerIndex)
+                            : (*points)(outerIndex, innerIndex);
+                        arc += cv::norm(current - previous) * 0.25;
+                    }
+                    maximum = std::max(maximum, arc);
+                }
+                return std::max(2, static_cast<int>(std::ceil(maximum)) + 1);
+            };
+            component.texture.create(maximumArc(true), maximumArc(false));
             for (int row = 0; row < component.texture.rows; ++row) {
                 for (int column = 0; column < component.texture.cols; ++column) {
                     component.texture(row, column) = value++;
@@ -98,11 +114,13 @@ void checkReplayStripCtRendering()
 
     vc::fiber_tracer::FiberReplayStripMeshes strips;
     vc::fiber_tracer::FiberReplayStripComponent component;
-    cv::Mat_<cv::Vec3f> points(2, 2);
-    points(0, 0) = {1.0F, 1.0F, 1.0F};
-    points(0, 1) = {2.0F, 1.0F, 1.0F};
-    points(1, 0) = {1.0F, 2.0F, 1.0F};
-    points(1, 1) = {2.0F, 2.0F, 1.0F};
+    cv::Mat_<cv::Vec3f> points(2, 3);
+    points(0, 0) = {0.5F, 0.5F, 1.0F};
+    points(0, 1) = {3.0F, 0.5F, 1.0F};
+    points(0, 2) = {5.5F, 0.5F, 1.0F};
+    points(1, 0) = {0.5F, 5.5F, 1.0F};
+    points(1, 1) = {3.0F, 5.5F, 1.0F};
+    points(1, 2) = {5.5F, 5.5F, 1.0F};
     component.lineSurface =
         std::make_shared<QuadSurface>(points, cv::Vec2f{1.0F, 1.0F});
     component.centerlineBaseXYZ = {{1.0, 1.0, 1.0}};
@@ -110,11 +128,10 @@ void checkReplayStripCtRendering()
     const auto groupLocator =
         (directory / "1").string() + std::filesystem::path::preferred_separator;
     vc::fiber_tracer::renderFiberReplayStripTextures(
-        strips, *volume, groupLocator, 2);
+        strips, *volume, groupLocator);
 
     REQUIRE(strips.textureSource.has_value());
     CHECK(strips.textureSource->locator == groupLocator);
-    CHECK(strips.textureSource->renderScale == 2);
     CHECK(strips.textureSource->shapeZYX == std::array<int, 3>{4, 4, 4});
     CHECK(strips.textureSource->scaleFromBaseXYZ ==
           std::array<double, 3>{0.5, 0.5, 0.5});
@@ -125,7 +142,7 @@ void checkReplayStripCtRendering()
     auto wholePyramid = Volume::New(directory);
     CHECK_THROWS_WITH_AS(
         vc::fiber_tracer::validateFiberReplayStripCtVolume(
-            *wholePyramid, directory.string(), 2),
+            *wholePyramid, directory.string()),
         doctest::Contains("one concrete Zarr array/group"),
         std::invalid_argument);
 
@@ -277,7 +294,7 @@ TEST_CASE("replay strip CT rendering rejects unsupported uint16 volumes")
     volume = Volume::New(directory / "0");
     CHECK_THROWS_WITH_AS(
         vc::fiber_tracer::validateFiberReplayStripCtVolume(
-            *volume, (directory / "0").string(), 4),
+            *volume, (directory / "0").string()),
         doctest::Contains("must use uint8"), std::invalid_argument);
     volume.reset();
     std::filesystem::remove_all(directory.parent_path());
@@ -422,7 +439,7 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     CHECK(values.at("semantic") == "ct_intensity");
     CHECK(values.at("encoding") == "obj_uv_grayscale_tiff_u8");
     CHECK(values.at("renderer") == "vc_line_probe_fine_to_coarse");
-    CHECK(values.at("render_scale") == 4);
+    CHECK(values.at("sampling_grid") == "source_group_voxel_pitch");
     CHECK(values.at("source_locator") == "/data/ct.zarr/2");
     CHECK(values.at("source_dtype") == "uint8");
     CHECK(values.at("source_shape_zyx") == std::array<int, 3>{16, 16, 16});

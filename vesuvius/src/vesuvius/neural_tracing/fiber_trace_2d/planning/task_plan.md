@@ -19,7 +19,7 @@
    base-to-group transform from the parent `multiscales` metadata, transform a
    sampling-coordinate copy, and pass the selected group to the unchanged
    renderer as a one-level volume. Persist the group path, transform, shape,
-   and the existing `--strip-render-scale N` value (default four).
+   and automatic native-grid contract.
 4. Delete the complete alternate path: `buildLineSurfaceRibbon`, its changed
    caller/test, `renderFiberReplayStripCt`, fixed-level validation, replay-only
    raw ribbon/intensity state not needed by the shared helpers, the
@@ -32,9 +32,10 @@
    UVs. Publish standard OBJ/MTL/TIFF triples. This atlas combination is the
    sole new packaging step; per-component geometry and surface-to-texture
    mapping remain the existing implementation.
-6. Update the strict napari reader for TIFF atlases and scale-aware UVs. It
-   continues to read only hashed self-contained artifacts and never opens the
-   CT source.
+6. Update the strict napari reader for TIFF atlases and scale-aware UVs. Since
+   napari does not render OBJ UV textures, tessellate the validated surface to
+   one displayed vertex per stored texel. It continues to read only hashed
+   self-contained artifacts and never opens the CT source.
 
 ## Tests
 
@@ -55,7 +56,7 @@
 
 - Replace the erroneous legacy-renderer/PNG contract with the existing VC3D
   strip geometry and fine-to-coarse texture-rendering contract.
-- Require and persist the selected OME-Zarr group path, transform, and render scale.
+- Require and persist the selected OME-Zarr group path, transform, and native-grid contract.
 - Retain strict self-contained disconnected trace artifacts.
 - Replace the contradictory PNG/uint16/level-zero/ribbon-helper/mask section
   before treating the updated spec as the validation authority.
@@ -66,3 +67,20 @@
   example in `volume-cartographer/docs/fiberlets.md`.
 - Correct the current changelog, status, and task log; explicitly record that
   no renderer, sampler, cache, or pyramid behavior changed.
+
+# Plan: native-resolution replay strip textures
+
+1. Derive each disconnected strip component's texture width and height from
+   its arc extent in the explicitly selected Zarr group's voxel coordinates.
+   Resample only the coordinate grid to at most one group voxel per texel, then
+   call the unchanged shared fine-to-coarse renderer at scale one.
+2. Remove the fixed replay `--strip-render-scale` control and metadata. Permit
+   different native heights for disconnected components and retain the
+   standard OBJ/MTL/TIFF atlas with one-pixel replicated tile borders.
+3. Keep the persisted OBJ as the standard default `buildLineViewSurfaces()`
+   mesh. In the napari reader, validate its UV atlas and bilinearly tessellate
+   the mesh to the stored native texture grid so every CT texel becomes one
+   displayed surface value instead of discarding intermediate texels.
+4. Add C++ coverage for group-resolution sizing and variable-size atlas
+   publication, Python coverage for strict atlas inference and dense display
+   geometry, then rebuild and run the focused suites with `-j32`.

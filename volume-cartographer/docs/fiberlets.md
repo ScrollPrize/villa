@@ -448,13 +448,15 @@ strip triples: `replay/reference_strip.{obj,mtl,tif}`,
 longitudinal samples and the standard 21-row line surface. Trace resets remain
 separate surface components with no faces between them. Each component is
 rendered by the same fine-to-coarse helper used by `vc_lasagna_line_probe`.
-`--strip-render-scale N` controls its existing coordinate-grid supersampling and
-defaults to 4. Disconnected images are packed into one padded grayscale atlas
-per trace type by transforming the existing textured-mesh UVs; each tile's
-replicated one-pixel border prevents interpolation into a neighboring component.
+The sampling grid is selected automatically from each surface's arc extent in
+the chosen Zarr group's voxel coordinates: endpoints are retained and adjacent
+texels are at most one group voxel apart. Disconnected images are packed into
+one padded grayscale atlas per trace type by transforming the existing
+textured-mesh UVs; each tile's replicated one-pixel border prevents
+interpolation into a neighboring component.
 An empty trace type gets an empty OBJ, MTL, and 1x1 uncompressed TIFF. The local
 manifest records the selected group path, its actual base-to-group scale/offset
-transform and shape, render scale, and source provenance. No replay-specific
+transform and shape, native-grid contract, and source provenance. No replay-specific
 renderer, mask, uint16 conversion, or PNG compatibility path is retained.
 
 For example, generate replay visualizations with:
@@ -503,8 +505,11 @@ The established clipping, radius, width, size, and path-quality controls apply
 to the selected local generation.
 
 The three hidden grayscale `reference CT strip`, `greedy CT strip`, and
-`fiberlet CT strip` Surface layers read their values from the hashed PNG atlases
-referenced by their hashed OBJ/MTL artifacts and share a p1/p99 display range. The viewer neither accepts a CT
+`fiberlet CT strip` Surface layers read their values from the hashed TIFF atlases
+referenced by their hashed OBJ/MTL artifacts and share a p1/p99 display range.
+Napari has no UV-texture surface path, so the adapter bilinearly tessellates the
+validated OBJ surface to the stored native texture grid and displays every
+texel once. The viewer neither accepts a CT
 volume argument nor opens the provenance path in the manifest. Older direct
 visualization manifests without the all-three strip extension still open and
 do not synthesize these layers. The unpublished geometry-only and vertex-RGB

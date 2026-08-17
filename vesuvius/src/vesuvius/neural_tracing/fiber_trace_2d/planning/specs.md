@@ -2999,15 +2999,19 @@
   the normal-aligned surface has 21 cross samples, and its existing inferred
   width and transported frame are retained. Each surface is rendered through
   the same extracted helper used by `vc_lasagna_line_probe`, including blocking
-  dependency prefetch and `sampleCoordsFineToCoarse()`. `--strip-render-scale`
-  is the existing texture-coordinate supersampling control and defaults to four.
+  dependency prefetch and `sampleCoordsFineToCoarse()`. Before that unchanged
+  renderer is called at scale one, each component's coordinate grid is
+  endpoint-preservingly resampled from its maximum row/column arc extent in the
+  selected group's voxel coordinates. The resulting grid has at least two
+  samples per axis and no more than one group voxel of arc per texel. Replay has
+  no independent render-scale option.
   No replay-specific surface builder, mask renderer, uint16 path, or PNG path
   exists. Evaluator resets and clipped trace boundaries remain disconnected
   surface components. Their standard VC3D textured meshes are packed into one
   grayscale atlas per trace type with a replicated one-pixel border and an
   affine transform of their existing UVs. Empty trace types use an empty OBJ,
   valid MTL, and 1x1 TIFF. The manifest records the selected group path, its
-  actual base-to-group scale/offset transform and shape, render scale, and
+  actual base-to-group scale/offset transform and shape, native-grid contract, and
   artifact hashes.
 - The napari viewer takes one direct visualization manifest through `--replay`;
   there is no index argument. An aggregate root is discovery/reporting data and
@@ -3019,7 +3023,8 @@
   visualization. When present, the viewer strictly resolves each OBJ's local
   MTL and each MTL's local hashed TIFF, validates the standard textured-mesh
   topology, atlas padding and transformed UVs, reads the
-  stored finite grayscale texels, derives
+  stored finite grayscale texels, bilinearly tessellates the validated coarse
+  OBJ surface to one displayed vertex per native-grid texel, derives
   one shared p1/p99 display range, and creates independent hidden grayscale
   napari Surface layers. It neither accepts a CT-volume argument nor opens the
   recorded provenance path. Empty meshes remain valid empty layers. Reload

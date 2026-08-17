@@ -282,6 +282,79 @@ OmeZarrGroupTransform omeZarrGroupTransform(
         "replay strip CT --volume group is not advertised by parent OME-Zarr multiscales metadata");
 }
 
+cv::Mat_<cv::Vec3f> nativeGroupTextureCoordinates(
+    const cv::Mat_<cv::Vec3f>& basePoints,
+    const FiberReplayStripTextureSource& source)
+{
+    cv::Mat_<cv::Vec3f> groupPoints = basePoints.clone();
+    for (auto& point : groupPoints) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+            point[axis] = static_cast<float>(
+                static_cast<double>(point[axis]) *
+                    source.scaleFromBaseXYZ[axis] +
+                source.offsetFromBaseXYZ[axis]);
+        }
+    }
+
+    const auto distance = [](const cv::Vec3f& left, const cv::Vec3f& right) {
+        const cv::Vec3f delta = right - left;
+        return std::sqrt(static_cast<double>(delta.dot(delta)));
+    };
+    double maximumRowArc = 0.0;
+    for (int column = 0; column < groupPoints.cols; ++column) {
+        double arc = 0.0;
+        for (int row = 1; row < groupPoints.rows; ++row)
+            arc += distance(groupPoints(row - 1, column), groupPoints(row, column));
+        maximumRowArc = std::max(maximumRowArc, arc);
+    }
+    double maximumColumnArc = 0.0;
+    for (int row = 0; row < groupPoints.rows; ++row) {
+        double arc = 0.0;
+        for (int column = 1; column < groupPoints.cols; ++column)
+            arc += distance(groupPoints(row, column - 1), groupPoints(row, column));
+        maximumColumnArc = std::max(maximumColumnArc, arc);
+    }
+    const auto sampleCount = [](double arc) {
+        if (!std::isfinite(arc) || arc < 0.0 ||
+            arc > static_cast<double>(std::numeric_limits<int>::max() - 1)) {
+            throw std::invalid_argument(
+                "replay strip source-group extent is invalid");
+        }
+        return std::max(2, static_cast<int>(std::ceil(arc)) + 1);
+    };
+    const cv::Size nativeSize(
+        sampleCount(maximumColumnArc), sampleCount(maximumRowArc));
+    if (nativeSize.width == groupPoints.cols &&
+        nativeSize.height == groupPoints.rows) {
+        return groupPoints;
+    }
+    cv::Mat_<cv::Vec3f> nativePoints(nativeSize.height, nativeSize.width);
+    for (int row = 0; row < nativePoints.rows; ++row) {
+        const double sourceRow = static_cast<double>(row) *
+            (groupPoints.rows - 1) / (nativePoints.rows - 1);
+        const int row0 = static_cast<int>(std::floor(sourceRow));
+        const int row1 = std::min(row0 + 1, groupPoints.rows - 1);
+        const float rowWeight = static_cast<float>(sourceRow - row0);
+        for (int column = 0; column < nativePoints.cols; ++column) {
+            const double sourceColumn = static_cast<double>(column) *
+                (groupPoints.cols - 1) / (nativePoints.cols - 1);
+            const int column0 = static_cast<int>(std::floor(sourceColumn));
+            const int column1 = std::min(column0 + 1, groupPoints.cols - 1);
+            const float columnWeight =
+                static_cast<float>(sourceColumn - column0);
+            const cv::Vec3f top =
+                groupPoints(row0, column0) * (1.0F - columnWeight) +
+                groupPoints(row0, column1) * columnWeight;
+            const cv::Vec3f bottom =
+                groupPoints(row1, column0) * (1.0F - columnWeight) +
+                groupPoints(row1, column1) * columnWeight;
+            nativePoints(row, column) =
+                top * (1.0F - rowWeight) + bottom * rowWeight;
+        }
+    }
+    return nativePoints;
+}
+
 StripAtlasArtifact stripAtlasArtifact(
     const char* header,
     const std::string& stem,
@@ -291,7 +364,7 @@ StripAtlasArtifact stripAtlasArtifact(
     int atlasRows = 1;
     int atlasColumns = 1;
     if (!components.empty()) {
-        atlasRows = components.front().texture.rows + 2 * padding;
+        atlasRows = 0;
         int64_t columns = 0;
         for (const auto& component : components) {
             if (!component.lineSurface || component.texture.empty()) {
@@ -300,12 +373,12 @@ StripAtlasArtifact stripAtlasArtifact(
             }
             const auto* points = component.lineSurface->rawPointsPtr();
             if (!points || points->empty() ||
-                component.texture.rows % points->rows != 0 ||
-                component.texture.cols % points->cols != 0 ||
-                component.texture.rows + 2 * padding != atlasRows) {
+                component.texture.rows < 2 || component.texture.cols < 2) {
                 throw std::invalid_argument(
                     "replay strip rendered image dimensions are invalid");
             }
+            atlasRows = std::max(
+                atlasRows, component.texture.rows + 2 * padding);
             columns += static_cast<int64_t>(component.texture.cols) +
                 2 * padding;
         }
@@ -326,15 +399,15 @@ StripAtlasArtifact stripAtlasArtifact(
         component.texture.row(0).copyTo(
             atlas(cv::Rect(atlasColumn + padding, 0, columns, 1)));
         component.texture.row(rows - 1).copyTo(
-            atlas(cv::Rect(atlasColumn + padding, atlasRows - 1, columns, 1)));
+            atlas(cv::Rect(atlasColumn + padding, rows + padding, columns, 1)));
         component.texture.col(0).copyTo(
             atlas(cv::Rect(atlasColumn, padding, 1, rows)));
         component.texture.col(columns - 1).copyTo(
             atlas(cv::Rect(atlasColumn + columns + padding, padding, 1, rows)));
         atlas(0, atlasColumn) = component.texture(0, 0);
-        atlas(atlasRows - 1, atlasColumn) = component.texture(rows - 1, 0);
+        atlas(rows + padding, atlasColumn) = component.texture(rows - 1, 0);
         atlas(0, atlasColumn + columns + padding) = component.texture(0, columns - 1);
-        atlas(atlasRows - 1, atlasColumn + columns + padding) =
+        atlas(rows + padding, atlasColumn + columns + padding) =
             component.texture(rows - 1, columns - 1);
 
         auto mesh = vc::core::util::texturedSurfaceMesh(*component.lineSurface);
@@ -617,10 +690,11 @@ void validateStripComponents(
             throw std::invalid_argument("replay strip component dimensions are invalid");
         }
         if (meshes.textureSource.has_value()) {
-            const int renderScale = meshes.textureSource->renderScale;
+            const auto nativePoints = nativeGroupTextureCoordinates(
+                *surfacePoints, *meshes.textureSource);
             if (component.texture.empty() ||
-                component.texture.rows != surfacePoints->rows * renderScale ||
-                component.texture.cols != surfacePoints->cols * renderScale) {
+                component.texture.rows != nativePoints.rows ||
+                component.texture.cols != nativePoints.cols) {
                 throw std::invalid_argument(
                     "replay strip rendered CT image is invalid");
             }
@@ -644,7 +718,6 @@ void validateStripComponents(
 void validateTextureSource(const FiberReplayStripTextureSource& source)
 {
     if (source.locator.empty() ||
-        source.renderScale < 1 ||
         std::any_of(
             source.shapeZYX.begin(), source.shapeZYX.end(),
             [](int value) { return value <= 0; }) ||
@@ -820,8 +893,7 @@ FiberReplayStripMeshes makeFiberReplayStripSurfaces(
 
 FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     ::Volume& volume,
-    const std::string& sourceLocator,
-    int renderScale)
+    const std::string& sourceLocator)
 {
     if (sourceLocator.empty())
         throw std::invalid_argument("replay strip CT source locator is empty");
@@ -832,8 +904,6 @@ FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
         throw std::invalid_argument(
             "replay strip CT --volume must name one concrete Zarr array/group");
     }
-    if (renderScale < 1)
-        throw std::invalid_argument("replay strip render scale must be positive");
     if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
         throw std::invalid_argument(
             "replay strip CT volume must use uint8 voxels");
@@ -841,7 +911,6 @@ FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     const auto transform = omeZarrGroupTransform(sourceLocator);
     FiberReplayStripTextureSource source{
         sourceLocator,
-        renderScale,
         volume.shape(0),
         transform.scaleFromBaseXYZ,
         transform.offsetFromBaseXYZ,
@@ -853,13 +922,11 @@ FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
 void renderFiberReplayStripTextures(
     FiberReplayStripMeshes& meshes,
     ::Volume& volume,
-    const std::string& sourceLocator,
-    int renderScale)
+    const std::string& sourceLocator)
 {
     if (meshes.textureSource.has_value())
         throw std::invalid_argument("replay strip CT has already been rendered");
-    const auto source = validateFiberReplayStripCtVolume(
-        volume, sourceLocator, renderScale);
+    const auto source = validateFiberReplayStripCtVolume(volume, sourceLocator);
 
     const auto allComponents = [&](auto&& callback) {
         for (auto* collection : {&meshes.reference, &meshes.greedy,
@@ -876,17 +943,10 @@ void renderFiberReplayStripTextures(
         const auto* basePoints = component.lineSurface->rawPointsPtr();
         if (!basePoints || basePoints->empty())
             throw std::invalid_argument("replay strip surface has no coordinates");
-        cv::Mat_<cv::Vec3f> groupPoints = basePoints->clone();
-        for (auto& point : groupPoints) {
-            for (size_t axis = 0; axis < 3; ++axis) {
-                point[axis] = static_cast<float>(
-                    static_cast<double>(point[axis]) *
-                        source.scaleFromBaseXYZ[axis] +
-                    source.offsetFromBaseXYZ[axis]);
-            }
-        }
+        const auto groupPoints = nativeGroupTextureCoordinates(
+            *basePoints, source);
         component.texture = vc::core::util::renderCoordsTextureFineToCoarse(
-            groupPoints, volume, 0, renderScale, "Strip texture sampling");
+            groupPoints, volume, 0, 1, "Strip texture sampling");
     });
     meshes.textureSource = source;
 }
@@ -1116,7 +1176,7 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
                      {"semantic", "ct_intensity"},
                      {"encoding", "obj_uv_grayscale_tiff_u8"},
                      {"renderer", "vc_line_probe_fine_to_coarse"},
-                     {"render_scale", texture.renderScale},
+                     {"sampling_grid", "source_group_voxel_pitch"},
                      {"atlas_padding_pixels", 1},
                      {"texture_format", "tiff_gray_u8_uncompressed"},
                      {"source_locator", texture.locator},

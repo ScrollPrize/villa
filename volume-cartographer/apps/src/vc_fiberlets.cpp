@@ -74,8 +74,6 @@ struct CliOptions {
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
     bool alongSpecified = false;
-    bool stripRenderScaleSpecified = false;
-    int stripRenderScale = 4;
     int inferenceScaledownPower = 2;
     double failureThresholdBaseVoxels = 20.0;
     double alongBaseVoxels = 128.0;
@@ -158,7 +156,6 @@ void usage(const char* executable)
               << "  --length N                    compared reference length in base voxels [full]\n"
               << "  --vis                         write indexed local failure visualizations\n"
               << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
-              << "  --strip-render-scale N        strip texture supersampling [4]\n"
               << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
               << "  --radius N                    extraction tube radius in base voxels [64]\n"
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
@@ -300,11 +297,6 @@ CliOptions parseArgs(int argc, char** argv)
             options.writeReplayVisualizations = true;
         } else if (argument == "--volume" && isReplayCommand(options.command)) {
             options.volumeZarr = valueAfter(index, argc, argv, "volume");
-        } else if (argument == "--strip-render-scale" && isReplayCommand(options.command)) {
-            options.stripRenderScale = parseInt(
-                valueAfter(index, argc, argv, "strip-render-scale"),
-                "strip-render-scale");
-            options.stripRenderScaleSpecified = true;
         } else if (argument == "--along" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
             options.alongBaseVoxels = parseDouble(valueAfter(index, argc, argv, "along"), "along");
             options.alongSpecified = true;
@@ -440,10 +432,8 @@ CliOptions parseArgs(int argc, char** argv)
         }
         if (options.writeReplayVisualizations && options.volumeZarr.empty())
             fail("fiber-replay --vis requires --volume PATH for CT strip sampling");
-        if (options.stripRenderScale < 1)
-            fail("--strip-render-scale must be positive");
         if (!options.writeReplayVisualizations &&
-            (!options.volumeZarr.empty() || options.stripRenderScaleSpecified)) {
+            !options.volumeZarr.empty()) {
             fail("fiber-replay volume strip options are only valid together with --vis");
         }
     }
@@ -638,8 +628,7 @@ int main(int argc, char** argv)
             replayCtVolume->setCacheBudget(options.decodedCacheBytes);
             (void)vc::fiber_tracer::validateFiberReplayStripCtVolume(
                 *replayCtVolume,
-                replayCtLocator,
-                options.stripRenderScale);
+                replayCtLocator);
         }
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
         openOptions.remoteCacheRoot = options.remoteCacheDirectory;
@@ -1004,8 +993,7 @@ int main(int argc, char** argv)
                         vc::fiber_tracer::renderFiberReplayStripTextures(
                             *visual.strips,
                             *replayCtVolume,
-                            replayCtLocator,
-                            options.stripRenderScale);
+                            replayCtLocator);
                         bundle.visualizations.push_back(std::move(visual));
                         std::cerr << "fiber_replay_stage stage=visualization status=completed"
                                   << " tracer=" << vc::fiber_tracer::fiberReplayTracerName(tracer) << " index=" << failure.index
