@@ -6188,6 +6188,7 @@ LineAnnotationController::umbilicusStatus() const
 LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
 {
     FiberMapSnapshot snapshot;
+    snapshot.generation = _fiberDataGeneration;
 
     // Fibers are annotated in the volume's level-0 source frame, so the
     // annotation voxel size is the source resolution, not the (possibly
@@ -6230,6 +6231,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         // The user part of the label comes from the file name, not the
         // username field: for some fibers the two disagree and the file name
         // is what the fiber panel shows.
+        entry.fileName = fiber.fileName;
         const QString stem =
             vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
         const int separator = stem.indexOf(QLatin1Char('_'));
@@ -6294,17 +6296,96 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         return snapshot;
     }
 
-    // The umbilicus may be annotated on a downsampled grid while fibers live in
-    // the level-0 frame (PHercParis4 is x4; see
-    // scripts/fiber_network_unroll.md). A stamped file states the grid it
-    // indexes, so its scale is a division; unstamped files have to be guessed.
+    // The umbilicus may be annotated on a downsampled grid while the fibers
+    // live in the volume's level-0 source frame (PHercParis4's is x4; see
+    // scripts/fiber_network_unroll.md), so its coordinates have to be brought
+    // into that frame first. In order of trust: the stamped grid dimensions
+    // against the fibers' own grid (exact integers), the stamped voxel size
+    // against the annotation voxel size, then which downsample of the fibers'
+    // grid the points actually fit inside. Fiber geometry is never consulted:
+    // where the annotation happens to reach says nothing about the grid the
+    // umbilicus was drawn on, and using it got this wrong in both directions.
+    std::array<double, 3> fiberGridXyz{0.0, 0.0, 0.0};
+    if (_state) {
+        try {
+            if (const auto volume = _state->currentVolume()) {
+                // The identity's scale factor lifts the volume's own base grid
+                // to the finer frame the fibers are annotated in.
+                double factor = 1.0;
+                if (coordinateIdentity &&
+                    coordinateIdentity->sourceCoordinateScaleFactor > 0) {
+                    factor = static_cast<double>(
+                        coordinateIdentity->sourceCoordinateScaleFactor);
+                }
+                fiberGridXyz = {volume->sliceWidth() * factor,
+                                volume->sliceHeight() * factor,
+                                volume->numSlices() * factor};
+            }
+        } catch (...) {
+            fiberGridXyz = {0.0, 0.0, 0.0};
+        }
+    }
+    const bool haveFiberGrid = fiberGridXyz[0] > 0.0 && fiberGridXyz[1] > 0.0 &&
+                               fiberGridXyz[2] > 0.0;
+
     double scale = 1.0;
-    bool guessed = true;
-    if (resolved.info.voxelsizeUm) {
+    bool haveScale = false;
+    bool inferred = false;
+
+    const bool haveStampedDims = resolved.info.volumeWidth &&
+                                 resolved.info.volumeHeight &&
+                                 resolved.info.volumeSlices &&
+                                 *resolved.info.volumeWidth > 0 &&
+                                 *resolved.info.volumeHeight > 0 &&
+                                 *resolved.info.volumeSlices > 0;
+    if (haveStampedDims && haveFiberGrid) {
+        const std::array<double, 3> ratios{
+            fiberGridXyz[0] / *resolved.info.volumeWidth,
+            fiberGridXyz[1] / *resolved.info.volumeHeight,
+            fiberGridXyz[2] / *resolved.info.volumeSlices};
+        const double lo = std::min({ratios[0], ratios[1], ratios[2]});
+        const double hi = std::max({ratios[0], ratios[1], ratios[2]});
+        if (lo > 0.0 && hi <= lo * 1.02) {
+            scale = (ratios[0] + ratios[1] + ratios[2]) / 3.0;
+            haveScale = true;
+            Logger()->info(
+                "Fiber map: umbilicus {} at scale x{:g} (stamped {}x{}x{} grid "
+                "into {:g}x{:g}x{:g})",
+                resolved.path.string(),
+                scale,
+                *resolved.info.volumeWidth,
+                *resolved.info.volumeHeight,
+                *resolved.info.volumeSlices,
+                fiberGridXyz[0],
+                fiberGridXyz[1],
+                fiberGridXyz[2]);
+        } else {
+            Logger()->warn(
+                "Fiber map: umbilicus {} stamps a {}x{}x{} grid whose axis "
+                "ratios against {:g}x{:g}x{:g} disagree ({:g}..{:g}); not a "
+                "uniform rescale of this volume",
+                resolved.path.string(),
+                *resolved.info.volumeWidth,
+                *resolved.info.volumeHeight,
+                *resolved.info.volumeSlices,
+                fiberGridXyz[0],
+                fiberGridXyz[1],
+                fiberGridXyz[2],
+                lo,
+                hi);
+            snapshot.umbilicusMessage =
+                tr("%1 was annotated on a grid that is not a uniform rescale of "
+                   "this volume.")
+                    .arg(QString::fromStdString(resolved.path.filename().string()));
+            return snapshot;
+        }
+    }
+
+    if (!haveScale && resolved.info.voxelsizeUm && snapshot.voxelSizeUm > 0.0) {
         const double ratio = *resolved.info.voxelsizeUm / snapshot.voxelSizeUm;
         if (std::isfinite(ratio) && ratio > 0.0) {
             scale = ratio;
-            guessed = false;
+            haveScale = true;
             Logger()->info(
                 "Fiber map: umbilicus {} at scale x{:g} (stamped {:g} um into "
                 "{:g} um)",
@@ -6315,58 +6396,85 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         }
     }
 
-    if (guessed) {
-        double fiberZLo = std::numeric_limits<double>::infinity();
-        double fiberZHi = -std::numeric_limits<double>::infinity();
-        for (const auto& fiber : snapshot.fibers) {
-            for (const auto& point : fiber.linePoints) {
-                if (std::isfinite(point[2])) {
-                    fiberZLo = std::min(fiberZLo, point[2]);
-                    fiberZHi = std::max(fiberZHi, point[2]);
-                }
-            }
-        }
-        double umbZLo = std::numeric_limits<double>::infinity();
-        double umbZHi = -std::numeric_limits<double>::infinity();
+    if (!haveScale && haveFiberGrid) {
+        // Nothing stamped: find which downsample of the fibers' grid the points
+        // were drawn on. An umbilicus is annotated along the whole scroll, so
+        // the right grid is the one it nearly fills and still fits inside.
+        // Candidates are a factor of two apart, so a grid covered at least this
+        // much leaves the next coarser one under half covered — the match is
+        // unique without needing a tie-break.
+        constexpr double kMinZCoverage = 0.6;
+        constexpr int kMaxDownsampleSteps = 5;
+        double umbLo[3] = {std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::infinity()};
+        double umbHi[3] = {-std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()};
         for (const auto& point : points) {
-            umbZLo = std::min(umbZLo, static_cast<double>(point[2]));
-            umbZHi = std::max(umbZHi, static_cast<double>(point[2]));
+            for (int axis = 0; axis < 3; ++axis) {
+                umbLo[axis] = std::min(umbLo[axis], static_cast<double>(point[axis]));
+                umbHi[axis] = std::max(umbHi[axis], static_cast<double>(point[axis]));
+            }
         }
 
-        // Pick the smallest power-of-two scale whose z span best matches the
-        // fibers' z span. The score is intersection-over-union, not plain
-        // coverage: an oversized scale still "covers" the fibers while placing
-        // the centers far outside the windings, which turns the unroll into an
-        // oscillating angle.
-        if (fiberZHi > fiberZLo) {
-            double bestScore = -1.0;
-            for (const double candidate : {1.0, 2.0, 4.0, 8.0}) {
-                const double overlap = std::min(umbZHi * candidate, fiberZHi) -
-                                       std::max(umbZLo * candidate, fiberZLo);
-                const double unionSpan = std::max(umbZHi * candidate, fiberZHi) -
-                                         std::min(umbZLo * candidate, fiberZLo);
-                const double score =
-                    unionSpan > 0.0 ? std::max(overlap, 0.0) / unionSpan : 0.0;
-                if (score > bestScore + 0.01) {
-                    bestScore = score;
-                    scale = candidate;
-                }
+        std::vector<double> matches;
+        double bestCoverage = 0.0;
+        for (int step = 0; step <= kMaxDownsampleSteps; ++step) {
+            const double candidate = std::pow(2.0, step);
+            bool fits = umbLo[0] >= 0.0 && umbLo[1] >= 0.0 && umbLo[2] >= 0.0;
+            for (int axis = 0; axis < 3 && fits; ++axis) {
+                fits = umbHi[axis] <= fiberGridXyz[axis] / candidate;
             }
-            if (bestScore < 0.25) {
-                Logger()->warn(
-                    "Fiber map: umbilicus {} z span matches only {:.0f}% of the "
-                    "fiber z span at any scale; not unrolling",
-                    resolved.path.string(),
-                    std::max(bestScore, 0.0) * 100.0);
-                return snapshot;
+            if (!fits) {
+                continue;
             }
+            const double gridZ = fiberGridXyz[2] / candidate;
+            const double coverage = gridZ > 0.0 ? (umbHi[2] - umbLo[2]) / gridZ : 0.0;
+            bestCoverage = std::max(bestCoverage, coverage);
+            if (coverage >= kMinZCoverage) {
+                matches.push_back(candidate);
+            }
+        }
+
+        if (matches.size() == 1) {
+            scale = matches.front();
+            haveScale = true;
+            inferred = true;
             Logger()->info(
-                "Fiber map: umbilicus {} at scale x{:g} (z-span match {:.0f}%)",
+                "Fiber map: umbilicus {} is unstamped; inferred scale x{:g} from "
+                "the volume grid (z coverage {:.0f}%)",
                 resolved.path.string(),
                 scale,
-                bestScore * 100.0);
+                bestCoverage * 100.0);
+        } else {
+            Logger()->warn(
+                "Fiber map: umbilicus {} is unstamped and its grid could not be "
+                "identified ({} candidate grids, best z coverage {:.0f}%)",
+                resolved.path.string(),
+                matches.size(),
+                bestCoverage * 100.0);
+            snapshot.umbilicusMessage =
+                tr("%1 carries no frame metadata and the grid it was annotated "
+                   "on could not be identified. Stamp it with volume_width, "
+                   "volume_height and volume_slices.")
+                    .arg(QString::fromStdString(resolved.path.filename().string()));
+            return snapshot;
         }
     }
+
+    if (!haveScale) {
+        Logger()->warn(
+            "Fiber map: umbilicus {} cannot be placed — no stamped frame and no "
+            "volume grid to compare against",
+            resolved.path.string());
+        snapshot.umbilicusMessage =
+            tr("%1 cannot be placed: it carries no frame metadata and no volume "
+               "is loaded to compare it against.")
+                .arg(QString::fromStdString(resolved.path.filename().string()));
+        return snapshot;
+    }
+    const bool guessed = inferred;
 
     // A bare factor says how much the coordinates moved but not what frame they
     // came from. Within one volpkg the volumes are levels of a single
@@ -6377,10 +6485,10 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     const QString factor = QString::number(scale, 'g', 6);
     QString label;
     if (guessed) {
-        label = tr("umbilicus ×%1 (guessed)").arg(factor);
+        // Inferred from the volume's grid rather than stated by the file, so say
+        // so: it is the one scale a reader may want to double-check.
+        label = tr("umbilicus ×%1 (inferred)").arg(factor);
     } else {
-        // Not guessed means the file stamped a voxel size, so voxelsizeUm is
-        // set throughout this branch; the volume name is separately optional.
         const double level = std::log2(scale);
         const double rounded = std::round(level);
         if (std::abs(level - rounded) < 1e-6) {
@@ -6397,9 +6505,17 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                         .arg(levelOffset >= 0 ? QStringLiteral("+") : QString())
                         .arg(levelOffset)
                         .arg(factor);
-        } else {
+        } else if (resolved.info.voxelsizeUm) {
             label = tr("umbilicus: %1 µm grid → ×%2")
                         .arg(QString::number(*resolved.info.voxelsizeUm, 'g', 6))
+                        .arg(factor);
+        } else {
+            // Dimensions stamped but not a power-of-two ratio: the grid it was
+            // drawn on is the only description that fits.
+            label = tr("umbilicus: %1×%2×%3 grid → ×%4")
+                        .arg(*resolved.info.volumeWidth)
+                        .arg(*resolved.info.volumeHeight)
+                        .arg(*resolved.info.volumeSlices)
                         .arg(factor);
         }
     }
@@ -6491,6 +6607,18 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                     *resolved.info.volume,
                     transform.string());
             }
+        } else {
+            // The scale itself only needs the fibers' own grid, so a name we
+            // cannot resolve does not block the unroll — but it does mean the
+            // stamp went unverified, and a stamp naming a different scan of the
+            // same scroll would look identical from here.
+            label += tr(" (stamp unverified: %1 not attached)")
+                         .arg(QString::fromStdString(*resolved.info.volume));
+            Logger()->warn(
+                "Fiber map: umbilicus {} names volume {}, which is not attached; "
+                "its stamp could not be verified",
+                resolved.path.string(),
+                *resolved.info.volume);
         }
     }
 
@@ -11484,7 +11612,22 @@ void LineAnnotationController::reoptimizeMergedFibers(
 
 void LineAnnotationController::emitFiberSummaries()
 {
+    // Every in-memory fiber mutation lands here (or in the save/load paths that
+    // bump the counter themselves), so this is where derived data becomes stale.
+    ++_fiberDataGeneration;
     emit fibersChanged(fiberSummaries());
+}
+
+uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileName) const
+{
+    if (fileName.empty()) {
+        return 0;
+    }
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(),
+                                 [&fileName](const StoredFiber& fiber) {
+                                     return fiber.fileName == fileName;
+                                 });
+    return it != _fibers.end() ? it->id : 0;
 }
 
 void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>& tags)
@@ -14009,6 +14152,9 @@ void LineAnnotationController::finishFiberSaveJob(
 
     QString errorMessage;
     if (result.ok) {
+        // Saves do not go through emitFiberSummaries(), but they do change the
+        // stored geometry derived views were built from.
+        ++_fiberDataGeneration;
         for (size_t i = 0; i < result.fiberIds.size(); ++i) {
             const uint64_t generation =
                 i < result.generations.size() ? result.generations[i] : 0;

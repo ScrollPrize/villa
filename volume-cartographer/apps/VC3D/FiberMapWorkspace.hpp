@@ -22,6 +22,7 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
+class QShowEvent;
 class QSpinBox;
 class QTreeWidget;
 class QWheelEvent;
@@ -75,6 +76,8 @@ protected:
     // The map's colours follow the application theme, and a switch is only
     // announced by a palette change.
     void changeEvent(QEvent* event) override;
+    // Catches a layout built from fiber data that has since changed.
+    void showEvent(QShowEvent* event) override;
 
 private:
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
@@ -89,6 +92,14 @@ private:
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
     void markStale();
+    // Compares the controller's fiber generation against the one this layout
+    // was built from, marking stale on a mismatch; returns whether the map is
+    // stale. Cheap (one integer compare), so it guards interaction too.
+    bool refreshStaleState();
+    // Appends the package's umbilicus state to a status line, resolving it at
+    // most once per fiber generation: it is filesystem work, and the whole point
+    // of the generation check is to keep that off the annotation paths.
+    [[nodiscard]] QString withCachedUmbilicusStatus(const QString& status);
     void setHighlightedFiber(uint64_t fiberId);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
@@ -124,4 +135,11 @@ private:
     bool _viewFitted = false;
     bool _fiberDockSized = false;
     bool _retheming = false;
+    // Fiber generation the current layout came from, and whether a change has
+    // been seen since; a fresh workspace is stale until its first rebuild.
+    uint64_t _layoutGeneration = 0;
+    bool _stale = false;
+    QString _umbilicusStatusText;
+    uint64_t _umbilicusStatusGeneration = 0;
+    bool _umbilicusStatusValid = false;
 };

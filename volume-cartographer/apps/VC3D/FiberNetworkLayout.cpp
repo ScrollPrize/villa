@@ -620,6 +620,7 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             const FiberGeometry& geo = geometry.at(member);
             PlacedFiber placedFiber;
             placedFiber.id = fiber.id;
+            placedFiber.fileName = fiber.fileName;
             placedFiber.label = fiber.label;
             placedFiber.hvTag = fiber.hvTag;
             placedFiber.controlPoints = geo.controlPoints;

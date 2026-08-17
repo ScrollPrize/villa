@@ -6,6 +6,7 @@
 #include "FiberNetworkLayout.hpp"
 
 using vc3d::fiber_map::InputFiber;
+using vc3d::fiber_map::PlacedFiber;
 using vc3d::fiber_map::LayoutParams;
 using vc3d::fiber_map::PlacedNetwork;
 using vc3d::fiber_map::PlacedLink;
@@ -69,6 +70,9 @@ InputFiber makeFiber(uint64_t id, const QString& label, char hvTag,
 {
     InputFiber fiber;
     fiber.id = id;
+    // The stable identity the workspace acts through; derived from the label so
+    // the assertions can tell placed fibers apart without their runtime ids.
+    fiber.fileName = label.toStdString() + ".json";
     fiber.label = label;
     fiber.hvTag = hvTag;
     fiber.linePoints = std::move(linePoints);
@@ -296,6 +300,13 @@ private slots:
         QVERIFY(second != nullptr);
         QVERIFY(first->pending);
         QVERIFY(!second->pending);
+
+        // The stable identity has to reach the placed fibers: the workspace
+        // resolves navigation through it once runtime ids have been reassigned.
+        for (const PlacedFiber& placed : network.fibers) {
+            QCOMPARE(QString::fromStdString(placed.fileName),
+                     placed.label + QStringLiteral(".json"));
+        }
         const double gap = std::abs(second->a.x() - first->a.x());
         QVERIFY2(std::abs(gap - kTwoPi * network.rRefCm) < 0.02,
                  qPrintable(QStringLiteral("gap %1 vs %2")

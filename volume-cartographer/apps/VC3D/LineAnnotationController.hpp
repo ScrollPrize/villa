@@ -132,7 +132,11 @@ public:
     };
 
     struct FiberMapFiber {
+        // Runtime id, valid only for the generation this snapshot was taken in.
         uint64_t id = 0;
+        // Stable identity across loads; the runtime id is reassigned per load,
+        // so anything acted on later must be resolved from this.
+        std::string fileName;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
         char hvTag = '?';
@@ -146,6 +150,9 @@ public:
 
     struct FiberMapSnapshot {
         std::vector<FiberMapFiber> fibers;
+        // fiberDataGeneration() when this snapshot was taken; a holder compares
+        // it to know whether what it built from this is still current.
+        uint64_t generation = 0;
         // Umbilicus control points scaled into the fibers' frame, sorted by z;
         // empty when no plausible umbilicus was found.
         std::vector<cv::Vec3f> umbilicusCenters;
@@ -278,6 +285,14 @@ public:
     // cached, so call it on user-visible state changes rather than per frame.
     [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
+    // Bumped whenever the loaded fiber set changes (load, save, delete, and the
+    // edits that refresh the fiber summaries). Holders of derived data compare
+    // it to decide whether what they built is still current; runtime fiber ids
+    // are only meaningful within one generation.
+    [[nodiscard]] uint64_t fiberDataGeneration() const { return _fiberDataGeneration; }
+    // Runtime id of the loaded fiber with this file name, or 0 when the package
+    // no longer holds it. The stable way to act on a fiber recorded earlier.
+    [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
@@ -908,6 +923,9 @@ private:
     // Orienting off the volume centre instead is exactly the silent degradation
     // that hid a frame mismatch for a whole scroll, so it is said out loud.
     QString _umbilicusNotice;
+    // See fiberDataGeneration(). Starts at 1 so a holder's default 0 always
+    // reads as stale.
+    uint64_t _fiberDataGeneration = 1;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

@@ -2,6 +2,8 @@
 
 #include "LineAnnotationController.hpp"
 
+#include "vc/core/util/Logging.hpp"
+
 #include <QAction>
 #include <QColor>
 #include <QDockWidget>
@@ -493,7 +495,7 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidg
     toolBar->addWidget(rebuildButton);
     toolBar->addSeparator();
     _statusLabel =
-        new QLabel(withUmbilicusStatus(tr("press Rebuild layout"), _controller), toolBar);
+        new QLabel(tr("press Rebuild layout"), toolBar);
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
@@ -554,23 +556,62 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidg
                 }
             });
 
-    if (_controller) {
-        connect(_controller, &LineAnnotationController::fibersChanged,
-                this, [this](std::vector<LineAnnotationController::FiberSummary>) { markStale(); });
-        connect(_controller, &LineAnnotationController::fiberSaved,
-                this, [this](uint64_t, uint64_t) { markStale(); });
-        connect(_controller, &LineAnnotationController::fibersDeleted,
-                this, [this](std::vector<uint64_t>) { markStale(); });
-    }
+    // No connections to the controller's change signals on purpose: annotation
+    // work must not pay for a workspace that may never be opened. Staleness is
+    // discovered by comparing fiberDataGeneration() at the moments it matters —
+    // see refreshStaleState().
 
     rebuildScene(tr("press Rebuild layout"));
 }
 
+QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
+{
+    const uint64_t generation =
+        _controller ? _controller->fiberDataGeneration() : 0;
+    if (!_umbilicusStatusValid || generation != _umbilicusStatusGeneration) {
+        _umbilicusStatusText = withUmbilicusStatus(QString(), _controller);
+        _umbilicusStatusGeneration = generation;
+        _umbilicusStatusValid = true;
+    }
+    return status + _umbilicusStatusText;
+}
+
 void FiberMapWorkspace::markStale()
 {
+    _stale = true;
     if (_statusLabel) {
         _statusLabel->setText(
-            withUmbilicusStatus(tr("Fibers changed — press Rebuild layout"), _controller));
+            withCachedUmbilicusStatus(tr("Fibers changed — press Rebuild layout")));
+    }
+}
+
+bool FiberMapWorkspace::refreshStaleState()
+{
+    if (_stale) {
+        return true;
+    }
+    if (!_controller || _layout.networks.empty()) {
+        return false;
+    }
+    if (_controller->fiberDataGeneration() != _layoutGeneration) {
+        markStale();
+        return true;
+    }
+    return false;
+}
+
+void FiberMapWorkspace::showEvent(QShowEvent* event)
+{
+    QMainWindow::showEvent(event);
+    // Becoming visible is the first of the three moments a stale layout has to
+    // be caught; the others are a rebuild and any attempt to act on the map.
+    if (refreshStaleState()) {
+        return;
+    }
+    // Nothing built yet: this is where the umbilicus state gets looked up, so a
+    // package that will not unroll says so before the user presses Rebuild.
+    if (_layout.networks.empty() && _statusLabel) {
+        _statusLabel->setText(withCachedUmbilicusStatus(tr("press Rebuild layout")));
     }
 }
 
@@ -580,6 +621,8 @@ void FiberMapWorkspace::rebuildLayout()
         return;
     }
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
+    _layoutGeneration = snapshot.generation;
+    _stale = false;
 
     // The snapshot's geometry is handed straight to the layout; every fiber of
     // the package is in it, so a second copy is worth avoiding.
@@ -588,6 +631,7 @@ void FiberMapWorkspace::rebuildLayout()
     for (auto& fiber : snapshot.fibers) {
         vc3d::fiber_map::InputFiber input;
         input.id = fiber.id;
+        input.fileName = fiber.fileName;
         input.label = fiber.label;
         input.hvTag = fiber.hvTag;
         input.controlPoints = std::move(fiber.controlPoints);
@@ -1010,6 +1054,11 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
 
 void FiberMapWorkspace::handleSceneClick(const QPointF& scenePos)
 {
+    // A stale map's runtime ids may name different fibers than they did when it
+    // was built, so it stops responding until rebuilt.
+    if (refreshStaleState()) {
+        return;
+    }
     const uint64_t fiberId = fiberAt(scenePos);
     setHighlightedFiber(fiberId);
     if (fiberId != 0) {
@@ -1098,6 +1147,9 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     if (_highlightedFiber == 0 || _controlPointDots.empty() || !_controller) {
         return;
     }
+    if (refreshStaleState()) {
+        return;
+    }
     // Grabbing a dot must work wherever it is drawn: kControlDotTolerancePx is
     // the floor, the scene-space radius takes over once zoomed in.
     const double tolerance =
@@ -1117,12 +1169,29 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     }
 
     const uint64_t fiberId = _highlightedFiber;
+    const auto entry = _entries.constFind(fiberId);
+    if (entry == _entries.constEnd()) {
+        return;
+    }
+    const std::string fileName = entry->fiber.fileName;
     QMenu menu(this);
     QAction* action = menu.addAction(tr("Go to control point %1 in %2")
                                         .arg(bestIndex)
                                         .arg(_controller->fiberDisplayName(fiberId)));
-    connect(action, &QAction::triggered, this, [this, fiberId, bestIndex]() {
-        emit openFiberAtControlPointRequested(fiberId, bestIndex);
+    // Resolve the runtime id from the file name when the action fires, not from
+    // the id captured here: a reload in between would have reassigned it.
+    connect(action, &QAction::triggered, this, [this, fileName, bestIndex]() {
+        if (!_controller) {
+            return;
+        }
+        const uint64_t target = _controller->fiberIdForFileName(fileName);
+        if (target == 0) {
+            markStale();
+            Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
+                           fileName);
+            return;
+        }
+        emit openFiberAtControlPointRequested(target, bestIndex);
     });
     menu.exec(globalPos);
 }

@@ -6,6 +6,7 @@
 #include <opencv2/core/matx.hpp>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Extrinsic unroll of manually linked H/V fiber networks about the scroll
@@ -35,6 +36,9 @@ struct InputLink {
 
 struct InputFiber {
     uint64_t id = 0;
+    // Stable identity, carried through so callers can act on a placed fiber
+    // after the runtime ids have been reassigned.
+    std::string fileName;
     QString label;
     char hvTag = '?';
     std::vector<cv::Vec3d> controlPoints;
@@ -66,6 +70,7 @@ struct Run {
 
 struct PlacedFiber {
     uint64_t id = 0;
+    std::string fileName;
     QString label;
     char hvTag = '?';
     std::vector<Run> runs;
