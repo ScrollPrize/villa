@@ -97,7 +97,9 @@ private:
     void rebuildLayout();
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
-    void markStale();
+    // The reason is shown in the status line, so it names what actually changed
+    // rather than always blaming the fibers.
+    void markStale(const QString& reason);
     // Drops the layout entirely, for the changes that leave it not merely out of
     // date but meaningless: geometry unrolled in one coordinate frame says
     // nothing about another, and a different package has different fibers.
@@ -168,6 +170,12 @@ private:
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
     QString _layoutUmbilicusFingerprint;
+    // Whether a layout has ever been built. Distinct from "the layout has no
+    // networks": an empty result is still a result, built from dependencies that
+    // can go out of date, and conflating the two left a map that had found no
+    // umbilicus saying so forever. Also what keeps the dependency comparison from
+    // firing against a default-constructed frame before the first build.
+    bool _layoutBuilt = false;
     bool _stale = false;
     QString _umbilicusStatusText;
     QString _umbilicusStatusFingerprint;

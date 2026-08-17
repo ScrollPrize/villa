@@ -6227,6 +6227,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // one derivation — deriving them separately is what let a rebased store pair
     // a level-0 resolution with level-N counts.
     const auto frame = annotationFrame();
+    snapshot.frame = frame;
     snapshot.voxelSizeUm = frame.voxelSizeUm;
     if (snapshot.voxelSizeUm) {
         Logger()->info(

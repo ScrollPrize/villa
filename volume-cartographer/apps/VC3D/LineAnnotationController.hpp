@@ -150,6 +150,11 @@ public:
 
     struct FiberMapSnapshot {
         std::vector<FiberMapFiber> fibers;
+        // The frame this snapshot's geometry was derived in. Reported rather than
+        // left for a holder to re-derive: a second call to annotationFrame()
+        // reads live volume state and so could answer differently, which would
+        // tag a layout with a frame it was not built in.
+        vc3d::annotation::AnnotationFrame frame;
         // fiberDataGeneration() when this snapshot was taken; a holder compares
         // it to know whether what it built from this is still current.
         uint64_t generation = 0;
