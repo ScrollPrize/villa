@@ -13,8 +13,10 @@
 #include <optional>
 #include <vector>
 
+#include "AnnotationFrame.hpp"
 #include "FiberNetworkLayout.hpp"
 
+class CState;
 class LineAnnotationController;
 class QDockWidget;
 class QEvent;
@@ -67,7 +69,10 @@ class FiberMapWorkspace : public QMainWindow
     Q_OBJECT
 
 public:
+    // `state` is observed only for the package switch that invalidates a layout
+    // outright; it may be null in tests.
     explicit FiberMapWorkspace(LineAnnotationController* controller,
+                               CState* state,
                                QWidget* parent = nullptr);
 
 signals:
@@ -93,13 +98,21 @@ private:
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
     void markStale();
-    // Compares the controller's fiber generation against the one this layout
-    // was built from, marking stale on a mismatch; returns whether the map is
-    // stale. Cheap (one integer compare), so it guards interaction too.
+    // Drops the layout entirely, for the changes that leave it not merely out of
+    // date but meaningless: geometry unrolled in one coordinate frame says
+    // nothing about another, and a different package has different fibers.
+    void clearLayout(const QString& reason);
+    // Compares what the current layout was built from against what a rebuild
+    // would use now: a changed coordinate frame clears the map, while changed
+    // fibers or a changed umbilicus only mark it stale. Returns whether the map
+    // can still be acted on. Cheap enough to guard interaction — an integer
+    // compare, a few volume metadata reads, and one stat().
     bool refreshStaleState();
+    // The frame a rebuild would place geometry in right now.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame currentFrame() const;
     // Appends the package's umbilicus state to a status line, resolving it at
-    // most once per fiber generation: it is filesystem work, and the whole point
-    // of the generation check is to keep that off the annotation paths.
+    // most once per umbilicus fingerprint: it is filesystem work, and keying it
+    // to the fibers instead threw the answer away on every save.
     [[nodiscard]] QString withCachedUmbilicusStatus(const QString& status);
     // Scene units (voxels) per centimetre, from the package's voxel size when it
     // has one and from the documented assumption otherwise. This is the only
@@ -150,11 +163,13 @@ private:
     bool _viewFitted = false;
     bool _fiberDockSized = false;
     bool _retheming = false;
-    // Fiber generation the current layout came from, and whether a change has
-    // been seen since; a fresh workspace is stale until its first rebuild.
+    // What the current layout was built from, and whether a change has been seen
+    // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
+    vc3d::annotation::AnnotationFrame _layoutFrame;
+    QString _layoutUmbilicusFingerprint;
     bool _stale = false;
     QString _umbilicusStatusText;
-    uint64_t _umbilicusStatusGeneration = 0;
+    QString _umbilicusStatusFingerprint;
     bool _umbilicusStatusValid = false;
 };

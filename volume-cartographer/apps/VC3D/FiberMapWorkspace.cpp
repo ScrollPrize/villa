@@ -1,5 +1,6 @@
 #include "FiberMapWorkspace.hpp"
 
+#include "CState.hpp"
 #include "LineAnnotationController.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -482,7 +483,9 @@ void FiberMapView::mouseReleaseEvent(QMouseEvent* event)
     }
 }
 
-FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidget* parent)
+FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
+                                     CState* state,
+                                     QWidget* parent)
     : QMainWindow(parent)
     , _controller(controller)
 {
@@ -578,8 +581,19 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidg
 
     // No connections to the controller's change signals on purpose: annotation
     // work must not pay for a workspace that may never be opened. Staleness is
-    // discovered by comparing fiberDataGeneration() at the moments it matters —
-    // see refreshStaleState().
+    // discovered by comparing what the layout was built from at the moments it
+    // matters — see refreshStaleState().
+    //
+    // A package switch is the exception, and only because it cannot wait for
+    // one of those moments: leaving another scroll's fibers on screen until the
+    // next click is showing the wrong picture, not a late one. The slot drops
+    // the layout and nothing more, so no annotation path pays for it.
+    if (state) {
+        connect(state, &CState::vpkgChanged, this,
+                [this](const std::shared_ptr<VolumePkg>&) {
+                    clearLayout(tr("project changed — press Rebuild layout"));
+                });
+    }
 
     rebuildScene(tr("press Rebuild layout"));
 }
@@ -601,14 +615,20 @@ QString FiberMapWorkspace::formatMapLength(double valueVx) const
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
 {
-    const uint64_t generation =
-        _controller ? _controller->fiberDataGeneration() : 0;
-    if (!_umbilicusStatusValid || generation != _umbilicusStatusGeneration) {
+    const QString fingerprint =
+        _controller ? _controller->umbilicusFingerprint() : QString();
+    if (!_umbilicusStatusValid || fingerprint != _umbilicusStatusFingerprint) {
         _umbilicusStatusText = withUmbilicusStatus(QString(), _controller);
-        _umbilicusStatusGeneration = generation;
+        _umbilicusStatusFingerprint = fingerprint;
         _umbilicusStatusValid = true;
     }
     return status + _umbilicusStatusText;
+}
+
+vc3d::annotation::AnnotationFrame FiberMapWorkspace::currentFrame() const
+{
+    return _controller ? _controller->annotationFrame()
+                       : vc3d::annotation::AnnotationFrame{};
 }
 
 void FiberMapWorkspace::markStale()
@@ -620,15 +640,54 @@ void FiberMapWorkspace::markStale()
     }
 }
 
+void FiberMapWorkspace::clearLayout(const QString& reason)
+{
+    // Emptying the layout first is what makes rebuildScene() draw the reason
+    // instead of geometry; it also owns tearing down the items, the entries and
+    // the highlight, so none of that is repeated here.
+    _layout = {};
+    _layoutGeneration = 0;
+    _layoutFrame = {};
+    _layoutUmbilicusFingerprint.clear();
+    _voxelSizeUm.reset();
+    _scrollZMaxVx = 0.0;
+    // A fresh fit belongs to the next layout, which is not this one's frame.
+    _viewFitted = false;
+    // Whatever was cached about the umbilicus described the old package.
+    _umbilicusStatusValid = false;
+    _stale = true;
+    if (_tree) {
+        _tree->clear();
+    }
+    rebuildScene(reason);
+    if (_statusLabel) {
+        _statusLabel->setText(withCachedUmbilicusStatus(reason));
+    }
+}
+
 bool FiberMapWorkspace::refreshStaleState()
 {
+    if (!_controller || _layout.networks.empty()) {
+        return _stale;
+    }
+    // The frame comes first: geometry unrolled in one coordinate frame is not
+    // out of date in another, it is meaningless there, so this clears rather
+    // than marks. Two stores of one scan at different downsample levels compare
+    // equal, which is why switching between them costs nothing.
+    if (!vc3d::annotation::sameAnnotationFrame(currentFrame(), _layoutFrame)) {
+        clearLayout(tr("coordinate frame changed — press Rebuild layout"));
+        return true;
+    }
     if (_stale) {
         return true;
     }
-    if (!_controller || _layout.networks.empty()) {
-        return false;
-    }
     if (_controller->fiberDataGeneration() != _layoutGeneration) {
+        markStale();
+        return true;
+    }
+    // Attaching or repointing the umbilicus changes where every fiber lands and
+    // emits nothing to say so.
+    if (_controller->umbilicusFingerprint() != _layoutUmbilicusFingerprint) {
         markStale();
         return true;
     }
@@ -657,6 +716,10 @@ void FiberMapWorkspace::rebuildLayout()
     }
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
     _layoutGeneration = snapshot.generation;
+    // Everything the snapshot was derived from, so a later check compares against
+    // what this build actually used rather than against whatever is current.
+    _layoutFrame = currentFrame();
+    _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
     _stale = false;
 
     // The snapshot's geometry is handed straight to the layout; every fiber of
@@ -1243,20 +1306,34 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     QAction* action = menu.addAction(tr("Go to control point %1 in %2")
                                         .arg(bestIndex)
                                         .arg(_controller->fiberDisplayName(fiberId)));
-    // Resolve the runtime id from the file name when the action fires, not from
-    // the id captured here: a reload in between would have reassigned it.
-    connect(action, &QAction::triggered, this, [this, fileName, bestIndex]() {
-        if (!_controller) {
-            return;
-        }
-        const uint64_t target = _controller->fiberIdForFileName(fileName);
-        if (target == 0) {
-            markStale();
-            Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
-                           fileName);
-            return;
-        }
-        emit openFiberAtControlPointRequested(target, bestIndex);
-    });
+    // menu.exec() runs a nested event loop, so the fiber set can change while the
+    // menu is open. Both captures matter: the runtime id is resolved from the file
+    // name because a reload reassigns ids, and the generation is compared because
+    // bestIndex indexes the control points as they were when the menu was built —
+    // an edit in between could have made it mean a different point, or none.
+    const uint64_t menuGeneration = _controller->fiberDataGeneration();
+    connect(action, &QAction::triggered, this,
+            [this, fileName, bestIndex, menuGeneration]() {
+                if (!_controller) {
+                    return;
+                }
+                if (_controller->fiberDataGeneration() != menuGeneration) {
+                    markStale();
+                    Logger()->warn(
+                        "Fiber map: fibers changed while the menu was open; not "
+                        "navigating to control point {} in {}",
+                        bestIndex,
+                        fileName);
+                    return;
+                }
+                const uint64_t target = _controller->fiberIdForFileName(fileName);
+                if (target == 0) {
+                    markStale();
+                    Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
+                                   fileName);
+                    return;
+                }
+                emit openFiberAtControlPointRequested(target, bestIndex);
+            });
     menu.exec(globalPos);
 }
