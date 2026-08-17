@@ -104,11 +104,11 @@ def main(argv=None):
                            help="Type of pooling in encoder ('conv' = strided conv)")
 
     # Training Control
-    grp_train.add_argument("--max-epoch", type=int, default=1000,
+    grp_train.add_argument("--max-epoch", type=int, default=None,
                            help="Maximum number of epochs")
-    grp_train.add_argument("--max-steps-per-epoch", type=int, default=250,
+    grp_train.add_argument("--max-steps-per-epoch", type=int, default=None,
                            help="Max training steps per epoch (use all data if unset)")
-    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=50,
+    grp_train.add_argument("--max-val-steps-per-epoch", type=int, default=None,
                            help="Max validation steps per epoch (use all data if unset)")
     grp_train.add_argument("--full-epoch", action="store_true",
                            help="Iterate over entire train/val set per epoch (overrides max-steps)")
