@@ -1,27 +1,22 @@
-# VC3D short line-segment handling
+# VC3D control-point collapse rollback fixes
 
-Use one 32-base-voxel sampling distance for generated line strips and control-
-point click replacement.
+Correct two regressions in generated-view control-point editing introduced by
+the 32-base-voxel multi-control collapse behavior.
 
 Requirements:
 
-- Keep every annotation control point and both line endpoints as exact strip
-  supports. Internal optimized line points define the path but are not supports.
-- Resample each control-point span by optimized-polyline arclength using the
-  interval count whose physical spacing is closest to 32.
-- Keep control-point spans at or below 32 base voxels as one strip interval.
-- Declare the generated strip's along-line scale as exactly `1/32`, so short
-  physical spans are expanded to one nominal display interval.
-- Use exactly seven cross-strip samples at 32 base voxels for both the line
-  surface and side slice, giving a fixed 192-base-voxel extent close to the
-  previous typical width.
-- Remove the unused configurable cross extents and cross-sample count.
-- On generated-view clicks, compare existing controls by optimized-polyline
-  arclength rather than line-index distance.
-- Collapse every existing control within an inclusive 32-base-voxel arclength
-  radius into one control at the clicked location.
-- Keep Max extrap CP distance separate: it limits only placement beyond the
-  outer controls and is always measured by optimized-polyline arclength in base
-  voxels. Interior placement remains unrestricted.
-- Preserve seed, interpolation-span, branch-link, and endpoint semantics while
-  collapsing controls.
+- Automatic multi-control collapse must use the same local line-update sequence
+  as insertion and single-control replacement: reconstruct the adjacent spans
+  around the replacement's authoritative `linePosition`, then start fiber-mode
+  optimization from that updated line.
+- Do not start multi-control optimization directly against the unchanged old
+  line. In particular, a replacement on a self-approaching fiber must not be
+  associated with another winding by nearest 3-D position.
+- Preserve the existing 32-base-voxel inclusive collapse selection, control
+  metadata ownership, branch-index remapping, dirty-span scope, seed/focus
+  behavior, no-reoptimization behavior, and asynchronous failure rollback.
+- If synchronous local update preparation throws, leave the pre-edit controls,
+  line, branches, seed/focus, and optimization state unchanged.
+- Keep the broader persisted-control/legacy nearest-3-D reconstruction issue out
+  of scope; this task fixes the PR 1484 regression without changing the fiber
+  file format.

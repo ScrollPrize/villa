@@ -2,6 +2,9 @@
 
 ## 2026-08-17
 
+- Anchored multi-control collapse through the ordinary local span update before
+  fiber optimization and made failed synchronous edit preparation leave the
+  prior session state unchanged.
 - Resampled generated strips between exact control-point supports at a 32-vx pitch, fixed their cross width near the previous default, and made nearby control-point replacement use physical polyline arclength.
 
 - Added a VC3D Download parallelism setting that switches the process-wide
