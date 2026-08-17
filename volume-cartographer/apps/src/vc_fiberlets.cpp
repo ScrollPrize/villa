@@ -127,11 +127,12 @@ void usage(const char* executable)
               << "  --window N                    refinement radius in base voxels [cell-side]\n"
               << "  --presence-floor N            inclusive observation floor [0.05]\n"
               << "  --minimum-support N           inclusive aligned support [0.05]\n"
-              << "  --merge-angle-deg N           maximum duplicate-axis angle [10]\n"
-              << "  --merge-abs-loss N            maximum normalized merge loss [0.01]\n"
-              << "  --merge-rel-loss N            maximum relative merge loss [0.05]\n"
+              << "  --robust-max-trim N           maximum trimmed evidence mass [0.20]\n"
+              << "  --robust-mad-multiplier N     angular residual MAD multiplier [3]\n"
+              << "  --robust-min-angle-deg N      angular noise floor [5]\n"
+              << "  --nms-angle-deg N             maximum duplicate-axis angle [10]\n"
               << "  --maximum-seeds N             deterministic PCA seed count [8]\n"
-              << "  --maximum-iterations N        assignment/PCA iteration limit [64]\n"
+              << "  --maximum-iterations N        robust assignment/update pass limit [2]\n"
               << "  --crop X,Y,Z,W,H,D            base-volume box; selects intersected cells\n"
               << "  --glyph-length-base-voxels N  diagnostic anchor length [16]\n\n"
               << "Path options:\n"
@@ -320,14 +321,18 @@ CliOptions parseArgs(int argc, char** argv)
             options.anchors.observationPresenceFloor = parseDouble(valueAfter(index, argc, argv, "presence-floor"), "presence-floor");
         } else if (argument == "--minimum-support" && options.command != Command::Paths) {
             options.anchors.minimumAlignedSupport = parseDouble(valueAfter(index, argc, argv, "minimum-support"), "minimum-support");
-        } else if (argument == "--merge-angle-deg" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumAngleDegrees = parseDouble(valueAfter(index, argc, argv, "merge-angle-deg"), "merge-angle-deg");
-        } else if (argument == "--merge-abs-loss" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumAbsoluteObjectiveLoss =
-                parseDouble(valueAfter(index, argc, argv, "merge-abs-loss"), "merge-abs-loss");
-        } else if (argument == "--merge-rel-loss" && options.command != Command::Paths) {
-            options.anchors.mergeMaximumRelativeObjectiveLoss =
-                parseDouble(valueAfter(index, argc, argv, "merge-rel-loss"), "merge-rel-loss");
+        } else if (argument == "--robust-max-trim" && options.command != Command::Paths) {
+            options.anchors.robustMaximumTrimMassFraction =
+                parseDouble(valueAfter(index, argc, argv, "robust-max-trim"), "robust-max-trim");
+        } else if (argument == "--robust-mad-multiplier" && options.command != Command::Paths) {
+            options.anchors.robustMadMultiplier =
+                parseDouble(valueAfter(index, argc, argv, "robust-mad-multiplier"), "robust-mad-multiplier");
+        } else if (argument == "--robust-min-angle-deg" && options.command != Command::Paths) {
+            options.anchors.robustMinimumAngleDegrees =
+                parseDouble(valueAfter(index, argc, argv, "robust-min-angle-deg"), "robust-min-angle-deg");
+        } else if (argument == "--nms-angle-deg" && options.command != Command::Paths) {
+            options.anchors.nmsMaximumAngleDegrees =
+                parseDouble(valueAfter(index, argc, argv, "nms-angle-deg"), "nms-angle-deg");
         } else if (argument == "--maximum-seeds" && options.command != Command::Paths) {
             const int value = parseInt(valueAfter(index, argc, argv, "maximum-seeds"), "maximum-seeds");
             if (value <= 0)
@@ -504,7 +509,6 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.peakGridStepPredictionVoxels = options.peakStepBaseVoxels.value_or(0.5 * grid.predictionToBaseScale) / grid.predictionToBaseScale;
     options.anchors.localWindowRadiusPredictionVoxels = options.localWindowBaseVoxels.value_or(cellSideBase) / grid.predictionToBaseScale;
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
-    options.anchors.nmsMaximumAngleDegrees = options.anchors.mergeMaximumAngleDegrees;
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
 }
@@ -573,8 +577,21 @@ void printTubeExtractionProfile(
         fit.seedPairRefinementWorkSeconds + fit.initializationWorkSeconds +
         fit.localRefinementWorkSeconds + fit.peakSearchWorkSeconds +
         fit.finalEvaluationWorkSeconds;
+    const double localProfiledWorkSeconds =
+        fit.localTensorProposalWorkSeconds +
+        fit.localCentroidProposalWorkSeconds +
+        fit.localStateEvaluationWorkSeconds;
+    const auto depthCounts = [](const auto& counts) {
+        std::ostringstream encoded;
+        for (size_t depth = 0; depth < counts.size(); ++depth) {
+            if (depth != 0)
+                encoded << ',';
+            encoded << counts[depth];
+        }
+        return encoded.str();
+    };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=2"
+           << "fiberlet_extraction_profile version=4"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -628,6 +645,26 @@ void printTubeExtractionProfile(
            << fit.localRefinementAcceptedSteps
            << " anchor_fit_backtracking_evaluations="
            << fit.backtrackingEvaluations
+           << " anchor_fit_robust_components_without_outliers="
+           << fit.robustComponentsWithoutOutliers
+           << " anchor_fit_robust_trimmed_components="
+           << fit.robustTrimmedComponents
+           << " anchor_fit_robust_removed_nonunique_components="
+           << fit.robustRemovedNonuniqueComponents
+           << " anchor_fit_robust_hard_limit_hits="
+           << fit.robustHardLimitHits
+           << " anchor_fit_spatial_candidates_tested="
+           << fit.spatialCandidatesTested
+           << " anchor_fit_robust_candidate_trimmed_mass="
+           << fit.robustCandidateTrimmedMass
+           << " anchor_fit_robust_trimmed_mass="
+           << fit.robustTrimmedMass
+           << " anchor_fit_robust_retained_mass="
+           << fit.robustRetainedMass
+           << " anchor_fit_spatial_tested_by_depth="
+           << depthCounts(fit.spatialCandidatesTestedByDepth)
+           << " anchor_fit_spatial_accepted_by_depth="
+           << depthCounts(fit.spatialCandidatesAcceptedByDepth)
            << " anchor_fit_local_tensor_observation_visits="
            << fit.localTensorObservationVisits
            << " anchor_fit_local_centroid_observation_visits="
@@ -656,6 +693,18 @@ void printTubeExtractionProfile(
            << fit.initializationWorkSeconds
            << " anchor_fit_local_refinement_work_seconds="
            << fit.localRefinementWorkSeconds
+           << " anchor_fit_local_tensor_proposal_work_seconds="
+           << fit.localTensorProposalWorkSeconds
+           << " anchor_fit_local_centroid_proposal_work_seconds="
+           << fit.localCentroidProposalWorkSeconds
+           << " anchor_fit_local_state_evaluation_work_seconds="
+           << fit.localStateEvaluationWorkSeconds
+           << " anchor_fit_local_profiled_work_seconds="
+           << localProfiledWorkSeconds
+           << " anchor_fit_local_control_work_seconds="
+           << std::max(
+                  0.0, fit.localRefinementWorkSeconds -
+                      localProfiledWorkSeconds)
            << " anchor_fit_peak_search_work_seconds="
            << fit.peakSearchWorkSeconds
            << " anchor_fit_final_evaluation_work_seconds="
@@ -1212,6 +1261,9 @@ int main(int argc, char** argv)
                       << " local_window_base_voxels=" << options.anchors.localWindowRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " nms_transverse_radius_base_voxels=" << options.anchors.nmsTransverseRadiusPredictionVoxels * grid.predictionToBaseScale
                       << " nms_longitudinal_radius_base_voxels=" << options.anchors.nmsLongitudinalRadiusPredictionVoxels * grid.predictionToBaseScale
+                      << " robust_max_trim=" << options.anchors.robustMaximumTrimMassFraction
+                      << " robust_mad_multiplier=" << options.anchors.robustMadMultiplier
+                      << " robust_min_angle_deg=" << options.anchors.robustMinimumAngleDegrees
                       << " cell_diagonal_base_voxels=" << cellSideBase * std::sqrt(3.0) << " cells=" << report.diagnostics.totalCells
                       << " anchors=" << report.diagnostics.oneAnchorCells + 2 * report.diagnostics.twoAnchorCells
                       << " zero=" << report.diagnostics.zeroAnchorCells << " one=" << report.diagnostics.oneAnchorCells

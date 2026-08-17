@@ -144,6 +144,7 @@ struct RefinedComponentState {
 
 struct RefinedEvaluation {
     std::vector<uint8_t> assignments;
+    std::vector<uint8_t> retainedInliers;
     std::array<double, 2> denominators{0.0, 0.0};
     std::array<double, 2> numerators{0.0, 0.0};
     std::array<double, 2> presenceMasses{0.0, 0.0};
@@ -153,10 +154,108 @@ struct RefinedEvaluation {
 
 struct RefinedFitState {
     std::array<RefinedComponentState, 2> components;
+    std::array<size_t, 2> componentIds{0, 1};
+    std::array<size_t, 2> removedComponentIds{
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
     RefinedEvaluation evaluation;
     size_t activeComponents = 0;
+    size_t removedComponentCount = 0;
     size_t acceptedIterations = 0;
 };
+
+constexpr size_t kRobustHistogramBins = 256;
+
+[[nodiscard]] size_t robustHistogramBin(double residual)
+{
+    const double bounded = std::clamp(residual, 0.0, 1.0);
+    return std::min(
+        kRobustHistogramBins - 1,
+        static_cast<size_t>(std::floor(
+            bounded * static_cast<double>(kRobustHistogramBins))));
+}
+
+[[nodiscard]] double robustHistogramCenter(size_t bin)
+{
+    return (static_cast<double>(bin) + 0.5) /
+        static_cast<double>(kRobustHistogramBins);
+}
+
+[[nodiscard]] size_t weightedHistogramQuantileBin(
+    const std::array<double, kRobustHistogramBins>& histogram,
+    double totalMass,
+    double quantile)
+{
+    if (!(totalMass > 0.0))
+        return kRobustHistogramBins - 1;
+    const double target = std::clamp(quantile, 0.0, 1.0) * totalMass;
+    double cumulative = 0.0;
+    for (size_t bin = 0; bin < histogram.size(); ++bin) {
+        cumulative += histogram[bin];
+        if (cumulative >= target)
+            return bin;
+    }
+    return kRobustHistogramBins - 1;
+}
+
+[[nodiscard]] double histogramMassAbove(
+    const std::array<double, kRobustHistogramBins>& histogram,
+    size_t cutoffBin)
+{
+    return std::accumulate(
+        histogram.begin() + static_cast<std::ptrdiff_t>(cutoffBin + 1),
+        histogram.end(), 0.0);
+}
+
+struct RobustHistogramCutoff {
+    FiberAnchorRobustCutoff summary;
+    size_t cutoffBin = kRobustHistogramBins - 1;
+};
+
+[[nodiscard]] RobustHistogramCutoff selectRobustHistogramCutoff(
+    const std::array<double, kRobustHistogramBins>& residualHistogram,
+    const std::array<double, kRobustHistogramBins>& deviationHistogram,
+    double totalMass,
+    double median,
+    double maximumTrimMassFraction,
+    double madMultiplier,
+    double minimumAngleDegrees)
+{
+    RobustHistogramCutoff result;
+    result.summary.totalMass = totalMass;
+    result.summary.retainedMass = totalMass;
+    if (!(totalMass > 0.0) || !(maximumTrimMassFraction > 0.0))
+        return result;
+
+    const double mad = robustHistogramCenter(weightedHistogramQuantileBin(
+        deviationHistogram, totalMass, 0.5));
+    const double floorRadians = minimumAngleDegrees * std::acos(-1.0) / 180.0;
+    const double floorResidual = std::sin(floorRadians) * std::sin(floorRadians);
+    result.cutoffBin = robustHistogramBin(std::clamp(
+        std::max(median + madMultiplier * mad, floorResidual), 0.0, 1.0));
+    result.summary.candidateTrimmedMass = histogramMassAbove(
+        residualHistogram, result.cutoffBin);
+    result.summary.detectedOutliers =
+        result.summary.candidateTrimmedMass > 0.0;
+    if (!result.summary.detectedOutliers)
+        return result;
+
+    const double maximumTrimmed = maximumTrimMassFraction * totalMass;
+    if (result.summary.candidateTrimmedMass > maximumTrimmed) {
+        result.cutoffBin = std::max(
+            result.cutoffBin,
+            weightedHistogramQuantileBin(
+                residualHistogram, totalMass,
+                1.0 - maximumTrimMassFraction));
+    }
+    result.summary.cutoffResidual =
+        static_cast<double>(result.cutoffBin + 1) /
+        static_cast<double>(kRobustHistogramBins);
+    result.summary.trimmedMass = histogramMassAbove(
+        residualHistogram, result.cutoffBin);
+    result.summary.retainedMass = totalMass - result.summary.trimmedMass;
+    return result;
+}
 
 struct PeakOwnerBounds {
     cv::Vec3d lower{0.0, 0.0, 0.0};
@@ -328,103 +427,235 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
          config.gaussianSigmaPredictionVoxels));
 }
 
-[[nodiscard]] RefinedEvaluation evaluateRefinedState(
+[[nodiscard]] bool usableDirectionObservation(
+    const FiberAnchorObservation& observation,
+    const FiberAnchorConfig& config,
+    cv::Vec3d& direction)
+{
+    if (!observation.valid || !finiteVector(observation.direction) ||
+        !std::isfinite(observation.presence) ||
+        observation.presence < config.observationPresenceFloor ||
+        observation.presence < 0.0 || observation.presence > 1.0) {
+        return false;
+    }
+    direction = normalized(observation.direction);
+    return direction.dot(direction) > kMatrixEpsilon;
+}
+
+struct RobustDirectionProposal {
+    std::vector<uint8_t> assignments;
+    std::vector<uint8_t> retainedInliers;
+    std::array<cv::Vec3d, 2> axes{};
+    std::array<bool, 2> unique{false, false};
+};
+
+[[nodiscard]] RobustDirectionProposal robustDirectionProposal(
     const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile)
+{
+    RobustDirectionProposal proposal;
+    proposal.assignments.assign(observations.size(), kUnassignedComponent);
+    proposal.retainedInliers.assign(observations.size(), 0);
+    std::array<std::array<double, kRobustHistogramBins>, 2> residualHistograms{};
+    std::array<double, 2> totalMass{0.0, 0.0};
+
+    for (size_t index = 0; index < observations.size(); ++index) {
+        const auto& observation = observations[index];
+        cv::Vec3d direction;
+        if (!usableDirectionObservation(observation, config, direction))
+            continue;
+        std::array<double, 2> gaussian{0.0, 0.0};
+        std::array<double, 2> alignment{0.0, 0.0};
+        std::array<double, 2> score{0.0, 0.0};
+        for (size_t component = 0; component < activeComponents; ++component) {
+            gaussian[component] = transverseGaussian(
+                observation, components[component], pivot, config);
+            const double dot = direction.dot(components[component].axis);
+            alignment[component] = dot * dot;
+            score[component] = gaussian[component] * observation.presence *
+                alignment[component];
+        }
+        uint8_t assigned = kUnassignedComponent;
+        for (size_t component = 0; component < activeComponents; ++component) {
+            if (score[component] > 0.0 &&
+                (assigned == kUnassignedComponent ||
+                 score[component] > score[assigned])) {
+                assigned = static_cast<uint8_t>(component);
+            }
+        }
+        proposal.assignments[index] = assigned;
+        if (assigned == kUnassignedComponent)
+            continue;
+        const double mass = gaussian[assigned] * observation.presence;
+        const double residual = std::clamp(1.0 - alignment[assigned], 0.0, 1.0);
+        residualHistograms[assigned][robustHistogramBin(residual)] += mass;
+        totalMass[assigned] += mass;
+    }
+    if (profile != nullptr)
+        profile->localTensorObservationVisits += observations.size();
+
+    std::array<size_t, 2> cutoffBins{
+        kRobustHistogramBins - 1, kRobustHistogramBins - 1};
+    for (size_t component = 0; component < activeComponents; ++component) {
+        if (!(totalMass[component] > 0.0) ||
+            !(config.robustMaximumTrimMassFraction > 0.0)) {
+            if (profile != nullptr)
+                profile->robustRetainedMass += totalMass[component];
+            continue;
+        }
+        const size_t medianBin = weightedHistogramQuantileBin(
+            residualHistograms[component], totalMass[component], 0.5);
+        const double median = robustHistogramCenter(medianBin);
+        std::array<double, kRobustHistogramBins> deviationHistogram{};
+        for (size_t index = 0; index < observations.size(); ++index) {
+            if (proposal.assignments[index] != component)
+                continue;
+            const auto& observation = observations[index];
+            cv::Vec3d direction;
+            if (!usableDirectionObservation(observation, config, direction))
+                continue;
+            const double gaussian = transverseGaussian(
+                observation, components[component], pivot, config);
+            const double dot = direction.dot(components[component].axis);
+            const double residual = std::clamp(1.0 - dot * dot, 0.0, 1.0);
+            deviationHistogram[robustHistogramBin(std::abs(residual - median))] +=
+                gaussian * observation.presence;
+        }
+        if (profile != nullptr)
+            profile->localTensorObservationVisits += observations.size();
+        const RobustHistogramCutoff cutoff = selectRobustHistogramCutoff(
+            residualHistograms[component], deviationHistogram,
+            totalMass[component], median,
+            config.robustMaximumTrimMassFraction,
+            config.robustMadMultiplier,
+            config.robustMinimumAngleDegrees);
+        if (!cutoff.summary.detectedOutliers) {
+            if (profile != nullptr) {
+                ++profile->robustComponentsWithoutOutliers;
+                profile->robustRetainedMass += totalMass[component];
+            }
+            continue;
+        }
+        cutoffBins[component] = cutoff.cutoffBin;
+        if (profile != nullptr) {
+            profile->robustCandidateTrimmedMass +=
+                cutoff.summary.candidateTrimmedMass;
+            profile->robustTrimmedMass += cutoff.summary.trimmedMass;
+            profile->robustRetainedMass += cutoff.summary.retainedMass;
+            if (cutoff.summary.trimmedMass > 0.0)
+                ++profile->robustTrimmedComponents;
+        }
+    }
+
+    std::array<std::array<CompensatedSum, 9>, 2> tensorSums;
+    for (size_t index = 0; index < observations.size(); ++index) {
+        const uint8_t assigned = proposal.assignments[index];
+        if (assigned >= activeComponents)
+            continue;
+        const auto& observation = observations[index];
+        cv::Vec3d direction;
+        if (!usableDirectionObservation(observation, config, direction))
+            continue;
+        const double gaussian = transverseGaussian(
+            observation, components[assigned], pivot, config);
+        const double dot = direction.dot(components[assigned].axis);
+        const double residual = std::clamp(1.0 - dot * dot, 0.0, 1.0);
+        if (robustHistogramBin(residual) > cutoffBins[assigned])
+            continue;
+        proposal.retainedInliers[index] = 1;
+        const double mass = gaussian * observation.presence;
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                tensorSums[assigned][static_cast<size_t>(row * 3 + column)].add(
+                    mass * direction[row] * direction[column]);
+            }
+        }
+    }
+    if (profile != nullptr)
+        profile->localTensorObservationVisits += observations.size();
+    for (size_t component = 0; component < activeComponents; ++component) {
+        cv::Matx33d tensor;
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                tensor(row, column) = tensorSums[component][
+                    static_cast<size_t>(row * 3 + column)].sum;
+            }
+        }
+        const FiberPrincipalAxis principal = principalFiberAxis(tensor);
+        proposal.unique[component] = principal.unique;
+        if (principal.unique)
+            proposal.axes[component] = principal.axis;
+    }
+    return proposal;
+}
+
+[[nodiscard]] double retainedSpatialObjective(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    CompensatedSum numerator;
+    CompensatedSum denominator;
+    for (size_t index = 0; index < observations.size(); ++index) {
+        for (size_t component = 0; component < activeComponents; ++component) {
+            denominator.add(transverseGaussian(
+                observations[index], components[component], pivot, config));
+        }
+        const uint8_t component = assignments[index];
+        cv::Vec3d direction;
+        if (!retainedInliers[index] || component >= activeComponents)
+            continue;
+        if (!usableDirectionObservation(observations[index], config, direction))
+            continue;
+        const double gaussian = transverseGaussian(
+            observations[index], components[component], pivot, config);
+        const double dot = direction.dot(components[component].axis);
+        numerator.add(gaussian * observations[index].presence * dot * dot);
+    }
+    return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+}
+
+[[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
     const FiberAnchorConfig& config)
 {
     RefinedEvaluation evaluation;
-    evaluation.assignments.assign(observations.size(), kUnassignedComponent);
+    evaluation.assignments = assignments;
+    evaluation.retainedInliers = retainedInliers;
     std::array<CompensatedSum, 2> denominators;
     std::array<CompensatedSum, 2> numerators;
     std::array<CompensatedSum, 2> presenceMasses;
-    const double cutoff = config.gaussianCutoffSigmas *
-        config.gaussianSigmaPredictionVoxels;
-    double maximumDistanceSquared = 0.0;
-    // Resolve each finite kernel into pivot-parallel and pivot-transverse reach.
-    for (size_t component = 0; component < activeComponents; ++component) {
-        const double axisNormSquared =
-            components[component].axis.dot(components[component].axis);
-        const cv::Vec3d positionOffset =
-            components[component].position - pivot;
-        const double positionDistanceSquared =
-            positionOffset.dot(positionOffset);
-        if (!(axisNormSquared > kMatrixEpsilon * kMatrixEpsilon) ||
-            !std::isfinite(axisNormSquared) ||
-            !std::isfinite(positionDistanceSquared)) {
-            maximumDistanceSquared =
-                std::numeric_limits<double>::infinity();
-            break;
-        }
-        const double maximumAxialDistance =
-            config.axialSupportHalfWidthPredictionVoxels /
-            std::sqrt(axisNormSquared);
-        const double maximumTransverseDistance =
-            cutoff + std::sqrt(std::max(0.0, positionDistanceSquared));
-        const double broadPhaseMargin = 1.0e-9 * std::max({
-            1.0, maximumAxialDistance, maximumTransverseDistance});
-        const double conservativeAxialDistance =
-            maximumAxialDistance + broadPhaseMargin;
-        const double conservativeTransverseDistance =
-            maximumTransverseDistance + broadPhaseMargin;
-        const double componentDistanceSquared = std::nextafter(
-            conservativeAxialDistance * conservativeAxialDistance +
-                conservativeTransverseDistance *
-                    conservativeTransverseDistance,
-            std::numeric_limits<double>::infinity());
-        maximumDistanceSquared = std::max(
-            maximumDistanceSquared, componentDistanceSquared);
-    }
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto& observation = observations[index];
-        std::array<double, 2> gaussian{0.0, 0.0};
-        std::array<double, 2> evidence{0.0, 0.0};
-        bool potentiallySupported = false;
-        if (finiteVector(observation.positionPredictionXYZ)) {
-            const cv::Vec3d pivotOffset =
-                observation.positionPredictionXYZ - pivot;
-            const double pivotDistanceSquared = pivotOffset.dot(pivotOffset);
-            potentiallySupported = !std::isfinite(pivotDistanceSquared) ||
-                pivotDistanceSquared <= maximumDistanceSquared;
-        }
         for (size_t component = 0; component < activeComponents; ++component) {
-            gaussian[component] = potentiallySupported
-                ? transverseGaussian(
-                      observation, components[component], pivot, config)
-                : 0.0;
-            denominators[component].add(gaussian[component]);
-            if (!(gaussian[component] > 0.0) || !observation.valid ||
-                !finiteVector(observation.direction) ||
-                !std::isfinite(observation.presence) ||
-                observation.presence < config.observationPresenceFloor ||
-                observation.presence < 0.0 || observation.presence > 1.0) {
-                continue;
-            }
-            const cv::Vec3d direction = normalized(observation.direction);
-            if (direction.dot(direction) <= kMatrixEpsilon)
-                continue;
-            const double dot = direction.dot(components[component].axis);
-            evidence[component] = observation.presence * dot * dot;
+            denominators[component].add(transverseGaussian(
+                observation, components[component], pivot, config));
         }
-        uint8_t assigned = kUnassignedComponent;
-        if (activeComponents == 1) {
-            if (evidence[0] > 0.0)
-                assigned = 0;
-        } else if (evidence[0] > 0.0 || evidence[1] > 0.0) {
-            assigned = evidence[0] >= evidence[1] ? 0 : 1;
-        }
-        evaluation.assignments[index] = assigned;
-        if (assigned == kUnassignedComponent)
+        const uint8_t assigned = assignments[index];
+        if (!retainedInliers[index] || assigned >= activeComponents)
             continue;
-        const auto& component = components[assigned];
-        const cv::Vec3d direction = normalized(observation.direction);
-        const double dot = direction.dot(component.axis);
+        cv::Vec3d direction;
+        if (!usableDirectionObservation(observation, config, direction))
+            continue;
+        const double gaussian = transverseGaussian(
+            observation, components[assigned], pivot, config);
+        const double dot = direction.dot(components[assigned].axis);
         numerators[assigned].add(
-            gaussian[assigned] * observation.presence * dot * dot);
-        presenceMasses[assigned].add(
-            gaussian[assigned] * observation.presence);
+            gaussian * observation.presence * dot * dot);
+        presenceMasses[assigned].add(gaussian * observation.presence);
         ++evaluation.assignedCounts[assigned];
     }
     CompensatedSum numeratorTotal;
@@ -446,15 +677,18 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     const std::vector<FiberAnchorObservation>& observations,
     const cv::Vec3d& pivot,
     const std::array<cv::Vec3d, 2>& seedAxes,
+    const std::array<size_t, 2>& seedComponentIds,
     size_t activeComponents,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
+    using RefinementClock = std::chrono::steady_clock;
     RefinedFitState state;
     state.activeComponents = activeComponents;
     for (size_t component = 0; component < activeComponents; ++component) {
         state.components[component].axis = canonicalFiberAxis(seedAxes[component]);
         state.components[component].position = pivot;
+        state.componentIds[component] = seedComponentIds[component];
     }
     cv::Vec3d lower{
         std::numeric_limits<double>::infinity(),
@@ -476,48 +710,64 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 upper[coordinate], observation.positionPredictionXYZ[coordinate]);
         }
     }
-    if (profile != nullptr)
-        profile->refinedEvaluationObservationVisits += observations.size();
-    state.evaluation = evaluateRefinedState(
-        observations, state.components, activeComponents, pivot, config);
-
     for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
         if (profile != nullptr) {
             ++profile->localRefinementAttempts;
-            profile->localTensorObservationVisits +=
-                activeComponents * observations.size();
-            profile->localCentroidObservationVisits +=
-                activeComponents * observations.size();
         }
-        auto proposed = state.components;
-        for (size_t component = 0; component < activeComponents; ++component) {
-            std::array<CompensatedSum, 9> tensorSums;
-            for (size_t index = 0; index < observations.size(); ++index) {
-                if (state.evaluation.assignments[index] != component)
-                    continue;
-                const auto& observation = observations[index];
-                const double gaussian = transverseGaussian(
-                    observation, state.components[component], pivot, config);
-                const cv::Vec3d direction = normalized(observation.direction);
-                const double weight = gaussian * observation.presence;
-                for (int row = 0; row < 3; ++row) {
-                    for (int column = 0; column < 3; ++column) {
-                        tensorSums[static_cast<size_t>(row * 3 + column)].add(
-                            weight * direction[row] * direction[column]);
-                    }
-                }
-            }
-            cv::Matx33d tensor;
-            for (int row = 0; row < 3; ++row) {
-                for (int column = 0; column < 3; ++column) {
-                    tensor(row, column) = tensorSums[
-                        static_cast<size_t>(row * 3 + column)].sum;
-                }
-            }
-            const FiberPrincipalAxis principal = principalFiberAxis(tensor);
-            if (principal.unique)
-                proposed[component].axis = principal.axis;
+        const auto tensorStart = profile != nullptr
+            ? RefinementClock::now()
+            : RefinementClock::time_point{};
+        RobustDirectionProposal robust = robustDirectionProposal(
+            observations, state.components, state.activeComponents, pivot,
+            config, profile);
+        if (profile != nullptr) {
+            profile->localTensorProposalWorkSeconds +=
+                std::chrono::duration<double>(
+                    RefinementClock::now() - tensorStart).count();
+        }
 
+        bool removedComponent = false;
+        std::array<RefinedComponentState, 2> compactComponents{};
+        std::array<size_t, 2> compactIds{kNoDiagnosticId, kNoDiagnosticId};
+        size_t compactCount = 0;
+        for (size_t component = 0; component < state.activeComponents; ++component) {
+            if (!robust.unique[component]) {
+                removedComponent = true;
+                state.removedComponentIds[state.removedComponentCount++] =
+                    state.componentIds[component];
+                if (profile != nullptr)
+                    ++profile->robustRemovedNonuniqueComponents;
+                continue;
+            }
+            compactComponents[compactCount] = state.components[component];
+            compactComponents[compactCount].axis = robust.axes[component];
+            compactIds[compactCount] = state.componentIds[component];
+            ++compactCount;
+        }
+        if (compactCount == 0) {
+            state.activeComponents = 0;
+            state.evaluation.assignments.assign(
+                observations.size(), kUnassignedComponent);
+            state.evaluation.retainedInliers.assign(observations.size(), 0);
+            if (profile != nullptr) {
+                profile->localRefinementAcceptedSteps +=
+                    state.acceptedIterations;
+            }
+            return state;
+        }
+        if (removedComponent) {
+            state.components = compactComponents;
+            state.componentIds = compactIds;
+            state.activeComponents = compactCount;
+            --iteration;
+            continue;
+        }
+
+        auto proposed = compactComponents;
+        const auto centroidStart = profile != nullptr
+            ? RefinementClock::now()
+            : RefinementClock::time_point{};
+        for (size_t component = 0; component < state.activeComponents; ++component) {
             const cv::Vec3d projectedCurrent = projectToConstraintPlane(
                 state.components[component].position,
                 pivot,
@@ -529,8 +779,10 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 projectedCurrent,
             };
             for (size_t index = 0; index < observations.size(); ++index) {
-                if (state.evaluation.assignments[index] != component)
+                if (robust.assignments[index] != component ||
+                    !robust.retainedInliers[index]) {
                     continue;
+                }
                 const auto& observation = observations[index];
                 const double gaussian = transverseGaussian(
                     observation, centered, pivot, config);
@@ -558,68 +810,118 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                     config.localWindowRadiusPredictionVoxels, lower, upper);
             }
         }
+        if (profile != nullptr) {
+            profile->localCentroidObservationVisits +=
+                state.activeComponents * observations.size();
+            profile->localCentroidProposalWorkSeconds +=
+                std::chrono::duration<double>(
+                    RefinementClock::now() - centroidStart).count();
+        }
 
-        bool accepted = false;
-        RefinedFitState candidate = state;
+        std::array<RefinedComponentState, 2> baseline = state.components;
         double acceptedDirectionUpdate = 0.0;
+        double maximumTargetDisplacement = 0.0;
+        for (size_t component = 0; component < state.activeComponents; ++component) {
+            baseline[component].axis = proposed[component].axis;
+            baseline[component].position = clampToWindow(
+                projectToConstraintPlane(
+                    state.components[component].position, pivot,
+                    baseline[component].axis),
+                pivot, baseline[component].axis,
+                config.localWindowRadiusPredictionVoxels, lower, upper);
+            acceptedDirectionUpdate = std::max(
+                acceptedDirectionUpdate,
+                projectiveUpdate(
+                    state.components[component].axis,
+                    baseline[component].axis));
+            const cv::Vec3d displacement =
+                proposed[component].position - baseline[component].position;
+            maximumTargetDisplacement = std::max(
+                maximumTargetDisplacement,
+                std::sqrt(std::max(0.0, displacement.dot(displacement))));
+        }
+        const auto evaluationStart = profile != nullptr
+            ? RefinementClock::now()
+            : RefinementClock::time_point{};
+        if (profile != nullptr)
+            profile->refinedEvaluationObservationVisits += observations.size();
+        const double baselineObjective = retainedSpatialObjective(
+            observations, baseline, state.activeComponents,
+            robust.assignments, robust.retainedInliers, pivot, config);
+        auto acceptedComponents = baseline;
         double acceptedPositionUpdate = 0.0;
-        for (int backtrack = 0; backtrack <= 8; ++backtrack) {
+        const auto fractions = fiberAnchorSpatialBacktrackingFractions(
+            maximumTargetDisplacement,
+            config.peakGridStepPredictionVoxels);
+        for (size_t depth = 0; depth < fractions.size(); ++depth) {
             if (profile != nullptr) {
                 ++profile->backtrackingEvaluations;
+                ++profile->spatialCandidatesTested;
+                ++profile->spatialCandidatesTestedByDepth[depth];
                 profile->refinedEvaluationObservationVisits +=
                     observations.size();
             }
-            const double fraction = std::ldexp(1.0, -backtrack);
-            auto interpolated = state.components;
-            for (size_t component = 0; component < activeComponents; ++component) {
-                cv::Vec3d targetAxis = proposed[component].axis;
-                if (state.components[component].axis.dot(targetAxis) < 0.0)
-                    targetAxis *= -1.0;
-                interpolated[component].axis = canonicalFiberAxis(normalized(
-                    state.components[component].axis * (1.0 - fraction) +
-                    targetAxis * fraction));
-                const cv::Vec3d offset =
-                    (state.components[component].position - pivot) * (1.0 - fraction) +
-                    (proposed[component].position - pivot) * fraction;
-                interpolated[component].position = clampToWindow(
-                    pivot + offset, pivot, interpolated[component].axis,
+            auto candidate = baseline;
+            for (size_t component = 0; component < state.activeComponents; ++component) {
+                candidate[component].position = clampToWindow(
+                    baseline[component].position +
+                        (proposed[component].position - baseline[component].position) *
+                            fractions[depth],
+                    pivot, candidate[component].axis,
                     config.localWindowRadiusPredictionVoxels, lower, upper);
             }
-            RefinedEvaluation evaluation = evaluateRefinedState(
-                observations, interpolated, activeComponents, pivot, config);
+            const double objective = retainedSpatialObjective(
+                observations, candidate, state.activeComponents,
+                robust.assignments, robust.retainedInliers, pivot, config);
             const double tolerance = config.convergenceTolerance *
-                std::max(1.0, std::abs(state.evaluation.objective));
-            if (evaluation.objective <= state.evaluation.objective + tolerance)
+                std::max(1.0, std::abs(baselineObjective));
+            if (objective <= baselineObjective + tolerance)
                 continue;
-            candidate.components = interpolated;
-            candidate.evaluation = std::move(evaluation);
-            candidate.acceptedIterations = state.acceptedIterations + 1;
-            for (size_t component = 0; component < activeComponents; ++component) {
-                acceptedDirectionUpdate = std::max(
-                    acceptedDirectionUpdate,
-                    projectiveUpdate(
-                        state.components[component].axis,
-                        candidate.components[component].axis));
+            acceptedComponents = candidate;
+            if (profile != nullptr)
+                ++profile->spatialCandidatesAcceptedByDepth[depth];
+            for (size_t component = 0; component < state.activeComponents; ++component) {
                 const cv::Vec3d delta =
-                    candidate.components[component].position -
-                    state.components[component].position;
+                    acceptedComponents[component].position -
+                    baseline[component].position;
                 acceptedPositionUpdate = std::max(
                     acceptedPositionUpdate,
                     std::sqrt(std::max(0.0, delta.dot(delta))));
             }
-            accepted = true;
             break;
         }
-        if (!accepted)
+        if (profile != nullptr) {
+            profile->localStateEvaluationWorkSeconds +=
+                std::chrono::duration<double>(
+                    RefinementClock::now() - evaluationStart).count();
+        }
+        state.components = acceptedComponents;
+        state.evaluation.assignments = robust.assignments;
+        state.evaluation.retainedInliers = robust.retainedInliers;
+        ++state.acceptedIterations;
+        const double positionTolerance = std::max(
+            config.positionConvergenceTolerancePredictionVoxels,
+            config.peakGridStepPredictionVoxels);
+        if (acceptedDirectionUpdate <= config.convergenceTolerance &&
+            acceptedPositionUpdate <= positionTolerance) {
             break;
-        const bool assignmentsUnchanged =
-            candidate.evaluation.assignments == state.evaluation.assignments;
-        state = std::move(candidate);
-        if (assignmentsUnchanged &&
-            acceptedDirectionUpdate <= config.convergenceTolerance &&
-            acceptedPositionUpdate <=
-                config.positionConvergenceTolerancePredictionVoxels) {
-            break;
+        }
+        if (iteration + 1 == config.maximumIterations && profile != nullptr)
+            ++profile->robustHardLimitHits;
+    }
+    if (state.activeComponents > 0) {
+        const auto refreshStart = profile != nullptr
+            ? RefinementClock::now()
+            : RefinementClock::time_point{};
+        const RobustDirectionProposal finalMembership = robustDirectionProposal(
+            observations, state.components, state.activeComponents, pivot,
+            config, profile);
+        state.evaluation.assignments = finalMembership.assignments;
+        state.evaluation.retainedInliers = finalMembership.retainedInliers;
+        if (profile != nullptr) {
+            profile->localTensorProposalWorkSeconds +=
+                std::chrono::duration<double>(
+                    RefinementClock::now() - refreshStart).count();
         }
     }
     if (profile != nullptr)
@@ -684,8 +986,9 @@ struct DirectionConditionedPeak {
     const cv::Vec3d& pivot,
     const PeakOwnerBounds& owner,
     const std::array<RefinedComponentState, 2>& components,
-    size_t activeComponents,
     size_t selectedComponent,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
@@ -717,7 +1020,9 @@ struct DirectionConditionedPeak {
         ++profile->peakComponents;
         profile->peakPreparationObservationVisits += observations.size();
     }
-    for (const auto& observation : observations) {
+    for (size_t observationIndex = 0;
+         observationIndex < observations.size(); ++observationIndex) {
+        const auto& observation = observations[observationIndex];
         if (!finiteVector(observation.positionPredictionXYZ))
             continue;
         const cv::Vec3d pivotOffset =
@@ -729,30 +1034,18 @@ struct DirectionConditionedPeak {
         if (transverse.dot(transverse) > unionRadius * unionRadius)
             continue;
 
-        double signal = 0.0;
+        cv::Vec3d direction;
+        const bool usablePositive = usableDirectionObservation(
+            observation, config, direction);
+        const bool retainedForComponent =
+            retainedInliers[observationIndex] &&
+            assignments[observationIndex] == selectedComponent;
         double selectedAlignment = 0.0;
-        if (observation.valid && finiteVector(observation.direction) &&
-            std::isfinite(observation.presence) &&
-            observation.presence >= config.observationPresenceFloor &&
-            observation.presence >= 0.0 && observation.presence <= 1.0) {
-            const cv::Vec3d direction = normalized(observation.direction);
-            if (direction.dot(direction) > kMatrixEpsilon) {
-                size_t assignment = 0;
-                double bestAlignment = -1.0;
-                for (size_t component = 0; component < activeComponents;
-                     ++component) {
-                    const double dot = direction.dot(components[component].axis);
-                    const double alignment = dot * dot;
-                    if (alignment > bestAlignment) {
-                        bestAlignment = alignment;
-                        assignment = component;
-                    }
-                }
-                if (assignment == selectedComponent) {
-                    signal = observation.presence * bestAlignment;
-                    selectedAlignment = bestAlignment;
-                }
-            }
+        double signal = 0.0;
+        if (retainedForComponent && usablePositive) {
+            const double dot = direction.dot(axis);
+            selectedAlignment = dot * dot;
+            signal = observation.presence * selectedAlignment;
         }
         peakObservations.push_back({
             observation.positionPredictionXYZ,
@@ -1118,6 +1411,23 @@ void accumulateFitProfile(
     total.localRefinementAttempts += value.localRefinementAttempts;
     total.localRefinementAcceptedSteps += value.localRefinementAcceptedSteps;
     total.backtrackingEvaluations += value.backtrackingEvaluations;
+    total.robustComponentsWithoutOutliers +=
+        value.robustComponentsWithoutOutliers;
+    total.robustTrimmedComponents += value.robustTrimmedComponents;
+    total.robustRemovedNonuniqueComponents +=
+        value.robustRemovedNonuniqueComponents;
+    total.robustHardLimitHits += value.robustHardLimitHits;
+    total.spatialCandidatesTested += value.spatialCandidatesTested;
+    for (size_t depth = 0;
+         depth < total.spatialCandidatesTestedByDepth.size(); ++depth) {
+        total.spatialCandidatesTestedByDepth[depth] +=
+            value.spatialCandidatesTestedByDepth[depth];
+        total.spatialCandidatesAcceptedByDepth[depth] +=
+            value.spatialCandidatesAcceptedByDepth[depth];
+    }
+    total.robustCandidateTrimmedMass += value.robustCandidateTrimmedMass;
+    total.robustTrimmedMass += value.robustTrimmedMass;
+    total.robustRetainedMass += value.robustRetainedMass;
     total.localTensorObservationVisits += value.localTensorObservationVisits;
     total.localCentroidObservationVisits +=
         value.localCentroidObservationVisits;
@@ -1139,6 +1449,12 @@ void accumulateFitProfile(
         value.seedPairRefinementWorkSeconds;
     total.initializationWorkSeconds += value.initializationWorkSeconds;
     total.localRefinementWorkSeconds += value.localRefinementWorkSeconds;
+    total.localTensorProposalWorkSeconds +=
+        value.localTensorProposalWorkSeconds;
+    total.localCentroidProposalWorkSeconds +=
+        value.localCentroidProposalWorkSeconds;
+    total.localStateEvaluationWorkSeconds +=
+        value.localStateEvaluationWorkSeconds;
     total.peakSearchWorkSeconds += value.peakSearchWorkSeconds;
     total.finalEvaluationWorkSeconds += value.finalEvaluationWorkSeconds;
 }
@@ -1240,6 +1556,8 @@ void applyLocalMaximumNms(
                         if (otherIndex == index)
                             continue;
                         const auto& other = candidates[otherIndex];
+                        if (other.cell == candidate.cell)
+                            continue;
                         const auto& otherAnchor = other.cell->components[
                             other.componentIndex].anchor;
                         if (nmsRankedBefore(other, candidate) &&
@@ -1274,6 +1592,76 @@ void applyLocalMaximumNms(
 }
 
 } // namespace
+
+FiberAnchorRobustCutoff selectFiberAnchorRobustCutoff(
+    const std::vector<FiberAnchorResidualSample>& samples,
+    double maximumTrimMassFraction,
+    double madMultiplier,
+    double minimumAngleDegrees)
+{
+    if (!(maximumTrimMassFraction >= 0.0) ||
+        maximumTrimMassFraction > 0.20 ||
+        !std::isfinite(maximumTrimMassFraction) ||
+        !(madMultiplier >= 0.0) || !std::isfinite(madMultiplier) ||
+        !(minimumAngleDegrees >= 0.0) || minimumAngleDegrees > 90.0 ||
+        !std::isfinite(minimumAngleDegrees)) {
+        throw std::invalid_argument("invalid fiber anchor robust cutoff parameters");
+    }
+    FiberAnchorRobustCutoff result;
+    std::array<double, kRobustHistogramBins> histogram{};
+    for (const auto& sample : samples) {
+        if (!std::isfinite(sample.residual) || !std::isfinite(sample.mass) ||
+            !(sample.mass > 0.0)) {
+            continue;
+        }
+        histogram[robustHistogramBin(sample.residual)] += sample.mass;
+        result.totalMass += sample.mass;
+    }
+    result.retainedMass = result.totalMass;
+    if (!(result.totalMass > 0.0) || !(maximumTrimMassFraction > 0.0))
+        return result;
+
+    const size_t medianBin = weightedHistogramQuantileBin(
+        histogram, result.totalMass, 0.5);
+    const double median = robustHistogramCenter(medianBin);
+    std::array<double, kRobustHistogramBins> deviationHistogram{};
+    for (const auto& sample : samples) {
+        if (!std::isfinite(sample.residual) || !std::isfinite(sample.mass) ||
+            !(sample.mass > 0.0)) {
+            continue;
+        }
+        deviationHistogram[robustHistogramBin(std::abs(
+            std::clamp(sample.residual, 0.0, 1.0) - median))] += sample.mass;
+    }
+    return selectRobustHistogramCutoff(
+        histogram, deviationHistogram, result.totalMass, median,
+        maximumTrimMassFraction, madMultiplier, minimumAngleDegrees).summary;
+}
+
+std::vector<double> fiberAnchorSpatialBacktrackingFractions(
+    double maximumDisplacementPredictionVoxels,
+    double targetStepPredictionVoxels,
+    int maximumHalvings)
+{
+    if (!(maximumDisplacementPredictionVoxels >= 0.0) ||
+        !std::isfinite(maximumDisplacementPredictionVoxels) ||
+        !(targetStepPredictionVoxels > 0.0) ||
+        !std::isfinite(targetStepPredictionVoxels) ||
+        maximumHalvings < 0 || maximumHalvings > 8) {
+        throw std::invalid_argument("invalid fiber anchor spatial backtracking parameters");
+    }
+    std::vector<double> fractions;
+    fractions.reserve(static_cast<size_t>(maximumHalvings + 1));
+    for (int depth = 0; depth <= maximumHalvings; ++depth) {
+        const double fraction = std::ldexp(1.0, -depth);
+        fractions.push_back(fraction);
+        if (maximumDisplacementPredictionVoxels * fraction <=
+            targetStepPredictionVoxels) {
+            break;
+        }
+    }
+    return fractions;
+}
 
 std::optional<FiberAnchorQuadraticPeakOffset> fitFiberAnchorQuadraticPeak(
     const std::array<std::array<double, 3>, 3>& response)
@@ -1447,6 +1835,23 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         !(config.minimumAlignedSupport <= 1.0) ||
         !std::isfinite(config.minimumAlignedSupport)) {
         throw std::invalid_argument("fiber anchor minimum aligned support must be in [0, 1]");
+    }
+    if (!(config.robustMaximumTrimMassFraction >= 0.0) ||
+        config.robustMaximumTrimMassFraction > 0.20 ||
+        !std::isfinite(config.robustMaximumTrimMassFraction)) {
+        throw std::invalid_argument(
+            "fiber anchor robust maximum trim mass must be in [0, 0.20]");
+    }
+    if (!(config.robustMadMultiplier >= 0.0) ||
+        !std::isfinite(config.robustMadMultiplier)) {
+        throw std::invalid_argument(
+            "fiber anchor robust MAD multiplier must be nonnegative and finite");
+    }
+    if (!(config.robustMinimumAngleDegrees >= 0.0) ||
+        config.robustMinimumAngleDegrees > 90.0 ||
+        !std::isfinite(config.robustMinimumAngleDegrees)) {
+        throw std::invalid_argument(
+            "fiber anchor robust minimum angle must be in [0, 90]");
     }
     if (!(config.mergeMaximumAngleDegrees >= 0.0) ||
         !(config.mergeMaximumAngleDegrees <= 90.0) ||
@@ -1736,70 +2141,24 @@ FiberCellAnchorResult fitFiberCellAnchors(
                 }) ? "degenerate" : "empty";
         }
     }
-    bool mergeComponents = false;
-    if (denominator.sum > 0.0 && global.unique &&
-        fittedComponents[0].unique && fittedComponents[1].unique) {
-        const double splitObjective =
-            (fittedComponents[0].largestEigenvalue +
-             fittedComponents[1].largestEigenvalue) / denominator.sum;
-        const double jointObjective = global.largestEigenvalue / denominator.sum;
-        const double objectiveLoss = std::max(0.0, splitObjective - jointObjective);
-        const double allowedObjectiveLoss = std::max(
-            config.mergeMaximumAbsoluteObjectiveLoss,
-            config.mergeMaximumRelativeObjectiveLoss * jointObjective);
-        const double axialDot = std::clamp(
-            std::abs(fittedComponents[0].axis.dot(fittedComponents[1].axis)),
-            0.0,
-            1.0);
-        const double angleDegrees =
-            std::acos(axialDot) * 180.0 / std::acos(-1.0);
-        mergeComponents =
-            angleDegrees <= config.mergeMaximumAngleDegrees &&
-            objectiveLoss <= allowedObjectiveLoss;
-        result.mergeEvaluation = FiberAnchorMergeEvaluation{
-            angleDegrees,
-            jointObjective,
-            splitObjective,
-            objectiveLoss,
-            allowedObjectiveLoss,
-            mergeComponents,
-        };
-    }
-
-    if (mergeComponents) {
-        result.objective = result.mergeEvaluation->jointObjective;
-    } else {
-        result.objective = seededObjective;
-    }
+    result.objective = seededObjective;
 
     std::array<cv::Vec3d, 2> seedAxes{};
     std::array<size_t, 2> diagnosticIds{kNoDiagnosticId, kNoDiagnosticId};
     size_t activeComponents = 0;
-    if (mergeComponents) {
-        seedAxes[activeComponents] = global.axis;
-        diagnosticIds[activeComponents++] = 2;
-        for (auto& diagnostic : result.initializedDiagnostics) {
-            if (!diagnostic.anchor.has_value())
-                continue;
-            diagnostic.transition.outcome = "merged";
-            diagnostic.transition.reason = "merged_same_direction";
-            diagnostic.transition.successorId = 2;
-        }
-    } else {
-        for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
-            const auto& fitted = fittedComponents[componentIndex];
-            if (fitted.unique) {
-                seedAxes[activeComponents] = fitted.axis;
-                diagnosticIds[activeComponents++] = componentIndex;
-            } else {
-                result.components[componentIndex].rejectionReason = std::any_of(
-                    bestFit.assignments.begin(), bestFit.assignments.end(),
-                    [profile, componentIndex](uint8_t assigned) {
-                        if (profile != nullptr)
-                            ++profile->initializationObservationVisits;
-                        return assigned == componentIndex;
-                    }) ? "degenerate" : "empty";
-            }
+    for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
+        const auto& fitted = fittedComponents[componentIndex];
+        if (fitted.unique) {
+            seedAxes[activeComponents] = fitted.axis;
+            diagnosticIds[activeComponents++] = componentIndex;
+        } else {
+            result.components[componentIndex].rejectionReason = std::any_of(
+                bestFit.assignments.begin(), bestFit.assignments.end(),
+                [profile, componentIndex](uint8_t assigned) {
+                    if (profile != nullptr)
+                        ++profile->initializationObservationVisits;
+                    return assigned == componentIndex;
+                }) ? "degenerate" : "empty";
         }
     }
     if (activeComponents == 0) {
@@ -1818,7 +2177,16 @@ FiberCellAnchorResult fitFiberCellAnchors(
     }
 
     RefinedFitState refined = refineLocalComponents(
-        input, center, seedAxes, activeComponents, config, profile);
+        input, center, seedAxes, diagnosticIds, activeComponents, config,
+        profile);
+    for (size_t index = 0; index < refined.removedComponentCount; ++index) {
+        const size_t diagnosticId = refined.removedComponentIds[index];
+        if (diagnosticId >= result.initializedDiagnostics.size())
+            continue;
+        auto& diagnostic = result.initializedDiagnostics[diagnosticId];
+        diagnostic.transition.outcome = "rejected";
+        diagnostic.transition.reason = "degenerate";
+    }
     if (profile != nullptr) {
         profile->localRefinementWorkSeconds += std::chrono::duration<double>(
             FitClock::now() - phaseStart).count();
@@ -1827,11 +2195,12 @@ FiberCellAnchorResult fitFiberCellAnchors(
     const PeakOwnerBounds owner = peakOwnerBounds(
         input, cellBeginZYX, cellEndZYX);
     const auto broadRefinedComponents = refined.components;
-    for (size_t componentIndex = 0; componentIndex < activeComponents;
+    for (size_t componentIndex = 0; componentIndex < refined.activeComponents;
          ++componentIndex) {
         const auto peak = findDirectionConditionedLocalPeak(
             input, center, owner, broadRefinedComponents,
-            activeComponents, componentIndex, config, profile);
+            componentIndex, refined.evaluation.assignments,
+            refined.evaluation.retainedInliers, config, profile);
         result.components[componentIndex]
             .discretePeakPositionPredictionXYZ = peak.discrete;
         result.components[componentIndex]
@@ -1846,15 +2215,17 @@ FiberCellAnchorResult fitFiberCellAnchors(
         phaseStart = FitClock::now();
         profile->finalEvaluationObservationVisits += input.size();
     }
-    refined.evaluation = evaluateRefinedState(
-        input, refined.components, activeComponents, center, config);
+    refined.evaluation = evaluateFinalRefinedState(
+        input, refined.components, refined.activeComponents,
+        refined.evaluation.assignments,
+        refined.evaluation.retainedInliers, center, config);
     result.objective = refined.evaluation.objective;
-    for (size_t componentIndex = 0; componentIndex < activeComponents; ++componentIndex) {
+    for (size_t componentIndex = 0;
+         componentIndex < refined.activeComponents; ++componentIndex) {
         auto& component = result.components[componentIndex];
-        component.diagnosticId = diagnosticIds[componentIndex];
-        component.diagnosticParentIds = mergeComponents
-            ? std::vector<size_t>{0, 1}
-            : std::vector<size_t>{diagnosticIds[componentIndex]};
+        component.diagnosticId = refined.componentIds[componentIndex];
+        component.diagnosticParentIds = {
+            refined.componentIds[componentIndex]};
         const double denominatorValue = refined.evaluation.denominators[componentIndex];
         const double numeratorValue = refined.evaluation.numerators[componentIndex];
         const double presenceMass = refined.evaluation.presenceMasses[componentIndex];
@@ -1882,10 +2253,21 @@ FiberCellAnchorResult fitFiberCellAnchors(
         }
         component.retainedAfterSupport = component.retained;
     }
-    if (mergeComponents)
-        result.components[1].rejectionReason = "merged_same_direction";
-    else if (activeComponents == 1 && result.components[1].rejectionReason.empty())
-        result.components[1].rejectionReason = "empty";
+    size_t outputIndex = refined.activeComponents;
+    for (size_t index = 0;
+         index < refined.removedComponentCount &&
+         outputIndex < result.components.size();
+         ++index, ++outputIndex) {
+        auto& component = result.components[outputIndex];
+        component.diagnosticId = refined.removedComponentIds[index];
+        component.diagnosticParentIds = {refined.removedComponentIds[index]};
+        component.rejectionReason = "degenerate";
+        component.removedDuringRobustRefinement = true;
+    }
+    while (outputIndex < result.components.size()) {
+        result.components[outputIndex].rejectionReason = "empty";
+        ++outputIndex;
+    }
     if (componentLess(result.components[1], result.components[0]))
         std::swap(result.components[0], result.components[1]);
     if (profile != nullptr) {
@@ -2628,7 +3010,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         record.cellZYX = cell.cellZYX;
         record.candidateId = component.diagnosticId;
         record.parentIds = component.diagnosticParentIds;
-        record.anchor = component.anchor;
+        if (!component.removedDuringRobustRefinement)
+            record.anchor = component.anchor;
         record.discretePeakPositionPredictionXYZ =
             component.discretePeakPositionPredictionXYZ;
         record.separablePeakPositionPredictionXYZ =
@@ -3040,7 +3423,7 @@ nlohmann::json fiberAnchorReportJson(
         throw std::invalid_argument("fiber anchor artifacts require source identity and manifest hash");
     nlohmann::json root = {
         {"format", "vc_fiberlet_anchors"},
-        {"version", 1},
+        {"version", 2},
         {"source", {
             {"manifest", artifact.sourceLocator},
             {"manifest_content_hash", artifact.manifestContentHash},
@@ -3083,6 +3466,9 @@ nlohmann::json fiberAnchorReportJson(
             {"nms_longitudinal_radius_prediction_voxels", report.config.nmsLongitudinalRadiusPredictionVoxels},
             {"observation_presence_floor", report.config.observationPresenceFloor},
             {"minimum_aligned_support", report.config.minimumAlignedSupport},
+            {"robust_maximum_trim_mass_fraction", report.config.robustMaximumTrimMassFraction},
+            {"robust_mad_multiplier", report.config.robustMadMultiplier},
+            {"robust_minimum_angle_degrees", report.config.robustMinimumAngleDegrees},
             {"merge_maximum_angle_degrees", report.config.mergeMaximumAngleDegrees},
             {"merge_maximum_absolute_objective_loss", report.config.mergeMaximumAbsoluteObjectiveLoss},
             {"merge_maximum_relative_objective_loss", report.config.mergeMaximumRelativeObjectiveLoss},
@@ -3207,6 +3593,9 @@ nlohmann::json anchorDiagnosticParameters(const FiberAnchorConfig& config)
         {"nms_longitudinal_radius_prediction_voxels", config.nmsLongitudinalRadiusPredictionVoxels},
         {"observation_presence_floor", config.observationPresenceFloor},
         {"minimum_aligned_support", config.minimumAlignedSupport},
+        {"robust_maximum_trim_mass_fraction", config.robustMaximumTrimMassFraction},
+        {"robust_mad_multiplier", config.robustMadMultiplier},
+        {"robust_minimum_angle_degrees", config.robustMinimumAngleDegrees},
         {"merge_maximum_angle_degrees", config.mergeMaximumAngleDegrees},
         {"merge_maximum_absolute_objective_loss", config.mergeMaximumAbsoluteObjectiveLoss},
         {"merge_maximum_relative_objective_loss", config.mergeMaximumRelativeObjectiveLoss},

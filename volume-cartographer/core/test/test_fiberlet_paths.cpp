@@ -1384,6 +1384,12 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK_FALSE(loaded.report.nonEmptyCells[0].components[1].retained);
     CHECK(loaded.report.config.nmsTransverseRadiusPredictionVoxels == 2.0);
     CHECK(loaded.report.config.nmsLongitudinalRadiusPredictionVoxels == 1.0);
+    CHECK(loaded.report.config.robustMaximumTrimMassFraction ==
+          anchors.report.config.robustMaximumTrimMassFraction);
+    CHECK(loaded.report.config.robustMadMultiplier ==
+          anchors.report.config.robustMadMultiplier);
+    CHECK(loaded.report.config.robustMinimumAngleDegrees ==
+          anchors.report.config.robustMinimumAngleDegrees);
 
     auto oldCoordinates = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     oldCoordinates["coordinates"]["position_space"] = "stored_prediction_grid";
@@ -1401,13 +1407,40 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
+    auto missingRobustParameter =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    missingRobustParameter["parameters"].erase("robust_mad_multiplier");
+    {
+        std::ofstream output(path);
+        output << missingRobustParameter.dump(2);
+    }
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version-2 schema"), std::runtime_error);
+
+    auto legacyRobustParameters =
+        vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+    legacyRobustParameters["parameters"].erase(
+        "robust_maximum_trim_mass_fraction");
+    legacyRobustParameters["parameters"].erase("robust_mad_multiplier");
+    legacyRobustParameters["parameters"].erase(
+        "robust_minimum_angle_degrees");
+    legacyRobustParameters["version"] = 1;
+    {
+        std::ofstream output(path);
+        output << legacyRobustParameters.dump(2);
+    }
+    const auto legacyLoaded = vc::fiber_tracer::loadFiberAnchorArtifact(path);
+    CHECK(legacyLoaded.report.config.robustMaximumTrimMassFraction ==
+          vc::fiber_tracer::FiberAnchorConfig{}.robustMaximumTrimMassFraction);
+
     auto missingTransverseNmsParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingTransverseNmsParameter["parameters"].erase("nms_transverse_radius_prediction_voxels");
     {
         std::ofstream output(path);
         output << missingTransverseNmsParameter.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-1 schema"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-2 schema"), std::runtime_error);
 
     auto missingRefinementParameter = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementParameter["parameters"].erase("peak_sigma_prediction_voxels");
@@ -1439,7 +1472,7 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
         std::ofstream output(path);
         output << extraParameter.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-1 schema"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version-2 schema"), std::runtime_error);
 
     auto missingRefinementValue = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     missingRefinementValue["cells"][0]["components"][0].erase("refinement_score");
@@ -1482,12 +1515,14 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
     auto json = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
-    json["version"] = 2;
+    json["version"] = 3;
     {
         std::ofstream output(path);
         output << json.dump(2);
     }
-    CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version 1"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::loadFiberAnchorArtifact(path),
+        doctest::Contains("version 1 or 2"), std::runtime_error);
     std::filesystem::remove(path);
 }
 

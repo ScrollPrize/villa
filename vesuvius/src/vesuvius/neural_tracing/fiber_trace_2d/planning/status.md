@@ -1,11 +1,18 @@
-# Status: accelerate anchor local refinement
+# Status: robust sampled-direction anchor refinement
 
-- [x] Record the measured bottleneck and exactness constraints in `task.md`.
-- [x] Write the implementation, validation, spec, docs, and changelog plan.
+- [x] Record the requested robust direction and spatial refinement semantics.
+- [x] Write the implementation, configuration, diagnostics, testing, spec,
+  documentation, changelog, performance, and quality plan.
 - [x] Complete independent plan review against task/spec/workflow documents.
-- [x] Measure and reject cached-direction and fused-scan regressions.
-- [x] Implement the exact actual-component support-sphere broad phase.
-- [x] Add focused regression coverage.
-- [x] Run GCC and Clang focused builds/tests and `git diff --check`.
-- [x] Run three canonical replays and compare complete artifact inventories.
-- [x] Record final measurements and finish specs, docs, task log, and changelog.
+- [x] Obtain user approval to begin implementation.
+- [x] Implement adaptive robust direction aggregation and component removal.
+- [x] Implement position-only bounded backtracking.
+- [x] Add configuration, diagnostics, strict artifact loading, and focused
+  regression coverage.
+- [x] Build and run focused GCC tests in regular and performance trees.
+- [x] Run three default canonical measurements and deterministic artifact
+  comparison; record the high-load wall-time caveat and an idle-host
+  apples-to-apples checkpoint.
+- [x] Complete independent implementation review and address high-severity
+  findings; record the remaining forced-removal fixture limitation.
+- [x] Finish specs, docs, task log, status, and changelog.

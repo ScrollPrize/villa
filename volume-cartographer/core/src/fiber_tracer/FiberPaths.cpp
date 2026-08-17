@@ -1531,8 +1531,12 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     } catch (const nlohmann::json::exception& error) {
         throw std::runtime_error("cannot parse fiber anchor artifact: " + std::string(error.what()));
     }
-    if (!root.is_object() || root.value("format", "") != "vc_fiberlet_anchors" || root.value("version", 0) != 1) {
-        throw std::runtime_error("fiber anchor artifact must be vc_fiberlet_anchors version 1");
+    const int artifactVersion = root.is_object() ? root.value("version", 0) : 0;
+    if (!root.is_object() ||
+        root.value("format", "") != "vc_fiberlet_anchors" ||
+        (artifactVersion != 1 && artifactVersion != 2)) {
+        throw std::runtime_error(
+            "fiber anchor artifact must be vc_fiberlet_anchors version 1 or 2");
     }
     LoadedFiberAnchorArtifact loaded;
     const auto& source = root.at("source");
@@ -1606,6 +1610,9 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         "nms_longitudinal_radius_prediction_voxels",
         "observation_presence_floor",
         "minimum_aligned_support",
+        "robust_maximum_trim_mass_fraction",
+        "robust_mad_multiplier",
+        "robust_minimum_angle_degrees",
         "merge_maximum_angle_degrees",
         "merge_maximum_absolute_objective_loss",
         "merge_maximum_relative_objective_loss",
@@ -1618,8 +1625,18 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
     std::set<std::string> storedParameterKeys;
     for (const auto& item : parameters.items())
         storedParameterKeys.insert(item.key());
-    if (storedParameterKeys != parameterKeys)
-        throw std::runtime_error("fiber anchor parameters do not match the version-1 schema");
+    auto legacyParameterKeys = parameterKeys;
+    legacyParameterKeys.erase("robust_maximum_trim_mass_fraction");
+    legacyParameterKeys.erase("robust_mad_multiplier");
+    legacyParameterKeys.erase("robust_minimum_angle_degrees");
+    const bool hasRobustParameters = artifactVersion == 2;
+    const auto& expectedParameterKeys =
+        hasRobustParameters ? parameterKeys : legacyParameterKeys;
+    if (storedParameterKeys != expectedParameterKeys) {
+        throw std::runtime_error(
+            "fiber anchor parameters do not match the version-" +
+            std::to_string(artifactVersion) + " schema");
+    }
     auto& config = loaded.report.config;
     config.cellSizePredictionVoxels = parameters.at("cell_size_prediction_voxels").get<int>();
     config.gaussianSigmaPredictionVoxels =
@@ -1645,6 +1662,16 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
         finiteNumber(parameters.at("nms_longitudinal_radius_prediction_voxels"), "nms_longitudinal_radius_prediction_voxels");
     config.observationPresenceFloor = finiteNumber(parameters.at("observation_presence_floor"), "observation_presence_floor");
     config.minimumAlignedSupport = finiteNumber(parameters.at("minimum_aligned_support"), "minimum_aligned_support");
+    if (hasRobustParameters) {
+        config.robustMaximumTrimMassFraction = finiteNumber(
+            parameters.at("robust_maximum_trim_mass_fraction"),
+            "robust_maximum_trim_mass_fraction");
+        config.robustMadMultiplier = finiteNumber(
+            parameters.at("robust_mad_multiplier"), "robust_mad_multiplier");
+        config.robustMinimumAngleDegrees = finiteNumber(
+            parameters.at("robust_minimum_angle_degrees"),
+            "robust_minimum_angle_degrees");
+    }
     config.mergeMaximumAngleDegrees = finiteNumber(parameters.at("merge_maximum_angle_degrees"), "merge_maximum_angle_degrees");
     config.mergeMaximumAbsoluteObjectiveLoss =
         finiteNumber(parameters.at("merge_maximum_absolute_objective_loss"), "merge_maximum_absolute_objective_loss");

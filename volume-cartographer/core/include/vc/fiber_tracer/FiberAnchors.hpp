@@ -43,11 +43,14 @@ struct FiberAnchorConfig {
     double nmsLongitudinalRadiusPredictionVoxels = 1.0;
     double observationPresenceFloor = 0.05;
     double minimumAlignedSupport = 0.05;
+    double robustMaximumTrimMassFraction = 0.20;
+    double robustMadMultiplier = 3.0;
+    double robustMinimumAngleDegrees = 5.0;
     double mergeMaximumAngleDegrees = 10.0;
     double mergeMaximumAbsoluteObjectiveLoss = 0.01;
     double mergeMaximumRelativeObjectiveLoss = 0.05;
     size_t maximumSeedCount = 8;
-    int maximumIterations = 64;
+    int maximumIterations = 2;
     double convergenceTolerance = 1.0e-12;
     size_t maximumConcurrentSampleBytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -148,6 +151,7 @@ struct FiberAnchorComponent {
     std::optional<double> selectionTestedValue;
     std::optional<double> selectionThreshold;
     std::optional<FiberAnchorDiagnosticSuppressor> nmsSuppressor;
+    bool removedDuringRobustRefinement = false;
 };
 
 struct FiberAnchorMergeEvaluation {
@@ -181,6 +185,31 @@ struct FiberAnchorExtractionDiagnostics {
     size_t outsideSelectionComponents = 0;
 };
 
+struct FiberAnchorResidualSample {
+    double residual = 0.0;
+    double mass = 0.0;
+};
+
+struct FiberAnchorRobustCutoff {
+    double cutoffResidual = 1.0;
+    double totalMass = 0.0;
+    double candidateTrimmedMass = 0.0;
+    double trimmedMass = 0.0;
+    double retainedMass = 0.0;
+    bool detectedOutliers = false;
+};
+
+[[nodiscard]] FiberAnchorRobustCutoff selectFiberAnchorRobustCutoff(
+    const std::vector<FiberAnchorResidualSample>& samples,
+    double maximumTrimMassFraction,
+    double madMultiplier,
+    double minimumAngleDegrees);
+
+[[nodiscard]] std::vector<double> fiberAnchorSpatialBacktrackingFractions(
+    double maximumDisplacementPredictionVoxels,
+    double targetStepPredictionVoxels,
+    int maximumHalvings = 8);
+
 struct FiberAnchorFitProfile {
     size_t invocations = 0;
     size_t nonemptyCells = 0;
@@ -196,6 +225,16 @@ struct FiberAnchorFitProfile {
     size_t localRefinementAttempts = 0;
     size_t localRefinementAcceptedSteps = 0;
     size_t backtrackingEvaluations = 0;
+    size_t robustComponentsWithoutOutliers = 0;
+    size_t robustTrimmedComponents = 0;
+    size_t robustRemovedNonuniqueComponents = 0;
+    size_t robustHardLimitHits = 0;
+    size_t spatialCandidatesTested = 0;
+    std::array<size_t, 9> spatialCandidatesTestedByDepth{};
+    std::array<size_t, 9> spatialCandidatesAcceptedByDepth{};
+    double robustCandidateTrimmedMass = 0.0;
+    double robustTrimmedMass = 0.0;
+    double robustRetainedMass = 0.0;
     size_t localTensorObservationVisits = 0;
     size_t localCentroidObservationVisits = 0;
     size_t refinedEvaluationObservationVisits = 0;
@@ -211,6 +250,9 @@ struct FiberAnchorFitProfile {
     double seedPairRefinementWorkSeconds = 0.0;
     double initializationWorkSeconds = 0.0;
     double localRefinementWorkSeconds = 0.0;
+    double localTensorProposalWorkSeconds = 0.0;
+    double localCentroidProposalWorkSeconds = 0.0;
+    double localStateEvaluationWorkSeconds = 0.0;
     double peakSearchWorkSeconds = 0.0;
     double finalEvaluationWorkSeconds = 0.0;
 };

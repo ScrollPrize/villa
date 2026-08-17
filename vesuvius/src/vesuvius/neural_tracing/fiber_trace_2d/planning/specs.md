@@ -2511,41 +2511,47 @@
   assignment/PCA supplies only initial directions. A single covariance's first
   two orthogonal eigenvectors are not a valid replacement. Initial component
   positions are the centre of the clipped owned-cell voxel range.
-- Direction and a provisional position are then refined jointly from a bounded
-  halo. For
+- Direction and a provisional position are then refined from a bounded halo. For
   anchor `(p_k,u_k)`, the transverse Gaussian is recentered at `p_k`, uses the
   distance to the line through `p_k` along `u_k`, and is truncated at three
   sigma. Evidence is also restricted to a symmetric axial slab about the plane
   through the fixed cell pivot normal to `u_k`. Invalid axes and presence below
   the inclusive floor contribute no numerator. Direction-mode assignment uses
-  `p_i (d_i dot u_k)^2` among components whose finite kernels contain the site;
+  `g_ik p_i abs(d_i dot u_k)^2`; stable component index breaks exact ties and
   zero-evidence sites remain unassigned.
-- Each component direction update is the principal eigenvector of its assigned
-  `g_ik p_i d_i d_i^T`. Its position update is the assigned
+- Within each assigned component, projective residual
+  `1-abs(d_i dot u_k)^2` is summarized with a deterministic 256-bin weighted
+  median/MAD histogram using `g_ik p_i` mass. The cutoff is the larger of
+  median plus the configured MAD multiplier and the configured angular-noise
+  floor expressed as `sin(angle)^2`. It may trim no more than the configured
+  evidence-mass fraction, at most 0.20; coherent data retains all observations
+  and complete cutoff bins are retained. The defaults are 0.20 maximum trim,
+  multiplier 3, and 5 degrees.
+- Each component direction update is installed directly as the principal axis
+  of retained `g_ik p_i d_i d_i^T`. There is no angular interpolation or
+  angular line search. A retained tensor without the existing unique principal
+  axis removes only that component while preserving stable diagnostic ancestry.
+  Supported close components are not merged before refinement.
+- Its position target is the retained assigned
   `g_ik p_i (d_i dot u_k)^2` centroid projected onto the plane through the cell
-  pivot normal to the updated direction. The plane therefore rotates with the
-  direction, but the anchor never advances along the fiber through the cell.
-  Transverse displacement is clamped to the local window and the prediction
-  grid. The next iteration recomputes falloff about the new provisional
-  position.
-- Refined-state evaluation uses an exact conservative support broad phase. A
-  component with axis `u` and position `p` can only receive contributions from
-  observations within `axial_half_width / |u|` of the pivot along the
-  normalized axis and within `Gaussian_cutoff + |p - pivot|` transversely.
-  Evaluation takes the maximum resulting pivot-centered squared radius over
-  the actual active components, then expands it by a scale-relative numerical
-  margin and one outward ULP. This covers initial, backtracked, and post-peak
-  states without assuming exact unit axes or an exact configured position
-  radius. Observations beyond the sphere retain their original zero additions
-  to compensated denominators while component-specific kernel work is skipped.
-- Proposed joint updates use deterministic backtracking and are accepted only
-  when the normalized joint objective strictly improves. This bounded monotonic
-  direction-refinement phase is retained unchanged. A component's denominator is
-  `sum g_ik` over every lattice site in its finite kernel, including invalid,
-  below-floor, zero-presence, and unassigned sites. Aligned support is assigned
-  aligned evidence divided by that denominator; coherence divides by assigned
-  `sum g_ik p_i`. Empty, degenerate, and below-threshold components are
-  discarded independently.
+  pivot normal to the updated direction. Deterministic backtracking changes
+  position only and tests `1, 1/2, ...` through the first displacement at or
+  below the peak-grid step; the first strict spatial-objective improvement is
+  accepted. Direction remains installed even when position does not improve.
+  Transverse displacement is clamped to the local window and prediction grid.
+- The spatial objective and final aligned support use retained evidence in the
+  numerator and `sum g_ik` over every sampled lattice site for each active
+  component in the denominator. The denominator is independent of site
+  presence, direction, assignment, and trim state, so rejected positive sites
+  cannot create normalization holes that attract or repel the fit. Coherence
+  divides by retained assigned `sum g_ik p_i`. Empty, degenerate, and
+  below-threshold components are discarded independently.
+- Robust assignment, trimming, direct direction update, and position update run
+  for at most `maximum_iterations`, default 2. This is a bounded alternating
+  refinement budget, not convergence to exact equality of hard assignment or
+  histogram membership sets. An earlier exit is allowed when projective
+  direction change is within tolerance and accepted position movement is no
+  larger than the peak-grid step. The later peak stage owns finer positioning.
 - After direction refinement, final position is selected independently for each
   surviving direction by deterministic steepest ascent on a narrower
   direction-conditioned response in the final normal plane. The response is
@@ -2578,12 +2584,12 @@
   presence response. The gated signed value is added with default weight
   `1.0`. `--gradient-weight` changes or disables it.
 - Peak support is the intersection of independent three-sigma transverse and
-  axial bounds. Direction assignment uses all valid above-floor observations
-  in that support and is independent of the provisional center. The denominator
-  includes every sampled in-volume site inside both bounds, including invalid,
-  below-floor, zero-presence, and unassigned sites, so global-edge truncation is
-  normalized. The broad direction fit continues to use its separate fixed
-  axial half-width.
+  axial bounds. Positive peak signal is restricted to the final retained
+  assignment for that component; trimmed or competing observations cannot
+  re-enter. Its denominator includes every sampled in-volume site inside both
+  bounds independent of presence, direction, assignment, or trim state. The
+  broad direction fit
+  continues to use its separate fixed axial half-width.
 - The peak grid is anchored at the fixed cell pivot and uses canonical
   transverse basis construction, configured prediction-voxel step, a circular
   local window, and continuous voxel-Voronoi ownership
@@ -2629,19 +2635,15 @@
   serialized in either final or any diagnostic-stage version-1 anchor artifact.
   Both estimators optimize two normal-plane coordinates from a response that
   integrates 3D volumetric evidence; neither permits axial motion.
-- When both fitted components and their joint PCA are unique, near-duplicate
-  components are evaluated before support rejection. Let `O2` be the sum of
-  the two fixed-assignment principal eigenvalues divided by `sum_cell g_i` and
-  `O1` the joint principal eigenvalue over the same denominator. The components
-  merge when `acos(abs(u0 dot u1)) <= 10 degrees` and
-  `max(0, O2-O1) <= max(0.01, 0.05 O1)` by default. All comparisons are
-  inclusive and all three limits are configurable. A merge rebuilds axis,
-  position, support, coherence, and assigned count from every usable
-  observation through the same rotating-plane refinement, then applies the
-  ordinary minimum-support test. Exact collapse that already leaves the second
-  component empty is not a merge.
+- There is no pre-refinement same-direction merge. Supported close components
+  remain independently fitted; the ordinary cross-cell NMS below handles true
+  duplicates. Merge fields remain readable and serializable for compatibility
+  but are inert for newly fitted cells. Robust anchor artifacts use schema
+  version 2; the loader accepts strict legacy version 1 artifacts with their
+  original parameter set.
 - After all local fits, deterministic local-maximum NMS removes cross-cell
   duplicates with compatible unoriented directions. Two anchors interact only
+  when they come from different cells and
   within the configured angular, transverse, and longitudinal limits measured
   around their sign-aligned average axis. Transverse and longitudinal defaults
   are independent of the refinement window and cell size: 2 and 1 stored
@@ -3019,7 +3021,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=2` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=4` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3048,6 +3050,21 @@
 - Version-2 observation-visit fields are logical operation counts. Exact broad
   phases may avoid detailed kernel calculations while retaining these counts,
   so before/after workloads and fitting decisions remain directly comparable.
+- Version 3 partitions local-refinement worker time into tensor proposals,
+  centroid proposals, and refined-state evaluations. The remaining parent time
+  is reported as local control work and includes setup, state interpolation,
+  acceptance/convergence decisions, and profiling overhead. These four values
+  reconcile to total local-refinement work. Refined-state evaluation includes
+  the initial state and every backtracking candidate and computes spatial
+  Gaussian support, directional evidence, assignments, and the normalized
+  objective.
+- Version 4 adds robust no-outlier/trimmed/non-unique/iteration-limit component
+  counts, candidate/actual trimmed and retained evidence mass, and spatial
+  candidate counts by halving depth. Tensor proposal time includes competitive
+  assignment, weighted histogram cutoff selection, and retained sampled-axis
+  aggregation. State-evaluation time contains fixed-direction spatial
+  objectives. Robust component and mass counters accumulate proposals across
+  bounded passes and are not final-population counts.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's
@@ -3057,11 +3074,13 @@
   snapshot owns its tree and segment storage, is immutable after construction,
   and supports concurrent const queries. Public replay-tube distance methods
   retain the existing double-precision linear projection for diagnostics.
-- Fiberlet performance changes are measurement-first. Exact numeric identity is
-  relaxed only for the float32 replay-tube and local-corridor containment
-  filters; comparisons must quantify changed classifications near the radius,
-  and changes outside the documented float32 boundary band are failures. Other
-  numerics and deterministic ordering remain unchanged. A comparison records
+- Fiberlet performance changes are measurement-first. Exact legacy numeric
+  identity is not required for the robust anchor fitter or the float32
+  replay-tube/local-corridor filters. Robust fitting is accepted through
+  deterministic repeatability, matched anchor axis/position distributions,
+  anchor/fiberlet/graph populations, downstream replay metrics, and visual
+  inspection. Float32 containment comparisons still quantify boundary changes.
+  A comparison records
   the command, input identities, commit, build
   type and flags, host, thread count, decoded/disk/OS cache state, warmup policy,
   repeated-run distribution, and exact output hashes or bytes in addition to
@@ -3070,15 +3089,16 @@
 # Anchor pipeline stage diagnostics
 
 - Anchor extraction assigns stable per-cell diagnostic IDs to the two fitted
-  attempts before merge, compaction, or component sorting. Both attempts are
-  emitted for every selected cell; unavailable directions use null geometry.
-  A same-direction merge creates candidate ID 2 with parent IDs 0 and 1.
+  attempts before robust component removal, compaction, or component sorting.
+  Both attempts are emitted for every selected cell; unavailable or robustly
+  degenerate directions use null geometry. No merge successor is created.
 - Five strict `vc_fiberlet_anchor_stage` version-1 JSON files capture the real
   boundaries `initialized`, `refined`, `support`, `selection`, and `nms`.
   External NMS-context cells may be referenced as suppressors but never enter
   the selected stage populations.
-- Per-record transitions distinguish empty/degenerate initialization, merge,
-  refined empty or below-support rejection, outside-selection rejection, and
+- Per-record transitions distinguish empty/degenerate initialization or robust
+  direction removal, refined empty or below-support rejection,
+  outside-selection rejection, and
   NMS suppression. Threshold decisions store their tested value and threshold;
   NMS rejection stores the actual higher-ranked suppressor used by the existing
   pass, its ranking fields, and whether it is external context.

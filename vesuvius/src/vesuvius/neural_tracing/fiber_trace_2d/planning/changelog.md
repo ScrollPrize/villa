@@ -1,3 +1,12 @@
+# 2026-08-17: robust sampled-direction anchor refinement
+
+- Replaced joint angular line search with deterministic competitive robust
+  sampled-direction aggregation and position-only bounded refinement.
+- Removed pre-refinement close-direction merging, preserved robust membership
+  through peak fitting, and added strict configuration/artifact diagnostics.
+- Reduced the default alternating robust update budget to two measured passes;
+  legacy numeric identity is intentionally not required for this fitter.
+
 # 2026-08-17: fiberlet extraction profiling
 
 - Added deterministic anchor and fiberlet workload counters and finer-grained
@@ -553,3 +562,6 @@
   refined-state evaluation. On the same 5,000-base-voxel replay, median wall
   time fell from 24.92 to 22.09 seconds and complete artifacts remained
   byte-identical.
+- Added version-3 local-refinement subphase profiling, identifying repeated
+  refined-state evaluation as roughly 89-90% of remaining local-refinement
+  worker time on the canonical replay.
