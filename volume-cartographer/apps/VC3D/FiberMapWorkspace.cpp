@@ -158,6 +158,15 @@ constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
 constexpr int kClickSlopPx = 4;
 
+// The layout's tuning constants (resample step, label pads, panel tick) are
+// physical lengths, so it needs some voxel size to lay anything out at all. A
+// package that cannot say how big its voxels are gets this stand-in for the
+// geometry alone: it is the voxel size of the open-data scrolls, so the common
+// case is unaffected, and every physical figure the workspace would otherwise
+// derive from it is reported in voxels instead (see formatMapLength()).
+constexpr double kAssumedVoxelSizeUm = 2.4;
+constexpr double kUmPerCm = 10000.0;
+
 QColor tint(const QColor& color, const QColor& toward, double amount)
 {
     const auto blend = [amount](int from, int to) {
@@ -564,6 +573,22 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller, QWidg
     rebuildScene(tr("press Rebuild layout"));
 }
 
+double FiberMapWorkspace::layoutVoxelSizeUm() const
+{
+    return _voxelSizeUm.value_or(kAssumedVoxelSizeUm);
+}
+
+QString FiberMapWorkspace::formatMapLength(double valueCm) const
+{
+    if (_voxelSizeUm) {
+        return tr("%1 cm").arg(valueCm, 0, 'f', 2);
+    }
+    // The layout ran at kAssumedVoxelSizeUm, so its centimetres divide back into
+    // voxels exactly; the voxel count is what the geometry really says.
+    const double voxels = valueCm * kUmPerCm / kAssumedVoxelSizeUm;
+    return tr("%1 vx").arg(std::llround(voxels));
+}
+
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
 {
     const uint64_t generation =
@@ -647,13 +672,17 @@ void FiberMapWorkspace::rebuildLayout()
         inputs.push_back(std::move(input));
     }
 
+    _voxelSizeUm = snapshot.voxelSizeUm;
+
     vc3d::fiber_map::LayoutParams params;
-    params.voxelSizeUm = snapshot.voxelSizeUm;
+    params.voxelSizeUm = layoutVoxelSizeUm();
     params.minFibers = _minFiberSpin->value();
     params.maxNetworks = _topNetworkSpin->value();
     _layout = vc3d::fiber_map::buildLayout(inputs, snapshot.umbilicusCenters, params);
+    // Scene coordinates, so this converts with the scale the layout itself used
+    // rather than with a real voxel size the package may not have.
     _scrollZMaxCm = snapshot.annotationZSlices > 0
-        ? snapshot.annotationZSlices * snapshot.voxelSizeUm / 10000.0
+        ? snapshot.annotationZSlices * layoutVoxelSizeUm() / kUmPerCm
         : 0.0;
 
     QString emptyMessage;
@@ -697,6 +726,11 @@ void FiberMapWorkspace::rebuildLayout()
                          .arg(placedFibers)
                          .arg(_layout.networks.size())
                          .arg(_layout.suspectLinkCount);
+    if (!_voxelSizeUm) {
+        // No physical figure on the map means anything, so say why once rather
+        // than leave the voxel counts looking like an odd choice of unit.
+        status += tr(" · voxel size unknown — lengths in vx");
+    }
     if (!snapshot.umbilicusCenters.empty() && !snapshot.umbilicusLabel.isEmpty()) {
         // The controller composes this: which grid the umbilicus indexes,
         // whether that came from the file's own metadata or from the z-span
@@ -937,10 +971,10 @@ void FiberMapWorkspace::rebuildTree()
         const int suspectCount = static_cast<int>(
             std::count_if(network.links.begin(), network.links.end(),
                           [](const vc3d::fiber_map::PlacedLink& link) { return link.suspect; }));
-        QString title = tr("Network %1 — %2 fibers · r ≈ %3 cm")
+        QString title = tr("Network %1 — %2 fibers · r ≈ %3")
                             .arg(network.networkIndex + 1)
                             .arg(network.fibers.size())
-                            .arg(network.rRefCm, 0, 'f', 2);
+                            .arg(formatMapLength(network.rRefCm));
         if (suspectCount > 0) {
             title += tr(" · %1 winding-suspect").arg(suspectCount);
         }

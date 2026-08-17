@@ -6198,7 +6198,42 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         if (coordinateIdentity->sourceOriginalResolution > 0.0 &&
             std::isfinite(coordinateIdentity->sourceOriginalResolution)) {
             snapshot.voxelSizeUm = coordinateIdentity->sourceOriginalResolution;
+            Logger()->info(
+                "Fiber map: annotation voxel size {:g} um from the open-data "
+                "coordinate identity",
+                *snapshot.voxelSizeUm);
         }
+    }
+    // Fallback for a volume that carries no downsample tags: with nothing to
+    // say otherwise, the store's own level-0 resolution *is* the frame the
+    // fibers are annotated in. This is not equivalent to the identity above and
+    // must never be preferred over it: a tagged store can report
+    // baseScaleLevel() == 0 while its coordinates are a finer grid than its own
+    // voxel size describes, and only sourceOriginalResolution knows that. The
+    // fallback is therefore reached exactly when (1) is unavailable, which is
+    // also the only case in which it is right.
+    if (!snapshot.voxelSizeUm && _state) {
+        try {
+            if (const auto volume = _state->currentVolume()) {
+                const double level0Um =
+                    volume->voxelSize() / std::pow(2.0, volume->baseScaleLevel());
+                if (level0Um > 0.0 && std::isfinite(level0Um)) {
+                    snapshot.voxelSizeUm = level0Um;
+                    Logger()->info(
+                        "Fiber map: annotation voxel size {:g} um from the "
+                        "current volume's level-0 resolution ({:g} um at base "
+                        "scale level {})",
+                        level0Um,
+                        volume->voxelSize(),
+                        volume->baseScaleLevel());
+                }
+            }
+        } catch (...) {
+        }
+    }
+    if (!snapshot.voxelSizeUm) {
+        Logger()->info("Fiber map: no voxel size available; the map will report "
+                       "lengths in voxels");
     }
 
     // The scroll's z extent, scaled into that same source frame so it pairs with
@@ -6331,6 +6366,9 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     double scale = 1.0;
     bool haveScale = false;
     bool inferred = false;
+    // Which of the three sources decided the scale; only the voxel-size path
+    // licenses the label to describe the frame in µm.
+    bool scaleFromStampedVoxelSize = false;
 
     const bool haveStampedDims = resolved.info.volumeWidth &&
                                  resolved.info.volumeHeight &&
@@ -6381,19 +6419,29 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         }
     }
 
-    if (!haveScale && resolved.info.voxelsizeUm && snapshot.voxelSizeUm > 0.0) {
-        const double ratio = *resolved.info.voxelsizeUm / snapshot.voxelSizeUm;
+    // Comparing voxel sizes needs the annotation's own; without it the stamp
+    // says nothing usable and the inferred-grid path below has to decide.
+    if (!haveScale && resolved.info.voxelsizeUm && snapshot.voxelSizeUm &&
+        *snapshot.voxelSizeUm > 0.0) {
+        const double ratio = *resolved.info.voxelsizeUm / *snapshot.voxelSizeUm;
         if (std::isfinite(ratio) && ratio > 0.0) {
             scale = ratio;
             haveScale = true;
+            scaleFromStampedVoxelSize = true;
             Logger()->info(
                 "Fiber map: umbilicus {} at scale x{:g} (stamped {:g} um into "
                 "{:g} um)",
                 resolved.path.string(),
                 scale,
                 *resolved.info.voxelsizeUm,
-                snapshot.voxelSizeUm);
+                *snapshot.voxelSizeUm);
         }
+    } else if (!haveScale && resolved.info.voxelsizeUm && !snapshot.voxelSizeUm) {
+        Logger()->info(
+            "Fiber map: umbilicus {} stamps {:g} um but the annotation voxel "
+            "size is unknown; falling through to the grid comparison",
+            resolved.path.string(),
+            *resolved.info.voxelsizeUm);
     }
 
     if (!haveScale && haveFiberGrid) {
@@ -6505,7 +6553,11 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                         .arg(levelOffset >= 0 ? QStringLiteral("+") : QString())
                         .arg(levelOffset)
                         .arg(factor);
-        } else if (resolved.info.voxelsizeUm) {
+        } else if (scaleFromStampedVoxelSize && resolved.info.voxelsizeUm) {
+            // Only said when the µm comparison is what produced the scale: with
+            // the annotation voxel size unknown that path is skipped, and a
+            // scale that came from the stamped grid is described by that grid
+            // below rather than by a µm figure this mapping never used.
             label = tr("umbilicus: %1 µm grid → ×%2")
                         .arg(QString::number(*resolved.info.voxelsizeUm, 'g', 6))
                         .arg(factor);

@@ -156,7 +156,13 @@ public:
         // Umbilicus control points scaled into the fibers' frame, sorted by z;
         // empty when no plausible umbilicus was found.
         std::vector<cv::Vec3f> umbilicusCenters;
-        double voxelSizeUm = 2.4;
+        // Physical size of one voxel of the frame the fibers are annotated in,
+        // in µm. Unset when the package cannot say: no coordinate identity to
+        // read it from and no volume to fall back on. There is no default on
+        // purpose — a guessed voxel size turns every derived physical figure
+        // (cm, reference radii, scroll height) silently wrong, so consumers
+        // must handle the unset case and show voxels instead.
+        std::optional<double> voxelSizeUm;
         // Scroll z extent in the fibers' frame, i.e. the current volume's slice
         // count scaled back to the annotation (level 0) resolution; 0 when the
         // volume is unknown.
