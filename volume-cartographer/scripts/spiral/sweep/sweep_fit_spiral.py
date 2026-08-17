@@ -21,6 +21,10 @@ agent moves to the next config; the sweep objective is the across-seed mean.
 The spec's "eval" section configures the post-fit render_ink +
 get_ink_metrics chain (see paris4_sweep.json in this directory).
 
+``--reuse-root`` may be repeated on ``create``/``run`` to reuse exact-matching
+completed seeds from older local sweep output directories.  It is independent
+of the new wandb sweep id: ``run`` always creates a new sweep before launch.
+
 Example (from scripts/spiral/):
 
   python sweep/sweep_fit_spiral.py run --spec sweep/paris4_sweep.json \
@@ -189,6 +193,8 @@ def build_wrapper_command(spec, args):
         cmd += ['--cache', str(Path(args.cache).resolve())]
     if args.base_config:
         cmd += ['--base-config', str(Path(args.base_config).resolve())]
+    for reuse_root in args.reuse_root:
+        cmd += ['--reuse-root', str(Path(reuse_root).resolve())]
     eval_cfg = spec.get('eval', {})
     unknown = set(eval_cfg) - set(EVAL_OPTION_FLAGS) - set(EVAL_BOOL_FLAGS)
     if unknown:
@@ -410,6 +416,10 @@ def add_create_args(p):
                         '(start from dump-config output)')
     p.add_argument('--out-root', default='sweep_out',
                    help='per-run outputs go to <out-root>/<sweep_id>/<run_id>')
+    p.add_argument('--reuse-root', action='append', default=[],
+                   help='old local sweep output directory used as a completed-seed '
+                        'cache; repeat for multiple sources (a new wandb sweep is '
+                        'still created)')
     p.add_argument('--project', default='scrolls')
     p.add_argument('--entity', default=None)
     p.add_argument('--dry-run', action='store_true',
