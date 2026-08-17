@@ -527,3 +527,19 @@
 - Restored direct replay visualization manifests without a viewer index,
   published stable per-tracer failure aliases for reload, and restored loading
   of strict version-1 single-visualization replay artifacts.
+
+# 2026-08-17: CT-rendered replay trace strips
+
+- Added three disconnected, sheet-aligned replay strip OBJ artifacts per
+  failure using the unchanged default `buildLineViewSurfaces()` geometry.
+- Extracted the existing `vc_lasagna_line_probe` fine-to-coarse surface texture,
+  textured-mesh, and TIFF helpers for shared use without changing their sampler
+  behavior.
+- Made `vc_fiberlets fiberlet-replay --vis` require `--volume` to name one
+  concrete CT OME-Zarr array/group. Base trace coordinates are mapped through
+  the parent `multiscales` transform before the unchanged renderer samples that
+  group. Each trace publishes a hashed OBJ/MTL/uncompressed-TIFF triple; the
+  selected group transform is persisted and napari reads only those artifacts.
+- Removed the unpublished replay-only ribbon, mask, uint16, and PNG paths.
+- Accepted equivalent concrete-group paths with or without a trailing directory
+  separator when resolving OME-Zarr multiscales metadata.

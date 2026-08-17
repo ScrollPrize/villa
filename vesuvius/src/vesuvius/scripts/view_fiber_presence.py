@@ -64,6 +64,21 @@ class AnchorStageGeometry:
 
 
 @dataclass(frozen=True)
+class SurfaceObjGeometry:
+    vertices_zyx: np.ndarray
+    triangles: np.ndarray
+    normalized_ct_intensity: np.ndarray
+    component_count: int
+
+
+@dataclass(frozen=True)
+class ReplayStripGeometry:
+    reference: SurfaceObjGeometry
+    greedy: SurfaceObjGeometry
+    fiberlet: SurfaceObjGeometry
+
+
+@dataclass(frozen=True)
 class FiberReplayBundle:
     path: Path
     tracer: str
@@ -82,6 +97,8 @@ class FiberReplayBundle:
     anchor_cells_obj: Path | None
     anchor_stages: tuple[AnchorStageGeometry, ...]
     paths_obj: Path | None
+    strip_metadata: dict | None = None
+    strip_artifacts: tuple[tuple[Path, Path, Path], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +107,7 @@ class ReplayVisualArtifacts:
     anchor_cells: AnchorCellGeometry
     anchor_stages: tuple[AnchorStageGeometry, ...]
     fiberlets: LineObjGeometry
+    strips: ReplayStripGeometry | None = None
 
 
 @dataclass
@@ -836,6 +854,250 @@ def _read_segmented_replay_obj(path: Path, header: str) -> tuple[np.ndarray, ...
     return tuple(result)
 
 
+def _read_replay_strip_obj(
+    artifacts: tuple[Path, Path, Path],
+    header: str,
+    source_segments_xyz: Sequence[np.ndarray],
+    metadata: dict,
+) -> SurfaceObjGeometry:
+    """Read the standard VC3D textured-surface OBJ/TIFF strip artifact."""
+    path, mtl_path, texture_path = artifacts
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read replay strip OBJ {path}: {exc}") from exc
+    if not lines or lines[0].strip() != header:
+        raise ValueError(f"{path}: unsupported replay strip OBJ header")
+
+    stem = path.stem
+    material = f"{stem}_texture"
+    if path.parent / mtl_path.name != mtl_path:
+        raise ValueError(f"{path}: replay strip MTL is not local to its OBJ")
+    if mtl_path.parent / texture_path.name != texture_path:
+        raise ValueError(f"{mtl_path}: replay strip texture is not local to its MTL")
+    expected_mtl = [
+        f"newmtl {material}",
+        "Ka 1 1 1",
+        "Kd 1 1 1",
+        "Ks 0 0 0",
+        "d 1",
+        "illum 1",
+        f"map_Kd {texture_path.name}",
+    ]
+    try:
+        mtl_lines = [line.strip() for line in mtl_path.read_text().splitlines() if line.strip()]
+    except OSError as exc:
+        raise ValueError(f"cannot read replay strip MTL {mtl_path}: {exc}") from exc
+    if mtl_lines != expected_mtl:
+        raise ValueError(f"{mtl_path}: invalid replay strip material")
+    try:
+        from PIL import Image
+
+        with Image.open(texture_path) as image:
+            if image.format != "TIFF" or image.mode != "L":
+                raise ValueError(
+                    f"{texture_path}: replay strip texture must be grayscale TIFF"
+                )
+            if image.tag_v2.get(259, 1) != 1:
+                raise ValueError(
+                    f"{texture_path}: replay strip TIFF must be uncompressed"
+                )
+            texture = np.asarray(image, dtype=np.uint8).copy()
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"cannot read replay strip texture {texture_path}: {exc}") from exc
+
+    expected_cross = int(metadata["cross_samples"])
+    render_scale = int(metadata["values"]["render_scale"])
+    expected_sources = [
+        (index, np.asarray(segment, dtype=np.float64))
+        for index, segment in enumerate(source_segments_xyz)
+        if len(segment) >= 2
+    ]
+    expected_vertices = sum(expected_cross * len(points) for _, points in expected_sources)
+    expected_faces = sum(
+        (expected_cross - 1) * (len(points) - 1)
+        for _, points in expected_sources
+    )
+
+    if expected_sources:
+        expected_prefix = [
+            header,
+            f"mtllib {mtl_path.name}",
+            f"o {stem}",
+            f"usemtl {material}",
+        ]
+    else:
+        expected_prefix = [header, f"mtllib {mtl_path.name}", f"usemtl {material}"]
+    if [line.strip() for line in lines[: len(expected_prefix)]] != expected_prefix:
+        raise ValueError(f"{path}: invalid replay strip material binding")
+
+    vertices: list[list[float]] = []
+    texture_coordinates: list[list[float]] = []
+    triangles: list[list[int]] = []
+    faces: list[tuple[list[int], list[int], int]] = []
+    section = "vertices"
+    for line_number, raw in enumerate(
+        lines[len(expected_prefix) :], start=len(expected_prefix) + 1
+    ):
+        fields = raw.strip().split()
+        if not fields:
+            continue
+        if fields[0] == "v" and len(fields) == 4:
+            if section != "vertices":
+                raise ValueError(f"{path}:{line_number}: misplaced strip vertex")
+            try:
+                vertex = [float(item) for item in fields[1:4]]
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid strip vertex") from exc
+            if not np.isfinite(vertex).all():
+                raise ValueError(f"{path}:{line_number}: non-finite strip vertex")
+            vertices.append(vertex)
+        elif fields[0] == "vt" and len(fields) == 3:
+            if section == "faces":
+                raise ValueError(f"{path}:{line_number}: misplaced strip texture coordinate")
+            section = "texture_coordinates"
+            try:
+                coordinate = [float(item) for item in fields[1:]]
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid strip texture coordinate"
+                ) from exc
+            if not np.isfinite(coordinate).all() or any(
+                value < 0.0 or value > 1.0 for value in coordinate
+            ):
+                raise ValueError(
+                    f"{path}:{line_number}: invalid strip texture coordinate"
+                )
+            texture_coordinates.append(coordinate)
+        elif fields[0] == "f" and len(fields) == 5:
+            if section == "vertices":
+                raise ValueError(f"{path}:{line_number}: misplaced strip face")
+            section = "faces"
+            try:
+                pairs = [item.split("/") for item in fields[1:]]
+                if any(len(pair) != 2 for pair in pairs):
+                    raise ValueError
+                face = [int(pair[0]) for pair in pairs]
+                texture_face = [int(pair[1]) for pair in pairs]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{path}:{line_number}: invalid strip face") from exc
+            faces.append((face, texture_face, line_number))
+        else:
+            raise ValueError(f"{path}:{line_number}: unsupported strip OBJ record")
+    if len(vertices) != expected_vertices or len(texture_coordinates) != expected_vertices:
+        raise ValueError(f"{path}: strip component vertex/UV count is invalid")
+    if len(faces) != expected_faces:
+        raise ValueError(f"{path}: strip component face count is invalid")
+
+    vertex_array = np.asarray(vertices, dtype=np.float64).reshape((-1, 3))
+    texture_array = np.asarray(texture_coordinates, dtype=np.float64).reshape((-1, 2))
+    expected_texture_height = expected_cross * render_scale + 2 if expected_sources else 1
+    expected_texture_width = (
+        sum(len(points) * render_scale + 2 for _, points in expected_sources)
+        if expected_sources
+        else 1
+    )
+    if texture.shape != (expected_texture_height, expected_texture_width):
+        raise ValueError(f"{texture_path}: replay strip atlas dimensions are invalid")
+    intensities: list[float] = []
+    atlas_column = 0
+    vertex_offset = 0
+    face_offset = 0
+    for _, source in expected_sources:
+        longitudinal = len(source)
+        component_vertices = expected_cross * longitudinal
+        grid = vertex_array[
+            vertex_offset : vertex_offset + component_vertices
+        ].reshape((expected_cross, longitudinal, 3))
+        center = grid[expected_cross // 2]
+        if not np.allclose(center, source, rtol=1e-5, atol=1e-4):
+            raise ValueError(f"{path}: strip centerline differs from trace geometry")
+        uv_grid = texture_array[
+            vertex_offset : vertex_offset + component_vertices
+        ].reshape(
+            (expected_cross, longitudinal, 2)
+        )
+        texture_columns = longitudinal * render_scale
+        texture_rows = expected_cross * render_scale
+        local_u = np.linspace(0.0, 1.0, longitudinal)
+        local_v = np.linspace(1.0, 0.0, expected_cross)
+        left = (atlas_column + 1.5) / expected_texture_width
+        right = (atlas_column + 0.5 + texture_columns) / expected_texture_width
+        bottom = 1.0 - (texture_rows + 0.5) / expected_texture_height
+        top = 1.0 - 1.5 / expected_texture_height
+        expected_u = left + local_u * (right - left)
+        expected_v = bottom + local_v * (top - bottom)
+        if not np.allclose(
+            uv_grid[:, :, 0], expected_u[None, :], rtol=0.0, atol=1e-5
+        ) or not np.allclose(
+            uv_grid[:, :, 1], expected_v[:, None], rtol=0.0, atol=1e-5
+        ):
+            raise ValueError(f"{path}: strip UVs do not address atlas texel centers")
+
+        component_faces = (expected_cross - 1) * (longitudinal - 1)
+        for local_face_index, (face, texture_face, line_number) in enumerate(
+            faces[face_offset : face_offset + component_faces]
+        ):
+            row, column = divmod(local_face_index, longitudinal - 1)
+            expected = [
+                vertex_offset + row * longitudinal + column + 1,
+                vertex_offset + row * longitudinal + column + 2,
+                vertex_offset + (row + 1) * longitudinal + column + 2,
+                vertex_offset + (row + 1) * longitudinal + column + 1,
+            ]
+            if face != expected or texture_face != expected:
+                raise ValueError(
+                    f"{path}:{line_number}: strip face crosses or scrambles components"
+                )
+            zero = [item - 1 for item in face]
+            triangles.extend(
+                ([zero[0], zero[1], zero[2]], [zero[0], zero[2], zero[3]])
+            )
+
+        tile = texture[
+            1 : texture_rows + 1,
+            atlas_column + 1 : atlas_column + texture_columns + 1,
+        ]
+        padded = texture[
+            : texture_rows + 2,
+            atlas_column : atlas_column + texture_columns + 2,
+        ]
+        if (
+            not np.array_equal(padded[0, 1:-1], tile[0])
+            or not np.array_equal(padded[-1, 1:-1], tile[-1])
+            or not np.array_equal(padded[1:-1, 0], tile[:, 0])
+            or not np.array_equal(padded[1:-1, -1], tile[:, -1])
+            or padded[0, 0] != tile[0, 0]
+            or padded[-1, 0] != tile[-1, 0]
+            or padded[0, -1] != tile[0, -1]
+            or padded[-1, -1] != tile[-1, -1]
+        ):
+            raise ValueError(f"{texture_path}: replay strip atlas padding is invalid")
+        sample_rows = np.rint(
+            np.linspace(0, texture_rows - 1, expected_cross)
+        ).astype(np.int64)
+        sample_columns = np.rint(
+            np.linspace(0, texture_columns - 1, longitudinal)
+        ).astype(np.int64)
+        intensities.extend(
+            (tile[np.ix_(sample_rows, sample_columns)].astype(np.float32) / 255.0)
+            .reshape(-1)
+            .tolist()
+        )
+        atlas_column += texture_columns + 2
+        vertex_offset += component_vertices
+        face_offset += component_faces
+
+    return SurfaceObjGeometry(
+        vertices_zyx=vertex_array[:, ::-1].copy(),
+        triangles=np.asarray(triangles, dtype=np.int64).reshape((-1, 3)),
+        normalized_ct_intensity=np.asarray(intensities, dtype=np.float32),
+        component_count=len(expected_sources),
+    )
+
+
 def _load_legacy_fiber_replay(
     bundle_path: Path, root: dict, include_anchor_stages: bool
 ) -> FiberReplayBundle:
@@ -1027,6 +1289,8 @@ def _load_legacy_fiber_replay(
         anchor_cells_obj=anchor_cells_obj,
         anchor_stages=anchor_stages,
         paths_obj=paths_obj,
+        strip_metadata=None,
+        strip_artifacts=None,
     )
 
 
@@ -1082,9 +1346,11 @@ def load_fiber_replay_bundle(
         "fiberlet_trace_segments_base_xyz",
         "artifacts",
     }
+    has_strips = "trace_strips" in local
+    expected_local_fields = local_fields | ({"trace_strips"} if has_strips else set())
     if (
         not isinstance(local, dict)
-        or set(local) != local_fields
+        or set(local) != expected_local_fields
         or local.get("format") != "vc_fiber_replay_visualization"
         or local.get("version") != 1
         or local.get("coordinates") != coordinates
@@ -1219,6 +1485,77 @@ def load_fiber_replay_bundle(
         )
     ):
         raise ValueError("replay visualization tube is invalid")
+    strip_metadata = None
+    if has_strips:
+        strip_metadata = local["trace_strips"]
+        strip_fields = {"orientation", "geometry_builder", "cross_samples", "values"}
+        values = (
+            strip_metadata.get("values") if isinstance(strip_metadata, dict) else None
+        )
+        value_fields = {
+            "semantic",
+            "encoding",
+            "renderer",
+            "render_scale",
+            "atlas_padding_pixels",
+            "texture_format",
+            "source_locator",
+            "source_dtype",
+            "source_shape_zyx",
+            "source_group_scale_from_base_xyz",
+            "source_group_offset_from_base_xyz",
+            "source_storage_order",
+            "vertex_position_order",
+            "position_space",
+            "scale_xyz",
+            "translation_xyz",
+        }
+        if (
+            not isinstance(strip_metadata, dict)
+            or set(strip_metadata) != strip_fields
+            or strip_metadata.get("orientation") != "sheet_aligned_normal_cross_tangent"
+            or strip_metadata.get("geometry_builder")
+            != "buildLineViewSurfaces_default"
+            or strip_metadata.get("cross_samples") != 21
+            or not isinstance(values, dict)
+            or set(values) != value_fields
+            or values.get("semantic") != "ct_intensity"
+            or values.get("encoding") != "obj_uv_grayscale_tiff_u8"
+            or values.get("renderer") != "vc_line_probe_fine_to_coarse"
+            or not isinstance(values.get("render_scale"), int)
+            or isinstance(values.get("render_scale"), bool)
+            or values["render_scale"] < 1
+            or values.get("atlas_padding_pixels") != 1
+            or values.get("texture_format") != "tiff_gray_u8_uncompressed"
+            or not isinstance(values.get("source_locator"), str)
+            or not values["source_locator"]
+            or values.get("source_dtype") != "uint8"
+            or not isinstance(values.get("source_shape_zyx"), list)
+            or len(values["source_shape_zyx"]) != 3
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in values["source_shape_zyx"]
+            )
+            or any(
+                not isinstance(values.get(field), list)
+                or len(values[field]) != 3
+                or any(not _finite_number(value) for value in values[field])
+                for field in (
+                    "source_group_scale_from_base_xyz",
+                    "source_group_offset_from_base_xyz",
+                )
+            )
+            or any(
+                value <= 0
+                for value in values["source_group_scale_from_base_xyz"]
+            )
+            or values.get("source_storage_order") != "ZYX"
+            or values.get("vertex_position_order") != "XYZ"
+            or values.get("position_space") != "base_volume"
+            or values.get("scale_xyz") != [1.0, 1.0, 1.0]
+            or values.get("translation_xyz") != [0.0, 0.0, 0.0]
+        ):
+            raise ValueError("replay visualization strip metadata is invalid")
     expected_artifacts = {
         "replay/reference.obj",
         "replay/greedy.obj",
@@ -1238,9 +1575,30 @@ def load_fiber_replay_bundle(
         "paths/fiberlets.obj",
         "paths/fiberlet_graph.json",
     }
+    strip_artifacts = {
+        "replay/reference_strip.obj",
+        "replay/reference_strip.mtl",
+        "replay/reference_strip.tif",
+        "replay/greedy_strip.obj",
+        "replay/greedy_strip.mtl",
+        "replay/greedy_strip.tif",
+        "replay/fiberlet_strip.obj",
+        "replay/fiberlet_strip.mtl",
+        "replay/fiberlet_strip.tif",
+    }
+    actual_artifacts = local["artifacts"]
+    if not isinstance(actual_artifacts, dict):
+        raise ValueError("replay visualization artifact set is invalid")  # noqa: TRY004
+    present_strip_artifacts = set(actual_artifacts) & strip_artifacts
+    if bool(strip_metadata) != bool(present_strip_artifacts) or (
+        present_strip_artifacts and present_strip_artifacts != strip_artifacts
+    ):
+        raise ValueError("replay visualization strip artifact set is incomplete")
+    if strip_metadata is not None:
+        expected_artifacts |= strip_artifacts
     resolved = _resolve_replay_artifacts(
         manifest_path.parent,
-        local["artifacts"],
+        actual_artifacts,
         expected_artifacts,
         "replay visualization",
     )
@@ -1278,6 +1636,25 @@ def load_fiber_replay_bundle(
     )
     if not np.array_equal(failure_obj, marker_xyz):
         raise ValueError("replay failure OBJ differs from visualization metadata")
+    resolved_strip_artifacts = None
+    if strip_metadata is not None:
+        resolved_strip_artifacts = (
+            (
+                resolved["replay/reference_strip.obj"],
+                resolved["replay/reference_strip.mtl"],
+                resolved["replay/reference_strip.tif"],
+            ),
+            (
+                resolved["replay/greedy_strip.obj"],
+                resolved["replay/greedy_strip.mtl"],
+                resolved["replay/greedy_strip.tif"],
+            ),
+            (
+                resolved["replay/fiberlet_strip.obj"],
+                resolved["replay/fiberlet_strip.mtl"],
+                resolved["replay/fiberlet_strip.tif"],
+            ),
+        )
     anchor_stages: tuple[AnchorStageGeometry, ...] = ()
     if include_anchor_stages:
         anchor_stages = load_anchor_stage_directory(
@@ -1303,6 +1680,8 @@ def load_fiber_replay_bundle(
         anchor_cells_obj=resolved["anchors/anchor_cells.obj"],
         anchor_stages=anchor_stages,
         paths_obj=resolved["paths/fiberlets.obj"],
+        strip_metadata=strip_metadata,
+        strip_artifacts=resolved_strip_artifacts,
     )
 
 
@@ -1317,12 +1696,66 @@ def load_replay_visual_artifacts(replay: FiberReplayBundle) -> ReplayVisualArtif
         or len(replay.anchor_stages) not in {0, len(_ANCHOR_STAGE_NAMES)}
     ):
         raise ValueError("artifact reload requires a failed replay bundle")
+    strips = None
+    if replay.strip_artifacts is not None:
+        if replay.strip_metadata is None:
+            raise ValueError("replay strip paths have no metadata")
+        strips = ReplayStripGeometry(
+            reference=_read_replay_strip_obj(
+                replay.strip_artifacts[0],
+                "# vc_fiber_replay_reference_strip version 4",
+                (replay.reference_zyx[:, ::-1],),
+                replay.strip_metadata,
+            ),
+            greedy=_read_replay_strip_obj(
+                replay.strip_artifacts[1],
+                "# vc_greedy_fiber_replay_strip version 4",
+                tuple(value[:, ::-1] for value in replay.greedy_segments_zyx),
+                replay.strip_metadata,
+            ),
+            fiberlet=_read_replay_strip_obj(
+                replay.strip_artifacts[2],
+                "# vc_fiberlet_graph_replay_strip version 4",
+                tuple(value[:, ::-1] for value in replay.fiberlet_segments_zyx),
+                replay.strip_metadata,
+            ),
+        )
     return ReplayVisualArtifacts(
         anchors=read_line_obj(replay.anchors_obj, "anchors", replay.crop_xyzwhd),
         anchor_cells=read_anchor_cell_obj(replay.anchor_cells_obj),
         anchor_stages=replay.anchor_stages,
         fiberlets=read_line_obj(replay.paths_obj, "paths", replay.crop_xyzwhd),
+        strips=strips,
     )
+
+
+def replay_strip_contrast_limits(
+    strips: ReplayStripGeometry,
+) -> tuple[float, float]:
+    """Return one robust display range shared by all stored CT strip values."""
+    values = (
+        np.concatenate(
+            [
+                geometry.normalized_ct_intensity
+                for geometry in (strips.reference, strips.greedy, strips.fiberlet)
+                if len(geometry.normalized_ct_intensity)
+            ]
+        )
+        if any(
+            len(geometry.normalized_ct_intensity)
+            for geometry in (strips.reference, strips.greedy, strips.fiberlet)
+        )
+        else np.empty(0, dtype=np.float32)
+    )
+    if not len(values):
+        return (0.0, 1.0)
+    lower, upper = (float(value) for value in np.percentile(values, (1.0, 99.0)))
+    if not upper > lower:
+        lower = float(np.min(values))
+        upper = float(np.max(values))
+    if not upper > lower:
+        return (0.0, 1.0)
+    return (lower, upper)
 
 
 def replay_visual_topology(
@@ -1335,6 +1768,7 @@ def replay_visual_topology(
         bool(replay.greedy_segments_zyx),
         bool(replay.fiberlet_segments_zyx),
         tuple(stage.stage for stage in artifacts.anchor_stages),
+        artifacts.strips is not None,
     )
 
 
@@ -1869,6 +2303,7 @@ def add_clipping_controls(
     anchor_cell_centers_layer=None,
     anchor_displacements_layer=None,
     anchor_stage_layers: Sequence | None = None,
+    additional_layers: Sequence | None = None,
     presence_radius_base_voxels: float | None = None,
     maximum_presence_radius_base_voxels: float | None = None,
     set_presence_radius: Callable[[float], None] | None = None,
@@ -1941,6 +2376,7 @@ def add_clipping_controls(
         return slider, spin
 
     anchor_stage_layers = tuple(anchor_stage_layers or ())
+    additional_layers = tuple(additional_layers or ())
     anchor_width_source = (
         anchors_layer
         if anchors_layer is not None
@@ -2095,6 +2531,7 @@ def add_clipping_controls(
             anchor_cell_centers_layer,
             anchor_displacements_layer,
             *anchor_stage_layers,
+            *additional_layers,
         )
         if layer is not None
     )
@@ -3308,6 +3745,7 @@ def launch_viewer(
     trace_layer = None
     fiberlet_route_layer = None
     failure_layer = None
+    strip_layers: tuple = ()
     if replay is not None:
         reference_layer = viewer.add_shapes(
             [replay.reference_zyx],
@@ -3342,6 +3780,39 @@ def launch_viewer(
                 name="replay failure",
                 face_color="red",
                 size=4,
+            )
+        if replay_artifacts is not None and replay_artifacts.strips is not None:
+            strip_contrast_limits = replay_strip_contrast_limits(
+                replay_artifacts.strips
+            )
+            strip_specs = (
+                (
+                    "reference CT strip",
+                    replay_artifacts.strips.reference,
+                ),
+                (
+                    "greedy CT strip",
+                    replay_artifacts.strips.greedy,
+                ),
+                (
+                    "fiberlet CT strip",
+                    replay_artifacts.strips.fiberlet,
+                ),
+            )
+            strip_layers = tuple(
+                viewer.add_surface(
+                    (
+                        geometry.vertices_zyx,
+                        geometry.triangles,
+                        geometry.normalized_ct_intensity,
+                    ),
+                    name=name,
+                    colormap="gray",
+                    contrast_limits=strip_contrast_limits,
+                    shading="none",
+                    visible=False,
+                )
+                for name, geometry in strip_specs
             )
 
     anchor_radius_base_voxels = None
@@ -3434,7 +3905,10 @@ def launch_viewer(
         import dask.array as da
 
         replay_root_path = replay.path
-        replay_state = {"replay": replay, "artifacts": replay_artifacts}
+        replay_state = {
+            "replay": replay,
+            "artifacts": replay_artifacts,
+        }
 
         def build_reloaded_anchor_filters(
             artifacts: ReplayVisualArtifacts,
@@ -3491,6 +3965,7 @@ def launch_viewer(
                     trace_layer,
                     fiberlet_route_layer,
                     failure_layer,
+                    *strip_layers,
                     volume_layer,
                 )
                 if layer is not None
@@ -3537,6 +4012,20 @@ def launch_viewer(
                         candidate_replay.fiberlet_segments_zyx
                     )
                 failure_layer.data = candidate_replay.failure_zyx
+                if strip_layers:
+                    if candidate_artifacts.strips is None or len(strip_layers) != 3:
+                        raise ValueError("replacement replay strip data is incomplete")
+                    strip_data = (
+                        candidate_artifacts.strips.reference,
+                        candidate_artifacts.strips.greedy,
+                        candidate_artifacts.strips.fiberlet,
+                    )
+                    for layer, geometry in zip(strip_layers, strip_data, strict=True):
+                        layer.data = (
+                            geometry.vertices_zyx,
+                            geometry.triangles,
+                            geometry.normalized_ct_intensity,
+                        )
                 for stage in candidate_artifacts.anchor_stages:
                     layer = anchor_stage_layers_by_name.get(stage.stage)
                     if layer is None:
@@ -3686,6 +4175,7 @@ def launch_viewer(
         anchor_cell_centers_layer=anchor_cell_centers_layer,
         anchor_displacements_layer=anchor_displacements_layer,
         anchor_stage_layers=anchor_stage_layers,
+        additional_layers=(fiberlet_route_layer, *strip_layers),
         presence_radius_base_voxels=presence_radius_base_voxels,
         maximum_presence_radius_base_voxels=(
             maximum_display_radius if presence_distance_base is not None else None
@@ -3780,7 +4270,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     stage_directory, anchors, crop
                 )
         resolved = resolve_ome_zarr_level(args.zarr, args.level)
-        launch_viewer(resolved, crop, anchors, paths, replay, anchor_stages)
+        launch_viewer(
+            resolved,
+            crop,
+            anchors,
+            paths,
+            replay,
+            anchor_stages,
+        )
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

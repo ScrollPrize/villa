@@ -3,6 +3,7 @@ configure_file(src/Version.cpp.in Version.cpp)
 add_library(vc_core
         src/AtomicFile.cpp
         src/TexturedMesh.cpp
+        src/SurfaceTexture.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp

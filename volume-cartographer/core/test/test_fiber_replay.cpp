@@ -1,12 +1,16 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <opencv2/imgcodecs.hpp>
 
 namespace
 {
@@ -23,6 +27,111 @@ std::string readText(const std::filesystem::path& path)
 {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+class RecordingNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    [[nodiscard]] vc::lasagna::NormalSample sampleNormal(
+        const cv::Vec3d& point) const override
+    {
+        points.push_back(point);
+        return {{0.0, 0.0, 1.0}, true, {}};
+    }
+
+    mutable std::vector<cv::Vec3d> points;
+};
+
+void attachTestCtValues(vc::fiber_tracer::FiberReplayStripMeshes& strips)
+{
+    strips.textureSource = {
+        "/data/ct.zarr/2",
+        4,
+        {16, 16, 16},
+        {0.25, 0.25, 0.25},
+        {0.0, 0.0, 0.0},
+    };
+    uint8_t value = 0;
+    for (auto* components : {
+             &strips.reference, &strips.greedy, &strips.fiberlet}) {
+        for (auto& component : *components) {
+            REQUIRE(component.lineSurface);
+            const auto* points = component.lineSurface->rawPointsPtr();
+            REQUIRE(points);
+            component.texture.create(
+                points->rows * strips.textureSource->renderScale,
+                points->cols * strips.textureSource->renderScale);
+            for (int row = 0; row < component.texture.rows; ++row) {
+                for (int column = 0; column < component.texture.cols; ++column) {
+                    component.texture(row, column) = value++;
+                }
+            }
+        }
+    }
+}
+
+void checkReplayStripCtRendering()
+{
+    const auto directory = temporaryDirectory() / "ct_uint8";
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {8, 8, 8};
+    options.chunkShapeZYX = {4, 4, 4};
+    options.dtype = vc::render::ChunkDtype::UInt8;
+    options.numLevels = 2;
+    options.compressor = "none";
+    options.overwriteExisting = true;
+    auto pyramid = Volume::New(directory, options);
+    REQUIRE(pyramid);
+
+    Array3D<uint8_t> values({8, 8, 8}, 0);
+    for (size_t z = 0; z < 8; ++z) {
+        for (size_t y = 0; y < 8; ++y) {
+            for (size_t x = 0; x < 8; ++x) {
+                values(z, y, x) = static_cast<uint8_t>(z * 20 + y * 4 + x);
+            }
+        }
+    }
+    pyramid->writeZYX(values, {0, 0, 0});
+    pyramid.reset();
+    auto volume = Volume::New(directory / "1");
+    REQUIRE(volume);
+
+    vc::fiber_tracer::FiberReplayStripMeshes strips;
+    vc::fiber_tracer::FiberReplayStripComponent component;
+    cv::Mat_<cv::Vec3f> points(2, 2);
+    points(0, 0) = {1.0F, 1.0F, 1.0F};
+    points(0, 1) = {2.0F, 1.0F, 1.0F};
+    points(1, 0) = {1.0F, 2.0F, 1.0F};
+    points(1, 1) = {2.0F, 2.0F, 1.0F};
+    component.lineSurface =
+        std::make_shared<QuadSurface>(points, cv::Vec2f{1.0F, 1.0F});
+    component.centerlineBaseXYZ = {{1.0, 1.0, 1.0}};
+    strips.reference.push_back(std::move(component));
+    const auto groupLocator =
+        (directory / "1").string() + std::filesystem::path::preferred_separator;
+    vc::fiber_tracer::renderFiberReplayStripTextures(
+        strips, *volume, groupLocator, 2);
+
+    REQUIRE(strips.textureSource.has_value());
+    CHECK(strips.textureSource->locator == groupLocator);
+    CHECK(strips.textureSource->renderScale == 2);
+    CHECK(strips.textureSource->shapeZYX == std::array<int, 3>{4, 4, 4});
+    CHECK(strips.textureSource->scaleFromBaseXYZ ==
+          std::array<double, 3>{0.5, 0.5, 0.5});
+    REQUIRE(strips.reference[0].texture.rows == 4);
+    REQUIRE(strips.reference[0].texture.cols == 4);
+    CHECK(cv::countNonZero(strips.reference[0].texture) > 0);
+
+    auto wholePyramid = Volume::New(directory);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::validateFiberReplayStripCtVolume(
+            *wholePyramid, directory.string(), 2),
+        doctest::Contains("one concrete Zarr array/group"),
+        std::invalid_argument);
+
+    wholePyramid.reset();
+    volume.reset();
+    std::filesystem::remove_all(directory.parent_path());
 }
 
 }  // namespace
@@ -102,6 +211,76 @@ TEST_CASE("forward polyline interval defaults to the complete remaining referenc
     CHECK_THROWS_WITH_AS(
         vc::fiber_tracer::selectForwardPolylineArcInterval(reference, 3),
         doctest::Contains("no forward extent"), std::invalid_argument);
+}
+
+TEST_CASE("replay strip meshes keep reset components and sample normals in working coordinates")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {8, 8, 8};
+    grid.predictionToBaseScale = 2.0;
+    const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+        {{0.0, 0.0, 0.0}, {8.0, 0.0, 0.0}}, 4.0, 4.0, 2.0, grid, 2);
+
+    vc::fiber_tracer::FiberReplayTraceResult greedy;
+    vc::fiber_tracer::FiberReplayTraceSegment first;
+    first.tracePointsBase = {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}};
+    first.matches.push_back({1, 2.0, 2.0, {2.0, 0.0, 0.0}, 0.0, 2.0, 0.0, 0.0});
+    vc::fiber_tracer::FiberReplayTraceSegment second;
+    second.startReferenceArcBase = 2.0;
+    second.tracePointsBase = {{2.0, 1.0, 0.0}, {8.0, 1.0, 0.0}};
+    second.matches.push_back({1, 8.0, 8.0, {8.0, 0.0, 0.0}, 2.0, 8.0, 1.0, 0.5});
+    greedy.segments = {first, second};
+
+    vc::fiber_tracer::FiberletGraphReplayResult fiberlet;
+    vc::fiber_tracer::FiberletGraphReplaySegment route;
+    route.routePointsBaseXYZ = {{0.0, -1.0, 0.0}, {8.0, -1.0, 0.0}};
+    route.matches = {
+        {0, 0.0, 0.0, {0.0, 0.0, 0.0}, 0.0, 0.0, 1.0},
+        {1, 8.0, 8.0, {8.0, 0.0, 0.0}, 0.0, 8.0, 1.0},
+    };
+    fiberlet.segments = {route};
+
+    RecordingNormalSampler normals;
+    const auto strips = vc::fiber_tracer::makeFiberReplayStripSurfaces(
+        tube, greedy, fiberlet, normals, 2.0, 4);
+
+    REQUIRE(strips.reference.size() == 1);
+    REQUIRE(strips.greedy.size() == 2);
+    REQUIRE(strips.fiberlet.size() == 1);
+    CHECK(strips.greedy[0].sourceSegmentIndex == 0);
+    CHECK(strips.greedy[1].sourceSegmentIndex == 1);
+    REQUIRE(strips.reference[0].lineSurface);
+    CHECK(strips.reference[0].lineSurface->rawPointsPtr()->rows == 21);
+    CHECK(strips.reference[0].lineSurface->rawPointsPtr()->cols == 2);
+    REQUIRE_FALSE(normals.points.empty());
+    CHECK(normals.points.back()[0] <= 4.0);
+}
+
+TEST_CASE("replay strip CT rendering uses the existing surface renderer for uint8")
+{
+    checkReplayStripCtRendering();
+}
+
+TEST_CASE("replay strip CT rendering rejects unsupported uint16 volumes")
+{
+    const auto directory = temporaryDirectory() / "ct_uint16";
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {4, 4, 4};
+    options.chunkShapeZYX = {4, 4, 4};
+    options.dtype = vc::render::ChunkDtype::UInt16;
+    options.numLevels = 1;
+    options.compressor = "none";
+    options.overwriteExisting = true;
+    auto volume = Volume::New(directory, options);
+    REQUIRE(volume);
+    volume.reset();
+    volume = Volume::New(directory / "0");
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::validateFiberReplayStripCtVolume(
+            *volume, (directory / "0").string(), 4),
+        doctest::Contains("must use uint8"), std::invalid_argument);
+    volume.reset();
+    std::filesystem::remove_all(directory.parent_path());
 }
 
 TEST_CASE("dual replay publication is deterministic and no-vis has only full traces")
@@ -211,6 +390,21 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     visualization.pathArtifact.normalManifestContentHash = "fnv1a64:2";
     visualization.pathArtifact.anchorArtifactLocator = "anchors/anchors.json";
     visualization.pathArtifact.anchorArtifactContentHash = "fnv1a64:3";
+    RecordingNormalSampler visualNormals;
+    visualization.strips = vc::fiber_tracer::makeFiberReplayStripSurfaces(
+        visualization.tube,
+        input.greedyReplay,
+        input.fiberletReplay,
+        visualNormals,
+        1.0,
+        1);
+    auto unsampledInput = input;
+    unsampledInput.visualizations.push_back(visualization);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::writeFiberReplayBundle(directory, unsampledInput),
+        doctest::Contains("no rendered CT images"), std::invalid_argument);
+    CHECK(readText(directory / "fiber_replay.json") == first);
+    attachTestCtValues(*visualization.strips);
     input.visualizations.push_back(std::move(visualization));
     const auto visualBundle =
         vc::fiber_tracer::writeFiberReplayBundle(directory, input);
@@ -221,6 +415,51 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     const auto local = nlohmann::json::parse(readText(directory / alias));
     CHECK(local.at("format") == "vc_fiber_replay_visualization");
     CHECK(local.at("artifacts").at("replay/reference.obj").at("path").get<std::string>().starts_with("runs/"));
+    CHECK(local.at("trace_strips").at("geometry_builder") ==
+          "buildLineViewSurfaces_default");
+    CHECK(local.at("trace_strips").at("cross_samples") == 21);
+    const auto& values = local.at("trace_strips").at("values");
+    CHECK(values.at("semantic") == "ct_intensity");
+    CHECK(values.at("encoding") == "obj_uv_grayscale_tiff_u8");
+    CHECK(values.at("renderer") == "vc_line_probe_fine_to_coarse");
+    CHECK(values.at("render_scale") == 4);
+    CHECK(values.at("source_locator") == "/data/ct.zarr/2");
+    CHECK(values.at("source_dtype") == "uint8");
+    CHECK(values.at("source_shape_zyx") == std::array<int, 3>{16, 16, 16});
+    CHECK(values.at("source_group_scale_from_base_xyz") ==
+          std::array<double, 3>{0.25, 0.25, 0.25});
+    CHECK(local.at("artifacts").contains("replay/reference_strip.obj"));
+    CHECK(local.at("artifacts").contains("replay/reference_strip.mtl"));
+    CHECK(local.at("artifacts").contains("replay/reference_strip.tif"));
+    CHECK(local.at("artifacts").contains("replay/greedy_strip.obj"));
+    CHECK(local.at("artifacts").contains("replay/greedy_strip.mtl"));
+    CHECK(local.at("artifacts").contains("replay/greedy_strip.tif"));
+    CHECK(local.at("artifacts").contains("replay/fiberlet_strip.obj"));
+    CHECK(local.at("artifacts").contains("replay/fiberlet_strip.mtl"));
+    CHECK(local.at("artifacts").contains("replay/fiberlet_strip.tif"));
+    const auto referenceStripPath = directory / alias;
+    const auto referenceStrip =
+        nlohmann::json::parse(readText(referenceStripPath))
+            .at("artifacts")
+            .at("replay/reference_strip.obj")
+            .at("path")
+            .get<std::string>();
+    const auto stripObjText = readText(referenceStripPath.parent_path() /
+                                       referenceStrip);
+    CHECK(stripObjText.starts_with(
+        "# vc_fiber_replay_reference_strip version 4\n"));
+    CHECK(stripObjText.find("mtllib reference_strip.mtl\n") != std::string::npos);
+    CHECK(stripObjText.find("vt ") != std::string::npos);
+    CHECK(stripObjText.find("f 1/1 ") != std::string::npos);
+    const auto referenceTexture = referenceStripPath.parent_path() /
+        nlohmann::json::parse(readText(referenceStripPath))
+            .at("artifacts")
+            .at("replay/reference_strip.tif")
+            .at("path")
+            .get<std::string>();
+    const cv::Mat texture = cv::imread(referenceTexture.string(), cv::IMREAD_UNCHANGED);
+    CHECK_FALSE(texture.empty());
+    CHECK(texture.type() == CV_8UC1);
 
     input.visualizations.clear();
     input.greedyReplay.failures.clear();

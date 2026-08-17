@@ -8,11 +8,16 @@
 
 #include <array>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <opencv2/core/mat.hpp>
+
+class Volume;
+class QuadSurface;
 
 namespace vc::fiber_tracer
 {
@@ -31,6 +36,28 @@ struct FiberReplayTube {
     [[nodiscard]] bool containsPredictionPoint(const cv::Vec3d& pointPredictionXYZ, double predictionToBaseScale) const;
 };
 
+struct FiberReplayStripComponent {
+    size_t sourceSegmentIndex = 0;
+    std::vector<cv::Vec3d> centerlineBaseXYZ;
+    std::shared_ptr<QuadSurface> lineSurface;
+    cv::Mat_<uint8_t> texture;
+};
+
+struct FiberReplayStripTextureSource {
+    std::string locator;
+    int renderScale = 1;
+    std::array<int, 3> shapeZYX{};
+    std::array<double, 3> scaleFromBaseXYZ{};
+    std::array<double, 3> offsetFromBaseXYZ{};
+};
+
+struct FiberReplayStripMeshes {
+    std::vector<FiberReplayStripComponent> reference;
+    std::vector<FiberReplayStripComponent> greedy;
+    std::vector<FiberReplayStripComponent> fiberlet;
+    std::optional<FiberReplayStripTextureSource> textureSource;
+};
+
 [[nodiscard]] FiberReplayTube makeFiberReplayTube(
     const std::vector<cv::Vec3d>& referenceLineBase,
     double centerArcBase,
@@ -46,6 +73,25 @@ enum class FiberReplayTracer {
 
 [[nodiscard]] const char* fiberReplayTracerName(FiberReplayTracer tracer) noexcept;
 
+[[nodiscard]] FiberReplayStripMeshes makeFiberReplayStripSurfaces(
+    const FiberReplayTube& tube,
+    const FiberReplayTraceResult& greedyReplay,
+    const FiberletGraphReplayResult& fiberletReplay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    int parallelThreads);
+
+void renderFiberReplayStripTextures(
+    FiberReplayStripMeshes& meshes,
+    ::Volume& volume,
+    const std::string& sourceLocator,
+    int renderScale);
+
+[[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
+    ::Volume& volume,
+    const std::string& sourceLocator,
+    int renderScale);
+
 struct FiberReplayVisualizationInput {
     FiberReplayTracer tracer = FiberReplayTracer::Greedy;
     size_t tracerFailureIndex = 0;
@@ -54,6 +100,7 @@ struct FiberReplayVisualizationInput {
     FiberAnchorArtifactInfo anchorArtifact;
     FiberletPathReport paths;
     FiberletArtifactInfo pathArtifact;
+    std::optional<FiberReplayStripMeshes> strips;
 };
 
 struct FiberReplayBundleInput {

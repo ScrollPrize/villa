@@ -427,13 +427,50 @@ reports both evaluator failure counts and confirms reference fraction one for
 both.
 
 By default the command publishes only the strict version-2 whole-run bundle.
-`--vis` additionally extracts a local tube for every failure. `--along 128`
-then selects the reference arclength before and after that failure and
-`--radius 64` selects the Euclidean tube radius. These controls affect only
+`--vis` additionally extracts a local tube for every failure and requires
+`--volume /path/to/ct.ome.zarr/2`. The path must name the concrete uint8 3D
+Zarr array/group to render, not the OME-Zarr pyramid root. Choose a group whose
+chunks are fully stored locally. The producer finds that group in its parent
+OME-Zarr `multiscales` metadata and uses the declared coordinate transform to
+map base-volume trace coordinates into group voxels. The source group is opened
+and validated before replay extraction, so no visualization is published when
+it is missing, is not advertised by the parent OME-Zarr, or has the wrong type.
+`--along 128` then selects the reference arclength before and after that failure
+and `--radius 64` selects the Euclidean tube radius. These controls affect only
 visualization extraction; the evaluators always traverse the selected
 comparison interval. Every local visualization contains its own anchors,
 anchor stages, fiberlets, graph, cropped evaluator segments, reference, and
-failure marker. No central textured slice OBJ is produced.
+failure marker. It also contains three self-contained sheet-aligned textured
+strip triples: `replay/reference_strip.{obj,mtl,tif}`,
+`replay/greedy_strip.{obj,mtl,tif}`, and
+`replay/fiberlet_strip.{obj,mtl,tif}`. They are built directly by the existing
+`buildLineViewSurfaces()` default path, with the exact trace points as the
+longitudinal samples and the standard 21-row line surface. Trace resets remain
+separate surface components with no faces between them. Each component is
+rendered by the same fine-to-coarse helper used by `vc_lasagna_line_probe`.
+`--strip-render-scale N` controls its existing coordinate-grid supersampling and
+defaults to 4. Disconnected images are packed into one padded grayscale atlas
+per trace type by transforming the existing textured-mesh UVs; each tile's
+replicated one-pixel border prevents interpolation into a neighboring component.
+An empty trace type gets an empty OBJ, MTL, and 1x1 uncompressed TIFF. The local
+manifest records the selected group path, its actual base-to-group scale/offset
+transform and shape, render scale, and source provenance. No replay-specific
+renderer, mask, uint16 conversion, or PNG compatibility path is retained.
+
+For example, generate replay visualizations with:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
+  /path/to/fiber.lasagna.json \
+  /path/to/reference-fiber.json \
+  /tmp/fiberlet-replay \
+  --normal-manifest /path/to/lasagna.lasagna.json \
+  --vis \
+  --volume /path/to/ct.ome.zarr/2
+```
+
+For the current sparse Paris4 CT store, group `/2` is the first fully stored
+scale and must be passed directly as shown above.
 
 Each run is published under `runs/<content-hash>/`; only after all requested
 generations exist is `fiber_replay.json` atomically replaced. The root stores
@@ -458,16 +495,27 @@ python -m vesuvius.scripts.view_fiber_presence \
 Replay mode accepts one direct visualization manifest and has no index
 argument. Passing the aggregate root reports a directly usable manifest path,
 or requests regeneration with `--vis` if none exist. It rejects manual
-crop/anchor/path arguments and verifies the external Zarr shape/scale, artifact
-paths, hashes, strict geometry, and manifest identity. Reference, segmented greedy
-trace, segmented fiberlet trace, failure marker, anchors, stages, fiberlets,
-and presence are separate toggleable layers. The established clipping, radius,
-width, size, and path-quality controls apply to the selected local generation.
+crop/anchor/path arguments and verifies the external presence-Zarr shape/scale,
+artifact paths, hashes, strict geometry/UV/material bindings, stored CT texture values, and manifest
+identity. Reference, segmented greedy trace, segmented fiberlet trace, failure
+marker, anchors, stages, fiberlets, and presence are separate toggleable layers.
+The established clipping, radius, width, size, and path-quality controls apply
+to the selected local generation.
+
+The three hidden grayscale `reference CT strip`, `greedy CT strip`, and
+`fiberlet CT strip` Surface layers read their values from the hashed PNG atlases
+referenced by their hashed OBJ/MTL artifacts and share a p1/p99 display range. The viewer neither accepts a CT
+volume argument nor opens the provenance path in the manifest. Older direct
+visualization manifests without the all-three strip extension still open and
+do not synthesize these layers. The unpublished geometry-only and vertex-RGB
+strip formats are rejected and must be regenerated.
 
 `Reload artifacts` rereads the same stable direct manifest, which is atomically
 updated by a later replay publication. It does not reload the presence Zarr and
-preserves display state. Incompatible or malformed replacement output is
-rejected before replacing any layer.
+preserves display state. Replacement strip geometry, faces, UVs, and stored values
+are applied from the new artifacts while preserving the three Surface layers'
+visibility and other display settings. Incompatible or malformed replacement
+output is rejected before replacing any layer.
 
 This remains an overcomplete diagnostic collection. There is no path-quality
 cutoff, degree selection, overlap deduplication, extension, H/V, or winding

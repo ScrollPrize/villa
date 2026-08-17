@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -7,13 +8,16 @@ import dask.array as da
 import numpy as np
 import pytest
 import zarr
+from PIL import Image
 from vesuvius.scripts.view_fiber_presence import (
     AnchorCellGeometry,
     AnchorStageGeometry,
     CropSelection,
     FiberReplayBundle,
     LineObjGeometry,
+    ReplayStripGeometry,
     ReplayVisualArtifacts,
+    _read_replay_strip_obj,
     anchor_path_representatives,
     apply_replay_geometry_filter,
     build_parser,
@@ -40,6 +44,7 @@ from vesuvius.scripts.view_fiber_presence import (
     replay_display_radius_defaults_base,
     replay_distance_transform_base,
     replay_fiberlet_distances_base,
+    replay_strip_contrast_limits,
     replay_visual_topology,
     resolve_ome_zarr_level,
     select_base_crop,
@@ -58,6 +63,16 @@ def test_anchor_stage_layers_are_enabled_by_default_with_explicit_opt_out():
     assert not parser.parse_args(
         ["presence.zarr", "--crop", "0,0,0,1,1,1", "--no-anchor-stages"]
     ).anchor_stages
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "presence.zarr",
+                "--crop",
+                "0,0,0,1,1,1",
+                "--volume",
+                "ct.zarr",
+            ]
+        )
 
 
 def test_replay_cli_uses_a_direct_manifest_without_an_index():
@@ -82,7 +97,90 @@ def _fnv1a64(data: bytes) -> str:
     return f"fnv1a64:{value:016x}"
 
 
-def _write_visual_replay(tmp_path):
+def _straight_strip_files(stem, header, length, *, origin=0.0):
+    cross_samples = 21
+    longitudinal_samples = 2
+    render_scale = 4
+    lines = [
+        header,
+        f"mtllib {stem}.mtl",
+        f"o {stem}",
+        f"usemtl {stem}_texture",
+    ]
+    for row in range(cross_samples):
+        y = float(np.float32(origin + row - cross_samples // 2))
+        for column in range(longitudinal_samples):
+            vertex_x = float(np.float32(origin + column * length))
+            vertex_z = float(np.float32(origin))
+            lines.append(f"v {vertex_x} {y} {vertex_z}")
+    texture_rows = cross_samples * render_scale
+    texture_columns = longitudinal_samples * render_scale
+    texture_values = (
+        np.arange(texture_rows * texture_columns, dtype=np.uint16)
+        .reshape(texture_rows, texture_columns)
+        % 254
+        + 1
+    ).astype(np.uint8)
+    atlas = np.pad(texture_values, 1, mode="edge")
+    for row in range(cross_samples):
+        for column in range(longitudinal_samples):
+            local_u = column / (longitudinal_samples - 1)
+            local_v = 1.0 - row / (cross_samples - 1)
+            left = 1.5 / atlas.shape[1]
+            right = (texture_columns + 0.5) / atlas.shape[1]
+            bottom = 1.0 - (texture_rows + 0.5) / atlas.shape[0]
+            top = 1.0 - 1.5 / atlas.shape[0]
+            u = left + local_u * (right - left)
+            v = bottom + local_v * (top - bottom)
+            lines.append(f"vt {u!r} {v!r}")
+    for row in range(cross_samples - 1):
+        for column in range(longitudinal_samples - 1):
+            p00 = row * longitudinal_samples + column + 1
+            p01 = p00 + 1
+            p10 = p00 + longitudinal_samples
+            p11 = p10 + 1
+            lines.append(f"f {p00}/{p00} {p01}/{p01} {p11}/{p11} {p10}/{p10}")
+    tif = io.BytesIO()
+    Image.fromarray(atlas).save(tif, format="TIFF", compression="raw")
+    mtl = (
+        f"newmtl {stem}_texture\n"
+        "Ka 1 1 1\n"
+        "Kd 1 1 1\n"
+        "Ks 0 0 0\n"
+        "d 1\n"
+        "illum 1\n"
+        f"map_Kd {stem}.tif\n"
+    ).encode()
+    return {
+        f"replay/{stem}.obj": ("\n".join(lines) + "\n").encode(),
+        f"replay/{stem}.mtl": mtl,
+        f"replay/{stem}.tif": tif.getvalue(),
+    }
+
+
+def _empty_strip_files(stem, header):
+    tif = io.BytesIO()
+    Image.fromarray(np.zeros((1, 1), dtype=np.uint8)).save(
+        tif, format="TIFF", compression="raw"
+    )
+    return {
+        f"replay/{stem}.obj": (
+            f"{header}\nmtllib {stem}.mtl\nusemtl {stem}_texture\n"
+        ).encode(),
+        f"replay/{stem}.mtl": (
+            f"newmtl {stem}_texture\n"
+            "Ka 1 1 1\n"
+            "Kd 1 1 1\n"
+            "Ks 0 0 0\n"
+            "d 1\n"
+            "illum 1\n"
+            f"map_Kd {stem}.tif\n"
+        ).encode(),
+        f"replay/{stem}.tif": tif.getvalue(),
+    }
+
+
+def _write_visual_replay(tmp_path, *, with_strips=False):
     generation = tmp_path / "runs" / "abc"
     replay_dir = generation / "replay"
     visual_dir = generation / "visualizations" / "000000"
@@ -117,6 +215,24 @@ def _write_visual_replay(tmp_path):
         "paths/fiberlets.obj": b"unused\n",
         "paths/fiberlet_graph.json": b"{}\n",
     }
+    if with_strips:
+        local_files.update(
+            _straight_strip_files(
+                "reference_strip", "# vc_fiber_replay_reference_strip version 4", 8
+            )
+        )
+        local_files.update(
+            _straight_strip_files(
+                "greedy_strip", "# vc_greedy_fiber_replay_strip version 4", 4
+            )
+        )
+        local_files.update(
+            _straight_strip_files(
+                "fiberlet_strip",
+                "# vc_fiberlet_graph_replay_strip version 4",
+                6,
+            )
+        )
     for relative, content in local_files.items():
         target = visual_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +293,30 @@ def _write_visual_replay(tmp_path):
             for key, content in local_files.items()
         },
     }
+    if with_strips:
+        local["trace_strips"] = {
+            "orientation": "sheet_aligned_normal_cross_tangent",
+            "geometry_builder": "buildLineViewSurfaces_default",
+            "cross_samples": 21,
+            "values": {
+                "semantic": "ct_intensity",
+                "encoding": "obj_uv_grayscale_tiff_u8",
+                "renderer": "vc_line_probe_fine_to_coarse",
+                "render_scale": 4,
+                "atlas_padding_pixels": 1,
+                "texture_format": "tiff_gray_u8_uncompressed",
+                "source_locator": "/data/ct.zarr/2",
+                "source_dtype": "uint8",
+                "source_shape_zyx": [25, 25, 25],
+                "source_group_scale_from_base_xyz": [0.25, 0.25, 0.25],
+                "source_group_offset_from_base_xyz": [0.0, 0.0, 0.0],
+                "source_storage_order": "ZYX",
+                "vertex_position_order": "XYZ",
+                "position_space": "base_volume",
+                "scale_xyz": [1.0, 1.0, 1.0],
+                "translation_xyz": [0.0, 0.0, 0.0],
+            },
+        }
     manifest = json.dumps(local).encode()
     (visual_dir / "manifest.json").write_bytes(manifest)
     full_files = {
@@ -268,6 +408,173 @@ def test_loads_direct_dual_replay_visualization(tmp_path):
     np.testing.assert_array_equal(replay.failure_zyx, [[0, 0, 4]])
     assert replay.tube_radius_base_voxels == 8.0
     assert replay.fiber_manifest_content_hash == "fnv1a64:1"
+
+
+def test_loads_three_strict_disconnected_replay_strip_meshes(tmp_path):
+    manifest = _write_visual_replay(tmp_path, with_strips=True)
+    replay = load_fiber_replay_bundle(manifest, include_anchor_stages=False)
+    assert replay.strip_artifacts is not None
+    strips = ReplayStripGeometry(
+        reference=_read_replay_strip_obj(
+            replay.strip_artifacts[0],
+            "# vc_fiber_replay_reference_strip version 4",
+            (replay.reference_zyx[:, ::-1],),
+            replay.strip_metadata,
+        ),
+        greedy=_read_replay_strip_obj(
+            replay.strip_artifacts[1],
+            "# vc_greedy_fiber_replay_strip version 4",
+            tuple(value[:, ::-1] for value in replay.greedy_segments_zyx),
+            replay.strip_metadata,
+        ),
+        fiberlet=_read_replay_strip_obj(
+            replay.strip_artifacts[2],
+            "# vc_fiberlet_graph_replay_strip version 4",
+            tuple(value[:, ::-1] for value in replay.fiberlet_segments_zyx),
+            replay.strip_metadata,
+        ),
+    )
+
+    assert strips.reference.component_count == 1
+    assert strips.greedy.component_count == 1
+    assert strips.fiberlet.component_count == 1
+    assert strips.reference.vertices_zyx.shape == (21 * 2, 3)
+    assert strips.reference.triangles.shape == (20 * 1 * 2, 3)
+    assert strips.reference.normalized_ct_intensity.shape == (21 * 2,)
+    assert replay_strip_contrast_limits(strips)[0] > 0.0
+    np.testing.assert_allclose(
+        strips.reference.vertices_zyx[10 * 2 : 11 * 2],
+        np.asarray([[0, 0, 0], [0, 0, 8]]),
+    )
+
+
+def test_replay_strip_artifacts_must_be_all_present_or_all_absent(tmp_path):
+    manifest = _write_visual_replay(tmp_path, with_strips=True)
+    root = json.loads(manifest.read_text())
+    root["artifacts"].pop("replay/greedy_strip.obj")
+    manifest.write_text(json.dumps(root))
+
+    with pytest.raises(ValueError, match="strip artifact set is incomplete"):
+        load_fiber_replay_bundle(manifest, include_anchor_stages=False)
+
+
+def test_replay_strip_parser_rejects_a_face_crossing_component_topology(tmp_path):
+    manifest = _write_visual_replay(tmp_path, with_strips=True)
+    root = json.loads(manifest.read_text())
+    descriptor = root["artifacts"]["replay/reference_strip.obj"]
+    strip = manifest.parent / descriptor["path"]
+    content = strip.read_text().replace(
+        "f 1/1 2/2 4/4 3/3", "f 1/1 2/2 5/5 3/3", 1
+    )
+    strip.write_text(content)
+    descriptor["content_hash"] = _fnv1a64(content.encode())
+    manifest.write_text(json.dumps(root))
+    replay = load_fiber_replay_bundle(manifest, include_anchor_stages=False)
+
+    with pytest.raises(ValueError, match="crosses or scrambles"):
+        _read_replay_strip_obj(
+            replay.strip_artifacts[0],
+            "# vc_fiber_replay_reference_strip version 4",
+            (replay.reference_zyx[:, ::-1],),
+            replay.strip_metadata,
+        )
+
+
+def test_replay_strip_parser_accepts_float_mesh_precision_at_large_coordinates(
+    tmp_path,
+):
+    header = "# vc_fiber_replay_reference_strip version 4"
+    origin = 54_544.123
+    files = _straight_strip_files("strip", header, 8, origin=origin)
+    for relative, content in files.items():
+        (tmp_path / Path(relative).name).write_bytes(content)
+    artifacts = tuple(tmp_path / f"strip.{suffix}" for suffix in ("obj", "mtl", "tif"))
+    source = np.asarray(
+        [[origin, origin, origin], [origin + 8, origin, origin]], dtype=np.float64
+    )
+
+    geometry = _read_replay_strip_obj(
+        artifacts,
+        header,
+        (source,),
+        {
+            "cross_samples": 21,
+            "values": {"render_scale": 4},
+        },
+    )
+
+    assert geometry.component_count == 1
+
+
+def test_replay_strip_parser_accepts_a_strict_empty_textured_layer(tmp_path):
+    header = "# vc_greedy_fiber_replay_strip version 4"
+    files = _empty_strip_files("strip", header)
+    for relative, content in files.items():
+        (tmp_path / Path(relative).name).write_bytes(content)
+    artifacts = tuple(tmp_path / f"strip.{suffix}" for suffix in ("obj", "mtl", "tif"))
+
+    geometry = _read_replay_strip_obj(
+        artifacts,
+        header,
+        (),
+        {
+            "cross_samples": 21,
+            "values": {"render_scale": 4},
+        },
+    )
+
+    assert geometry.component_count == 0
+    assert geometry.vertices_zyx.shape == (0, 3)
+    assert geometry.triangles.shape == (0, 3)
+    assert geometry.normalized_ct_intensity.shape == (0,)
+
+
+def test_replay_strip_parser_rejects_invalid_material(tmp_path):
+    header = "# vc_fiber_replay_reference_strip version 4"
+    files = _straight_strip_files("strip", header, 8)
+    for relative, content in files.items():
+        (tmp_path / Path(relative).name).write_bytes(content)
+    (tmp_path / "strip.mtl").write_text(
+        (tmp_path / "strip.mtl").read_text().replace("illum 1", "illum 2")
+    )
+    artifacts = tuple(tmp_path / f"strip.{suffix}" for suffix in ("obj", "mtl", "tif"))
+
+    with pytest.raises(ValueError, match="invalid replay strip material"):
+        _read_replay_strip_obj(
+            artifacts,
+            header,
+            (np.column_stack((np.arange(9), np.zeros(9), np.zeros(9))),),
+            {
+                "cross_samples": 21,
+                "values": {"render_scale": 4},
+            },
+        )
+
+
+@pytest.mark.parametrize("uv", ["nan 0.5", "-0.1 0.5", "0.5", "0.5 1.1"])
+def test_replay_strip_parser_rejects_invalid_texture_coordinates(tmp_path, uv):
+    header = "# vc_fiber_replay_reference_strip version 4"
+    files = _straight_strip_files("strip", header, 8)
+    for relative, content in files.items():
+        (tmp_path / Path(relative).name).write_bytes(content)
+    path = tmp_path / "strip.obj"
+    content = path.read_text()
+    first_uv = next(line for line in content.splitlines() if line.startswith("vt "))
+    path.write_text(content.replace(first_uv, f"vt {uv}", 1))
+    artifacts = tuple(tmp_path / f"strip.{suffix}" for suffix in ("obj", "mtl", "tif"))
+
+    with pytest.raises(
+        ValueError, match="texture coordinate|unsupported strip OBJ record"
+    ):
+        _read_replay_strip_obj(
+            artifacts,
+            header,
+            (np.column_stack((np.arange(9), np.zeros(9), np.zeros(9))),),
+            {
+                "cross_samples": 21,
+                "values": {"render_scale": 4},
+            },
+        )
 
 
 def test_replay_rejects_missing_visualizations(tmp_path):

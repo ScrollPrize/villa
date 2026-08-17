@@ -1,6 +1,11 @@
 #include "vc/fiber_tracer/FiberReplay.hpp"
 
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceTexture.hpp"
+#include "vc/core/util/TexturedMesh.hpp"
+#include "vc/lasagna/LineViewBuilder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -108,6 +113,279 @@ std::string segmentedLineObj(const char* header, const std::vector<std::vector<c
     return output.str();
 }
 
+struct StripAtlasArtifact {
+    std::string obj;
+    std::string mtl;
+    cv::Mat_<uint8_t> texture;
+};
+
+struct OmeZarrGroupTransform {
+    std::array<double, 3> scaleFromBaseXYZ{};
+    std::array<double, 3> offsetFromBaseXYZ{};
+};
+
+struct OmeCoordinateTransform {
+    std::array<double, 3> scaleZYX{1.0, 1.0, 1.0};
+    std::array<double, 3> translationZYX{0.0, 0.0, 0.0};
+};
+
+OmeCoordinateTransform omeCoordinateTransform(
+    const nlohmann::json& dataset,
+    const std::filesystem::path& attrsPath)
+{
+    OmeCoordinateTransform result;
+    if (!dataset.contains("coordinateTransformations"))
+        return result;
+    const auto& transforms = dataset.at("coordinateTransformations");
+    if (!transforms.is_array()) {
+        throw std::invalid_argument(
+            "OME-Zarr dataset coordinateTransformations must be an array: " +
+            attrsPath.string());
+    }
+    bool sawScale = false;
+    bool sawTranslation = false;
+    for (const auto& transform : transforms) {
+        if (!transform.is_object() || !transform.contains("type") ||
+            !transform.at("type").is_string()) {
+            throw std::invalid_argument(
+                "OME-Zarr dataset has an invalid coordinate transformation: " +
+                attrsPath.string());
+        }
+        const std::string type = transform.at("type").get<std::string>();
+        if (type != "scale" && type != "translation")
+            continue;
+        if (!transform.contains(type) || !transform.at(type).is_array() ||
+            transform.at(type).size() != 3 ||
+            (type == "scale" && sawScale) ||
+            (type == "translation" && sawTranslation)) {
+            throw std::invalid_argument(
+                "OME-Zarr dataset has an invalid " + type +
+                " transformation: " + attrsPath.string());
+        }
+        auto& target = type == "scale" ? result.scaleZYX : result.translationZYX;
+        for (size_t axis = 0; axis < 3; ++axis) {
+            if (!transform.at(type).at(axis).is_number()) {
+                throw std::invalid_argument(
+                    "OME-Zarr dataset transformation values must be numeric: " +
+                    attrsPath.string());
+            }
+            target[axis] = transform.at(type).at(axis).get<double>();
+            if (!std::isfinite(target[axis]) ||
+                (type == "scale" && !(target[axis] > 0.0))) {
+                throw std::invalid_argument(
+                    "OME-Zarr dataset transformation values are invalid: " +
+                    attrsPath.string());
+            }
+        }
+        sawScale = sawScale || type == "scale";
+        sawTranslation = sawTranslation || type == "translation";
+    }
+    return result;
+}
+
+OmeZarrGroupTransform omeZarrGroupTransform(
+    const std::filesystem::path& groupPath)
+{
+    const auto normalizeDirectory = [](const std::filesystem::path& path) {
+        auto normalized = std::filesystem::absolute(path).lexically_normal();
+        while (normalized != normalized.root_path() &&
+               normalized.filename().empty()) {
+            normalized = normalized.parent_path();
+        }
+        return normalized;
+    };
+    const auto selected = normalizeDirectory(groupPath);
+    if (!std::filesystem::exists(selected / ".zarray") &&
+        !std::filesystem::exists(selected / "zarr.json")) {
+        throw std::invalid_argument(
+            "replay strip CT --volume must name a concrete Zarr array/group");
+    }
+
+    for (auto root = selected.parent_path(); !root.empty();
+         root = root.parent_path()) {
+        const auto attrsPath = root / ".zattrs";
+        if (!std::filesystem::exists(attrsPath)) {
+            if (root == root.root_path())
+                break;
+            continue;
+        }
+        std::ifstream input(attrsPath);
+        if (!input)
+            throw std::runtime_error("cannot read OME-Zarr attributes: " + attrsPath.string());
+        nlohmann::json attrs;
+        input >> attrs;
+        if (!attrs.contains("multiscales") || !attrs.at("multiscales").is_array())
+            continue;
+        for (const auto& multiscale : attrs.at("multiscales")) {
+            if (!multiscale.is_object() || !multiscale.contains("datasets") ||
+                !multiscale.at("datasets").is_array() ||
+                multiscale.at("datasets").empty()) {
+                continue;
+            }
+            if (multiscale.contains("axes")) {
+                const auto& axes = multiscale.at("axes");
+                if (!axes.is_array() || axes.size() != 3) {
+                    throw std::invalid_argument(
+                        "replay strip CT OME-Zarr must have three Z,Y,X axes");
+                }
+                constexpr std::array<const char*, 3> expected{"z", "y", "x"};
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    if (!axes.at(axis).is_object() ||
+                        axes.at(axis).value("name", std::string{}) != expected[axis]) {
+                        throw std::invalid_argument(
+                            "replay strip CT OME-Zarr axes must be ordered Z,Y,X");
+                    }
+                }
+            }
+
+            const auto& datasets = multiscale.at("datasets");
+            const nlohmann::json* selectedDataset = nullptr;
+            for (const auto& dataset : datasets) {
+                if (!dataset.is_object() || !dataset.contains("path") ||
+                    !dataset.at("path").is_string()) {
+                    continue;
+                }
+                const auto candidate = normalizeDirectory(
+                    root / dataset.at("path").get<std::string>());
+                if (candidate == selected) {
+                    selectedDataset = &dataset;
+                    break;
+                }
+            }
+            if (selectedDataset == nullptr)
+                continue;
+            const auto& baseDataset = datasets.front();
+            if (!baseDataset.is_object() || !baseDataset.contains("path") ||
+                !baseDataset.at("path").is_string()) {
+                throw std::invalid_argument(
+                    "OME-Zarr base dataset descriptor is invalid: " +
+                    attrsPath.string());
+            }
+            const auto base = omeCoordinateTransform(baseDataset, attrsPath);
+            const auto group = omeCoordinateTransform(*selectedDataset, attrsPath);
+            OmeZarrGroupTransform result;
+            for (size_t xyzAxis = 0; xyzAxis < 3; ++xyzAxis) {
+                const size_t zyxAxis = 2 - xyzAxis;
+                result.scaleFromBaseXYZ[xyzAxis] =
+                    base.scaleZYX[zyxAxis] / group.scaleZYX[zyxAxis];
+                result.offsetFromBaseXYZ[xyzAxis] =
+                    (base.translationZYX[zyxAxis] -
+                     group.translationZYX[zyxAxis]) /
+                    group.scaleZYX[zyxAxis];
+            }
+            return result;
+        }
+        if (root == root.root_path())
+            break;
+    }
+    throw std::invalid_argument(
+        "replay strip CT --volume group is not advertised by parent OME-Zarr multiscales metadata");
+}
+
+StripAtlasArtifact stripAtlasArtifact(
+    const char* header,
+    const std::string& stem,
+    const std::vector<FiberReplayStripComponent>& components)
+{
+    constexpr int padding = 1;
+    int atlasRows = 1;
+    int atlasColumns = 1;
+    if (!components.empty()) {
+        atlasRows = components.front().texture.rows + 2 * padding;
+        int64_t columns = 0;
+        for (const auto& component : components) {
+            if (!component.lineSurface || component.texture.empty()) {
+                throw std::invalid_argument(
+                    "replay strip component has not been rendered");
+            }
+            const auto* points = component.lineSurface->rawPointsPtr();
+            if (!points || points->empty() ||
+                component.texture.rows % points->rows != 0 ||
+                component.texture.cols % points->cols != 0 ||
+                component.texture.rows + 2 * padding != atlasRows) {
+                throw std::invalid_argument(
+                    "replay strip rendered image dimensions are invalid");
+            }
+            columns += static_cast<int64_t>(component.texture.cols) +
+                2 * padding;
+        }
+        if (columns > std::numeric_limits<int>::max()) {
+            throw std::overflow_error("replay strip texture atlas is too wide");
+        }
+        atlasColumns = static_cast<int>(columns);
+    }
+
+    cv::Mat_<uint8_t> atlas(atlasRows, atlasColumns, uint8_t(0));
+    vc::core::util::TexturedMesh atlasMesh;
+    int atlasColumn = 0;
+    for (const auto& component : components) {
+        const int rows = component.texture.rows;
+        const int columns = component.texture.cols;
+        component.texture.copyTo(
+            atlas(cv::Rect(atlasColumn + padding, padding, columns, rows)));
+        component.texture.row(0).copyTo(
+            atlas(cv::Rect(atlasColumn + padding, 0, columns, 1)));
+        component.texture.row(rows - 1).copyTo(
+            atlas(cv::Rect(atlasColumn + padding, atlasRows - 1, columns, 1)));
+        component.texture.col(0).copyTo(
+            atlas(cv::Rect(atlasColumn, padding, 1, rows)));
+        component.texture.col(columns - 1).copyTo(
+            atlas(cv::Rect(atlasColumn + columns + padding, padding, 1, rows)));
+        atlas(0, atlasColumn) = component.texture(0, 0);
+        atlas(atlasRows - 1, atlasColumn) = component.texture(rows - 1, 0);
+        atlas(0, atlasColumn + columns + padding) = component.texture(0, columns - 1);
+        atlas(atlasRows - 1, atlasColumn + columns + padding) =
+            component.texture(rows - 1, columns - 1);
+
+        auto mesh = vc::core::util::texturedSurfaceMesh(*component.lineSurface);
+        const size_t vertexOffset = atlasMesh.vertices.size();
+        const size_t textureOffset = atlasMesh.textureCoordinates.size();
+        atlasMesh.vertices.insert(
+            atlasMesh.vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
+        const double left =
+            (static_cast<double>(atlasColumn + padding) + 0.5) / atlasColumns;
+        const double right =
+            (static_cast<double>(atlasColumn + padding + columns) - 0.5) /
+            atlasColumns;
+        const double bottom =
+            1.0 - (static_cast<double>(padding + rows) - 0.5) / atlasRows;
+        const double top =
+            1.0 - (static_cast<double>(padding) + 0.5) / atlasRows;
+        for (const auto& uv : mesh.textureCoordinates) {
+            atlasMesh.textureCoordinates.push_back({
+                left + uv[0] * (right - left),
+                bottom + uv[1] * (top - bottom),
+            });
+        }
+        for (auto quad : mesh.quads) {
+            for (size_t corner = 0; corner < 4; ++corner) {
+                quad.vertexIndices[corner] += vertexOffset;
+                quad.textureCoordinateIndices[corner] += textureOffset;
+            }
+            atlasMesh.quads.push_back(quad);
+        }
+        atlasColumn += columns + 2 * padding;
+    }
+    std::string obj;
+    if (components.empty()) {
+        obj = std::string("# ") + header + "\nmtllib " + stem +
+            ".mtl\nusemtl " + stem + "_texture\n";
+    } else {
+        obj = vc::core::util::texturedMeshObj(
+            atlasMesh,
+            header,
+            stem + ".mtl",
+            stem + "_texture",
+            stem);
+    }
+    return {
+        std::move(obj),
+        vc::core::util::textureMaterialMtl(
+            stem + "_texture", stem + ".tif"),
+        std::move(atlas),
+    };
+}
+
 std::string hashString(const std::string& value)
 {
     uint64_t hash = 14695981039346656037ULL;
@@ -143,6 +421,20 @@ bool nearlyEqual(const cv::Vec3d& left, const cv::Vec3d& right)
 {
     return nearlyEqual(left[0], right[0]) &&
         nearlyEqual(left[1], right[1]) && nearlyEqual(left[2], right[2]);
+}
+
+bool meshNearlyEqual(double left, double right)
+{
+    const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+    return std::abs(left - right) <=
+        4.0 * static_cast<double>(std::numeric_limits<float>::epsilon()) * scale;
+}
+
+bool meshNearlyEqual(const cv::Vec3d& left, const cv::Vec3d& right)
+{
+    return meshNearlyEqual(left[0], right[0]) &&
+        meshNearlyEqual(left[1], right[1]) &&
+        meshNearlyEqual(left[2], right[2]);
 }
 
 template <typename Replay>
@@ -300,6 +592,86 @@ std::vector<std::vector<cv::Vec3d>> clippedFiberletSegments(const FiberletGraphR
     return output;
 }
 
+void validateStripComponents(
+    const std::vector<FiberReplayStripComponent>& components,
+    const std::vector<std::vector<cv::Vec3d>>& source,
+    const FiberReplayStripMeshes& meshes)
+{
+    constexpr int expectedCrossSamples = 21;
+    size_t componentIndex = 0;
+    for (size_t sourceIndex = 0; sourceIndex < source.size(); ++sourceIndex) {
+        const auto& points = source[sourceIndex];
+        if (points.size() < 2)
+            continue;
+        if (componentIndex >= components.size())
+            throw std::invalid_argument("replay strip component is missing");
+        const auto& component = components[componentIndex++];
+        const auto* surfacePoints = component.lineSurface
+            ? component.lineSurface->rawPointsPtr()
+            : nullptr;
+        if (component.sourceSegmentIndex != sourceIndex ||
+            !surfacePoints || surfacePoints->empty() ||
+            surfacePoints->rows != expectedCrossSamples ||
+            static_cast<size_t>(surfacePoints->cols) != points.size() ||
+            component.centerlineBaseXYZ != points) {
+            throw std::invalid_argument("replay strip component dimensions are invalid");
+        }
+        if (meshes.textureSource.has_value()) {
+            const int renderScale = meshes.textureSource->renderScale;
+            if (component.texture.empty() ||
+                component.texture.rows != surfacePoints->rows * renderScale ||
+                component.texture.cols != surfacePoints->cols * renderScale) {
+                throw std::invalid_argument(
+                    "replay strip rendered CT image is invalid");
+            }
+        } else if (!component.texture.empty()) {
+            throw std::invalid_argument(
+                "replay strip rendered CT image has no source metadata");
+        }
+        for (size_t index = 0; index < points.size(); ++index) {
+            if (!meshNearlyEqual(
+                    cv::Vec3d((*surfacePoints)(expectedCrossSamples / 2,
+                                               static_cast<int>(index))),
+                    points[index])) {
+                throw std::invalid_argument("replay strip centerline differs from trace geometry");
+            }
+        }
+    }
+    if (componentIndex != components.size())
+        throw std::invalid_argument("replay strip has an unexpected component");
+}
+
+void validateTextureSource(const FiberReplayStripTextureSource& source)
+{
+    if (source.locator.empty() ||
+        source.renderScale < 1 ||
+        std::any_of(
+            source.shapeZYX.begin(), source.shapeZYX.end(),
+            [](int value) { return value <= 0; }) ||
+        std::any_of(
+            source.scaleFromBaseXYZ.begin(), source.scaleFromBaseXYZ.end(),
+            [](double value) { return !std::isfinite(value) || value <= 0.0; }) ||
+        std::any_of(
+            source.offsetFromBaseXYZ.begin(), source.offsetFromBaseXYZ.end(),
+            [](double value) { return !std::isfinite(value); })) {
+        throw std::invalid_argument(
+            "replay strip CT source metadata is invalid");
+    }
+}
+
+void validateStripMeshes(
+    const FiberReplayStripMeshes& meshes,
+    const FiberReplayTube& tube,
+    const std::vector<std::vector<cv::Vec3d>>& greedy,
+    const std::vector<std::vector<cv::Vec3d>>& fiberlet)
+{
+    if (meshes.textureSource.has_value())
+        validateTextureSource(*meshes.textureSource);
+    validateStripComponents(meshes.reference, {tube.referenceIntervalBase}, meshes);
+    validateStripComponents(meshes.greedy, greedy, meshes);
+    validateStripComponents(meshes.fiberlet, fiberlet, meshes);
+}
+
 const FiberReplayFailure& visualizationFailure(const FiberReplayBundleInput& input, const FiberReplayVisualizationInput& visualization)
 {
     const auto& failures = visualization.tracer == FiberReplayTracer::Greedy ? input.greedyReplay.failures : input.fiberletReplay.failures;
@@ -375,6 +747,148 @@ FiberReplayTube makeFiberReplayTube(
 const char* fiberReplayTracerName(FiberReplayTracer tracer) noexcept
 {
     return tracer == FiberReplayTracer::Greedy ? "greedy" : "fiberlet";
+}
+
+FiberReplayStripMeshes makeFiberReplayStripSurfaces(
+    const FiberReplayTube& tube,
+    const FiberReplayTraceResult& greedyReplay,
+    const FiberletGraphReplayResult& fiberletReplay,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    int parallelThreads)
+{
+    if (!(normalWorkingToBaseScale > 0.0) ||
+        !std::isfinite(normalWorkingToBaseScale) || parallelThreads < 1) {
+        throw std::invalid_argument("replay strip normal-sampling configuration is invalid");
+    }
+    FiberReplayStripMeshes result;
+    const auto greedy = clippedGreedySegments(
+        greedyReplay, tube.beginArcBase, tube.endArcBase);
+    const auto fiberlet = clippedFiberletSegments(
+        fiberletReplay, tube.beginArcBase, tube.endArcBase);
+
+    struct PendingComponent {
+        std::vector<FiberReplayStripComponent>* output = nullptr;
+        size_t sourceSegmentIndex = 0;
+        std::vector<cv::Vec3d> points;
+        size_t normalOffset = 0;
+    };
+    std::vector<PendingComponent> pending;
+    const auto append = [&](std::vector<FiberReplayStripComponent>& output,
+                            const std::vector<std::vector<cv::Vec3d>>& source) {
+        for (size_t index = 0; index < source.size(); ++index) {
+            if (source[index].size() >= 2)
+                pending.push_back({&output, index, source[index], 0});
+        }
+    };
+    append(result.reference, {tube.referenceIntervalBase});
+    append(result.greedy, greedy);
+    append(result.fiberlet, fiberlet);
+
+    std::vector<cv::Vec3d> workingPoints;
+    for (auto& component : pending) {
+        component.normalOffset = workingPoints.size();
+        for (const auto& point : component.points)
+            workingPoints.push_back(point * (1.0 / normalWorkingToBaseScale));
+    }
+    std::vector<vc::lasagna::NormalSampleWithDerivative> normalSamples;
+    normalSampler.sampleNormalBatch(
+        workingPoints, false, parallelThreads, normalSamples);
+    if (normalSamples.size() != workingPoints.size())
+        throw std::runtime_error("replay strip normal sampler returned the wrong count");
+
+    for (auto& component : pending) {
+        vc::lasagna::LineModel line;
+        line.points.reserve(component.points.size());
+        for (size_t index = 0; index < component.points.size(); ++index) {
+            line.points.push_back({
+                component.points[index],
+                normalSamples[component.normalOffset + index].sample,
+                true,
+            });
+        }
+        auto views = vc::lasagna::buildLineViewSurfaces(line);
+        FiberReplayStripComponent output;
+        output.sourceSegmentIndex = component.sourceSegmentIndex;
+        output.centerlineBaseXYZ = std::move(component.points);
+        output.lineSurface = std::move(views.lineSurface);
+        component.output->push_back(std::move(output));
+    }
+    validateStripMeshes(result, tube, greedy, fiberlet);
+    return result;
+}
+
+FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
+    ::Volume& volume,
+    const std::string& sourceLocator,
+    int renderScale)
+{
+    if (sourceLocator.empty())
+        throw std::invalid_argument("replay strip CT source locator is empty");
+    auto* cache = volume.chunkedCache();
+    if (cache == nullptr)
+        throw std::runtime_error("replay strip CT volume has no chunk cache");
+    if (cache->numLevels() != 1 || !volume.hasScaleLevel(0)) {
+        throw std::invalid_argument(
+            "replay strip CT --volume must name one concrete Zarr array/group");
+    }
+    if (renderScale < 1)
+        throw std::invalid_argument("replay strip render scale must be positive");
+    if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
+        throw std::invalid_argument(
+            "replay strip CT volume must use uint8 voxels");
+    }
+    const auto transform = omeZarrGroupTransform(sourceLocator);
+    FiberReplayStripTextureSource source{
+        sourceLocator,
+        renderScale,
+        volume.shape(0),
+        transform.scaleFromBaseXYZ,
+        transform.offsetFromBaseXYZ,
+    };
+    validateTextureSource(source);
+    return source;
+}
+
+void renderFiberReplayStripTextures(
+    FiberReplayStripMeshes& meshes,
+    ::Volume& volume,
+    const std::string& sourceLocator,
+    int renderScale)
+{
+    if (meshes.textureSource.has_value())
+        throw std::invalid_argument("replay strip CT has already been rendered");
+    const auto source = validateFiberReplayStripCtVolume(
+        volume, sourceLocator, renderScale);
+
+    const auto allComponents = [&](auto&& callback) {
+        for (auto* collection : {&meshes.reference, &meshes.greedy,
+                                 &meshes.fiberlet}) {
+            for (auto& component : *collection)
+                callback(component);
+        }
+    };
+    allComponents([&](FiberReplayStripComponent& component) {
+        if (!component.lineSurface || !component.texture.empty()) {
+            throw std::invalid_argument(
+                "replay strip component is missing or already rendered");
+        }
+        const auto* basePoints = component.lineSurface->rawPointsPtr();
+        if (!basePoints || basePoints->empty())
+            throw std::invalid_argument("replay strip surface has no coordinates");
+        cv::Mat_<cv::Vec3f> groupPoints = basePoints->clone();
+        for (auto& point : groupPoints) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                point[axis] = static_cast<float>(
+                    static_cast<double>(point[axis]) *
+                        source.scaleFromBaseXYZ[axis] +
+                    source.offsetFromBaseXYZ[axis]);
+            }
+        }
+        component.texture = vc::core::util::renderCoordsTextureFineToCoarse(
+            groupPoints, volume, 0, renderScale, "Strip texture sampling");
+    });
+    meshes.textureSource = source;
 }
 
 nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirectory, const FiberReplayBundleInput& input)
@@ -485,7 +999,52 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         vc::core::util::atomicWriteString(directory / "replay/fiberlet.obj", segmentedLineObj("# vc_fiberlet_graph_replay version 2", fiberlet));
         vc::core::util::atomicWriteString(directory / "replay/failure.obj", lineObj("# vc_fiber_replay_failure version 2", {marker}, true));
 
-        const std::vector<std::filesystem::path> localArtifacts{
+        if (visualization.strips.has_value()) {
+            if (!visualization.strips->textureSource.has_value()) {
+                throw std::invalid_argument(
+                    "replay strip visualization has no rendered CT images");
+            }
+            validateStripMeshes(
+                *visualization.strips, visualization.tube, greedy, fiberlet);
+            const auto referenceStrip = stripAtlasArtifact(
+                "vc_fiber_replay_reference_strip version 4",
+                "reference_strip", visualization.strips->reference);
+            const auto greedyStrip = stripAtlasArtifact(
+                "vc_greedy_fiber_replay_strip version 4",
+                "greedy_strip", visualization.strips->greedy);
+            const auto fiberletStrip = stripAtlasArtifact(
+                "vc_fiberlet_graph_replay_strip version 4",
+                "fiberlet_strip", visualization.strips->fiberlet);
+            vc::core::util::atomicWriteString(
+                directory / "replay/reference_strip.obj",
+                referenceStrip.obj);
+            vc::core::util::atomicWriteString(
+                directory / "replay/reference_strip.mtl",
+                referenceStrip.mtl);
+            vc::core::util::writeUncompressedTextureTiff(
+                directory / "replay/reference_strip.tif",
+                referenceStrip.texture);
+            vc::core::util::atomicWriteString(
+                directory / "replay/greedy_strip.obj",
+                greedyStrip.obj);
+            vc::core::util::atomicWriteString(
+                directory / "replay/greedy_strip.mtl",
+                greedyStrip.mtl);
+            vc::core::util::writeUncompressedTextureTiff(
+                directory / "replay/greedy_strip.tif",
+                greedyStrip.texture);
+            vc::core::util::atomicWriteString(
+                directory / "replay/fiberlet_strip.obj",
+                fiberletStrip.obj);
+            vc::core::util::atomicWriteString(
+                directory / "replay/fiberlet_strip.mtl",
+                fiberletStrip.mtl);
+            vc::core::util::writeUncompressedTextureTiff(
+                directory / "replay/fiberlet_strip.tif",
+                fiberletStrip.texture);
+        }
+
+        std::vector<std::filesystem::path> localArtifacts{
             "replay/reference.obj",
             "replay/greedy.obj",
             "replay/fiberlet.obj",
@@ -504,6 +1063,21 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
             "paths/fiberlets.obj",
             "paths/fiberlet_graph.json",
         };
+        if (visualization.strips.has_value()) {
+            localArtifacts.insert(
+                localArtifacts.end(),
+                {
+                    "replay/reference_strip.obj",
+                    "replay/reference_strip.mtl",
+                    "replay/reference_strip.tif",
+                    "replay/greedy_strip.obj",
+                    "replay/greedy_strip.mtl",
+                    "replay/greedy_strip.tif",
+                    "replay/fiberlet_strip.obj",
+                    "replay/fiberlet_strip.mtl",
+                    "replay/fiberlet_strip.tif",
+                });
+        }
         nlohmann::json local = {
             {"format", "vc_fiber_replay_visualization"},
             {"version", 1},
@@ -531,6 +1105,35 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
             {"fiberlet_trace_segments_base_xyz", nlohmann::json::array()},
             {"artifacts", nlohmann::json::object()},
         };
+        if (visualization.strips.has_value()) {
+            const auto& texture = *visualization.strips->textureSource;
+            local["trace_strips"] = {
+                {"orientation", "sheet_aligned_normal_cross_tangent"},
+                {"geometry_builder", "buildLineViewSurfaces_default"},
+                {"cross_samples", 21},
+                {"values",
+                 {
+                     {"semantic", "ct_intensity"},
+                     {"encoding", "obj_uv_grayscale_tiff_u8"},
+                     {"renderer", "vc_line_probe_fine_to_coarse"},
+                     {"render_scale", texture.renderScale},
+                     {"atlas_padding_pixels", 1},
+                     {"texture_format", "tiff_gray_u8_uncompressed"},
+                     {"source_locator", texture.locator},
+                     {"source_dtype", "uint8"},
+                     {"source_shape_zyx", texture.shapeZYX},
+                     {"source_group_scale_from_base_xyz",
+                      texture.scaleFromBaseXYZ},
+                     {"source_group_offset_from_base_xyz",
+                      texture.offsetFromBaseXYZ},
+                     {"source_storage_order", "ZYX"},
+                     {"vertex_position_order", "XYZ"},
+                     {"position_space", "base_volume"},
+                     {"scale_xyz", {1.0, 1.0, 1.0}},
+                     {"translation_xyz", {0.0, 0.0, 0.0}},
+                 }},
+            };
+        }
         for (const auto& segment : greedy)
             local["greedy_trace_segments_base_xyz"].push_back(pointsJson(segment));
         for (const auto& segment : fiberlet)

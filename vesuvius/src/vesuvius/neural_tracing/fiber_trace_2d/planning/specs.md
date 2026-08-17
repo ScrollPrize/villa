@@ -2987,12 +2987,45 @@
   the evaluators are not rerun. The local manifest also references cropped
   full-run reference and both segmented evaluator traces plus its failure
   marker. `--along` is visualization-only and does not limit evaluation.
+- Every newly generated failure visualization also contains exactly three
+  self-contained sheet-aligned OBJ/MTL/TIFF triples for the reference, greedy,
+  and fiberlet traces. `--vis` requires `--volume` to name one concrete local
+  uint8 OME-Zarr dataset array/group, not the pyramid root. The group must be
+  advertised by its parent `multiscales` metadata. The producer maps
+  base-volume trace coordinates into that group with the declared dataset/base
+  transforms before calling the shared renderer.
+  Geometry is produced directly by `buildLineViewSurfaces()` with the unchanged
+  default `LineViewConfig`: the exact trace points are the longitudinal samples,
+  the normal-aligned surface has 21 cross samples, and its existing inferred
+  width and transported frame are retained. Each surface is rendered through
+  the same extracted helper used by `vc_lasagna_line_probe`, including blocking
+  dependency prefetch and `sampleCoordsFineToCoarse()`. `--strip-render-scale`
+  is the existing texture-coordinate supersampling control and defaults to four.
+  No replay-specific surface builder, mask renderer, uint16 path, or PNG path
+  exists. Evaluator resets and clipped trace boundaries remain disconnected
+  surface components. Their standard VC3D textured meshes are packed into one
+  grayscale atlas per trace type with a replicated one-pixel border and an
+  affine transform of their existing UVs. Empty trace types use an empty OBJ,
+  valid MTL, and 1x1 TIFF. The manifest records the selected group path, its
+  actual base-to-group scale/offset transform and shape, render scale, and
+  artifact hashes.
 - The napari viewer takes one direct visualization manifest through `--replay`;
   there is no index argument. An aggregate root is discovery/reporting data and
   is rejected with either a directly usable manifest path or a request to rerun
   with `--vis`. The viewer rejects manual crop/anchor/path arguments, path
   escapes, hash/geometry mismatches, and malformed strict state. Reload rereads
   the same stable direct alias and does not reload the external presence Zarr.
+- Replay strip artifacts are an optional all-three-or-none part of a
+  visualization. When present, the viewer strictly resolves each OBJ's local
+  MTL and each MTL's local hashed TIFF, validates the standard textured-mesh
+  topology, atlas padding and transformed UVs, reads the
+  stored finite grayscale texels, derives
+  one shared p1/p99 display range, and creates independent hidden grayscale
+  napari Surface layers. It neither accepts a CT-volume argument nor opens the
+  recorded provenance path. Empty meshes remain valid empty layers. Reload
+  reparses geometry, faces, UVs, materials, and values from the nine artifacts and updates the
+  existing Surface layers without changing their display state. There is no
+  reader or repair path for the discarded replay-specific strip formats.
 - `vc_fiberlets benchmark` runs the exact shared local tube anchor/path
   extraction without artifacts. Its interval starts at the first control point
   and, when `--along` is omitted, extends through the reference end. An explicit

@@ -1,8 +1,16 @@
-# Task: direct replay visualization manifests
+# Task: reuse the existing VC3D strip infrastructure for replay
 
-Restore the original viewer workflow for fiber replay diagnostics. Each
-failure-local visualization produced by `vc_fiberlets fiberlet-replay --vis`
-must be directly openable with `view_fiber_presence --replay <manifest>`.
-Remove the viewer's `--index` argument and retain the aggregate
-`fiber_replay.json` only as a report/index. Preserve loading of existing strict
-version-1 single-visualization replay artifacts.
+Remove the replay-specific strip generation and rendering paths and use the
+existing VC3D/line-probe infrastructure without changing its behavior.
+
+- Build every disconnected trace strip through
+  `buildLineViewSurfaces(...).lineSurface`.
+- Reuse the existing line-probe fine-to-coarse surface texture renderer.
+- Do not use `render_surface_image()`, generate a mask, add a new sampler, or
+  change the volume/cache/pyramid implementations.
+- Require `--volume` to name the concrete OME-Zarr array/group to render, so
+  users can choose a fully present stored scale without a separate level option.
+- Keep three self-contained napari layers for reference, greedy, and fiberlet
+  traces, with disconnected segments in each layer.
+- If implementation requires any behavioral deviation from the existing strip
+  infrastructure, stop and ask before proceeding.

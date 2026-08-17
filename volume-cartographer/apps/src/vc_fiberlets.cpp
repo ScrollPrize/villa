@@ -2,6 +2,7 @@
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
@@ -54,6 +55,7 @@ struct CliOptions {
     std::filesystem::path fiberJson;
     std::string normalManifestLocation;
     std::filesystem::path outputDirectory;
+    std::filesystem::path volumeZarr;
     std::filesystem::path remoteCacheDirectory;
     vc::fiber_tracer::FiberAnchorConfig anchors;
     vc::fiber_tracer::FiberletPathConfig paths;
@@ -72,6 +74,8 @@ struct CliOptions {
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
     bool alongSpecified = false;
+    bool stripRenderScaleSpecified = false;
+    int stripRenderScale = 4;
     int inferenceScaledownPower = 2;
     double failureThresholdBaseVoxels = 20.0;
     double alongBaseVoxels = 128.0;
@@ -153,6 +157,8 @@ void usage(const char* executable)
               << "  --fail N                      dense-reference failure distance in base voxels [20]\n"
               << "  --length N                    compared reference length in base voxels [full]\n"
               << "  --vis                         write indexed local failure visualizations\n"
+              << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
+              << "  --strip-render-scale N        strip texture supersampling [4]\n"
               << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
               << "  --radius N                    extraction tube radius in base voxels [64]\n"
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
@@ -292,6 +298,13 @@ CliOptions parseArgs(int argc, char** argv)
                 parseDouble(valueAfter(index, argc, argv, "length"), "length");
         } else if (argument == "--vis" && isReplayCommand(options.command)) {
             options.writeReplayVisualizations = true;
+        } else if (argument == "--volume" && isReplayCommand(options.command)) {
+            options.volumeZarr = valueAfter(index, argc, argv, "volume");
+        } else if (argument == "--strip-render-scale" && isReplayCommand(options.command)) {
+            options.stripRenderScale = parseInt(
+                valueAfter(index, argc, argv, "strip-render-scale"),
+                "strip-render-scale");
+            options.stripRenderScaleSpecified = true;
         } else if (argument == "--along" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
             options.alongBaseVoxels = parseDouble(valueAfter(index, argc, argv, "along"), "along");
             options.alongSpecified = true;
@@ -424,6 +437,14 @@ CliOptions parseArgs(int argc, char** argv)
         if ((options.seenTraceOptions.beamWidth && options.trace.beamWidth != 1) ||
             (options.seenTraceOptions.beamLookahead && options.trace.beamLookaheadSteps != 1)) {
             fail("fiber-replay only supports --beam-width 1 and --beam-lookahead-steps 1");
+        }
+        if (options.writeReplayVisualizations && options.volumeZarr.empty())
+            fail("fiber-replay --vis requires --volume PATH for CT strip sampling");
+        if (options.stripRenderScale < 1)
+            fail("--strip-render-scale must be positive");
+        if (!options.writeReplayVisualizations &&
+            (!options.volumeZarr.empty() || options.stripRenderScaleSpecified)) {
+            fail("fiber-replay volume strip options are only valid together with --vis");
         }
     }
     if (options.command == Command::Benchmark &&
@@ -606,6 +627,20 @@ int main(int argc, char** argv)
 {
     try {
         CliOptions options = parseArgs(argc, argv);
+        std::shared_ptr<Volume> replayCtVolume;
+        std::string replayCtLocator;
+        if (options.writeReplayVisualizations) {
+            replayCtLocator = std::filesystem::absolute(options.volumeZarr)
+                                  .lexically_normal()
+                                  .string();
+            replayCtVolume = Volume::New(options.volumeZarr);
+            replayCtVolume->setIOThreads(options.paths.parallelThreads);
+            replayCtVolume->setCacheBudget(options.decodedCacheBytes);
+            (void)vc::fiber_tracer::validateFiberReplayStripCtVolume(
+                *replayCtVolume,
+                replayCtLocator,
+                options.stripRenderScale);
+        }
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
         openOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
@@ -959,6 +994,18 @@ int main(int argc, char** argv)
                         visual.pathArtifact.anchorArtifactContentHash =
                             stringHash(vc::fiber_tracer::fiberAnchorReportJson(visual.anchors, visual.anchorArtifact).dump(2) + "\n");
                         visual.pathArtifact.baseVoxelSizeUm = options.baseVoxelSizeUm;
+                        visual.strips = vc::fiber_tracer::makeFiberReplayStripSurfaces(
+                            visual.tube,
+                            bundle.greedyReplay,
+                            bundle.fiberletReplay,
+                            canonicalNormalSampler,
+                            grid.predictionToBaseScale,
+                            options.paths.parallelThreads);
+                        vc::fiber_tracer::renderFiberReplayStripTextures(
+                            *visual.strips,
+                            *replayCtVolume,
+                            replayCtLocator,
+                            options.stripRenderScale);
                         bundle.visualizations.push_back(std::move(visual));
                         std::cerr << "fiber_replay_stage stage=visualization status=completed"
                                   << " tracer=" << vc::fiber_tracer::fiberReplayTracerName(tracer) << " index=" << failure.index

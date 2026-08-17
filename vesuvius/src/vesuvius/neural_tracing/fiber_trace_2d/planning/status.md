@@ -1,12 +1,13 @@
-# Status: direct replay visualization manifests
+# Status: existing VC3D strips for replay
 
-- [x] Record the task.
-- [x] Write the implementation and validation plan.
-- [x] Complete independent plan review.
-- [x] Refactor direct and legacy replay loading.
-- [x] Remove indexed viewer interface and update reload.
-- [x] Expose generated direct manifest paths.
-- [x] Add focused regression tests.
-- [x] Update specification and documentation.
-- [x] Build and run focused validation.
-- [x] Finish task log and changelog.
+- [x] Identify every divergence from the existing strip infrastructure
+- [x] Capture the corrected task and implementation plan
+- [x] Complete independent plan review
+- [x] Restore the unchanged line-view geometry path
+- [x] Extract and reuse the existing surface texture helper
+- [x] Require and persist the selected OME-Zarr group path and transform
+- [x] Remove legacy renderer, mask, uint16, and PNG paths
+- [x] Update strict napari artifact loading
+- [x] Run focused C++ and Python validation
+- [x] Regenerate Paris4 output from explicit level 2
+- [x] Update specifications, documentation, and task log
