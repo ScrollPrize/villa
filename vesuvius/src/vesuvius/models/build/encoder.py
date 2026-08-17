@@ -133,7 +133,14 @@ class Encoder(nn.Module,):
                     n_blocks_per_stage[s], conv_op, input_channels, features_per_stage[s], kernel_sizes[s], conv_stride,
                     conv_bias, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs
                 ))
-                stages.append(nn.Sequential(*stage_modules))
+                stage = nn.Sequential(*stage_modules)
+                # The residual branch above adds pool_op the same way; without it
+                # a pooled ConvBlock encoder never downsamples, because the conv
+                # stride was handed to the pool that then never runs.
+                if pool_op is not None:
+                    stage = nn.Sequential(pool_op(strides[s]), stage)
+
+                stages.append(stage)
                 input_channels = features_per_stage[s]
 
 
