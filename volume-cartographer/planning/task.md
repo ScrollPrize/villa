@@ -1,27 +1,27 @@
-# Direct Zarr mirror disk cache
+# VC3D short line-segment handling
 
-Change persistent remote-volume caching so a newly encountered remote Zarr is
-cached as an incomplete but otherwise exact local mirror of the source Zarr.
+Use one 32-base-voxel sampling distance for generated line strips and control-
+point click replacement.
 
 Requirements:
 
-- Select the legacy cache layout whenever an existing cache directory contains
-  the legacy cache footprint, including for a remote volume newly added to a
-  project.
-- Keep legacy per-chunk reading and writing so existing mixed `.bin`, `.zst`,
-  `.c3d`, `.source`, and `.empty` caches remain usable.
-- Select the direct-mirror layout for a remote volume with no legacy footprint.
-- Mirror required Zarr metadata and store every downloaded encoded chunk at its
-  exact source-relative Zarr object key. The resulting directory must be
-  readable as an incomplete native Zarr volume.
-- For sharded arrays, download, deduplicate, persist, and account the complete
-  outer shard object while decoding only requested logical inner chunks.
-- Continue writing missing-chunk markers as an adjacent `<chunk-key>.empty`
-  file; native Zarr readers must continue to see the original chunk key as
-  absent and ignore the marker.
-- Ordinary remote reads, Open Data prefill, and cache redownload must all use
-  the selected layout and the shared source scheduler.
-- Remove VC3D options and production paths that recompress decoded cache data.
-  Keep legacy compressed-cache decoding, but do not create new recompressed
-  cache entries.
-- Preserve exact downloaded bytes and existing rendering values.
+- Keep every annotation control point and both line endpoints as exact strip
+  supports. Internal optimized line points define the path but are not supports.
+- Resample each control-point span by optimized-polyline arclength using the
+  interval count whose physical spacing is closest to 32.
+- Keep control-point spans at or below 32 base voxels as one strip interval.
+- Declare the generated strip's along-line scale as exactly `1/32`, so short
+  physical spans are expanded to one nominal display interval.
+- Use exactly seven cross-strip samples at 32 base voxels for both the line
+  surface and side slice, giving a fixed 192-base-voxel extent close to the
+  previous typical width.
+- Remove the unused configurable cross extents and cross-sample count.
+- On generated-view clicks, compare existing controls by optimized-polyline
+  arclength rather than line-index distance.
+- Collapse every existing control within an inclusive 32-base-voxel arclength
+  radius into one control at the clicked location.
+- Keep Max extrap CP distance separate: it limits only placement beyond the
+  outer controls and is always measured by optimized-polyline arclength in base
+  voxels. Interior placement remains unrestricted.
+- Preserve seed, interpolation-span, branch-link, and endpoint semantics while
+  collapsing controls.

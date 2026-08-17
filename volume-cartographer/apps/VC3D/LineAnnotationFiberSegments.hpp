@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -113,6 +114,25 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     }
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
+
+struct ControlPointCollapseResult {
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+
+    [[nodiscard]] bool replacedExisting() const noexcept
+    {
+        return !collapsedOldIndices.empty();
+    }
+};
+
+[[nodiscard]] ControlPointCollapseResult collapseControlPointsAtClick(
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint);
 
 struct StoredControlPoint : cv::Vec3d {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;

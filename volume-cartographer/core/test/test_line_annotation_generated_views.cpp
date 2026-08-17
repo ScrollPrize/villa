@@ -665,46 +665,6 @@ TEST_CASE("arrow pan integrator handles zero steps and degenerate inputs")
     CHECK(resting.velocity == 0.0);
 }
 
-TEST_CASE("arrow pan boundary target extends one hop past the outer control point")
-{
-    using vc3d::line_annotation::generatedArrowPanBoundaryTarget;
-    const std::vector<double> positions{12.0, 20.0, 40.0};
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-
-    // Bounded by the max-CP-distance allowance when it is shorter than the
-    // remaining line, by the line end (extrapolation limit) otherwise.
-    const auto right = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 30.0);
-    REQUIRE(right.has_value());
-    CHECK(*right == doctest::Approx(70.0));
-    const auto rightClamped = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 1000.0);
-    REQUIRE(rightClamped.has_value());
-    CHECK(*rightClamped == doctest::Approx(100.0));
-    const auto left = generatedArrowPanBoundaryTarget(positions, -1, 0.0, 5.0);
-    REQUIRE(left.has_value());
-    CHECK(*left == doctest::Approx(7.0));
-
-    // <= 0 or non-finite max distance means unlimited: the line end bounds it.
-    const auto unlimited = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 0.0);
-    REQUIRE(unlimited.has_value());
-    CHECK(*unlimited == doctest::Approx(100.0));
-    const auto nanMax = generatedArrowPanBoundaryTarget(positions, 1, 100.0, nan);
-    REQUIRE(nanMax.has_value());
-    CHECK(*nanMax == doctest::Approx(100.0));
-
-    // No room beyond the outer control point, no control points, or unusable
-    // inputs: no boundary hop.
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, 40.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({0.0, 40.0}, -1, 0.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({}, 1, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 0, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, nan, 30.0).has_value());
-
-    // Non-finite control positions are skipped when finding the outer one.
-    const auto skipped = generatedArrowPanBoundaryTarget({nan, 20.0}, 1, 100.0, 10.0);
-    REQUIRE(skipped.has_value());
-    CHECK(*skipped == doctest::Approx(30.0));
-}
-
 TEST_CASE("arrow pan stop target picks the next control point in the direction")
 {
     const std::vector<double> positions{12.0, 20.0, 28.0, 40.0};
@@ -825,47 +785,86 @@ TEST_CASE("line annotation fixed current slice snaps only within quarter line po
           doctest::Approx(19.7499));
 }
 
-TEST_CASE("line annotation max control distance uses nearest flattened control")
+TEST_CASE("line annotation collapses nearby controls with explicit span ownership")
 {
-    const std::vector<double> controlPositions{10.0, 100.0};
+    const auto metadata = [](const std::string& message) {
+        vc3d::line_annotation::FiberTraceSegmentMetadata value;
+        value.message = message;
+        return value;
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {1.0, {32.0, 0.0, 0.0}, true, 1},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+        {3.0, {96.0, 0.0, 0.0}, false, 3},
+    };
+    controls[0].segmentToNext = metadata("left");
+    controls[1].segmentToNext = metadata("removed");
+    controls[2].segmentToNext = metadata("right");
 
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        250.0,
-        controlPositions,
-        0.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        70.0,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        55.0,
-        controlPositions,
-        40.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        100.25,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        std::vector<double>{100.0},
-        80.0));
+    const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+        controls, {2, 1}, 1.5, {48.0, 2.0, 0.0});
+    REQUIRE(collapsed.controlPoints.size() == 3);
+    CHECK(collapsed.replacementIndex == 1);
+    CHECK(collapsed.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(collapsed.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(collapsed.controlPoints[0].segmentToNext->message == "left");
+    CHECK(collapsed.controlPoints[1].linePosition == doctest::Approx(1.5));
+    CHECK(collapsed.controlPoints[1].volumePoint == cv::Vec3d(48.0, 2.0, 0.0));
+    CHECK(collapsed.controlPoints[1].optimizedIndex == -1);
+    CHECK(collapsed.controlPoints[1].isSeed);
+    REQUIRE(collapsed.controlPoints[1].segmentToNext);
+    CHECK(collapsed.controlPoints[1].segmentToNext->message == "right");
+    CHECK_FALSE(collapsed.controlPoints.back().segmentToNext.has_value());
+}
 
-    CHECK(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        55.0,
-        controlPositions,
-        40.0));
+TEST_CASE("line annotation control collapse handles insertion endpoints and all controls")
+{
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.message = "span";
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, 0},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+    };
+    controls[0].segmentToNext = metadata;
+
+    SUBCASE("insertion keeps controls ordered and splits the existing policy")
+    {
+        const auto inserted = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(inserted.controlPoints.size() == 3);
+        CHECK_FALSE(inserted.replacedExisting());
+        CHECK(inserted.replacementIndex == 1);
+        CHECK(inserted.oldToNewIndices == std::vector<size_t>{0, 2});
+        CHECK(inserted.dirtySegmentIndices == std::vector<size_t>{0, 1});
+        REQUIRE(inserted.controlPoints[0].segmentToNext);
+        REQUIRE(inserted.controlPoints[1].segmentToNext);
+        CHECK(inserted.controlPoints[0].segmentToNext->message == "span");
+        CHECK(inserted.controlPoints[1].segmentToNext->message == "span");
+    }
+
+    SUBCASE("replacing the final control leaves no outgoing metadata")
+    {
+        const auto replaced = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {1}, 2.25, {72.0, 0.0, 0.0});
+        REQUIRE(replaced.controlPoints.size() == 2);
+        CHECK(replaced.replacementIndex == 1);
+        CHECK_FALSE(replaced.controlPoints.back().segmentToNext.has_value());
+        CHECK(replaced.controlPoints.front().isSeed);
+        CHECK_FALSE(replaced.controlPoints.back().isSeed);
+    }
+
+    SUBCASE("collapsing every control produces one seed and no dirty spans")
+    {
+        const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {0, 1}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(collapsed.controlPoints.size() == 1);
+        CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 0});
+        CHECK(collapsed.dirtySegmentIndices.empty());
+        CHECK(collapsed.controlPoints.front().isSeed);
+        CHECK_FALSE(collapsed.controlPoints.front().segmentToNext.has_value());
+    }
 }
 
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")

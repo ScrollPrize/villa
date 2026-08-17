@@ -128,7 +128,7 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
     int extrapolationDistanceVx() const;
-    int maxControlPointDistanceVx() const;
+    int maxControlPointExtrapolationDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setLasagnaDatasetOptions(
@@ -292,8 +292,8 @@ private:
     // next one after the key comes up, and the opposite arrow reverses mid-pan.
     void startArrowPan(int direction);
     // Control-point line positions plus (when there is room) one boundary
-    // target beyond each outer control point: Max CP distance or the
-    // extrapolated line end, whichever is shorter.
+    // target beyond each outer control point: the maximum base-voxel
+    // arclength extrapolation distance or the line end, whichever is shorter.
     std::vector<double> arrowPanTargetPositions() const;
     void releaseArrowPanKey(int direction);
     void updateArrowPanStopTarget();
@@ -427,7 +427,7 @@ private:
     // uncommitted edits until then (and revert when the menu reopens).
     int _appliedInitialCenterlineLengthVx = 0;
     int _appliedExtrapolationDistanceVx = 0;
-    QSpinBox* _maxControlPointDistanceSpin = nullptr;
+    QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
