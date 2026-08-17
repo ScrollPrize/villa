@@ -158,6 +158,10 @@ def seed_fit_environment(base_env, seed_overrides, seed_out):
     env['FIT_SPIRAL_CONFIG_OVERRIDES'] = json.dumps(seed_overrides)
     env['FIT_SPIRAL_OUT_DIR'] = str(seed_out)
     env['FIT_SPIRAL_NUM_THREADS'] = str(SWEEP_THREADS_PER_GPU)
+    # torchrun otherwise forces OMP_NUM_THREADS=1 before child startup and
+    # prints a warning. Keep OpenMP aligned with the Torch thread pools each
+    # rank configures from FIT_SPIRAL_NUM_THREADS.
+    env['OMP_NUM_THREADS'] = str(SWEEP_THREADS_PER_GPU)
     for var in SEED_WANDB_IDENTITY_VARS:
         env.pop(var, None)
     env['WANDB_MODE'] = 'disabled'
