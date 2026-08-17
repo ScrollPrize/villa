@@ -1,0 +1,256 @@
+{
+  "description": "Hybrid local-3D-stem / 2D U-Net on the aligned 21-slice corpus: 17-of-21 jittered Z window, fixed scroll-prior batch sampling, robust-MAD normalization, smoothed BCE + Dice. The datasets block lists the full released corpus (29 representations across 4 scrolls, matching aligned21_fixed_scroll_prior.json); replace the /path/to/ink_9um placeholder with your local copy of the ink_9um dataset and set out_dir.",
+  "mode": "flat",
+  "model_type": "vesuvius_unet_3d_stem_2d",
+  "model_config": {
+    "autoconfigure": true,
+    "basic_encoder_block": "BasicBlockD",
+    "basic_decoder_block": "ConvBlock",
+    "stem_channels": 16,
+    "z_projection_mode": "none"
+  },
+  "targets": {
+    "ink": {
+      "activation": "none",
+      "out_channels": 1,
+      "z_projection_mode": "none"
+    }
+  },
+  "in_channels": 1,
+  "patch_size": [17, 128, 128],
+  "patch_overlap": 0.25,
+  "patch_min_labeled_coverage": 0.0,
+  "flat_z_window_jitter": {
+    "enabled": true,
+    "window_depth": 17,
+    "max_offset": 2,
+    "probability": 1.0,
+    "padding": "forbidden"
+  },
+  "image_normalization": {
+    "mode": "robust_mad",
+    "percentile_lower": 1.0,
+    "percentile_upper": 99.0
+  },
+  "augmentation_preset": "default",
+  "augmentation_rotation_axes": [0],
+  "loss": {
+    "bce_label_smoothing": 0.5,
+    "dice_label_smoothing": 0.0
+  },
+  "optimizer": "sgd",
+  "learning_rate": 0.01,
+  "weight_decay": 3e-05,
+  "scheduler": {"name": "diffusers_cosine_warmup"},
+  "warmup_steps": 1000,
+  "grad_clip": 1.0,
+  "mixed_precision": "fp16",
+  "batch_size": 64,
+  "num_iterations": 78125,
+  "seed": 42,
+  "sampling_strategy": "fixed_scroll_prior_stratified",
+  "fixed_scroll_prior": {
+    "seed": 42,
+    "target_batch_counts": {
+      "0139": 29,
+      "1667": 22,
+      "Paris4": 11,
+      "0814": 2
+    }
+  },
+  "sampling_audit_every": 200,
+  "best_checkpoint_metric": "val_balanced_accuracy",
+  "save_every": 5000,
+  "val_every": 5000,
+  "val_steps": 32,
+  "val_preview_batches": 1,
+  "log_every": 50,
+  "dataloader_workers": 12,
+  "pin_memory": true,
+  "verify_finite_gradients_steps": 0,
+  "max_amp_overflow_events": 0,
+  "out_dir": "/path/to/run-output",
+  "datasets": [
+    {
+      "segments_path": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices",
+      "segments": [
+        "pherc0139-w016",
+        "pherc0139-w017",
+        "pherc0139-w028",
+        "pherc0139-w029",
+        "pherc0139-w035",
+        "pherc0139-w039",
+        "pherc0139-w040",
+        "pherc0139-w041",
+        "pherc0139-w043"
+      ],
+      "surface_volume_paths": {
+        "pherc0139-w016": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016/surface-volume.zarr",
+        "pherc0139-w017": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w017/surface-volume.zarr",
+        "pherc0139-w028": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w028/surface-volume.zarr",
+        "pherc0139-w029": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w029/surface-volume.zarr",
+        "pherc0139-w035": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w035/surface-volume.zarr",
+        "pherc0139-w039": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w039/surface-volume.zarr",
+        "pherc0139-w040": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w040/surface-volume.zarr",
+        "pherc0139-w041": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w041/surface-volume.zarr",
+        "pherc0139-w043": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w043/surface-volume.zarr"
+      },
+      "volume_scale": 0,
+      "sampling_scroll": "0139",
+      "sampling_physical_segment_keys": {
+        "pherc0139-w016": "0139:w016",
+        "pherc0139-w017": "0139:w017",
+        "pherc0139-w028": "0139:w028",
+        "pherc0139-w029": "0139:w029",
+        "pherc0139-w035": "0139:w035",
+        "pherc0139-w039": "0139:w039",
+        "pherc0139-w040": "0139:w040",
+        "pherc0139-w041": "0139:w041",
+        "pherc0139-w043": "0139:w043"
+      },
+      "sampling_representation_keys": {
+        "pherc0139-w016": "public_2p4_level2_zmean4:pherc0139-w016",
+        "pherc0139-w017": "public_2p4_level2_zmean4:pherc0139-w017",
+        "pherc0139-w028": "public_2p4_level2_zmean4:pherc0139-w028",
+        "pherc0139-w029": "public_2p4_level2_zmean4:pherc0139-w029",
+        "pherc0139-w035": "public_2p4_level2_zmean4:pherc0139-w035",
+        "pherc0139-w039": "public_2p4_level2_zmean4:pherc0139-w039",
+        "pherc0139-w040": "public_2p4_level2_zmean4:pherc0139-w040",
+        "pherc0139-w041": "public_2p4_level2_zmean4:pherc0139-w041",
+        "pherc0139-w043": "public_2p4_level2_zmean4:pherc0139-w043"
+      }
+    },
+    {
+      "segments_path": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices",
+      "segments": [
+        "w035",
+        "w039",
+        "w040",
+        "w041",
+        "w044"
+      ],
+      "surface_volume_paths": {
+        "w035": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices/w035/surface-volume.zarr",
+        "w039": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices/w039/surface-volume.zarr",
+        "w040": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices/w040/surface-volume.zarr",
+        "w041": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices/w041/surface-volume.zarr",
+        "w044": "/path/to/ink_9um/labels/native9-scrollprizeorg-21slices/w044/surface-volume.zarr"
+      },
+      "volume_scale": 0,
+      "sampling_scroll": "0139",
+      "sampling_physical_segment_keys": {
+        "w035": "0139:w035",
+        "w039": "0139:w039",
+        "w040": "0139:w040",
+        "w041": "0139:w041",
+        "w044": "0139:w044"
+      },
+      "sampling_representation_keys": {
+        "w035": "native_9p362_level0:w035",
+        "w039": "native_9p362_level0:w039",
+        "w040": "native_9p362_level0:w040",
+        "w041": "native_9p362_level0:w041",
+        "w044": "native_9p362_level0:w044"
+      }
+    },
+    {
+      "segments_path": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices",
+      "segments": [
+        "pherc0814-46527"
+      ],
+      "surface_volume_paths": {
+        "pherc0814-46527": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0814-46527/surface-volume.zarr"
+      },
+      "volume_scale": 0,
+      "sampling_scroll": "0814",
+      "sampling_physical_segment_keys": {
+        "pherc0814-46527": "0814:46527"
+      },
+      "sampling_representation_keys": {
+        "pherc0814-46527": "public_2p4_level2_zmean4:pherc0814-46527"
+      }
+    },
+    {
+      "segments_path": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices",
+      "segments": [
+        "pherc1667-w013",
+        "pherc1667-w018",
+        "pherc1667-w023",
+        "pherc1667-w028",
+        "pherc1667-w029",
+        "pherc1667-w031"
+      ],
+      "surface_volume_paths": {
+        "pherc1667-w013": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w013/surface-volume.zarr",
+        "pherc1667-w018": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w018/surface-volume.zarr",
+        "pherc1667-w023": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w023/surface-volume.zarr",
+        "pherc1667-w028": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w028/surface-volume.zarr",
+        "pherc1667-w029": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w029/surface-volume.zarr",
+        "pherc1667-w031": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc1667-w031/surface-volume.zarr"
+      },
+      "volume_scale": 0,
+      "sampling_scroll": "1667",
+      "sampling_physical_segment_keys": {
+        "pherc1667-w013": "1667:w013",
+        "pherc1667-w018": "1667:w018",
+        "pherc1667-w023": "1667:w023",
+        "pherc1667-w028": "1667:w028",
+        "pherc1667-w029": "1667:w029",
+        "pherc1667-w031": "1667:w031"
+      },
+      "sampling_representation_keys": {
+        "pherc1667-w013": "public_2p4_level2_zmean4:pherc1667-w013",
+        "pherc1667-w018": "public_2p4_level2_zmean4:pherc1667-w018",
+        "pherc1667-w023": "public_2p4_level2_zmean4:pherc1667-w023",
+        "pherc1667-w028": "public_2p4_level2_zmean4:pherc1667-w028",
+        "pherc1667-w029": "public_2p4_level2_zmean4:pherc1667-w029",
+        "pherc1667-w031": "public_2p4_level2_zmean4:pherc1667-w031"
+      }
+    },
+    {
+      "segments_path": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices",
+      "segments": [
+        "phercparis4-w00",
+        "phercparis4-w01",
+        "phercparis4-w02",
+        "phercparis4-w03",
+        "phercparis4-w05",
+        "phercparis4-w06",
+        "phercparis4-w07",
+        "phercparis4-w09"
+      ],
+      "surface_volume_paths": {
+        "phercparis4-w00": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w00/surface-volume.zarr",
+        "phercparis4-w01": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w01/surface-volume.zarr",
+        "phercparis4-w02": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w02/surface-volume.zarr",
+        "phercparis4-w03": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w03/surface-volume.zarr",
+        "phercparis4-w05": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w05/surface-volume.zarr",
+        "phercparis4-w06": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w06/surface-volume.zarr",
+        "phercparis4-w07": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w07/surface-volume.zarr",
+        "phercparis4-w09": "/path/to/ink_9um/labels/aligned-scrollprizeorg-21slices/phercparis4-w09/surface-volume.zarr"
+      },
+      "volume_scale": 0,
+      "sampling_scroll": "Paris4",
+      "sampling_physical_segment_keys": {
+        "phercparis4-w00": "Paris4:w00",
+        "phercparis4-w01": "Paris4:w01",
+        "phercparis4-w02": "Paris4:w02",
+        "phercparis4-w03": "Paris4:w03",
+        "phercparis4-w05": "Paris4:w05",
+        "phercparis4-w06": "Paris4:w06",
+        "phercparis4-w07": "Paris4:w07",
+        "phercparis4-w09": "Paris4:w09"
+      },
+      "sampling_representation_keys": {
+        "phercparis4-w00": "public_2p4_level2_zmean4:phercparis4-w00",
+        "phercparis4-w01": "public_2p4_level2_zmean4:phercparis4-w01",
+        "phercparis4-w02": "public_2p4_level2_zmean4:phercparis4-w02",
+        "phercparis4-w03": "public_2p4_level2_zmean4:phercparis4-w03",
+        "phercparis4-w05": "public_2p4_level2_zmean4:phercparis4-w05",
+        "phercparis4-w06": "public_2p4_level2_zmean4:phercparis4-w06",
+        "phercparis4-w07": "public_2p4_level2_zmean4:phercparis4-w07",
+        "phercparis4-w09": "public_2p4_level2_zmean4:phercparis4-w09"
+      }
+    }
+  ]
+}

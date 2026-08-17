@@ -520,7 +520,12 @@ def save_overlay_and_print_satisfaction(
     get_or_build_unattached_pcl_flat,
     run_tag=None,
     save_png_visualizations=False,
+    progress=None,
 ):
+    if progress is not None:
+        progress.begin(
+            'finalizing', 'Evaluating verified patches',
+            detail=f'{len(patches_list):,} patches')
     satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
     )
@@ -544,6 +549,10 @@ def save_overlay_and_print_satisfaction(
     unattached_pcl_per_point_satisfied = []
     unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
     if unattached_pcl_strips:
+        if progress is not None:
+            progress.begin(
+                'finalizing', 'Evaluating point collections',
+                detail=f'{len(unattached_pcl_strips):,} collections')
         unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(
             slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips, get_or_build_unattached_pcl_flat,
         )
@@ -565,6 +574,10 @@ def save_overlay_and_print_satisfaction(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
+            if progress is not None:
+                progress.begin(
+                    'finalizing', 'Evaluating tracks',
+                    detail=f'{len(tracks):,} tracks')
             track_satisfied_counts, track_total_counts = get_track_satisfied_counts_in_chunks(
                 slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
             )
@@ -653,6 +666,8 @@ def save_overlay_and_print_satisfaction(
         satisfied_quads_flat.to(torch.int64),
     )
     if save_png_visualizations and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
+        if progress is not None:
+            progress.begin('finalizing', 'Rendering satisfaction overlay')
         winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,
@@ -695,5 +710,5 @@ def save_overlay_and_print_satisfaction(
             out_path, cfg, z_begin, z_end, voxel_size_um,
             get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
             tracks=tracks,
-            run_tag=run_tag, name=suffix,
+            run_tag=run_tag, name=suffix, progress=progress,
         )

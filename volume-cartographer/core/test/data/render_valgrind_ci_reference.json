@@ -1,0 +1,207 @@
+{
+  "cases": {
+    "parallel/fallback_3": {
+      "checksum": 4092684805825541122,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "parallel",
+        "height": 256,
+        "measured_pixels": 65536,
+        "repetitions": 1,
+        "scenario": "fallback_3",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 256,
+        "worker_override": 4
+      },
+      "modeled_runtime_score_ns": 2552537.228411861
+    },
+    "parallel/full_res": {
+      "checksum": 8319256024933588756,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "parallel",
+        "height": 256,
+        "measured_pixels": 65536,
+        "repetitions": 1,
+        "scenario": "full_res",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 256,
+        "worker_override": 4
+      },
+      "modeled_runtime_score_ns": 903181.9151699011
+    },
+    "parallel/mixed_correlated": {
+      "checksum": 9419607384140948446,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "parallel",
+        "height": 256,
+        "measured_pixels": 65536,
+        "repetitions": 1,
+        "scenario": "mixed_correlated",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 256,
+        "worker_override": 4
+      },
+      "modeled_runtime_score_ns": 1789703.9293174774
+    },
+    "parallel/mixed_shuffled": {
+      "checksum": 2698931263477305860,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "parallel",
+        "height": 256,
+        "measured_pixels": 65536,
+        "repetitions": 1,
+        "scenario": "mixed_shuffled",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 256,
+        "worker_override": 4
+      },
+      "modeled_runtime_score_ns": 6905131.744881165
+    },
+    "serial/fallback_3": {
+      "checksum": 2611257448726826058,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "serial",
+        "height": 96,
+        "measured_pixels": 9216,
+        "repetitions": 1,
+        "scenario": "fallback_3",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 96,
+        "worker_override": 1
+      },
+      "modeled_runtime_score_ns": 865138.977293745
+    },
+    "serial/full_res": {
+      "checksum": 8712995097771526824,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "serial",
+        "height": 96,
+        "measured_pixels": 9216,
+        "repetitions": 1,
+        "scenario": "full_res",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 96,
+        "worker_override": 1
+      },
+      "modeled_runtime_score_ns": 327705.06868933974
+    },
+    "serial/mixed_correlated": {
+      "checksum": 2185938871354150015,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "serial",
+        "height": 96,
+        "measured_pixels": 9216,
+        "repetitions": 1,
+        "scenario": "mixed_correlated",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 96,
+        "worker_override": 1
+      },
+      "modeled_runtime_score_ns": 607820.3348490751
+    },
+    "serial/mixed_shuffled": {
+      "checksum": 1627454152496030813,
+      "identity": {
+        "architecture_target": "x86-64-v3",
+        "benchmark_metadata_schema": 1,
+        "build_type": "Release",
+        "cache_geometry": {
+          "D1": "32768,8,64",
+          "I1": "32768,8,64",
+          "LL": "8388608,16,64"
+        },
+        "compiler_id": "GNU",
+        "compiler_version": "15.3.0",
+        "fixture": "serial",
+        "height": 96,
+        "measured_pixels": 9216,
+        "repetitions": 1,
+        "scenario": "mixed_shuffled",
+        "tile_size": 32,
+        "valgrind_version": "valgrind-3.25.1",
+        "width": 96,
+        "worker_override": 1
+      },
+      "modeled_runtime_score_ns": 905963.5653866293
+    }
+  },
+  "model_sha256": "c75069f4fc1580029bf4013c1bbf999f2388a1ddda481d53f108f1412e11e409",
+  "schema_version": 1,
+  "tolerance": 0.1
+}

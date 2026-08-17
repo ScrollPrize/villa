@@ -53,9 +53,18 @@ public:
 
     QString cacheRoot() const;
 
+signals:
+    void fetchProgress(const QString& artifactId, const QString& phase,
+                       const QString& fileName, int filesComplete, int totalFiles,
+                       qint64 bytesReceived, qint64 totalBytes);
+
 private:
     struct FetchJob;
-    void startNextFile(const std::shared_ptr<FetchJob>& job);
+    // Keep the job's transfers saturated: start files until the concurrency
+    // limit is reached, and publish once the last one lands.
+    void pumpFiles(const std::shared_ptr<FetchJob>& job);
+    void startFile(const std::shared_ptr<FetchJob>& job, const QJsonObject& entry);
+    void publishJob(const std::shared_ptr<FetchJob>& job);
     void finishJob(const std::shared_ptr<FetchJob>& job, const QString& error, bool gone = false);
     static bool validateManifest(const QJsonObject& manifest, QString* error);
     static bool isDeferredPreviewFile(const QString& name);

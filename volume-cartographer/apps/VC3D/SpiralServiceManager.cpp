@@ -5,6 +5,7 @@
 #include "VCSettings.hpp"
 
 #include <QCoreApplication>
+#include <QApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
@@ -16,7 +17,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QMessageBox>
 #include <QProcessEnvironment>
+#include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSettings>
@@ -32,15 +35,65 @@ namespace {
 constexpr int kPollMs = 500;
 constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
-// Keep remote stdout/stderr close to the locally launched service experience.
-// In particular, tqdm redraws its loading and fit bars several times a second;
-// a long polling interval turns those redraws into delayed bursts.
-constexpr int kRemoteLogPollMs = 500;
-constexpr int kRestartProbeMs = 500;
-constexpr int kRestartTimeoutMs = 60000;
+// One structured event subscriber covers every connection (local and
+// remote). The service coalesces high-frequency records server-side, so a
+// short poll interval keeps the panel live without flooding it.
+constexpr int kEventPollMs = 500;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 11;
 constexpr int kPreviewCacheKept = 3;
+
+// Deterministic per-dataset default output root, outside the dataset: the
+// service requires --output and rejects a location under --dataset.
+QString defaultLocalOutputRoot(const QString& datasetRoot)
+{
+    const QString canonical = QFileInfo(datasetRoot).absoluteFilePath();
+    const QString digest = QString::fromLatin1(
+        QCryptographicHash::hash(canonical.toUtf8(), QCryptographicHash::Sha256)
+            .toHex().left(8));
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + QStringLiteral("/spiral-output/%1-%2")
+              .arg(QFileInfo(canonical).fileName(), digest);
+}
+
+// One panel line per structured event record. Log-kind records stay as raw
+// text (the panel keeps its plain console-line look); the other kinds carry a
+// kind prefix, and child-rank records name their rank.
+QString formatEventRecord(const QJsonObject& event)
+{
+    const QString kind = event.value(QStringLiteral("kind")).toString();
+    const QString text = event.value(QStringLiteral("text")).toString();
+    const QJsonValue rankValue = event.value(QStringLiteral("rank"));
+    const QString rankSuffix = (rankValue.isDouble() && rankValue.toInt() > 0)
+        ? QStringLiteral(" [rank %1]").arg(rankValue.toInt()) : QString();
+    if (kind == QLatin1String("log")) return text + rankSuffix;
+    const QJsonObject payload = event.value(QStringLiteral("payload")).toObject();
+    if (kind == QLatin1String("progress")) {
+        QString line = QStringLiteral("[progress] ") + text;
+        const qint64 step = payload.value(QStringLiteral("step")).toInteger(-1);
+        const qint64 total = payload.value(QStringLiteral("total_steps")).toInteger(-1);
+        if (step >= 0 && total > 0) {
+            line += QStringLiteral(" — %1/%2").arg(step).arg(total);
+            const QString unit = payload.value(QStringLiteral("unit")).toString();
+            if (!unit.isEmpty()) line += QLatin1Char(' ') + unit;
+        }
+        const QString detail = payload.value(QStringLiteral("detail")).toString();
+        if (!detail.isEmpty()) line += QStringLiteral(" — ") + detail;
+        return line + rankSuffix;
+    }
+    if (kind == QLatin1String("metric")) {
+        QString line = QStringLiteral("[metric] ") + text;
+        const QJsonValue loss = payload.value(QStringLiteral("total_loss"));
+        if (loss.isDouble())
+            line += QStringLiteral(" — loss %1").arg(loss.toDouble(), 0, 'g', 6);
+        const QJsonValue lr = payload.value(QStringLiteral("learning_rate"));
+        if (lr.isDouble())
+            line += QStringLiteral(" — lr %1").arg(lr.toDouble(), 0, 'g', 4);
+        return line + rankSuffix;
+    }
+    if (kind == QLatin1String("error"))
+        return QStringLiteral("[error] ") + text + rankSuffix;
+    return text + rankSuffix;
+}
 
 QString stateName(SpiralServiceManager::ConnectionState state)
 {
@@ -65,10 +118,26 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
     _poll = new QTimer(this);
     _poll->setInterval(kPollMs);
     connect(_poll, &QTimer::timeout, this, &SpiralServiceManager::pollStatus);
-    _remoteLogPoll = new QTimer(this);
-    _remoteLogPoll->setInterval(kRemoteLogPollMs);
-    connect(_remoteLogPoll, &QTimer::timeout, this,
-            &SpiralServiceManager::pollRemoteLogs);
+    _eventPoll = new QTimer(this);
+    _eventPoll->setInterval(kEventPollMs);
+    connect(_eventPoll, &QTimer::timeout, this,
+            &SpiralServiceManager::pollEvents);
+    connect(_artifactCache, &SpiralArtifactCache::fetchProgress, this,
+            [this](const QString& artifactId, const QString& phase,
+                   const QString& fileName, int filesComplete, int totalFiles,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                if (artifactId != _fetchingPreviewArtifact) return;
+                emit previewTransferProgress(
+                    phase, fileName, filesComplete, totalFiles,
+                    bytesReceived, totalBytes);
+            });
+    connect(_artifactCache, &SpiralArtifactCache::fetchProgress, this,
+            [this](const QString& artifactId, const QString& phase,
+                   const QString&, int, int,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                if (artifactId != _fetchingCheckpointArtifact) return;
+                emit checkpointDownloadProgress(phase, bytesReceived, totalBytes);
+            });
 
     connect(_tunnel, &SpiralSshTunnel::logMessage, this, &SpiralServiceManager::logMessage);
     connect(_tunnel, &SpiralSshTunnel::ready, this, [this](int localPort) {
@@ -170,14 +239,16 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _installedPreviewArtifact.clear();
     _installedPreviewSession.clear();
     _fetchingPreviewArtifact.clear();
+    _installedDiagnosticsArtifact.clear();
+    _fetchingDiagnosticsArtifact.clear();
+    _lastPreviewLocalPath.clear();
+    _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
-    _serviceOwnsDataset = false;
-    _remoteLogsInFlight = false;
-    _restartInProgress = false;
-    _remoteLogFailures = 0;
-    _lastRemoteLogSequence = 0;
+    _eventsInFlight = false;
+    _eventFailures = 0;
+    _lastEventCursor = 0;
     _advertisedDataset = {};
 
     _credential = profile.apiKey;
@@ -235,10 +306,34 @@ void SpiralServiceManager::startTunnel()
 
 void SpiralServiceManager::startLocalProcess()
 {
-    if (ownsProcess()) {
-        // Reuse the already-running owned service.
-        beginHandshake();
+    // The owned service is bound to one dataset/output/cache triple at
+    // startup; a different selection is a different service instance.
+    if (_profile.datasetRoot.trimmed().isEmpty()) {
+        const QString message = tr("The local Spiral service needs a dataset root. "
+                                   "Set it in the Spiral Service connection panel.");
+        setConnectionState(ConnectionState::Failed, message);
+        emit errorOccurred(message);
         return;
+    }
+    QString outputRoot = _profile.outputRoot.trimmed();
+    if (outputRoot.isEmpty())
+        outputRoot = defaultLocalOutputRoot(_profile.datasetRoot.trimmed());
+    QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
+                        QStringLiteral("--output"), outputRoot};
+    if (!_profile.cacheRoot.trimmed().isEmpty())
+        binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
+
+    if (ownsProcess()) {
+        if (binding == _ownedLaunchBinding) {
+            // Reuse the already-running owned service: same bound instance.
+            beginHandshake();
+            return;
+        }
+        // A different dataset/output/cache selection restarts the owned
+        // process with the new binding.
+        emit logMessage(tr("Restarting the local Spiral service for a different "
+                           "dataset binding"));
+        stopService();
     }
     const QString python = findPython();
     const QString service = findService();
@@ -254,7 +349,11 @@ void SpiralServiceManager::startLocalProcess()
         connect(_process, &QProcess::readyReadStandardOutput, this, [this]() {
             const QString output = QString::fromUtf8(_process->readAllStandardOutput());
             for (const QString& line : output.split('\n', Qt::SkipEmptyParts)) {
-                emit logMessage(line);
+                // Once the connection is Ready the structured event stream
+                // delivers the service's console lines; relaying stdout as
+                // well would duplicate them. Before that, stdout is the only
+                // startup diagnostic channel.
+                if (_connectionState != ConnectionState::Ready) emit logMessage(line);
                 // The ready line carries only the port; API compatibility is
                 // validated through the authenticated /health handshake.
                 const QRegularExpressionMatch match = QRegularExpression(
@@ -267,7 +366,8 @@ void SpiralServiceManager::startLocalProcess()
         });
         connect(_process, &QProcess::readyReadStandardError, this, [this]() {
             const QString output = QString::fromUtf8(_process->readAllStandardError());
-            for (const QString& line : output.split('\n', Qt::SkipEmptyParts)) emit logMessage(line);
+            for (const QString& line : output.split('\n', Qt::SkipEmptyParts))
+                if (_connectionState != ConnectionState::Ready) emit logMessage(line);
         });
         connect(_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
             emit errorOccurred(_process->errorString());
@@ -275,6 +375,15 @@ void SpiralServiceManager::startLocalProcess()
         connect(_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this](int code, QProcess::ExitStatus) {
                     _poll->stop();
+                    _eventPoll->stop();
+                    // A dead service can no longer serve /events; surface any
+                    // console tail (crash tracebacks) that was suppressed
+                    // while the event stream was authoritative.
+                    const QString tail =
+                        QString::fromUtf8(_process->readAllStandardOutput())
+                        + QString::fromUtf8(_process->readAllStandardError());
+                    for (const QString& line : tail.split('\n', Qt::SkipEmptyParts))
+                        emit logMessage(line);
                     if (_profile.autoLaunch
                         && _connectionState != ConnectionState::Disconnected) {
                         setConnectionState(ConnectionState::Failed, tr("The local Spiral service stopped"));
@@ -291,8 +400,11 @@ void SpiralServiceManager::startLocalProcess()
     environment.insert(QStringLiteral("PYTHONUNBUFFERED"), QStringLiteral("1"));
     _process->setProcessEnvironment(environment);
     setConnectionState(ConnectionState::Starting);
-    _process->start(python, {service, QStringLiteral("--nonce"), _credential,
-                             QStringLiteral("--parent-pid"), QString::number(QCoreApplication::applicationPid())});
+    _ownedLaunchBinding = binding;
+    _process->start(python, QStringList{service, QStringLiteral("--nonce"), _credential,
+                                        QStringLiteral("--parent-pid"),
+                                        QString::number(QCoreApplication::applicationPid())}
+                                + binding);
 }
 
 void SpiralServiceManager::beginHandshake()
@@ -322,16 +434,15 @@ void SpiralServiceManager::beginHandshake()
 void SpiralServiceManager::handleHealth(const QJsonObject& health)
 {
     const int apiVersion = health.value(QStringLiteral("api_version")).toInt(-1);
-    if (apiVersion != kSupportedApiVersion) {
+    if (apiVersion != SpiralServiceManager::kApiVersion) {
         const QString message = tr("Incompatible Spiral service: expected API version %1, received %2. "
                                    "Update the service and VC3D together.")
-                                    .arg(kSupportedApiVersion).arg(apiVersion);
+                                    .arg(SpiralServiceManager::kApiVersion).arg(apiVersion);
         setConnectionState(ConnectionState::Failed, message);
         emit errorOccurred(message);
         if (ownsProcess()) stopService();
         return;
     }
-    _serviceOwnsDataset = health.value(QStringLiteral("dataset_owned")).toBool();
     _artifactCache->setEndpoint(endpointFingerprint(), _network,
                                 [this](const QString& path, int timeoutMs) {
                                     return makeRequest(path, timeoutMs);
@@ -349,14 +460,18 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
-    if (!ownsProcess()) {
-        _remoteLogPoll->start();
-        pollRemoteLogs();
-    } else {
-        _remoteLogPoll->stop();
-    }
-    if (_serviceOwnsDataset) fetchAdvertisedDataset();
+    fetchAdvertisedDataset();
+    get(QStringLiteral("/configuration"), Timeout::Quick,
+        [this](const QJsonObject& catalog) {
+            _configurationDefaults =
+                catalog.value(QStringLiteral("defaults")).toObject();
+            emit configurationCatalogChanged(catalog);
+        });
+    // Reconnect protocol: read the durable status snapshot first, then
+    // subscribe to the bounded event stream from the persisted cursor.
     pollStatus();
+    _eventPoll->start();
+    pollEvents();
 }
 
 void SpiralServiceManager::fetchAdvertisedDataset()
@@ -374,10 +489,9 @@ void SpiralServiceManager::disconnectFromService()
 {
     ++_connectionGeneration;
     _poll->stop();
-    _remoteLogPoll->stop();
+    _eventPoll->stop();
     _statusInFlight = false;
-    _remoteLogsInFlight = false;
-    _restartInProgress = false;
+    _eventsInFlight = false;
     _artifactCache->clearEndpoint();
     _synchronizedSessionId.clear();
     _tunnel->stop();
@@ -397,91 +511,16 @@ void SpiralServiceManager::reconnect()
     connectToService(_profile);
 }
 
-void SpiralServiceManager::restartRemoteService()
-{
-    if (!_profile.isRemote()) {
-        emit errorOccurred(tr("Only a remote Spiral service can be restarted"));
-        return;
-    }
-    if (!isReady() || _restartInProgress) {
-        emit errorOccurred(tr("Spiral service is not connected"));
-        return;
-    }
-
-    post(QStringLiteral("/service/restart"),
-         {{QStringLiteral("command_id"), commandId()}},
-         Timeout::Command,
-         [this](const QJsonObject&) {
-             // Invalidate every request from the old process before probing
-             // the replacement. The SSH tunnel itself remains alive.
-             ++_connectionGeneration;
-             _poll->stop();
-             _remoteLogPoll->stop();
-             _statusInFlight = false;
-             _remoteLogsInFlight = false;
-             _statusFailures = 0;
-             _remoteLogFailures = 0;
-             _lastStatusGeneration = -1;
-             _installedPreviewArtifact.clear();
-             _installedPreviewSession.clear();
-             _fetchingPreviewArtifact.clear();
-             _synchronizedSessionId.clear();
-             _lastRemoteLogSequence = 0;
-             _serviceOwnsDataset = false;
-             _advertisedDataset = {};
-             _artifactCache->clearEndpoint();
-             if (_hasActiveSession) {
-                 _hasActiveSession = false;
-                 emit sessionActiveChanged(false);
-             }
-             _restartInProgress = true;
-             _restartElapsed.start();
-             setConnectionState(ConnectionState::Reconnecting,
-                                tr("Restarting remote service…"));
-             emit logMessage(tr("Remote Spiral service accepted the restart request"));
-             QTimer::singleShot(kRestartProbeMs, this,
-                                &SpiralServiceManager::probeRestartedService);
-         },
-         [this](const QString& error) {
-             emit errorOccurred(tr("Could not restart the Spiral service: %1").arg(error));
-         });
-}
-
-void SpiralServiceManager::probeRestartedService()
-{
-    if (!_restartInProgress
-        || _connectionState != ConnectionState::Reconnecting)
-        return;
-
-    const quint64 generation = _connectionGeneration;
-    get(QStringLiteral("/health"), Timeout::Quick,
-        [this, generation](const QJsonObject& health) {
-            if (generation != _connectionGeneration || !_restartInProgress) return;
-            _restartInProgress = false;
-            emit logMessage(tr("Remote Spiral service restarted successfully"));
-            handleHealth(health);
-        },
-        [this, generation](const QString& error) {
-            if (generation != _connectionGeneration || !_restartInProgress) return;
-            if (_restartElapsed.elapsed() >= kRestartTimeoutMs) {
-                _restartInProgress = false;
-                const QString message =
-                    tr("The Spiral service did not return after restarting: %1").arg(error);
-                setConnectionState(ConnectionState::Failed, message);
-                emit errorOccurred(message);
-                return;
-            }
-            QTimer::singleShot(kRestartProbeMs, this,
-                               &SpiralServiceManager::probeRestartedService);
-        });
-}
-
 void SpiralServiceManager::ensureStarted()
 {
     if (_connectionState == ConnectionState::Ready
         || _connectionState == ConnectionState::Starting
         || _connectionState == ConnectionState::Connecting) return;
-    if (_profile.id.isEmpty()) _profile = SpiralServiceProfile::localhostProfile();
+    if (_profile.id.isEmpty()) {
+        // Pick up the persisted local launch binding (dataset/output/cache).
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _profile = SpiralServiceProfile::localhostProfile(&settings);
+    }
     connectToService(_profile);
 }
 
@@ -518,22 +557,10 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     return request;
 }
 
-void SpiralServiceManager::resolveDataset(const QString& root)
+void SpiralServiceManager::rebuildSession(QJsonObject request)
 {
-    if (!isReady()) { ensureStarted(); emit errorOccurred(tr("Spiral service is not connected; retry dataset resolution when Ready.")); return; }
-    post(QStringLiteral("/dataset/resolve"), {{QStringLiteral("dataset_root"), root}},
-         Timeout::Command,
-         [this](const QJsonObject& value) { emit datasetResolved(value); });
-}
-
-void SpiralServiceManager::loadSession(QJsonObject request)
-{
-    if (!_serviceOwnsDataset) {
-        request[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(request);
-        return;
-    }
-    // The service owns its base inputs; a remote load request carries run
+    // The service always owns its base inputs (it is launched with
+    // --dataset), so a rebuild request carries run
     // parameters plus the client-selectable checkpoint/tracks values only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
@@ -549,7 +576,7 @@ void SpiralServiceManager::loadSession(QJsonObject request)
         if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
         else load[QStringLiteral("paths")] = selectable;
         load[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(load);
+        sendRebuildRequest(load);
     };
 
     if (checkpoint.isEmpty()) {
@@ -586,9 +613,16 @@ void SpiralServiceManager::loadSession(QJsonObject request)
                               });
 }
 
-void SpiralServiceManager::sendLoadRequest(QJsonObject request)
+void SpiralServiceManager::rebuildWithDefaults()
 {
-    postWithRetry(QStringLiteral("/session/load"), request, Timeout::Load, kMutationRetries,
+    if (!isReady()) return;
+    sendRebuildRequest({{QStringLiteral("defaults"), true},
+                        {QStringLiteral("command_id"), commandId()}});
+}
+
+void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
+{
+    postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
                   [this](const QJsonObject& response) {
                       handleStatus(response);
                   });
@@ -706,14 +740,24 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig)
+                                         const QJsonObject& runConfig,
+                                         const QJsonObject& inputs)
 {
-    postWithRetry(QStringLiteral("/session/run"),
-                  {{QStringLiteral("command_id"), commandId()},
-                   {QStringLiteral("iterations"), iterations},
-                   {QStringLiteral("influence_config"), influenceConfig},
-                   {QStringLiteral("run_config"), runConfig}},
-                  Timeout::Command, kMutationRetries, {});
+    QJsonObject configuration = _configurationDefaults;
+    for (auto it = _appliedConfiguration.begin();
+         it != _appliedConfiguration.end(); ++it)
+        configuration[it.key()] = it.value();
+    for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
+        configuration[it.key()] = it.value();
+    postWithRetry(
+        QStringLiteral("/session/run"),
+        {{QStringLiteral("command_id"), commandId()},
+         {QStringLiteral("configuration"), configuration},
+         {QStringLiteral("iterations"), iterations},
+         {QStringLiteral("influence"), influenceConfig},
+         {QStringLiteral("inputs"), inputs},
+         {QStringLiteral("expected_session_revision"), _sessionRevision}},
+        Timeout::Command, kMutationRetries, {});
 }
 
 void SpiralServiceManager::stopAfterIteration()
@@ -723,16 +767,129 @@ void SpiralServiceManager::stopAfterIteration()
                   Timeout::Command, kMutationRetries, {});
 }
 
-void SpiralServiceManager::saveCheckpoint(const QString& path)
+void SpiralServiceManager::saveCheckpoint(const QString& name)
 {
+    // The client names the checkpoint; the service places it under the
+    // session output directory and reports the resulting host path back
+    // through the status snapshot.
     postWithRetry(QStringLiteral("/session/save-checkpoint"),
                   {{QStringLiteral("command_id"), commandId()},
-                   {QStringLiteral("path"), path}},
-                  Timeout::LongCommand, kMutationRetries, {});
+                   {QStringLiteral("name"), name}},
+                  Timeout::LongCommand, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      handleStatus(response);
+                      // The saved file joins the checkpoints the service
+                      // advertises, which is what a load offers to choose from.
+                      fetchAdvertisedDataset();
+                  });
+}
+
+void SpiralServiceManager::requestPreview()
+{
+    if (!isReady() || _previewRequestInFlight) return;
+    _previewRequestInFlight = true;
+    // The service accepts the export and returns; the work itself costs
+    // minutes and is followed through the status snapshot this manager
+    // already polls (preview_exporting, then preview_publish, then
+    // preview_artifact or preview_publish_error, and for the overlays
+    // preview_diagnostics_artifact after that).
+    postWithRetry(QStringLiteral("/session/export-preview"),
+                  {{QStringLiteral("command_id"), commandId()},
+                   {QStringLiteral("diagnostics"), _previewDiagnosticsWanted}},
+                  Timeout::Command, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      _previewRequestInFlight = false;
+                      handleStatus(response);
+                  },
+                  [this](const QString& error) {
+                      _previewRequestInFlight = false;
+                      emit logMessage(tr("Preview export failed: %1").arg(error));
+                  });
+}
+
+QStringList SpiralServiceManager::serviceCheckpoints() const
+{
+    QStringList paths;
+    for (const QString& key : {QStringLiteral("session_checkpoints"),
+                               QStringLiteral("detected_checkpoints")})
+        for (const QJsonValue& value : _advertisedDataset.value(key).toArray())
+            if (!value.toString().isEmpty()) paths.push_back(value.toString());
+    return paths;
+}
+
+void SpiralServiceManager::loadCheckpoint(const QString& hostPath,
+                                          const QString& localPath,
+                                          bool allowRebuild)
+{
+    QJsonObject body;
+    if (allowRebuild) body[QStringLiteral("allow_rebuild")] = true;
+    if (localPath.isEmpty()) {
+        body[QStringLiteral("host_checkpoint")] = hostPath;
+        sendLoadCheckpoint(body, hostPath, localPath);
+        return;
+    }
+    // A local file has to exist on the service before the service can resolve
+    // it. The upload reuses an identical checkpoint already on the host, so
+    // escalating a refusal to a rebuild re-sends nothing.
+    emit logMessage(tr("Uploading checkpoint %1 to the service…").arg(localPath));
+    uploadCheckpointForResume(
+        localPath,
+        [this, body, localPath](const QString& uploaded, const QString& error,
+                                bool reused) mutable {
+            if (uploaded.isEmpty()) {
+                emit errorOccurred(tr("Checkpoint upload failed: %1").arg(error));
+                return;
+            }
+            emit logMessage(reused
+                                ? tr("Reusing checkpoint already on the service at %1").arg(uploaded)
+                                : tr("Checkpoint uploaded to service path %1").arg(uploaded));
+            body[QStringLiteral("uploaded_checkpoint")] = uploaded;
+            sendLoadCheckpoint(body, {}, localPath);
+        });
+}
+
+void SpiralServiceManager::sendLoadCheckpoint(QJsonObject body,
+                                              const QString& hostPath,
+                                              const QString& localPath)
+{
+    // Without allow_rebuild the resident model stays and only its parameters,
+    // optimiser, scheduler and RNG state are replaced, and only if the
+    // service's preflight finds the checkpoint an exact match. A refusal
+    // carries the reasons and the rebuild that would accept it, which the
+    // panel offers; with allow_rebuild the service performs that rebuild.
+    // Which checkpoint this is the service resolves: the body only says
+    // whether the name came from its own advertisement or from an upload.
+    body[QStringLiteral("command_id")] = commandId();
+    postWithRetry(QStringLiteral("/session/load-checkpoint"), body,
+                  Timeout::Load, kMutationRetries,
+                  [this](const QJsonObject& response) {
+                      handleStatus(response);
+                      // Preserve the behaviour the automatic
+                      // checkpoint-resume preview used to give: after a load,
+                      // show the restored model.
+                      requestPreview();
+                      emit checkpointLoaded(
+                          response.value(QStringLiteral("checkpoint_path")).toString(),
+                          response.value(QStringLiteral("restored_iteration"))
+                              .toInteger(-1));
+                  },
+                  {},
+                  [this, hostPath, localPath](const QString& message,
+                                              const QJsonObject& refusal) {
+                      QStringList reasons;
+                      for (const QJsonValue& value :
+                               refusal.value(QStringLiteral("reasons")).toArray())
+                          reasons.push_back(value.toString());
+                      emit checkpointLoadRefused(
+                          hostPath, localPath, reasons,
+                          refusal.value(QStringLiteral("stage")).toString(),
+                          message);
+                  });
 }
 
 void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
 {
+    emit checkpointDownloadProgress(QStringLiteral("creating"), 0, 0);
     postWithRetry(
         QStringLiteral("/session/download-checkpoint"),
         {{QStringLiteral("command_id"), commandId()}},
@@ -745,13 +902,16 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
                 emit checkpointDownloadFinished(localPath, tr("The service did not return a checkpoint artifact"));
                 return;
             }
+            _fetchingCheckpointArtifact = artifactId;
             _artifactCache->fetchArtifact(
                 sessionId, artifactId,
                 [this, localPath](const QString& entryPath, const QString& error, bool) {
+                    _fetchingCheckpointArtifact.clear();
                     if (entryPath.isEmpty()) {
                         emit checkpointDownloadFinished(localPath, error);
                         return;
                     }
+                    emit checkpointDownloadProgress(QStringLiteral("copying"), 0, 0);
                     // Atomic replacement: a failed transfer cannot leave a
                     // partial file at the selected destination.
                     const QString temporary = localPath + QStringLiteral(".part");
@@ -774,30 +934,13 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
         });
 }
 
-void SpiralServiceManager::deleteSession()
-{
-    if (!isReady()) return;
-    QNetworkRequest request = makeRequest(QStringLiteral("/session"),
-                                          static_cast<int>(Timeout::Command));
-    const QJsonObject body{{QStringLiteral("command_id"), commandId()}};
-    auto* reply = _network->sendCustomRequest(request, "DELETE",
-                                              QJsonDocument(body).toJson(QJsonDocument::Compact));
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
-        handleReply(reply, generation,
-                    [this](const QJsonObject& response) {
-                        handleStatus(response);
-                    }, {});
-    });
-}
-
 void SpiralServiceManager::commitInputs()
 {
     postWithRetry(QStringLiteral("/session/commit-inputs"),
                   {{QStringLiteral("command_id"), commandId()}},
                   Timeout::LongCommand, kMutationRetries,
                   [this](const QJsonObject& response) {
-                      if (_serviceOwnsDataset) fetchAdvertisedDataset();
+                      fetchAdvertisedDataset();
                       handleStatus(response);
                       QStringList committed;
                       for (const QJsonValue& value : response.value(QStringLiteral("committed")).toArray())
@@ -813,17 +956,10 @@ void SpiralServiceManager::commitInputs()
 void SpiralServiceManager::removeEphemeralInput(const QString& kind, const QString& inputId)
 {
     if (!isReady()) return;
-    QNetworkRequest request = makeRequest(QStringLiteral("/session/ephemeral-inputs"),
-                                          static_cast<int>(Timeout::Command));
-    const QJsonObject body{{QStringLiteral("command_id"), commandId()},
-                           {QStringLiteral("kind"), kind},
-                           {QStringLiteral("id"), inputId}};
-    auto* reply = _network->sendCustomRequest(request, "DELETE",
-                                              QJsonDocument(body).toJson(QJsonDocument::Compact));
-    const quint64 generation = _connectionGeneration;
-    connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
-        handleReply(reply, generation, {}, {});
-    });
+    // The target is named in the path, so this is a bodyless DELETE and goes
+    // through the same helpers as every other verb.
+    del(QStringLiteral("/session/ephemeral-inputs/%1/%2").arg(kind, inputId),
+        Timeout::Command);
 }
 
 void SpiralServiceManager::uploadPatch(const QString& directory, const QString& inputId)
@@ -967,18 +1103,22 @@ void SpiralServiceManager::post(const QString& path, QJsonObject body, Timeout t
 void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, Timeout timeout,
                                          int retriesLeft,
                                          std::function<void(const QJsonObject&)> success,
-                                         std::function<void(const QString&)> failure)
+                                         std::function<void(const QString&)> failure,
+                                         DetailedFailure detailedFailure)
 {
     if (!isReady()) {
         const QString message = tr("Spiral service is not connected");
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, {});
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     QNetworkRequest request = makeRequest(path, static_cast<int>(timeout));
     auto* reply = _network->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
     const quint64 generation = _connectionGeneration;
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, generation, path, body, timeout, retriesLeft, success, failure]() {
+            [this, reply, generation, path, body, timeout, retriesLeft, success,
+             failure, detailedFailure]() {
                 const QNetworkReply::NetworkError networkError = reply->error();
                 const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
                 // When a mutating request times out or the transport drops, it
@@ -990,12 +1130,14 @@ void SpiralServiceManager::postWithRetry(const QString& path, QJsonObject body, 
                     reply->deleteLater();
                     emit logMessage(tr("Retrying %1 with the same command id (%2 retries left)")
                                         .arg(path).arg(retriesLeft));
-                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft, success, failure]() {
-                        postWithRetry(path, body, timeout, retriesLeft - 1, success, failure);
+                    QTimer::singleShot(1000, this, [this, path, body, timeout, retriesLeft,
+                                                    success, failure, detailedFailure]() {
+                        postWithRetry(path, body, timeout, retriesLeft - 1, success,
+                                      failure, detailedFailure);
                     });
                     return;
                 }
-                handleReply(reply, generation, success, failure);
+                handleReply(reply, generation, success, failure, detailedFailure);
             });
 }
 
@@ -1011,9 +1153,22 @@ void SpiralServiceManager::get(const QString& path, Timeout timeout,
     });
 }
 
+void SpiralServiceManager::del(const QString& path, Timeout timeout,
+                               std::function<void(const QJsonObject&)> success,
+                               std::function<void(const QString&)> failure)
+{
+    QNetworkRequest request = makeRequest(path, static_cast<int>(timeout));
+    auto* reply = _network->sendCustomRequest(request, "DELETE");
+    const quint64 generation = _connectionGeneration;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, generation, success, failure]() {
+        handleReply(reply, generation, success, failure);
+    });
+}
+
 void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
                                        std::function<void(const QJsonObject&)> success,
-                                       std::function<void(const QString&)> failure)
+                                       std::function<void(const QString&)> failure,
+                                       DetailedFailure detailedFailure)
 {
     const QByteArray bytes = reply->readAll();
     const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -1026,7 +1181,9 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
     if (networkError != QNetworkReply::NoError && http == 0) {
         // Unreachable / timeout: distinguish from service-reported errors.
         const QString message = tr("Spiral service is unreachable: %1").arg(networkErrorString);
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, {});
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     if (!document.isObject() || http >= 400) {
@@ -1044,7 +1201,9 @@ void SpiralServiceManager::handleReply(QNetworkReply* reply, quint64 generation,
                 detailLines.push_back(field.isEmpty() ? description : QStringLiteral("%1: %2").arg(field, description));
         }
         if (!detailLines.isEmpty()) message += QStringLiteral("\n") + detailLines.join(QStringLiteral("\n"));
-        if (failure) failure(message); else emit errorOccurred(message);
+        if (detailedFailure) detailedFailure(message, document.object());
+        else if (failure) failure(message);
+        else emit errorOccurred(message);
         return;
     }
     if (success) success(document.object());
@@ -1084,41 +1243,52 @@ void SpiralServiceManager::pollStatus()
         });
 }
 
-void SpiralServiceManager::pollRemoteLogs()
+void SpiralServiceManager::pollEvents()
 {
-    if (_remoteLogsInFlight || ownsProcess()
-        || _connectionState != ConnectionState::Ready)
-        return;
-    _remoteLogsInFlight = true;
+    if (_eventsInFlight || _connectionState != ConnectionState::Ready) return;
+    _eventsInFlight = true;
     const quint64 generation = _connectionGeneration;
-    get(QStringLiteral("/logs?after=%1").arg(_lastRemoteLogSequence), Timeout::Quick,
+    get(QStringLiteral("/events?cursor=%1").arg(_lastEventCursor), Timeout::Quick,
         [this, generation](const QJsonObject& response) {
-            _remoteLogsInFlight = false;
+            _eventsInFlight = false;
             if (generation != _connectionGeneration) return;
-            _remoteLogFailures = 0;
+            _eventFailures = 0;
             if (response.value(QStringLiteral("cursor_reset")).toBool())
-                _lastRemoteLogSequence = 0;
+                _lastEventCursor = 0;
             const qint64 dropped = response.value(QStringLiteral("dropped")).toInteger();
-            if (dropped > 0)
-                emit logMessage(tr("Remote Python log buffer dropped %1 older line(s).")
-                                    .arg(dropped));
-            const QJsonArray entries = response.value(QStringLiteral("entries")).toArray();
-            for (const QJsonValue& value : entries) {
-                const QJsonObject entry = value.toObject();
-                const qint64 sequence = entry.value(QStringLiteral("sequence")).toInteger();
-                const QString message = entry.value(QStringLiteral("text")).toString();
-                if (sequence <= _lastRemoteLogSequence || message.isEmpty()) continue;
-                _lastRemoteLogSequence = sequence;
-                emit logMessage(message);
+            if (dropped > 0 && _lastEventCursor > 0) {
+                // The bounded event ring overran this client's cursor: the
+                // stream is history, not reconnect state, so refresh the
+                // durable view from the status snapshot and continue from
+                // the cursor the service reports.
+                emit logMessage(tr("Spiral event stream dropped %1 older record(s); "
+                                   "refreshing session status.").arg(dropped));
+                pollStatus();
             }
-            _lastRemoteLogSequence = response.value(QStringLiteral("next_sequence"))
-                                         .toInteger(_lastRemoteLogSequence);
+            const QJsonArray events = response.value(QStringLiteral("events")).toArray();
+            for (const QJsonValue& value : events) {
+                const QJsonObject event = value.toObject();
+                const qint64 sequence = event.value(QStringLiteral("sequence")).toInteger();
+                if (sequence <= _lastEventCursor) continue;
+                _lastEventCursor = sequence;
+                if (event.value(QStringLiteral("severity")).toString()
+                        == QLatin1String("error")) {
+                    // Popups are reserved for error severity; the handler
+                    // also appends the message to the panel.
+                    emit errorOccurred(event.value(QStringLiteral("text")).toString());
+                    continue;
+                }
+                const QString line = formatEventRecord(event);
+                if (!line.isEmpty()) emit logMessage(line);
+            }
+            _lastEventCursor = response.value(QStringLiteral("next_cursor"))
+                                   .toInteger(_lastEventCursor);
         },
         [this, generation](const QString& error) {
-            _remoteLogsInFlight = false;
+            _eventsInFlight = false;
             if (generation != _connectionGeneration) return;
-            if (++_remoteLogFailures == 1)
-                emit logMessage(tr("Remote Python log polling failed: %1").arg(error));
+            if (++_eventFailures == 1)
+                emit logMessage(tr("Spiral event polling failed: %1").arg(error));
         });
 }
 
@@ -1127,10 +1297,17 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     const qint64 generation = status.value(QStringLiteral("generation")).toInteger(-1);
     if (generation < _lastStatusGeneration) return;
     _lastStatusGeneration = generation;
+    _sessionRevision =
+        status.value(QStringLiteral("session_revision")).toInteger();
+    const QJsonObject applied =
+        status.value(QStringLiteral("applied_config")).toObject();
+    if (!applied.isEmpty()) _appliedConfiguration = applied;
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
-    const bool active = !sessionId.isEmpty()
-        && status.value(QStringLiteral("state")).toString() != QStringLiteral("Empty");
+    // The service always holds a session; there is no "no session" state to
+    // check for. A session identity is present from the moment the service
+    // starts building one.
+    const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;
         emit sessionActiveChanged(active);
@@ -1145,6 +1322,16 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
         }
+    }
+    // Pausing no longer exports a preview by itself. Ask for one exactly
+    // where the automatic pause preview used to appear: the first Idle after
+    // a run.
+    const QString state = status.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("Running")) {
+        _sawRunningSinceIdle = true;
+    } else if (state == QStringLiteral("Idle") && _sawRunningSinceIdle) {
+        _sawRunningSinceIdle = false;
+        requestPreview();
     }
     emit sessionStatusChanged(status);
     syncArtifacts(status);
@@ -1179,10 +1366,48 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
+                // A newly installed surface has no overlays until its own
+                // diagnostics artifact arrives; the previous generation's
+                // must not be drawn over it.
+                _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
                     sessionId, kPreviewCacheKept,
-                    {_lastPreviewLocalPath});
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+            });
+    }
+
+    // The overlays are published as a second artifact once the surface is on
+    // its way, so they are fetched separately and only reach the workspace
+    // when they belong to the preview it has installed.
+    const QString diagnosticsId =
+        status.value(QStringLiteral("preview_diagnostics_artifact")).toObject()
+            .value(QStringLiteral("id")).toString();
+    if (!diagnosticsId.isEmpty() && diagnosticsId != _installedDiagnosticsArtifact
+        && diagnosticsId != _fetchingDiagnosticsArtifact) {
+        _fetchingDiagnosticsArtifact = diagnosticsId;
+        const qint64 sequence = _previewSequence;
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, diagnosticsId,
+            [this, diagnosticsId, sequence, sessionId, generation](
+                const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                if (_fetchingDiagnosticsArtifact == diagnosticsId)
+                    _fetchingDiagnosticsArtifact.clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone) emit errorOccurred(error);
+                    return;
+                }
+                // The surface these overlays were mapped onto has already
+                // been replaced; the next generation publishes its own.
+                if (sequence < _previewSequence) return;
+                _installedDiagnosticsArtifact = diagnosticsId;
+                _lastDiagnosticsLocalPath = entryPath;
+                emit previewDiagnosticsAvailable(entryPath, sequence);
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept,
+                    {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
             });
     }
 }
@@ -1190,11 +1415,13 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
                                             FetchPreviewFileCallback done)
 {
-    if (_installedPreviewArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
-        done({}, tr("No Spiral preview artifact is installed"));
+    // Deferred preview files are the loss overlays, and those live in the
+    // diagnostics artifact the service publishes after the surface.
+    if (_installedDiagnosticsArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
+        done({}, tr("No Spiral preview diagnostics are installed"));
         return;
     }
-    const QString artifactId = _installedPreviewArtifact;
+    const QString artifactId = _installedDiagnosticsArtifact;
     const QString sessionId = _installedPreviewSession;
     const quint64 generation = _connectionGeneration;
     _artifactCache->fetchFile(
@@ -1202,7 +1429,7 @@ void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
         [this, artifactId, generation, done = std::move(done)](
             const QString& localPath, const QString& error, bool gone) {
             if (generation != _connectionGeneration
-                || artifactId != _installedPreviewArtifact)
+                || artifactId != _installedDiagnosticsArtifact)
                 return;
             done(localPath,
                  gone ? tr("The Spiral preview was pruned before the file was downloaded")

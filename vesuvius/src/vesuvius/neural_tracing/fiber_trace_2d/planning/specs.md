@@ -1,0 +1,2697 @@
+# 2D Fiber Trace Initial Loader Specs
+
+## Shared 3D Tiled Inference
+
+- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled
+  inference runner used by both Lasagna predict3d and Fiber 3D inference. It owns:
+  canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
+  from `_download` metadata, circular Z scratch, output-chunk-only resume,
+  temp cleanup, progress formatting, and atomic Zarr chunk writes.
+- Product-specific adapters own model semantics, raw output splitting, output
+  channel schema, tile preprocessing, raw-to-persisted finalization, and
+  completeness semantics. Shared predict3d helpers own OME-Zarr group
+  creation, Lasagna manifest writing, standard scalar/normal pyramid building,
+  and chunk writing/resume mechanics.
+- `preprocess_cos_omezarr.py predict3d` remains the compatibility wrapper for
+  Lasagna cos/normal inference. Its CLI, output values, `.lasagna.json`
+  manifest, scale handling, optional `pred_dt`, and OME-Zarr pyramid behavior
+  must remain compatible with the pre-extraction implementation.
+- Resume state is durable output chunks only. Done markers are not allowed.
+  Scratch mmap/temporary files are not resume state and may be deleted on
+  startup/resume or finish.
+- Neural accumulation uses a fixed-depth circular mmap per raw product,
+  float32 by default and optionally float16 for memory-constrained experiments, and one
+  float32 geometric weight mmap per distinct source-relative inference scale.
+  Flush reads widen bounded product chunks to float32 before normalization and
+  finalization. FP16 assumes finite, model-bounded raw products; unbounded
+  custom adapters must select float32 to avoid overflow.
+  Ring depth is derived from the actual canonical Z tile positions, nonzero
+  tile support, flush opportunities, and output chunk alignment. Mmap shape and
+  logical file size must be independent of full output Z.
+- Ring planning keeps the chunk-aligned `flushed` frontier separate from the
+  physical ring origin and follows runtime write-before-post-row-flush order.
+  The initial prefix from logical plane zero remains live when a computed
+  frontier merely equals `output_begin`; only a strictly advancing runtime
+  flush releases it.
+- Flush overlaps inference through the same circular mmap, enlarged only for
+  the exact maximum span produced by one frozen finalized interval plus the
+  following active canonical Z row. There is one runner-wide flush future,
+  including across inference scales. No live overlap, finalized band, or full
+  mmap region is copied to another mmap or a band-sized RAM buffer.
+- Submitted/frozen, completed/written, and released/origin frontiers are
+  distinct. At the next advancing frontier the coordinator waits for the
+  previous combined flush, clears its exact dirty rectangles, releases its
+  generations, and only then submits the next combined interval. User-visible
+  finalized Z advances only after successful output writes.
+- The flush worker receives immutable chunk descriptors and reads frozen mmap
+  regions one output chunk at a time. Temporary denominator, stacked raw, and
+  finalized channel arrays remain bounded by one output chunk. A failed flush
+  never clears or reuses its frozen slots, and all exit paths wait for the
+  non-cancellable reader thread before mmap cleanup.
+- Completed output is normalized, finalized, written, and cleared one globally
+  anchored output chunk at a time. Denominator and wrap scratch are bounded by
+  one output chunk; no full-XY or full-band normalization/finalization
+  temporary is allowed. Circular slots may be reused only after every live raw
+  product region sharing their geometric weight has finished.
+- Resume masks suppress accumulation for already complete product chunks.
+  Weight contributions are accumulated once over the union of incomplete
+  product regions at a scale, never once per product. Each scheduled global
+  model tile is inferred at most once even when it feeds several scales or
+  products.
+- `OutputProductSpec.scaledown` is base-relative output metadata. The
+  internal product `inference_scaledown` value is only runner geometry state
+  for tile downsampling and ring layout; it is not serialized into Lasagna
+  manifests.
+- Fiber inference manifests must not add redundant trace-scale aliases such as
+  `trace_to_base_scale`, `prediction_to_base_scale`,
+  `prediction_spacing_in_trace_voxels`, `inference_scaledown_factor`, or
+  per-group `inference_scaledown`. Native consumers require an explicit
+  numeric manifest `source_to_base` and derive persisted prediction sample
+  scale as `source_to_base * 2**group.scaledown`. Native precomputed tracing
+  receives the missing inference-output scaledown relative to trace coordinates
+  as `--inference-scaledown-power` (default `2`), then derives
+  `trace_to_base = prediction_to_base / 2**power` and
+  `prediction_spacing_in_trace_voxels = 2**power`.
+- Native precomputed Trace2CP search must match the Python tracer's beam
+  semantics: pruning is ordered by `cumulative_loss + depth * 1e-12` with
+  original tensor/generation order preserved on ties, spatial pruning uses the
+  squared-distance `>= distance**2` keep rule, and reached-target selection
+  chooses the first reached state with minimum cumulative loss only. Native
+  compact normal interpolation must choose the principal tensor axis with a
+  symmetric eigensolver and then apply the same hint/no-hint sign convention as
+  Python. The active `candidate_substeps=1` candidate loss is the Python
+  all-pairs direction product plus the configured smoothness terms.
+- Native precomputed Trace2CP may score independent beam candidates in
+  parallel only when the prediction source and, if present, the Lasagna normal
+  sampler explicitly advertise concurrent sampling support. Parallel scoring
+  must build candidate tasks in deterministic beam/candidate order, keep
+  persisted Zarr/cache access chunky by preparing interpolation requests as a
+  batch, and rebuild the next frontier serially in original candidate order,
+  so pruning, reached-state selection, and trace output remain deterministic.
+  Persisted sources may decode and score each candidate directly while its
+  pinned corners are hot, provided scores are written at their original global
+  candidate indices. Static scoring ranges may be submitted as one indexed
+  worker batch to avoid per-range futures, but every index must run exactly
+  once and worker exceptions must be rethrown after batch completion.
+  Candidate task metadata and point coordinates may use separate compact
+  arrays, provided their shared index remains the original deterministic
+  beam/candidate order. `--threads 0` is the default and uses the available
+  worker pool; `--threads 1` must force serial candidate scoring.
+- Native precomputed Trace2CP persisted sampling must use one long-lived VC3D
+  decoded chunk cache per physical scalar Zarr volume. Each candidate batch
+  must fetch the ordered eight integer voxel corners through blocking
+  requested-level nearest-neighbor coordinate sampling, with dependencies
+  deduplicated and chunks pinned before candidate access. The tracer must use
+  the shared corner visitor to interpolate scalar channels and decode/score
+  compact channels without candidate-sized corner arrays. The materializing
+  corner API must use that same visitor rather than duplicate cache/layout
+  behavior. Compact `nx/ny` corners must be decoded as paired ambiguous axes
+  and interpolated through the weighted orientation tensor; independently
+  interpolating encoded `nx` and `ny` is not allowed. Candidate points sharing
+  one integer voxel cube must reuse one gathered ordered-corner record per
+  physical scalar volume; per-point fractions and callback indices remain
+  distinct. Concrete single-point prediction sampling must resolve each cube's
+  unique chunk keys once rather than probing the shared chunk cache per corner.
+- Native precomputed Trace2CP final lookahead orders intermediate parents by
+  nonnegative cumulative-loss lower bound and original parent index. With
+  `--lookahead-parent-cap 0`, it must expand parents lazily until the next lower
+  bound is strictly greater than the established reached loss or complete
+  spatial-beam threshold; equal bounds must remain observable, producing the
+  same result as exhaustive expansion. The production default intentionally
+  caps this ordered expansion at 32 parents. This is an accepted approximate
+  search-semantic change measured at 7 restarts on the representative
+  87-segment workload. Original global child indices remain required for ties.
+  `--exhaustive-lookahead` bypasses both lazy stopping and the parent cap.
+  `--lookahead-retry-parent-cap` is an explicit deterministic failed-segment
+  retry cap; `0` disables it and remains the default. A retry result replaces
+  the original only when it succeeds.
+- Native fiber-trace internal geometry, direction, interpolation, beam, and
+  loss math may use float. Public persisted coordinates may remain double at
+  API boundaries. Candidate generation order, pruning tie order, and output
+  determinism remain required, and performance changes must report the
+  representative whole-fiber restart metric so numeric changes cannot silently
+  degrade trace quality.
+- Multi-GPU tiled inference exists only in the shared runner and is therefore
+  identical for Lasagna predict3d and Fiber 3D inference. It uses one
+  persistent spawn-context model worker per selected CUDA device, without DDP
+  or GPU collectives.
+- The canonical tile stream materializes only independent Z/Y/X axis lattices
+  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
+  execution, result completion, and ordered commit use fixed bounded windows.
+- Input reads happen outside GPU workers. The default local Zarr-v2 backend is
+  one asynchronously polled TensorStore driver/context created only after all
+  spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
+  Resume/skipped work is rejected before read submission. The lazy prefetch
+  window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
+  counts as one) and is independent of GPU shared-memory slots.
+- Every outstanding TensorStore read may own a full padded input tile. Input
+  memory is bounded by that window times tile bytes, plus the separately bounded
+  TensorStore cache, existing input/result shared memory, and request/cache
+  overhead. A ready tile enters shared memory only when input/result slots and a
+  GPU queue are available. Existing clipped bounds, source dtype, uint16
+  conversion timing, fully-outside uint8 behavior, and NumPy reflect-padding
+  semantics are preserved exactly.
+- Input slots cannot be reused until H2D completion, and results cannot be
+  published until D2H completion. The coordinator alone unlinks shared memory;
+  workers only attach and close it.
+- CUDA input transfer preserves compact uint8/uint16 source dtype. UInt16 is
+  converted through int32 floor division by 257; normalization and adapter
+  preprocessing are CUDA FP32. CPU fallback preserves historical NumPy
+  conversion. Fiber model autocast follows checkpoint training-policy metadata
+  by default, with explicit precision override and all-device validation;
+  shared product arithmetic, filtering, D2H, and accumulation remain FP32.
+- Opt-in multi-device pipeline profiling uses bounded streaming aggregates,
+  preserves the disabled worker/message path, distinguishes summed concurrent
+  service from wall span, and directly reports reader throughput and effective
+  outstanding-request concurrency, queue delays, CPU conversion,
+  CUDA/transfer/model/output, and commit stages.
+- GPU results may finish out of order, but accumulation remains in canonical
+  tile order. A Z row flushes only after all preceding canonical events,
+  including skips, commit. The coordinator solely owns circular accumulators,
+  resume state, progress, and output writes.
+- Output adapters must permit completeness checks for future, disjoint chunks
+  while the flush worker writes a frozen chunk. Model adapters must permit
+  inference to overlap their stateless raw-product finalization callback.
+- Sparse/resume-complete work is rejected before prefetch. Workers calculate
+  only the union of raw products required by incomplete output chunks; the
+  coordinator retains chunk masks and adds shared geometric weight once.
+- Worker exceptions, hard exits, CUDA failures, interrupts, and coordinator
+  errors cancel prefetch, stop workers, and close shared resources rather than
+  waiting indefinitely.
+- `--devices all` selects all visible CUDA devices and a comma-separated list
+  selects a subset. Existing singular `--device` and CPU behavior remain
+  supported; conflicting or invalid selections fail before model construction.
+- Automatic OME-Zarr download uses `--download-workers` independently of
+  inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
+  must be positive even when automatic download is disabled.
+- `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
+  malformed, or schema-invalid cache data warns and behaves as an empty set;
+  it must never abort inference or suppress remote validation. Saves snapshot
+  Stats under lock, include empty sets, and use same-directory unique temporary
+  files plus atomic replace. Save failures warn, retain the previous valid
+  target when possible, clean temporary files, and do not fail the download.
+- Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
+  (factor 4 relative to selected input). It is converted to the runner's
+  literal factor and does not read or reinterpret tracer config `scaledown`.
+- Model tensor downsampling retains floor-sized interpolation geometry, but
+  persisted OME-Zarr level shapes and exclusive output-region endpoints use
+  ceil division. Odd selected-input dimensions must therefore write their
+  final valid output plane and output chunk rather than leaving the ceil-sized
+  OME edge unwritten.
+- Scaled output uses the shared repeated separable `[1,4,6,4,1]/16`
+  blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
+  no private resampling, blending, or border implementation.
+- Lasagna predict3d and Fiber inference default to 64x64x64 OME-Zarr chunks.
+- `las_manager` Bash and Zsh completion is generated from the same command
+  registry used for prefix dispatch. Dynamic snapshot and catalog candidates
+  use cached indexes only; inference candidates read durable records; live-run
+  candidates may query tmux but never reconcile or mutate records.
+- A manager-launched inference is complete only when the child exits zero and
+  its portable `artifacts/inference.json` reports `completed` with an artifact
+  inventory. A zero exit without that contract is recorded as failed with a
+  diagnostic completion error.
+- Portable artifact inventory paths must be relative, remain inside the bundle,
+  and resolve after the complete `artifacts/` directory is moved. This bounded
+  validation does not recursively enumerate Zarr chunks.
+- Pyramid multiprocessing may use the automatic available-CPU process count,
+  but every pyramid worker must run native BLAS/OpenMP libraries with one
+  thread. The same constraint applies to serial pyramid execution, and parent
+  environment/native limits must be restored on success and failure.
+- Accumulator activity is contribution-driven. Unsupported, resume-complete,
+  and untouched chunks produce neither output chunks nor mmap zero-writes.
+  Only dirty product and shared-weight regions are flushed and cleared before
+  circular-slot reuse.
+- Sparse source support is evaluated on the global output lattice: each global
+  output-chunk footprint is clipped to the product's full output shape and only
+  then mapped into selected-input coordinates. Crop-local padded ring
+  dimensions must never clip this global footprint. Products sharing an
+  inference-scale accumulator must share the same full output shape.
+- Output products are independently resumable. For Lasagna, missing `pred_dt`
+  chunks schedule only derived distance-transform generation; they must not
+  schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
+  complete. Missing one sibling of `grad_mag/nx/ny` makes only the coarse
+  normal bundle incomplete.
+- Output chunks and model tile origins are anchored to a global full-volume
+  lattice. A crop only selects which global output chunks to produce; it must
+  not shift the tile support used for a shared chunk. Overlapping or separate
+  crop runs therefore produce the same bytes for the same complete global
+  output chunk.
+- Every output chunk write uses a unique temporary path on the target
+  filesystem followed by atomic `os.replace`. If any channel in a coherent
+  product is missing, the product is incomplete and the next run rewrites the
+  missing product chunk through the same atomic path.
+- Fiber 3D inference is exposed by
+  `python -m vesuvius.neural_tracing.fiber_trace_3d.infer`. It uses the shared
+  tiled runner with the common arguments `--input`, `--output`,
+  `--checkpoint`, `--tile-size`, `--overlap`, `--border`, `--scaledown`,
+  `--crop`, `--device`, `--no-download`, `--levels`, and `--ome-chunk`.
+  It also accepts `--pyramid-workers` to pass worker count to the shared
+  pyramid builders.
+  Fiber-specific arguments are the positional training/inference config,
+  `--recurrent-steps`, `--base-ref`, and `--base-scale`.
+- Fiber 3D inference `--output` is a `.lasagna.json` manifest path. The
+  manifest is the authoritative output description and points to per-channel
+  OME-Zarr groups derived from the manifest stem.
+- Fiber 3D inference must use the existing 3D fiber model/config/checkpoint
+  stack: `build_fiber_trace_3d_model(...)`, training snapshot loading, the
+  configured tile image normalization, mixed-precision/autocast helpers, and
+  Lasagna 3x2 direction encoding helpers.
+- When a 3D fiber inference/tracing checkpoint contains a saved training
+  `config`, that checkpoint config is authoritative for model construction,
+  option count, and tile preprocessing. Runtime configs still provide the
+  dataset/CLI context, but must not silently build a different architecture
+  than the snapshot. Older checkpoints without embedded config may infer a
+  minimal legacy free-branch model layout from
+  `net.decoder.final_seg_layer.weight` when possible.
+- Lasagna 3x2 normal estimation and compact `nx/ny` byte encoding live in the
+  package-safe shared `lasagna.normal_encoding` module. Lasagna predict3d,
+  fiber whole-volume inference, and live fiber prediction paths must import
+  that helper directly, not private functions from
+  `preprocess_cos_omezarr.py`.
+- Fiber model output has seven raw channels per option internally:
+  `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
+  `presence`. These raw channels are accumulated in the shared circular Z ring
+  and are never persisted as output channels.
+- Fiber persisted output is only `presence`, `nx`, and `ny` per option.
+  Presence is fixed-point uint8 with `0 == 0.0` and `255 == 1.0`. `nx/ny` use
+  Lasagna's compact ambiguous hemisphere encoding: estimate the 3D axis from
+  raw 3x2 direction channels, flip the equivalent sign to `z >= 0`, then write
+  `round(component * 127 + 128)` clipped to uint8.
+- Product completeness for a fiber option requires all three persisted sibling
+  chunks: `presence`, `nx`, and `ny`.
+- Multi-branch legacy outputs and conditioned recurrent outputs must be
+  preserved as separate coherent fiber options. Inference must not collapse
+  them to branch 0, min/max, average, or any other summary unless a separate
+  explicit postprocessing mode is added.
+- Fiber inference must build coarser OME-Zarr pyramids: scalar mean-pool
+  pyramids for `presence` and paired normal pyramids for `nx/ny`, using the
+  existing Lasagna pyramid helpers.
+- Fiber inference must not keep legacy V0 output compatibility shims: no
+  `fiber_trace_3d_inference.json`, no raw seven-channel persisted bundle, no
+  directory-style `--output`, no duplicate fiber output adapter, and no public
+  exports for removed V0 symbols.
+- Shared multi-device Fiber/Lasagna inference accumulates output chunks in
+  persistent spawned CPU processes. A stable integer mapping gives each
+  `(scale, chunk_z, chunk_y, chunk_x)` exactly one FIFO owner, so overlapping
+  tile updates need no locks and retain canonical per-chunk order. GPU result
+  slots remain live until every referenced accumulation task acknowledges.
+- Accumulation queues are bounded and a new Z row cannot reserve circular-ring
+  generations until the preceding row is committed. Flush frontiers therefore
+  observe only acknowledged tasks and retain the rolling-memory bound.
+- Product rings default to float16 while the shared weight ring remains
+  float32. Each product update widens the stored half to float32, adds the
+  float32 tile contribution, and rounds to nearest-even back to binary16.
+  This reduced-precision accumulation is explicitly not bitwise equivalent to
+  float32; `--product-accumulator-dtype float32` restores float32 accumulation.
+- The optional native accumulator extension must retain a portable scalar
+  implementation. On supported x86 GCC/Clang builds it may runtime-dispatch to
+  an isolated AVX-512F+F16C kernel; the package must not require AVX-512
+  globally and unsupported CPUs/platforms must continue through the fallback.
+
+## 3D CP-Centered Fiber Model Variant
+
+- The 3D CP model lives in a sibling package,
+  `vesuvius.neural_tracing.fiber_trace_3d`. It must not replace or reinterpret
+  `fiber_trace_2d` configs, strip geometry, Trace2CP tooling, or 2D training.
+- 3D training samples ordinary CP-centered ZYX volume blocks from the selected
+  base-volume Zarr level. It must not build fiber-aligned 3D strips or slices
+  for input loading.
+- Dataset entries use `base_volume_path`, `base_volume_scale`, and
+  `fiber_paths`/`fiber_glob`. `lasagna_manifest_path` is optional for 3D
+  training; when omitted, the loader derives `base_shape_zyx` from the raw
+  OME-Zarr volume and validates the selected scale against the configured
+  `base_volume_scale`.
+- JSON and NML fiber parsing, control-point exactness, and optional
+  dataset-level XYZ affine transforms follow the existing
+  `fiber_trace_2d.fiber_json` semantics.
+- `base_volume_scale` selects both the Zarr level read by the 3D loader and the
+  voxel scale at which CP-centered patches are sampled.
+- The 3D sample stream is deterministic pseudo-random by configured `seed` and
+  covers every configured control point once per pass before repeating. Changing
+  batch size or step count may truncate/extend the consumed prefix, but must not
+  reshuffle earlier samples.
+- 3D training uses a strict stream/data index split. `stream_index` is the
+  unbounded deterministic stream position; `data_index` is the bounded
+  dataset-selection index after applying `training.max_sample_index` /
+  `sample_index_limit`. `training.max_sample_index` limits CP/data sample
+  selection only. Every deterministic random source and augmentation parameter
+  must be keyed by `stream_index`, never `data_index`, so reusing a bounded
+  CP/data prefix cannot replay the same augmentation transforms on each repeat.
+- Public 3D loader compatibility calls may still accept an argument named
+  `sample_index`, but it is semantically `stream_index` and must be normalized
+  to that name internally. Batch/sample data structures must carry explicit
+  `stream_index`/`stream_indices` and `data_index`/`data_indices` fields.
+  `data_index` is only for dataset lookup/CP selection and debug reporting.
+- With `training.max_steps = 0`, 3D training repeats the deterministic training
+  stream indefinitely until interrupted. Positive `max_steps` values are
+  absolute target training steps, including for resumed runs.
+- 3D geometric augmentation is represented by explicit coordinate maps before
+  the final volume patch is materialized. `backward_source_zyx` maps output
+  voxels to selected-level source-volume coordinates for image sampling.
+  Source fiber points are mapped to output-patch coordinates with the matching
+  analytic forward transform built from the same augmentation parameters. The
+  image, transformed fiber line, transformed CP, and direction targets must
+  therefore see the same geometry without dense inverse search.
+- V0 3D geometric augmentations support CP-local shift, isotropic scale,
+  arbitrary 3D rotation, and independent axis flips. Non-zero 3D shear/skew and
+  ringing artifact keys are rejected until their semantics are specified.
+- 3D smooth displacement is opt-in through
+  `augment_smooth_displacement_mode` (`none`, `1d`, `2d`, `3d`),
+  `augment_smooth_displacement_amplitude_zyx`,
+  `augment_smooth_displacement_control_spacing_zyx`, and
+  `augment_smooth_displacement_probability`. Smooth modes must use explicit
+  paired map construction, matching the 2D fused-map contract. Runtime paths
+  must not invert one map direction into the other by search, brute-force
+  nearest lookup, iterative solving, or formula re-evaluation. The current 3D
+  mode uses explicitly invertible 1D/2D offsets and 3D triangular coupling
+  stages.
+- The 3D loader must sample the final regular 3D patch through explicit
+  coordinates using the VC3D blocking coordinate sampler. It must not load an
+  oversized axis-aligned zarr crop and then resample that crop with torch
+  `grid_sample` for normal training. Array-backed tests may use the
+  NumPy/trilinear fallback sampler. Value-only augmentations happen after
+  sampling as torch tensor operations.
+- VC3D blocking coordinate sampling means strict requested-level sampling:
+  every required requested-level chunk is fetched/decoded and locally pinned
+  before sampling starts, scale fallback is disabled, and returned stats report
+  `requested_level_only: true`, `fallback_levels: 0`, and `missing_chunks` for
+  genuinely absent requested-level chunks. Only those truly missing
+  requested-level chunks may render black. Chunk I/O/decode errors must fail
+  loudly. The returned sampler `valid_mask` is only geometry/sample coverage;
+  it must not be treated as proof that requested-level data was used.
+- V0 3D value augmentations support normalization, brightness, contrast, gamma,
+  noise, and separable isotropic Gaussian blur. Opt-in anisotropic blur is
+  configured with `augment_anisotropic_blur_probability`,
+  `augment_anisotropic_blur_sigma_along`,
+  `augment_anisotropic_blur_sigma_across`,
+  `augment_anisotropic_blur_orientation`, and
+  `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
+  coordinate sampling, not a geometric transform.
+- The active 3D multi-direction experiment uses
+  `model_3d.conditioned_decoder_enabled: true`. A shared spatial 3D U-Net
+  emits a latent feature volume whose width is
+  `model_3d.conditioned_latent_channels` and defaults to `64`, independently
+  of `unet_base_channels`. A separate conditioned decoder receives the latent
+  channels plus a six-channel Lasagna 3x2 query direction at each voxel and
+  emits seven sigmoid channels: six direction channels and one sheet/fiber
+  presence channel.
+- The conditioned decoder head must be pointwise only: `1x1x1` convolutions or
+  equivalent per-voxel linear layers. It must not add spatial 3D kernels after
+  the shared U-Net latent.
+- The all-zero six-channel query is a reserved off-manifold unconditioned
+  token. It must not be decoded or interpreted as a real direction.
+- `FiberTrace3DNet.forward(volume)` remains a zero-query compatibility path
+  returning `B,7,D,H,W`. `forward_recurrent_grouped(volume, steps=2)` returns
+  branch-shaped grouped outputs where the first seven channels are zero-query
+  output and the next seven channels are decoded using the first prediction's
+  encoded direction as the query.
+- Legacy/free-branch configs remain supported when
+  `conditioned_decoder_enabled` is false. In that mode the output layout is
+  grouped by direction branch, each branch has seven channels, and branch 0
+  preserves the legacy channel positions (`0:6` direction, `6` presence).
+- Each seven-channel prediction's six direction channels use Lasagna's double-angle projection layout:
+  `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
+  `dir0_x,dir1_x` for `(ty,tz)`.
+- Direction supervision is computed from the transformed 3D line tangent and is
+  masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
+  may downweight channels whose projection is nearly degenerate.
+- In conditioned mode, sparse positive supervision evaluates two positive
+  queries per supervised point with equal weight: the zero/unconditioned query,
+  and one deterministic query sampled from the plane perpendicular to the GT
+  direction with configurable jitter
+  (`training.conditioned_perpendicular_jitter_degrees`, default `45.0`). Both
+  positive queries predict positive presence and the same GT direction.
+- Conditioned positive-query randomness is deterministic from `stream_index`
+  and the local sparse point coordinate, not from loader order or global RNG.
+- In conditioned mode, dense negative presence supervision decodes both the
+  zero query and one deterministic random direction query per patch over all
+  `presence_mask` locations, including positive pixels by design. The weak
+  dense negative BCE at positive pixels is intentional; under the configured
+  positive/negative component weights it is equivalent to a softened positive
+  target, not contradictory masked supervision.
+- Conditioned presence BCE is normalized by patch/query group before
+  aggregation. The group-normalized positive and negative components are
+  multiplied by `training.conditioned_positive_query_weight` and
+  `training.conditioned_negative_query_weight`, both defaulting to `1.0`.
+- Legacy/free-branch positive supervision still chooses one branch per sparse
+  positive point by detached
+  `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`.
+  Legacy two-branch training keeps the deterministic `2x2x2` anti-collapse
+  repair and legacy global-negative branch BCE semantics for old configs.
+- 3D training defaults `training.direction_weight` to `10.0` and
+  `training.presence_weight` to `1.0`, so direction loss is 10x stronger than
+  presence loss unless the config overrides it.
+- 3D target generation is source-format dependent. NML fibers use dense
+  supervision along all fiber-line segments that overlap the patch. The
+  transformed output-space segments are clipped/rasterized directly into the
+  patch target volume; they must not be generated by a full voxel-by-segment
+  nearest search or by inverting sampled image coordinates. Non-NML fiber
+  sources supervise only the sampled CP neighborhood for direction and
+  presence.
+- The first 3D model used branch-routed direction plus presence losses; the
+  active multi-direction experiment uses the conditioned query loss above.
+  Contrastive embedding remains unsupported by default in the 3D V0 path.
+- The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
+  actual BatchNorm batch because the trainer has no internal micro-batching.
+  `model_3d.normalization: "none"` remains supported for explicit ablations.
+- `batch_size` is the actual CP-patch batch passed through the 3D model in one
+  forward/backward call. The 3D trainer does not support internal
+  micro-batching; any BatchNorm statistics must come from the real configured
+  batch.
+- `training.mixed_precision` controls trainer autocast only and must not
+  introduce internal micro-batching. Supported modes are `off`, `bf16`, `fp16`,
+  and `auto`. BF16 uses autocast without a scaler; FP16 uses AMP with
+  `GradScaler` and snapshots include scaler state when present. Dense test
+  loss, benchmark forward loss, TensorBoard sample-sheet inference, and
+  Trace2CP metric/visual inference use the same configured autocast mode.
+- The active S1A 3D configs use `training.mixed_precision: "bf16"` to reduce
+  activation memory while preserving the configured BatchNorm batch.
+- The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
+  `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
+  (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
+  for 192-voxel patches.
+- `train_s1a_nml_all_64_sd2.json` and
+  `train_s1a_nml_all_128_sd2.json` are experimental S1A NML configs at
+  `base_volume_scale: 2` for 64- and 128-voxel patches. The 64 sd2 config uses
+  the active conditioned decoder path. The 128 sd2 config is currently a
+  regular single-output legacy config with one seven-channel branch
+  (`direction_branch_count: 1`, `output_channels: 7`) for direct comparison
+  against the conditioned experiment. Both keep the same implemented
+  augmentation families enabled at magnitudes appropriate for their patch
+  sizes: affine shift/rotation/scale/flip, value
+  brightness/contrast/gamma/noise, isotropic blur, smooth displacement, and
+  anisotropic blur. Shear/skew and ringing remain unsupported and must not
+  appear as enabled keys in these configs.
+- 3D training TensorBoard visualization logs CP-centered slice sheets at
+  `training.sample_vis_interval`. By default, up to four batch samples are
+  shown; `training.sample_vis_count` / `train_sample_vis_count` and
+  `training.test_sample_vis_count` control the side-by-side train/test sample
+  counts. Each sample block has five rows: the `yx`, `zx`, and `zy` principal
+  planes, a longitudinal slice containing the GT CP tangent, and a
+  perpendicular/cross slice whose plane normal is the GT CP tangent.
+  Single-output rows have five columns: volume image with projected GT line and
+  model-predicted/fitted CP direction overlay where applicable,
+  target/context presence, raw predicted presence, predicted presence weighted
+  by `abs(dot(pred_axis, slice_normal))`, and predicted presence weighted by
+  `abs(dot(pred_axis, GT_tangent))`. Multi-output rows keep the branch summary
+  layout: image, target/context presence, first prediction presence, second
+  prediction presence, prediction presence for the output whose decoded
+  direction is closer to the slice normal by `abs(dot(axis, normal))`, the other
+  prediction presence, max prediction presence, min prediction presence, and
+  average prediction presence. In conditioned mode the first prediction is the
+  zero-query output and the second prediction is the recurrent output
+  conditioned on the first decoded direction; in legacy branch mode these are
+  branch outputs. The target/context
+  presence panel must visualize the carried transformed fiber-line segment
+  metadata even for JSON/non-NML CP-only samples where loss supervision remains
+  CP-only. The two oblique rows must project/rasterize transformed line
+  segments into their oblique slice frame for both image overlay and
+  target/context presence. Dense-line/NML samples must carry the transformed CP
+  tangent so the GT-tangent and perpendicular rows are constructed from the
+  actual local target tangent. The GT line overlay includes target-line
+  portions within 2 voxels of the displayed principal slice plane or oblique
+  slice plane. The sparse direction angular-error panel
+  is intentionally not shown because it is too sparse to be useful for routine
+  inspection. The predicted/fitted CP direction overlay is drawn as a thin
+  anti-aliased line whose length is scaled by the in-slice projection magnitude,
+  so out-of-slice directions are visibly shorter.
+- The 3D target-presence panel in TensorBoard is display-only max-pooled with a
+  `3x3x3` kernel before slicing. This must not modify `presence_target` used by
+  training or test loss.
+- 3D training/test loss logging reports average supervised prediction direction
+  angular error in degrees as `train/angle_mean_deg` and
+  `test/angle_mean_deg`. The scalar is computed over sparse supervised
+  direction samples with Lasagna 3x2 analytic decoding and unoriented
+  `abs(dot)` agreement. Legacy branch routing diagnostics include branch usage
+  fractions and selected score means; conditioned mode reports fixed equal
+  query fractions for its two positive query groups and the mean
+  `abs(dot) * presence` over those positive query outputs.
+- Conditioned 3D presence loss uses equal default component weight when
+  positive-query and dense negative-query supervision are both present:
+  `mean(positive-query BCE) + mean(dense negative-query BCE)`, multiplied by
+  the configured conditioned positive/negative component weights. Legacy branch
+  mode keeps its existing selected-positive plus branch-negative BCE contract.
+- When `training.test_interval > 0`, 3D training runs the configured test
+  evaluation at step 0 before the first optimizer step and logs the same
+  TensorBoard scalars/stdout as interval tests.
+- 3D snapshots are evaluation-only. `training.checkpoint_interval` must be a
+  positive multiple of `training.test_interval`, and
+  `training.kept_snapshot_interval` must be `0` or a multiple of
+  `training.test_interval`. `current.pt` and retained numbered snapshots are
+  written only on aligned evaluation steps; an otherwise unscheduled final
+  training step must not write a snapshot.
+- The 3D `best.pt` snapshot is selected exclusively by the lowest observed
+  dense `test/loss_total`. Training loss must never be compared with the test
+  metric or trigger a best snapshot.
+- Dense 3D test loaders do not inherit train augmentations by default.
+  `training.test_augment_enabled: true` is the explicit opt-in for augmented
+  dense tests.
+- Dense 3D tests default to evaluating every configured held-out CP once in the
+  deterministic pseudo-random test stream from sample index zero.
+  `training.test_control_points: 0` is the explicit full-test sentinel with
+  the same behavior. Positive values keep the fixed deterministic random test
+  range beginning at `test_start_sample_index`.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
+  entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
+  `--prefetch`.
+- Multi-process 3D training is enabled only by the standard `torchrun`
+  environment (`WORLD_SIZE > 1` with `RANK` and `LOCAL_RANK`); no DDP config
+  keys are required. A typical launch is
+  `torchrun --standalone --nproc_per_node=N -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>`.
+  `--benchmark`, `--prefetch`, and `--trace2cp-vis` are single-process-only
+  modes and must fail clearly when launched with `WORLD_SIZE > 1`.
+- In DDP training, configured `batch_size` remains the per-rank local batch size.
+  The effective global optimizer-step batch is `batch_size * WORLD_SIZE`.
+  Training samples are partitioned by rank as disjoint deterministic stream
+  batches, and `training.max_steps` remains the number of optimizer steps.
+- CUDA DDP training must convert `BatchNorm3d` modules to `SyncBatchNorm`
+  before DDP wrapping so BatchNorm statistics are computed across ranks.
+  Ordinary single-process training keeps literal `BatchNorm3d` modules.
+  Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
+  not receive a DDP `module.` prefix.
+- DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
+  Trace2CP metrics, and train/test visualization. Dense test model evaluation
+  is deterministically distributed across all ranks; scalar training losses
+  are averaged across ranks before rank-0 logging.
+- Dense DDP tests partition global batch IDs as `rank, rank + WORLD_SIZE, ...`.
+  The configured test start is a literal sample offset, including when it is
+  not batch-aligned; every global batch is evaluated exactly once and only the
+  final global batch is sliced. Per-batch float metric rows are gathered to
+  rank 0, restored to global batch order, and combined with the historical
+  unweighted Python per-batch mean so metric and best-snapshot semantics remain
+  unchanged. Ranks with no assigned batch still enter the gather.
+- Each rank retains a separate persistent test DataLoader worker pool using the
+  same worker count, prefetch factor, worker device, and multiprocessing context
+  as training. Rank 0 reuses its already evaluated global batch zero for the
+  test sample sheet instead of synchronously loading it again. The train and
+  test pools coexist and are both released before distributed teardown.
+- Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
+  overrides config resume keys, restores model and optimizer state, writes a
+  fresh timestamped run directory, and records the effective resume path in
+  TensorBoard config text. After restoring checkpoint optimizer state, training
+  must reapply the current config optimizer hyperparameters supported by the
+  trainer, currently `training.learning_rate` and `training.weight_decay`, to
+  every optimizer param group while preserving loaded AdamW moment buffers and
+  step counters. If finite `training.max_steps` is not greater than the
+  checkpoint step, training must fail clearly.
+- 3D training and `--benchmark --load-only` runtime loading use
+  `torch.utils.data.DataLoader` worker processes when
+  `training.loader_workers > 0`. Each DataLoader item is one complete
+  `FiberTrace3DBatch`, not an individual CP patch, and PyTorch default
+  collation is bypassed so the custom dataclass is not nested or reshaped.
+- Each 3D DataLoader worker lazily constructs its own `FiberTrace3DLoader` and
+  VC3D sampler state in the worker process. Worker outputs are CPU
+  `FiberTrace3DBatch` objects; the main training process transfers the whole
+  batch to `training.device` immediately before forward/backward. The old
+  thread-backed `_OrderedBatchLoadPipeline` is not a supported 3D loading path.
+- In 3D configs, omitted or `null` `volume_cache_memory_mib` means a
+  Python-side default of 512 MiB per VC3D sampler/loader/worker, not VC3D's
+  internal 8 GiB default. Explicit positive values override this cap. The
+  generated 2D Trace2CP geometry loader used by 3D evaluation receives the same
+  default when the 3D raw config leaves the key unset or `null`.
+- 3D DataLoader workers must not materialize full dense direction/presence
+  target tensors. Worker batches carry image/valid tensors plus compact target
+  descriptors: CP-only samples carry local CP/tangent metadata plus
+  visualization-only transformed line segments, and NML dense-line samples carry
+  transformed output-space line segments with precomputed patch bboxes for
+  supervision. Dense `presence_target` and `presence_mask` are created by
+  `fiber_trace_3d.targets.materialize_targets(...)` in the main training process
+  on the training device. Direction supervision is represented sparsely as
+  `direction_indices_bzyx`, `direction_target_sparse`, and
+  `direction_weight_sparse`; normal training must gather predictions at those
+  supervised line/CP voxels instead of creating full-patch dense six-channel
+  direction targets.
+- For JSON/non-NML 3D samples, `target_segment_*` metadata is visualization
+  context only. The materializer must filter dense line rasterization by
+  `_TARGET_MODE_DENSE_LINE`, so CP-only JSON segments do not create dense
+  presence or direction supervision. Their direction target is the transformed
+  CP tangent applied only to the CP neighborhood. TensorBoard visualization may
+  draw those visualization-only segments in the target/context presence panel,
+  but that display-only raster must not be fed back into loss materialization.
+- The GPU target materializer must preserve the existing label semantics:
+  NML sources supervise direction/presence by drawing the overlapping clipped
+  fiber centerline voxels only, without a radius-expanded distance-to-segment
+  tube. Non-NML sources supervise only the sampled CP neighborhood using
+  `presence_radius_voxels`; that radius does not apply to NML centerline
+  targets. Presence edge masking applies only to CP-only samples; NML dense-line
+  samples supervise presence over the full valid patch. Lasagna 3x2 direction
+  encoding uses the shared NumPy/torch-compatible helper semantics.
+- `training.loader_workers` controls 3D DataLoader worker process count.
+  Under DDP this count is per rank. `0` is the explicit serial/debug path.
+  `training.loader_prefetch_factor` maps directly to PyTorch DataLoader prefetch
+  factor for worker processes.
+  `training.loader_worker_device` defaults to `"cpu"`. CPU worker processes
+  use a guarded `forkserver` multiprocessing context where available, falling
+  back to `fork` only when needed; CUDA worker devices select `spawn`.
+- 3D `--benchmark --load-only` timing output separates main-process
+  `wait_ms` from `to_device_ms`. It also reports worker-side profiling columns
+  for loader construction, descriptor lookup, augmentation parameters,
+  geometry-map creation, coordinate conversion, valid-mask generation, VC3D
+  sampling, tensor conversion, value augmentation, compact target-spec
+  generation, batch stacking, worker wall time, and worker CPU time. Dense
+  target work is reported separately as main-process GPU target materialization
+  timings (`target_ms`, `gpu_ms`, `line_idx`, `cp_idx`, `scatter`, `dir_enc`,
+  `gpu_mask`, `linePts`, `dirPts`, and `posK`). With worker processes, the
+  first `loader_workers` benchmark rows can include worker-local loader
+  construction and should not be used as steady-state throughput.
+- 3D prefetch computes chunk dependencies from a CP-centered selected-level
+  augmentation-envelope bbox and asks VC3D to convert that bbox to authoritative
+  chunk dependency metadata. It follows the 2D step-count
+  sentinel rules: omitted `--prefetch-steps` uses `training.max_steps`;
+  positive values override config; explicit `--prefetch-steps 0` means every
+  selected training CP once; negative values fail clearly. A positive
+  `training.max_sample_index` bounds the prefetched training prefix, and
+  full/config-driven prefetch also covers held-out test CPs once in flat order
+  when `test_datasets` is configured.
+- VC3D dependency collection exposes both coordinate-surface metadata
+  (`collect_coords_dependencies`) for 2D strip/top-slice surfaces and selected
+  ZYX bbox metadata (`collect_bbox_dependencies`) for regular 3D prefetch
+  envelopes. Python must preserve VC3D-returned metadata rather than
+  reconstructing cache paths or remote chunk keys.
+- 3D prefetch must follow the same streaming dependency/download state machine
+  as 2D prefetch: bounded dependency producers controlled by
+  `prefetch_sampler_workers`, bounded download workers controlled by
+  `prefetch_workers`, deterministic raw-sample-order producer consumption,
+  global chunk de-duplication, cache-hit / `.empty` classification before
+  downloads, earliest-raw-sample download priority, safe-prefix `idx`
+  tracking, live dependency and download progress, sample skip accounting,
+  fatal cancellation of queued futures, temporary PyTorch CPU intra-op thread
+  pinning, and the shared Python atomic download helper.
+- The only intentional 3D differences from 2D prefetch are that one 3D sample
+  produces one CP-centered 3D augmentation-envelope dependency volume, valid
+  counts are voxels, and there is no strip-z offset loop or top-view branch.
+- The 3D augmentation-envelope dependency volume is
+  augmentation-sample-independent, not augmentation-config-independent:
+  configured augmentation extrema define the conservative source range, but
+  one deterministic random augmentation draw must not decide which chunks are
+  prefetched.
+- 3D prefetch dependency generation must not call `_sample_augment_params` or
+  otherwise sample concrete augmentation parameters. It must generate
+  a selected-level bbox from the configured envelope and call VC3D bbox
+  dependency discovery without `sample_coords`, coordinate materialization,
+  image decoding, normalization, or target construction.
+- V0 3D prefetch uses VC3D chunk dependency metadata and the shared Python
+  prefetch writer with atomic cache-file renames and `.empty` marker handling.
+  It does not prefetch Lasagna manifest channels.
+- The 3D-to-2D evaluation bridge in `fiber_trace_3d.trace2cp_bridge` samples
+  dense 3D model outputs at explicit 2D Trace2CP strip coordinates, projects
+  six-channel Lasagna 3x2 direction predictions into the requested 2D strip
+  frame, carries presence through, and reuses the existing 2D Trace2CP scorer.
+  This bridge is metric/debug tooling only and does not change 3D input
+  loading into strip loading.
+- 3D Trace2CP projection must decode the six Lasagna 3x2 direction channels
+  analytically: each two-channel projection is decoded with
+  `theta = atan2(sin2theta, cos2theta) / 2`, then the three projection planes
+  are reconstructed/sign-aligned with the Lasagna three-plane logic. Unit-sphere
+  candidate tables, binned direction lookup, or grid-search decoding are not
+  allowed for 3D Trace2CP projection.
+- 3D training test evaluation may reuse the 2D `FiberStrip2DLoader` only to
+  construct Trace2CP segment geometry. It must keep normal 3D training samples
+  as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
+  run over tiled axis-aligned blocks covering the requested 2D strip
+  coordinates plus configured context, then sampled/projected back to 2D.
+- Hang diagnostics are disabled by default. Setting the JSON boolean
+  `training.test_hang_diagnostics_enabled: true` or passing
+  `--test-hang-diagnostics` during normal training enables append-only per-rank
+  diagnostic logs, `SIGUSR2` manual dumps, detailed test phase markers, and a
+  rank-0 pre-NCCL-timeout watchdog. The watchdog defaults to 480 seconds through
+  `training.test_watchdog_seconds`, which must be positive and below the
+  600-second process-group timeout when diagnostics are enabled. Disabled mode
+  creates no files or handlers, arms no timer, polls no resources, and performs
+  no diagnostic CUDA synchronization. The CLI flag is invalid in auxiliary
+  prefetch, benchmark, and Trace2CP visualization modes.
+- Rank 0 prints `test_timing step=... total_seconds=...` for the complete test
+  routine through distributed dense evaluation, visualization, and Trace2CP,
+  excluding the subsequent TensorBoard flush, and logs the same duration as
+  `timing/test_total_seconds`. Rank-0-only post-dense phases must remain below
+  the process-group timeout while other ranks wait at the result broadcast.
+- When a 3D config defines `test_datasets` and `test_trace2cp_enabled` is
+  false, test evaluation runs ordinary 3D sparse direction/presence loss on the
+  held-out CP-centered 3D samples. It must not require Trace2CP geometry or
+  trace loss.
+- Configured dense 3D tests log `test_sample_3d/principal_slices` with the same
+  principal-slice sheet layout as training at step 0 and interval test runs.
+  The TensorBoard writer is flushed after configured test logging so initial
+  test scalars and images are visible promptly.
+- The `train_s1a_nml_all_64_sd2.json` 3D config includes the same held-out 2D
+  fiber JSON `test_datasets` block as the full S1A NML 3D config, so step-0 and
+  interval dense 3D test loss run for the fast 64-scale training setup.
+- When `training.test_trace2cp_enabled` is true, 3D training logs
+  `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
+  count. Trace2CP metrics are diagnostic and must not replace dense
+  `test/loss_total` as the snapshot metric. `best.pt`, `current.pt`, and
+  retained numbered snapshots store `metric_name: test/loss_total`.
+- `training.test_trace2cp_control_points: 0` means the full held-out Trace2CP
+  CP set in flat order. Positive values use the deterministic random held-out
+  range beginning at `training.test_trace2cp_start_sample_index` or, when that
+  key is omitted, `training.test_start_sample_index`.
+- The 3D Trace2CP metric path performs no training augmentations. Required 2D
+  metric geometry must be explicit through `training.test_trace2cp_loader_config`
+  or the 3D config keys `test_trace2cp_patch_shape_hw`,
+  `test_trace2cp_strip_z_offset_count`, and `test_trace2cp_strip_z_offset_step`;
+  missing required geometry must fail loudly.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.train --trace2cp-vis`
+  runs the same 3D projection/scoring path for one sample or a whole
+  `--fiber-json`, prints `trace2cp_error=...` or `trace2cp_error_mean=...`, and
+  exports `trace2cp_3d_vis.jpg`.
+- `python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool` is a
+  separate native 3D Trace2CP inspection tool. It must not replace the
+  projected `test/trace2cp_error` diagnostic or affect best-checkpoint
+  selection, which is based only on dense `test/loss_total`.
+- Native 3D Trace2CP is metric-only by default. It always prints native metric
+  lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
+  partial image updates are opt-in and run only when `--vis` is supplied.
+- Native 3D Trace2CP accepts multiple `--fiber-json` paths in one invocation.
+  Multi-fiber mode is whole-fiber only: sample-index and explicit CP selectors
+  are rejected because the accumulated score is defined over complete fibers.
+  The tool traces the fibers sequentially with one shared loaded model, writes
+  one per-fiber summary as `trace2cp_native_3d_000_summary.json`,
+  `trace2cp_native_3d_001_summary.json`, etc., writes indexed JPGs with the
+  same stems when `--vis` is supplied, writes
+  `trace2cp_native_3d_summary_all.json`, and reports the accumulated
+  restart-rate score from summed restarts divided by summed original-line
+  reference length.
+- Native 3D whole-fiber JPG visualization must never write a JPEG whose width
+  reaches the format limit. When `--vis` is enabled, completed restart spans
+  are packed into split pages with a target width of `32000` pixels so page
+  breaks prefer restart boundaries. A single very long no-restart span is split
+  internally before it reaches the JPEG dimension cap; split pages keep the
+  base output path for page zero and write additional pages with numbered
+  suffixes.
+- Native 3D whole-fiber visualization must mark CP positions without covering
+  the point with distance text. CP labels are drawn at the bottom edge of each
+  rendered strip and include the CP index plus the distance/miss state, e.g.
+  `cp=17 d=3.2`, so the same index can be used with explicit CP selection
+  arguments.
+- Dedicated native 3D Trace2CP metric configs may require the JSON fiber to be
+  supplied by `--fiber-json`. In that mode the config `datasets` entry is only
+  a volume/scale/manifest template and must not carry a config-local
+  `fiber_glob` or `fiber_paths` list. It should contain only metric/runtime
+  fields and must not carry unrelated NML training datasets, affine transforms,
+  train/test duplicate dataset blocks, augmentation settings, prefetch
+  settings, loss weights, TensorBoard settings, or training-loop/run/checkpoint
+  settings.
+- Native 3D Trace2CP selection supports both the existing
+  `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
+  `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
+  index mode requires `--fiber-json`, requires both CP indices, uses flat
+  single-fiber CP ordering, and must reuse the existing 2D Trace2CP segment
+  source builder with `target_control_point_index`.
+- When `--fiber-json <path>` is supplied without explicit CP indices, native
+  3D Trace2CP defaults to whole-fiber mode. Whole-fiber mode traces
+  consecutive CP pairs from CP `0` to the last CP by default. Supplying
+  `--whole-fiber-start-cp-index N` starts whole-fiber tracing at CP `N` and
+  measures the restart-rate denominator along the original line from CP `N` to
+  the final CP. The chosen start CP must leave at least one target segment.
+  Supplying both explicit CP indices keeps the single-segment debug mode;
+  supplying only one CP index must fail loudly.
+- The native 3D tool traces in selected-level ZYX voxel coordinates. It loads
+  the same dataset/test-dataset CP pair as the visualization geometry loader,
+  decodes six Lasagna 3x2 direction channels analytically, treats predicted
+  axes as sign-ambiguous, and aligns sampled directions to the current trace
+  direction before scoring.
+- For conditioned 3D models, native Trace2CP inferred-block caching must store
+  grouped recurrent outputs: zero-query output first, then output conditioned
+  on the first decoded direction. Existing branch-aware candidate scoring then
+  chooses between strongest and recurrent secondary predictions; these grouped
+  slots are not free branch heads.
+- Native 3D Trace2CP inference uses overlapped axis-aligned model-output
+  blocks. Each block has a full input patch and a cropped trusted core; point
+  lookups must route to a block whose trusted core contains the queried point.
+  The tool must not silently score candidates from cropped-away model-output
+  borders.
+- When the native 3D Trace2CP checkpoint output has grouped
+  direction/presence branches (`7*K` channels), inferred block sampling decodes
+  all `K` Lasagna 3x2 direction branches plus their branch-local presence
+  values. Branch 0 remains the compatibility layout for single-branch callers,
+  but native tracing must not be branch-0-only for grouped outputs.
+- Native 3D Trace2CP cached inferred blocks are device-resident on the tracing
+  device and bounded by the existing LRU byte budget. CUDA tracing must sample
+  cached model-output blocks without copying every resident block back from CPU
+  for each lookup. Long whole-fiber traces still must not retain every
+  historical block until process exit; `--max-cached-inference-gib` bounds the
+  resident inferred field cache and eviction may cause re-inference.
+- Native 3D Trace2CP field lookup must keep query points, block-origin
+  calculation, per-block grouping, trusted-core masks, and sampled field
+  tensors on `cache.device` for resident lookups. CPU transfer is limited to
+  the unique missing/resident block origins required by the VC3D/model-output
+  block cache. The lookup must not convert every candidate point batch to
+  NumPy for `np.unique`/`flatnonzero` routing.
+- Broad reference-line or corridor model-block prefetch must not be enabled by
+  default. It may only be added when it is proven metric-equivalent to the
+  incremental inference order, because changing model-block materialization
+  order/batching has been observed to alter native Trace2CP decisions for the
+  current checkpoint.
+- Native 3D Trace2CP supports `--inference-scaledown-power N` for opt-in
+  lower-resolution tracing over the raw model-output field. The scaledown
+  factor is `2 ** N`: `0` is the default no-op, `1` samples a half-resolution
+  field, and `2` samples a quarter-resolution field. The model input patch is
+  unchanged; after inference, every raw product tensor is downscaled with the
+  same Gaussian pyramid helper Lasagna predict3d uses (`_pyrdown3d`, repeated
+  `[1,4,6,4,1]/16` separable filtering plus `::2` subsampling) before the
+  field cache stores it. The valid mask remains a conservative support mask:
+  it is reduced with the same factor and a scaled output voxel is valid only if
+  all source voxels in the cell were valid. The inference patch shape and
+  `--core-margin-voxels` must be evenly divisible by the factor, and invalid
+  combinations must fail before tracing starts. The trusted core is still
+  defined in selected-level voxel coordinates, while cached output lookups
+  convert points to the scaled field with the same factor.
+- Native 3D Trace2CP supports `--inference-blur-sigma-voxels` for opt-in 3D
+  Gaussian blur over the inferred direction/presence fields. The blur runs
+  after model inference and after optional `--inference-scaledown-power`
+  pyramid filtering, but before trusted-core margin cropping into the field cache.
+  The configured sigma is measured in unscaled selected-level inference voxels;
+  internally the scaled field uses `sigma / inference_scaledown_factor`, so
+  changing scaledown does not change the selected-level blur size. The default
+  `0.0` preserves unblurred behavior, and negative sigma values must fail
+  before tracing.
+- Native 3D Trace2CP inferred blocks must be bounded by resident cache bytes by default.
+  The native CLI uses an LRU byte budget exposed as
+  `--max-cached-inference-gib`, defaults to 8 GiB, and reports total inferred,
+  resident, evicted, and resident byte/GiB counts. Eviction may cause
+  re-inference, but long whole-fiber runs must not retain every historical
+  block until process exit. Cached model-output blocks retain only the trusted
+  core plus the one-voxel upper interpolation halo needed to preserve
+  trilinear point sampling inside the trusted core; full margin outputs must
+  not remain in the resident cache after block inference.
+- Native 3D Trace2CP inference blocks are regular axis-aligned selected-level
+  regions and must be sampled through `CoordinateSampler.sample_block_zyx(...)`.
+  This path is backed by VC3D requested-level chunk-cache reads and must not
+  materialize dense `[D,H,W,3]` coordinate grids or call generic
+  `sample_coord_batch(...)` for these blocks. Real configured volumes must not
+  be read by direct zarr/raw block slicing in Python. The block sampler must use
+  strict requested-level VC3D blocking semantics, report
+  `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
+  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
+  follow the existing strict VC3D rendering semantics: black covered pixels and
+  a non-zero `missing_chunks` stat.
+- Generic `CoordinateSampler.sample_coords(...)` and
+  `sample_coord_batch(...)` remain the correct boundary for arbitrary
+  coordinate surfaces such as side/top strips, TTA surfaces, and strip
+  visualization.
+- Native 3D Trace2CP applies the configured 3D model-input normalization before
+  inference. Exported native strip volume panels must display that same
+  normalized input domain so the visualization shows what inference sees. For
+  `image_normalization: "zscore"`, display maps a fixed normalized `[-3, 3]`
+  window to `0..255`; for `minmax`, display maps normalized `0..1`; for
+  raw/none modes, display clips raw `0..255`. Per-panel percentile display
+  scaling is not allowed for native Trace2CP volume panels because it hides
+  loading and brightness problems.
+- Trace2CP strip rendering must reject non-blocking coordinate samplers and
+  VC3D sampler results that do not report strict requested-level blocking
+  semantics. Scale fallback, unresolved requested chunks, or chunk errors must
+  fail loudly for debugging renders instead of being shown as valid strips.
+- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 128 128 128`
+  and `--core-margin-voxels 48`, matching the current trained checkpoint setup
+  and the observed artifact margin. Other patch shapes remain explicit CLI
+  overrides.
+- Native 3D Trace2CP may batch missing axis-aligned inference blocks before
+  model forwarding. `--inference-block-batch-size` controls the maximum number
+  of newly materialized blocks in one forward and defaults to `2` to limit
+  transient 128-cube GPU memory.
+- Native 3D Trace2CP ordinary single-sample CLI mode defaults to sample index
+  13 when no explicit `--sample-index` is provided. Bare `--fiber-json`
+  without sample/CP selectors remains whole-fiber mode and must not be turned
+  into sample-index mode by this default.
+- Native 3D Trace2CP does not default to a fixed large step count. The default
+  trace guard is distance-derived:
+  `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
+  `--max-step-factor 3.0`. `--max-steps N` is only an optional additional
+  safety cap.
+- Native 3D candidate stepping samples deterministic tangent-plane angular
+  offsets around the current inferred 3D direction. The default cone is
+  `--cone-angle-degrees 25.0` with `--cone-angle-step-degrees 5.0`, keeping
+  offsets inside the cone disk and always including the center direction. This
+  produces 81 candidates at the default settings. The legacy square-grid
+  generator is used only when `--cone-angle-step-degrees <= 0`, in which case
+  `--cone-grid-size` controls the grid. Ring/azimuth candidate generation is
+  not supported.
+- Native 3D Trace2CP uses beam search by default. `--beam-width 8` keeps
+  multiple cumulative candidate histories, `--beam-prune-distance-voxels 1.0`
+  merges near-duplicate live beam states, and `--beam-lookahead-steps 2`
+  expands short future trees before pruning. Pruning happens after the
+  configured lookahead expansion, not after every single candidate step.
+  `--beam-width 1` preserves the previous greedy one-step-commit control flow
+  and bypasses lookahead. When target-plane candidates are found, the reached
+  beam with the lowest cumulative score is selected; if no beam reaches the
+  target plane before the step guard, the best live state is returned with the
+  same failure reason semantics as greedy tracing.
+- Native 3D beam-mode candidate selection is vectorized across the active
+  beam/frontier states and their candidate directions for each lookahead
+  depth. Candidate directions are generated as torch tensors on `cache.device`;
+  current-point branch selection, candidate scoring, target-plane crossing, and
+  pruning operate on tensors. Candidate points are then grouped by trusted
+  inference block, sampled with batched `grid_sample`, decoded with the
+  analytic Lasagna 3x2 torch decoder, and scored as tensors. The bounded
+  inferred-block cache keeps sampled model-output tensors on `cache.device`;
+  cache-miss source-block construction may still involve CPU/VC3D reads, but
+  resident candidate point routing and trusted-core grouping stay tensorized.
+  For multi-branch outputs, every candidate evaluates every branch at the
+  candidate point and uses the branch with the best score. Candidate selection
+  minimizes a cost. By default, the direction score uses all-pairs product
+  scoring over four signed/aligned directions: previous step direction,
+  current-point sampled direction, candidate step direction, and candidate-point
+  sampled direction. Candidate-sampled axes are sign-aligned to the candidate
+  step direction, pairwise dots are clamped to `[0, 1]`, and the score is
+  `presence * product(six pairwise dots)`. `--no-all-pairs-direction-product`
+  restores the older two-dot score
+  `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence`.
+  `--candidate-substeps 1` is the default and preserves endpoint-only candidate
+  scoring. With `--candidate-substeps S` for `S > 1`, candidate scoring samples
+  the segment at `t = 1/S, 2/S, ..., 1`, evaluates all branches at every
+  substep, takes the best branch score per substep, averages those substep
+  scores, and then applies the current-point direction gate when legacy
+  two-dot scoring is enabled. A multi-substep candidate is valid only when
+  every substep has at least one valid branch. Search smoothness defaults to
+  normal-aware split smoothness in the native 3D CLI. Candidate Lasagna normals
+  default to sparse Lasagna corner/tensor sampling through
+  `--normal-sampler sparse-corner-principal`: sample `grad_mag` at candidate
+  points, sample compact `nx/ny` only at the eight channel-grid corners, decode
+  corners, blend the sign-invariant tensor/hint, and recover the axis with the
+  same principal-axis helper as the baseline path. The established
+  `fiber_trace_2d` geometry-loader path `_lasagna_normals_at_zyx_batch` remains
+  available as `--normal-sampler baseline` and as the fail-fast comparison
+  reference. Compact `nx`/`ny` normals must not be interpolated directly, and the
+  tracer must not call `FitData3D.normal_3d` on interpolated compact normals,
+  perform grid search, or interpolate normals by reference-line progress.
+  Once the sign-invariant local tensor is built from decoded compact-normal
+  corners, the principal axis may be recovered with a batched symmetric
+  eigensolve or another measured tensor principal-axis method. The native 3D
+  default is `--normal-principal-axis-method config`, which resolves to
+  `native_trace2cp.normal_principal_axis_method` when present and otherwise to
+  `eigh`. The explicit `analytic` method is an experimental closed-form
+  symmetric-tensor principal-axis decoder. It must remain opt-in unless the
+  approved whole-fiber benchmark matches the `eigh` restart metric and improves
+  timing. With a valid
+  candidate normal axis,
+  smoothness is split into tangent-plane turn and normal-tilt turn using the
+  vector-normal projection equations from the pre-acceleration tracer:
+  tangent-plane turn is the angle between previous and candidate step
+  directions after subtracting their signed normal-axis components, while
+  normal-tilt turn compares their signed `asin(dot(direction, normal))`
+  elevations. Both components use
+  `max(0, angle - smoothness_free_angle)^2`, in radians, and the native 3D
+  CLI default for `smoothness_free_angle` is `0` degrees so all measured
+  turns are penalized unless explicitly overridden. The Lasagna normal
+  sign ambiguity must not affect this penalty. The CLI flags
+  `--smoothness-tangent-weight` and `--smoothness-normal-weight` override the
+  component weights independently; their native 3D CLI defaults are `10.0` for
+  tangent-plane turn and `0.1` for normal-tilt turn. Native Trace2CP must fail
+  before tracing when these normal-aware terms, or the cumulative tangent term,
+  are active and no Lasagna normal sampler is available. If a Lasagna normal
+  sampler exists but returns an invalid normal for one candidate, that
+  candidate falls back to the previous isotropic smoothness term
+  `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`.
+  Native 3D Trace2CP also adds cumulative tangent-only smoothness over a
+  short history direction so several small tangent-plane turns cannot compound
+  into a large tangent-plane bend. This cumulative term is additive
+  smoothness, not a direction/presence gate. It uses
+  `--cumulative-smoothness-steps` to update a running trace heading and
+  `--cumulative-smoothness-tangent-weight` to penalize the tangent-plane angle
+  between that heading and the candidate step. It never penalizes
+  normal/elevation change. Missing Lasagna normal sampling is a hard error when
+  this term has positive weight. If a sampled candidate normal is invalid or the
+  tangent projection is degenerate, the cumulative term is zero for that
+  candidate.
+  The optional `--debug-compare-normal-sampler` mode is diagnostic only. It
+  wraps the production geometry-loader sampler, runs one or more accelerated
+  sparse Lasagna samplers on the same candidate points, returns the production
+  normals to the tracer, and raises immediately on valid-mask mismatch or an
+  angular difference above `--debug-normal-angle-threshold-degrees`. This mode
+  must not be used as production scoring.
+  The native 3D tool does not expose additive direction/presence
+  candidate-selection weights.
+- The native 3D Trace2CP start direction is sampled from the model at the
+  start CP. The adjacent CP-local fiber-line tangent toward the target CP's
+  line index is only a reference used to sign-align and choose the start
+  direction branch. It must not use the straight CP-to-CP chord. For
+  multi-branch outputs, the start branch is the valid branch with the highest
+  directional agreement to that CP-local tangent; start-branch selection is
+  not weighted by branch presence. The selected sampled direction becomes both
+  the current direction and previous/history direction for the first candidate
+  step, so direction scoring and normal-aware/cumulative smoothness apply to
+  the first step exactly as they do to later steps. Later steps sample the
+  model direction at the current trace point, sign-aligned to the previous
+  accepted step, and keep the full direction gate plus normal-aware smoothness.
+  For ordinary current-point lookup after the start CP, the branch is chosen by
+  best `dot(branch_dir, previous_step_dir) * branch_presence`.
+- The native 3D CLI prints live progress bars for forward and backward tracing.
+  Progress is measured from remaining Euclidean distance to the target CP, not
+  from a CP-to-CP chord target-plane normal. It includes step count, ETA, and
+  inferred-block count.
+- Native 3D Trace2CP always reports final metric lines plus total trace
+  wall/CPU time. Detailed per-stage profiling is opt-in through `--profile`,
+  because profiling uses instrumentation and some CUDA synchronizations that
+  should not slow ordinary metric-only runs.
+- When `--vis` is supplied, native 3D strip visualization prints live progress
+  for rendering stages and
+  for side/top presence-strip sampling. Presence progress must report
+  processed inference blocks, total unique inference blocks, sampled strip
+  points, valid output points, newly inferred blocks, cached blocks, and total
+  cache block count. Regular trace candidate sampling remains quiet unless a
+  caller explicitly supplies a progress label.
+- When `--vis` is supplied, native 3D strip visualization progressively
+  overwrites the regular
+  `trace2cp_native_3d_vis.jpg` output at render start, stage start/end, and as
+  panels are rendered and added to the sheet. Before the first panel is
+  available, the file must contain a status canvas rather than being absent.
+  There must not be separate partial snapshot filenames; the same output path
+  should always show the latest available status, partial sheet, or final sheet.
+- `--trace-step-limit N` is a debug-only cap on accepted trace steps per
+  direction. When set, native tracing can intentionally return a partial trace
+  with `reason=trace_step_limit`; this is distinct from the safety guard
+  `--max-steps`.
+- Native 3D tracing must not use the straight CP-to-CP chord as a target-plane
+  normal. Each one-way trace targets explicit target-local planes through the
+  target CP: the plane normal from the target CP line point to the next fiber
+  line point when available, the plane normal from the target CP line point to
+  the previous fiber line point when available, and the sampled model
+  direction at the target CP sign-aligned to the local target tangent. The
+  trace continues until all configured target-local planes have been crossed
+  and the selected crossing is within the caller's endpoint threshold, or
+  until its step budget is exhausted. It selects the crossed plane with the
+  smallest in-plane CP error. Later
+  crossings of the same target plane replace earlier crossings when their
+  in-plane CP error is lower. The shared C++ tracer used by VC3D and the native
+  metric CLI must preserve this state independently for every beam and compact
+  lazy-lookahead frontier. Its fixed-capacity representation supports the three
+  derived target-local planes and must reject larger explicit sets. In Python
+  and C++ whole-fiber tracing, all target-local planes being crossed is necessary
+  but not sufficient for segment acceptance:
+  the selected best crossing error must also be at or below the configured
+  whole-fiber threshold; otherwise tracing continues until the budget or another
+  failure condition ends the segment. CP-pair tracing must retain the complete
+  unsnapped stepped path for post-trace meeting search, including samples after
+  an early out-of-threshold crossing. Whole-fiber tracing likewise retains the
+  actual stepped endpoint and uses the selected crossing only for acceptance
+  and error reporting. Missing required target planes are reported in the
+  failure reason.
+- In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
+  selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
+  remains single-segment inspection using deterministic flat sample selection,
+  and explicit `--start-cp-index/--target-cp-index` remains explicit
+  single-segment inspection. `--whole-fiber-start-cp-index N` is only valid in
+  whole-fiber mode and traces CP `N` through the final CP.
+- In native 3D whole-fiber mode, each segment targets the next CP using the
+  same target-local plane set described above. A segment succeeds only when
+  all configured target-local planes are crossed within the segment's step
+  budget and the selected smallest in-plane error to the target CP is at most
+  `--whole-fiber-error-threshold-base-voxels` (default `20`) after converting
+  selected-volume distances with `volume_spacing_base`. Successful segments
+  do not restart, resample CP-start direction, or reset smoothing history. The
+  selected crossing is only the metric/checkpoint location; live tracing
+  continues from the actual stepped trace point with previous direction,
+  sampled-current direction when cached, and smoothing-history direction
+  preserved. Failed segments count one restart and resume tracing from the
+  failed target CP with a fresh CP-local fiber tangent.
+- Shared C++ CP-pair fusion must preserve each trace's traced order and search
+  the complete forward and reverse paths even when either trace exhausts its
+  endpoint-plane budget. It resamples both traces at a deterministic frequent
+  interval, moves a locally tangent plane along each trace, and intersects the
+  other trace's segments with that plane. The symmetric search also includes
+  qualifying target-CP endpoint-plane crossings. The selected candidate has
+  the smallest raw 3D/in-plane meeting error; exact ties prefer more balanced
+  progress, then greater combined progress and stable trace indices.
+  Acceptance requires positive combined partial traced length and
+  `meeting_error / combined_partial_trace_length <= 0.10` by default. An
+  acceptable moving-plane meeting does not require either one-way trace to
+  have reached all endpoint planes. The selected pair midpoint is the fusion
+  meeting point: the forward start-to-meeting and reverse target-to-meeting
+  partial traces are warped to that midpoint by traced arc-length fraction,
+  concatenated, then arc-length-resampled as the CP-to-CP fused line. Original
+  CP endpoints are restored exactly.
+- Native 3D Trace2CP reports tool-local debug metrics:
+  `native_trace2cp_plane_error` and
+  `native_trace2cp_closest_target_error`, plus fusion diagnostics such as
+  selected diagnostic progress, raw gap, considered pair score, and center
+  penalty. For pairwise traced-arc fusion the center penalty is fixed to `1.0`.
+  These are not the public 2D `trace2cp_error`.
+- Native 3D whole-fiber mode reports its tool-local human stdout metric as
+  compact error-rate fields: `err/kvx=...` and, when physical units are
+  available, `err/m=... (N.Nmm)`, where the parenthesized value is the mean
+  successful traced run length between restarts in millimeters. Human
+  stdout/progress should use one digit after the decimal for `err/kvx`,
+  `err/m`, and the millimeter run length, and must not include physical unit or
+  reference length fields. Live whole-fiber progress must update one terminal
+  line with carriage returns; it must not print a fresh line for every segment.
+  It should emit a newline when the restart counter first increases to a new
+  value and when progress reaches the terminal state, so restart events remain
+  visible in persisted terminal logs.
+  The metric is `restart_count / (reference_length_voxels / 1000)`, where
+  `reference_length_voxels` is measured along the original loaded fiber line
+  between CP0 and the final CP in selected-level voxels. Physical units are
+  reported only when the VC3D sampler exposes
+  `record.sampler.volume.metadata["voxelsize"]` as a finite positive value in
+  micrometers. In that case the tool converts it with `voxelsize * 1e-6`.
+  If that exact VC3D metadata path is unavailable or invalid, the per-meter
+  field is omitted from stdout and null in JSON. The
+  VC3D remote volume loader must normalize public Vesuvius
+  `scan/tomo/acquisition/detector/samplePixelSize` metadata into
+  `metadata["voxelsize"]` whenever no explicit positive `voxelsize` exists,
+  independent of the remote volume base-scale mode. The
+  fiber code must not parse Zarr/OME JSON directly, inspect dataset config or
+  record metadata for physical units, accept alternate keys, or infer voxel
+  size from filenames. The JSON summary stores per-segment status, reason,
+  reached-plane flag, in-plane error, step count, restart point, reference arc
+  distance at the last successful CP plane, full-precision reference lengths,
+  full-precision `native_trace2cp_fiber_restarts_per_kvx` and optional
+  `native_trace2cp_fiber_restarts_per_meter`, and the old segment-normalized
+  fraction only as `restart_fraction_per_segment`.
+- VC3D native GUI fiber tracing is a segment-local port of the 3D Trace2CP
+  behavior. It consumes a precomputed fiber inference `.lasagna.json` dataset
+  from the project and never runs PyTorch/model inference inside VC3D.
+- VC3D projects store normal and fiber inference manifests in the canonical
+  `lasagna_datasets` collection. The reserved `vc-lasagna-fiber` entry tag
+  identifies fiber inference data; an entry without that tag is regular
+  Lasagna data. `selected_lasagna_dataset` and
+  `selected_fiber_inference_dataset` select the two roles independently. The
+  old `fiber_inference_datasets` project field is accepted on read, migrated
+  into tagged canonical entries, and is not written. A native GUI trace
+  requires both a normal Lasagna dataset for geometry normals and a selected
+  fiber inference dataset for persisted `presence`/`nx`/`ny` prediction fields.
+- Native GUI fiber prediction must decode persisted fiber inference channels
+  with the shared `vc_lasagna` compact-channel helper. It must not copy private
+  normal-sampler logic, raw-interpolate compact `nx`/`ny` values as ordinary
+  directions, or invent a separate remote-cache path.
+- Native GUI fiber prediction must resolve the selected fiber inference
+  manifest's trace scale from `source_to_base` and the persisted prediction
+  sampling scale from prediction group `scaledown` before opening prediction
+  channels. The
+  persisted lines and control points remain in base coordinates even when the
+  derived trace scale differs. The GUI must convert base points to trace space,
+  open separate prediction and normal samplers with that trace-to-base scale,
+  run tracing in trace voxels, then convert accepted points back to base space.
+  Original segment endpoints must be restored exactly. Endpoint errors are
+  converted to base voxels before acceptance; the ordinary line sampler
+  remains in base space for final reconstruction.
+- Ctrl-right-click on a generated line annotation span exposes a checked
+  `Interpolation goal` submenu with `Global`, `Cubic spline`, `Lasagna`, and
+  `Fiber trace`. The action changes only the CP-owned goal for that span, runs
+  the shared grouped interpolation coordinator in a background task, blocks
+  line edits while it runs, and commits geometry and segment descriptors
+  atomically. Original CP coordinates must remain exact.
+- Native GUI segment optimization runs both directions until their configured
+  target-local planes are reached within `20` base voxels or their step budgets
+  are exhausted, then applies the symmetric moving-plane meeting search. At
+  the default sd2 trace scale the endpoint threshold is `5` trace voxels. A
+  fused span is accepted when the selected meeting error in base voxels is at
+  most `max(10, 10% of its combined partial traced length)`. The ratio remains
+  a stored/displayed diagnostic. `Volume::voxelSize()` is used only to add a
+  micrometer diagnostic when it is finite and positive; unavailable physical
+  metadata must not block tracing.
+- `vc3d_fiber` version 3 stores every control point as an object with a finite
+  `position`. CP `i` owns the required `segment_to_next` descriptor for its
+  following span; every non-final CP must contain one and the final CP must not.
+  Every new non-final CP
+  persists `interp_goal` (`global`, `cspline`, `lasagna`, or `trace`) and
+  `interp_mode` (`cspline`, `lasagna`, or `trace`). The goal is policy; the mode
+  identifies the algorithm that produced the stored dense geometry and must
+  never be inferred from the fiber-wide mode after loading.
+- A version-3 descriptor also stores compact `msg` and optional `metric`.
+  `trace` metric is minimum meeting-plane error in base voxels, `lasagna`
+  metric is maximum final normal-alignment error in degrees, and `cspline`
+  has no metric. Trace configuration/meeting/failure diagnostics and Lasagna
+  failure code/detail remain mode-specific. Stale fields are cleared when a
+  later retry changes actual mode. Unknown enums, malformed metadata, or a
+  descriptor on the final CP are hard errors in every strict reader.
+- `normal_manifest` is the Lasagna manifest identity used for interpolation;
+  `fiber_manifest` is the fiber-inference manifest identity. Direct Lasagna
+  records the Lasagna identity only. Trace records both because the tracer also
+  samples Lasagna normals. Direct/short cubic spline records neither. A
+  fallback retains every identity actually consulted by its rejected attempts.
+  Ordinary project datasets use their configured local or remote manifest
+  location. Catalogue-backed Lasagna uses the exact public remote manifest URL
+  reconstructed from its artifact URL and root manifest filename, never the
+  cache path. The catalogue has no artifact UUID; sample ID, volume ID,
+  coordinate level, optional model ID, and artifact index are auxiliary
+  catalogue identity components.
+- Legacy version-1 fibers remain readable and their numeric CP-to-CP spans load
+  as goal `global`, actual `lasagna`. Version 3 is the only supported object-CP
+  format and the only format carrying segment descriptors. The unpublished
+  top-level file version 2 and metadata/tracer schemas `(1, 1)` and `(2, 2)`
+  are rejected; version 3's current descriptor schema `(3, 2)` remains valid.
+  Writers always emit version 3. Fiber coordinate scaling preserves goals,
+  actual modes, and diagnostics while scaling base-voxel trace quantities.
+- Every v3 reader validates the complete descriptor sequence and the required
+  top-level `optimization_mode` before consuming geometry, including VC3D,
+  native CLI tools, Atlas/Lasagna/Spiral consumers, Python loaders, and sync.
+  Missing or malformed v3 metadata is a hard format error: readers must not
+  synthesize defaults, normalize fields, tag the file for reoptimization, or
+  rewrite it. Multi-file tools may report and skip the invalid file unchanged.
+  Legacy v1 alone may omit `optimization_mode`, which defaults to `lasagna`,
+  and receives in-memory global/Lasagna span state.
+- Segment descriptors and dense geometry are applied atomically. CP movement
+  dirties both adjacent spans while preserving their goals. Insertion copies
+  the split owner's goal to both new spans. Interior deletion leaves the left
+  owner's goal on the merged span. Unaffected spans remain protected. Overlay
+  refresh and reload must repopulate status directly from the persisted
+  descriptors.
+- Fiber-aware sync treats each version-3 CP-to-CP dense line slice and its
+  CP-owned descriptor as one atomic three-way-merge value. A one-sided change
+  is retained verbatim; identical two-sided changes are accepted. Different
+  changes to the same run are conflicts. Local-only and remote-only changed
+  runs may coexist only when at least one complete base span between them is
+  unchanged on both sides. Adjacent changes, overlapping CP topology edits,
+  missing ordered CP/line anchors, or inexact selected-run joins are manual
+  conflicts. Sync must never select a segment from the higher generation,
+  combine descriptor fields from different results, or replace version-3
+  geometry with a CP-only placeholder. `optimization_mode` is merged
+  base-aware: an isolated change wins, equal changes converge, and different
+  two-sided changes conflict. Version-1 merge behavior is unchanged; version 2
+  is invalid and is sent to manual conflict handling.
+- Each VC3D fiber has a persisted top-level `optimization_mode`: `lasagna` or
+  `native_fiber_trace3d`. It is required for version 3. Missing mode metadata
+  on existing version-1 files defaults to `lasagna`; unknown values are errors.
+  The mode is the fiber-wide extrapolation policy and resolves only `global`
+  CP-to-CP goals.
+  New interactive fibers default to `native_fiber_trace3d`; this controls the
+  initial line geometry as well as the GUI and persisted mode. When a selected
+  or uniquely attached fiber-inference dataset is configured, seed placement
+  must use the Lasagna seed solve only as an internal reference-line/tangent
+  baseline and then replace both open tails through the existing single-CP
+  native extrapolator. The intermediate Lasagna line must not be displayed or
+  saved. With no selected or uniquely attached inference dataset, initial
+  creation remains Lasagna and must not force a file picker. This must not
+  change the Lasagna compatibility default used while loading older files.
+- Goal resolution starts with the explicit goal or the fiber-wide mode for
+  `global`. A global Lasagna/trace span whose Euclidean endpoint distance is
+  below 100 base voxels uses `cspline` directly; exactly 100 still attempts the
+  resolved global mode. Explicit goals are exempt. Fallback order is
+  `trace -> lasagna -> cspline` and `lasagna -> cspline`; every relevant
+  reoptimization starts again from the goal so prior fallback is not sticky.
+- Trace attempts and Lasagna initialization success are decided independently
+  per span. Successful trace spans are stitched and protected. Each failed
+  trace enters Lasagna, and only a Lasagna span with no usable initializer is
+  demoted to cubic spline. Connected usable Lasagna geometry is then jointly
+  refined with all trace, cubic-spline, and unrelated explicit spans protected.
+  At every protected-span-adjacent CP, the tangent is
+  `normalize(first_distinct_native_point - CP)`, walking inward from that CP;
+  the Lasagna geometry on the opposite side must leave the CP along the
+  negated tangent. VC3D materializes one adjacent proxy point on that tangent
+  and fixes both the CP and proxy in the ordinary Ceres solve. No custom
+  manifold or weighted direction penalty is used. The fiber direction is the
+  only rollout candidate when it is available at one endpoint; if both
+  endpoints have native directions, one rollout candidate is generated from
+  each endpoint. The old Lasagna span and its endpoint directions are never
+  reinitialization candidates. A direction propagated from an already solved
+  neighboring span has the same precedence over generic CP/chord rollout
+  initialization. This applies independently to all native spans, to both ends
+  of a Lasagna span bracketed by native spans, and to a retained Lasagna tail
+  after native extrapolation failure.
+  Per-span solves and the final shared global solve preserve the fixed proxy
+  while the existing Lasagna smoothness terms optimize the remaining points.
+  Native samples remain fixed. A successful native span without a finite,
+  distinct endpoint-neighbor sample is an error.
+- Adjacent `cspline` spans form one run. The shared core interpolator uses
+  chord-length piecewise cubic Hermite geometry with exact CPs, one shared
+  tangent at every internal CP, and hard boundary directions from neighboring
+  stored spans. With only two CPs and no boundary directions it is exactly
+  straight. Handles are bounded and deterministically reduced until every span
+  is finite, forward-progressing, and locally bounded. Geometry does not
+  consult normal or prediction data and is resampled at base annotation
+  spacing.
+- A global-mode change dirties every `global` span and initially protects
+  explicit spans. A goal change dirties its span. CP edits dirty adjacent spans.
+  Dirty cubic-spline spans expand through their connected spline run; untouched
+  explicit spans stay fixed and provide boundary directions.
+- Generated-strip status is derived from each descriptor. Prefix labels with
+  `C`, `L`, or `T` for actual mode and show persisted metric and `msg`. Show a
+  label whenever any of its span intersects the viewport, clamp it into the
+  visible interval, preserve fiber order while packing labels in viewport
+  pixels, and use a deterministic second row only when one row cannot fit.
+  Detailed failure fields remain available in the tooltip.
+- The VC3D generated line-annotation layout has a separate fixed-height,
+  full-width schematic overview map plus two volume-rendered strip viewers:
+  `lineSurface` followed by `lineSideSlice`. The overview compresses the whole
+  line into its width and is not a replacement for either rendered strip. Both
+  rendered strips remain ordinary interactive viewers with independent pan,
+  zoom, scrolling, camera persistence, control-point interaction, and the
+  per-span mode/metric/message labels above. They must not be converted to the
+  obsolete fixed-height, fit-to-width, non-interactive rendered top strip.
+  During in-place surface replacement, each rendered strip retains its prior
+  overlays until that strip displays a frame for the new surface geometry.
+- Lasagna direction transport must remain in the sampled-normal tangent plane.
+  If removing a direction's normal component is degenerate, transport chooses
+  a deterministic perpendicular tangent; it must never return the original
+  normal-parallel direction.
+- The line-annotation extrapolation control is measured in base voxels and
+  applies beyond both outer CPs. Native mode converts that distance to trace
+  voxels and derives a hard nominal generation budget from it. Extrapolation
+  has no target planes and does not multiply its budget by `max_step_factor`;
+  it takes `ceil(distance / step)` generations, with the final generation using
+  the remaining nominal distance. Completing those generations is success;
+  accumulated measured arc length is not a termination or acceptance input.
+  Successful completion replaces the corresponding Lasagna tail. If the next candidate generation has no
+  valid prediction directions, the one-way tracer retains its last valid path
+  and VC3D uses that path as a native tail truncated at the data edge. A failure
+  before producing one outward step retains the Lasagna tail. Whenever VC3D
+  retains that fallback, it emits a command-line warning with the tail side,
+  the full tracer or exception reason, the returned trace-point count, and the
+  reason source. Completed length-based extrapolation and accepted data-edge
+  truncation do not warn. This extrapolation-only rule does not change CP-pair
+  or whole-fiber target-plane acceptance. A zero distance trims the line to the
+  outer CPs.
+- A fiber with only its initial seed CP still rebuilds both open tails when
+  switching modes or changing the extrapolation distance. Changing the
+  distance marks the line unoptimized and, when Auto-reoptimize is enabled,
+  immediately rebuilds both tails in the active fiber mode.
+- `vc_fiber_trace_metric <fiber.lasagna.json> <fiber.json>` is the native
+  no-visualization full-fiber metric runner for precomputed 3D fiber inference
+  output. It loads one `vc3d_fiber` JSON, requires exact control-point matches
+  in `line_points`, traces one-sided from CP to next CP plane, continues from
+  the reached point after success, restarts from the failed CP after failure,
+  and reports restart rate per 1000 trace voxels as `err/kvx`.
+  The runner requires an explicit numeric manifest `source_to_base` and a
+  command-line `--inference-scaledown-power`, defaulting to 2. Persisted
+  prediction channel scale is validated as
+  `source_to_base * 2**group.scaledown`; trace coordinate scale is derived as
+  `prediction_to_base / 2**inference_scaledown_power`, and prediction spacing
+  in trace voxels is `2**inference_scaledown_power`. All `presence`/`nx`/`ny`
+  channels used by the tracer, including prefixed multi-output channel sets,
+  must agree on prediction scale. Missing prediction channels or
+  scale-mismatched prediction channels are hard errors. The JSON fiber is
+  assumed to already be in the manifest base coordinate system; no command-line
+  fiber rescaling is currently exposed. Default trace-control parameters are
+  `--step-voxels 4.0`,
+  `--cone-angle-degrees 25.0`, `--cone-angle-step-degrees 5.0`,
+  `--cone-grid-size 25`, `--beam-width 8`,
+  `--beam-prune-distance-voxels 1.0`, `--beam-lookahead-steps 2`,
+  `--smoothness-weight 2.0`, `--smoothness-free-angle-degrees 0.0`,
+  `--smoothness-normal-weight 0.1`, `--smoothness-tangent-weight 10.0`,
+  `--cumulative-smoothness-steps 4`, and
+  `--cumulative-smoothness-tangent-weight 2.0`, matching the regular Python
+  Trace2CP defaults except for inference-only options.
+  Endpoint acceptance uses `--error-threshold-base-voxels 20`; trace-grid
+  endpoint errors are multiplied by the derived `trace_to_base` before this
+  comparison.
+  `vc_fiber_trace_metric` requires an explicit `--normal-manifest` pointing to
+  the Lasagna normal manifest used for tangent/normal smoothness. It must not
+  try to derive normals from the fiber prediction manifest because the
+  precomputed fiber products do not persist Lasagna normal channels. Physical
+  `err/m` is reported only when the caller provides an explicit
+  positive `--voxel-size-um`; the runner must not invent physical units from
+  filenames or parse unrelated metadata. The CLI is a thin wrapper over
+  `vc_fiber_tracer`, `vc_lasagna` dataset opening, and the required
+  `LasagnaNormalSampler`.
+- The native Lasagna dataset opener supports local `.lasagna.json` manifests,
+  local manifests with an adjacent `lasagna-remote.json` read-through marker,
+  and direct remote `s3://`, `s3+REGION://`, `http://`, or `https://`
+  manifests when the caller supplies an explicit remote cache root. Direct
+  remote manifest JSON is materialized through the shared exact-byte remote
+  file cache and reused across runs. The CLI and VC3D therefore share durable
+  manifest and referenced-Zarr caching. Remote
+  manifest fetch failures must include the original location, redacted resolved
+  request URL, HTTP status or no-response marker, response metadata and body
+  excerpt when available, plus S3 region and credential-loaded status for S3
+  requests.
+- The shared remote-file cache stores one arbitrary file/object per request. It
+  supports HTTP, HTTPS, S3, and region-qualified S3 transports plus a custom
+  fetch-to-file callback. Cache-first and explicit refresh policies validate a
+  canonical query-free source location, byte size, and accounting class from a
+  sidecar. Readable cache placement mirrors validated
+  `remote_sources/<scheme>/<authority>/<path>` components; traversal and
+  platform-invalid components are rejected. Publication is atomic,
+  concurrent in-process fetches are
+  coalesced, failed refresh preserves the previous entry, and diagnostics must
+  redact URL queries. Managed payloads participate in the persistent cache
+  budget; unmanaged control files such as Lasagna manifests do not. Recursive
+  remote-directory caching and automatic TTL/ETag refresh are not implied.
+- Lasagna manifest group `zarr` paths are location strings. Relative paths
+  resolve against the containing manifest location: the parent directory for
+  local manifests or the parent URL for direct remote manifests. Absolute local
+  paths starting at `/` are opened as local Zarr groups. Absolute remote
+  `s3://`, `s3+REGION://`, `http://`, or `https://` group paths are opened as
+  independent remote read-through Zarr roots. Relative remote-backed group
+  paths that escape their manifest/artifact parent are rejected; absolute paths
+  are explicit and are not rewritten.
+- Attaching either a local or remote Lasagna manifest to a VC3D project also
+  attaches every referenced group/channel as a flat ordinary 3D project
+  volume. Every group must name exactly one channel and reference an actual ZYX
+  array. Flat channel-first CZYX arrays are older Lasagna preprocessing/fit
+  intermediates and must be converted to per-channel 3D OME-Zarr before VC3D
+  attachment. Generic `Volume`, remote-volume loading, project storage, and
+  VC3D remain strictly 3D. Each derived volume stores the actual resolved local
+  or remote Zarr source as `location`; cache paths and synthetic identifiers
+  are not project source fields. A `vc-lasagna-derived:<manifest location>`
+  ownership tag drives deduplication, reload reconciliation, role changes, and
+  detach cleanup. Group, channel, spacing, dtype, and shape remain authoritative
+  in the manifest/Zarr descriptor and must not be duplicated in project tags. An
+  independently attached primary volume is reused without an ownership tag and
+  survives manifest detach only when its resolved source, 3D shape, dtype,
+  fill value, base/present level layout, per-level shapes/chunks, and voxel
+  spacing match the manifest-prepared volume. Runtime UUID equality is not
+  required. Missing or incompatible runtime backing rejects and rolls back the
+  manifest attachment. Manifest entry, derived volume entries, and
+  selected-role updates
+  are committed together or rolled back together; detaching removes a derived
+  volume only when no remaining manifest owns it.
+- `vc_fiber_trace_metric` exposes `--remote-cache-dir PATH` and opens both the
+  fiber inference manifest and `--normal-manifest` through the shared
+  location-aware Lasagna opener. If either manifest argument is remote and no
+  remote cache directory is supplied, the CLI fails before tracing.
+- Native 3D single-pair visualization first builds the initial side/top strip
+  source from the existing 2D Trace2CP geometry loader for the input CP pair.
+  In single-pair mode, the configured cross-strip height is a maximum cap: the
+  rendered cross height is the odd centered size needed to cover the projected
+  forward, backward, and fused traces with 50% extra margin, capped by that
+  configured maximum. This adaptive render height is visualization-only and
+  must not affect tracing or metric values.
+- Trace2CP segment-source construction may trim extra line-window margin to the
+  valid compact-geometry interval that contains both start and target control
+  points. It must not synthesize missing normals. If the actual CP-to-CP line
+  range crosses an invalid compact-geometry gap, source construction must fail
+  loudly.
+- Native 3D visualization includes side/top strip panels of the inferred 3D
+  presence signal sampled on the displayed side/top strip coordinates from the
+  native inference cache. Presence sampling should batch strip coordinates per
+  strip rather than call model inference per pixel.
+- Refined/fused/regenerated native 3D presence panels are visualization-only
+  presence multiplied by the sampled ambiguous fiber direction's alignment to
+  the displayed strip plane. The alignment must be sign-invariant and compare
+  against the plane spanned by the strip column tangent and row axis, not a
+  signed dot product against a single tangent vector. Original/input presence
+  panels remain raw presence for comparison.
+- Native 3D whole-fiber visualization uses eight stitched panel rows: initial
+  side volume, initial side 3D presence, initial top volume, initial top 3D
+  presence, regenerated/fused side volume, regenerated/fused side 3D presence,
+  regenerated/fused top volume, and regenerated/fused top 3D presence.
+  Whole-fiber mode renders restart-delimited continuous long strips instead of
+  one visual column per CP segment. Each visual span starts at the first CP
+  after a restart and ends at the latest traced target CP in that span. Failed
+  segment overlays are cut before they overlap the next CP region, then the
+  displayed trace resumes from the restart CP in the next visual span.
+  Whole-fiber visualization always uses a fixed 64 px cross-strip width; this
+  width is visualization-only, and a traced path leaving the 64 px strip must
+  only clip the drawn overlay, not invalidate tracing, metric calculation, or
+  3D sampling. The regenerated/fused rows rebuild side/top strip geometry from
+  explicit traced volume-space XYZ points using the same low-level
+  `FiberStripLineWindow` / `build_side_strip_patch_grid_tensor_from_line_window`
+  construction as original CP-pair strips. Regenerated/fused strips must sample
+  fresh Lasagna normals at the traced line points and must not recover their
+  line from `source.grid.coords_xyz`, `source.grid.offset_axis_xyz`, or
+  `source.grid.side_axis_xyz`. Traced points that are outside the original
+  source strip valid area are not fatal and are not clipped for regenerated
+  strip construction; only non-finite or degenerate traced line points may be
+  discarded before construction. The
+  regular `trace2cp_native_3d_vis.jpg` path must be overwritten
+  after every completed segment so long whole-fiber runs show partial visual
+  progress. Completed whole-fiber spans are retained as one composed sheet, not
+  as a growing list of individual 8-panel image tuples.
+  The control points covered by each visual span must be projected into the
+  displayed initial and regenerated side/top strip frames and drawn as markers
+  on all eight rows. Each marker
+  must also show that CP's native trace distance at the CP plane: the span
+  start CP is `d=0.0`, reached target planes show the segment's
+  `in_plane_error_voxels`, and unreached target planes show `miss`.
+- Native forward, reverse, and fused 3D traces are projected onto the initial
+  side and top strip coordinate systems for overlay. The same visualization
+  also rebuilds side/top strip geometry from the fused native 3D line and
+  renders fused-line volume/presence panels with only the fused line overlaid
+  thinly. The fused-line panels are debug visualization only; they do not define
+  a new scoring path.
+
+- The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
+- Fiber source parsing accepts existing VC3D fiber JSON files and Knossos /
+  WebKnossos `.nml` files. VC3D JSON parsing follows
+  `vesuvius.neural_tracing.fiber_trace.fiber_json`.
+- NML parsing orders nodes by edges, not XML order. Each usable open simple
+  path component becomes one normalized `Vc3dFiber`; branch components, closed
+  loops, disconnected singleton nodes, or malformed components are skipped or
+  rejected with diagnostics rather than guessed through.
+- NML line points and control points initially use the same ordered node
+  coordinates unless a later explicit control-point convention is added.
+- Each selected control point must be an exact member of `line_points`; otherwise the fiber JSON is rejected as inconsistent.
+- The loader works on 2D sampled fiber side-strip patches.
+- Neighboring strip-z context is represented as separate 2D patches.
+- The default strip-z offset settings are `strip_z_offset_count=16` and `strip_z_offset_step=1.0`, generating `-7..8` selected-scale offsets and giving 16 patches per selected control point.
+- Lasagna normals are used where needed to construct aligned strip frames.
+- At loader startup, the loader builds one shared compact in-RAM fiber-line
+  geometry store for all configured records. It computes the line-index ranges
+  that can affect configured CP source windows and consecutive CP-to-CP
+  Trace2CP spans, samples Lasagna normals only for those required ranges,
+  builds valid contiguous frame intervals, and keeps compact per-line/frame
+  arrays read-only for the rest of the process.
+- A requested Trace2CP CP-to-CP span must not fail because an interior
+  centerline point was omitted from compact-geometry preload. If compact
+  geometry reports an invalid unsampled point inside such a span, that is a
+  diagnostic bug path and the error must say so explicitly with a direct
+  Lasagna value probe.
+- Startup compact geometry construction may parallelize across independent
+  records with process workers controlled by `loader_workers`.
+  `loader_workers=0` means all logical CPU cores, and `loader_workers=1` is
+  the serial startup/debug path. Each process opens its own base-volume and
+  Lasagna channel handles, builds compact geometry for assigned records, and
+  returns only compact arrays/metadata to the parent. Parallel startup may
+  complete records out of order internally, but the final parent-owned store
+  must be indexed by original record order.
+- Startup Lasagna normal sampling may use batched/vectorized channel reads and
+  normal decoding, but it must preserve Lasagna `_decode_normals`, ambiguous
+  normal principal-axis handling, and strict invalid-data semantics.
+- The compact geometry store is assembled and owned by the parent process, then
+  shared by all threaded loader workers and cloned loaders in that process.
+  Startup process workers must not remain as runtime geometry owners.
+  `fiber_trace_2d` training does not currently use DDP or
+  `torch.distributed`; this task must not introduce per-worker duplicated
+  compact geometry.
+- Runtime side/top source-grid construction looks up the record/control-point
+  entry directly, evaluates only the requested source columns from the compact
+  frame arrays, and broadcasts rows by frame axes. It must not write/read a
+  dense per-CP coordinate cache.
+- If a line point required by a CP source window cannot be sampled from the
+  Lasagna manifest channels, the loader must not fabricate or propagate a
+  replacement normal. That CP is invalid and is skipped by training/prefetch in
+  deterministic stream order.
+- During prefetch and training batch assembly, invalid CP-local samples caused by Lasagna channel data such as missing samples or in-bounds `grad_mag == 0` are skipped and reported, then the deterministic sample stream advances to the next sample.
+- Fatal prefetch/training errors are infrastructure or programming failures such as missing APIs, broken bindings, interrupts, memory errors, or unexpected internal exceptions; those should stop the run rather than being hidden as data skips.
+- VC3D side-strip/surface/segment sampling semantics define patch coordinates.
+- Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
+- The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
+- The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
+- Source-strip coordinate generation may use torch vectorization for Hermite
+  interpolation and normal interpolation, but it must preserve the existing
+  VC3D/Lasagna frame construction semantics.
+- Dense source-strip coordinates, strip-z offset coordinates, geometric coordinate augmentation, and transformed line/control-point coordinates stay as torch tensors on the configured augmentation device until an explicit NumPy consumer boundary.
+- The explicit NumPy boundaries are VC3D coordinate sampling, runner/PIL visualization/export, and sample metadata arrays. The loader must not repeatedly convert coordinates between NumPy and torch inside one source/augmentation path.
+- The augment-vis source/patch path is the canonical loader path for runner exports, training batch loading, and prefetch coordinate generation.
+- Augmentation visualization, training, runner batch loading, and prefetch must share the same CP-local source-strip and final-coordinate generation implementation.
+- Normal training, benchmark/profile/load-only, augment-vis, line-trace-vis,
+  dir-vis, and direct runner/debug center-patch loading use the configured
+  `augment_device` for torch coordinate generation. With the example config,
+  `augment_device: "auto"` uses CUDA when available. Prefetch dependency
+  generation is the exception and stays CPU-pinned.
+- The loader builds source geometry from the compact in-RAM store for each
+  selected CP and reuses that source across augmentation variants and strip-z
+  offsets as appropriate. Source-space line pixel coordinates remain the full
+  per-column centerline used by training visualization, while volume sampling
+  coordinates come from compact frame interpolation.
+- Image loading samples base-volume Zarr values from explicit coordinates.
+- Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
+- Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
+- `base_volume_scale` selects both the Zarr level to read and the sampling pixel scale: by default, one output patch pixel advances by one voxel at that selected level.
+- Internally, fiber control-point coordinates remain in base-volume coordinates, so a selected level `s` uses a patch pixel spacing of `2**s` base voxels before coordinates are divided for reading level `/s`.
+- The loader must not use the existing neural-tracing crop-loading path for image loading.
+- Training's multiple strip-z offsets are derived from one CP-local source geometry by offsetting along the strip normal/frame direction, not by rebuilding a separate coordinate-generation path.
+- Runtime geometric augmentation work should be batched across strip-z offsets
+  and patches where tensor shapes are compatible. The implementation should
+  avoid many tiny per-patch GPU calls when the same operation can be expressed
+  as one batched tensor operation without changing deterministic sample order
+  or augmentation semantics.
+- Runtime image sampling should batch each CP sample's strip-z coordinate stack
+  through `CoordinateSampler.sample_coord_batch`. If no native sampler batch API
+  is available, flattening `[strip_z,H,W,3]` to one larger coordinate image is
+  functionally valid because every output pixel samples from explicit 3D
+  coordinates; only request traversal and cache/chunk locality may change.
+- Dataset and loader settings are specified in Vesuvius-style JSON.
+- Config keys include `datasets`, `batch_size`, `patch_shape_hw`,
+  `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `loader_workers`,
+  `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional
+  `volume_cache_memory_mib`, optional `volume_io_threads`, and optional volume
+  cache settings. `strip_coord_cache_dir` has been removed and must be rejected
+  if present.
+- Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
+- Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
+- Geometric strip augmentations operate on strip coordinates before image sampling.
+- Training, augment-vis, line-trace, Trace2CP, labels, TTA, and all core
+  loader paths must never do geometric augmentations as image-space operations.
+  No helper, function, or API on those paths may geometrically warp, rotate,
+  scale, shear, translate, resize, or flip an already sampled image/tensor.
+  Such geometric changes must be represented as coordinate manipulation before
+  sampling/slicing the patch.
+- The only image-space geometric exception is the `--dir-vis` diagnostic probe:
+  it may apply pixel-perfect identity, flips, and 90-degree rotations to an
+  already sampled center patch to inspect checkpoint robustness. That exception
+  must not be reused for training data, labels, augment-vis, line tracing,
+  Trace2CP, or TTA.
+- Image-space operations after sampling are allowed only for value-only changes
+  such as brightness, contrast, gamma, noise, and blur.
+- Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
+- Geometric augmentation map handling is centralized in one paired fused map
+  object. In this spec, "fused map" means actual precomputed coordinate map
+  tensors, not a shared bundle of transform formulas.
+- The paired transform must be constructed once for the specific source shape,
+  output shape, augmentation parameters, and torch device. It must store:
+  `backward_map_xy` for output pixel -> source pixel sampling, and
+  `forward_map_xy` for source pixel -> output pixel line/control-point lookup.
+- Both geometric map directions must be built explicitly as paired concrete
+  map tensors during augmentation construction. Runtime consumers must never
+  invert one map direction into the other after the fact, including by
+  nearest-neighbor searches, brute-force distance scans, iterative solvers, or
+  analytic/formula re-evaluation. If a runner, loader, target, or visualization
+  path needs the opposite direction, it must receive and sample the prebuilt
+  opposite map.
+- Every geometric augmentation stage is baked into those map tensors at
+  construction time: translation, flips, scale, shear, rotation, and smooth
+  offset. No geometric augmentation may invert coordinates with rasterized
+  masks, image warps, nearest-neighbor searches over the output grid,
+  brute-force distance scans, iterative solvers, or runtime analytic inverse
+  formulas.
+- Smooth offset augmentation is a direct paired vertical map in source-strip
+  coordinates. The output-to-source map applies the smooth offset as
+  `source_y += f(source_x)`, and the source-to-output point map applies the
+  inverse as `source_y -= f(source_x)` before the affine forward map. It must
+  not require iterative solving or dense nearest-grid inversion. Smooth control
+  generation/interpolation is allowed only while constructing the fused map
+  tensors; it must not run during line/control-point lookup.
+- Affine geometric shift is an output-space translation applied after scale/flip, not a source-space translation before scale. Combined shift+scale must keep image sampling, transformed line coordinates, and transformed control-point coordinates under that same composition.
+- Training line targets and debug line overlays are geometric coordinate products, not raster images. The line must be represented by strip/output pixel coordinates after the same geometric coordinate transform used for image sampling.
+- Transformed line/control-point coordinates are computed from cached
+  source-space line/control-point coordinates by bilinear lookup/interpolation
+  against the precomputed `forward_map_xy`. Smooth-offset line/control-point
+  mapping must not run smooth interpolation, evaluate affine transform formulas,
+  or invert the patch by dense output-grid nearest-neighbor search.
+- Line points and the control point for a patch must be transformed together in
+  one vectorized lookup call through the fused map object, then split back into
+  line and CP outputs.
+- Sparse line/control-point mapping must use direct bilinear gather against
+  `forward_map_xy`. Tiny `grid_sample` calls for sparse point lists are not the
+  intended implementation because their fixed launch overhead dominates the
+  small amount of point data.
+- When multiple patches from one loader sample need transformed line/control
+  point coordinates, their `forward_map_xy` tensors and source point lists
+  should be stacked and processed as a batched sparse lookup where shapes are
+  compatible.
+- Coordinate augmentation should stack `backward_map_xy` tensors and run
+  batched dense sampling for compatible strip-z offset patches.
+- When multiple strip-z offsets share the same CP source geometry and the same
+  augmentation parameters, transformed line/control-point coordinates must be
+  computed once and reused across those offsets.
+- The line must never be transformed by resampling a raster line mask. No geometric augmentation may be implemented as an image-space transform of a previously rasterized line, mask, or image patch.
+- Debug visualization may rasterize the transformed line coordinates only as the final drawing step, with fixed screen-space thickness/opacity, so line thickness and sharpness are not affected by scale, rotation, shear, or interpolation artifacts.
+- Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
+- Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
+- Value augmentations after VC3D image loading should run as batched tensor
+  operations where possible. Variable per-patch Gaussian blur uses grouped
+  batched convolutions instead of one CUDA convolution loop per patch.
+  Per-patch operations remain acceptable only when required to preserve behavior,
+  such as deterministic per-patch noise streams.
+- VC3D coordinate sampling remains the explicit image I/O boundary unless the
+  sampler exposes a true batched coordinate API. The loader must not add a
+  separate image sampling path just to batch around that boundary.
+- Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
+- The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
+- Augment visualization prints no timing diagnostics by default.
+- `--augment-vis --augment-profile` enables timing diagnostics. Profile mode runs the same sample and augmentation entries twice, prints a pass 1 table for cold/first-use costs and a pass 2 table for warmed costs, and each table includes per-entry rows plus full total/average-per-patch summaries and `total/no-first` plus `avg/no-first` summaries that exclude the first unaugmented row.
+- Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
+- Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
+- Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
+- Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`,
+  and `base_volume_scale`; `lasagna_manifest_path` is required for 2D strip
+  training/Trace2CP normals but optional for 3D CP-volume training.
+- Dataset entries may define a fiber-coordinate affine transform using one of
+  `fiber_transform_json` / `fiber_transform_json_path` for Vesuvius
+  registration `transform.json`, inline `fiber_transform`, or Lasagna-compatible
+  inline `transform`. Inline matrices are XYZ 3x4 or homogeneous 4x4. The
+  matrix direction is source/moving fiber XYZ to current/fixed base-volume XYZ;
+  `fiber_transform_invert` or `transform_invert` inverts it before use.
+- Fiber-coordinate transforms are applied once immediately after JSON/NML
+  parsing and before bounds checks, sample ordering, strip-coordinate cache
+  identity, prefetch, training, and Trace2CP tooling. Lasagna manifest normals
+  are still sampled from the current manifest after transformation.
+- Optional top-level `test_datasets` uses the same dataset-entry schema as `datasets`; when present it defines a separate deterministic test loader while reusing the rest of the loader configuration.
+- Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
+- Trace2CP segment samples carry the line-window original line indices and the
+  signed Lasagna normals used to build the segment strip, plus the actual
+  start/target strip row-axis vectors after VC3D-style frame construction.
+  Single-pair Trace2CP may choose either valid sign, but whole-fiber Trace2CP
+  must align each later pair-local row axis to any already accepted shared-CP
+  row-axis reference before sampling image data. If the initially built grid's
+  row-axis disagrees with that reference, the loader flips the local Lasagna
+  normal sequence and rebuilds the grid. This prevents adjacent segment images
+  from flipping in y solely because Lasagna normals are sign-ambiguous.
+- Normal batch loading samples control points in deterministic pseudo-random order from the configured seed.
+- The deterministic pseudo-random training order covers every configured control point exactly once per dataset pass before repeating.
+- Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
+- `load_batch` may parallelize CP-sample construction with `loader_workers`,
+  defaulting to the machine logical CPU count. `loader_workers=0` explicitly
+  requests all logical CPU cores. Parallel workers may evaluate candidate
+  samples out of order, but accepted output samples and skip handling must
+  follow the same deterministic sample-index order as serial loading.
+  `loader_workers=1` is the serial no-thread debug path. When
+  `loader_workers > 1`, the loader reuses a persistent CP-level executor across
+  batches instead of constructing a new thread pool per step.
+- The same `loader_workers` setting also controls startup compact-geometry
+  record construction. Startup uses process workers, while warm
+  `load_batch` CP-sample construction uses the persistent in-process thread
+  executor above. No separate startup worker-count key exists.
+- Parallel loader workers must not serialize on deterministic random-order
+  locks during the warm path. Random dataset-pass orders are built once per
+  pass, cached by pass index, and prewarmed for the attempted batch window
+  before CP workers are submitted.
+- The tester/runner loads a batch from a specified deterministic control-point sample index.
+- Prefetch uses the same shared source-strip implementation as training and augment-vis.
+- Prefetch remains CPU-pinned, but it still uses the same torch-native source-grid and strip-offset path, converting to NumPy only once for VC3D dependency discovery.
+- Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates. In 3D this same rule means one CP-centered volume envelope per sample, not one concrete sampled 3D augmentation.
+- Prefetch may conservatively cover more chunks than one concrete augmented training sample, but it should avoid misses for later random augmentations within the configured extrema.
+- Prefetch must use dependency-only chunk discovery for the base-volume sampler. For VC3D this means `collect_coords_dependencies` over the same conservative source-envelope coordinates, without `sample_coords`, image-value sampling, or discarded sampled pixels.
+- VC3D dependency discovery must return explicit per-chunk metadata for Python prefetch: remote chunk key/URL, final persistent cache data path, `.empty` marker path, persistent extension, and cache payload format.
+- Python prefetch must not reconstruct VC3D persistent cache paths or remote chunk keys; it consumes the metadata returned by VC3D dependency discovery.
+- Python prefetch currently supports only direct-source uncompressed chunks whose remote payload is exactly the persistent `.bin` payload VC3D expects. Compressed, filtered, sharded, byte-swapped, or otherwise non-direct payloads must fail clearly until explicit codec support is added.
+- Normal image loading still uses the VC3D blocking coordinate sampler, so training/export samples are decoded before image sampling returns.
+- Prefetch classifies VC3D persistent-cache files in Python: existing data files are cache hits, existing `<cache>/level_<level>/<iz>/<iy>/<ix>.empty` files are known-missing hits, and definitive missing chunks write that same zero-byte `.empty` marker.
+- Prefetch data downloads are written to unique temporary files in the final cache directory and then atomically renamed to the VC3D-provided final cache path.
+- VC3D also writes persistent-cache `.empty` markers as zero-byte files and reads them by existence.
+- Prefetch performs global chunk deduplication by store identity and chunk key before network work.
+- Python Zarr prefetch must preserve store-relative v2 chunk keys and raw chunk
+  bytes under both supported Zarr 2 and Zarr 3 APIs; version-specific key and
+  store access belongs in one shared helper rather than individual loaders.
+- Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is controlled by `prefetch_workers` without an additional hard-coded cap, and dependency/sampler producer count is controlled by `prefetch_sampler_workers`.
+- During prefetch, PyTorch CPU intra-op threads are temporarily forced to `1`
+  while dependency producers run, then restored. This prevents each producer
+  from fanning out over the full machine and makes `prefetch_sampler_workers`
+  the practical CPU-side source/dependency generation limit.
+- Prefetch may generate dependency requests with parallel producers, but producer
+  results are consumed in raw deterministic sample-index order before chunks are
+  classified or enqueued for download.
+- Prefetch schedules not-yet-submitted chunk downloads by the earliest raw
+  deterministic sample index that requested the chunk. This keeps downloads as
+  close as practical to `idx` order and avoids burying earlier-sample chunks
+  behind a large later-sample executor backlog. Transfers already active are
+  not cancelled or restarted for reprioritization.
+- Prefetch reports sample/dependency progress only while dependency generation is incomplete; once all requested samples have been processed or skipped, live progress reports only download progress. The live progress includes unique chunks, cache hits, known-missing chunks, downloaded chunks, queued download futures, configured transfer worker count, configured sampler/dependency producer count, skipped samples, errors, and MiB/s. The download denominator is the number of chunks that were not cache hits or pre-existing `.empty` markers and therefore needed fetch/missing resolution. While dependency generation is incomplete, download ETA extrapolates from observed chunks per sample and observed cache-hit/known-missing/download-needed ratios.
+- Prefetch reports skipped invalid samples separately from download errors and includes the first skip reason.
+- If prefetch hits a fatal producer error, queued producer/download futures are cancelled so shutdown does not wait on a large stale download backlog.
+- Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
+- V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
+- `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
+- `train.py --benchmark` runs 100 training batches and exits without test evaluation, TensorBoard, run-directory creation, or snapshot setup. It reports throughput in CNN image patches per second, where one patch is one flattened strip-z image sent through the 2D model.
+- `train.py --profile` runs the same 100-batch benchmark path with per-batch timing rows and a final average milliseconds-per-patch summary. Profiled stages are aggregate coordinate generation, descriptor lookup, strip-coordinate cache load, source geometry generation, line-coordinate generation, coordinate augmentation, base-volume Zarr read/sampling, torch image/value augmentation, forward plus loss, and backward plus optimizer step.
+- When loader CP parallelism is enabled, profile rows report both loader wall
+  time and summed loader worker time. The threading factor is
+  `worker_time / wall_time`; stage columns such as descriptor/cache/load remain
+  summed worker timings and must not be interpreted as wall time under
+  parallel loading.
+- Profile rows also report whole-process CPU time for the benchmark batch. The
+  process CPU factor is `process_cpu_time / batch_wall_time`; compare this
+  value against system CPU-utilization monitors when checking whether loader
+  work is actually keeping CPU cores busy.
+- `train.py --load-only` runs the same 100-batch benchmark loader path and exits without test evaluation, TensorBoard, run-directory creation, snapshots, image/value augmentation, image normalization, supervision building, model forward, backward, or optimizer work. It still performs deterministic sample selection, CP-local source construction, coordinate augmentation, and base-volume sampling so loading bottlenecks can be isolated. When `training.pipeline_enabled` is true, load-only benchmarks use the bounded whole-batch queue so loader parallelism can be measured without model work.
+- Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
+- With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
+- `training.max_sample_index` is an optional positive exclusive deterministic
+  `data_index` limit. The default `0` means no limit. When positive, training
+  maps every unbounded `stream_index` through
+  `stream_index % training.max_sample_index` only for CP/data selection, so
+  long runs reuse that deterministic CP/data prefix independently of
+  `training.max_steps`. The limit does not bound any random source: geometric
+  and value/image augmentation draws, branch-choice grid offsets, jitter, and
+  noise are keyed by the unbounded `stream_index`, so repeated use of the same
+  bounded `data_index` gets fresh deterministic random parameters instead of
+  replaying the same transform.
+- Explicit positive `--prefetch-steps N` overrides `training.max_steps` and prefetches exactly `N * training.control_points_per_step` CP samples from the deterministic random training stream.
+- Explicit `--prefetch-steps 0` overrides `training.max_steps` and prefetches every configured training-dataset CP once, independent of `control_points_per_step`; if `training.max_sample_index` is positive it prefetches that bounded deterministic prefix instead. When `test_datasets` is configured, it also prefetches every held-out test CP once.
+- If `--prefetch-steps` is omitted, prefetch uses `training.max_steps`; if that configured value is `0`, omitted prefetch also means every configured training/test CP once.
+- Negative `--prefetch-steps` values are invalid.
+- The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
+- In training and benchmark modes, top-level `batch_size` is the number of CP
+  samples loaded per step and must match `training.control_points_per_step`.
+  Non-default flattened CNN patch counts are valid and must not warn; the
+  flattened CNN patch count is `batch_size * strip_z_offset_count`.
+- Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.
+- On CUDA training runs, `training.pipeline_enabled` may overlap future batch loading with current-batch model work through a bounded deterministic producer/consumer queue. The same queue is used by `--load-only` benchmarks to measure batch-loader parallelism directly. `training.pipeline_depth` controls the number of submitted whole-batch futures and defaults to `16`. `training.pipeline_workers` controls how many whole-batch `load_batch` calls may run concurrently and defaults to `8`; `0` means use `pipeline_depth`. Whole batches are still consumed strictly by step number, so the deterministic CP sample stream is unchanged.
+- `training.pipeline_isolated_loaders` defaults to `false`. The normal
+  pipeline shares the base loader, parsed fiber/Lasagna metadata, deterministic
+  sample-order cache, and VC3D sampler/cache across whole-batch futures.
+  Setting it to `true` creates worker-local loader clones with fresh VC3D
+  samplers but shared parsed records and deterministic order cache.
+- `volume_cache_memory_mib` is an optional VC3D sampler cache budget. `null` or
+  omission leaves VC3D's default cache behavior intact. Positive values cap
+  each VC3D sampler cache, which is mainly useful when
+  `training.pipeline_isolated_loaders=true` duplicates VC3D samplers.
+- `volume_io_threads` optionally forwards a positive VC3D I/O thread count to
+  each VC3D sampler when the installed binding exposes that control.
+- The training pipeline keeps strip-coordinate generation and geometric coordinate augmentation on the configured `augment_device`. It does not move those torch coordinate operations to CPU. The only unavoidable CPU/NumPy boundary remains the VC3D coordinate sampler call after final coordinates are generated.
+- The pipeline uses the shared `FiberStrip2DLoader.load_batch` path with image/value augmentation deferred. Loaded batches carry the deterministic per-patch augmentation parameters.
+- CUDA training prepares loaded batches on a separate CUDA stream when `training.pipeline_enabled` is true. A background preparation executor submits deferred torch image/value augmentation, image normalization, and direction-supervision tensor construction for loaded batches, then records a CUDA event. The main training stream waits for that event immediately before forward pass.
+- Normal CUDA training must keep prepared augmented image tensors on CUDA and must not round-trip deferred value augmentation through NumPy. Runner/debug APIs may still return NumPy batches for export and tests.
+- Training timing logs include CPU batch load time, load-pipeline wait, preparation enqueue time, measured CUDA preparation time, preparation wait time, and preparation submit time for queuing future prepared batches. `prep_submit_ms` is main-thread queue-refill overhead; the full preparation work is represented by `prep_ms`/`prep_gpu_ms` and runs in the background preparation executor on CUDA pipeline runs. Profile mode also reports an `outside` aggregate for work outside the forward/backward/optimizer critical path.
+- Normal training prints the effective CUDA pipeline enable flag, queue depth,
+  whole-batch loader workers, and loader CP-worker count once at startup.
+- Whole-batch loading may use multiple concurrent producers. Zarr cache tracing is thread-local, and whole-batch outputs remain ordered at consumption time.
+- CPU training runs default to the synchronous path even when `training.pipeline_enabled` is true; the automatic pipeline is a CUDA training optimization.
+- A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.
+- If a deterministic training sample is invalid because its CP-local Lasagna normal window is invalid, batch loading skips it and continues with following deterministic sample indices until the requested number of control-point samples is loaded. If too many consecutive samples are invalid, batch loading fails with a clear error.
+- Training flattens control-point and strip-z dimensions into a patch batch before the 2D model forward pass.
+- The default V0 direction model is a 10-block residual CNN with 64 hidden channels. It uses a 3x3 input projection, constant-width residual blocks, BatchNorm2d normalization, a final 1x1 direction projection, an optional 1x1 sheet/fiber-presence projection, and an optional 1x1 embedding projection for explicit contrastive experiments.
+- Standard training uses direction supervision plus sheet/fiber presence when
+  `training.presence_enabled` is true. Contrastive embedding training is
+  disabled by default and must be explicitly enabled.
+- V0 model output always starts with exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding. When `training.presence_enabled` is true, one sigmoid sheet/fiber-presence channel follows the direction channels. When `training.contrastive_enabled` is true and `training.contrastive_embedding_channels > 0`, raw embedding channels are appended after direction and any presence channel. A disabled contrastive config must instantiate no embedding head, even if a stale positive `contrastive_embedding_channels` value is present. Consumers must use explicit output-slicing helpers instead of hard-coded embedding offsets.
+- When `training.top_view_enabled` is true, training jointly instantiates a
+  second V0 model for top-view strip slices. This top-view model outputs the
+  same two Lasagna ambiguous direction channels plus one sigmoid scalar channel
+  interpreted as a fiber-center distance transform, not sheet/fiber presence.
+  The side model output layout is unchanged.
+- For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
+- Sheet/fiber presence training is enabled by `training.presence_enabled`.
+  It supervises each loaded strip patch's rounded transformed CP pixel as
+  presence `1`. Valid non-CP pixels inside the same shift-reachable
+  CP-neighborhood rectangle used for contrastive negatives are supervised as
+  presence `0`; unreachable patch edges are ignored so the network does not
+  learn that CPs can never occur there. The positive-pixel BCE mean and the
+  negative-pixel BCE mean have equal aggregate weight, and the combined loss is
+  multiplied by `training.presence_weight`.
+- Contrastive embedding training is experimental opt-in, enabled by
+  `training.contrastive_enabled`.
+  It requires `training.contrastive_embedding_channels > 0` and
+  `training.control_points_per_step` divisible by
+  `training.contrastive_control_points_per_fiber`.
+- In contrastive mode, each training step loads deterministic same-fiber CP
+  groups: every group contains `contrastive_control_points_per_fiber` CPs from
+  one fiber, and consecutive groups are concatenated to fill
+  `control_points_per_step`. Group ordering is deterministic and covers the
+  effective CP set by shuffled fiber-local CP groups before repeating.
+- Same-fiber CP patches keep independent geometric augmentation draws through
+  unique stream indices. Value/image augmentation draws are synchronized
+  within each same-fiber group so the embedding objective does not treat
+  value-only appearance jitter as identity evidence.
+- The contrastive embedding loss uses cosine similarity on each loaded strip
+  patch's rounded transformed CP pixel. Positive terms are z-search-aware:
+  for every anchor CP sample/strip-z offset, candidates are only other CP
+  samples from the same fiber, across their loaded strip-z offsets. The
+  already most-similar candidate is selected and trained toward cosine
+  similarity `1`; same-CP offsets are not used as positives. Negative terms
+  compare each CP embedding sample with one deterministic valid non-CP pixel
+  from the batch and penalize cosine similarity above
+  `training.contrastive_negative_margin`. Negative candidates are restricted to
+  the CP-neighborhood reachable rectangle implied by the configured
+  output-space `augment_shift_x/y` bounds; unreachable patch edges are ignored,
+  not supervised as negatives. CP embeddings from other fibers are not used as
+  negative samples. Positive and negative means are averaged equally, then
+  multiplied by `training.contrastive_weight`.
+- Contrastive embedding training also includes a similarity-image sparsity
+  term. For each supervised CP embedding, the embedding similarity image
+  against that CP is computed in normalized visualization space
+  `0.5 + 0.5 * cosine_similarity`; its valid-pixel mean over the same
+  shift-reachable CP area used for contrastive pixel negatives is trained
+  toward the fixed target `0.1` with MSE. This term is added to the balanced
+  positive/negative pair loss before applying `training.contrastive_weight`, so
+  CP-similar embeddings are encouraged to stay spatially sparse without using
+  unreachable patch edges as evidence.
+- Presence visualization writes TensorBoard presence-probability maps when the
+  presence head is enabled. Contrastive embedding visualization writes
+  TensorBoard similarity maps:
+  per-pixel cosine similarity against the selected patch's CP embedding is
+  mapped from `[-1, 1]` to `[0, 255]` with invalid pixels black.
+- Equivalent implementation formulas are `cos2theta=(dx^2-dy^2)/(dx^2+dy^2+eps)`, `sin2theta=2*dx*dy/(dx^2+dy^2+eps)`, `dir0=0.5+0.5*cos2theta`, and `dir1=0.5+0.5*(cos2theta-sin2theta)/sqrt(2)`.
+- Lasagna two-channel direction decoding must use the analytic inverse:
+  `cos2theta=2*d0-1`,
+  `sin2theta=cos2theta-sqrt(2)*(2*d1-1)`, and
+  `theta=atan2(sin2theta, cos2theta)/2`. Binned or candidate-angle lookup
+  decoders must not exist anywhere in `fiber_trace_2d`.
+- Forward/backward ambiguity comes from the double-angle encoding itself; `(dx,dy)` and `(-dx,-dy)` must encode identically.
+- Direction targets are derived from the transformed output-pixel line coordinates produced by the same augmentation path as the image. They must not be derived from unaugmented line points for augmented patches.
+- Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
+- The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation. Training additionally reports folded unoriented angular error in degrees over the same supervised pixels, with `0` degrees perfect and `90` degrees maximally wrong.
+- Top-view training loads one top-strip patch per loaded CP sample, using the
+  same deterministic CP ordering and the same geometric/value augmentation
+  parameters as that CP's center side-strip sample. The top strip is sampled
+  with the VC3D-style `lineSurface`/top-strip coordinate construction already
+  used by Trace2CP visualization: columns follow the fiber line and rows follow
+  the side/cross-fiber axis derived from Lasagna normals.
+- Top-view training uses the same cached, vectorized, batched loader mechanics
+  as side-view training. The only source-coordinate difference is the grid
+  builder: top view uses the top-strip builder, side view uses the side-strip
+  builder. Top-view coordinate augmentation stacks maps and tensors through the
+  same batched coordinate-resampling helper, and top-view image loading is
+  grouped through `CoordinateSampler.sample_coord_batch`.
+- Because a top patch and its center side-strip patch use the same source/output
+  pixel frame and the same geometric augmentation parameters, the transformed
+  fiber line and CP pixel coordinates are identical. Top-view batch loading
+  must reuse the already computed side-sample line/CP coordinates instead of
+  running a second line-coordinate lookup for the top patch.
+- Top-view direction supervision uses the transformed top-strip line tangent
+  and the same Lasagna ambiguous two-channel MSE objective as side strips.
+  Top-view distance-transform supervision uses only the rounded normal
+  cross-section through the transformed CP. Its target is `1.0` at the CP,
+  falls linearly to `0.0` at `training.top_view_dt_radius_px` pixels
+  (default `30.0`), and remains explicitly supervised as `0.0` for valid
+  rounded-line pixels beyond that radius. The top direction and DT losses are
+  multiplied by `training.top_view_direction_weight` and
+  `training.top_view_dt_weight`.
+- Training creates a run directory from `training.run_path` and `training.run_name` plus a date string. Passing `--resume <snapshot.pt>` creates and names a fresh run directory the same way, restores model and optimizer state from the snapshot, starts from `checkpoint_step + 1`, and keeps `training.max_steps` as the absolute target step. To continue past a finished run, increase `training.max_steps` before resuming. If two runs start in the same second, a numeric suffix is added to avoid a run-directory collision.
+- Training config keys include `max_sample_index` for bounded deterministic-prefix reuse, `pipeline_enabled`, `pipeline_depth`, `pipeline_workers`, and `pipeline_isolated_loaders` for CUDA training load/model overlap, and `test_interval`, `test_control_points`, `test_start_sample_index`, `test_trace2cp_step_px`, and `test_trace2cp_rf_margin_px` for deterministic test evaluation when `test_datasets` is configured.
+- Test evaluation runs at step 1, every `training.test_interval`, and the final step when `test_datasets` is configured. Positive `training.test_control_points` values load the fixed deterministic random range starting at `training.test_start_sample_index`, so the same held-out CP samples are compared across time. `training.test_control_points: 0` is the full-test sentinel: it evaluates every configured held-out CP sample once in flat CP order starting at zero, ignoring `training.test_start_sample_index`, so whole-fiber test metrics can be compared directly against `--trace2cp-vis --fiber-json` on the same held-out fiber apart from pair-alignment details. In addition to fixed-batch direction loss, the test path evaluates the public Trace2CP metric by tracing each selected held-out CP to its next CP segment and averaging valid `trace2cp_error` values.
+- TensorBoard logging writes the training config JSON as text, direction-loss scalars, angular-error degree scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers. Overlay contact sheets select examples across loaded control-point samples first, preferring each CP's strip-z offset closest to zero before showing additional offsets. When `test_datasets` is configured, TensorBoard also logs `test/loss_direction`, `test/angle_error_mean_deg`, `test/supervision_samples`, test cache diagnostics, and a `test/batch_direction_overlay` image at test evaluation steps.
+- When top-view training is enabled, TensorBoard also logs top-view
+  direction/angle/DT scalars and writes top-view image summaries: a GT-line
+  plus predicted-direction overlay and a fixed `0..1` DT scalar map for train
+  and test batches.
+- Console training progress prints every one of the first 100 training steps,
+  then falls back to `training.scalar_log_interval`.
+- Prefetch progress includes `idx=<exclusive-index>` showing the largest
+  contiguous exclusive deterministic training-stream prefix whose required
+  chunks are cache-complete. This index is counted through the seeded shuffled
+  CP stream used by training, before mapping a stream position to its original
+  flat fiber/CP id. Operators can use that value as
+  `training.max_sample_index` to train on the same prefetched random-prefix
+  stream. A stream sample is cache-complete only after every dependency request
+  for that sample has been classified and each required chunk is a cache hit, a
+  known/new missing marker, or a completed successful download. Dependency
+  generation alone must not advance `idx` while downloads are still pending.
+  When `training.top_view_enabled` is true, prefetch dependency generation
+  includes the top-view strip envelope in addition to all side-strip z-offset
+  envelopes, and both views must be complete before that sample can advance the
+  prefix.
+- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed averaged `test/trace2cp_error`. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss. `training.kept_snapshot_interval` defaults to `10000` and writes retained numbered snapshots named `step_<iteration>.pt`; `0` disables retained numbered snapshots. A resumed run writes its own fresh `current.pt`, `best.pt`, and retained numbered snapshots under the newly created resumed run directory.
+- The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
+- Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
+- Direction-field inspection is exported with `--dir-vis --checkpoint <snapshot> --export-dir <dir>`.
+- Direction-field inspection uses the same deterministic `--sample-index` ordering as training, prefetch, augment-vis, and line-trace-vis. It loads the center side-strip patch, center-crops it to the largest native square when needed, applies pixel-perfect image-space identity, flip-x, flip-y, rot90, rot180, and rot270 variants, runs the checkpointed direction model on each native-resolution variant, decodes the Lasagna ambiguous two-cos-channel output, nearest-neighbor scales each augmented patch image by 4x for visualization only, and draws short direction line segments on top.
+- Direction-field inspection draws only every second source pixel in x and y, so each drawn sample corresponds to an 8x8 display-pixel cell in the 4x visualization. It draws anti-aliased 6-display-pixel direction segments, skips invalid image pixels and invalid/non-finite decoded directions for arrow placement only, writes the augmented variants as one natural-size horizontal `dir_vis.jpg` strip with a single top label band, and writes sample/checkpoint/per-augmentation drawn-count metadata to `dir_vis_summary.txt`. The valid mask gates model normalization and arrow placement, but does not black out display pixels.
+- `--dir-vis --dbg-dirs` adds a second row to `dir_vis.jpg`. Column 1 is the raw unaugmented patch without direction arrows. The remaining columns copy the unaugmented center crop whose side is half the center-patch image side into the center of each transformed patch, run inference on those pasted variants, and render their direction overlays.
+- V0.1 patch line-tracing inspection is exported with `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>`.
+- Line-tracing inspection uses the same deterministic `--sample-index` ordering as training, prefetch, and augment-vis, loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, and traces from the transformed CP in both directions.
+- The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
+- The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is `model_depth`; `--line-trace-rf-margin` can override it for inspection.
+- The default line-trace step is `4.0` strip-image pixels and can be overridden with `--line-trace-step`.
+- Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image by default: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from random combined geometric test-time augmentations mapped back through TTA output-to-reference coordinate grids.
+- Line-trace test-time augmentations are deterministic per `sample_index` and are sampled from the regular training geometric augmentation ranges: shift, rotation, shear, scale, smooth offset, and flips. Value-only augmentations are not applied for line tracing.
+- `--line-trace-tta-count` controls the number of random geometric TTA variants and defaults to `100`. `--med-tta-count` is accepted as a compatibility alias for the same count.
+- Line-trace TTA constructs augmented coordinate grids from the base patch coordinates, samples the volume at those coordinates, runs the model and tracer in augmented patch coordinates, then uses the TTA output-to-reference coordinate grid to map traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
+- `--line-trace-vis --med-tta` adds a third `line_trace_vis.jpg` column for
+  median test-time augmentation tracing. Median TTA traces in the unaugmented
+  reference patch space; at each trace step it transforms the current reference
+  point into the reference/TTA direction fields, samples decoded Lasagna
+  ambiguous directions there, transforms orientations back to reference space,
+  keeps only the ambiguous sign aligned within 90 degrees of the previous
+  reference-space step direction, then takes and normalizes the component-wise
+  median direction before stepping. The median trace uses the same random TTA
+  field list as the flock column. `line_trace_summary.txt` records
+  `med_tta=true`, `line_trace_tta_count`, and the median trace point count.
+- Trace-to-control-point inspection is exported with `--trace2cp-vis
+  --checkpoint <snapshot> --export-dir <dir>`.
+- Trace2CP inspection uses the same deterministic `--sample-index` ordering as
+  training, prefetch, augment-vis, dir-vis, and line-trace-vis. The sampled
+  control point is the start CP. The default target is the next control point
+  in the same fiber; `--trace2cp-target-offset` changes the relative target and
+  `--trace2cp-target-cp-index` selects an absolute target CP index in the same
+  fiber. The target CP must be in range and different from the start CP.
+- `--trace2cp-vis --fiber-json <path>` runs whole-fiber Trace2CP visualization
+  for an explicit fiber JSON. In this mode the runner narrows a single-dataset
+  config to `fiber_paths=[<path>]` before constructing the loader, so it loads
+  only that fiber while reusing the configured Lasagna manifest, volume scale,
+  cache, and sampler context. It must not require the fiber to match the
+  configured dataset glob/list, and it must not introduce a separate
+  manifest-less fiber loading path. Whole-fiber mode uses all in-range CP pairs
+  for the non-zero `--trace2cp-target-offset`; the default offset `1` evaluates
+  adjacent pairs `(0,1), (1,2), ...`. It cannot be combined with
+  `--trace2cp-target-cp-index`.
+- Whole-fiber Trace2CP must continue past CP pairs whose segment cannot be
+  constructed or traced because of invalid local data such as zero
+  Lasagna `grad_mag` normal samples. Skipped pairs are reported to stdout and
+  listed in `trace2cp_fiber_summary.txt`; the command fails only if every
+  requested pair is skipped.
+- Trace2CP loading constructs a side-strip segment that spans the start and
+  target CPs plus receptive-field/visualization margin. The segment strip
+  height is eight times the configured patch height so traces have more vertical
+  room before entering the RF margin. It uses the same
+  Lasagna manifest normal sampling and VC3D-equivalent side-strip coordinate
+  construction as CP-local patches, but anchors the start CP at an explicit
+  strip x-coordinate so the target CP lies in the same image at its arc-length
+  column. It does not use the neural-tracing 3D crop loader.
+- Trace2CP samples the center strip-z image only, runs the checkpointed
+  direction model, decodes the Lasagna ambiguous two-cos-channel output, and
+  traces the same selected segment in both directions: start CP to target CP,
+  and target CP back to start CP on the same segment strip. Each directional
+  trace uses `--line-trace-step` and the line-trace receptive-field margin
+  default `model_depth`, overrideable with `--line-trace-rf-margin`.
+- Each Trace2CP direction initializes its ambiguous-direction sign from the
+  vector pointing from that direction's start CP to its target CP. The reverse
+  trace therefore starts at the second CP and is seeded toward the first CP.
+- Per-direction Trace2CP endpoint diagnostics still evaluate the traced y
+  coordinate at that direction's target CP x-column. If the trace crosses that
+  x-column, the y coordinate is linearly interpolated between bracketing trace
+  points. These endpoint scores remain in the summary as diagnostics, but they
+  are not the public `trace2cp_score`.
+- The public Trace2CP metric is `trace2cp_error`: the mean target-column y
+  error divided by the horizontal start-to-target CP span. The forward trace is
+  linearly interpolated where it reaches the target CP x-column and compared
+  to the target CP y. The reverse trace is linearly interpolated where it
+  reaches the start CP x-column and compared to the start CP y. The two raw y
+  errors are averaged before division by horizontal span.
+- Target-directed Trace2CP traces must normally stop by reaching the opposite
+  CP x-column. When a step crosses that column, the returned trace must append
+  an exact linearly interpolated point at the target column before terminating
+  with reason `target_column`.
+- If a trace explicitly stops before the opposite CP x-column because it hits
+  the RF margin, invalid sampled data, or an invalid predicted direction, that
+  direction uses the default maximum y error for the segment: vertical distance
+  from the CP centerline y to the nearest usable vertical strip edge after
+  RF-margin exclusion. The same maximum y error caps pathological endpoint y
+  errors. This intentionally treats exact early/late edge intersection as noise
+  for now.
+- If a target-directed Trace2CP trace terminates by exhausting `max_steps`, that
+  is an internal budget failure and must raise a visible error. It must not be
+  scored through the missing-target-column maximum-y fallback, because that can
+  hide traces that stop far before the opposite CP column.
+- The previous center-biased closest-approach value remains available only as a
+  refinement/visualization diagnostic named `refine_score`. It must not be used
+  as the public Trace2CP metric or as the training best-checkpoint criterion.
+- Trace2CP builds a CP-to-CP initialized segment from the two closest-approach
+  partial traces. Each CP stays fixed. Each partial trace is corrected only in
+  y, with zero correction at its CP and linearly increasing correction toward
+  the closest x position. At the closest x position both traces are warped to
+  the midpoint between their original y values. The two warped partial traces
+  are fused and resampled by arc length using `--line-trace-step`.
+- Trace2CP also runs a small deterministic refinement of the fused line that
+  reduces local direction mismatch against the sampled direction field while
+  discouraging uneven segment spacing. The refined line keeps the two CP
+  endpoints fixed.
+- `--trace2cp-refine-iterations N` enables iterative Trace2CP refinement after
+  the initial pass. Iteration `0` is the normal Trace2CP evaluation. Each extra
+  iteration smooths the previous selected fused CP-to-CP trace, keeps the CP
+  endpoints and x columns fixed during smoothing, converts the smoothed
+  patch-space `(x,y,z)` trace back through the previous segment source to
+  volume coordinates, builds a fresh side-strip segment from that volume-space
+  curve, and reruns the same Trace2CP scoring mode. `N=0` preserves the current
+  single-pass behavior.
+- Iterative Trace2CP refinement must resample the volume from the refined
+  curve geometry. It must not geometrically warp, bend, rotate, or otherwise
+  reuse the previous strip image as the next pass input.
+- A refined pass must be equivalent to running Trace2CP on an independent
+  line source: after converting the previous fused trace to volume-space line
+  points, the loader must build a fresh segment source with endpoint context
+  before the start CP and after the target CP. Both forward and reverse traces
+  must therefore have the same valid local neighborhood at their start points
+  as they do for an original fiber-json line.
+- `--trace2cp-refine-smooth-window` controls the finite Gaussian smoothing
+  window used between iterations and defaults to `5`. Even values are rounded
+  up to the next odd window. The smoothing keeps x columns and both CP
+  endpoints fixed.
+- Single-pair refinement outputs keep the initial pass as `trace2cp_vis.jpg`
+  and `trace2cp_summary.txt`. Extra passes write `trace2cp_vis_it1.jpg`,
+  `trace2cp_summary_it1.txt`, then `it2`, etc. If z-layer TIFF export is also
+  enabled, extra passes write `trace2cp_z_layers_it1.tif`, etc.
+- Trace2CP CLI runs print a compact stage timing table after the metric/debug
+  summary. Single-pair mode prints `trace2cp timings`; whole-fiber mode prints
+  `trace2cp fiber timings` aggregated across valid pairs. Rows are grouped by
+  stage and include count, total milliseconds, mean milliseconds, and max
+  milliseconds, covering inference, source sampling, tracing, debug rendering,
+  and file output stages where applicable.
+- Slow Trace2CP dynamic-programming solves print live progress before the final
+  timing table. DP progress is opt-in at CLI call sites and uses rows
+  `trace2cp dp start`, `trace2cp dp progress`, `trace2cp dp done`, or
+  `trace2cp dp failed`. Progress rows include the DP label, solved columns,
+  elapsed seconds, and `eta_s` on progress rows. The low-level DP helper is
+  quiet by default for unit tests and internal direct calls.
+- Trace2CP CLI side, side-z, and top-model DP solves use a torch-vectorized
+  backend on the active model device. The backend keeps the DP column
+  recurrence sequential but vectorizes per-column work across z layers, rows,
+  sampled transition columns, and move chunks. The existing NumPy/Python DP
+  remains the fallback when no torch device is supplied.
+- Side-z DP must not infer or optimize unreachable z layers. Since the path is
+  anchored at the center layer at both CP columns and transitions can move only
+  one z layer per DP column, the effective layer bound is capped by the number
+  of horizontal transitions. The side DP vertical move lattice may use a broad
+  compute search band, but that band must be independent of the configured
+  candidate-angle limit.
+- Trace2CP uses `--med-tta` to determine whether TTA is used. Without
+  `--med-tta`, it traces and scores both directions on the base strip
+  direction field. With `--med-tta`, it builds deterministic random geometric
+  TTA direction fields using `--line-trace-tta-count`, default `100`, and
+  traces both median-TTA directions in the reference segment strip.
+- Trace2CP supports an optional inspection/refinement mode enabled by
+  `--trace2cp-combined` or `--trace2cp-use-presence`. In this mode the selected
+  trace uses the regular stepwise candidate-fan tracer by default, scoring side
+  direction at both the current/last point and the candidate point, plus
+  optional presence. The non-combined reference tracer remains the public
+  target-column `trace2cp_error` path. The monotone-x dynamic-programming
+  backend is experimental and must only run when `--trace2cp-dp` is explicitly
+  supplied.
+- The side-strip DP state is `(side_z_layer, y, prev_dy, prev_dz)`. It uses
+  fixed 4 px horizontal transitions, plus the exact target column, and
+  integrates angle-space direction alignment cost across every crossed pixel
+  column. The sampled alignment is frame-ambiguous:
+  `theta = degrees(acos(abs(dot(path_tangent, layer_direction))))`, and the
+  cost is
+  `(theta / 10)^2 * (1 + max(theta - knee, 0) / knee)` before applying
+  `direction_weight`. Transition samples use fractional bilinear
+  interpolation in strip row and z-layer coordinates, not rounded nearest
+  lookup. Because decoded Lasagna directions are sign-ambiguous, all
+  interpolated direction-vector corners are sign-aligned to the candidate
+  transition tangent before blending. Invalid or missing direction pixels add a
+  fixed penalty instead of breaking the path. Side-strip DP does not apply a
+  default per-step z movement penalty; its default z regularization is
+  second-order dz smoothness, currently `0.5 * (dz_current - dz_previous)^2`,
+  so steady z motion is allowed while abrupt z-step changes are discouraged.
+- The side-strip DP still uses `--line-trace-step` only for resampling the
+  selected fused output trace and for the public trace visualization density.
+  It must not use `--line-trace-step` as the DP transition length.
+- The side-strip DP uses the existing Trace2CP candidate-angle setting as the
+  local angle-excess knee in that penalty. With the default 25 degree knee,
+  10 degrees costs roughly 1, 20 degrees roughly 4, and 45 degrees roughly
+  36. This setting must not cap global horizontal slope or vertical moves,
+  because valid local fiber directions can be steeper than 45 degrees.
+- The default side-strip DP dy smoothness penalty is zero. The default
+  side-strip DP dz smoothness penalty is nonzero as described above and should
+  discourage lateral/z jitter without penalizing total z travel.
+- `--trace2cp-combined-mode direction` is the only active combined mode.
+  `--trace2cp-combined-mode embedding`, `--trace2cp-use-embedding`,
+  `--trace2cp-combined-mode image`, and `--trace2cp-use-image` are removed from
+  the active tracer and must fail clearly if requested. Legacy helper
+  functions may remain as inactive implementation experiments, but runner
+  Trace2CP selection must not route through embedding or image similarity.
+- `--trace2cp-use-presence` adds an orthogonal sheet/fiber-presence score to
+  the active combined tracer. It samples the sigmoid presence probability from
+  the same selected layer as the direction field and adds
+  `trace2cp_combined_presence_weight * (1 - presence_probability)` to the
+  candidate/transition cost. This requires a checkpoint/model output with a
+  presence channel and fails clearly if the channel is absent. Visualization appends
+  fixed-scale presence debug output when presence scoring is active: single-pair
+  `trace2cp_vis.jpg` gets a presence column, whole-fiber
+  `trace2cp_fiber_vis.jpg` gets a presence row, `0` renders black, `1` renders
+  white, invalid pixels are black, and the fiber line, CPs, and selected traces
+  are overlaid. When z-search is enabled, the z debug visualization must also
+  show forward, reverse, and fused z-corrected presence maps selected
+  column-by-column from the same trace z layers as the z-corrected image.
+  Whole-fiber presence visualization must use the fused z-corrected presence
+  when it is available.
+- Trace2CP z-search uses raw per-layer side-presence by default. Adding
+  `--trace2cp-presence-blur` makes Trace2CP use a cache-level
+  Gaussian-smoothed side-presence view for presence scoring and presence
+  display. The smoothing is weighted by valid pixels and runs over side-z plus
+  side-image x/y. The side-z pass uses radius 21. The side-image pass uses a
+  per-pixel anisotropic Gaussian rotated around the side-z axis to align with
+  the local predicted side direction: radius 5 along the direction and radius 1
+  across it. The kernel is symmetric, so direction sign ambiguity does not
+  change the result. Non-z Trace2CP presence scoring remains unblurred because
+  there is no side-z stack.
+- Trace2CP visualization also appends VC3D-style top-strip output sampled from
+  volume coordinates, not warped from rendered side-strip pixels. Single-pair
+  `trace2cp_vis.jpg` gets a top-strip debug column. Whole-fiber
+  `trace2cp_fiber_vis.jpg` gets top-strip rows stitched into the same global CP
+  x-coordinate system as the side-strip rows. The original/init comparison top
+  strip uses the same pair-local line window and Lasagna/VC3D frame
+  construction as the side-strip segment, but rows are offset along
+  `frame.side` as in VC3D `lineSurface`. Visualizations must also include a
+  traced fused top strip projected to the central z slice: for each output
+  column, interpolate the fused trace, sample the segment coordinate grid and
+  Lasagna row-normal axis at that traced side-strip point, derive the
+  top-strip side axis from traced tangent and row normal, then sample rows
+  along that side axis with zero side-z offset. When z-search is active, the
+  visualization additionally appends a traced fused z-corrected top strip using
+  the fused trace's selected-scale `z_voxels` value as an out-of-plane side-z
+  offset before the top-strip side-axis offset. This is visualization-only and
+  must not change Trace2CP scoring.
+- When z-search is active and the side model exposes a sheet/fiber-presence
+  head, Trace2CP top-strip visualization also appends fixed-scale side-presence
+  z-pillar rows below the regular top-strip slices. For each output column `x`,
+  each pillar row samples one inferred side-slice layer at `(x, trace_y(x))`;
+  the image height is `2 * trace2cp_z_max_layer + 1`, so `+/-40` produces an
+  81 px tall z-pillar image. Separate z-pillar panels may be shown for the
+  original/init trace, the traced fused central-z line, and the z-search fused
+  line. For the z-search fused line, each column is shifted by that column's
+  selected z value (`round(z_voxels / z_step_voxels)`), so the center row
+  represents relative z=0 at the layer actually used by the trace. These rows
+  are side-z-stack projections rather than true top-strip surface predictions;
+  if the side presence field is broad or similar across shifted layers they
+  can resemble a narrow side-presence slice. They are visualization-only, do
+  not use the optional top-view model, and must not affect Trace2CP scoring,
+  z-search, or training.
+- `--trace2cp-top-model-dir-vis` requires a checkpoint with
+  `top_model_state_dict`. It samples a fixed top-strip normal-offset stack
+  around the traced fused top strip using offsets `-4..+4` selected-scale
+  voxels in one-voxel steps, runs the jointly trained top-view model on every
+  layer, and appends sparse direction indicators from an aligned median
+  direction field. Per pixel, only valid layer directions within 45 degrees of
+  image-horizontal are considered; each Lasagna-ambiguous direction is
+  normalized and sign-aligned before taking the median so opposite signs cannot
+  cancel. If a z-corrected fused trace is available, that trace is used as the
+  stack center; otherwise the central-z fused trace is used. The same fused
+  top-direction field is traced from each CP along the top-strip center row
+  until the opposite CP x-column, invalid direction, edge, or max-step guard,
+  and those two traces are drawn with equal visual weight on the debug panel.
+  The panel also draws a monotone-x dynamic-programming path connecting the two
+  CP columns on the top-strip center row. That DP path's state is
+  `(top_offset_layer, y, prev_dy, prev_dz)`, so it may transition between
+  neighboring top-offset layers with a fixed z-transition penalty of
+  `0.1 * abs(delta_layer)` while also preferring smooth step sequences. The
+  default second-order penalties are zero; the first transition has no
+  smoothing cost because no previous step exists. There is no default
+  absolute-y row penalty because that would bias the path toward a row rather
+  than smoothing its slope. It uses fixed 8 px horizontal transitions, plus the
+  exact target column, and integrates direction alignment
+  cost `1 - abs(dot(path_tangent, layer_direction))` across every pixel column
+  crossed by each transition, using fractional row/z interpolation from the
+  direction field. The vertical transition band scales with the horizontal
+  step, and start/target rows and layers are exact at the CPs. Invalid or
+  missing direction pixels in the selected layer add a fixed penalty instead of
+  blocking the path, so the diagnostic path still connects the CPs while
+  preferring valid pixels where available.
+  The visualization also appends optimized-line diagnostics derived from that
+  DP path: a top strip resliced around the DP top-row path and selected
+  top-offset layers, a side slice reconstructed column-wise from the same
+  optimized side displacement, and matching top z-pillar plus side-column
+  presence panels when side-model presence is available. The optimized side
+  displacement is the sum of the selected top-offset layer and the DP
+  top-row offset from the old center row. In the optimized top-strip panel,
+  the optimized path is the slice center and is drawn as a straight centerline,
+  not as the pre-reslice curved path. Side-slice and presence diagnostics must
+  build a visualization z-plane cache whose bounds cover this combined
+  optimized side displacement; using only the raw selected top-offset layer
+  range can incorrectly turn out-of-cache columns black. These panels use the
+  optimized line only for visualization and do not feed back into Trace2CP
+  scoring.
+- Z-corrected side-image and side-presence visualization helpers must infer
+  requested cache layers on demand with the z-plane cache API. They must not
+  treat `plane_cache.layers` as a complete layer set, because visualization
+  caches may start with only the center layer populated.
+  During top trace integration, ambiguous direction signs must be resolved
+  before bilinear interpolation by flipping each of the four neighboring pixel
+  direction samples, if needed, so it agrees with the current trace direction;
+  otherwise opposite signs from the Lasagna two-cos encoding can cancel or
+  flip the sampled direction. This is visualization-only and must not change
+  Trace2CP scoring or z-search layer selection.
+- `--trace2cp-side-top-z-experiment` is an opt-in single-pair diagnostic. It
+  is exclusive: when set, the runner writes only the side/top-z experiment
+  artifacts and does not run the normal Trace2CP overlay/refinement chain,
+  public `trace2cp_error` export, training metric, or best-checkpoint
+  selection. The
+  experiment runs regular stepwise side-strip traces from both CPs while also
+  carrying a selected-scale z/offset state. Side x/y stepping must use the same
+  candidate fan scoring semantics as the normal forward/backward combined
+  tracer: interpolate side direction at the current/last point and at each side
+  candidate point from the side prediction for the current z layer, using
+  ambiguity-aware two-cos direction interpolation, and include optional side
+  presence scoring when `--trace2cp-use-presence` is active. It must not score
+  embedding/image similarity or run DP in this diagnostic. Top
+  inference must not run for all side candidates. After the side candidate is
+  selected, the experiment builds one local top patch centered at that accepted
+  side point and runs the checkpoint's top-view model on that patch to update
+  only the carried z/offset state. The local top patch x axis is derived from the
+  sampled side-view direction: the side-strip tangent is tilted within the side
+  tangent/normal plane according to the side direction. The top patch keeps the
+  side-strip lateral axis as the second in-plane axis, so this experiment only
+  corrects angle relative to the side-view normal and does not optimize roll or
+  arbitrary rotation around the fiber line. The top direction used for the
+  offset update is an ambiguity-aligned weighted median over a normal
+  neighborhood, default radius 20 px. The experiment writes separate
+  `trace2cp_side_top_z_experiment.jpg` and
+  `trace2cp_side_top_z_summary.txt` artifacts. The JPG must stay compact and
+  diagnostic-specific: forward side trace with z-corrected image, backward side
+  trace with z-corrected image, forward z-corrected presence, backward
+  z-corrected presence, original top strip, forward traced top strip with
+  z-correction, and backward traced top strip with z-correction. It must not
+  draw per-step top-direction ticks there or reuse the full Trace2CP overlay
+  rows for
+  fused/reference/similarity/DP debug.
+  The experiment additionally writes every local top slice actually used for
+  z-update inference to `trace2cp_side_top_z_top_slices/` and a matching
+  native-resolution direction overlay to `trace2cp_side_top_z_top_overlays/`;
+  filenames are prefixed `fw_` or `bw_` by trace direction. These generated
+  directories clear stale JPGs before each export. XYZ trace positions and z
+  offsets are subpixel/floating-point throughout stepping; rounding is limited
+  to side z-layer prediction lookup and column-wise display reconstruction.
+  Because this diagnostic repeatedly samples local top patches and runs top
+  model inference, it prints throttled `trace2cp side_top_z progress` rows for
+  the forward and backward traces. Each row includes a small progress bar,
+  accepted steps versus expected horizontal steps, top-patch and invalid counts,
+  current z offset, elapsed time, ETA, and the final termination reason.
+- Combined Trace2CP is an inspection/refinement path. It does not replace the
+  public `trace2cp_error` definition, the direction-only tracer, training loss,
+  or best-checkpoint selection unless explicitly enabled by the command-line
+  flag. `--med-tta` is supported only by the stepwise combined tracer, not by
+  the explicit `--trace2cp-dp` backend.
+- `--trace2cp-vis --trace2cp-combined --trace2cp-z-search` enables an
+  experimental side-strip z-search mode. It requires combined tracing and
+  cannot be combined with `--med-tta`. By default this is the regular stepwise
+  candidate-fan z-search that existed before the DP experiment: each accepted
+  side step may choose the current or neighboring z layer. Existing Trace2CP
+  commands without `--trace2cp-z-search` keep the center strip-z image-only
+  behavior. Adding `--trace2cp-dp` switches this z-search to the experimental
+  monotone DP backend.
+- Trace2CP z-search derives additional segment-strip planes from one accepted
+  center segment source. The center source is built once from the CP-to-CP
+  line window and Lasagna normals, including the row-axis sign alignment used
+  for whole-fiber Trace2CP. Side-strip axes are explicit: image x follows the
+  fiber tangent/arc direction, image y follows the Lasagna mesh-normal row
+  axis, and z-search layers move along the remaining out-of-plane side axis
+  aligned with the VC3D frame side direction, approximately
+  `mesh_normal x tangent`. State layer `k` represents
+  `z_voxels = k * --trace2cp-z-step-voxels` along that axis. Volume/model
+  inference must run at no finer than one selected-scale voxel spacing: when
+  `--trace2cp-z-step-voxels >= 1.0`, the requested state layer is sampled
+  directly by adding `side_axis_zyx[y,x] * (z_voxels * volume_spacing_base)`
+  to every center coordinate before volume sampling; when
+  `--trace2cp-z-step-voxels < 1.0`, only the bracketing integer
+  selected-scale side-z voxel offsets are sampled and inferred. Direction and
+  sheet/fiber-presence fields for sub-voxel state layers are interpolated from
+  those integer layers, with ambiguous direction vectors sign-aligned before
+  interpolation and normalized afterward. It must not use the side-strip
+  image-y/row axis, a global normal, a row-coordinate approximation, an
+  image-space shift, or an unrelated rebuilt plane. The default
+  `--trace2cp-z-step-voxels 1.0` means layer `k` is offset by `k`
+  selected-scale voxels along the segment strip side-z axis.
+  `--trace2cp-z-max-layer` bounds lazy expansion and defaults to `4`.
+- Default z-search lazily samples side-strip layers as the stepwise candidate
+  tracer requests the current and neighboring z layers. Inference is
+  deterministic and stores each layer's sampled image, valid mask, decoded
+  direction field, and optional presence field. For sub-voxel z steps, lazy
+  sampling stores both requested state layers and the integer inferred layers
+  used to build them. Each selected path point carries `x`, `y`, and
+  selected-scale `z_voxels`; direction and presence costs are sampled from the
+  selected state layer, which may be interpolated from neighboring inferred
+  integer side-z layers. If presence is used, those state-layer presence fields
+  are first smoothed over side-z and strip x by the cache-level presence blur.
+- With explicit `--trace2cp-dp`, z-search infers the bounded reachable layer
+  stack for the pair before running the side DP. The DP may transition between
+  neighboring z layers without an absolute z movement penalty, while its
+  default dz smoothness term discourages abrupt z-step changes. DP output is
+  already a fused CP-to-CP path, so the optimized visualization row uses that
+  joint path directly.
+- Z-search does not change the public `trace2cp_error`, training test metric,
+  or best-checkpoint selection. Those remain target-column y error per
+  horizontal CP span.
+- Single-pair z-search visualization adds a z-corrected column. It contains
+  separate forward and reverse views because each trace direction can choose a
+  different z layer per x column. It also contains a fused z-corrected view and
+  a fused z-layer map row so the selected layer per output column is visible
+  even when neighboring sampled planes look similar. Each z-corrected image is
+  assembled column-by-column by rounding the trace/fused z value to the nearest
+  z-search state layer and copying that state's sampled image column. For
+  sub-voxel z steps, interpolated states reuse the nearest integer-inferred
+  side-z image. It must not re-sample the volume and must not interpolate image
+  values between z layers; columns without a trace/fused z value and columns
+  whose rounded layer is missing render black and are counted in summary/debug
+  output.
+- `--trace2cp-vis --trace2cp-z-search --trace2cp-z-layers-tif` exports the
+  already inferred z-search layer cache as TIFF debug stacks. Single-pair mode
+  writes `trace2cp_z_layers.tif`; whole-fiber mode writes one pair-local TIFF
+  per valid pair under `trace2cp_z_layers/` because segment strips can have
+  different shapes. Pages are uint8 and non-interleaved: all sampled slice
+  images first in sorted inferred z-layer order, then all available
+  sheet/fiber-presence maps in the same sorted inferred z-layer order. For
+  sub-voxel z steps, the TIFF stack exports only the actually inferred integer
+  side-z layers, not every interpolated DP/search state. The export must use
+  the existing z-search cache, must not re-sample the volume, and must not
+  interpolate image values between z layers.
+- `--trace2cp-vis --trace2cp-obj` is an opt-in single-pair diagnostic export.
+  It writes vertex-colored OBJ meshes under `trace2cp_obj/` plus a manifest.
+  OBJ geometry must come from the same sampled Trace2CP coordinate grids used
+  for image loading: center side strip, z-search selected side-strip columns,
+  original top strip, traced fused top strip, and z-corrected traced top strip
+  when those surfaces exist. Vertex colors are grayscale scalar values from the
+  corresponding volume image (`0..255`) or side-model sheet/fiber presence
+  (`0..1` for raw presence, `0..255` for z-corrected debug presence). Quad
+  faces are emitted only where all four vertices are valid. The flag is not
+  currently supported by whole-fiber `--fiber-json` Trace2CP output.
+- Single-pair `trace2cp_vis.jpg` includes an additional embedding-debug column
+  when the checkpoint exposes embedding channels. The column renders cosine
+  similarity maps for the start CP embedding, target CP embedding, same-fiber
+  CP-bank mean similarity when the combined Trace2CP bank is available,
+  forward trace-progress last-point columns, and reverse trace-progress
+  last-point columns. For the forward/reverse panels, each newly placed trace
+  point paints the vertical column band around itself using the previous
+  accepted trace point's embedding as the similarity reference; the band radius
+  is `ceil(step_px / 2)`, and small overwrites are allowed.
+  These maps are fixed-scale cosine displays (`-1..1` mapped to
+  `0..255`) and are visualization-only; they must not affect tracing,
+  refinement, metrics, or best-checkpoint selection.
+- Trace2CP TTA samples from the regular training geometric augmentation ranges
+  but forces y-shift to zero and scale to one for long-strip target-column
+  semantics. Each TTA field is built by transforming the segment coordinate
+  grid first, then sampling the volume at those coordinates. It must not warp
+  the already sampled base segment image.
+- Trace2CP TTA output canvases are sized so the transformed base segment-strip
+  corner footprint fits in the TTA image. Pixels that map outside the base
+  coordinate strip or volume stay invalid/black.
+- The Trace2CP median trace is stepped in the reference segment strip by
+  sampling the reference and TTA direction fields, mapping each current
+  reference trace point into each TTA field through the prebuilt
+  reference-to-TTA map, mapping TTA directions back to reference coordinates
+  through each TTA output-to-reference coordinate grid, resolving ambiguous
+  signs against the previous step, and using the normalized component-wise
+  median direction. It must not locate reference points in TTA fields by
+  scanning the dense output-to-reference grid.
+- `--trace2cp-vis --med-tta --vis-tta` writes `trace2cp_tta/reference.jpg`,
+  one `trace2cp_tta/random_NNN.jpg` per generated TTA field, and a contact
+  sheet. Each TTA debug image shows the sampled TTA slice with the transformed
+  base-strip corner outline and start/target CP markers.
+- Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
+  a dedicated public-metric stdout line beginning with `trace2cp_error=...`.
+  Additional stdout lines are diagnostics and must not duplicate the selected
+  public metric label. The summary includes sample index, fiber path,
+  start/target CP indices, trace mode, public `trace2cp_error`,
+  target-column metric raw y error in pixels, horizontal CP span, refinement
+  diagnostic score, endpoint diagnostic scores, per-direction raw errors,
+  target x-columns, reach statuses, termination reasons, and trace point
+  counts. The JPG is a labeled vertical stack with rows for full bidirectional
+  traces, partial traces up to the closest point, the fused CP-to-CP line, and
+  the optimized refinement. Without `--med-tta`, this stack is the
+  reference-only inference result. With `--med-tta`, the JPG has two columns:
+  the selected median-TTA result first, and a second reference-only inference
+  column using the base direction field without TTA. It does not draw score
+  text over image pixels.
+- With `--trace2cp-refine-iterations`, the base `trace2cp_vis.jpg` remains the
+  initial pass for compatibility; extra pass visualizations use the `itN`
+  suffix. Each `itN` pass uses the same drawing structure and public
+  `trace2cp_error` reporting semantics as the initial pass.
+- Whole-fiber Trace2CP mode writes `trace2cp_fiber_vis.jpg` and
+  `trace2cp_fiber_summary.txt`, and `trace2cp_fiber_debug.txt`. Each CP pair
+  is loaded, traced, and measured with the same pair-local Trace2CP path as the
+  single-pair command. The final
+  visualization is composed afterward by mapping each pair-local segment image,
+  centerline, CP markers, selected traces, and optimized line into a shared
+  arc-length x coordinate system for the selected fiber. The mapping uses each
+  pair's local start/target CP image columns and the corresponding global
+  start/target CP arc-length columns. Pair-local y orientation is fixed before
+  image sampling by shared-CP row-axis alignment, not by guessing after
+  composition. The debug file and stdout include per-pair start/target CP strip
+  coordinates, strip-space CP deltas, start/target row axes, frame vectors, and
+  3D CP deltas projected into the start frame. The image layer uses dense rectangular valid-mask averaging of
+  the already sampled segment images; it must not use sparse per-pixel
+  splatting that can introduce display holes. Metric errors and traces are
+  still computed pair by pair. The JPG uses the same four-row Trace2CP structure as
+  single-pair output: full bidirectional traces, partial closest-approach
+  traces, fused CP-to-CP line, and optimized CP-to-CP line. Skipped-pair counts
+  and reasons are included in the summary. Whole-fiber metric output is the
+  average public `trace2cp_error` over all valid CP-pair segments and is
+  printed on its own stdout line as `trace2cp_error_mean=<value>`.
+- With `--trace2cp-refine-iterations`, whole-fiber mode writes additional
+  aggregate iteration images and summaries as `trace2cp_fiber_vis_it1.jpg` and
+  `trace2cp_fiber_summary_it1.txt`, then `it2`, etc. The unsuffixed whole-fiber
+  outputs remain the initial pass.
+- Trace2CP target-column crossing takes precedence over RF-margin rejection for
+  the next step in each direction. If a step crosses that direction's target
+  x-column and would also enter the RF margin, the trace is considered to have
+  reached the target column, an exact interpolated target-column point is
+  appended to the trace, and the score is computed at that point. RF-margin
+  stop reasons should identify whether the x margin, y margin, or both were
+  hit. `max_steps` exhaustion is not a valid scored stop reason for
+  target-directed Trace2CP traces and must raise instead.
+- Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
+- `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
+- Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
+# Lasagna inference manager foundations
+
+- The installed `las_manager` CLI owns one backend-neutral configuration,
+  catalog, snapshot, run, provenance, and publication model for Fiber 3D and
+  Lasagna inference. Command and entity tokens use exact match first, then only
+  unambiguous prefixes; ordinals printed by listings are not stable selectors.
+- Global configuration lives at
+  `${XDG_CONFIG_HOME:-~/.config}/las_manager/config.toml`, with
+  `LAS_MANAGER_CONFIG` as an automation override. It contains the catalog URL,
+  public bucket, snapshot directory list, cache/output/venv/Atlas directories,
+  staging S3 origin, and catalog maximum age. It never contains AWS
+  credentials. Relative paths resolve from the config file.
+- Global `params` is a string-token array passed to both inference backends.
+  Initialized configs default to `--tile-size 512 --border 32 --overlap 96
+  --devices all`. Per-run arguments after `--` follow configured tokens and
+  override them; explicit singular/plural device selection removes the
+  configured mutually exclusive device selector. Existing configs without the
+  key receive the default without migration failure.
+- The open-data catalog is cached as validated JSON plus a sidecar containing
+  its source URL, SHA-256, ETag/Last-Modified, fetch/validation times, and last
+  refresh error. `fetch` always revalidates; dependent commands refresh when
+  the cache is missing or at least one hour old. Refresh failure may use a
+  previously valid cache with a warning; invalid new data must not replace it.
+- A volume record preserves the complete catalog identity needed for portable
+  provenance and Atlas ingestion: sample/volume IDs and long ID, shape, voxel
+  size/format/license, the original volume DataEntry, all OME origins/access
+  roots, selected public S3 origin, and catalog hash/fetch metadata. Stable
+  selectors are `sample_id/long_id`, globally unique `long_id`, and globally
+  unique volume ID.
+- Human `volume ls` renders a deterministic, aligned table with one header,
+  groups records by sample/scroll, prints the scroll and first volume together,
+  and puts branches for additional volumes beneath it in the `SCROLL` column.
+  A single-volume scroll has no branch. The redundant `ID`
+  column is omitted because the long volume name begins with that ID. Three-D
+  shapes retain depth/height/width order and use space-padded widths 6/5/5.
+  Its `PREFETCHED` column contains numerically
+  sorted local OME groups only when `.zarray` and at least one non-metadata
+  chunk exist; advertised or metadata-only groups remain absent. UTF-capable
+  output uses `├─`/`└─`, otherwise `|-`/`\-`. Empty results are header-only.
+  `volume ls --json` retains the backend-neutral record schema for machines and
+  is unaffected by human rendering.
+- Snapshot roots may be a run collection, one run, or `snapshots/`. Listing
+  deduplicates canonical paths, reads checkpoints with CPU mapping, mmap and
+  `weights_only=True`, and caches metadata by path/size/mtime. The stable
+  selector is backend/run/checkpoint. Records include hash, step/test metric,
+  patch/architecture/output options, precision, task/process/code revision,
+  and optional Atlas model identity; absent legacy metadata remains explicit.
+- Shell completion is generated by the same command registry and may use only
+  valid local catalog/checkpoint caches. It must not refresh the network, open
+  an uncached checkpoint, download data, or mutate state.
+- `completion install [bash]` atomically installs a canonical loader in the
+  standard XDG user Bash-completion directory plus one digest-isolated provider
+  per canonical console-script executable. At completion time the loader uses
+  the external `las_manager` selected by `PATH`, obtains its canonical provider
+  identity through a config-free command, and dispatches only to that provider.
+  Providers from multiple venvs coexist; missing venvs are inert. Installation
+  support is Bash-only, while `completion bash|zsh` remains available for
+  generated setup.
+- A final literal `help` before any `--` prints argparse help for the longest
+  exact or uniquely abbreviated command prefix. Unrecognized suffixes fall
+  back to the understood parent; an unrecognized first token remains an error.
+  A `help` token after `--` is forwarded to the inference backend unchanged.
+- Bash and Zsh completion delegate full word context to one shared resolver,
+  understand unique command abbreviations, and complete valid flags, static
+  option values, cached selectors, samples, formats, and locally evidenced OME
+  scale indices. Scale discovery reads only local `.zattrs` multiscale dataset
+  paths and numeric groups with `.zarray`; it does not invent unknown remote
+  levels or perform network access.
+- Nullable optional catalog collections are normalized before iteration.
+  Specifically, `properties.shape = null` is indexed and displayed as unknown
+  rather than preventing other volumes from being listed or completed.
+- `volume prefetch <volume> <scale>` calls the existing OME-Zarr downloader for
+  exactly that numbered group and stores the OME root at
+  `<cache_dir>/volumes/<sample_id>/<long_id>`. It preserves downloader metadata
+  and accepts an explicit worker count; no manager-specific transfer path is
+  permitted.
+- A Lasagna install built from the monorepo includes the sibling Vesuvius
+  namespace, Fiber inference packages, their config data, and canonical
+  `lasagna.*` modules. The configured venv must run Fiber inference without an
+  ambient `PYTHONPATH`; both editable installs and monorepo-built wheels obey
+  this contract.
+- `inference run <snapshot> <volume> <scale>` atomically reserves a run,
+  launches a detached manager-prefixed tmux session, prints its path, and
+  returns immediately. By default the tmux runner invokes the shared downloader
+  before inference and passes backend `--no-download`; `--no-prefetch` skips the
+  manager phase and omits backend `--no-download`, retaining normal on-demand
+  crop-aware fetching during the inference lifecycle. On an empty cache the
+  manager initializes only local `_download` source metadata, with no remote
+  scan or chunk transfer. `--download-workers` applies to both modes; explicit
+  backend arguments after `--`, including `--no-download`, retain precedence.
+  The serialized, versioned request
+  preserves source, destination, group, workers, anonymous access, and remote
+  inventory behavior. Additional inference
+  argv is preserved without shell interpolation. The positional scale selects
+  the input OME group and does not alter the backend's output-scaledown default.
+- Every launch has an immutable UUID and atomically reserved output directory
+  containing private `metadata.json`, `command.json`, `run.log`, and a portable
+  `artifacts/` subtree. The backend-neutral record pins the complete source and
+  checkpoint identity and tracks prefetch, inference, staging-upload,
+  Atlas-ingest, and Atlas-publication state independently. New directory labels
+  use `<sample>-<acquisition>-las-sd<group>-<uuid8>`; this is a concise human
+  label, not Atlas canonical identity. Full volume, model, backend, source
+  group, command, time, revision, and UUID identity remains structured metadata.
+- A manager wrapper owns the `created -> running -> completed|failed|interrupted`
+  transition, combined prefetch/inference logging, real child exit status, and
+  signal forwarding. Prefetch tracks pending/running/completed/failed/skipped,
+  timestamps and error; failure/interruption prevents inference from starting.
+  Inference stdout/stderr is teed byte-for-byte to both `run.log` and the tmux
+  pane so attaching shows live carriage-return progress without weakening the
+  durable log or exit-code contract.
+  Stale active records are reconciled against both tmux and PID/start-time
+  identity without deleting artifacts. `inference ls` is the durable view;
+  `run ls` contains only live tmux sessions.
+- `tmux attach` attaches normally outside tmux. Inside tmux it links the run
+  window immediately after the current window and selects it, never nesting a
+  client or renaming the source window. Creation atomically captures tmux's
+  stable `window_id`, tags the window with the immutable run UUID, and validates
+  both before live/attach decisions. Numeric indices are never durable
+  identity. Window names use `inf-<sample>-<uuid4>` and are only short display
+  labels. A surviving orphan inference process is durable-running but not
+  attachable when its wrapper window is gone.
+- Subsequent ordered phases add direct portable provenance,
+  shared Zstd output, Atlas Lasagna-bundle publication, and the Lasagna backend without
+  introducing a second manager workflow or discarding the identities above.
+- Current Fiber checkpoints are self-configuring for inference: their embedded
+  config is authoritative and the CLI positional config is optional. A
+  positional config remains supported only as the explicit fallback for a
+  legacy checkpoint without embedded config; conflicting explicit config does
+  not override a current checkpoint.
+- Fiber inference directly and atomically maintains bundle-relative
+  `inference.json` with schema version, status, source/catalog identity,
+  requested and observed input scale, effective output scale/levels/crop,
+  numerical settings, checkpoint/config identity, repository/runtime identity,
+  and a bounded structural artifact inventory. It records failed/interrupted
+  status after artifact initialization and never recursively inventories Zarr
+  chunks.
+- The shared Fiber/Lasagna inference metadata writer records the checked-out
+  Villa revision as `inference.code_commit`; this applies to direct and managed
+  invocation. Repository dirtiness remains explicit. Packaged deployments may
+  supply the build commit when no Git checkout is present; otherwise the value
+  is null. Git provenance is not copied into Atlas model metadata.
+- The manager passes portable catalog/model/run context through an explicit
+  private context file. Fiber inference, not the manager, authors inference
+  facts. Private absolute paths, command, hostname/user, logs, and tmux identity
+  remain outside `artifacts/`.
+- Lasagna manifests preserve a relative `provenance` reference and unknown
+  forward-compatible top-level fields across load/save.
+- Newly created Fiber and Lasagna inference OME-Zarr arrays use the shared
+  exact Zarr-v2 compressor `{id: blosc, cname: zstd, clevel: 3, shuffle: 1,
+  blocksize: 0}` at every generated level. Both direct CLIs expose the same
+  `--ome-compressor` compatibility override. Resume never rewrites an existing
+  array's codec; requested/actual mismatches are reported, while provenance
+  inventories the codec actually persisted per level.
+
+## Atlas staging and ingestion
+
+- `las_manager open-data validate/upload` accepts completed portable Fiber and
+  Lasagna bundles through one backend-neutral implementation. Both require a
+  CC BY-NC 4.0 source license. Model identity is resolved automatically from a
+  carried ID or a freshly rehashed checkpoint in configured snapshot roots;
+  there is no normal upload-time model-ID argument.
+- Staging uses the immutable run UUID and a fixed local file inventory.
+  `_INCOMPLETE` is the manager-side transaction guard: it is written before
+  rclone starts and removed only after rclone succeeds; failed staging never
+  invokes Atlas ingestion. Retry invokes rclone again and relies on its
+  configured comparison behavior. Completed run UUID/bundle contents are
+  immutable because `rclone copy --size-only` neither detects changed same-size
+  objects nor deletes stale destination objects. No manager upload manifest or
+  per-Zarr-chunk transaction hash is stored remotely.
+- Atlas maps both Fiber and Lasagna output to the existing `lasagna` copy-first
+  artifact. Canonical identity is volume, canonical model ID, and source input
+  level. The data entry contains only its private origin and existing
+  `model_id`/`level` parameters; portable provenance remains in `inference.json`
+  and is not copied into Atlas `creation_info`. The origin path is relative to
+  its access-root URL and Atlas joins them to resolve the full data-sync source.
+- Missing models are registered automatically using an Atlas UTC datetime ID.
+  Fiber uses the minimal Lasagna model record with architecture `fiber3d/unet`,
+  task `lasagna`, process `model_training`, snapshot-root-relative checkpoint
+  path, and snapshot SHA-256. Data entries keep numeric model references.
+  Byte-identical checkpoint aliases are normalized; incompatible hashes,
+  metadata, tasks, or canonical-ID collisions are rejected before staging.
+- Public publication remains an operator-controlled Atlas data-sync action.
+
+## Lasagna manager backend
+
+- Snapshot discovery classifies current Fiber checkpoints by their embedded
+  Fiber model config and Lasagna checkpoints by their Lasagna architecture
+  metadata/state-dict wrapper. It never infers a backend from a filename.
+  Selectors are namespaced as `fiber3d/run/checkpoint` and
+  `lasagna/run/checkpoint`; `--backend` is needed only for an ambiguous legacy
+  shorthand.
+- Lasagna launches use `preprocess_cos_omezarr predict3d` but otherwise share
+  the manager's volume prefetch, immutable run record, tmux runner, completion,
+  lifecycle, portable artifact bundle, staging, and Atlas ingestion paths.
+- Direct and managed Lasagna inference write the shared `inference.json`
+  envelope with `artifact_kind = "lasagna"`. Its product metadata preserves
+  the `.lasagna.json` source-to-base mapping, gradient encoding scale/factor,
+  crops, groups, channels, Zarr paths, and output scaledowns. The manifest
+  points to `inference.json` by a bundle-relative path.
+
+# Process-parallel 3D flush
+
+- Fiber and Lasagna inference use the same shared rolling-mmap flush engine.
+- Positive `flush_workers` use persistent spawn processes with bounded
+  descriptor-only queues. Workers read frozen mmap regions directly and own
+  distinct scale/chunk writes; ndarray payloads never cross IPC.
+- Exactly one frozen batch may overlap the following inference band. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch.
+- Each worker limits native CPU libraries to one thread and allocates at most
+  one chunk's denominator/raw/finalized arrays.
+- `flush_workers=0` is the synchronous baseline and uses immediate ring release;
+  both inference CLIs default to the available CPU count capped at 64 process
+  workers.

@@ -1,6 +1,9 @@
 # VC3D Agent Bridge Protocol
 
-Status: current protocol reference.
+Status: current protocol reference. Protocol version 2.
+
+Version history: v2 removed `traceNeedsReview`/`traceVerified` from
+`fiber.list` — human review state is the ordinary `reviewed` tag in `tags`.
 
 The bridge is an opt-in JSON-RPC 2.0 server embedded in VC3D. A separate
 FastMCP process translates agent-facing tools into bridge calls. The bridge
@@ -441,7 +444,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |
 | `vc3d_fiber_launch` | `fiber.launch` |
-| `vc3d_fiber_list` | `fiber.list` |
+| `vc3d_fiber_list` | `fiber.list` | Per fiber includes `traceState` (`legacy`/`predictions`/`mixed`) and per-span `interpMode` (`C`/`L`/`T`) plus `fiberManifest` (predictions provenance, trace spans only). Human review state is just the ordinary `reviewed` tag in `tags`. |
 | `vc3d_fiber_open` | `fiber.open` |
 | `vc3d_fiber_save` | `fiber.save` |
 | `vc3d_fiber_set_follow` | `fiber.set_follow` |

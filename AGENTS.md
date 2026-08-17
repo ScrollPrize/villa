@@ -8,6 +8,9 @@ The repo contains multiple subprojects with different languages, runtimes, and c
 2. Follow the **Monorepo-wide rules** below.
 3. Then apply the matching **Subproject playbook** (e.g., `volume-cartographer/`, `vesuvius/`) only if the prompt targets it.
 
+
+**If you are working on a PR or issue for this repository, refer to CONTRIBUTING.md for guidelines**  
+
 ---
 
 ## 1) Monorepo-wide rules
@@ -207,6 +210,12 @@ High-ROI improvements that are usually safe across projects:
 - reduce needless copies and conversions
 - hoist invariants out of loops
 - add early-outs that are logically equivalent
+
+Do not copy an existing implementation into a new module just because the
+existing code is private to another translation unit or package. Extract the
+shared behavior into a reusable helper/library first, then make both callers use
+that shared implementation. If extraction is genuinely impossible in the current
+task, treat that as an explicit deviation and report it before proceeding.
 
 ### 4.3 Document anything that affects developer workflow
 If you add:

@@ -18,7 +18,7 @@ DecodedChunkCacheBudget::Stats DecodedChunkCacheBudget::stats() const
 {
     Stats result;
     result.decodedBytes = decodedBytes_.load(std::memory_order_acquire);
-    result.maximumBytes = maximumBytes_;
+    result.maximumBytes = maximumBytes_.load(std::memory_order_acquire);
     {
         std::lock_guard lock(participantsMutex_);
         result.cacheCount = participants_.size();
@@ -28,7 +28,13 @@ DecodedChunkCacheBudget::Stats DecodedChunkCacheBudget::stats() const
 
 std::size_t DecodedChunkCacheBudget::maximumBytes() const noexcept
 {
-    return maximumBytes_;
+    return maximumBytes_.load(std::memory_order_acquire);
+}
+
+void DecodedChunkCacheBudget::setMaximumBytes(std::size_t maximumBytes)
+{
+    maximumBytes_.store(maximumBytes, std::memory_order_release);
+    enforce();
 }
 
 std::uint64_t DecodedChunkCacheBudget::registerCache(Participant participant)
@@ -69,11 +75,13 @@ void DecodedChunkCacheBudget::removeBytes(std::size_t bytes) noexcept
 
 void DecodedChunkCacheBudget::enforce()
 {
-    if (decodedBytes_.load(std::memory_order_acquire) <= maximumBytes_)
+    if (decodedBytes_.load(std::memory_order_acquire) <=
+        maximumBytes_.load(std::memory_order_acquire))
         return;
 
     std::lock_guard enforcementLock(enforcementMutex_);
-    while (decodedBytes_.load(std::memory_order_acquire) > maximumBytes_) {
+    while (decodedBytes_.load(std::memory_order_acquire) >
+           maximumBytes_.load(std::memory_order_acquire)) {
         std::vector<std::pair<std::uint64_t, Participant>> snapshot;
         {
             std::lock_guard lock(participantsMutex_);

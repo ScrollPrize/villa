@@ -4,6 +4,8 @@ import zarr
 import os
 from typing import Union, Dict, Any, Optional, Tuple
 
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """
@@ -33,9 +35,11 @@ def get_max_value(dtype: np.dtype) -> Union[float, int]:
         raise ValueError("Unsupported dtype")
     return max_value
 
-def open_zarr(path: str, mode: str = 'r', 
+def open_zarr(path: str, mode: str = 'r',
               storage_options: Optional[Dict[str, Any]] = None,
               verbose: bool = False,
+              cache: bool = False,
+              cache_size_mb: int = 256,
               # Additional zarr creation parameters
               shape: Optional[Tuple] = None,
               chunks: Optional[Tuple] = None,
@@ -43,6 +47,7 @@ def open_zarr(path: str, mode: str = 'r',
               compressor: Any = None,
               fill_value: Any = None,
               order: str = None,
+              zarr_format: Optional[int] = 2,
               **kwargs) -> zarr.Array:
     """
     Open a zarr array with consistent handling of local and remote URLs.
@@ -57,8 +62,23 @@ def open_zarr(path: str, mode: str = 'r',
         Additional options for storage backend. For S3, {'anon': False} will be added by default.
     verbose : bool, default False
         Whether to print verbose information about opening the zarr array.
+    cache : bool, default False
+        If True (read mode only), wrap the store in an in-memory LRU chunk
+        cache (zarr's ``CacheStore``) so repeated reads of the same region
+        are served locally instead of re-fetched from the remote store.
+        Byte-exact: caches the compressed chunks as stored, so decoded
+        values are identical with or without it.
+    cache_size_mb : int, default 256
+        Maximum size of the LRU chunk cache, in megabytes. Ignored unless
+        ``cache=True``.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
+    zarr_format : Optional[int], default 2
+        Zarr format version for arrays created with mode 'w'. Defaults to 2 because
+        the numcodecs compressors used throughout this package (and the logits stores
+        blend_logits validates) are v2 constructs: zarr 3 raises for `compressor=` on
+        a v3 array. Pass None to accept zarr's own default. Ignored when the
+        installed zarr is 2.x, which only writes v2 and does not accept the argument.
     **kwargs : Additional parameters passed to zarr.open
         
     Returns:
@@ -134,14 +154,57 @@ def open_zarr(path: str, mode: str = 'r',
             create_kwargs['fill_value'] = fill_value
         if order is not None:
             create_kwargs['order'] = order
-        
+        # zarr 2 has no zarr_format argument: it warns "ignoring keyword
+        # argument 'zarr_format'" for every array and writes v2 regardless,
+        # which is already what this default asks for. Only zarr 3 needs telling.
+        if zarr_format is not None and _ZARR_V3:
+            create_kwargs['zarr_format'] = zarr_format
+
         # Add any other kwargs
         create_kwargs.update(kwargs)
-        
+
+        # zarr 3 derives `overwrite` from the mode, so passing it alongside
+        # mode='w' raises "got multiple values for keyword argument 'overwrite'".
+        # mode='w' already means truncate, so an explicit overwrite=True is
+        # redundant; drop it rather than making every caller know this.
+        if create_kwargs.pop('overwrite', None) is False:
+            raise ValueError(
+                "open_zarr(mode='w') always truncates; overwrite=False is contradictory"
+            )
+
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
         return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
+        if cache and mode == 'r':
+            if not _ZARR_V3:
+                raise NotImplementedError(
+                    "open_zarr(cache=True) requires zarr>=3 (uses "
+                    "zarr.experimental.cache_store.CacheStore, added in zarr 3); "
+                    f"installed zarr is {zarr.__version__}"
+                )
+            # Wrap the store in zarr's built-in read-through LRU chunk cache.
+            # Repeated reads of the same region (overlapping training
+            # patches, viewer panning, tracer neighborhood revisits) are
+            # then served from memory instead of re-fetched over the
+            # network. The cache holds the compressed chunk bytes exactly
+            # as stored, so decoded values are byte-identical to the
+            # uncached path. This restores what use_volume_store_cache
+            # provided before zarr 3 removed LRUStoreCache.
+            from zarr.experimental.cache_store import CacheStore
+            from zarr.storage import FsspecStore, LocalStore, MemoryStore
+            if path.startswith(('http://', 'https://', 's3://')):
+                inner = FsspecStore.from_url(path, storage_options=storage_options, read_only=True)
+            else:
+                inner = LocalStore(path, read_only=True)
+            cached_store = CacheStore(
+                inner,
+                cache_store=MemoryStore(),
+                max_size=cache_size_mb * 2**20,
+            )
+            if verbose:
+                print(f"Wrapping store in LRU chunk cache ({cache_size_mb} MB)")
+            return zarr.open(cached_store, mode=mode, **kwargs)
         return zarr.open(path, mode=mode, **store_kwargs, **kwargs)

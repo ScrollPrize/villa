@@ -60,10 +60,13 @@ function(vc_add_test)
         target_compile_definitions(${T_NAME} PRIVATE ${T_DEFS})
     endif()
     add_test(NAME ${T_NAME} COMMAND ${T_NAME})
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS ${T_NAME})
+    vc_register_test_target(${T_NAME})
+    vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
+
+vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
 
@@ -149,6 +152,13 @@ vc_add_test(NAME test_fiber_widget
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_fiber_trace_review
+    SOURCES test_fiber_trace_review.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
 vc_add_test(NAME test_lasagna_service_manager_factory
@@ -189,12 +199,24 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
+qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+vc_add_test(NAME test_spiral_config_profile_editor
+    SOURCES test_spiral_config_profile_editor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${spiral_config_profile_editor_moc}
+            ${collapsible_settings_group_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -202,7 +224,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry
@@ -213,6 +235,9 @@ vc_add_test(NAME test_fiber_slice_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_fiber_trace3d
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -266,9 +291,10 @@ vc_add_test(NAME test_merge_grid_resolve)
 # itself if unset, so the default ctest run stays fast.
 add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
 target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
+vc_register_test_target(test_merge_e2e_small)
 if(VC_RUN_E2E)
     add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_merge_e2e_small)
+    vc_register_ctest(test_merge_e2e_small test_merge_e2e_small)
     # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
@@ -277,47 +303,417 @@ endif()
 
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_volume_sample)
 # Bench has a generous wall-clock assertion; not part of default ctest
 # unless the user opts in via VC_RUN_BENCHES. Expose it as a target so
 # it's always built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
+    vc_register_ctest(bench_volume_sample bench_volume_sample)
 endif()
 
 add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
 target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_quadsurface_gen)
 # Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
 # cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
 # built as a target so it's runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_quadsurface_gen)
+    vc_register_ctest(bench_quadsurface_gen bench_quadsurface_gen)
 endif()
 
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_chunked_plane_sampler)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
 # carries only a loose wall-clock assertion, so it stays out of default
 # ctest unless the user opts in via VC_RUN_BENCHES; the target is always
 # built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_chunked_plane_sampler)
+    vc_register_ctest(bench_chunked_plane_sampler bench_chunked_plane_sampler)
+endif()
+
+add_executable(bench_render_synthetic bench_render_synthetic.cpp)
+target_link_libraries(bench_render_synthetic PRIVATE vc_core)
+set(_render_benchmark_architecture "${CMAKE_SYSTEM_PROCESSOR}")
+if(NOT VC_MARCH_NATIVE AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND NOT WIN32)
+    set(_render_benchmark_architecture "x86-64-v3")
+elseif(VC_MARCH_NATIVE)
+    set(_render_benchmark_architecture "native")
+endif()
+target_compile_definitions(bench_render_synthetic PRIVATE
+    VC_RENDER_BENCH_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+    VC_RENDER_BENCH_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+    VC_RENDER_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    VC_RENDER_BENCH_ARCHITECTURE="${_render_benchmark_architecture}")
+vc_register_test_target(bench_render_synthetic)
+add_test(NAME test_render_synthetic_fixture
+    COMMAND bench_render_synthetic --verify-all)
+set_tests_properties(test_render_synthetic_fixture PROPERTIES
+    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
+vc_register_ctest(test_render_synthetic_fixture bench_render_synthetic)
+add_test(NAME test_render_synthetic_fallback_1
+    COMMAND bench_render_synthetic
+        --fixture parallel --scenario fallback_1
+        --repetitions 1 --native-trials 1)
+set_tests_properties(test_render_synthetic_fallback_1 PROPERTIES
+    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=4")
+vc_register_ctest(test_render_synthetic_fallback_1 bench_render_synthetic)
+add_test(NAME test_render_sampler_worker_override_invalid
+    COMMAND bench_render_synthetic --fixture serial --scenario full_res)
+set_tests_properties(test_render_sampler_worker_override_invalid PROPERTIES
+    ENVIRONMENT "VC_RENDER_SAMPLER_THREADS=0"
+    WILL_FAIL TRUE)
+vc_register_ctest(
+    test_render_sampler_worker_override_invalid bench_render_synthetic)
+
+add_executable(bench_thread_pool_dispatch bench_thread_pool_dispatch.cpp)
+target_link_libraries(bench_thread_pool_dispatch PRIVATE vc_core)
+target_compile_definitions(bench_thread_pool_dispatch PRIVATE
+    VC_DISPATCH_BENCH_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+    VC_DISPATCH_BENCH_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+    VC_DISPATCH_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    VC_DISPATCH_BENCH_ARCHITECTURE="${_render_benchmark_architecture}")
+vc_register_test_target(bench_thread_pool_dispatch)
+
+add_library(vc_thread_sync_replay STATIC
+    thread_sync_replay/Replay.cpp)
+target_include_directories(vc_thread_sync_replay PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_thread_sync_replay PUBLIC
+    nlohmann_json::nlohmann_json)
+
+add_executable(bench_thread_sync_replay
+    thread_sync_replay/main.cpp)
+target_link_libraries(bench_thread_sync_replay PRIVATE
+    vc_thread_sync_replay nlohmann_json::nlohmann_json)
+target_compile_definitions(bench_thread_sync_replay PRIVATE
+    VC_REPLAY_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+    VC_REPLAY_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+    VC_REPLAY_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    VC_REPLAY_ARCHITECTURE="${_render_benchmark_architecture}")
+vc_register_test_target(bench_thread_sync_replay)
+
+vc_add_test(NAME test_thread_sync_replay_native
+    LIBS doctest::doctest vc_thread_sync_replay)
+add_test(NAME test_thread_pool_dispatch_fixture
+    COMMAND bench_thread_pool_dispatch
+        --mode futures --workers 4 --tasks 8 --work-iterations 100 --rounds 32)
+vc_register_ctest(test_thread_pool_dispatch_fixture bench_thread_pool_dispatch)
+add_test(NAME test_thread_pool_dispatch_work_kinds
+    COMMAND bench_thread_pool_dispatch
+        --mode serial --workers 1 --tasks 1 --work-iterations 257
+        --rounds 3 --warmup-rounds 1 --work-kind mixed
+        --working-set-bytes 65536)
+vc_register_ctest(test_thread_pool_dispatch_work_kinds bench_thread_pool_dispatch)
+add_test(NAME test_thread_pool_dispatch_grid_sample
+    COMMAND bench_thread_pool_dispatch
+        --mode serial --workers 1 --tasks 1 --work-iterations 257
+        --rounds 3 --warmup-rounds 1 --work-kind grid-sample
+        --working-set-bytes 65536)
+vc_register_ctest(test_thread_pool_dispatch_grid_sample bench_thread_pool_dispatch)
+foreach(_work_kind mixed-grid-phase mixed-grid-random)
+    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
+    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
+        COMMAND bench_thread_pool_dispatch
+            --mode serial --workers 1 --tasks 1 --work-iterations 260
+            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
+            --working-set-bytes 65536)
+    vc_register_ctest(
+        test_thread_pool_dispatch_${_work_kind_test_suffix}
+        bench_thread_pool_dispatch)
+endforeach()
+foreach(_work_kind cache-read cache-write)
+    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
+    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
+        COMMAND bench_thread_pool_dispatch
+            --mode serial --workers 1 --tasks 1 --work-iterations 257
+            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
+            --working-set-bytes 65536)
+    vc_register_ctest(
+        test_thread_pool_dispatch_${_work_kind_test_suffix}
+        bench_thread_pool_dispatch)
+endforeach()
+foreach(_work_kind
+        read-four read-eight write-eight
+        line-read-one line-read-eight line-write-one line-write-eight
+        line-r1-w1 line-r8-w1 line-r1-w8 line-r8-w8)
+    string(REPLACE "-" "_" _work_kind_test_suffix "${_work_kind}")
+    add_test(NAME test_thread_pool_dispatch_${_work_kind_test_suffix}
+        COMMAND bench_thread_pool_dispatch
+            --mode serial --workers 1 --tasks 1 --work-iterations 257
+            --rounds 3 --warmup-rounds 1 --work-kind ${_work_kind}
+            --working-set-bytes 65536)
+    vc_register_ctest(
+        test_thread_pool_dispatch_${_work_kind_test_suffix}
+        bench_thread_pool_dispatch)
+endforeach()
+add_test(NAME test_thread_pool_dispatch_gate_open
+    COMMAND bench_thread_pool_dispatch
+        --mode futures-gate-open --workers 4 --tasks 4
+        --work-iterations 100 --rounds 32)
+vc_register_ctest(test_thread_pool_dispatch_gate_open bench_thread_pool_dispatch)
+add_test(NAME test_thread_pool_dispatch_gate_closed
+    COMMAND bench_thread_pool_dispatch
+        --mode futures-gate-closed --workers 4 --tasks 4
+        --work-iterations 100 --rounds 32)
+vc_register_ctest(test_thread_pool_dispatch_gate_closed bench_thread_pool_dispatch)
+add_test(NAME test_thread_pool_dispatch_idle
+    COMMAND bench_thread_pool_dispatch
+        --mode futures --workers 4 --tasks 4
+        --work-iterations 100 --rounds 32 --idle-nanoseconds 100000)
+vc_register_ctest(test_thread_pool_dispatch_idle bench_thread_pool_dispatch)
+add_test(NAME test_thread_pool_dispatch_lifecycle
+    COMMAND bench_thread_pool_dispatch
+        --mode lifecycle --workers 4 --tasks 1
+        --work-iterations 0 --rounds 32)
+vc_register_ctest(test_thread_pool_dispatch_lifecycle bench_thread_pool_dispatch)
+
+if(VC_RUN_RENDER_BENCHMARKS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        find_program(VC_VALGRIND_EXECUTABLE valgrind REQUIRED)
+    endif()
+
+    set(_render_benchmark_output "${CMAKE_BINARY_DIR}/render-benchmark")
+    set(_render_benchmark_runner
+        "${PROJECT_SOURCE_DIR}/scripts/run_render_callgrind.py")
+    set(_render_benchmark_baseline
+        "${PROJECT_SOURCE_DIR}/core/test/data/render_callgrind_baseline.json")
+    set(_render_benchmark_calibration
+        "${PROJECT_SOURCE_DIR}/core/test/data/render_callgrind_model.json")
+    add_test(NAME test_render_callgrind_runner_model
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_run_render_callgrind.py")
+    vc_register_ctest(test_render_callgrind_runner_model bench_render_synthetic)
+    add_test(NAME test_render_valgrind_ci_driver
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_run_render_valgrind_ci.py")
+    vc_register_ctest(test_render_valgrind_ci_driver bench_render_synthetic)
+    add_test(NAME test_render_valgrind_ci_no_site
+        COMMAND ${Python3_EXECUTABLE} -S
+            "${PROJECT_SOURCE_DIR}/core/test/test_render_valgrind_ci_no_site.py"
+            --replay-engine $<TARGET_FILE:bench_thread_sync_replay>)
+    vc_register_ctest(test_render_valgrind_ci_no_site bench_thread_sync_replay)
+    add_test(NAME test_thread_sync_replay_model
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_run_thread_sync_replay.py")
+    set_tests_properties(test_thread_sync_replay_model PROPERTIES
+        ENVIRONMENT
+            "VC_THREAD_SYNC_REPLAY_BIN=$<TARGET_FILE:bench_thread_sync_replay>")
+    vc_register_ctest(test_thread_sync_replay_model bench_thread_pool_dispatch)
+    add_test(NAME test_render_attribution_sensitivity
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_evaluate_render_attribution_sensitivity.py")
+    vc_register_ctest(test_render_attribution_sensitivity bench_thread_pool_dispatch)
+    add_test(NAME test_thread_dispatch_shared_calibration
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_dispatch_shared.py")
+    vc_register_ctest(test_thread_dispatch_shared_calibration bench_thread_pool_dispatch)
+    add_test(NAME test_thread_sync_synthetic_calibration
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_sync_synthetic.py")
+    vc_register_ctest(test_thread_sync_synthetic_calibration bench_thread_pool_dispatch)
+    add_test(NAME test_synthetic_event_cost_calibration
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs.py")
+    vc_register_ctest(test_synthetic_event_cost_calibration bench_thread_pool_dispatch)
+    add_test(NAME test_synthetic_event_cost_minimax_calibration
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs_minimax.py")
+    vc_register_ctest(test_synthetic_event_cost_minimax_calibration bench_thread_pool_dispatch)
+    add_test(NAME test_synthetic_event_feature_calibration
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_features.py")
+    vc_register_ctest(test_synthetic_event_feature_calibration bench_thread_pool_dispatch)
+    add_test(NAME test_render_thread_calibration_validation
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_validate_render_thread_calibration.py")
+    vc_register_ctest(test_render_thread_calibration_validation bench_render_synthetic)
+    add_test(NAME test_fixed_cpu_frequency_runner
+        COMMAND ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/core/test/test_run_with_fixed_cpu_frequency.py")
+    vc_register_ctest(test_fixed_cpu_frequency_runner bench_thread_pool_dispatch)
+    foreach(_fixture serial parallel)
+        foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
+            set(_test_name "bench_render_callgrind_${_fixture}_${_scenario}")
+            add_test(NAME ${_test_name}
+                COMMAND ${Python3_EXECUTABLE} ${_render_benchmark_runner}
+                    --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    --fixture ${_fixture}
+                    --scenario ${_scenario}
+                    --output-dir ${_render_benchmark_output}
+                    --baseline ${_render_benchmark_baseline}
+                    --calibration ${_render_benchmark_calibration}
+                    --check)
+            set_tests_properties(${_test_name} PROPERTIES
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120)
+            if(_fixture STREQUAL "parallel")
+                set_tests_properties(${_test_name} PROPERTIES RUN_SERIAL TRUE)
+            endif()
+            vc_register_ctest(${_test_name} bench_render_synthetic)
+        endforeach()
+    endforeach()
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        set(_render_valgrind_ci_root
+            "${CMAKE_BINARY_DIR}/render-valgrind-ci")
+        set(_render_valgrind_ci_runner
+            "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py")
+        set(_render_valgrind_ci_common
+            "${PROJECT_SOURCE_DIR}/scripts/render_valgrind_common.py")
+        set(_render_valgrind_ci_model
+            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_model.json")
+        set(_render_valgrind_ci_reference
+            "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_reference.json")
+        set(_render_valgrind_ci_script_deps
+            "${_render_valgrind_ci_runner}"
+            "${_render_valgrind_ci_common}"
+            "${PROJECT_SOURCE_DIR}/scripts/native_thread_sync_replay.py"
+            "${PROJECT_SOURCE_DIR}/scripts/thread_sync_trace.py")
+        set(_render_valgrind_ci_measure_outputs)
+        set(_render_valgrind_ci_gate_outputs)
+
+        foreach(_fixture serial parallel)
+            foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
+                set(_case_dir
+                    "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
+                set(_callgrind_dir "${_case_dir}/callgrind")
+                set(_callgrind_artifact
+                    "${_callgrind_dir}/artifact.json")
+                set(_callgrind_byproducts
+                    "${_callgrind_dir}/callgrind.out"
+                    "${_callgrind_dir}/callgrind.out-01"
+                    "${_callgrind_dir}/metadata.callgrind.json")
+                if(_fixture STREQUAL "parallel")
+                    list(APPEND _callgrind_byproducts
+                        "${_callgrind_dir}/callgrind.out-02"
+                        "${_callgrind_dir}/callgrind.out-03"
+                        "${_callgrind_dir}/callgrind.out-04"
+                        "${_callgrind_dir}/callgrind.out-05")
+                endif()
+                add_custom_command(
+                    OUTPUT "${_callgrind_artifact}"
+                    BYPRODUCTS ${_callgrind_byproducts}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        "${_callgrind_dir}"
+                    COMMAND ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
+                        callgrind
+                        --benchmark $<TARGET_FILE:bench_render_synthetic>
+                        --fixture ${_fixture}
+                        --scenario ${_scenario}
+                        --repetitions 1
+                        --output-dir "${_callgrind_dir}"
+                        --artifact "${_callgrind_artifact}"
+                    DEPENDS
+                        bench_render_synthetic
+                        ${_render_valgrind_ci_script_deps}
+                    VERBATIM)
+
+                set(_drd_artifact)
+                if(_fixture STREQUAL "parallel")
+                    set(_drd_dir "${_case_dir}/drd")
+                    set(_drd_artifact "${_drd_dir}/artifact.json")
+                    add_custom_command(
+                        OUTPUT "${_drd_artifact}"
+                        BYPRODUCTS
+                            "${_drd_dir}/drd.log"
+                            "${_drd_dir}/events.jsonl"
+                            "${_drd_dir}/metadata.drd.json"
+                        COMMAND ${CMAKE_COMMAND} -E make_directory
+                            "${_drd_dir}"
+                        COMMAND ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
+                            drd
+                            --benchmark $<TARGET_FILE:bench_render_synthetic>
+                            --scenario ${_scenario}
+                            --repetitions 1
+                            --output-dir "${_drd_dir}"
+                            --artifact "${_drd_artifact}"
+                        DEPENDS
+                            bench_render_synthetic
+                            ${_render_valgrind_ci_script_deps}
+                        VERBATIM)
+                endif()
+
+                set(_evaluation "${_case_dir}/evaluation.json")
+                set(_evaluation_command
+                    ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
+                    evaluate
+                    --callgrind "${_callgrind_artifact}"
+                    --model "${_render_valgrind_ci_model}"
+                    --replay-engine $<TARGET_FILE:bench_thread_sync_replay>
+                    --output "${_evaluation}")
+                if(_fixture STREQUAL "parallel")
+                    list(APPEND _evaluation_command --drd "${_drd_artifact}")
+                endif()
+                add_custom_command(
+                    OUTPUT "${_evaluation}"
+                    COMMAND ${_evaluation_command}
+                    DEPENDS
+                        "${_callgrind_artifact}"
+                        ${_drd_artifact}
+                        bench_thread_sync_replay
+                        "${_render_valgrind_ci_model}"
+                        ${_render_valgrind_ci_script_deps}
+                    VERBATIM)
+                list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
+
+                set(_gate "${_case_dir}/checked.json")
+                set(_gate_command
+                    ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
+                    evaluate
+                    --callgrind "${_callgrind_artifact}"
+                    --model "${_render_valgrind_ci_model}"
+                    --reference "${_render_valgrind_ci_reference}"
+                    --replay-engine $<TARGET_FILE:bench_thread_sync_replay>
+                    --output "${_gate}")
+                if(_fixture STREQUAL "parallel")
+                    list(APPEND _gate_command --drd "${_drd_artifact}")
+                endif()
+                add_custom_command(
+                    OUTPUT "${_gate}"
+                    BYPRODUCTS "${_case_dir}/checked.failed.json"
+                    COMMAND ${_gate_command}
+                    DEPENDS
+                        "${_evaluation}"
+                        "${_callgrind_artifact}"
+                        ${_drd_artifact}
+                        bench_thread_sync_replay
+                        "${_render_valgrind_ci_model}"
+                        "${_render_valgrind_ci_reference}"
+                        ${_render_valgrind_ci_script_deps}
+                    VERBATIM)
+                list(APPEND _render_valgrind_ci_gate_outputs "${_gate}")
+            endforeach()
+        endforeach()
+
+        add_custom_target(render_valgrind_ci_measure
+            DEPENDS ${_render_valgrind_ci_measure_outputs})
+        add_custom_target(render_valgrind_ci
+            DEPENDS ${_render_valgrind_ci_gate_outputs})
+    endif()
 endif()
 
 add_executable(bench_lasagna_line_edit bench_lasagna_line_edit.cpp)
 target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
+vc_register_test_target(bench_lasagna_line_edit)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_lasagna_line_edit)
+    vc_register_ctest(bench_lasagna_line_edit bench_lasagna_line_edit)
 endif()
 
 add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
 target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
+vc_register_test_target(bench_fiber_intersections)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_fiber_intersections COMMAND bench_fiber_intersections --help)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_fiber_intersections)
+    vc_register_ctest(bench_fiber_intersections bench_fiber_intersections)
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
@@ -332,6 +728,7 @@ if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
 endif()
 add_executable(sanitizer_canary ${_canary_srcs})
 set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+vc_register_test_target(sanitizer_canary)
 
 # ctest: PASS_REGULAR_EXPRESSION must match in stdout/stderr for the test
 # to pass. The canary aborts via the sanitizer runtime on success, or
@@ -341,6 +738,7 @@ set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORC
 # by unrelated failures and would mask a regression.
 function(_add_canary name arg regex)
     add_test(NAME ${name} COMMAND sanitizer_canary ${arg})
+    vc_register_ctest(${name} sanitizer_canary)
     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
 endfunction()
 
@@ -370,6 +768,7 @@ vc_add_test(NAME test_gridstore_malformed)
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
 vc_add_test(NAME test_pherc0172_live)
+set_property(TEST test_pherc0172_live APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_tiff)
 
@@ -377,6 +776,7 @@ vc_add_test(NAME test_normalgridtools)
 
 # Live S3: opens the PHerc 0172 volume and reads small chunks.
 vc_add_test(NAME test_volume_live_s3)
+set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
 
@@ -389,6 +789,7 @@ vc_add_test(NAME test_http_fetch_errors)
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.
 vc_add_test(NAME test_normal_grid_live)
+set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normalgridtools_real)
 
@@ -409,6 +810,8 @@ vc_add_test(NAME test_quadsurface_basics)
 vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_remote_file_cache)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
@@ -434,6 +837,22 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
+
+# The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
+# with the command-line tool so the tested code is the shipped code).
+vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
+
+# End-to-end CLI contract for the same tool: exit codes, report
+# serialization, collection envelope. Needs the binary, so it only exists
+# in configurations that build the apps -- the test shards configure with
+# VC_BUILD_APPS=OFF and apps/ returns before the target is created, which
+# would make the TARGET_FILE expression a configure error.
+if(TARGET vc_tifxyz_selfcross)
+    vc_add_test(NAME test_tifxyz_selfcross_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
+    add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 

@@ -7,6 +7,8 @@
 class PlaneSurface : public Surface
 {
 public:
+    // Plane parameter coordinates and basis vectors use level-0/base-volume
+    // voxel units. Viewer camera scale is framebuffer pixels per such unit.
     //Surface API
     void move(cv::Vec3f &ptr, const cv::Vec3f &offset) override;
     bool valid(const cv::Vec3f &ptr, const cv::Vec3f &offset = {0,0,0}) override { return true; };
