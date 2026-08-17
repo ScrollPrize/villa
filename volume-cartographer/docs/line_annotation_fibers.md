@@ -95,11 +95,25 @@ Right press pauses the mouse hover-follow exactly as the space bar does, so the
 and cancels the pan. While the keyboard is panning, the strips stay centered
 on the current-position line and scroll underneath it.
 
+`/` and `0` both place a control point on the blue current-position dot in the
+current cut, so points can be dropped without leaving the keyboard while
+arrow-panning along the line. The key stops an active pan, because the
+placement renumbers the line positions the pan is steering by, but unlike a
+click in the cut view it leaves hover-follow exactly as it was rather than
+resuming it; the panes then land on the new control point once the
+re-optimized line arrives. It does nothing while the Max CP distance rule
+blocks placement at the current position, and stays inert while a spinbox or
+combo box has the keyboard.
+
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
-the initial centerline length and the base-voxel extrapolation distance, and
-Reset views. The toolbar retains the fiber-global Lasagna/Fiber model
-selector. Tag pills are edited directly from the same toolbar.
+the initial centerline length and the base-voxel extrapolation distance,
+Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
+the shared cursor cross between the four generated panes: on by default,
+remembered between sessions, and independent of the global "Sync cursor across
+views" setting, so unchecking it keeps the cross in the hovered pane even while
+that global setting is on. The toolbar retains the fiber-global Lasagna/Fiber
+model selector. Tag pills are edited directly from the same toolbar.
 
 Switching the fiber-global mode asks for confirmation before it re-optimizes,
 because the switch overwrites the current line: to Fiber model it re-traces

@@ -700,6 +700,24 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         extrapolationApply->setEnabled(false);
     });
     annotationMenu->addSeparator();
+    _mirrorCursorAction = annotationMenu->addAction(tr("Mirror cursor across panes"));
+    _mirrorCursorAction->setCheckable(true);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _mirrorCursorAction->setChecked(
+            settings
+                .value(vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES,
+                       vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES_DEFAULT)
+                .toBool());
+    }
+    _mirrorCursorAction->setToolTip(
+        tr("Checked: hovering one generated pane draws the cursor cross in the other three.\n"
+           "Unchecked: the cross stays in the hovered pane."));
+    connect(_mirrorCursorAction, &QAction::toggled, this, [this](bool checked) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES, checked);
+        applyLinkedCursorMirroringToPanes();
+    });
     _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
     _resetViewsAction->setEnabled(false);
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
@@ -1106,6 +1124,7 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
 {
+    _optimizationBusy = busy;
     if (_fiberOptimizationCombo) {
         _fiberOptimizationCombo->setEnabled(!busy);
     }
@@ -1489,6 +1508,25 @@ void LineAnnotationDialog::connectLinkedCursorMirroring(
             &CVolumeViewerView::sendMouseLeftView,
             this,
             [this, pane]() { requestLinkedCursorMirror(pane, std::nullopt); }));
+    }
+    applyLinkedCursorMirroringToPanes();
+}
+
+void LineAnnotationDialog::applyLinkedCursorMirroringToPanes()
+{
+    const bool enabled = !_mirrorCursorAction || _mirrorCursorAction->isChecked();
+    for (const auto& panePtr : _linkedCursorPanes) {
+        auto* pane = panePtr.data();
+        if (!pane) {
+            continue;
+        }
+        pane->setLinkedCursorMirroringSuppressed(!enabled);
+        if (!enabled) {
+            // Same clear-on-disable as the global toggle: drops a mirrored cross
+            // that is on screen right now, and with it the shared position
+            // readout, which would otherwise sit frozen at the last hover.
+            pane->setLinkedCursorVolumePoint(std::nullopt);
+        }
     }
 }
 
@@ -4400,6 +4438,33 @@ bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
     return true;
 }
 
+bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
+{
+    // A click cannot reach a busy dialog because the optimization overlay
+    // covers the panes, but the keys still arrive; the controller would reject
+    // the request and leave _pendingPlacementFocus behind for the running
+    // optimization to land on.
+    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationBusy ||
+        !controlPointPlacementAllowedAt(_currentLinePosition)) {
+        return false;
+    }
+    // The current cut's plane origin, i.e. exactly the blue dot the key aims at.
+    const cv::Vec3f volumePoint = interpolatedLinePoint(_currentLinePosition);
+    if (!finitePoint(volumePoint)) {
+        return false;
+    }
+    // Unlike a click in the cut pane this leaves hover-follow as the user set it
+    // -- the key is meant to be tapped mid-pan, where follow is deliberately
+    // paused -- so, like the shift-click snap, it has to stop the pan itself:
+    // the placement renumbers the line positions the pan is steering by.
+    cancelArrowPan();
+    _pendingPlacementFocus = volumePoint;
+    emit generatedControlPointRequested(_generatedViews.currentCutName,
+                                        volumePoint,
+                                        _currentLinePosition);
+    return true;
+}
+
 bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
@@ -4415,6 +4480,18 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
         resetGeneratedNormalOffsets();
         event->accept();
         return true;
+    }
+    // Handled here rather than as a QShortcut so keyboardFocusIsTextEntry() can
+    // keep "0" typeable in the menu's spinboxes and the toolbar combos. The
+    // keypad variants carry KeypadModifier (numpad / always, numpad 0 with Num
+    // Lock on), so mask it out rather than require NoModifier outright.
+    if ((event->key() == Qt::Key_Slash || event->key() == Qt::Key_0) &&
+        (event->modifiers() & ~Qt::KeypadModifier) == Qt::NoModifier &&
+        !event->isAutoRepeat() && !keyboardFocusIsTextEntry()) {
+        if (placeControlPointAtCurrentLinePosition()) {
+            event->accept();
+            return true;
+        }
     }
     // Arrows drive the control-point pan here; accepting all four also keeps the
     // viewers' own 64 px arrow panning out of this dialog.
