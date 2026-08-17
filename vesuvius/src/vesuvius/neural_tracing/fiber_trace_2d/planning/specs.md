@@ -2661,8 +2661,13 @@
   them into deterministic six-cell-per-axis spatial tiles, and samples one
   dense ZYX box per tile with the complete fitting/peak/gradient halo. Cell
   fits traverse indexed tile storage in the same canonical ZYX order as an
-  independent halo. Tile halos may overlap, but the decoded chunk cache avoids
-  repeated source-chunk reads. Deterministic tile splitting and the worker
+  independent halo. Each physical tile voxel has one compact float32 position,
+  pre-normalized direction, presence, and gradient record. A cell owns only
+  32-bit tile indices and cell-local gradient-validity bytes, avoiding expanded
+  observation copies across overlapping support regions. The public expanded
+  observation API and production indexed path share one templated fitter. Tile
+  halos may overlap, but the decoded chunk cache avoids repeated source-chunk
+  reads. Deterministic tile splitting and the worker
   count keep coordinate vectors, decoded samples, and cell scratch under the
   aggregate sample-memory budget; lower-level sampling uses one thread.
   Results and worker failures are stored by canonical cell index, retain

@@ -116,6 +116,52 @@ TEST_CASE("fiber anchor peak kernel defaults integrate across neighboring cells"
               2.0)) == doctest::Approx(std::exp(-0.5)));
 }
 
+TEST_CASE("normalized float observations preserve anchor geometry")
+{
+    auto value = config();
+    value.peakGradientWeight = 0.0;
+    const auto original = cellObservations(
+        4, directionAtDegrees(20.0), directionAtDegrees(70.0));
+    auto compactEquivalent = original;
+    for (auto& observation : compactEquivalent) {
+        for (int axis = 0; axis < 3; ++axis) {
+            observation.positionPredictionXYZ[axis] = static_cast<double>(
+                static_cast<float>(observation.positionPredictionXYZ[axis]));
+        }
+        const double norm = std::sqrt(
+            observation.direction.dot(observation.direction));
+        REQUIRE(norm > 0.0);
+        observation.direction /= norm;
+        for (int axis = 0; axis < 3; ++axis) {
+            observation.direction[axis] = static_cast<double>(
+                static_cast<float>(observation.direction[axis]));
+        }
+        observation.presence = static_cast<double>(
+            static_cast<float>(observation.presence));
+    }
+
+    const auto baseline = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, original, value);
+    const auto compact = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, compactEquivalent, value);
+
+    CHECK(compact.retainedAnchorCount == baseline.retainedAnchorCount);
+    for (size_t component = 0; component < baseline.components.size();
+         ++component) {
+        const auto& expected = baseline.components[component];
+        const auto& actual = compact.components[component];
+        CHECK(actual.retained == expected.retained);
+        CHECK(actual.rejectionReason == expected.rejectionReason);
+        if (!expected.retained)
+            continue;
+        CHECK(axialDot(actual.anchor.axisXYZ, expected.anchor.axisXYZ) >
+              1.0 - 1.0e-6);
+        CHECK(cv::norm(
+                  actual.anchor.positionPredictionXYZ -
+                  expected.anchor.positionPredictionXYZ) < 1.0e-3);
+    }
+}
+
 std::filesystem::path temporaryDirectory(const std::string& tag)
 {
     std::mt19937_64 generator(std::random_device{}());

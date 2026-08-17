@@ -1,28 +1,25 @@
-# Task: robust sampled-direction anchor refinement
+# Task: staged fiberlet anchor acceleration
 
-Replace angular line search in local anchor fitting with robust iterative
-aggregation of the network's sampled fiber directions. Previous component
-directions may condition sample assignment and outlier detection, but every
-updated direction must be calculated directly from currently assigned sampled
-directions.
+Continue accelerating anchor and fiberlet extraction from commit `73fe64e09`.
+Implement the remaining optimization options one at a time. After every option,
+run the canonical 5,000-base-voxel replay, report wall/CPU phase measurements,
+anchor and fiberlet populations, DP work, and replay failures, then stop for
+user review before beginning the next option.
 
-Support up to two potentially close directions in a cell. Use deterministic
-competitive spatial/directional assignment, detect uncertain or blended
-direction outliers adaptively, and trim at most 20% of each component's
-presence/spatial evidence mass. Coherent one-direction components with no
-detected outliers must retain all evidence.
+The ordered options are:
 
-Remove the existing pre-refinement 10-degree merge so supported close modes
-reach robust competition; ordinary downstream NMS remains responsible for
-true duplicate anchors.
+1. Build compact normalized observations once per extraction tile and let each
+   cell reference them instead of rebuilding expanded observation records.
+2. Reuse robust-proposal assignments, Gaussian/alignment state, baseline
+   objective, and final membership across adjacent fitting phases.
+3. Batch peak candidates or use a contiguous spatial index so repeated peak
+   responses share observation loads without the locality regression of the
+   rejected linked-bin experiment.
+4. Evaluate reducing robust refinement from two passes to one, with explicit
+   visual and replay-quality review.
+5. Reduce duplicated prediction sampling across overlapping anchor-tile halos
+   while preserving enough independent jobs for 32-worker load balance.
 
-Apply line-search fractions only to transverse spatial position. Stop after
-testing a displacement at or below the existing 0.5-prediction-voxel peak-grid
-spacing; leave finer position fitting to the subsequent direction-conditioned
-peak refinement. Components whose retained samples do not define a unique
-direction must be removed rather than assigned stale state.
-
-Measure performance and compare anchor/fiberlet populations, geometry,
-downstream replay failures, and repeatability. Exact numeric or artifact
-identity is not required; the user will inspect visual quality after the
-measured implementation is available.
+Small floating-point differences are acceptable. Persistent geometry and file
+formats must remain valid, and each checkpoint must retain acceptable replay
+quality before it can become the next baseline.

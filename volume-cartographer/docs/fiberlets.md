@@ -585,6 +585,13 @@ serialized output remain double precision. This halves the repeatedly scanned
 peak-search working set; small differences in peak ties and downstream path
 node counts are expected.
 
+Production extraction also constructs each sampled tile voxel once as a compact
+float32 observation with a pre-normalized direction. Each overlapping cell
+stores only canonical-order 32-bit indices into that tile plus its cell-local
+gradient-validity byte. The public expanded-observation fitting API uses the
+same templated fitter. Tile observation storage and maximum cell-reference
+scratch are included in the existing concurrent sample-memory budget.
+
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and
 accepted steps, and backtracking evaluations. Observation visits are counted
