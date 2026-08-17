@@ -60,6 +60,16 @@ def test_anchor_stage_layers_are_enabled_by_default_with_explicit_opt_out():
     ).anchor_stages
 
 
+def test_replay_cli_uses_a_direct_manifest_without_an_index():
+    parser = build_parser()
+    args = parser.parse_args(["presence.zarr", "--replay", "visualization.json"])
+    assert args.replay == "visualization.json"
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["presence.zarr", "--replay", "visualization.json", "--index", "0"]
+        )
+
+
 def test_replay_loader_enables_anchor_stages_by_default():
     assert load_fiber_replay_bundle.__kwdefaults__ == {"include_anchor_stages": True}
 
@@ -81,8 +91,12 @@ def _write_visual_replay(tmp_path):
     (visual_dir / "paths").mkdir(parents=True)
     replay_dir.mkdir(parents=True)
     reference = b"# vc_fiber_replay_reference version 2\nv 0 0 0\nv 8 0 0\nl 1 2\n"
-    greedy = b"# vc_greedy_fiber_replay version 2\ng segment_0\nv 0 0 0\nv 4 0 0\nl 1 2\n"
-    fiberlet = b"# vc_fiberlet_graph_replay version 2\ng segment_0\nv 0 0 0\nv 6 0 0\nl 1 2\n"
+    greedy = (
+        b"# vc_greedy_fiber_replay version 2\ng segment_0\nv 0 0 0\nv 4 0 0\nl 1 2\n"
+    )
+    fiberlet = (
+        b"# vc_fiberlet_graph_replay version 2\ng segment_0\nv 0 0 0\nv 6 0 0\nl 1 2\n"
+    )
     failure_obj = b"# vc_fiber_replay_failure version 2\nv 4 0 0\np 1\n"
     local_files = {
         "replay/reference.obj": reference,
@@ -215,17 +229,19 @@ def _write_visual_replay(tmp_path):
             "completed_reference_arc_base": 8.0,
         },
         "failure_counts": {"greedy": 1, "fiberlet": 0},
-        "visualizations": [{
-            "global_index": 0,
-            "tracer": "greedy",
-            "tracer_failure_index": 0,
-            "reference_arc_base": 4.0,
-            "reference_arc_fraction": 0.5,
-            "manifest": {
-                "path": "runs/abc/visualizations/000000/manifest.json",
-                "content_hash": _fnv1a64(manifest),
-            },
-        }],
+        "visualizations": [
+            {
+                "global_index": 0,
+                "tracer": "greedy",
+                "tracer_failure_index": 0,
+                "reference_arc_base": 4.0,
+                "reference_arc_fraction": 0.5,
+                "manifest": {
+                    "path": "runs/abc/visualizations/000000/manifest.json",
+                    "content_hash": _fnv1a64(manifest),
+                },
+            }
+        ],
         "artifacts": {
             key: {"path": f"runs/abc/{key}", "content_hash": _fnv1a64(content)}
             for key, content in full_files.items()
@@ -233,33 +249,47 @@ def _write_visual_replay(tmp_path):
     }
     path = tmp_path / "fiber_replay.json"
     path.write_text(json.dumps(bundle))
-    return path
+    return visual_dir / "manifest.json"
 
 
-def test_loads_indexed_dual_replay_visualization(tmp_path):
-    replay = load_fiber_replay_bundle(
-        _write_visual_replay(tmp_path), 0, include_anchor_stages=False
-    )
+def test_loads_direct_dual_replay_visualization(tmp_path):
+    manifest = _write_visual_replay(tmp_path)
+    (tmp_path / "fiber_replay.json").unlink()
+    replay = load_fiber_replay_bundle(manifest, include_anchor_stages=False)
 
     assert replay.status == "distance_above_threshold"
     assert replay.crop_xyzwhd == (0, 0, 0, 9, 2, 2)
     assert replay.prediction_shape_zyx == (4, 4, 4)
     np.testing.assert_array_equal(replay.reference_zyx, [[0, 0, 0], [0, 0, 8]])
     np.testing.assert_array_equal(replay.greedy_segments_zyx[0], [[0, 0, 0], [0, 0, 4]])
-    np.testing.assert_array_equal(replay.fiberlet_segments_zyx[0], [[0, 0, 0], [0, 0, 6]])
+    np.testing.assert_array_equal(
+        replay.fiberlet_segments_zyx[0], [[0, 0, 0], [0, 0, 6]]
+    )
     np.testing.assert_array_equal(replay.failure_zyx, [[0, 0, 4]])
     assert replay.tube_radius_base_voxels == 8.0
     assert replay.fiber_manifest_content_hash == "fnv1a64:1"
 
 
 def test_replay_rejects_missing_visualizations(tmp_path):
-    path = _write_visual_replay(tmp_path)
+    _write_visual_replay(tmp_path)
+    path = tmp_path / "fiber_replay.json"
     bundle = json.loads(path.read_text())
     bundle["visualizations"] = []
     path.write_text(json.dumps(bundle))
 
-    with pytest.raises(ValueError, match="no visualizations"):
-        load_fiber_replay_bundle(path, 0, include_anchor_stages=False)
+    with pytest.raises(ValueError, match="no visualization"):
+        load_fiber_replay_bundle(path, include_anchor_stages=False)
+
+
+def test_aggregate_replay_points_to_a_direct_manifest(tmp_path):
+    _write_visual_replay(tmp_path)
+    with pytest.raises(
+        ValueError,
+        match=r"open 'runs/abc/visualizations/000000/manifest.json' directly",
+    ):
+        load_fiber_replay_bundle(
+            tmp_path / "fiber_replay.json", include_anchor_stages=False
+        )
 
 
 def _reload_fixture():
@@ -293,7 +323,6 @@ def _reload_fixture():
     )
     replay = FiberReplayBundle(
         path=Path("/tmp/fiber_replay.json"),
-        visualization_index=0,
         tracer="greedy",
         tracer_failure_index=0,
         status="distance_above_threshold",
@@ -943,10 +972,10 @@ def test_fiberlet_filter_keeps_features_and_width_across_empty_replacement():
 
 def test_replay_bundle_rejects_hash_mismatch(tmp_path):
     path = _write_visual_replay(tmp_path)
-    (tmp_path / "runs" / "abc" / "replay" / "greedy.obj").write_text("changed")
+    (path.parent / "replay" / "greedy.obj").write_text("changed")
 
     with pytest.raises(ValueError, match="hash mismatch"):
-        load_fiber_replay_bundle(path, 0, include_anchor_stages=False)
+        load_fiber_replay_bundle(path, include_anchor_stages=False)
 
 
 def test_replay_bundle_rejects_lexical_escape(tmp_path):
@@ -956,24 +985,24 @@ def test_replay_bundle_rejects_lexical_escape(tmp_path):
     path.write_text(json.dumps(bundle))
 
     with pytest.raises(ValueError, match="escapes"):
-        load_fiber_replay_bundle(path, 0, include_anchor_stages=False)
+        load_fiber_replay_bundle(path, include_anchor_stages=False)
 
 
 def test_replay_bundle_rejects_symlink_escape(tmp_path):
     path = _write_visual_replay(tmp_path)
     outside = tmp_path.parent / f"{tmp_path.name}-outside.obj"
     outside.write_text("outside")
-    symlink = tmp_path / "runs" / "abc" / "replay" / "escape.obj"
+    symlink = path.parent / "replay" / "escape.obj"
     symlink.symlink_to(outside)
     bundle = json.loads(path.read_text())
     bundle["artifacts"]["replay/greedy.obj"] = {
-        "path": "runs/abc/replay/escape.obj",
+        "path": "replay/escape.obj",
         "content_hash": _fnv1a64(b"outside"),
     }
     path.write_text(json.dumps(bundle))
 
     with pytest.raises(ValueError, match="escapes"):
-        load_fiber_replay_bundle(path, 0, include_anchor_stages=False)
+        load_fiber_replay_bundle(path, include_anchor_stages=False)
     outside.unlink()
 
 

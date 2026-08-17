@@ -975,6 +975,20 @@ int main(int argc, char** argv)
             const auto resultBundle = vc::fiber_tracer::writeFiberReplayBundle(options.outputDirectory, bundle);
             std::cerr << "fiber_replay_stage stage=publish status=completed"
                       << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - publishStart).count() << '\n';
+            for (const auto& visualization : resultBundle.at("visualizations")) {
+                std::cout << "fiber_replay_visualization"
+                          << " tracer=" << visualization.at("tracer")
+                          << " tracer_failure_index="
+                          << visualization.at("tracer_failure_index")
+                          << " manifest="
+                          << std::filesystem::absolute(
+                                 options.outputDirectory /
+                                 visualization.at("manifest").at("path")
+                                     .get<std::string>())
+                                 .lexically_normal()
+                                 .string()
+                          << '\n';
+            }
             std::cout << "fiber_replay status=reference_end"
                       << " greedy_failures=" << resultBundle.at("failure_counts").at("greedy")
                       << " fiberlet_failures=" << resultBundle.at("failure_counts").at("fiberlet") << " greedy_reference_fraction=1"

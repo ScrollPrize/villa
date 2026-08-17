@@ -1,7 +1,8 @@
-# Task: bounded fiberlet replay comparison
+# Task: direct replay visualization manifests
 
-Add `--length N` to `vc_fiberlets fiberlet-replay`. The positive base-voxel
-length starts at the first control point and limits graph extraction, greedy
-replay, fiberlet replay, failure fractions, persisted reference geometry, and
-optional failure visualizations to the same interval. Omission retains the full
-remaining reference.
+Restore the original viewer workflow for fiber replay diagnostics. Each
+failure-local visualization produced by `vc_fiberlets fiberlet-replay --vis`
+must be directly openable with `view_fiber_presence --replay <manifest>`.
+Remove the viewer's `--index` argument and retain the aggregate
+`fiber_replay.json` only as a report/index. Preserve loading of existing strict
+version-1 single-visualization replay artifacts.

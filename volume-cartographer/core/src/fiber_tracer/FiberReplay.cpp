@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 
 namespace vc::fiber_tracer
@@ -567,6 +568,35 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         std::filesystem::rename(staging, finalGeneration);
 
     const std::filesystem::path generationRelative = std::filesystem::path("runs") / generationName;
+    std::set<std::string> publishedVisualizationAliases;
+    for (auto& entry : visualizationIndex) {
+        const auto localRelative = std::filesystem::path(
+            entry.at("manifest_relative_path").get<std::string>());
+        auto local = nlohmann::json::parse(
+            readFile(finalGeneration / localRelative));
+        for (auto& [key, descriptor] : local.at("artifacts").items()) {
+            const auto artifactRelative = std::filesystem::path(
+                descriptor.at("path").get<std::string>());
+            descriptor["path"] =
+                (generationRelative / localRelative.parent_path() /
+                 artifactRelative)
+                    .generic_string();
+        }
+        std::ostringstream aliasName;
+        aliasName << "fiber_replay_visualization."
+                  << entry.at("tracer").get<std::string>() << '.'
+                  << std::setfill('0') << std::setw(6)
+                  << entry.at("tracer_failure_index").get<size_t>() << ".json";
+        const std::string alias = aliasName.str();
+        const std::string content = local.dump(2) + "\n";
+        vc::core::util::atomicWriteString(outputDirectory / alias, content);
+        publishedVisualizationAliases.insert(alias);
+        entry["manifest"] = {
+            {"path", alias},
+            {"content_hash", hashString(content)},
+        };
+        entry.erase("manifest_relative_path");
+    }
     nlohmann::json root = {
         {"format", "vc_fiber_replay"},
         {"version", 2},
@@ -596,15 +626,18 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
             {"content_hash", artifactHash(finalGeneration / relative)},
         };
     }
-    for (auto& entry : root["visualizations"]) {
-        const auto relative = std::filesystem::path(entry.at("manifest_relative_path").get<std::string>());
-        entry["manifest"] = {
-            {"path", (generationRelative / relative).generic_string()},
-            {"content_hash", artifactHash(finalGeneration / relative)},
-        };
-        entry.erase("manifest_relative_path");
-    }
     vc::core::util::atomicWriteString(outputDirectory / "fiber_replay.json", root.dump(2) + "\n");
+    constexpr std::string_view kVisualizationPrefix =
+        "fiber_replay_visualization.";
+    for (const auto& entry : std::filesystem::directory_iterator(outputDirectory)) {
+        if (!entry.is_regular_file())
+            continue;
+        const std::string name = entry.path().filename().string();
+        if (name.starts_with(kVisualizationPrefix) &&
+            !publishedVisualizationAliases.contains(name)) {
+            std::filesystem::remove(entry.path());
+        }
+    }
     return root;
 }
 

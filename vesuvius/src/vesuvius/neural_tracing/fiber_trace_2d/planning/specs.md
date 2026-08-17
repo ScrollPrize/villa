@@ -2974,8 +2974,12 @@
   complete segmented evaluator results and
   matches, failure arrays/counts, trace OBJ/JSON descriptors, and an ordered
   visualization index. Runs publish an immutable `runs/<content-hash>`
-  generation before atomically replacing `fiber_replay.json`. Experimental
-  earlier formats have no compatibility or repair behavior.
+  generation before atomically replacing `fiber_replay.json`. Each visualization
+  also has an atomically replaced stable top-level alias named
+  `fiber_replay_visualization.<tracer>.<failure-index>.json`; its artifact paths
+  reference the current immutable generation. Strict version-1
+  single-visualization artifacts remain readable and normalize their trace and
+  optional graph route into the current segmented display representation.
 - Visualization is disabled by default. `--vis` creates one diagnostic tube per
   failure using exact reference bounds `[failure_arc-along,
   failure_arc+along]` clipped to the evaluated interval and the configured
@@ -2983,11 +2987,12 @@
   the evaluators are not rerun. The local manifest also references cropped
   full-run reference and both segmented evaluator traces plus its failure
   marker. `--along` is visualization-only and does not limit evaluation.
-- The napari viewer requires `--replay` plus `--index`. It rejects a root made
-  without `--vis`, out-of-range indexes, manual crop/anchor/path arguments,
-  path escapes, hash/geometry mismatches, and malformed strict-v2 state. Reload
-  retains the selected `{tracer, tracer_failure_index}` identity rather than a
-  possibly changed global index and does not reload the external presence Zarr.
+- The napari viewer takes one direct visualization manifest through `--replay`;
+  there is no index argument. An aggregate root is discovery/reporting data and
+  is rejected with either a directly usable manifest path or a request to rerun
+  with `--vis`. The viewer rejects manual crop/anchor/path arguments, path
+  escapes, hash/geometry mismatches, and malformed strict state. Reload rereads
+  the same stable direct alias and does not reload the external presence Zarr.
 - `vc_fiberlets benchmark` runs the exact shared local tube anchor/path
   extraction without artifacts. Its interval starts at the first control point
   and, when `--along` is omitted, extends through the reference end. An explicit
@@ -3064,9 +3069,10 @@
   centers, refinement offsets, and fiberlets even when an artifact population
   is empty, plus all five anchor stages unless diagnostic loading was explicitly
   disabled. The
-  `Reload artifacts` command always rereads
-  the original root `fiber_replay.json`, follows its newly published immutable
-  hashed generation, and passes it through the startup strict loaders.
+  `Reload artifacts` command always rereads the original direct visualization
+  manifest, follows its newly published immutable hashed generation, and passes
+  it through the startup strict loaders. Version-1 inputs reread their original
+  single-visualization path.
 - In-process artifact reload requires the same failed-replay artifact contract,
   fiber-prediction manifest content hash, prediction shape/scale, displayed
   Zarr level transform, base crop, extraction-tube radius, and the same optional

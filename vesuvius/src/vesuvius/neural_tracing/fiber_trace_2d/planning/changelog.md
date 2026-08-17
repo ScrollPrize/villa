@@ -524,3 +524,6 @@
 - Added replay-only `--length` in base voxels so extraction, both evaluators,
   failure reporting, persisted geometry, and visualizations share one bounded
   interval; omission retains complete-reference replay.
+- Restored direct replay visualization manifests without a viewer index,
+  published stable per-tracer failure aliases for reload, and restored loading
+  of strict version-1 single-visualization replay artifacts.

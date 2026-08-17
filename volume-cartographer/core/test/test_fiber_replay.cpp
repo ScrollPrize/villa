@@ -180,5 +180,53 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
     invalid.fiberletReplay.completedReferenceArcBase = 3.0;
     CHECK_THROWS_AS(vc::fiber_tracer::writeFiberReplayBundle(directory, invalid), std::invalid_argument);
     CHECK(readText(directory / "fiber_replay.json") == first);
+
+    input.sources = {
+        {"fiber_manifest", "fiber.json"},
+        {"fiber_manifest_content_hash", "fnv1a64:1"},
+        {"normal_manifest", "normal.json"},
+        {"normal_manifest_content_hash", "fnv1a64:2"},
+        {"fiber_json", "reference.json"},
+        {"fiber_json_content_hash", "fnv1a64:3"},
+    };
+    input.greedyReplay.failures.push_back({
+        0, 0, "distance_above_threshold", 2.0, 0.5,
+        {2.0, 0.0, 0.0}, cv::Vec3d{2.0, 1.0, 0.0}, 1,
+    });
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {8, 8, 8};
+    grid.predictionToBaseScale = 1.0;
+    vc::fiber_tracer::FiberReplayVisualizationInput visualization;
+    visualization.tracer = vc::fiber_tracer::FiberReplayTracer::Greedy;
+    visualization.tube = vc::fiber_tracer::makeFiberReplayTube(
+        input.request.fiber.linePointsXyzBase, 2.0, 2.0, 2.0, grid, 2);
+    visualization.anchors.grid = grid;
+    visualization.anchorArtifact.sourceLocator = "fiber.json";
+    visualization.anchorArtifact.manifestContentHash = "fnv1a64:1";
+    visualization.paths.grid = grid;
+    visualization.paths.anchorCellSizePredictionVoxels = 2;
+    visualization.pathArtifact.fiberManifestLocator = "fiber.json";
+    visualization.pathArtifact.fiberManifestContentHash = "fnv1a64:1";
+    visualization.pathArtifact.normalManifestLocator = "normal.json";
+    visualization.pathArtifact.normalManifestContentHash = "fnv1a64:2";
+    visualization.pathArtifact.anchorArtifactLocator = "anchors/anchors.json";
+    visualization.pathArtifact.anchorArtifactContentHash = "fnv1a64:3";
+    input.visualizations.push_back(std::move(visualization));
+    const auto visualBundle =
+        vc::fiber_tracer::writeFiberReplayBundle(directory, input);
+    REQUIRE(visualBundle.at("visualizations").size() == 1);
+    const auto alias = visualBundle.at("visualizations").at(0).at("manifest").at("path").get<std::string>();
+    CHECK(alias == "fiber_replay_visualization.greedy.000000.json");
+    REQUIRE(std::filesystem::exists(directory / alias));
+    const auto local = nlohmann::json::parse(readText(directory / alias));
+    CHECK(local.at("format") == "vc_fiber_replay_visualization");
+    CHECK(local.at("artifacts").at("replay/reference.obj").at("path").get<std::string>().starts_with("runs/"));
+
+    input.visualizations.clear();
+    input.greedyReplay.failures.clear();
+    const auto noVisualBundle =
+        vc::fiber_tracer::writeFiberReplayBundle(directory, input);
+    CHECK(noVisualBundle.at("visualizations").empty());
+    CHECK_FALSE(std::filesystem::exists(directory / alias));
     std::filesystem::remove_all(directory);
 }

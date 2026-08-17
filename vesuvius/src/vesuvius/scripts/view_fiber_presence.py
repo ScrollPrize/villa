@@ -66,7 +66,6 @@ class AnchorStageGeometry:
 @dataclass(frozen=True)
 class FiberReplayBundle:
     path: Path
-    visualization_index: int
     tracer: str
     tracer_failure_index: int
     status: str
@@ -766,7 +765,9 @@ def _resolve_replay_artifacts(
         try:
             artifact = (base / relative).resolve(strict=True)
         except OSError as exc:
-            raise ValueError(f"cannot resolve {label} artifact {relative}: {exc}") from exc
+            raise ValueError(
+                f"cannot resolve {label} artifact {relative}: {exc}"
+            ) from exc
         if not artifact.is_relative_to(base):
             raise ValueError(f"{label} artifact path {relative} escapes the bundle")
         try:
@@ -781,7 +782,7 @@ def _resolve_replay_artifacts(
 
 def _strict_segment_list(value: object, name: str) -> tuple[np.ndarray, ...]:
     if not isinstance(value, list):
-        raise ValueError(f"{name} must be a list")
+        raise ValueError(f"{name} must be a list")  # noqa: TRY004
     return tuple(
         _strict_xyz_points(segment, f"{name}[{index}]", 1)
         for index, segment in enumerate(value)
@@ -821,132 +822,251 @@ def _read_segmented_replay_obj(path: Path, header: str) -> tuple[np.ndarray, ...
     for record in records:
         if any(index < 1 or index > len(vertices) for index in record):
             raise ValueError(f"{path}: replay OBJ index is out of range")
-        canonical = record[:-1] if len(record) == 2 and record[0] == record[1] else record
+        canonical = (
+            record[:-1] if len(record) == 2 and record[0] == record[1] else record
+        )
         used.extend(canonical)
-        result.append(_strict_xyz_points([vertices[index - 1] for index in canonical], str(path), 1))
+        result.append(
+            _strict_xyz_points(
+                [vertices[index - 1] for index in canonical], str(path), 1
+            )
+        )
     if used != list(range(1, len(vertices) + 1)):
         raise ValueError(f"{path}: replay OBJ topology does not match its vertices")
     return tuple(result)
 
 
-def load_fiber_replay_bundle(
-    path: str | Path, index: int, *, include_anchor_stages: bool = True
+def _load_legacy_fiber_replay(
+    bundle_path: Path, root: dict, include_anchor_stages: bool
 ) -> FiberReplayBundle:
-    """Load one indexed visualization from a strict dual-replay v2 bundle."""
-    bundle_path = Path(path).expanduser().resolve()
-    try:
-        root = json.loads(bundle_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read replay bundle {bundle_path}: {exc}") from exc
-    root_fields = {
+    required = {
         "format",
         "version",
         "coordinates",
         "sources",
         "bindings",
         "trace_config",
-        "fiberlet_config",
-        "requested_length_base_voxels",
-        "reference_begin_arc_base",
-        "reference_end_arc_base",
-        "reference_length_base_voxels",
+        "status",
+        "termination_reason",
         "reference_points_base_xyz",
-        "greedy",
-        "fiberlet",
-        "failure_counts",
-        "visualizations",
+        "trace_points_base_xyz",
+        "comparison_trace_points_base_xyz",
+        "comparison",
+        "trace_cumulative_losses",
+        "matching",
+        "postroll",
+        "failure_trace_point_index",
+        "failure_reference_arc_base",
+        "fiberlet_replay",
+        "tube",
+        "volume_crop_base_xyzwhd",
         "artifacts",
     }
-    if (
-        not isinstance(root, dict)
-        or set(root) != root_fields
-        or root.get("format") != "vc_fiber_replay"
-        or root.get("version") != 2
-    ):
-        raise ValueError("replay bundle must be vc_fiber_replay version 2")
+    if set(root) != required:
+        raise ValueError("legacy replay bundle fields do not match version 1")
     coordinates = {
         "position_order": "XYZ",
         "position_space": "base_volume",
         "distance_unit": "base_voxels",
     }
     if root["coordinates"] != coordinates:
-        raise ValueError("replay bundle coordinate contract is unsupported")
-    begin_arc = root["reference_begin_arc_base"]
-    end_arc = root["reference_end_arc_base"]
-    interval_length = root["reference_length_base_voxels"]
-    requested_length = root["requested_length_base_voxels"]
-    if (
-        any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            for value in (begin_arc, end_arc, interval_length)
-        )
-        or begin_arc < 0
-        or end_arc <= begin_arc
-        or not math.isclose(interval_length, end_arc - begin_arc)
-        or (
-            requested_length is not None
-            and (
-                isinstance(requested_length, bool)
-                or not isinstance(requested_length, (int, float))
-                or not math.isfinite(requested_length)
-                or requested_length <= 0
-            )
-        )
-    ):
-        raise ValueError("replay bundle selected interval is invalid")
-    for name in ("greedy", "fiberlet"):
-        replay = root[name]
-        if (
-            not isinstance(replay, dict)
-            or not math.isclose(replay.get("reference_begin_arc_base", math.nan), begin_arc)
-            or not math.isclose(replay.get("reference_end_arc_base", math.nan), end_arc)
-            or not math.isclose(replay.get("completed_reference_arc_base", math.nan), end_arc)
-        ):
-            raise ValueError(f"{name} replay interval differs from the root bundle")
-    _resolve_replay_artifacts(
-        bundle_path.parent,
-        root["artifacts"],
-        {
-            "replay/reference.obj",
-            "replay/greedy.json",
-            "replay/greedy.obj",
-            "replay/fiberlet.json",
-            "replay/fiberlet.obj",
-        },
-        "replay bundle",
-    )
-    visualizations = root["visualizations"]
-    if not isinstance(visualizations, list) or not visualizations:
-        raise ValueError("replay bundle contains no visualizations; rerun with --vis")
-    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(visualizations):
-        raise ValueError(f"replay visualization index {index} is out of range")
-    selected = visualizations[index]
-    index_fields = {
-        "global_index",
-        "tracer",
-        "tracer_failure_index",
-        "reference_arc_base",
-        "reference_arc_fraction",
-        "manifest",
+        raise ValueError("legacy replay coordinate contract is unsupported")
+    sources = root["sources"]
+    source_fields = {
+        "fiber_manifest",
+        "fiber_manifest_content_hash",
+        "normal_manifest",
+        "normal_manifest_content_hash",
+        "fiber_json",
+        "fiber_json_content_hash",
     }
+    binding = root.get("bindings", {}).get("prediction")
+    shape = binding.get("prediction_shape_zyx") if isinstance(binding, dict) else None
+    scale = (
+        binding.get("prediction_to_base_scale") if isinstance(binding, dict) else None
+    )
     if (
-        not isinstance(selected, dict)
-        or set(selected) != index_fields
-        or selected.get("global_index") != index
-        or selected.get("tracer") not in {"greedy", "fiberlet"}
-        or not isinstance(selected.get("tracer_failure_index"), int)
+        not isinstance(sources, dict)
+        or set(sources) != source_fields
+        or any(not isinstance(value, str) or not value for value in sources.values())
+        or not isinstance(binding, dict)
+        or binding.get("mode") != "canonical_stored_grid"
+        or not isinstance(shape, list)
+        or len(shape) != 3
+        or any(not isinstance(item, int) or item <= 0 for item in shape)
+        or isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not math.isfinite(scale)
+        or scale <= 0
     ):
-        raise ValueError("replay visualization index entry is invalid")
-    descriptor = selected["manifest"]
-    manifest_path = _resolve_replay_artifacts(
-        bundle_path.parent, {"manifest": descriptor}, {"manifest"}, "replay index"
-    )["manifest"]
+        raise ValueError("legacy replay source or prediction binding is invalid")
+    reference_xyz = _strict_xyz_points(
+        root["reference_points_base_xyz"], "reference_points_base_xyz", 1
+    )
+    trace_xyz = _strict_xyz_points(
+        root["trace_points_base_xyz"], "trace_points_base_xyz", 1
+    )
+    comparison_trace_xyz = _strict_xyz_points(
+        root["comparison_trace_points_base_xyz"],
+        "comparison_trace_points_base_xyz",
+        1,
+    )
+    status = root["status"]
+    failed = status in {"failure_with_postroll", "failure_truncated"}
+    if status not in {
+        "failure_with_postroll",
+        "failure_truncated",
+        "no_failure",
+        "trace_terminated_before_failure",
+    }:
+        raise ValueError("legacy replay status is invalid")
+    crop_value = root["volume_crop_base_xyzwhd"]
+    if failed:
+        if not isinstance(crop_value, list) or len(crop_value) != 6:
+            raise ValueError("legacy failure replay crop is invalid")
+        try:
+            crop = parse_crop(",".join(str(item) for item in crop_value))
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError("legacy failure replay crop is invalid") from exc
+    else:
+        if crop_value is not None:
+            raise ValueError("legacy nonfailure replay must not contain a crop")
+        low = np.floor(reference_xyz.min(axis=0)).astype(int)
+        high = np.ceil(reference_xyz.max(axis=0)).astype(int) + 1
+        crop = (*low.tolist(), *(high - low).tolist())
+    artifacts = root["artifacts"]
+    if not isinstance(artifacts, dict):
+        raise ValueError("legacy replay artifacts must be an object")  # noqa: TRY004
+    resolved = _resolve_replay_artifacts(
+        bundle_path.parent, artifacts, set(artifacts), "legacy replay"
+    )
+    reference_obj = _read_replay_obj(
+        resolved["replay/reference.obj"],
+        "# vc_fiber_replay_reference version 1",
+        False,
+    )
+    trace_obj = _read_replay_obj(
+        resolved["replay/trace.obj"],
+        "# vc_fiber_replay_trace version 1",
+        False,
+    )
+    if not np.array_equal(reference_obj, reference_xyz) or not np.array_equal(
+        trace_obj, comparison_trace_xyz
+    ):
+        raise ValueError("legacy replay OBJ geometry differs from its JSON")
+    fiberlet_xyz: tuple[np.ndarray, ...] = ()
+    fiberlet = root["fiberlet_replay"]
+    if isinstance(fiberlet, dict) and fiberlet.get("status") not in {None, "not_run"}:
+        route = _strict_xyz_points(
+            fiberlet.get("route_points_base_xyz"),
+            "fiberlet_replay.route_points_base_xyz",
+            1,
+        )
+        fiberlet_xyz = (route,)
+        if "replay/fiberlet_trace.obj" in resolved:
+            route_obj = _read_replay_obj(
+                resolved["replay/fiberlet_trace.obj"],
+                "# vc_fiberlet_graph_replay version 1",
+                False,
+            )
+            if not np.array_equal(route_obj, route):
+                raise ValueError("legacy fiberlet OBJ differs from its JSON")
+    failure_zyx = None
+    radius = None
+    anchors_obj = None
+    anchor_cells_obj = None
+    paths_obj = None
+    anchor_stages: tuple[AnchorStageGeometry, ...] = ()
+    if failed:
+        failure_index = root["failure_trace_point_index"]
+        if not isinstance(failure_index, int) or not 0 <= failure_index < len(
+            trace_xyz
+        ):
+            raise ValueError("legacy replay failure index is invalid")
+        failure_obj = _read_replay_obj(
+            resolved["replay/failure.obj"],
+            "# vc_fiber_replay_failure version 1",
+            True,
+        )
+        if not np.array_equal(failure_obj[0], trace_xyz[failure_index]):
+            raise ValueError("legacy replay failure OBJ differs from its JSON")
+        failure_zyx = failure_obj[:, ::-1].copy()
+        tube = root["tube"]
+        radius = tube.get("radius_base_voxels") if isinstance(tube, dict) else None
+        if (
+            isinstance(radius, bool)
+            or not isinstance(radius, (int, float))
+            or not math.isfinite(radius)
+            or radius <= 0
+        ):
+            raise ValueError("legacy replay tube radius is invalid")
+        anchors_obj = resolved["anchors/anchors.obj"]
+        anchor_cells_obj = resolved["anchors/anchor_cells.obj"]
+        paths_obj = resolved["paths/fiberlets.obj"]
+        if include_anchor_stages:
+            anchor_stages = load_anchor_stage_directory(
+                resolved["anchors/stages/initialized.json"].parent,
+                anchors_obj,
+                crop,
+            )
+    return FiberReplayBundle(
+        path=bundle_path,
+        tracer="greedy",
+        tracer_failure_index=0,
+        status=status,
+        crop_xyzwhd=crop,
+        prediction_shape_zyx=tuple(shape),
+        prediction_to_base_scale=float(scale),
+        fiber_manifest_content_hash=sources["fiber_manifest_content_hash"],
+        reference_zyx=reference_xyz[:, ::-1].copy(),
+        greedy_segments_zyx=(comparison_trace_xyz[:, ::-1].copy(),),
+        fiberlet_segments_zyx=tuple(route[:, ::-1].copy() for route in fiberlet_xyz),
+        failure_zyx=failure_zyx,
+        tube_radius_base_voxels=float(radius) if radius is not None else None,
+        anchors_obj=anchors_obj,
+        anchor_cells_obj=anchor_cells_obj,
+        anchor_stages=anchor_stages,
+        paths_obj=paths_obj,
+    )
+
+
+def load_fiber_replay_bundle(
+    path: str | Path, *, include_anchor_stages: bool = True
+) -> FiberReplayBundle:
+    """Load one directly selected replay visualization manifest."""
+    bundle_path = Path(path).expanduser().resolve()
     try:
-        local = json.loads(manifest_path.read_text())
+        root = json.loads(bundle_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read replay visualization manifest: {exc}") from exc
+        raise ValueError(f"cannot read replay bundle {bundle_path}: {exc}") from exc
+    if not isinstance(root, dict):
+        raise ValueError("replay manifest root must be an object")  # noqa: TRY004
+    if root.get("format") == "vc_fiber_replay" and root.get("version") == 1:
+        return _load_legacy_fiber_replay(bundle_path, root, include_anchor_stages)
+    if root.get("format") == "vc_fiber_replay" and root.get("version") == 2:
+        visualizations = root.get("visualizations")
+        if not isinstance(visualizations, list) or not visualizations:
+            raise ValueError(
+                "aggregate replay contains no visualization manifests; "
+                "rerun fiberlet-replay with --vis"
+            )
+        paths = [
+            item.get("manifest", {}).get("path")
+            for item in visualizations
+            if isinstance(item, dict)
+        ]
+        usable = next((item for item in paths if isinstance(item, str)), None)
+        suffix = f"; open {usable!r} directly" if usable is not None else ""
+        raise ValueError(
+            "aggregate replay is an index, not a visualization manifest" + suffix
+        )
+    local = root
+    manifest_path = bundle_path
+    coordinates = {
+        "position_order": "XYZ",
+        "position_space": "base_volume",
+        "distance_unit": "base_voxels",
+    }
     local_fields = {
         "format",
         "version",
@@ -971,18 +1091,36 @@ def load_fiber_replay_bundle(
     ):
         raise ValueError("replay visualization manifest is invalid")
     identity = local["identity"]
-    if identity != {
-        "global_index": index,
-        "tracer": selected["tracer"],
-        "tracer_failure_index": selected["tracer_failure_index"],
-    }:
-        raise ValueError("replay visualization identity differs from its index")
-    if local["sources"] != root["sources"]:
-        raise ValueError("replay visualization sources differ from the root bundle")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"global_index", "tracer", "tracer_failure_index"}
+        or not isinstance(identity["global_index"], int)
+        or identity["global_index"] < 0
+        or identity["tracer"] not in {"greedy", "fiberlet"}
+        or not isinstance(identity["tracer_failure_index"], int)
+        or identity["tracer_failure_index"] < 0
+    ):
+        raise ValueError("replay visualization identity is invalid")
+    sources = local["sources"]
+    source_fields = {
+        "fiber_manifest",
+        "fiber_manifest_content_hash",
+        "normal_manifest",
+        "normal_manifest_content_hash",
+        "fiber_json",
+        "fiber_json_content_hash",
+    }
+    if (
+        not isinstance(sources, dict)
+        or set(sources) != source_fields
+        or any(not isinstance(value, str) or not value for value in sources.values())
+    ):
+        raise ValueError("replay visualization sources are invalid")
     binding = local["prediction_binding"]
-    root_binding = root.get("bindings", {}).get("prediction")
-    if binding != root_binding or not isinstance(binding, dict):
-        raise ValueError("replay visualization prediction binding is invalid")
+    if not isinstance(binding, dict):
+        raise ValueError(  # noqa: TRY004
+            "replay visualization prediction binding is invalid"
+        )
     shape = binding.get("prediction_shape_zyx")
     scale = binding.get("prediction_to_base_scale")
     if (
@@ -1035,11 +1173,12 @@ def load_fiber_replay_bundle(
     if (
         not isinstance(failure, dict)
         or set(failure) != failure_fields
-        or failure.get("index") != selected["tracer_failure_index"]
+        or failure.get("index") != identity["tracer_failure_index"]
         or not isinstance(failure.get("reason"), str)
         or not failure["reason"]
-        or not math.isclose(failure.get("reference_arc_base", math.nan), selected["reference_arc_base"])
-        or not math.isclose(failure.get("reference_arc_fraction", math.nan), selected["reference_arc_fraction"])
+        or not _finite_number(failure.get("reference_arc_base"))
+        or not _finite_number(failure.get("reference_arc_fraction"))
+        or not 0.0 <= failure["reference_arc_fraction"] <= 1.0
     ):
         raise ValueError("replay visualization failure metadata is invalid")
     marker_xyz = _strict_xyz_points(
@@ -1062,6 +1201,18 @@ def load_fiber_replay_bundle(
         or isinstance(tube.get("radius_base_voxels"), bool)
         or not math.isfinite(tube["radius_base_voxels"])
         or tube["radius_base_voxels"] <= 0
+        or not _finite_number(tube.get("begin_arc_base"))
+        or not _finite_number(tube.get("end_arc_base"))
+        or tube["begin_arc_base"] > failure["reference_arc_base"]
+        or tube["end_arc_base"] < failure["reference_arc_base"]
+        or tube["begin_arc_base"] >= tube["end_arc_base"]
+        or not isinstance(tube.get("cells_zyx"), list)
+        or any(
+            not isinstance(cell, list)
+            or len(cell) != 3
+            or any(not isinstance(value, int) or value < 0 for value in cell)
+            for cell in tube["cells_zyx"]
+        )
         or not np.array_equal(
             _strict_xyz_points(tube["reference_points_base_xyz"], "tube reference", 2),
             reference_xyz,
@@ -1088,7 +1239,10 @@ def load_fiber_replay_bundle(
         "paths/fiberlet_graph.json",
     }
     resolved = _resolve_replay_artifacts(
-        manifest_path.parent, local["artifacts"], expected_artifacts, "replay visualization"
+        manifest_path.parent,
+        local["artifacts"],
+        expected_artifacts,
+        "replay visualization",
     )
     if not np.array_equal(
         _read_replay_obj(
@@ -1104,7 +1258,8 @@ def load_fiber_replay_bundle(
             resolved["replay/greedy.obj"], "# vc_greedy_fiber_replay version 2"
         )
     ) or any(
-        not np.array_equal(left, right) for left, right in zip(greedy_xyz, greedy_obj, strict=True)
+        not np.array_equal(left, right)
+        for left, right in zip(greedy_xyz, greedy_obj, strict=True)
     ):
         raise ValueError("greedy replay OBJ differs from visualization metadata")
     if len(fiberlet_xyz) != len(
@@ -1112,7 +1267,8 @@ def load_fiber_replay_bundle(
             resolved["replay/fiberlet.obj"], "# vc_fiberlet_graph_replay version 2"
         )
     ) or any(
-        not np.array_equal(left, right) for left, right in zip(fiberlet_xyz, fiberlet_obj, strict=True)
+        not np.array_equal(left, right)
+        for left, right in zip(fiberlet_xyz, fiberlet_obj, strict=True)
     ):
         raise ValueError("fiberlet replay OBJ differs from visualization metadata")
     failure_obj = _read_replay_obj(
@@ -1129,16 +1285,10 @@ def load_fiber_replay_bundle(
             resolved["anchors/anchors.obj"],
             crop,
         )
-    sources = root["sources"]
-    if not isinstance(sources, dict) or not isinstance(
-        sources.get("fiber_manifest_content_hash"), str
-    ):
-        raise ValueError("replay sources are invalid")
     return FiberReplayBundle(
         path=bundle_path,
-        visualization_index=index,
-        tracer=selected["tracer"],
-        tracer_failure_index=selected["tracer_failure_index"],
+        tracer=identity["tracer"],
+        tracer_failure_index=identity["tracer_failure_index"],
         status=failure["reason"],
         crop_xyzwhd=crop,
         prediction_shape_zyx=tuple(shape),
@@ -2339,8 +2489,7 @@ def replay_distance_transform_base(
         else tuple(trace_segments_base_zyx)
     )
     polylines = (("reference", reference_base_zyx),) + tuple(
-        (f"trace segment {index}", value)
-        for index, value in enumerate(trace_segments)
+        (f"trace segment {index}", value) for index, value in enumerate(trace_segments)
     )
     for name, polyline_value in polylines:
         polyline = np.asarray(polyline_value, dtype=np.float64)
@@ -3429,7 +3578,6 @@ def launch_viewer(
             current_artifacts = replay_state["artifacts"]
             replacement_replay = load_fiber_replay_bundle(
                 replay_root_path,
-                current_replay.visualization_index,
                 include_anchor_stages=bool(current_replay.anchor_stages),
             )
             replacement_artifacts = load_replay_visual_artifacts(replacement_replay)
@@ -3591,12 +3739,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--replay",
-        help="Strict indexed vc_fiber_replay version-2 bundle",
-    )
-    parser.add_argument(
-        "--index",
-        type=int,
-        help="Visualization index in the replay bundle",
+        help="Direct replay visualization manifest",
     )
     parser.add_argument(
         "--anchor-stages",
@@ -3618,14 +3761,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.replay is None and args.crop is None:
             raise ValueError("manual mode requires --crop")
-        if args.replay is not None and args.index is None:
-            raise ValueError("replay mode requires --index")
-        if args.replay is None and args.index is not None:
-            raise ValueError("--index requires --replay")
         replay = (
             load_fiber_replay_bundle(
                 args.replay,
-                args.index,
                 include_anchor_stages=args.anchor_stages,
             )
             if args.replay

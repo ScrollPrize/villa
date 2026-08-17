@@ -440,31 +440,34 @@ generations exist is `fiber_replay.json` atomically replaced. The root stores
 the two scale bindings, requested and forced-effective trace configuration,
 requested/effective interval metadata, the exact selected reference geometry,
 complete segmented greedy and fiberlet results, failure arrays/counts, and an
-ordered visualization index with contained relative paths and hashes. It does
-not store the external presence-Zarr path. The experimental earlier replay
-formats have no compatibility or repair path.
+ordered visualization report with paths and hashes. For every failure, `--vis`
+also atomically publishes a stable directly openable alias named
+`fiber_replay_visualization.<tracer>.<failure-index>.json` and prints its
+absolute path. These aliases point into the current immutable generation and
+are the viewer inputs. The root does not store the external presence-Zarr path.
+Strict version-1 single-visualization replay files remain directly loadable.
 
 Load the bundle and the independently selected presence Zarr with:
 
 ```bash
 python -m vesuvius.scripts.view_fiber_presence \
   /path/to/fiber-presence.ome.zarr \
-  --replay /tmp/fiber-replay/fiber_replay.json \
-  --index 0
+  --replay /tmp/fiber-replay/fiber_replay_visualization.greedy.000000.json
 ```
 
-Replay mode requires an indexed visualization and rejects roots made without
-`--vis`, out-of-range indexes, and manual crop/anchor/path arguments. It verifies
-the external Zarr shape/scale, bundle paths, hashes, strict geometry, and the
-selected `{tracer, tracer_failure_index}` identity. Reference, segmented greedy
+Replay mode accepts one direct visualization manifest and has no index
+argument. Passing the aggregate root reports a directly usable manifest path,
+or requests regeneration with `--vis` if none exist. It rejects manual
+crop/anchor/path arguments and verifies the external Zarr shape/scale, artifact
+paths, hashes, strict geometry, and manifest identity. Reference, segmented greedy
 trace, segmented fiberlet trace, failure marker, anchors, stages, fiberlets,
 and presence are separate toggleable layers. The established clipping, radius,
 width, size, and path-quality controls apply to the selected local generation.
 
-`Reload artifacts` rereads the root and relocates the selected tracer/local
-failure identity even if its global visualization index changed. It does not
-reload the presence Zarr and preserves display state. Incompatible or malformed
-replacement output is rejected before replacing any layer.
+`Reload artifacts` rereads the same stable direct manifest, which is atomically
+updated by a later replay publication. It does not reload the presence Zarr and
+preserves display state. Incompatible or malformed replacement output is
+rejected before replacing any layer.
 
 This remains an overcomplete diagnostic collection. There is no path-quality
 cutoff, degree selection, overlap deduplication, extension, H/V, or winding
