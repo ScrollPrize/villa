@@ -177,3 +177,33 @@
 - All three runs retained exactly 2603 anchors, 51,782 searched / 26,494
   accepted fiberlets, 170,813 sampled fiberlet voxels, 50,822,225 DP nodes,
   2 greedy failures, and 1 fiberlet failure.
+
+## Checkpoint 6: Direct Packed-Key DP Index
+
+- Replaced each candidate's `unordered_map<uint32_t, size_t>` node index with
+  a direct `uint32_t` table indexed by the existing packed local-lattice key.
+  Missing entries use an explicit sentinel; node/transition order and all DP
+  cost calculations are unchanged.
+- The canonical workload stored 50,718,661 nodes in 109,469,154 table slots,
+  for 46.3% occupancy. Aggregate direct-table payload is about 438 MB versus
+  the prior 1.22 GB hash-storage estimate; both figures sum per-candidate
+  transient storage rather than concurrent peak RSS.
+
+  | metric | minimum | median | maximum | checkpoint 5 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 13.21 s | 13.26 s | 13.33 s | 13.54 s |
+  | total CPU | 335.40 s | 337.69 s | 340.78 s | 345.87 s |
+  | anchor wall | 6.62 s | 6.63 s | 6.72 s | 6.65 s |
+  | anchor CPU | 172.44 s | 173.35 s | 175.77 s | 174.07 s |
+  | fiberlet wall | 5.94 s | 5.97 s | 6.01 s | not recorded |
+  | fiberlet CPU | 160.77 s | 162.17 s | 162.83 s | not recorded |
+  | direct-index work | 0.390 s | 0.398 s | 0.402 s | not recorded |
+  | peak RSS | 2.49 GiB | 2.50 GiB | 2.55 GiB | not recorded |
+
+- Median total wall improved 2.1% and total CPU improved 2.4%. Anchor timing
+  stayed within run noise; the gain is isolated to fiberlet search.
+- All runs retained exactly 2603 anchors, 51,782 searched / 26,494 accepted
+  fiberlets, 170,813 sampled voxels, 50,822,225 DP nodes, 282,121,134
+  transition lookups, 2 greedy failures, and 1 fiberlet failure. Their
+  `fiber_replay.json` files have identical SHA-256
+  `eab2edfb769986649c900ebf5b5ab72fb2d615c07ba06e88cd3a1868cecaa98b`.

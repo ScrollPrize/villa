@@ -535,7 +535,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=7` row. Both commands use the same field
+`fiberlet_extraction_profile version=8` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -617,6 +617,14 @@ active tile working set and retained raw samples and remains bounded by
 `anchor_unique_tile_prediction_voxels` is the exact global union of all dense
 tile boxes. The union is measured with a coordinate-compressed box sweep and
 does not alter extraction work.
+
+Version 8 replaces the per-candidate packed-node-key hash map with a direct
+`uint32_t` table over the already validated packed-key range. The table uses an
+invalid sentinel for absent corridor nodes; node generation, transition order,
+DP state, and path-cost evaluation are unchanged. Peak search memory accounting
+uses the direct table's actual payload. `fiberlet_dp_node_index_entries` counts
+stored nodes and `fiberlet_dp_node_index_slots` counts allocated direct-table
+slots, exposing occupancy and sparse-lattice overhead.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

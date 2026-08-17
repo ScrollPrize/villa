@@ -177,6 +177,7 @@ struct FiberletPathReport {
     size_t interpolationCornerInsertions = 0;
     size_t interpolatedScoringPoints = 0;
     size_t dpNodeIndexEntries = 0;
+    size_t dpNodeIndexSlots = 0;
     size_t dpTransitionLookups = 0;
     size_t dpReachedStateVisits = 0;
     size_t dpRelaxations = 0;

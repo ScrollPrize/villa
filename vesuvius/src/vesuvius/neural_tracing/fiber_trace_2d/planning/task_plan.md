@@ -103,6 +103,21 @@ wall improved from 13.69 to 13.54 seconds and anchor CPU from 184.80 to 174.07
 seconds. Anchor/fiberlet populations, DP work, and replay failures were
 unchanged.
 
+## Checkpoint 6: Direct Packed-Key DP Index
+
+1. Replace each candidate's `unordered_map` from packed lattice key to node
+   index with a bounded direct `uint32_t` table over the already validated key
+   range.
+2. Preserve node generation, transition order, missing-node behavior, DP
+   state, and cost calculations exactly.
+3. Account the direct table rather than estimated hash storage in peak search
+   memory, and report allocated slots so sparse-lattice overhead is visible.
+
+Measured candidate: 50,718,661 retained nodes occupied 109,469,154 direct
+slots (46.3%). Median total wall improved from 13.54 to 13.26 seconds and
+median total CPU from 345.87 to 337.69 seconds. Work/quality populations and
+the replay artifact were unchanged. The direct index was accepted and retained.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

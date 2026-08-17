@@ -17,6 +17,9 @@
 - Paired overlapping anchor tiles into bounded sampling jobs and reused raw
   prediction samples across pair halos. This reduced canonical sampler
   submissions by 32.6% with unchanged extraction output.
+- Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
+  reducing canonical replay wall time by 2.1% with unchanged path work and
+  replay quality.
 
 # 2026-08-17: fiberlet extraction profiling
 

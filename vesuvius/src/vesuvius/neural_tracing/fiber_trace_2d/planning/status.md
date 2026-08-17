@@ -25,3 +25,8 @@
 - [x] Implement deterministic bounded tile-pair sample reuse.
 - [x] Benchmark checkpoint 5 with unchanged extraction and replay output.
 - [x] Add focused cross-tile reuse coverage and documentation.
+- [x] Obtain approval for checkpoint 6 direct packed-key DP indexing.
+- [x] Replace per-candidate node hash maps with bounded direct tables.
+- [x] Run GCC and Clang focused path/replay validation.
+- [x] Benchmark checkpoint 6 over three canonical runs.
+- [x] Review checkpoint 6 and retain the direct packed-key index.
