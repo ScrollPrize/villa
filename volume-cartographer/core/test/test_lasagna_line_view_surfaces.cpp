@@ -66,11 +66,18 @@ bool finitePoint(const cv::Vec3f& point)
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+vc::lasagna::LineViewConfig tenVoxelRibbonConfig()
+{
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 10.0;
+    return config;
+}
+
 } // namespace
 
 TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
 {
-    const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
+    const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine(), tenVoxelRibbonConfig());
 
     REQUIRE(views.lineSurface);
     REQUIRE(views.lineSideSlice);
@@ -87,22 +94,33 @@ TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
     checkVec(surfacePoints(10, 2), {20.0, 0.0, 0.0});
 }
 
-TEST_CASE("LineViewBuilder default strip spacing matches optimized step")
+TEST_CASE("LineViewBuilder keeps legacy strip height with 50 voxel along target")
 {
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
     const auto surfacePoints = views.lineSurface->rawPoints();
+    const auto sideSlicePoints = views.lineSideSlice->rawPoints();
 
     REQUIRE(surfacePoints.rows == 21);
     REQUIRE(surfacePoints.cols == 3);
+    REQUIRE(sideSlicePoints.rows == 21);
+    REQUIRE(sideSlicePoints.cols == 3);
 
-    checkVec(surfacePoints(9, 1), {10.0, -10.0, 0.0});
-    checkVec(surfacePoints(10, 1), {10.0, 0.0, 0.0});
-    checkVec(surfacePoints(11, 1), {10.0, 10.0, 0.0});
+    checkVec(surfacePoints(9, 0), {0.0, -10.0, 0.0});
+    checkVec(surfacePoints(10, 0), {0.0, 0.0, 0.0});
+    checkVec(surfacePoints(11, 0), {0.0, 10.0, 0.0});
+    checkVec(sideSlicePoints(9, 0), {0.0, 0.0, -10.0});
+    checkVec(sideSlicePoints(10, 0), {0.0, 0.0, 0.0});
+    checkVec(sideSlicePoints(11, 0), {0.0, 0.0, 10.0});
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSideSlice->scale()[1] == doctest::Approx(1.0 / 10.0));
 }
 
 TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along normal")
 {
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 10.0;
     config.surfaceHalfWidth = 2.0;
     config.sideSliceHalfDepth = 3.0;
     config.crossSamples = 3;
@@ -123,6 +141,7 @@ TEST_CASE("LineViewBuilder offsets line-surface along side and side-slice along 
 TEST_CASE("LineViewBuilder uses fitted mesh normal for side-slice")
 {
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 10.0;
     config.surfaceHalfWidth = 2.0;
     config.sideSliceHalfDepth = 3.0;
     config.crossSamples = 3;
@@ -157,6 +176,7 @@ TEST_CASE("LineViewBuilder creates one z slice per optimized control point")
 TEST_CASE("LineViewBuilder flips frames and ups to agree with oriented point normals")
 {
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 10.0;
     config.surfaceHalfWidth = 2.0;
     config.sideSliceHalfDepth = 3.0;
     config.crossSamples = 3;
@@ -312,6 +332,7 @@ TEST_CASE("LineViewBuilder uses finite deterministic fallback frames")
     line.points[2].sampledNormal = normal({0.0, 0.0, 0.0}, false);
 
     vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 10.0;
     config.surfaceHalfWidth = 5.0;
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
@@ -341,7 +362,7 @@ TEST_CASE("LineViewBuilder ignores dense segment samples for generated mesh rows
     auto line = simpleLine();
     line.segmentSamples[0].samples[1].position = {500.0, 0.0, 0.0};
 
-    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, tenVoxelRibbonConfig());
     REQUIRE(views.lineSurface);
     const auto points = views.lineSurface->rawPoints();
 
@@ -360,7 +381,7 @@ TEST_CASE("LineViewBuilder uses control point count even with duplicated segment
         line.segmentSamples[1].samples.begin(),
         {0.0, {10.0, 0.0, 0.0}, normal({0.0, 0.0, 1.0})});
 
-    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, tenVoxelRibbonConfig());
     const auto points = views.lineSurface->rawPoints();
 
     REQUIRE(points.cols == 3);
@@ -389,11 +410,126 @@ TEST_CASE("LineViewBuilder falls back when all normals or tangents are degenerat
     for (auto& point : degenerateTangentLine.points) {
         point.position = {5.0, 5.0, 5.0};
     }
-    auto views = vc::lasagna::buildLineViewSurfaces(degenerateTangentLine, config);
-    auto surfacePoints = views.lineSurface->rawPoints();
-    REQUIRE(surfacePoints.rows == 3);
-    REQUIRE(surfacePoints.cols == 3);
-    CHECK(finitePoint(surfacePoints(0, 0)));
-    CHECK(finitePoint(surfacePoints(0, 1)));
-    CHECK(finitePoint(surfacePoints(0, 2)));
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(degenerateTangentLine, config),
+                    std::invalid_argument);
+}
+
+TEST_CASE("LineViewBuilder resamples uneven control-point segments and maps positions")
+{
+    auto line = simpleLine();
+    line.points[1].position = {15.0, 0.0, 0.0};
+    line.points[2].position = {120.0, 0.0, 0.0};
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 50.0;
+    config.surfaceHalfWidth = 20.0;
+    config.sideSliceHalfDepth = 10.0;
+    config.crossSamples = 5;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.cols == 4);
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(40.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 40.0));
+    CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
+    checkVec(points(2, 0), {0.0, 0.0, 0.0});
+    checkVec(points(2, 1), {15.0, 0.0, 0.0});
+    checkVec(points(2, 2), {67.5, 0.0, 0.0});
+    checkVec(points(2, 3), {120.0, 0.0, 0.0});
+
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(1.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(1.0) ==
+          doctest::Approx(1.0));
+    const double fractional = 1.5;
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(
+              views.stripPositionMap.originalPositionToStripGridColumn(fractional)) ==
+          doctest::Approx(fractional));
+}
+
+TEST_CASE("LineViewBuilder preserves reversed uneven arclength orientation")
+{
+    auto line = simpleLine();
+    line.points[0].position = {120.0, 0.0, 0.0};
+    line.points[1].position = {15.0, 0.0, 0.0};
+    line.points[2].position = {0.0, 0.0, 0.0};
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 50.0;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.cols == 4);
+    checkVec(points(points.rows / 2, 0), {120.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {67.5, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 2), {15.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 3), {0.0, 0.0, 0.0});
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(2.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(2.0) ==
+          doctest::Approx(1.0));
+}
+
+TEST_CASE("LineViewBuilder preserves a control-point bend below target spacing")
+{
+    auto line = simpleLine();
+    line.points[0].position = {0.0, 0.0, 0.0};
+    line.points[1].position = {20.0, 0.0, 0.0};
+    line.points[2].position = {20.0, 20.0, 0.0};
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 50.0;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.cols == 3);
+    checkVec(points(points.rows / 2, 0), {0.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {20.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 2), {20.0, 20.0, 0.0});
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(1.0));
+}
+
+TEST_CASE("LineViewBuilder chooses closest spacing independently per segment")
+{
+    auto line = simpleLine();
+    line.points[0].position = {0.0, 0.0, 0.0};
+    line.points[1].position = {74.0, 0.0, 0.0};
+    line.points[2].position = {174.0, 0.0, 0.0};
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 50.0;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.cols == 5);
+    checkVec(points(points.rows / 2, 0), {0.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {37.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 2), {74.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 3), {124.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 4), {174.0, 0.0, 0.0});
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(2.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(2.0) ==
+          doctest::Approx(1.0));
+}
+
+TEST_CASE("LineViewBuilder mapping canonicalizes duplicate control points")
+{
+    auto line = simpleLine();
+    line.points.insert(line.points.begin() + 1, line.points.front());
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, tenVoxelRibbonConfig());
+    REQUIRE(views.stripPositionMap.valid());
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(0.0) == doctest::Approx(0.0));
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) == doctest::Approx(0.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(0.0) == doctest::Approx(0.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(1.0) == doctest::Approx(2.0));
+}
+
+TEST_CASE("LineViewBuilder validates target spacing and odd cross sample count")
+{
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 0.0;
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(simpleLine(), config),
+                    std::invalid_argument);
+    config.targetSpacingBaseVoxels = 50.0;
+    config.crossSamples = 4;
+    CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(simpleLine(), config),
+                    std::invalid_argument);
 }

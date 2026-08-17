@@ -26,11 +26,12 @@ bool finiteScenePoint(const QPointF& point)
 QPointF generatedStripControlPointToScene(
     CChunkedVolumeViewer* viewer,
     QuadSurface* surface,
-    const GeneratedOverlay::ControlPointMarker& control)
+    const GeneratedOverlay::ControlPointMarker& control,
+    const vc::lasagna::LineStripPositionMap& controlPositionMap)
 {
-    // The strip surface is parameterized by line position, so the O(1)
-    // mapping is exact for control points ON the centerline — the common
-    // case. volumeToScene runs QuadSurface::pointTo — an O(strip length)
+    // The strip is uniformly parameterized by centerline arclength. The
+    // explicit map converts the model point-index coordinate before the O(1)
+    // centerline lookup. volumeToScene runs QuadSurface::pointTo — an O(strip length)
     // gradient descent from the strip center — which made every overlay
     // rebuild cost O(controlPoints x lineLength) and dominated zoom/pan
     // lag on many-control-point fibers; keep it only for points that are
@@ -43,7 +44,10 @@ QPointF generatedStripControlPointToScene(
     if (viewer && surface && std::isfinite(control.linePosition)) {
         const auto* points = surface->rawPointsPtr();
         const cv::Vec2f scale = surface->scale();
-        const int column = static_cast<int>(std::lround(control.linePosition));
+        const double gridColumn = controlPositionMap.valid()
+            ? controlPositionMap.originalPositionToStripGridColumn(control.linePosition)
+            : control.linePosition;
+        const int column = static_cast<int>(std::lround(gridColumn));
         if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f &&
             column >= 0 && column < points->cols) {
             const cv::Vec3f centerlinePoint = (*points)(points->rows / 2, column);
@@ -53,7 +57,7 @@ QPointF generatedStripControlPointToScene(
                  cv::norm(control.point - centerlinePoint) <= kOnCenterlineToleranceVx);
             if (onCenterline) {
                 const QPointF positionScene = generatedStripLinePositionToScene(
-                    viewer, surface, control.linePosition);
+                    viewer, surface, control.linePosition, &controlPositionMap);
                 if (finiteScenePoint(positionScene)) {
                     return positionScene;
                 }
@@ -66,7 +70,8 @@ QPointF generatedStripControlPointToScene(
             return pointScene;
         }
     }
-    return generatedStripLinePositionToScene(viewer, surface, control.linePosition);
+    return generatedStripLinePositionToScene(viewer, surface, control.linePosition,
+                                             &controlPositionMap);
 }
 
 QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
@@ -87,7 +92,8 @@ QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
-                                          double linePosition)
+                                          double linePosition,
+                                          const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer || !surface) {
         return {};
@@ -96,19 +102,21 @@ QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
     if (!points || points->empty()) {
         return {};
     }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+    const double gridColumn = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(linePosition)
+        : linePosition;
+    if (!std::isfinite(gridColumn)) {
         return {};
     }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+    const cv::Vec2d surfacePoint = surface->gridToSurface(
+        {gridColumn, static_cast<double>(points->rows / 2)});
+    return viewer->surfaceCoordsToScene(static_cast<float>(surfacePoint[0]),
+                                        static_cast<float>(surfacePoint[1]));
 }
 
 double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint)
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer) {
         return std::numeric_limits<double>::quiet_NaN();
@@ -119,13 +127,16 @@ double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
         return std::numeric_limits<double>::quiet_NaN();
     }
     const cv::Vec2f surfacePoint = viewer->sceneToSurfaceCoords(scenePoint);
-    const cv::Vec2f scale = quad->scale();
-    if (scale[0] == 0.0f || !std::isfinite(surfacePoint[0])) {
+    if (!std::isfinite(surfacePoint[0]) || !std::isfinite(surfacePoint[1])) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    const double position = static_cast<double>(surfacePoint[0] * scale[0]) +
-                            static_cast<double>(points->cols) / 2.0;
-    return std::clamp(position, 0.0, static_cast<double>(points->cols - 1));
+    const cv::Vec2d gridPoint = quad->surfaceToGrid(
+        {static_cast<double>(surfacePoint[0]), static_cast<double>(surfacePoint[1])});
+    const double gridColumn = std::clamp(gridPoint[0], 0.0,
+                                         static_cast<double>(points->cols - 1));
+    return positionMap && positionMap->valid()
+        ? positionMap->stripGridColumnToOriginalPosition(gridColumn)
+        : gridColumn;
 }
 
 std::optional<float> generatedCrossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer)
@@ -411,6 +422,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
         const auto* points = quad ? quad->rawPointsPtr() : nullptr;
         if (points && !points->empty()) {
+            const double maximumLinePosition = overlay.stripPositionMap.valid()
+                ? static_cast<double>(overlay.stripPositionMap.originalArclengths.size() - 1)
+                : static_cast<double>(points->cols - 1);
             const cv::Vec2f scale = quad->scale();
             if (scale[0] != 0.0f && scale[1] != 0.0f && !overlay.linePoints.empty()) {
                 const float centerRow = static_cast<float>(points->rows / 2);
@@ -425,18 +439,20 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
             if (overlay.controlPoints.empty() &&
                 overlay.seedLineIndex >= 0 &&
-                overlay.seedLineIndex < points->cols) {
-                seedScene = generatedStripLinePositionToScene(viewer, quad, overlay.seedLineIndex);
+                static_cast<double>(overlay.seedLineIndex) <= maximumLinePosition) {
+                seedScene = generatedStripLinePositionToScene(
+                    viewer, quad, overlay.seedLineIndex, &overlay.stripPositionMap);
                 hasSeedScene = finiteScenePoint(seedScene);
             }
             for (const double position : overlay.markerLinePositions) {
                 if (!std::isfinite(position) ||
                     position < 0.0 ||
-                    position > static_cast<double>(points->cols - 1) ||
+                    position > maximumLinePosition ||
                     std::abs(position - overlay.currentLinePosition) < 1.0e-6) {
                     continue;
                 }
-                const QPointF markerScene = generatedStripLinePositionToScene(viewer, quad, position);
+                const QPointF markerScene = generatedStripLinePositionToScene(
+                    viewer, quad, position, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         markerScene,
@@ -448,11 +464,12 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             for (const auto& control : overlay.controlPoints) {
                 if (!std::isfinite(control.linePosition) ||
                     control.linePosition < 0.0 ||
-                    control.linePosition > static_cast<double>(points->cols - 1)) {
+                    control.linePosition > maximumLinePosition) {
                     continue;
                 }
                 const QPointF controlScene =
-                    generatedStripControlPointToScene(viewer, quad, control);
+                    generatedStripControlPointToScene(viewer, quad, control,
+                                                      overlay.stripPositionMap);
                 if (finiteScenePoint(controlScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         controlScene,
@@ -467,7 +484,8 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 }
                 const QPointF controlScene = finiteGeneratedPoint(predSnap.controlPoint)
                     ? viewer->volumeToScene(predSnap.controlPoint)
-                    : generatedStripLinePositionToScene(viewer, quad, predSnap.linePosition);
+                    : generatedStripLinePositionToScene(
+                          viewer, quad, predSnap.linePosition, &overlay.stripPositionMap);
                 const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
                 if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
@@ -483,7 +501,8 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
             if (std::isfinite(overlay.currentLinePosition)) {
                 const QPointF markerScene =
-                    generatedStripLinePositionToScene(viewer, quad, overlay.currentLinePosition);
+                    generatedStripLinePositionToScene(
+                        viewer, quad, overlay.currentLinePosition, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
                     if (overlay.currentLineMarkerAsCross) {
                         constexpr qreal kCrossRadius = 5.5;
@@ -728,7 +747,8 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         QPointF controlScene;
         if (options.stripViewer) {
             auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
-            controlScene = generatedStripControlPointToScene(options.viewer, quad, control);
+            controlScene = generatedStripControlPointToScene(
+                options.viewer, quad, control, options.stripPositionMap);
         } else {
             controlScene = options.viewer->volumeToScene(control.point);
         }

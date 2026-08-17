@@ -2179,6 +2179,7 @@ class FitContext:
                 track_source_ids=self.track_source_ids,
                 crossing_cache=self.track_crossing_cache,
                 track_graph=self.track_graph,
+                progress=self.progress,
             )
             # The sidecar CSR is setup-only. The prepared bundle now owns only its
             # fixed-width training tables, so release the whole-DB graph promptly.
@@ -2710,7 +2711,15 @@ class FitContext:
         self.interactive_influence_loss_weight = 0.0
         self.interactive_influence_anchor_samples = 0
 
-    def export_preview(self, generation_path, surface_id):
+    def export_preview(self, generation_path, surface_id, *, diagnostics=False):
+        """Write one preview generation; optionally with its loss overlays.
+
+        The diagnostics pass re-evaluates every enabled loss at full preview
+        sample counts and splats each one into an overlay, which costs as much
+        as the surface itself. It is off unless the client asked for it, so the
+        ordinary "show me the surface" preview does not pay for overlays
+        nobody opened.
+        """
         progress = progress_or_null(self.progress)
         # Export has its own saved RNG envelope so pausing does not alter the
         # stochastic training sequence.
@@ -2733,6 +2742,8 @@ class FitContext:
                 surface_id=surface_id,
                 progress=progress,
             )
+            if not diagnostics:
+                return manifest
             diagnostic_weights = {
                 name: self.config.get(f'loss_weight_{name}', 0.0)
                 for name in (
@@ -2877,6 +2888,38 @@ class FitContext:
             np.random.set_state(numpy_state)
             torch.random.set_rng_state(torch_state)
             torch.cuda.set_rng_state_all(cuda_states)
+            self._release_export_arena()
+
+    def _release_export_arena(self):
+        """Hand the dead device arena back before the host publishes.
+
+        Publication flattens this generation in a separate CUDA process while
+        the fitter sits idle in ExportingPreview. By now every allocation the
+        training step and this export made at their peaks is dead, but the
+        caching allocator still reserves it, so the flatten opens onto a
+        nearly full device and thrashes cudaMalloc against blocks nobody is
+        using. What stays reserved after this is the live set: parameters,
+        optimiser state and the resident brick pools.
+
+        The cost is one re-acquisition through cudaMalloc on the next step,
+        which is nothing beside a publication measured in minutes. The freed
+        amount is printed because it is the only way to know whether the
+        contention this avoids was worth avoiding.
+        """
+        if not torch.cuda.is_available():
+            return
+        reserved_before = torch.cuda.memory_reserved()
+        gc.collect()
+        torch.cuda.empty_cache()
+        reserved_after = torch.cuda.memory_reserved()
+        gib = 1024 ** 3
+        print(
+            f'preview export: released '
+            f'{(reserved_before - reserved_after) / gib:.2f} GiB of cached '
+            f'device memory before publication '
+            f'({torch.cuda.memory_allocated() / gib:.2f} GiB live, '
+            f'{reserved_after / gib:.2f} GiB still reserved)',
+            flush=True)
 
     def incorporate_interactive_inputs(self, records, influence_config=None, *,
                                        current_iteration, target_iteration):
@@ -3176,7 +3219,8 @@ class FitContext:
                     track_families=self.track_families,
                     track_source_ids=self.track_source_ids,
                     crossing_cache=self.track_crossing_cache,
-                    track_graph=self.track_graph)
+                    track_graph=self.track_graph,
+                    progress=self.progress)
                 replace_prepared_tracks = True
 
             target_tracks = (

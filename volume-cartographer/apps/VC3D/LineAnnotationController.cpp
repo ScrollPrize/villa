@@ -232,6 +232,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
         bool strip = false;
         bool follow = false;
         double linePosition = 0.0;
+        vc::lasagna::LineStripPositionMap stripPositionMap;
     };
 
     QPointer<QMdiArea> targetArea;
@@ -1199,7 +1200,8 @@ cv::Vec3f interpolatedUpAtLinePosition(const std::vector<cv::Vec3f>& upVectors,
 }
 
 std::optional<cv::Vec2f> stripLinePositionToSurfacePoint(QuadSurface* surface,
-                                                         double linePosition)
+                                                         double linePosition,
+                                                         const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!surface || !std::isfinite(linePosition)) {
         return std::nullopt;
@@ -1208,29 +1210,31 @@ std::optional<cv::Vec2f> stripLinePositionToSurfacePoint(QuadSurface* surface,
     if (!points || points->empty()) {
         return std::nullopt;
     }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+    const double gridColumn = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(linePosition)
+        : linePosition;
+    if (!std::isfinite(gridColumn)) {
         return std::nullopt;
     }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return cv::Vec2f{surfaceX, surfaceY};
+    const cv::Vec2d surfacePoint = surface->gridToSurface(
+        {gridColumn, static_cast<double>(points->rows / 2)});
+    return cv::Vec2f{static_cast<float>(surfacePoint[0]),
+                     static_cast<float>(surfacePoint[1])};
 }
 
 void frameStripLineSpan(CChunkedVolumeViewer* viewer,
                         QuadSurface* surface,
                         double firstLinePosition,
-                        double secondLinePosition)
+                        double secondLinePosition,
+                        const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer || !surface ||
         !std::isfinite(firstLinePosition) ||
         !std::isfinite(secondLinePosition)) {
         return;
     }
-    const auto first = stripLinePositionToSurfacePoint(surface, firstLinePosition);
-    const auto second = stripLinePositionToSurfacePoint(surface, secondLinePosition);
+    const auto first = stripLinePositionToSurfacePoint(surface, firstLinePosition, positionMap);
+    const auto second = stripLinePositionToSurfacePoint(surface, secondLinePosition, positionMap);
     if (!first || !second) {
         return;
     }
@@ -4725,7 +4729,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                 frameStripLineSpan(chunkedViewer,
                                    quad,
                                    side.triplet.previousLinePosition,
-                                   side.triplet.nextLinePosition);
+                                   side.triplet.nextLinePosition,
+                                   &side.lineViews.stripPositionMap);
             }
             if (_intersectionInspection) {
                 _intersectionInspection->generatedSurfaceContexts[side.stripSurfaceName] =
@@ -4735,10 +4740,13 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         true,
                         false,
                         side.focusLinePosition,
+                        side.lineViews.stripPositionMap,
                     };
             }
             const std::vector<cv::Vec3d> linePoints = side.fiber->linePoints;
             const std::vector<cv::Vec3f> lineUpVectors = side.lineViews.lineUpVectors;
+            const vc::lasagna::LineStripPositionMap stripPositionMap =
+                side.lineViews.stripPositionMap;
             const auto session = side.editSession;
             const double focus = side.focusLinePosition;
             const std::vector<double> markerLinePositions{
@@ -4752,6 +4760,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                  key = side.stripSurfaceName,
                  linePoints,
                  lineUpVectors,
+                 stripPositionMap,
                  session,
                  focus,
                  markerLinePositions]() {
@@ -4761,6 +4770,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     vc3d::line_annotation::GeneratedViews views;
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;
+                    views.stripPositionMap = stripPositionMap;
                     views.controlPoints = controlMarkersForSession(*session);
                     views.branchLinePoints = generatedBranchLinePointsForSession(*session);
                     views.branchLinks = generatedBranchLinkMarkers(session->branches);
@@ -4782,6 +4792,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     this,
                     [this,
                      chunkedViewer,
+                     stripPositionMap,
                      sourceSideFlag = side.sourceSide](cv::Vec3f,
                                                        Qt::MouseButtons,
                                                        Qt::KeyboardModifiers,
@@ -4798,7 +4809,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         const double linePosition =
                             vc3d::line_annotation::generatedLinePositionFromStripScene(
                                 chunkedViewer,
-                                scenePoint);
+                                scenePoint,
+                                &stripPositionMap);
                         if (std::isfinite(linePosition)) {
                             (void)updateIntersectionFollowSlice(
                                 sourceSideFlag,
@@ -4811,6 +4823,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     this,
                     [this,
                      surfaceName = side.stripSurfaceName,
+                     stripPositionMap,
                      sourceSideFlag = side.sourceSide](
                         cv::Vec3f volumePoint,
                         cv::Vec3f,
@@ -4823,7 +4836,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         const double linePosition =
                             vc3d::line_annotation::generatedLinePositionFromStripScene(
                                 qobject_cast<CChunkedVolumeViewer*>(sender()),
-                                scenePoint);
+                                scenePoint,
+                                &stripPositionMap);
                         if (!std::isfinite(linePosition)) {
                             return;
                         }
@@ -5376,7 +5390,8 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
         if (context.strip) {
             linePosition = vc3d::line_annotation::generatedLinePositionFromStripScene(
                 viewer,
-                scenePoint);
+                scenePoint,
+                &context.stripPositionMap);
         } else if (context.follow) {
             const auto& follow = context.sourceSide
                 ? _intersectionInspection->sourceFollow
@@ -5397,6 +5412,7 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
             : pane->session->optimizedLine.points.size();
         options.linePosition = linePosition;
         options.stripViewer = context.strip;
+        options.stripPositionMap = context.stripPositionMap;
         const auto candidateState = linkCandidateMenuState(*pane->session);
         options.linkWithCandidateEnabled = candidateState.enabled;
         options.linkWithCandidateLabel = candidateState.label;
@@ -9602,6 +9618,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSlice = views.lineSideSlice;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
+    generatedViews.stripPositionMap = views.stripPositionMap;
     generatedViews.lineNormals = std::move(orientedNormals);
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);

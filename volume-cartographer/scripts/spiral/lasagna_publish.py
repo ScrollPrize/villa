@@ -1,8 +1,13 @@
 """Flattened-preview publication through a temporary Lasagna fit service.
 
 ``LasagnaPublisher`` takes one raw Spiral preview generation, flattens it with
-Lasagna, maps the winding membership and the loss/run-difference overlays onto
-the flattened grid, and returns the published manifest path.
+Lasagna, and maps the winding membership and the run-difference overlay onto
+the flattened grid. That is one publication wave and it returns a
+``PublishedPreview``: a complete, immutable surface the host can index and
+announce immediately. The loss overlays are the second wave
+(``publish_diagnostics``), published as their own artifact when the export was
+asked to compute them, so a preview nobody wants overlays for never pays for
+them and one that does still shows its surface first.
 
 Everything the publisher reports goes through exactly one progress path
 (``_report``): the stage boundaries it declares itself, the poll updates from
@@ -43,9 +48,6 @@ import numpy as np
 from PIL import Image
 import scipy.ndimage
 
-from service_http import TRANSFER_CHUNK_BYTES
-
-
 LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
 LASAGNA_CONFIG_NAME = "flatten_fast_nofilter.json"
 # Lasagna prints this once the optimizer loop is done and the flatten model is
@@ -68,17 +70,6 @@ def _find_lasagna_service():
     raise RuntimeError(
         "Cannot find Lasagna fit_service.py on the Spiral host; "
         "set LASAGNA_SERVICE_PATH")
-
-
-def _md5_file(path):
-    digest = hashlib.md5(usedforsecurity=False)
-    with Path(path).open("rb") as stream:
-        while True:
-            block = stream.read(TRANSFER_CHUNK_BYTES)
-            if not block:
-                break
-            digest.update(block)
-    return f"md5:{digest.hexdigest()}"
 
 
 def _prepare_cleaned_lasagna_surface(surface_dir, destination,
@@ -172,10 +163,16 @@ def _prepare_lasagna_surface_object(surface_dir, object_store):
     if missing:
         raise RuntimeError(
             f"Spiral preview is missing: {', '.join(missing)}")
+    # The hash is the object store's key, and this store is a private
+    # temporary directory holding exactly one surface for one flatten. It
+    # therefore only has to be stable and distinct, not content addressed:
+    # digesting the coordinate rasters here meant a full extra read of the
+    # largest files in the pipeline to name a directory nothing else consults.
     lines = []
     for path in sorted(p for p in surface_dir.rglob("*") if p.is_file()):
+        stat = path.stat()
         relative = path.relative_to(surface_dir).as_posix()
-        lines.append(f"{relative}\t{_md5_file(path)}\n")
+        lines.append(f"{relative}\t{stat.st_size}\t{stat.st_mtime_ns}\n")
     manifest = hashlib.md5(
         "".join(lines).encode("utf-8"), usedforsecurity=False).hexdigest()
     ref = {"type": "tifxyz_segment", "name": surface_dir.name,
@@ -482,8 +479,8 @@ class PreviewPublication:
     """
 
     __slots__ = ("generation", "completed_generation", "session_id",
-                 "artifact", "error", "process", "previous_raw_manifest",
-                 "stage_started", "progress")
+                 "artifact", "diagnostics_artifact", "error", "process",
+                 "previous_raw_manifest", "stage_started", "progress")
 
     def __init__(self):
         #: Generation currently being published, or 0 when nothing is.
@@ -494,6 +491,9 @@ class PreviewPublication:
         self.session_id = None
         #: Registered artifact reference for the newest published generation.
         self.artifact = None
+        #: Registered loss-overlay artifact for that same generation, or None
+        #: when its export carried no diagnostics (or has not mapped them yet).
+        self.diagnostics_artifact = None
         self.error = None
         #: Temporary Lasagna subprocess, so shutdown can stop it.
         self.process = None
@@ -510,6 +510,7 @@ class PreviewPublication:
         self.completed_generation = 0
         self.session_id = None
         self.artifact = None
+        self.diagnostics_artifact = None
         self.error = None
         self.previous_raw_manifest = None
         self.stage_started = None
@@ -525,6 +526,10 @@ class PreviewPublication:
         self.generation = generation
         self.session_id = session_id
         self.error = None
+        # Overlays belong to one generation. Retiring them here keeps a newer
+        # surface from being drawn with the previous generation's diagnostics
+        # while its own are still being mapped.
+        self.diagnostics_artifact = None
         return True
 
     def owns(self, generation):
@@ -571,6 +576,38 @@ class PreviewPublication:
             "unit": "steps",
             "elapsed_seconds": elapsed,
         }
+
+
+class PublishedPreview:
+    """One published preview surface, plus what its overlays still need.
+
+    The surface is complete and immutable as soon as this exists, so the host
+    can index and announce it while the overlays - which nobody may ever open
+    - are still being mapped. The retained correspondence and validity mask
+    are the flatten's output; keeping them is what lets the diagnostics wave
+    run without a second flatten.
+    """
+
+    __slots__ = ("manifest_path", "surface_id", "generation", "raw_manifest",
+                 "raw_manifest_path", "publish_parent", "correspondence",
+                 "flattened_valid")
+
+    def __init__(self, *, manifest_path, surface_id, generation, raw_manifest,
+                 raw_manifest_path, publish_parent, correspondence,
+                 flattened_valid):
+        self.manifest_path = manifest_path
+        self.surface_id = surface_id
+        self.generation = generation
+        self.raw_manifest = raw_manifest
+        self.raw_manifest_path = raw_manifest_path
+        self.publish_parent = publish_parent
+        self.correspondence = correspondence
+        self.flattened_valid = flattened_valid
+
+    def release(self):
+        """Drop the flatten arrays once no diagnostics wave will need them."""
+        self.correspondence = None
+        self.flattened_valid = None
 
 
 class LasagnaPublisher:
@@ -630,7 +667,7 @@ class LasagnaPublisher:
 
     def publish(self, preview_manifest_path, *, session_id, generation,
                 output_directory, voxel_size_um=None):
-        """Flatten one raw preview generation and return its manifest path."""
+        """Flatten one raw preview generation into a published surface."""
         self._generation = generation
         self._timing_stage = None
         self._timing_started = time.perf_counter()
@@ -821,55 +858,12 @@ class LasagnaPublisher:
                     winding_ids.astype(np.float32), mode="F").save(
                     publish_root / winding_map_name)
 
-                mapped_loss_maps = []
-                loss_output = publish_root / "loss-maps"
-                loss_output.mkdir(exist_ok=True)
-                loss_entries = [
-                    entry for entry in manifest.get("loss_maps", [])
-                    if isinstance(entry, dict)
-                    and (preview_manifest_path.parent
-                         / str(entry.get("path") or "")).is_file()
-                ]
-                remap_total = len(loss_entries)
                 self._stage(
-                    "mapping", (
-                        f"Remapping preview loss maps (0/{remap_total})"
-                        if remap_total else "No preview loss maps to remap"),
-                    step=0, total_steps=remap_total,
-                    overall_progress=0.0)
+                    "mapping", "Building preview run difference",
+                    step=0, total_steps=0, overall_progress=0.0)
                 with ThreadPoolExecutor(
                         max_workers=4,
                         thread_name_prefix="spiral-overlay-channel") as remap_executor:
-                    for loss_index, entry in enumerate(loss_entries, start=1):
-                        relative = str(entry.get("path") or "")
-                        self._report(
-                            "mapping",
-                            (f"Remapping preview loss maps "
-                             f"({loss_index}/{remap_total}): "
-                             f"{Path(relative).name}"),
-                            step=loss_index - 1, total_steps=remap_total,
-                            overall_progress=(
-                                float(loss_index - 1) / float(remap_total)
-                                if remap_total else 1.0))
-                        source_overlay = preview_manifest_path.parent / relative
-                        with Image.open(source_overlay) as image:
-                            source_rgba = np.asarray(
-                                image.convert("RGBA"), dtype=np.uint8)
-                        mapped = _sample_rgba_through_map(
-                            source_rgba, correspondence, flattened_valid,
-                            executor=remap_executor)
-                        destination = loss_output / Path(relative).name
-                        Image.fromarray(mapped, mode="RGBA").save(destination)
-                        mapped_entry = dict(entry)
-                        mapped_entry["path"] = (
-                            Path("loss-maps") / destination.name).as_posix()
-                        mapped_entry["supported_pixels"] = int(
-                            np.count_nonzero(mapped[..., 3]))
-                        mapped_loss_maps.append(mapped_entry)
-
-                    self._stage(
-                        "mapping", "Building preview run difference",
-                        step=0, total_steps=0, overall_progress=0.0)
                     previous_manifest = None
                     previous_path = self._previous_raw_manifest()
                     if previous_path and Path(previous_path).is_file():
@@ -931,7 +925,10 @@ class LasagnaPublisher:
                 published["winding_id_map"] = winding_map_name
                 published["winding_id_dtype"] = "float32_integer"
                 published["winding_bounds"] = winding_bounds
-                published["loss_maps"] = mapped_loss_maps
+                # The overlays are a second, independently published artifact:
+                # the surface must not wait for them, and a surface manifest
+                # that named files nobody has mapped yet would be a lie.
+                published["loss_maps"] = []
                 published.pop("winding_column_ranges", None)
                 published.pop("components", None)
                 if run_diff is None:
@@ -944,7 +941,6 @@ class LasagnaPublisher:
 
                 # These are transient transport files.  The interactive Spiral
                 # preview never exposes a Lasagna model to VC3D.
-                del correspondence
                 model_output.unlink(missing_ok=True)
                 flatten_map_output.unlink(missing_ok=True)
                 (flattened_surface / "model.pt").unlink(missing_ok=True)
@@ -957,9 +953,108 @@ class LasagnaPublisher:
                 self._stage(
                     "finalizing", "Preparing preview artifact index",
                     step=0, total_steps=0, overall_progress=0.0)
-                return final_root / "manifest.json"
+                return PublishedPreview(
+                    manifest_path=final_root / "manifest.json",
+                    surface_id=surface_id,
+                    generation=generation,
+                    raw_manifest=manifest,
+                    raw_manifest_path=preview_manifest_path,
+                    publish_parent=publish_parent,
+                    correspondence=correspondence,
+                    flattened_valid=flattened_valid)
         finally:
             stop_process_group(process)
             if publish_root is not None:
                 shutil.rmtree(publish_root, ignore_errors=True)
             self._detach_process(process)
+
+    def publish_diagnostics(self, published):
+        """Map this generation's loss overlays into their own artifact root.
+
+        Second wave of one publication: the surface is already published,
+        indexed and (usually) downloading. Only the overlays land here, in a
+        directory of their own, so the surface artifact stays immutable and
+        the client never re-transfers it to gain a diagnostic layer.
+        """
+        loss_entries = [
+            entry for entry in published.raw_manifest.get("loss_maps", [])
+            if isinstance(entry, dict)
+            and (published.raw_manifest_path.parent
+                 / str(entry.get("path") or "")).is_file()
+        ]
+        remap_total = len(loss_entries)
+        final_root = (published.publish_parent
+                      / f"generation-{published.generation}-diagnostics")
+        if final_root.exists():
+            raise RuntimeError(
+                f"Refusing to overwrite published diagnostics: {final_root}")
+        publish_root = published.publish_parent / (
+            f".generation-{published.generation}-diagnostics"
+            f".incoming-{secrets.token_hex(5)}")
+        publish_root.mkdir(parents=True, exist_ok=False)
+        try:
+            loss_output = publish_root / "loss-maps"
+            loss_output.mkdir(exist_ok=True)
+            self._stage(
+                "mapping", (
+                    f"Remapping preview loss maps (0/{remap_total})"
+                    if remap_total else "No preview loss maps to remap"),
+                step=0, total_steps=remap_total, overall_progress=0.0)
+            mapped_loss_maps = []
+            with ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="spiral-overlay-channel") as remap_executor:
+                for loss_index, entry in enumerate(loss_entries, start=1):
+                    if not self._session_valid():
+                        raise RuntimeError(
+                            "The Spiral session changed while publishing its "
+                            "preview diagnostics")
+                    relative = str(entry.get("path") or "")
+                    self._report(
+                        "mapping",
+                        (f"Remapping preview loss maps "
+                         f"({loss_index}/{remap_total}): "
+                         f"{Path(relative).name}"),
+                        step=loss_index - 1, total_steps=remap_total,
+                        overall_progress=(
+                            float(loss_index - 1) / float(remap_total)
+                            if remap_total else 1.0))
+                    source_overlay = published.raw_manifest_path.parent / relative
+                    with Image.open(source_overlay) as image:
+                        source_rgba = np.asarray(
+                            image.convert("RGBA"), dtype=np.uint8)
+                    mapped = _sample_rgba_through_map(
+                        source_rgba, published.correspondence,
+                        published.flattened_valid, executor=remap_executor)
+                    destination = loss_output / Path(relative).name
+                    Image.fromarray(mapped, mode="RGBA").save(destination)
+                    mapped_entry = dict(entry)
+                    mapped_entry["path"] = (
+                        Path("loss-maps") / destination.name).as_posix()
+                    mapped_entry["supported_pixels"] = int(
+                        np.count_nonzero(mapped[..., 3]))
+                    mapped_loss_maps.append(mapped_entry)
+
+            self._stage(
+                "finalizing", "Finalizing preview diagnostics",
+                step=remap_total, total_steps=remap_total,
+                overall_progress=1.0)
+            # The surface this belongs to is named so a client that has since
+            # installed a newer preview can discard these instead of drawing
+            # overlays sampled through a different flatten.
+            (publish_root / "manifest.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "kind": "spiral_preview_diagnostics",
+                    "surface_id": published.surface_id,
+                    "generation": published.generation,
+                    "manifest_path": str(final_root / "manifest.json"),
+                    "loss_maps": mapped_loss_maps,
+                }, indent=2) + "\n", encoding="utf-8")
+            os.replace(publish_root, final_root)
+            publish_root = None
+            return final_root / "manifest.json"
+        finally:
+            if publish_root is not None:
+                shutil.rmtree(publish_root, ignore_errors=True)
+            published.release()
