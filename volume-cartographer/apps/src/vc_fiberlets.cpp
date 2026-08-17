@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=8"
+           << "fiberlet_extraction_profile version=9"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -745,6 +745,10 @@ void printTubeExtractionProfile(
            << " fiberlet_unique_sampled_voxels=" << paths.sampledVoxels
            << " fiberlet_interpolated_scoring_points="
            << paths.interpolatedScoringPoints
+           << " fiberlet_scoring_page_count=" << paths.scoringPageCount
+           << " fiberlet_scoring_page_slots=" << paths.scoringPageSlots
+           << " fiberlet_scoring_page_directory_probes="
+           << paths.scoringPageDirectoryProbes
            << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
            << " fiberlet_dp_node_index_slots=" << paths.dpNodeIndexSlots
            << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups

@@ -30,3 +30,9 @@
 - [x] Run GCC and Clang focused path/replay validation.
 - [x] Benchmark checkpoint 6 over three canonical runs.
 - [x] Review checkpoint 6 and retain the direct packed-key index.
+- [x] Obtain approval for checkpoint 7 paged scoring lookup.
+- [x] Measure `4^3`, `8^3`, and `16^3` scoring-page layouts.
+- [x] Implement the selected bounded `16^3` paged lookup.
+- [x] Run GCC and Clang focused path/replay validation.
+- [x] Benchmark checkpoint 7 over three canonical runs.
+- [x] Review checkpoint 7 and retain the paged scoring lookup.

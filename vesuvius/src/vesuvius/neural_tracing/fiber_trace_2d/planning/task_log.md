@@ -207,3 +207,36 @@
   transition lookups, 2 greedy failures, and 1 fiberlet failure. Their
   `fiber_replay.json` files have identical SHA-256
   `eab2edfb769986649c900ebf5b5ab72fb2d615c07ba06e88cd3a1868cecaa98b`.
+
+## Checkpoint 7: Paged Scoring Lookup
+
+- A temporary canonical measurement compared dense index pages around the
+  170,813 unique sampled scoring voxels:
+
+  | page | pages | slots | occupancy | stencil page probes |
+  |---:|---:|---:|---:|---:|
+  | `4^3` | 4,131 | 264,384 | 64.6% | 98,846,028 |
+  | `8^3` | 825 | 422,400 | 40.4% | 72,225,851 |
+  | `16^3` | 199 | 815,104 | 21.0% | 61,144,696 |
+
+- Selected `16^3` pages. Their dense `uint32_t` indices require about 3.1 MiB
+  and reduce sparse-directory probes by 6.6x from the 406,380,154 original
+  per-corner voxel hash lookups. The temporary measurement code was removed.
+- Each interpolation owns an eight-entry page cache. The sparse page directory
+  resolves a page at most once per stencil; dense local offsets then resolve
+  its corners. Interpolation arithmetic and corner order are unchanged.
+
+  | metric | minimum | median | maximum | checkpoint 6 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 13.14 s | 13.22 s | 13.24 s | 13.26 s |
+  | total CPU | 333.02 s | 335.86 s | 336.96 s | 337.69 s |
+  | interpolation materialization wall | 2.28 s | 2.30 s | 2.31 s | 2.40 s |
+  | interpolation materialization CPU | 72.21 s | 72.96 s | 73.22 s | 75.99 s |
+  | peak RSS | 2.50 GiB | 2.50 GiB | 2.52 GiB | 2.50 GiB |
+
+- Median materialization wall improved 4.2%, but total wall improved only 0.3%
+  and total CPU 0.5%. The remaining materialization cost is predominantly the
+  interpolation math rather than sparse lookup.
+- All populations, DP counters, and failures match checkpoint 6. All three new
+  runs and the checkpoint-6 reference produced identical `fiber_replay.json`
+  SHA-256 `eab2edfb769986649c900ebf5b5ab72fb2d615c07ba06e88cd3a1868cecaa98b`.

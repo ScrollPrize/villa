@@ -535,7 +535,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=8` row. Both commands use the same field
+`fiberlet_extraction_profile version=9` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -625,6 +625,15 @@ DP state, and path-cost evaluation are unchanged. Peak search memory accounting
 uses the direct table's actual payload. `fiberlet_dp_node_index_entries` counts
 stored nodes and `fiberlet_dp_node_index_slots` counts allocated direct-table
 slots, exposing occupancy and sparse-lattice overhead.
+
+Version 9 stores sampled scoring-voxel indices in sparse `16^3` pages. Each
+interpolation stencil caches up to its eight touched pages, then resolves each
+corner by a dense page-local offset. This changes only lookup: corner order,
+weights, tensor accumulation, principal-axis resolution, and compact node
+quantization are unchanged. `fiberlet_scoring_page_count` reports occupied
+pages, `fiberlet_scoring_page_slots` reports their dense index capacity, and
+`fiberlet_scoring_page_directory_probes` reports actual sparse-directory
+lookups after per-stencil reuse.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

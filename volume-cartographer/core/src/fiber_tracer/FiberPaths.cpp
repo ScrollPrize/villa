@@ -720,6 +720,145 @@ size_t checkedSum(size_t left, size_t right, const char* description)
     return left + right;
 }
 
+class PagedScoringIndex {
+    struct Page;
+
+public:
+    static constexpr int64_t pageSize = 16;
+    static constexpr size_t pageSlotCount =
+        static_cast<size_t>(pageSize * pageSize * pageSize);
+    static constexpr uint32_t missing =
+        std::numeric_limits<uint32_t>::max();
+
+    explicit PagedScoringIndex(const std::vector<Voxel>& voxels)
+    {
+        if (voxels.size() > static_cast<size_t>(missing))
+            throw std::overflow_error("fiberlet scoring index exceeds 32 bits");
+        for (size_t index = 0; index < voxels.size(); ++index) {
+            const Voxel key = pageKey(voxels[index]);
+            auto [page, inserted] = pages_.try_emplace(key);
+            (void)inserted;
+            auto& slot = page->second.indices[localOffset(voxels[index])];
+            if (slot != missing)
+                throw std::logic_error("fiberlet scoring index received a duplicate voxel");
+            slot = static_cast<uint32_t>(index);
+        }
+    }
+
+    class Lookup {
+    public:
+        Lookup(
+            const PagedScoringIndex& index,
+            const std::vector<ScoringVoxel>& scoring,
+            size_t& directoryProbes)
+            : index_(index), scoring_(scoring), directoryProbes_(directoryProbes)
+        {
+        }
+
+        const ScoringVoxel& operator()(const Voxel& voxel)
+        {
+            const Voxel key = pageKey(voxel);
+            const Page* page = nullptr;
+            for (size_t cached = 0; cached < cacheSize_; ++cached) {
+                if (cacheKeys_[cached] == key) {
+                    page = cachePages_[cached];
+                    break;
+                }
+            }
+            if (page == nullptr) {
+                ++directoryProbes_;
+                const auto found = index_.pages_.find(key);
+                if (found == index_.pages_.end()) {
+                    throw std::logic_error(
+                        "prepared fiberlet point references an unsampled page");
+                }
+                page = &found->second;
+                if (cacheSize_ >= cacheKeys_.size())
+                    throw std::logic_error("fiberlet interpolation spans too many pages");
+                cacheKeys_[cacheSize_] = key;
+                cachePages_[cacheSize_] = page;
+                ++cacheSize_;
+            }
+            const uint32_t scoringIndex = page->indices[localOffset(voxel)];
+            if (scoringIndex == missing) {
+                throw std::logic_error(
+                    "prepared fiberlet point references an unsampled voxel");
+            }
+            return scoring_[scoringIndex];
+        }
+
+    private:
+        const PagedScoringIndex& index_;
+        const std::vector<ScoringVoxel>& scoring_;
+        size_t& directoryProbes_;
+        std::array<Voxel, 8> cacheKeys_{};
+        std::array<const Page*, 8> cachePages_{};
+        size_t cacheSize_ = 0;
+    };
+
+    Lookup lookup(
+        const std::vector<ScoringVoxel>& scoring,
+        size_t& directoryProbes) const
+    {
+        return Lookup(*this, scoring, directoryProbes);
+    }
+
+    size_t pageCount() const noexcept { return pages_.size(); }
+
+    size_t slotCount() const
+    {
+        return checkedProduct(
+            pages_.size(), pageSlotCount,
+            "fiberlet scoring page slot count");
+    }
+
+    size_t payloadBytes() const
+    {
+        return checkedSum(
+            checkedProduct(
+                slotCount(), sizeof(uint32_t),
+                "fiberlet scoring page byte estimate"),
+            checkedProduct(
+                pages_.size(), sizeof(Voxel),
+                "fiberlet scoring page key byte estimate"),
+            "fiberlet scoring index byte estimate");
+    }
+
+    void clear()
+    {
+        pages_.clear();
+        pages_.rehash(0);
+    }
+
+private:
+    struct Page {
+        Page() { indices.fill(missing); }
+        std::array<uint32_t, pageSlotCount> indices;
+    };
+
+    static Voxel pageKey(const Voxel& voxel)
+    {
+        if (voxel[0] < 0 || voxel[1] < 0 || voxel[2] < 0)
+            throw std::logic_error("fiberlet scoring voxel is negative");
+        return {
+            voxel[0] / pageSize,
+            voxel[1] / pageSize,
+            voxel[2] / pageSize,
+        };
+    }
+
+    static size_t localOffset(const Voxel& voxel)
+    {
+        return static_cast<size_t>(voxel[2] % pageSize) *
+                static_cast<size_t>(pageSize * pageSize) +
+            static_cast<size_t>(voxel[1] % pageSize) *
+                static_cast<size_t>(pageSize) +
+            static_cast<size_t>(voxel[0] % pageSize);
+    }
+
+    std::unordered_map<Voxel, Page, VoxelHash> pages_;
+};
+
 bool storedVoxelLess(const Voxel& left, const Voxel& right)
 {
     return storedIndex(left) < storedIndex(right);
@@ -2294,18 +2433,14 @@ FiberletPathReport traceFiberletPaths(
     reportProgress("materialization", 0, prepared.size(), materializationStart, true);
     const auto scoringIndexStart = Clock::now();
     const double scoringIndexCpuStart = processCpuSeconds();
-    std::unordered_map<Voxel, size_t, VoxelHash> voxelIndices;
-    voxelIndices.reserve(checkedProduct(orderedVoxels.size(), 2, "fiberlet scoring index capacity"));
-    for (size_t index = 0; index < orderedVoxels.size(); ++index)
-        voxelIndices.emplace(orderedVoxels[index], index);
+    PagedScoringIndex scoringIndex(orderedVoxels);
+    report.scoringPageCount = scoringIndex.pageCount();
+    report.scoringPageSlots = scoringIndex.slotCount();
     report.scoringIndexSeconds = std::chrono::duration<double>(
         Clock::now() - scoringIndexStart).count();
     report.scoringIndexCpuSeconds =
         processCpuSeconds() - scoringIndexCpuStart;
-    const size_t scoringIndexPayloadBytes = checkedProduct(
-        voxelIndices.size(),
-        checkedSum(sizeof(Voxel), sizeof(size_t), "fiberlet scoring index byte estimate"),
-        "fiberlet scoring index byte estimate");
+    const size_t scoringIndexPayloadBytes = scoringIndex.payloadBytes();
     report.estimatedPeakOwnedBytes = std::
         max(report.estimatedPeakOwnedBytes,
             checkedSum(
@@ -2322,28 +2457,29 @@ FiberletPathReport traceFiberletPaths(
     }
     std::atomic<size_t> nextMaterialization{0};
     std::atomic<size_t> completedMaterialization{0};
-    const auto materializationWorker = [&]() {
+    std::vector<size_t> pageDirectoryProbes(workerCount);
+    const auto materializationWorker = [&](size_t workerIndex) {
+        size_t localPageDirectoryProbes = 0;
         while (true) {
             const size_t searchIndex = nextMaterialization.fetch_add(1, std::memory_order_relaxed);
             if (searchIndex >= prepared.size())
-                return;
+                break;
             try {
                 auto& item = prepared[searchIndex];
-                const auto lookup = [&](const Voxel& voxel) -> const ScoringVoxel& {
-                    const auto found = voxelIndices.find(voxel);
-                    if (found == voxelIndices.end())
-                        throw std::logic_error("prepared fiberlet point references an unsampled voxel");
-                    return scoringVoxels[found->second];
+                const auto interpolate = [&](const cv::Vec3d& point) {
+                    auto lookup = scoringIndex.lookup(
+                        scoringVoxels, localPageDirectoryProbes);
+                    return interpolateScoringPoint(point, grid, lookup);
                 };
                 const auto& candidate =
                     report.candidates[searchCandidateIndices[searchIndex]];
-                item.startScoring = interpolateScoringPoint(
-                    candidate.startPositionPredictionXYZ, grid, lookup);
-                item.targetScoring = interpolateScoringPoint(
-                    candidate.targetPositionPredictionXYZ, grid, lookup);
+                item.startScoring = interpolate(
+                    candidate.startPositionPredictionXYZ);
+                item.targetScoring = interpolate(
+                    candidate.targetPositionPredictionXYZ);
                 for (size_t node = 0; node < item.nodes.size(); ++node) {
-                    const ScoringVoxel scoring = interpolateScoringPoint(
-                        nodePoint(item.nodes[node]), grid, lookup);
+                    const ScoringVoxel scoring = interpolate(
+                        nodePoint(item.nodes[node]));
                     storeNodeScoring(item.nodes[node], scoring);
                 }
             } catch (...) {
@@ -2352,16 +2488,17 @@ FiberletPathReport traceFiberletPaths(
             const size_t completed = completedMaterialization.fetch_add(1, std::memory_order_relaxed) + 1;
             reportProgress("materialization", completed, prepared.size(), materializationStart, false);
         }
+        pageDirectoryProbes[workerIndex] = localPageDirectoryProbes;
     };
     const auto interpolationMaterializationStart = Clock::now();
     const double interpolationMaterializationCpuStart = processCpuSeconds();
     if (workerCount == 1) {
-        materializationWorker();
+        materializationWorker(0);
     } else {
         std::vector<std::thread> workers;
         workers.reserve(workerCount);
         for (size_t index = 0; index < workerCount; ++index)
-            workers.emplace_back(materializationWorker);
+            workers.emplace_back(materializationWorker, index);
         for (auto& thread : workers)
             thread.join();
     }
@@ -2371,14 +2508,18 @@ FiberletPathReport traceFiberletPaths(
             Clock::now() - interpolationMaterializationStart).count();
     report.interpolationMaterializationCpuSeconds =
         processCpuSeconds() - interpolationMaterializationCpuStart;
+    for (const size_t probes : pageDirectoryProbes) {
+        report.scoringPageDirectoryProbes = checkedSum(
+            report.scoringPageDirectoryProbes, probes,
+            "fiberlet scoring page probe count");
+    }
     report.samplingMaterializationSeconds = std::chrono::duration<double>(Clock::now() - materializationStart).count();
     report.samplingMaterializationCpuSeconds = processCpuSeconds() - materializationCpuStart;
     for (const auto& error : errors) {
         if (error)
             std::rethrow_exception(error);
     }
-    voxelIndices.clear();
-    voxelIndices.rehash(0);
+    scoringIndex.clear();
     orderedVoxels.clear();
     orderedVoxels.shrink_to_fit();
     scoringVoxels.clear();

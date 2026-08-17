@@ -20,6 +20,9 @@
 - Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
   reducing canonical replay wall time by 2.1% with unchanged path work and
   replay quality.
+- Replaced repeated scoring-voxel hash lookups with sparse `16^3` pages and
+  dense page-local indices, reducing interpolation materialization by 4.2%
+  while preserving exact replay artifacts.
 
 # 2026-08-17: fiberlet extraction profiling
 

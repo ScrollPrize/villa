@@ -118,6 +118,21 @@ slots (46.3%). Median total wall improved from 13.54 to 13.26 seconds and
 median total CPU from 345.87 to 337.69 seconds. Work/quality populations and
 the replay artifact were unchanged. The direct index was accepted and retained.
 
+## Checkpoint 7: Paged Scoring Lookup
+
+1. Measure occupied page storage and distinct per-stencil page probes for
+   `4^3`, `8^3`, and `16^3` prediction-voxel pages.
+2. Replace repeated scoring-voxel hash lookups with dense indices inside
+   occupied pages while retaining a sparse page directory.
+3. Preserve interpolation corner order, weights, tensor accumulation,
+   principal-axis resolution, and node quantization exactly.
+
+Measurement selected `16^3`: 199 pages, 815,104 slots, and 61,144,696 page
+directory probes versus 406,380,154 voxel-corner lookups. The implementation
+reduced median interpolation materialization wall time from 2.40 to 2.30
+seconds and total wall from 13.26 to 13.22 seconds. Exact artifact parity was
+retained, and the paged lookup was accepted.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.
