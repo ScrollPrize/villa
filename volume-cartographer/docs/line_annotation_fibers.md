@@ -59,9 +59,9 @@ original fractional point-index coordinate. The strip grid always declares an
 along-line scale of `1/32`, so a short physical span expands to one nominal
 display interval instead of changing the scale of the rest of the strip. Exact
 geometry and interaction still use the point grid and support arclengths.
-Automatic strip height retains the legacy behavior: its cross-row spacing is
-the median optimized line-point step, independent of the 32-voxel along-line
-target.
+Both generated ribbons have exactly 21 cross rows spaced 32 base voxels apart.
+Their cross scale is therefore always `1/32` and their first-to-last row extent
+is 640 base voxels, independent of optimized line-point spacing.
 
 Clicking to place a control point uses optimized-polyline arclength in base
 voxels. Every existing control within an inclusive 32-voxel radius is collapsed

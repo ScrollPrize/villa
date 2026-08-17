@@ -134,7 +134,9 @@
   strip grid density is always declared as `1/32` samples per base voxel, so a
   short physical segment expands to one nominal display interval. Explicit
   support arclengths provide the bidirectional mapping between original
-  fractional point positions and nonuniform ribbon grid columns. Generated-
+  fractional point positions and nonuniform ribbon grid columns. Both generated
+  ribbons have exactly 21 cross rows at `1/32` samples per base voxel, yielding
+  a fixed 640-base-voxel cross extent independent of input point spacing. Generated-
   view clicks collapse all controls within an inclusive 32-base-voxel
   optimized-polyline arclength radius into one control at the clicked point.
   Input line spacing may otherwise be arbitrary; cuts and persistence remain

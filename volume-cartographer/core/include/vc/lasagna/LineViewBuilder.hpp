@@ -12,6 +12,7 @@ class QuadSurface;
 namespace vc::lasagna {
 
 inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
+inline constexpr int kLineViewCrossSampleCount = 21;
 
 struct LineViewConfig {
     // Derived ribbons retain every optimized line point and subdivide each
@@ -20,11 +21,6 @@ struct LineViewConfig {
     // full display interval. This is a view parameter in level-0/base-volume
     // voxels, independent of stored point or optimizer spacing.
     double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
-    // Non-positive values retain the legacy automatic strip height: cross-row
-    // spacing matches the median optimized control-point step.
-    double surfaceHalfWidth = 0.0;
-    double sideSliceHalfDepth = 0.0;
-    int crossSamples = 21;
     // Optional per-control-point oriented sheet normals, indexed like
     // LineModel::points (entries may be NaN/zero where unavailable).
     // When non-empty and size-matched, one global sign flip is applied so the

@@ -134,7 +134,7 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
         return camera;
     }
 
-    const cv::Size size = quad->size();
+    const cv::Size size = quad->gridSize();
     if (size.width <= 0 || size.height <= 0) {
         return camera;
     }

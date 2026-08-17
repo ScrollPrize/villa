@@ -75,45 +75,16 @@ cv::Vec3f toVec3f(const cv::Vec3d& v)
             static_cast<float>(v[2])};
 }
 
-std::vector<double> crossOffsets(double halfWidth, int samples)
+std::vector<double> crossOffsets()
 {
-    if (samples < 3 || samples % 2 == 0) {
-        throw std::invalid_argument("LineViewConfig::crossSamples must be odd and at least 3");
-    }
     std::vector<double> offsets;
-    offsets.reserve(static_cast<size_t>(samples));
-    for (int i = 0; i < samples; ++i) {
-        const double t = static_cast<double>(i) / static_cast<double>(samples - 1);
-        offsets.push_back(-halfWidth + 2.0 * halfWidth * t);
+    offsets.reserve(kLineViewCrossSampleCount);
+    const int center = kLineViewCrossSampleCount / 2;
+    for (int i = 0; i < kLineViewCrossSampleCount; ++i) {
+        offsets.push_back(
+            static_cast<double>(i - center) * kLineViewSamplingDistanceBaseVoxels);
     }
     return offsets;
-}
-
-double typicalStepSize(const std::vector<SegmentNormalSample>& samples)
-{
-    std::vector<double> steps;
-    steps.reserve(samples.size());
-    for (size_t i = 0; i + 1 < samples.size(); ++i) {
-        const double step = norm(samples[i + 1].position - samples[i].position);
-        if (std::isfinite(step) && step > kEpsilon) {
-            steps.push_back(step);
-        }
-    }
-    if (steps.empty()) {
-        return 1.0;
-    }
-    std::sort(steps.begin(), steps.end());
-    return steps[steps.size() / 2];
-}
-
-double resolvedHalfExtent(double configuredHalfExtent,
-                          const std::vector<SegmentNormalSample>& samples,
-                          int crossSamples)
-{
-    if (configuredHalfExtent > 0.0) {
-        return configuredHalfExtent;
-    }
-    return typicalStepSize(samples) * static_cast<double>(crossSamples - 1) * 0.5;
 }
 
 std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
@@ -883,29 +854,20 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
         }
     }
 
-    const double surfaceHalfWidth = resolvedHalfExtent(config.surfaceHalfWidth,
-                                                       frameData.samples,
-                                                       config.crossSamples);
-    const double sideSliceHalfDepth = resolvedHalfExtent(config.sideSliceHalfDepth,
-                                                        frameData.samples,
-                                                        config.crossSamples);
-    const double surfaceCrossSpacing =
-        2.0 * surfaceHalfWidth / static_cast<double>(config.crossSamples - 1);
-    const double sideCrossSpacing =
-        2.0 * sideSliceHalfDepth / static_cast<double>(config.crossSamples - 1);
+    const auto fixedCrossOffsets = crossOffsets();
 
     LineViewSurfaces surfaces;
     surfaces.lineSurface = buildRibbon(ribbonSamples,
-                                       crossOffsets(surfaceHalfWidth, config.crossSamples),
+                                       fixedCrossOffsets,
                                        ribbonFrames,
                                        positionMap.stripGridSpacingBaseVoxels,
-                                       surfaceCrossSpacing,
+                                       kLineViewSamplingDistanceBaseVoxels,
                                        true);
     surfaces.lineSideSlice = buildRibbon(ribbonSamples,
-                                         crossOffsets(sideSliceHalfDepth, config.crossSamples),
+                                         fixedCrossOffsets,
                                          ribbonFrames,
                                          positionMap.stripGridSpacingBaseVoxels,
-                                         sideCrossSpacing,
+                                         kLineViewSamplingDistanceBaseVoxels,
                                          false);
     surfaces.stripPositionMap = positionMap;
 

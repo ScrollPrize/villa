@@ -2,7 +2,7 @@
 
 ## 2026-08-17
 
-- Fixed generated line strips to a 32-vx display pitch and made nearby control-point replacement use physical polyline arclength.
+- Fixed generated line strips to a 32-vx display pitch in both directions and made nearby control-point replacement use physical polyline arclength.
 
 - Added a VC3D Download parallelism setting that switches the process-wide
   chunk scheduler between automatic bandwidth-based admission and an explicit

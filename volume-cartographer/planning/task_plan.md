@@ -7,7 +7,8 @@
 2. Retain per-consecutive-optimized-point nearest-spacing subdivision and every
    exact optimized-point support, but declare only the along-strip grid density
    from the configured target rather than the mean physical source interval.
-   Keep cross-strip scale physical.
+   Remove cross-direction configuration and the median-point-spacing heuristic;
+   build both ribbons with exactly 21 rows at the shared 32-base-voxel pitch.
 3. Add one reusable cumulative-arclength mapping for fractional line positions,
    inverse mapping, and inclusive radius matching. Use it for both deduplication
    and the existing maximum-control-distance gate, whose setting is also in
@@ -26,22 +27,28 @@
    replacement's adjacent spans dirty because the local single-control updater
    does not accept simultaneous removals. Preserve rollback snapshots across
    the asynchronous update.
+7. Correct generated-pane initial fitting to use the QuadSurface grid dimensions
+   when converting the first and last grid samples to surface coordinates.
 
 ## Specification updates
 
 - Change the generated-line strip invariant from a 50-vx mean-density model to
   a fixed 32-vx display pitch with exact supports and segment-local subdivision.
+- Require a fixed 21-row, 640-base-voxel cross extent for both generated
+  ribbons, independent of optimized-line sampling.
 - Add the 32-vx arclength replacement/collapse rule.
 
 ## Documentation updates
 
 - Update the line-annotation fiber documentation to describe fixed 32-vx strip
-  display pitch and arclength-based control replacement.
+  display pitch in both directions, fixed cross extent, and arclength-based
+  control replacement.
 
 ## Testing and validation
 
-- Extend `test_lasagna_line_view_surfaces` for fixed `1/32` scale, exact short
-  endpoints, and unchanged long-span subdivision.
+- Extend `test_lasagna_line_view_surfaces` for fixed `1/32` scale in both
+  directions, fixed 21-row/640-vx cross extents, exact short endpoints, and
+  unchanged long-span subdivision. Remove tests for obsolete cross overrides.
 - Extend `test_fiber_slice_geometry` for forward/inverse fractional arclength
   conversion, inclusive multi-match selection, and maximum-distance behavior
   on nonuniform/curved polylines.

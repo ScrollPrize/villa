@@ -11,6 +11,10 @@ Requirements:
 - Keep spans at or below 32 base voxels as one strip interval.
 - Declare the generated strip's along-line scale as exactly `1/32`, so short
   physical spans are expanded to one nominal display interval.
+- Use exactly 21 cross-strip samples at 32 base voxels for both the line
+  surface and side slice, producing a fixed 640-base-voxel cross extent.
+- Remove the unused configurable cross extents and cross-sample count; generated
+  strip width must not depend on optimized-line point spacing.
 - On generated-view clicks, compare existing controls by optimized-polyline
   arclength rather than line-index distance.
 - Collapse every existing control within an inclusive 32-base-voxel arclength
