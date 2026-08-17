@@ -99,6 +99,7 @@ private slots:
     void attachSegments();
     void attachNormalGrid();
     void attachUmbilicus();
+    void detachUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
     void detachEntry();
@@ -194,6 +195,7 @@ private:
     QAction* _attachSegmentsAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _attachUmbilicusAct{nullptr};
+    QAction* _detachUmbilicusAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};

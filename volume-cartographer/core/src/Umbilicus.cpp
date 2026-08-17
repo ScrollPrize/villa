@@ -330,29 +330,43 @@ UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
     if (document.is_object() && document.contains("metadata")) {
         const auto& metadata = document.at("metadata");
         if (metadata.is_object()) {
+            // A present-but-invalid field is recorded so that consumers can
+            // tell a typo from a legacy file that never declared the field.
+            // Format is fixed: "<key>: <reason>, got <value-as-written>".
+            const auto reject = [&info](const char* key, const char* reason,
+                                        const utils::Json& value) {
+                info.metadataErrors.push_back(std::string(key) + ": " + reason +
+                                              ", got " + value.dump());
+            };
             if (metadata.contains("voxelsize_um")) {
                 const auto& value = metadata.at("voxelsize_um");
-                if (value.is_number()) {
-                    const double voxelsize = value.get_double();
-                    if (std::isfinite(voxelsize) && voxelsize > 0.0) {
-                        info.voxelsizeUm = voxelsize;
-                    }
+                const double voxelsize =
+                    value.is_number() ? value.get_double() : 0.0;
+                if (value.is_number() && std::isfinite(voxelsize) &&
+                    voxelsize > 0.0) {
+                    info.voxelsizeUm = voxelsize;
+                } else {
+                    reject("voxelsize_um", "expected a positive number", value);
                 }
             }
             if (metadata.contains("volume")) {
                 const auto& value = metadata.at("volume");
                 if (value.is_string() && !value.get_string().empty()) {
                     info.volume = value.get_string();
+                } else {
+                    reject("volume", "expected a non-empty string", value);
                 }
             }
             const auto readDimension =
-                [&metadata](const char* key, std::optional<int>& out) {
+                [&metadata, &reject](const char* key, std::optional<int>& out) {
                     if (!metadata.contains(key)) {
                         return;
                     }
                     const auto& value = metadata.at(key);
                     if (value.is_number_integer() && value.get_int() > 0) {
                         out = value.get_int();
+                    } else {
+                        reject(key, "expected a positive integer", value);
                     }
                 };
             readDimension("volume_width", info.volumeWidth);

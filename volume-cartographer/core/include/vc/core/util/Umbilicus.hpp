@@ -31,6 +31,14 @@ namespace vc::core::util {
         std::optional<int> volumeWidth;
         std::optional<int> volumeHeight;
         std::optional<int> volumeSlices;
+        // One entry per metadata field that was present but rejected, so a typo
+        // is distinguishable from a legacy file that never declared the field.
+        // Each entry reads "<key>: <reason>, got <value-as-written>", e.g.
+        // `volume_width: expected a positive integer, got -5`. Parsing still
+        // succeeds and the points are still returned; it is
+        // resolveScrollUmbilicus() that refuses a file with errors, so callers
+        // that only want the polyline are unaffected.
+        std::vector<std::string> metadataErrors;
     };
 
     class Umbilicus {
@@ -52,7 +60,8 @@ namespace vc::core::util {
             const std::filesystem::path& path);
         // Same points plus the file's frame metadata. Text/CSV files and json
         // files without a "metadata" object yield unset metadata, as does any
-        // individual metadata field that is missing or malformed.
+        // individual metadata field that is missing or malformed; a malformed
+        // field additionally appends to UmbilicusFileInfo::metadataErrors.
         static UmbilicusFileInfo LoadFileInfo(const std::filesystem::path& path);
 
         const cv::Vec3i& volume_shape() const noexcept;

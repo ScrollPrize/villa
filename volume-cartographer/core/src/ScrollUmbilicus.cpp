@@ -32,6 +32,23 @@ std::string joinPaths(const std::vector<fs::path>& paths)
     return joined;
 }
 
+// Malformed frame metadata is a hard failure here rather than in every
+// consumer: this function is the one place that answers "which umbilicus, in
+// which frame", so a typo must not be allowed to look like an unstamped file.
+std::string describeMetadataErrors(const fs::path& path,
+                                   const std::vector<std::string>& errors)
+{
+    std::string message =
+        "the umbilicus file " + path.string() + " declares malformed metadata: ";
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+        if (i != 0) {
+            message += "; ";
+        }
+        message += errors[i];
+    }
+    return message;
+}
+
 } // namespace
 
 namespace vc::core::util {
@@ -40,7 +57,18 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
 {
     ScrollUmbilicusResolution resolution;
 
-    if (const auto declared = pkg.umbilicusPath(); !declared.empty()) {
+    // The raw configured location, not umbilicusPath(), decides whether the
+    // field is set: umbilicusPath() blanks remote locations, and a blank there
+    // must not be mistaken for "nothing configured" and trigger a search.
+    if (const auto configured = pkg.umbilicus(); !configured.empty()) {
+        const auto declared = pkg.umbilicusPath();
+        if (declared.empty()) {
+            resolution.error =
+                "the project's \"umbilicus\" field is set to " + configured +
+                ", a remote or otherwise unsupported location that cannot be "
+                "used as an umbilicus file";
+            return resolution;
+        }
         std::error_code ec;
         if (!fs::exists(declared, ec) || ec) {
             resolution.error =
@@ -49,7 +77,13 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
             return resolution;
         }
         try {
-            resolution.info = Umbilicus::LoadFileInfo(declared);
+            auto info = Umbilicus::LoadFileInfo(declared);
+            if (!info.metadataErrors.empty()) {
+                resolution.error =
+                    describeMetadataErrors(declared, info.metadataErrors);
+                return resolution;
+            }
+            resolution.info = std::move(info);
             resolution.path = declared;
         } catch (const std::exception& e) {
             resolution.error =
@@ -73,7 +107,13 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
     addRoot(pkg.path().empty() ? fs::path(pkg.getVolpkgDirectory())
                                : pkg.path().parent_path());
     for (const auto& segment : pkg.availableSegmentPaths()) {
+        // Both attachment layouts: the entry may be the segments directory
+        // itself (parent is then the volpkg) or a single segment inside
+        // <volpkg>/paths (the volpkg is then the grandparent). Overlaps are
+        // harmless — identical roots dedup below, and one file reached through
+        // two roots collapses on its weakly_canonical form.
         addRoot(segment.parent_path());
+        addRoot(segment.parent_path().parent_path());
     }
 
     std::vector<fs::path> hits;
@@ -112,7 +152,13 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
     }
 
     try {
-        resolution.info = Umbilicus::LoadFileInfo(hits.front());
+        auto info = Umbilicus::LoadFileInfo(hits.front());
+        if (!info.metadataErrors.empty()) {
+            resolution.error =
+                describeMetadataErrors(hits.front(), info.metadataErrors);
+            return resolution;
+        }
+        resolution.info = std::move(info);
         resolution.path = hits.front();
     } catch (const std::exception& e) {
         resolution.error = "failed to load " + hits.front().string() + ": " +

@@ -139,6 +139,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachUmbilicusAct = new QAction(QObject::tr("Attach &Umbilicus..."), this);
     connect(_attachUmbilicusAct, &QAction::triggered, this, &MenuActionController::attachUmbilicus);
 
+    _detachUmbilicusAct = new QAction(QObject::tr("Detach Um&bilicus"), this);
+    connect(_detachUmbilicusAct, &QAction::triggered, this, &MenuActionController::detachUmbilicus);
+
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
@@ -223,6 +226,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachSegmentsAct);
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
+    _fileMenu->addAction(_detachUmbilicusAct);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -1808,10 +1812,49 @@ void MenuActionController::attachUmbilicus()
         _window->showStatusBarMessage(
             QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
     }
-    if (!info.voxelsizeUm) {
+    // Malformed metadata makes the file unusable until it is fixed (the
+    // resolver refuses it), so it must be reported instead of silently
+    // degrading to "unstamped". The field is stored anyway: attaching then
+    // fixing the file is a reasonable order of operations.
+    if (!info.metadataErrors.empty()) {
+        QStringList errors;
+        errors.reserve(static_cast<int>(info.metadataErrors.size()));
+        for (const auto& error : info.metadataErrors) {
+            errors << QString::fromStdString(error);
+        }
+        QMessageBox::warning(_window, QObject::tr("Attach Umbilicus"),
+            QObject::tr("%1 declares malformed frame metadata and will be refused "
+                        "until the file is fixed:\n\n%2")
+                .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
+    } else if (!info.voxelsizeUm) {
         QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
             QObject::tr("%1 declares no voxelsize_um, so consumers may have to guess "
                         "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
+    }
+}
+
+void MenuActionController::detachUmbilicus()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    const auto configured = pkg->umbilicus();
+    if (configured.empty()) {
+        QMessageBox::information(_window, QObject::tr("Detach Umbilicus"),
+            QObject::tr("No umbilicus is attached — the project already resolves one "
+                        "automatically."));
+        return;
+    }
+    // Clearing the field persists the project and restores automatic
+    // resolution; the umbilicus is a single-valued field, so it is not part of
+    // the entry-based Detach dialog.
+    pkg->setUmbilicus({});
+    if (_window->statusBar()) {
+        _window->showStatusBarMessage(
+            QObject::tr("Detached umbilicus %1; resolution is automatic again")
+                .arg(QString::fromStdString(configured)), 5000);
     }
 }
 
