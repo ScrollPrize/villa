@@ -14,6 +14,14 @@
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <utility>
+
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/point.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
 
 namespace vc::fiber_tracer
 {
@@ -321,6 +329,87 @@ std::vector<std::filesystem::path> relativeFiles(const std::filesystem::path& ro
 
 }  // namespace
 
+struct FiberReplayTubeContainmentQuery::Impl {
+    using Point = bg::model::point<float, 3, bg::cs::cartesian>;
+    using Box = bg::model::box<Point>;
+
+    struct Segment {
+        cv::Vec3f start{0.0f, 0.0f, 0.0f};
+        cv::Vec3f finish{0.0f, 0.0f, 0.0f};
+    };
+
+    using Entry = std::pair<Box, size_t>;
+    using Tree = bgi::rtree<Entry, bgi::quadratic<16>>;
+
+    std::vector<Segment> segments;
+    Tree tree;
+    float radiusSquared = 0.0f;
+
+    static Point boostPoint(const cv::Vec3f& point)
+    {
+        return {point[0], point[1], point[2]};
+    }
+
+    static float pointSegmentDistanceSquared(
+        const cv::Vec3f& point,
+        const cv::Vec3f& start,
+        const cv::Vec3f& finish) noexcept
+    {
+        const cv::Vec3f delta = finish - start;
+        const float denominator = delta.dot(delta);
+        const float fraction = denominator > 0.0f
+            ? std::clamp(
+                  (point - start).dot(delta) / denominator, 0.0f, 1.0f)
+            : 0.0f;
+        const cv::Vec3f residual = point - (start + delta * fraction);
+        return residual.dot(residual);
+    }
+};
+
+namespace
+{
+
+bool finiteFloatPoint(const cv::Vec3f& point) noexcept
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) &&
+        std::isfinite(point[2]);
+}
+
+}  // namespace
+
+FiberReplayTubeContainmentQuery::FiberReplayTubeContainmentQuery(
+    std::shared_ptr<const Impl> impl) noexcept
+    : impl_(std::move(impl))
+{
+}
+
+bool FiberReplayTubeContainmentQuery::containsPredictionPoint(
+    const cv::Vec3d& pointPredictionXYZ) const
+{
+    if (!impl_)
+        throw std::logic_error("fiber replay tube containment query is empty");
+    const cv::Vec3f point{
+        static_cast<float>(pointPredictionXYZ[0]),
+        static_cast<float>(pointPredictionXYZ[1]),
+        static_cast<float>(pointPredictionXYZ[2]),
+    };
+    if (!finiteFloatPoint(point))
+        throw std::invalid_argument("fiber replay tube query point is not finite as float32");
+    const Impl::Point queryPoint = Impl::boostPoint(point);
+    const Impl::Box queryBox(queryPoint, queryPoint);
+    const auto predicate = bgi::intersects(queryBox);
+    for (auto candidate = impl_->tree.qbegin(predicate);
+         candidate != impl_->tree.qend(); ++candidate) {
+        const auto& segment = impl_->segments[candidate->second];
+        if (Impl::pointSegmentDistanceSquared(
+                point, segment.start, segment.finish) <=
+            impl_->radiusSquared) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool FiberReplayTube::containsBasePoint(const cv::Vec3d& point) const
 {
     return distanceToBasePoint(point) <= radiusBaseVoxels + kEpsilon;
@@ -334,6 +423,74 @@ double FiberReplayTube::distanceToBasePoint(const cv::Vec3d& point) const
 bool FiberReplayTube::containsPredictionPoint(const cv::Vec3d& pointPredictionXYZ, double predictionToBaseScale) const
 {
     return containsBasePoint(pointPredictionXYZ * predictionToBaseScale);
+}
+
+FiberReplayTubeContainmentQuery FiberReplayTube::makePredictionContainmentQuery(
+    double predictionToBaseScale) const
+{
+    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale)) {
+        throw std::invalid_argument(
+            "fiber replay tube prediction-to-base scale must be positive");
+    }
+    const float scale = static_cast<float>(predictionToBaseScale);
+    const float radius = static_cast<float>(radiusBaseVoxels / predictionToBaseScale);
+    if (!(scale > 0.0f) || !std::isfinite(scale) || !(radius > 0.0f) ||
+        !std::isfinite(radius) || !std::isfinite(radius * radius)) {
+        throw std::invalid_argument(
+            "fiber replay tube scale or radius is not finite as float32");
+    }
+
+    auto impl = std::make_shared<FiberReplayTubeContainmentQuery::Impl>();
+    const auto clipped = clippedPolylineArcSegments(
+        reference, beginArcBase, endArcBase);
+    impl->segments.reserve(clipped.size());
+    std::vector<FiberReplayTubeContainmentQuery::Impl::Entry> entries;
+    entries.reserve(clipped.size());
+    constexpr float negativeInfinity = -std::numeric_limits<float>::infinity();
+    constexpr float positiveInfinity = std::numeric_limits<float>::infinity();
+    for (const auto& source : clipped) {
+        FiberReplayTubeContainmentQuery::Impl::Segment segment{
+            cv::Vec3f{
+                static_cast<float>(source.start[0] / predictionToBaseScale),
+                static_cast<float>(source.start[1] / predictionToBaseScale),
+                static_cast<float>(source.start[2] / predictionToBaseScale),
+            },
+            cv::Vec3f{
+                static_cast<float>(source.finish[0] / predictionToBaseScale),
+                static_cast<float>(source.finish[1] / predictionToBaseScale),
+                static_cast<float>(source.finish[2] / predictionToBaseScale),
+            },
+        };
+        if (!finiteFloatPoint(segment.start) || !finiteFloatPoint(segment.finish)) {
+            throw std::invalid_argument(
+                "fiber replay tube segment is not finite as float32");
+        }
+        const size_t segmentIndex = impl->segments.size();
+        impl->segments.push_back(segment);
+        cv::Vec3f low;
+        cv::Vec3f high;
+        for (size_t axis = 0; axis < 3; ++axis) {
+            low[axis] = std::nextafter(
+                std::min(segment.start[axis], segment.finish[axis]) - radius,
+                negativeInfinity);
+            high[axis] = std::nextafter(
+                std::max(segment.start[axis], segment.finish[axis]) + radius,
+                positiveInfinity);
+        }
+        if (!finiteFloatPoint(low) || !finiteFloatPoint(high)) {
+            throw std::invalid_argument(
+                "fiber replay tube bounds are not finite as float32");
+        }
+        entries.emplace_back(
+            FiberReplayTubeContainmentQuery::Impl::Box(
+                FiberReplayTubeContainmentQuery::Impl::boostPoint(low),
+                FiberReplayTubeContainmentQuery::Impl::boostPoint(high)),
+            segmentIndex);
+    }
+    impl->radiusSquared = radius * radius;
+    impl->tree = FiberReplayTubeContainmentQuery::Impl::Tree(
+        entries.begin(), entries.end());
+    return FiberReplayTubeContainmentQuery(std::move(impl));
 }
 
 FiberReplayTube makeFiberReplayTube(

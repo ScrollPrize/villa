@@ -836,6 +836,40 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     REQUIRE(parallel.diagnostics.searchedPairs == 2);
     CHECK(serial.candidateWorkers == 1);
     CHECK(parallel.candidateWorkers == 2);
+    const auto checkProfile = [](const auto& report) {
+        CHECK(report.latticeNodePositions >= report.corridorAcceptedNodes);
+        CHECK(report.corridorAcceptedNodes >= report.retainedSearchNodes);
+        CHECK(report.interpolationCornerInsertions >= report.sampledVoxels);
+        CHECK(report.interpolatedScoringPoints == report.evaluatedDpNodes);
+        CHECK(report.retainedSearchNodes + 2 * report.preparedCandidates ==
+              report.evaluatedDpNodes);
+        CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
+        CHECK(report.dpRelaxations <= report.dpTransitionLookups);
+        CHECK(report.preparationGeometryWorkSeconds >= 0.0);
+        CHECK(report.preparationNodeEnumerationWorkSeconds >= 0.0);
+        CHECK(report.preparationCornerCollectionWorkSeconds >= 0.0);
+        CHECK(report.scoringIndexSeconds >= 0.0);
+        CHECK(report.interpolationMaterializationSeconds >= 0.0);
+        CHECK(report.searchNodeIndexWorkSeconds >= 0.0);
+        CHECK(report.searchDpWorkSeconds >= 0.0);
+    };
+    checkProfile(serial);
+    checkProfile(parallel);
+    CHECK(serial.candidatePointPredicateCalls ==
+          parallel.candidatePointPredicateCalls);
+    CHECK(serial.latticeNodePositions == parallel.latticeNodePositions);
+    CHECK(serial.corridorSegmentTests == parallel.corridorSegmentTests);
+    CHECK(serial.corridorAcceptedNodes == parallel.corridorAcceptedNodes);
+    CHECK(serial.nodePointPredicateCalls == parallel.nodePointPredicateCalls);
+    CHECK(serial.retainedSearchNodes == parallel.retainedSearchNodes);
+    CHECK(serial.interpolationCornerInsertions ==
+          parallel.interpolationCornerInsertions);
+    CHECK(serial.interpolatedScoringPoints ==
+          parallel.interpolatedScoringPoints);
+    CHECK(serial.dpNodeIndexEntries == parallel.dpNodeIndexEntries);
+    CHECK(serial.dpTransitionLookups == parallel.dpTransitionLookups);
+    CHECK(serial.dpReachedStateVisits == parallel.dpReachedStateVisits);
+    CHECK(serial.dpRelaxations == parallel.dpRelaxations);
     REQUIRE_FALSE(progress.empty());
     for (size_t index = 1; index < progress.size(); ++index) {
         if (progress[index - 1].phase == progress[index].phase)
@@ -1455,4 +1489,37 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     }
     CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path), doctest::Contains("version 1"), std::runtime_error);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("fiberlet adjacent corridor segment fast path matches complete float scan")
+{
+    const std::vector<cv::Vec3f> reference{
+        {0.0f, 0.0f, 0.0f},
+        {2.0f, 0.0f, 0.0f},
+        {4.0f, 1.0f, 0.0f},
+        {6.0f, 1.0f, 1.0f},
+        {8.0f, 2.0f, 1.0f},
+    };
+    constexpr float radius = 1.25f;
+    std::mt19937 generator(12345);
+    std::uniform_real_distribution<float> x(-1.0f, 9.0f);
+    std::uniform_real_distribution<float> yz(-2.0f, 3.0f);
+    for (size_t index = 0; index < 20000; ++index) {
+        const cv::Vec3f point{x(generator), yz(generator), yz(generator)};
+        const auto complete =
+            vc::fiber_tracer::testing::debugFiberletCorridorContains(
+                point, reference, radius);
+        for (size_t adjacent = 0; adjacent + 1 < reference.size(); ++adjacent) {
+            const auto accelerated =
+                vc::fiber_tracer::testing::debugFiberletCorridorContains(
+                    point, reference, radius, adjacent);
+            CHECK(accelerated.inside == complete.inside);
+        }
+    }
+
+    const auto immediate =
+        vc::fiber_tracer::testing::debugFiberletCorridorContains(
+            {3.0f, 1.0f, 0.0f}, reference, radius, 1);
+    CHECK(immediate.inside);
+    CHECK(immediate.segmentTests == 1);
 }

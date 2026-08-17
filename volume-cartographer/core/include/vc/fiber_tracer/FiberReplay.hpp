@@ -8,6 +8,7 @@
 
 #include <array>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -16,6 +17,26 @@
 
 namespace vc::fiber_tracer
 {
+
+class FiberReplayTubeContainmentQuery {
+public:
+    FiberReplayTubeContainmentQuery(const FiberReplayTubeContainmentQuery&) noexcept = default;
+    FiberReplayTubeContainmentQuery(FiberReplayTubeContainmentQuery&&) noexcept = default;
+    FiberReplayTubeContainmentQuery& operator=(const FiberReplayTubeContainmentQuery&) noexcept = default;
+    FiberReplayTubeContainmentQuery& operator=(FiberReplayTubeContainmentQuery&&) noexcept = default;
+
+    [[nodiscard]] bool containsPredictionPoint(
+        const cv::Vec3d& pointPredictionXYZ) const;
+
+private:
+    struct Impl;
+
+    explicit FiberReplayTubeContainmentQuery(std::shared_ptr<const Impl> impl) noexcept;
+
+    std::shared_ptr<const Impl> impl_;
+
+    friend struct FiberReplayTube;
+};
 
 struct FiberReplayTube {
     PolylineArcGeometry reference;
@@ -29,6 +50,8 @@ struct FiberReplayTube {
     [[nodiscard]] bool containsBasePoint(const cv::Vec3d& point) const;
     [[nodiscard]] double distanceToBasePoint(const cv::Vec3d& point) const;
     [[nodiscard]] bool containsPredictionPoint(const cv::Vec3d& pointPredictionXYZ, double predictionToBaseScale) const;
+    [[nodiscard]] FiberReplayTubeContainmentQuery makePredictionContainmentQuery(
+        double predictionToBaseScale) const;
 };
 
 [[nodiscard]] FiberReplayTube makeFiberReplayTube(

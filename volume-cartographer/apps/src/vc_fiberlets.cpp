@@ -550,6 +550,125 @@ struct TubeExtractionResult {
     double fiberletCpuSeconds = 0.0;
 };
 
+void printTubeExtractionProfile(
+    std::ostream& output,
+    const TubeExtractionResult& extraction)
+{
+    const auto previousPrecision = output.precision();
+    const auto& anchor = extraction.anchors.profile;
+    const auto& paths = extraction.paths;
+    const double anchorProfiledSeconds =
+        anchor.setupSeconds + anchor.tilePlanningSeconds +
+        anchor.cellProcessingSeconds + anchor.selectionSeconds +
+        anchor.initialDiagnosticsSeconds +
+        anchor.duplicateSuppressionSeconds + anchor.finalizationSeconds;
+    const double fiberletProfiledSeconds =
+        paths.candidateGenerationSeconds + paths.preparationSeconds +
+        paths.cornerMergeSeconds + paths.predictionSamplingSeconds +
+        paths.normalSamplingSeconds + paths.samplingMaterializationSeconds +
+        paths.searchSeconds;
+    output << std::setprecision(17)
+           << "fiberlet_extraction_profile version=1"
+           << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
+           << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
+           << " anchor_profiled_seconds=" << anchorProfiledSeconds
+           << " anchor_residual_seconds="
+           << std::max(0.0, extraction.anchors.elapsedSeconds - anchorProfiledSeconds)
+           << " anchor_selected_cells=" << anchor.selectedCells
+           << " anchor_context_cells=" << anchor.contextCells
+           << " anchor_work_cells=" << anchor.workCells
+           << " anchor_tiles=" << anchor.tiles
+           << " anchor_workers=" << anchor.workers
+           << " anchor_sampler_calls=" << anchor.predictionSamplerCalls
+           << " anchor_submitted_prediction_voxels="
+           << anchor.submittedPredictionVoxels
+           << " anchor_candidate_observations=" << anchor.candidateObservations
+           << " anchor_retained_observations=" << anchor.retainedObservations
+           << " anchor_gradient_attempts=" << anchor.gradientAttempts
+           << " anchor_valid_gradients=" << anchor.validGradients
+           << " anchor_retain_predicate_calls=" << anchor.retainPredicateCalls
+           << " anchor_fit_iterations=" << anchor.fitIterations
+           << " anchor_setup_seconds=" << anchor.setupSeconds
+           << " anchor_tile_planning_seconds=" << anchor.tilePlanningSeconds
+           << " anchor_cell_processing_seconds=" << anchor.cellProcessingSeconds
+           << " anchor_cell_processing_cpu_seconds="
+           << anchor.cellProcessingCpuSeconds
+           << " anchor_coordinate_construction_work_seconds="
+           << anchor.coordinateConstructionWorkSeconds
+           << " anchor_prediction_sampling_work_seconds="
+           << anchor.predictionSamplingWorkSeconds
+           << " anchor_observation_construction_work_seconds="
+           << anchor.observationConstructionWorkSeconds
+           << " anchor_fitting_work_seconds=" << anchor.fittingWorkSeconds
+           << " anchor_selection_seconds=" << anchor.selectionSeconds
+           << " anchor_initial_diagnostics_seconds="
+           << anchor.initialDiagnosticsSeconds
+           << " anchor_duplicate_suppression_seconds="
+           << anchor.duplicateSuppressionSeconds
+           << " anchor_finalization_seconds=" << anchor.finalizationSeconds
+           << " fiberlet_elapsed_seconds=" << paths.elapsedSeconds
+           << " fiberlet_cpu_seconds=" << paths.elapsedCpuSeconds
+           << " fiberlet_profiled_seconds=" << fiberletProfiledSeconds
+           << " fiberlet_residual_seconds="
+           << std::max(0.0, paths.elapsedSeconds - fiberletProfiledSeconds)
+           << " fiberlet_candidate_predicate_calls="
+           << paths.candidatePointPredicateCalls
+           << " fiberlet_lattice_node_positions=" << paths.latticeNodePositions
+           << " fiberlet_corridor_segment_tests=" << paths.corridorSegmentTests
+           << " fiberlet_corridor_accepted_nodes=" << paths.corridorAcceptedNodes
+           << " fiberlet_node_predicate_calls=" << paths.nodePointPredicateCalls
+           << " fiberlet_retained_search_nodes=" << paths.retainedSearchNodes
+           << " fiberlet_corner_insertion_attempts="
+           << paths.interpolationCornerInsertions
+           << " fiberlet_unique_sampled_voxels=" << paths.sampledVoxels
+           << " fiberlet_interpolated_scoring_points="
+           << paths.interpolatedScoringPoints
+           << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
+           << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups
+           << " fiberlet_dp_reached_state_visits=" << paths.dpReachedStateVisits
+           << " fiberlet_dp_relaxations=" << paths.dpRelaxations
+           << " fiberlet_candidate_generation_seconds="
+           << paths.candidateGenerationSeconds
+           << " fiberlet_candidate_generation_cpu_seconds="
+           << paths.candidateGenerationCpuSeconds
+           << " fiberlet_preparation_seconds=" << paths.preparationSeconds
+           << " fiberlet_preparation_cpu_seconds="
+           << paths.preparationCpuSeconds
+           << " fiberlet_preparation_geometry_work_seconds="
+           << paths.preparationGeometryWorkSeconds
+           << " fiberlet_node_enumeration_work_seconds="
+           << paths.preparationNodeEnumerationWorkSeconds
+           << " fiberlet_corner_collection_work_seconds="
+           << paths.preparationCornerCollectionWorkSeconds
+           << " fiberlet_corner_merge_seconds=" << paths.cornerMergeSeconds
+           << " fiberlet_corner_merge_cpu_seconds="
+           << paths.cornerMergeCpuSeconds
+           << " fiberlet_prediction_sampling_seconds="
+           << paths.predictionSamplingSeconds
+           << " fiberlet_prediction_sampling_cpu_seconds="
+           << paths.predictionSamplingCpuSeconds
+           << " fiberlet_normal_sampling_seconds=" << paths.normalSamplingSeconds
+           << " fiberlet_normal_sampling_cpu_seconds="
+           << paths.normalSamplingCpuSeconds
+           << " fiberlet_materialization_seconds="
+           << paths.samplingMaterializationSeconds
+           << " fiberlet_materialization_cpu_seconds="
+           << paths.samplingMaterializationCpuSeconds
+           << " fiberlet_scoring_index_seconds=" << paths.scoringIndexSeconds
+           << " fiberlet_scoring_index_cpu_seconds="
+           << paths.scoringIndexCpuSeconds
+           << " fiberlet_interpolation_materialization_seconds="
+           << paths.interpolationMaterializationSeconds
+           << " fiberlet_interpolation_materialization_cpu_seconds="
+           << paths.interpolationMaterializationCpuSeconds
+           << " fiberlet_search_seconds=" << paths.searchSeconds
+           << " fiberlet_search_cpu_seconds=" << paths.searchCpuSeconds
+           << " fiberlet_node_index_work_seconds="
+           << paths.searchNodeIndexWorkSeconds
+           << " fiberlet_dp_work_seconds=" << paths.searchDpWorkSeconds << '\n';
+    output.precision(previousPrecision);
+}
+
 TubeExtractionResult extractTubeFiberlets(
     const std::vector<cv::Vec3d>& referenceBase,
     double beginArcBase,
@@ -585,6 +704,8 @@ TubeExtractionResult extractTubeFiberlets(
     result.anchorCpuSeconds = processCpuSeconds() - anchorCpuStart;
 
     vc::fiber_tracer::LoadedFiberAnchorArtifact loaded{result.anchors, {}};
+    const auto containmentQuery = result.tube.makePredictionContainmentQuery(
+        grid.predictionToBaseScale);
     const auto fiberletStart = std::chrono::steady_clock::now();
     const double fiberletCpuStart = processCpuSeconds();
     result.paths = vc::fiber_tracer::traceFiberletPaths(
@@ -594,7 +715,9 @@ TubeExtractionResult extractTubeFiberlets(
         [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
         normalSampler,
         printFiberletProgress,
-        [&](const cv::Vec3d& pointPrediction) { return result.tube.containsPredictionPoint(pointPrediction, grid.predictionToBaseScale); });
+        [&](const cv::Vec3d& pointPrediction) {
+            return containmentQuery.containsPredictionPoint(pointPrediction);
+        });
     result.fiberletSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - fiberletStart).count();
     result.fiberletCpuSeconds = processCpuSeconds() - fiberletCpuStart;
     return result;
@@ -750,6 +873,7 @@ int main(int argc, char** argv)
                       << " search_effective_cores=" << effectiveCores(extraction.paths.searchCpuSeconds, extraction.paths.searchSeconds)
                       << " total_seconds=" << totalSeconds << " total_cpu_seconds=" << totalCpuSeconds
                       << " total_effective_cores=" << effectiveCores(totalCpuSeconds, totalSeconds) << '\n';
+            printTubeExtractionProfile(std::cout, extraction);
             return 0;
         }
 
@@ -826,6 +950,7 @@ int main(int argc, char** argv)
                       << " sampling_batches=" << fullExtraction.paths.samplingCoordinateBatches
                       << " sampled_voxels=" << fullExtraction.paths.sampledVoxels << " peak_batch_voxels=" << fullExtraction.paths.peakCoordinateBatchVoxels
                       << " evaluated_dp_nodes=" << fullExtraction.paths.evaluatedDpNodes << '\n';
+            printTubeExtractionProfile(std::cerr, fullExtraction);
             auto fullPaths = std::move(fullExtraction.paths);
             const auto graphStart = std::chrono::steady_clock::now();
             std::cerr << "fiber_replay_stage stage=graph status=started\n";

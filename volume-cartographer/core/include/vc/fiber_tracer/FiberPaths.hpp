@@ -168,10 +168,25 @@ struct FiberletPathReport {
     size_t peakSearchTransientBytes = 0;
     size_t estimatedPeakOwnedBytes = 0;
     size_t candidateWorkers = 0;
+    size_t candidatePointPredicateCalls = 0;
+    size_t latticeNodePositions = 0;
+    size_t corridorSegmentTests = 0;
+    size_t corridorAcceptedNodes = 0;
+    size_t nodePointPredicateCalls = 0;
+    size_t retainedSearchNodes = 0;
+    size_t interpolationCornerInsertions = 0;
+    size_t interpolatedScoringPoints = 0;
+    size_t dpNodeIndexEntries = 0;
+    size_t dpTransitionLookups = 0;
+    size_t dpReachedStateVisits = 0;
+    size_t dpRelaxations = 0;
     double candidateGenerationSeconds = 0.0;
     double candidateGenerationCpuSeconds = 0.0;
     double preparationSeconds = 0.0;
     double preparationCpuSeconds = 0.0;
+    double preparationGeometryWorkSeconds = 0.0;
+    double preparationNodeEnumerationWorkSeconds = 0.0;
+    double preparationCornerCollectionWorkSeconds = 0.0;
     double cornerMergeSeconds = 0.0;
     double cornerMergeCpuSeconds = 0.0;
     double predictionSamplingSeconds = 0.0;
@@ -180,8 +195,14 @@ struct FiberletPathReport {
     double normalSamplingCpuSeconds = 0.0;
     double samplingMaterializationSeconds = 0.0;
     double samplingMaterializationCpuSeconds = 0.0;
+    double scoringIndexSeconds = 0.0;
+    double scoringIndexCpuSeconds = 0.0;
+    double interpolationMaterializationSeconds = 0.0;
+    double interpolationMaterializationCpuSeconds = 0.0;
     double searchSeconds = 0.0;
     double searchCpuSeconds = 0.0;
+    double searchNodeIndexWorkSeconds = 0.0;
+    double searchDpWorkSeconds = 0.0;
     double elapsedSeconds = 0.0;
     double elapsedCpuSeconds = 0.0;
 };
@@ -239,5 +260,23 @@ void writeFiberletPathArtifacts(const std::filesystem::path& outputDirectory, co
 void writeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirectory, const FiberPresenceSliceReport& report, const FiberPredictionGridInfo& grid);
 
 void removeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirectory);
+
+#ifdef VC_TESTING
+namespace testing
+{
+
+struct FiberletCorridorContainmentDebug {
+    bool inside = false;
+    size_t segmentTests = 0;
+};
+
+[[nodiscard]] FiberletCorridorContainmentDebug debugFiberletCorridorContains(
+    const cv::Vec3f& point,
+    const std::vector<cv::Vec3f>& reference,
+    float radius,
+    std::optional<size_t> adjacentSegment = std::nullopt);
+
+}  // namespace testing
+#endif
 
 }  // namespace vc::fiber_tracer

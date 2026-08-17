@@ -199,6 +199,12 @@ positions, sorted, and
 merged into one deterministic stored-ZYX ordered global union. Required corners
 remain included even when a replay tube excludes the corner itself.
 
+Local corridor membership is an unordered union of continuous float32 segment
+capsules. Because a node belongs to a known curved-domain layer, preparation
+tests one centerline segment adjacent to that layer first. A miss falls back to
+the remaining segments; an immediate hit avoids the complete scan without
+changing the geometric predicate.
+
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
 prediction calls, then all normal calls, materializes every prepared endpoint
@@ -426,6 +432,16 @@ limits coordinates per sampler call, as described above. The final summary
 reports both evaluator failure counts and confirms reference fraction one for
 both.
 
+The hot replay-tube point filter snapshots the selected reference interval in
+prediction coordinates. It stores float32 continuous segments in a packed
+Boost.Geometry R-tree using radius-expanded segment bounds, then performs the
+float32 point-to-segment test only for intersecting candidates. Queries are
+immutable and safe to share across preparation workers. The ordinary
+`FiberReplayTube` distance methods remain linear and double precision because
+anchor diagnostics need an actual distance rather than the high-volume boolean
+filter. Float32 classification may differ at the configured radius boundary;
+performance comparisons must report resulting workload and artifact changes.
+
 By default the command publishes only the strict version-2 whole-run bundle.
 `--vis` additionally extracts a local tube for every failure. `--along 128`
 then selects the reference arclength before and after that failure and
@@ -494,3 +510,29 @@ anchor and path stage rates; aggregate/mean/peak sampled voxels; estimated peak
 batch bytes; evaluated DP-node rate; and separate candidate-generation,
 sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
+
+Benchmark and replay extraction also emit a versioned
+`fiberlet_extraction_profile version=1` row. Both commands use the same field
+names and units. Replay writes the row to stderr after full tube extraction;
+benchmark writes it to stdout after the existing summary. The row separates:
+
+- anchor setup, tile planning, coordinate construction, prediction sampling,
+  observation/gradient construction, fitting, selection, duplicate suppression,
+  and finalization;
+- fiberlet candidate generation, geometry preparation, node enumeration,
+  interpolation-corner collection and merge, prediction/normal sampling,
+  scoring-index construction, interpolation materialization, node-index
+  construction, and dynamic programming;
+- deterministic workload counts including selected/context/work cells, tiles,
+  sampler calls and submitted coordinates, observations and gradients, lattice
+  nodes and corridor tests, corner insertion attempts and globally unique
+  sampled voxels, and DP lookups/visits/relaxations.
+
+Fields ending in `_seconds` are enclosing wall phases unless their name contains
+`_work_`; work fields sum per-candidate or per-worker elapsed time and may exceed
+wall time. CPU fields are process CPU time. Corner insertion attempts count all
+positive-weight insertion attempts, while `fiberlet_unique_sampled_voxels` is
+the deterministic global union. `*_profiled_seconds` is the sum of disjoint
+wall phases and `*_residual_seconds` is unassigned elapsed wall time. Existing
+progress callbacks remain inside their enclosing wall phases. Profiling is
+diagnostic only and does not alter extraction decisions, ordering, or artifacts.

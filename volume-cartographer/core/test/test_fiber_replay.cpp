@@ -5,8 +5,11 @@
 
 #include <filesystem>
 #include <fstream>
+#include <atomic>
 #include <iterator>
+#include <limits>
 #include <random>
+#include <thread>
 
 namespace
 {
@@ -23,6 +26,52 @@ std::string readText(const std::filesystem::path& path)
 {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+float pointSegmentDistanceSquared(
+    const cv::Vec3f& point,
+    const cv::Vec3f& start,
+    const cv::Vec3f& finish)
+{
+    const cv::Vec3f delta = finish - start;
+    const float denominator = delta.dot(delta);
+    const float fraction = denominator > 0.0f
+        ? std::clamp(
+              (point - start).dot(delta) / denominator, 0.0f, 1.0f)
+        : 0.0f;
+    const cv::Vec3f residual = point - (start + delta * fraction);
+    return residual.dot(residual);
+}
+
+bool directFloatContains(
+    const vc::fiber_tracer::FiberReplayTube& tube,
+    const cv::Vec3d& pointPrediction,
+    double predictionToBaseScale)
+{
+    const cv::Vec3f point{
+        static_cast<float>(pointPrediction[0]),
+        static_cast<float>(pointPrediction[1]),
+        static_cast<float>(pointPrediction[2]),
+    };
+    const float radius = static_cast<float>(
+        tube.radiusBaseVoxels / predictionToBaseScale);
+    const float radiusSquared = radius * radius;
+    for (const auto& source : vc::fiber_tracer::clippedPolylineArcSegments(
+             tube.reference, tube.beginArcBase, tube.endArcBase)) {
+        const cv::Vec3f start{
+            static_cast<float>(source.start[0] / predictionToBaseScale),
+            static_cast<float>(source.start[1] / predictionToBaseScale),
+            static_cast<float>(source.start[2] / predictionToBaseScale),
+        };
+        const cv::Vec3f finish{
+            static_cast<float>(source.finish[0] / predictionToBaseScale),
+            static_cast<float>(source.finish[1] / predictionToBaseScale),
+            static_cast<float>(source.finish[2] / predictionToBaseScale),
+        };
+        if (pointSegmentDistanceSquared(point, start, finish) <= radiusSquared)
+            return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -60,6 +109,96 @@ TEST_CASE("fiber replay tube uses exact endpoint caps and sorted explicit cells"
                              {1, 1, 2},
                          });
     CHECK(tube.volumeCropBaseXYZWHD == std::array<size_t, 6>{2, 2, 2, 8, 4, 4});
+}
+
+TEST_CASE("fiber replay tube float containment index matches direct segment scan")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {128, 128, 128};
+    grid.predictionToBaseScale = 2.0;
+    const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+        {
+            {4.0, 4.0, 4.0},
+            {20.0, 4.0, 4.0},
+            {20.0, 24.0, 8.0},
+            {36.0, 24.0, 8.0},
+        },
+        18.0,
+        17.0,
+        5.0,
+        grid,
+        2);
+    const auto query = tube.makePredictionContainmentQuery(
+        grid.predictionToBaseScale);
+
+    std::mt19937 generator(42);
+    std::uniform_real_distribution<double> coordinate(-2.0, 24.0);
+    for (size_t index = 0; index < 20000; ++index) {
+        const cv::Vec3d point{
+            coordinate(generator),
+            coordinate(generator),
+            coordinate(generator),
+        };
+        CHECK(
+            query.containsPredictionPoint(point) ==
+            directFloatContains(tube, point, grid.predictionToBaseScale));
+
+        const double legacyDistancePrediction = tube.distanceToBasePoint(
+            point * grid.predictionToBaseScale) / grid.predictionToBaseScale;
+        const double radiusPrediction =
+            tube.radiusBaseVoxels / grid.predictionToBaseScale;
+        if (std::abs(legacyDistancePrediction - radiusPrediction) > 1.0e-4) {
+            CHECK(
+                query.containsPredictionPoint(point) ==
+                (legacyDistancePrediction <= radiusPrediction + 5.0e-13));
+        }
+    }
+}
+
+TEST_CASE("fiber replay tube float containment owns its data and supports concurrent queries")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {64, 64, 64};
+    grid.predictionToBaseScale = 4.0;
+    auto query = [&] {
+        const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+            {{8.0, 12.0, 16.0}, {72.0, 12.0, 16.0}},
+            32.0,
+            24.0,
+            8.0,
+            grid,
+            2);
+        return tube.makePredictionContainmentQuery(
+            grid.predictionToBaseScale);
+    }();
+    const auto copy = query;
+
+    std::vector<std::thread> workers;
+    std::atomic<bool> matched{true};
+    for (size_t worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&, worker] {
+            for (size_t index = 0; index < 10000; ++index) {
+                const cv::Vec3d point{
+                    2.0 + static_cast<double>((index + worker) % 16),
+                    1.0 + static_cast<double>(index % 5),
+                    4.0,
+                };
+                if (query.containsPredictionPoint(point) !=
+                    copy.containsPredictionPoint(point)) {
+                    matched.store(false, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers)
+        worker.join();
+    CHECK(matched.load(std::memory_order_relaxed));
+    CHECK(query.containsPredictionPoint({8.0, 3.0, 4.0}));
+    CHECK_FALSE(query.containsPredictionPoint({8.0, 6.1, 4.0}));
+    CHECK_THROWS_AS(
+        query.containsPredictionPoint(
+            {std::numeric_limits<double>::infinity(), 0.0, 0.0}),
+        std::invalid_argument);
 }
 
 TEST_CASE("forward replay matching uses caller supplied variable advance")

@@ -1,3 +1,12 @@
+# 2026-08-17: fiberlet extraction profiling
+
+- Added deterministic anchor and fiberlet workload counters and finer-grained
+  wall, CPU, and summed-worker timings without changing extraction decisions.
+- Added one shared versioned extraction-profile row to `vc_fiberlets benchmark`
+  and full `fiberlet-replay` extraction.
+- Documented a reproducible, exact-output performance protocol and recorded the
+  initial optimization candidates for the fiberlet tracing pipeline.
+
 # 2026-08-13: fiberlet graph replay
 
 - Replaced the quantized world-axis half-grid DP with a deterministic curved
@@ -527,3 +536,12 @@
 - Restored direct replay visualization manifests without a viewer index,
   published stable per-tracer failure aliases for reload, and restored loading
   of strict version-1 single-visualization replay artifacts.
+
+# 2026-08-17: profiled and accelerated fiberlet extraction
+
+- Added versioned anchor/fiberlet phase profiles to benchmark and replay output,
+  including deterministic work counters and process-CPU measurements.
+- Replaced repeated replay-tube scans with an immutable float32 Boost segment
+  R-tree and prioritized each local corridor's layer-adjacent segment. On the
+  5,000-base-voxel Paris4 replay workload, median wall time fell from 58.61 to
+  25.32 seconds while complete published artifacts remained byte-identical.

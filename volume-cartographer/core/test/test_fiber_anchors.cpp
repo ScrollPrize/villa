@@ -1498,6 +1498,30 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(allSamplerCallsSingleThreaded.load());
     CHECK(report.diagnostics.totalCells == 2);
     CHECK(report.diagnostics.outsideSelectionComponents >= 1);
+    CHECK(report.profile.selectedCells == 2);
+    CHECK(report.profile.workCells ==
+          report.profile.selectedCells + report.profile.contextCells);
+    CHECK(report.profile.contextCells > 0);
+    CHECK(report.profile.tiles > 0);
+    CHECK(report.profile.workers > 0);
+    CHECK(report.profile.predictionSamplerCalls == report.profile.tiles);
+    CHECK(report.profile.submittedPredictionVoxels > 0);
+    CHECK(report.profile.candidateObservations >=
+          report.profile.retainedObservations);
+    CHECK(report.profile.retainedObservations > 0);
+    CHECK(report.profile.gradientAttempts ==
+          report.profile.retainedObservations);
+    CHECK(report.profile.validGradients <= report.profile.gradientAttempts);
+    CHECK(report.profile.retainPredicateCalls > 0);
+    CHECK(report.profile.setupSeconds >= 0.0);
+    CHECK(report.profile.tilePlanningSeconds >= 0.0);
+    CHECK(report.profile.cellProcessingSeconds >= 0.0);
+    CHECK(report.profile.coordinateConstructionWorkSeconds >= 0.0);
+    CHECK(report.profile.predictionSamplingWorkSeconds >= 0.0);
+    CHECK(report.profile.observationConstructionWorkSeconds >= 0.0);
+    CHECK(report.profile.fittingWorkSeconds >= 0.0);
+    CHECK(report.profile.duplicateSuppressionSeconds >= 0.0);
+    CHECK(report.profile.elapsedCpuSeconds >= 0.0);
     const auto& initialized = report.diagnosticStages[static_cast<size_t>(
         vc::fiber_tracer::FiberAnchorDiagnosticStage::Initialized)];
     const auto& refined = report.diagnosticStages[static_cast<size_t>(

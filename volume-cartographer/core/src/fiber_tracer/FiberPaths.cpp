@@ -101,10 +101,11 @@ struct SearchNode {
 static_assert(sizeof(SearchNode) == 24);
 
 struct SearchCorridor {
-    std::vector<cv::Vec3d> reference;
+    std::vector<cv::Vec3f> reference;
     Voxel begin{0, 0, 0};
     Voxel end{-1, -1, -1};
-    double radiusSquared = 0.0;
+    double radius = 0.0;
+    float radiusSquared = 0.0f;
 };
 
 struct ScoringVoxel {
@@ -119,6 +120,27 @@ struct PreparedCandidate {
     LocalNodeKeyLayout keyLayout;
     ScoringVoxel startScoring;
     ScoringVoxel targetScoring;
+};
+
+struct PreparationProfile {
+    size_t latticeNodePositions = 0;
+    size_t corridorSegmentTests = 0;
+    size_t corridorAcceptedNodes = 0;
+    size_t pointPredicateCalls = 0;
+    size_t retainedNodes = 0;
+    size_t interpolationCornerInsertions = 0;
+    double geometrySeconds = 0.0;
+    double nodeEnumerationSeconds = 0.0;
+    double cornerCollectionSeconds = 0.0;
+};
+
+struct SolveProfile {
+    size_t nodeIndexEntries = 0;
+    size_t transitionLookups = 0;
+    size_t reachedStateVisits = 0;
+    size_t relaxations = 0;
+    double nodeIndexSeconds = 0.0;
+    double dpSeconds = 0.0;
 };
 
 struct BackPointer {
@@ -427,11 +449,31 @@ SearchCorridor makeSearchCorridor(const CurvedDomain& domain, const FiberPredict
 {
     SearchCorridor corridor;
     const double radius = config.corridorRadiusPredictionVoxels > 0.0 ? config.corridorRadiusPredictionVoxels : static_cast<double>(cellSize);
-    corridor.radiusSquared = radius * radius;
-    corridor.reference = domainCenterline(domain);
-    cv::Vec3d minimum = corridor.reference.front();
-    cv::Vec3d maximum = corridor.reference.front();
-    for (const auto& point : corridor.reference) {
+    const float radiusFloat = static_cast<float>(radius);
+    if (!(radiusFloat > 0.0f) || !std::isfinite(radiusFloat) ||
+        !std::isfinite(radiusFloat * radiusFloat)) {
+        throw std::overflow_error("fiberlet corridor radius is not finite as float32");
+    }
+    corridor.radius = radius;
+    corridor.radiusSquared = radiusFloat * radiusFloat;
+    const auto reference = domainCenterline(domain);
+    corridor.reference.reserve(reference.size());
+    for (const auto& point : reference) {
+        const cv::Vec3f stored{
+            static_cast<float>(point[0]),
+            static_cast<float>(point[1]),
+            static_cast<float>(point[2]),
+        };
+        if (!std::isfinite(stored[0]) || !std::isfinite(stored[1]) ||
+            !std::isfinite(stored[2])) {
+            throw std::overflow_error(
+                "fiberlet corridor reference is not finite as float32");
+        }
+        corridor.reference.push_back(stored);
+    }
+    cv::Vec3d minimum = reference.front();
+    cv::Vec3d maximum = reference.front();
+    for (const auto& point : reference) {
         for (int axis = 0; axis < 3; ++axis) {
             minimum[axis] = std::min(minimum[axis], point[axis]);
             maximum[axis] = std::max(maximum[axis], point[axis]);
@@ -459,21 +501,39 @@ SearchCorridor makeSearchCorridor(const CurvedDomain& domain, const FiberPredict
     return corridor;
 }
 
-double pointSegmentDistanceSquared(const cv::Vec3d& point, const cv::Vec3d& start, const cv::Vec3d& target)
+float pointSegmentDistanceSquared(const cv::Vec3f& point, const cv::Vec3f& start, const cv::Vec3f& target)
 {
-    const cv::Vec3d delta = target - start;
-    const double denominator = delta.dot(delta);
-    if (!(denominator > kEpsilon))
+    const cv::Vec3f delta = target - start;
+    const float denominator = delta.dot(delta);
+    if (!(denominator > 0.0f))
         return (point - start).dot(point - start);
-    const double t = std::clamp((point - start).dot(delta) / denominator, 0.0, 1.0);
-    const cv::Vec3d residual = point - (start + delta * t);
+    const float t = std::clamp(
+        (point - start).dot(delta) / denominator, 0.0f, 1.0f);
+    const cv::Vec3f residual = point - (start + delta * t);
     return residual.dot(residual);
 }
 
-bool insideCorridor(const cv::Vec3d& point, const std::vector<cv::Vec3d>& reference, double radiusSquared)
+bool insideCorridor(
+    const cv::Vec3f& point,
+    const std::vector<cv::Vec3f>& reference,
+    float radiusSquared,
+    std::optional<size_t> adjacentSegment,
+    size_t& segmentTests)
 {
-    for (size_t index = 1; index < reference.size(); ++index) {
-        if (pointSegmentDistanceSquared(point, reference[index - 1], reference[index]) <= radiusSquared) {
+    const auto passes = [&](size_t segment) {
+        ++segmentTests;
+        return pointSegmentDistanceSquared(
+                   point, reference[segment], reference[segment + 1]) <=
+            radiusSquared;
+    };
+    if (adjacentSegment.has_value() && *adjacentSegment + 1 < reference.size() &&
+        passes(*adjacentSegment)) {
+        return true;
+    }
+    for (size_t segment = 0; segment + 1 < reference.size(); ++segment) {
+        if (adjacentSegment.has_value() && segment == *adjacentSegment)
+            continue;
+        if (passes(segment)) {
             return true;
         }
     }
@@ -486,7 +546,8 @@ std::vector<SearchNode> enumerateLocalNodes(
     const FiberletPathConfig& config,
     const FiberPredictionGridInfo& grid,
     const FiberletPointPredicate& pointPredicate,
-    const LocalNodeKeyLayout& layout)
+    const LocalNodeKeyLayout& layout,
+    PreparationProfile& profile)
 {
     std::vector<SearchNode> nodes;
     if (domain.layers.size() <= 2)
@@ -494,6 +555,7 @@ std::vector<SearchNode> enumerateLocalNodes(
     for (size_t layer = 1; layer + 1 < domain.layers.size(); ++layer) {
         for (int u = -layout.transverseLimit; u <= layout.transverseLimit; ++u) {
             for (int v = -layout.transverseLimit; v <= layout.transverseLimit; ++v) {
+                ++profile.latticeNodePositions;
                 const LocalNodeKey key{layer, u, v};
                 const cv::Vec3d mapped = localNodePoint(domain, key, config);
                 const cv::Vec3f stored{
@@ -508,8 +570,20 @@ std::vector<SearchNode> enumerateLocalNodes(
                 };
                 if (!finiteVector(point))
                     throw std::overflow_error("fiberlet local node is not finite as float32");
-                if (insidePredictionGrid(point, grid) && insideCorridor(point, corridor.reference, corridor.radiusSquared) &&
-                    (!pointPredicate || pointPredicate(point))) {
+                if (!insidePredictionGrid(point, grid) ||
+                    !insideCorridor(
+                        stored, corridor.reference, corridor.radiusSquared,
+                        layer - 1,
+                        profile.corridorSegmentTests)) {
+                    continue;
+                }
+                ++profile.corridorAcceptedNodes;
+                bool selected = true;
+                if (pointPredicate) {
+                    ++profile.pointPredicateCalls;
+                    selected = pointPredicate(point);
+                }
+                if (selected) {
                     SearchNode node;
                     node.point = stored;
                     node.key = packLocalNodeKey(key, layout);
@@ -647,9 +721,11 @@ bool storedVoxelLess(const Voxel& left, const Voxel& right)
 void addInterpolationCorners(
     const cv::Vec3d& point,
     const FiberPredictionGridInfo& grid,
-    std::unordered_set<Voxel, VoxelHash>& corners)
+    std::unordered_set<Voxel, VoxelHash>& corners,
+    size_t& insertionAttempts)
 {
     forEachInterpolationCorner(point, grid, [&](const Voxel& corner, double) {
+        ++insertionAttempts;
         corners.insert(corner);
     });
 }
@@ -660,26 +736,44 @@ PreparedCandidate prepareCandidate(
     int cellSize,
     const FiberletPathConfig& config,
     const FiberletPointPredicate& pointPredicate,
-    std::unordered_set<Voxel, VoxelHash>& corners)
+    std::unordered_set<Voxel, VoxelHash>& corners,
+    PreparationProfile& profile)
 {
     PreparedCandidate prepared;
+    const auto geometryStart = Clock::now();
     prepared.domain = makeCurvedDomain(candidate, config);
     const SearchCorridor corridor = makeSearchCorridor(prepared.domain, grid, cellSize, config);
     prepared.keyLayout = makeLocalNodeKeyLayout(
         prepared.domain,
-        std::sqrt(corridor.radiusSquared),
+        corridor.radius,
         config.transverseStepPredictionVoxels);
+    profile.geometrySeconds = std::chrono::duration<double>(
+        Clock::now() - geometryStart).count();
+    const auto nodeEnumerationStart = Clock::now();
     prepared.nodes = enumerateLocalNodes(
         prepared.domain,
         corridor,
         config,
         grid,
         pointPredicate,
-        prepared.keyLayout);
-    addInterpolationCorners(candidate.startPositionPredictionXYZ, grid, corners);
-    addInterpolationCorners(candidate.targetPositionPredictionXYZ, grid, corners);
+        prepared.keyLayout,
+        profile);
+    profile.retainedNodes = prepared.nodes.size();
+    profile.nodeEnumerationSeconds = std::chrono::duration<double>(
+        Clock::now() - nodeEnumerationStart).count();
+    const auto cornerCollectionStart = Clock::now();
+    addInterpolationCorners(
+        candidate.startPositionPredictionXYZ, grid, corners,
+        profile.interpolationCornerInsertions);
+    addInterpolationCorners(
+        candidate.targetPositionPredictionXYZ, grid, corners,
+        profile.interpolationCornerInsertions);
     for (const auto& node : prepared.nodes)
-        addInterpolationCorners(nodePoint(node), grid, corners);
+        addInterpolationCorners(
+            nodePoint(node), grid, corners,
+            profile.interpolationCornerInsertions);
+    profile.cornerCollectionSeconds = std::chrono::duration<double>(
+        Clock::now() - cornerCollectionStart).count();
     return prepared;
 }
 
@@ -841,7 +935,11 @@ bool betterCost(double candidate, double current)
     return candidate < current;
 }
 
-FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const FiberletPathConfig& config, const PreparedCandidate& prepared)
+FiberletCandidateResult solveCandidate(
+    FiberletCandidateResult candidate,
+    const FiberletPathConfig& config,
+    const PreparedCandidate& prepared,
+    SolveProfile& profile)
 {
     candidate.searched = true;
     const cv::Vec3d chordVector = candidate.targetPositionPredictionXYZ - candidate.startPositionPredictionXYZ;
@@ -892,11 +990,16 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
         candidate.reason = "empty_corridor";
         return candidate;
     }
+    const auto nodeIndexStart = Clock::now();
     std::unordered_map<uint32_t, size_t> nodeIndex;
     nodeIndex.reserve(checkedProduct(nodes.size(), 2, "fiberlet DP node hash capacity"));
     for (size_t index = 0; index < nodes.size(); ++index)
         nodeIndex.emplace(nodes[index].key, index);
+    profile.nodeIndexEntries = nodes.size();
+    profile.nodeIndexSeconds = std::chrono::duration<double>(
+        Clock::now() - nodeIndexStart).count();
 
+    const auto dpStart = Clock::now();
     constexpr size_t transitionStateCount = 9;
     constexpr size_t sourceState = transitionStateCount;
     constexpr size_t stateCount = transitionStateCount + 1;
@@ -939,6 +1042,7 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
             const auto& currentState = states[node * stateCount + previousState];
             if (!currentState.reached)
                 continue;
+            ++profile.reachedStateVisits;
             for (int deltaU = -1; deltaU <= 1; ++deltaU) {
                 for (int deltaV = -1; deltaV <= 1; ++deltaV) {
                     const LocalNodeKey nextKey{
@@ -951,6 +1055,7 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
                         nextKey.transverseV > prepared.keyLayout.transverseLimit) {
                         continue;
                     }
+                    ++profile.transitionLookups;
                     const auto found = nodeIndex.find(
                         packLocalNodeKey(nextKey, prepared.keyLayout));
                     if (found == nodeIndex.end())
@@ -982,6 +1087,7 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
                     const size_t transitionState = static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
                     auto& destination = states[next * stateCount + transitionState];
                     if (!destination.reached || betterCost(nextCost.total(), destination.cost.total())) {
+                        ++profile.relaxations;
                         destination.reached = true;
                         destination.cost = nextCost;
                         destination.previous = {static_cast<int64_t>(node), static_cast<int>(previousState)};
@@ -1037,6 +1143,8 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
         }
     }
     if (!foundPath) {
+        profile.dpSeconds = std::chrono::duration<double>(
+            Clock::now() - dpStart).count();
         candidate.reason = "no_path";
         return candidate;
     }
@@ -1067,6 +1175,8 @@ FiberletCandidateResult solveCandidate(FiberletCandidateResult candidate, const 
     candidate.scoreValid = true;
     candidate.success = true;
     candidate.reason = "success";
+    profile.dpSeconds = std::chrono::duration<double>(
+        Clock::now() - dpStart).count();
     return candidate;
 }
 
@@ -1829,7 +1939,18 @@ FiberletPathReport traceFiberletPaths(
                 const cv::Vec3d chord = chordVector / distance;
                 candidate.startAxisXYZ = normalized(source.anchor.axisXYZ);
                 candidate.targetAxisXYZ = normalized(target->anchor.axisXYZ);
-                if (pointPredicate && (!pointPredicate(candidate.startPositionPredictionXYZ) || !pointPredicate(candidate.targetPositionPredictionXYZ))) {
+                bool endpointsSelected = true;
+                if (pointPredicate) {
+                    ++report.candidatePointPredicateCalls;
+                    endpointsSelected =
+                        pointPredicate(candidate.startPositionPredictionXYZ);
+                    if (endpointsSelected) {
+                        ++report.candidatePointPredicateCalls;
+                        endpointsSelected = pointPredicate(
+                            candidate.targetPositionPredictionXYZ);
+                    }
+                }
+                if (!endpointsSelected) {
                     candidate.reason = "outside_selection";
                     report.candidates.push_back(std::move(candidate));
                     continue;
@@ -1896,6 +2017,8 @@ FiberletPathReport traceFiberletPaths(
     const size_t workerCount = std::min(searchCandidateIndices.size(), static_cast<size_t>(report.config.parallelThreads));
     report.candidateWorkers = workerCount;
     std::vector<PreparedCandidate> prepared(searchCandidateIndices.size());
+    std::vector<PreparationProfile> preparationProfiles(
+        searchCandidateIndices.size());
     std::vector<std::unordered_set<Voxel, VoxelHash>> workerCorners(workerCount);
     std::vector<std::exception_ptr> errors(searchCandidateIndices.size());
 
@@ -1912,7 +2035,9 @@ FiberletPathReport traceFiberletPaths(
                 return;
             try {
                 prepared[searchIndex] = prepareCandidate(
-                    report.candidates[searchCandidateIndices[searchIndex]], grid, report.anchorCellSizePredictionVoxels, report.config, pointPredicate, corners);
+                    report.candidates[searchCandidateIndices[searchIndex]], grid,
+                    report.anchorCellSizePredictionVoxels, report.config,
+                    pointPredicate, corners, preparationProfiles[searchIndex]);
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
@@ -1938,9 +2063,35 @@ FiberletPathReport traceFiberletPaths(
             std::rethrow_exception(error);
     }
     report.preparedCandidates = prepared.size();
-    for (const auto& item : prepared) {
+    for (size_t index = 0; index < prepared.size(); ++index) {
+        const auto& item = prepared[index];
+        const auto& profile = preparationProfiles[index];
         report.evaluatedDpNodes = checkedSum(
             report.evaluatedDpNodes, checkedSum(item.nodes.size(), 2, "fiberlet evaluated node count"), "fiberlet evaluated node count");
+        report.latticeNodePositions = checkedSum(
+            report.latticeNodePositions, profile.latticeNodePositions,
+            "fiberlet lattice node count");
+        report.corridorSegmentTests = checkedSum(
+            report.corridorSegmentTests, profile.corridorSegmentTests,
+            "fiberlet corridor segment test count");
+        report.corridorAcceptedNodes = checkedSum(
+            report.corridorAcceptedNodes, profile.corridorAcceptedNodes,
+            "fiberlet corridor accepted node count");
+        report.nodePointPredicateCalls = checkedSum(
+            report.nodePointPredicateCalls, profile.pointPredicateCalls,
+            "fiberlet node predicate call count");
+        report.retainedSearchNodes = checkedSum(
+            report.retainedSearchNodes, profile.retainedNodes,
+            "fiberlet retained node count");
+        report.interpolationCornerInsertions = checkedSum(
+            report.interpolationCornerInsertions,
+            profile.interpolationCornerInsertions,
+            "fiberlet interpolation corner insertion count");
+        report.preparationGeometryWorkSeconds += profile.geometrySeconds;
+        report.preparationNodeEnumerationWorkSeconds +=
+            profile.nodeEnumerationSeconds;
+        report.preparationCornerCollectionWorkSeconds +=
+            profile.cornerCollectionSeconds;
     }
     size_t preparedBytes = preparedPayloadBytes(prepared);
     report.preparedGeometryBytes = preparedBytes;
@@ -2103,10 +2254,16 @@ FiberletPathReport traceFiberletPaths(
     const auto materializationStart = Clock::now();
     const double materializationCpuStart = processCpuSeconds();
     reportProgress("materialization", 0, prepared.size(), materializationStart, true);
+    const auto scoringIndexStart = Clock::now();
+    const double scoringIndexCpuStart = processCpuSeconds();
     std::unordered_map<Voxel, size_t, VoxelHash> voxelIndices;
     voxelIndices.reserve(checkedProduct(orderedVoxels.size(), 2, "fiberlet scoring index capacity"));
     for (size_t index = 0; index < orderedVoxels.size(); ++index)
         voxelIndices.emplace(orderedVoxels[index], index);
+    report.scoringIndexSeconds = std::chrono::duration<double>(
+        Clock::now() - scoringIndexStart).count();
+    report.scoringIndexCpuSeconds =
+        processCpuSeconds() - scoringIndexCpuStart;
     const size_t scoringIndexPayloadBytes = checkedProduct(
         voxelIndices.size(),
         checkedSum(sizeof(Voxel), sizeof(size_t), "fiberlet scoring index byte estimate"),
@@ -2118,6 +2275,13 @@ FiberletPathReport traceFiberletPaths(
                 scoringIndexPayloadBytes,
                 "fiberlet peak owned byte estimate"));
     errors.assign(prepared.size(), {});
+    for (const auto& item : prepared) {
+        report.interpolatedScoringPoints = checkedSum(
+            report.interpolatedScoringPoints,
+            checkedSum(item.nodes.size(), 2,
+                "fiberlet interpolated scoring point count"),
+            "fiberlet interpolated scoring point count");
+    }
     std::atomic<size_t> nextMaterialization{0};
     std::atomic<size_t> completedMaterialization{0};
     const auto materializationWorker = [&]() {
@@ -2151,6 +2315,8 @@ FiberletPathReport traceFiberletPaths(
             reportProgress("materialization", completed, prepared.size(), materializationStart, false);
         }
     };
+    const auto interpolationMaterializationStart = Clock::now();
+    const double interpolationMaterializationCpuStart = processCpuSeconds();
     if (workerCount == 1) {
         materializationWorker();
     } else {
@@ -2162,6 +2328,11 @@ FiberletPathReport traceFiberletPaths(
             thread.join();
     }
     reportProgress("materialization", prepared.size(), prepared.size(), materializationStart, true);
+    report.interpolationMaterializationSeconds =
+        std::chrono::duration<double>(
+            Clock::now() - interpolationMaterializationStart).count();
+    report.interpolationMaterializationCpuSeconds =
+        processCpuSeconds() - interpolationMaterializationCpuStart;
     report.samplingMaterializationSeconds = std::chrono::duration<double>(Clock::now() - materializationStart).count();
     report.samplingMaterializationCpuSeconds = processCpuSeconds() - materializationCpuStart;
     for (const auto& error : errors) {
@@ -2179,6 +2350,7 @@ FiberletPathReport traceFiberletPaths(
     const double searchCpuStart = processCpuSeconds();
     reportProgress("search", 0, searchCandidateIndices.size(), searchStart, true);
     errors.assign(searchCandidateIndices.size(), {});
+    std::vector<SolveProfile> solveProfiles(searchCandidateIndices.size());
     std::atomic<size_t> nextSearch{0};
     std::atomic<size_t> completedSearches{0};
     const auto searchWorker = [&]() {
@@ -2188,7 +2360,9 @@ FiberletPathReport traceFiberletPaths(
                 return;
             const size_t candidateIndex = searchCandidateIndices[searchIndex];
             try {
-                report.candidates[candidateIndex] = solveCandidate(report.candidates[candidateIndex], report.config, prepared[searchIndex]);
+                report.candidates[candidateIndex] = solveCandidate(
+                    report.candidates[candidateIndex], report.config,
+                    prepared[searchIndex], solveProfiles[searchIndex]);
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
@@ -2212,6 +2386,22 @@ FiberletPathReport traceFiberletPaths(
     for (const auto& error : errors) {
         if (error)
             std::rethrow_exception(error);
+    }
+    for (const auto& profile : solveProfiles) {
+        report.dpNodeIndexEntries = checkedSum(
+            report.dpNodeIndexEntries, profile.nodeIndexEntries,
+            "fiberlet DP node-index entry count");
+        report.dpTransitionLookups = checkedSum(
+            report.dpTransitionLookups, profile.transitionLookups,
+            "fiberlet DP transition lookup count");
+        report.dpReachedStateVisits = checkedSum(
+            report.dpReachedStateVisits, profile.reachedStateVisits,
+            "fiberlet DP reached-state visit count");
+        report.dpRelaxations = checkedSum(
+            report.dpRelaxations, profile.relaxations,
+            "fiberlet DP relaxation count");
+        report.searchNodeIndexWorkSeconds += profile.nodeIndexSeconds;
+        report.searchDpWorkSeconds += profile.dpSeconds;
     }
     if (progressError)
         std::rethrow_exception(progressError);
@@ -2603,5 +2793,27 @@ void removeFiberPresenceSliceArtifacts(const std::filesystem::path& outputDirect
         removeSliceFile(paths.temporaryObj);
     }
 }
+
+#ifdef VC_TESTING
+namespace testing
+{
+
+FiberletCorridorContainmentDebug debugFiberletCorridorContains(
+    const cv::Vec3f& point,
+    const std::vector<cv::Vec3f>& reference,
+    float radius,
+    std::optional<size_t> adjacentSegment)
+{
+    if (!(radius > 0.0f) || !std::isfinite(radius) || reference.size() < 2)
+        throw std::invalid_argument("fiberlet corridor test input is invalid");
+    FiberletCorridorContainmentDebug result;
+    result.inside = insideCorridor(
+        point, reference, radius * radius, adjacentSegment,
+        result.segmentTests);
+    return result;
+}
+
+}  // namespace testing
+#endif
 
 }  // namespace vc::fiber_tracer

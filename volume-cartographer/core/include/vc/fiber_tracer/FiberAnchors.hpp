@@ -181,6 +181,35 @@ struct FiberAnchorExtractionDiagnostics {
     size_t outsideSelectionComponents = 0;
 };
 
+struct FiberAnchorExtractionProfile {
+    size_t selectedCells = 0;
+    size_t contextCells = 0;
+    size_t workCells = 0;
+    size_t tiles = 0;
+    size_t workers = 0;
+    size_t predictionSamplerCalls = 0;
+    size_t submittedPredictionVoxels = 0;
+    size_t candidateObservations = 0;
+    size_t retainedObservations = 0;
+    size_t gradientAttempts = 0;
+    size_t validGradients = 0;
+    size_t retainPredicateCalls = 0;
+    size_t fitIterations = 0;
+    double setupSeconds = 0.0;
+    double tilePlanningSeconds = 0.0;
+    double cellProcessingSeconds = 0.0;
+    double cellProcessingCpuSeconds = 0.0;
+    double coordinateConstructionWorkSeconds = 0.0;
+    double predictionSamplingWorkSeconds = 0.0;
+    double observationConstructionWorkSeconds = 0.0;
+    double fittingWorkSeconds = 0.0;
+    double selectionSeconds = 0.0;
+    double initialDiagnosticsSeconds = 0.0;
+    double duplicateSuppressionSeconds = 0.0;
+    double finalizationSeconds = 0.0;
+    double elapsedCpuSeconds = 0.0;
+};
+
 struct FiberAnchorExtractionReport {
     FiberPredictionGridInfo grid;
     FiberAnchorConfig config;
@@ -189,6 +218,7 @@ struct FiberAnchorExtractionReport {
     std::array<size_t, 3> selectedCellEndZYX{0, 0, 0};
     std::vector<std::array<size_t, 3>> selectedCellsZYX;
     FiberAnchorExtractionDiagnostics diagnostics;
+    FiberAnchorExtractionProfile profile;
     std::vector<FiberCellAnchorResult> nonEmptyCells;
     std::array<std::vector<FiberAnchorDiagnosticRecord>,
                kFiberAnchorDiagnosticStageCount> diagnosticStages;

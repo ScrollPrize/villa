@@ -2733,7 +2733,10 @@
   each searchable candidate exactly once into its canonical slot: one Hermite
   domain, one corridor enumeration, checked packed local keys, and mapped
   positions. DP reuses this representation and never reconstructs the domain,
-  corridor, or local nodes.
+  corridor, or local nodes. Local corridor admission uses float32 continuous
+  point-to-segment distance. It tests one segment adjacent to the node's layer
+  first and scans the remaining segments only when that test fails; this is the
+  same unordered union-of-segment-capsules predicate as a complete scan.
 - Preparation accumulates positive-weight native corners in worker-local sets.
   Sorted worker vectors are reduced by deterministic pairwise unique merges to
   one complete stored-ZYX ordered global union. Its exact contents and size are
@@ -2772,7 +2775,7 @@
   transport followed by re-orthogonalization. A local key `(layer,u,v)` maps to
   `center + 0.5*u*U + 0.5*v*V` in prediction XYZ. Finite transverse bounds are
   derived from corridor radius, then mapped points are filtered by inclusive
-  volume bounds, exact corridor membership, and any replay tube predicate. An
+  volume bounds, corridor membership, and any replay tube predicate. An
   interior mapped point is narrowed once to three `float32` coordinates before
   any of those admission tests; that stored position is authoritative for
   sampling, DP geometry, and output. Exact endpoint anchors remain doubles.
@@ -3005,6 +3008,35 @@
   timings.
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
+- Benchmark and full replay extraction emit the same versioned
+  `fiberlet_extraction_profile version=1` key/value schema. The profile exposes
+  deterministic workload counters and finer anchor/fiberlet phase timings.
+  Enclosing phase fields are wall time, `_work_seconds` fields are summed
+  worker/candidate time, and CPU fields are process CPU time. Corner insertion
+  attempts count every positive-weight attempt; the existing sampled-voxel
+  count remains the deterministic globally unique union. Profiled phase sums
+  and residual elapsed time make uncovered overhead visible. Progress callback
+  cost remains in its enclosing phase. Diagnostics must not change sampling,
+  fitting, candidate generation, DP math, ordering, serialized artifacts, or
+  determinism.
+- The hot replay-tube filter snapshots authoritative clipped source segments in
+  prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
+  radius-expanded segment AABBs. A point is inside when any candidate's
+  continuous float32 point-to-segment distance is within the float32 radius.
+  Candidate order and the linear projection function's `1e-12` tie behavior are
+  intentionally irrelevant to this boolean geometric-union predicate. The
+  snapshot owns its tree and segment storage, is immutable after construction,
+  and supports concurrent const queries. Public replay-tube distance methods
+  retain the existing double-precision linear projection for diagnostics.
+- Fiberlet performance changes are measurement-first. Exact numeric identity is
+  relaxed only for the float32 replay-tube and local-corridor containment
+  filters; comparisons must quantify changed classifications near the radius,
+  and changes outside the documented float32 boundary band are failures. Other
+  numerics and deterministic ordering remain unchanged. A comparison records
+  the command, input identities, commit, build
+  type and flags, host, thread count, decoded/disk/OS cache state, warmup policy,
+  repeated-run distribution, and exact output hashes or bytes in addition to
+  aggregate correctness metrics.
 
 # Anchor pipeline stage diagnostics
 

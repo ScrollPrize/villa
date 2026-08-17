@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <exception>
 #include <limits>
 #include <map>
@@ -27,6 +28,14 @@ namespace {
 
 constexpr double kMatrixEpsilon = 1.0e-15;
 constexpr double kGeometryEpsilon = 1.0e-12;
+
+double processCpuSeconds()
+{
+    const std::clock_t ticks = std::clock();
+    return ticks == static_cast<std::clock_t>(-1)
+        ? 0.0
+        : static_cast<double>(ticks) / static_cast<double>(CLOCKS_PER_SEC);
+}
 
 double segmentAabbDistanceSquared(
     const cv::Vec3d& start,
@@ -1818,6 +1827,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     };
 
     const auto start = std::chrono::steady_clock::now();
+    const double startCpuSeconds = processCpuSeconds();
     using CellIndex = std::array<size_t, 3>;
     std::vector<CellIndex> selectedCells = explicitCells;
     if (!usesExplicitCells) {
@@ -1883,6 +1893,11 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     }
     const std::vector<CellIndex> workCells(
         workCellSet.begin(), workCellSet.end());
+    report.profile.selectedCells = selectedCells.size();
+    report.profile.workCells = workCells.size();
+    report.profile.contextCells = workCells.size() - selectedCells.size();
+    report.profile.setupSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
 
     const auto processCells = [&](const std::vector<std::array<size_t, 3>>& requestedCells,
                                   bool tallySelectedDiagnostics,
@@ -1892,6 +1907,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             progressCallback({phase, 0, requestedCells.size(), 0.0});
         if (requestedCells.empty())
             return std::vector<FiberCellAnchorResult>{};
+        const auto tilePlanningStart = std::chrono::steady_clock::now();
 
         const auto sampleBounds = [&](const CellIndex& cell) {
             const CellIndex begin{
@@ -2039,15 +2055,35 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             static_cast<size_t>(config.parallelThreads),
             memoryWorkers,
         });
+        report.profile.tiles += tiles.size();
+        report.profile.workers = std::max(report.profile.workers, workerCount);
+        report.profile.tilePlanningSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tilePlanningStart).count();
 
         std::vector<std::optional<FiberCellAnchorResult>> jobResults(
             requestedCells.size());
         std::vector<std::exception_ptr> jobErrors(requestedCells.size());
+        struct WorkerProfile {
+            size_t predictionSamplerCalls = 0;
+            size_t submittedPredictionVoxels = 0;
+            size_t candidateObservations = 0;
+            size_t retainedObservations = 0;
+            size_t gradientAttempts = 0;
+            size_t validGradients = 0;
+            size_t fitIterations = 0;
+            double coordinateConstructionSeconds = 0.0;
+            double predictionSamplingSeconds = 0.0;
+            double observationConstructionSeconds = 0.0;
+            double fittingSeconds = 0.0;
+        };
+        std::vector<WorkerProfile> workerProfiles(workerCount);
         const auto processCell = [&]
             (const CellIndex& cellZYX,
              const Tile& tile,
              const std::vector<FiberStoredPredictionSample>& samples,
-             const std::array<size_t, 3>& sampleShape) {
+             const std::array<size_t, 3>& sampleShape,
+             WorkerProfile& workerProfile) {
+            const auto observationStart = std::chrono::steady_clock::now();
             const std::array<size_t, 3> begin{
                 cellZYX[0] * cellSize,
                 cellZYX[1] * cellSize,
@@ -2124,6 +2160,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
                 for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
                     for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
+                        ++workerProfile.candidateObservations;
                         const size_t index = tileIndex(z, y, x);
                         FiberAnchorObservation observation{
                             cv::Vec3d{
@@ -2151,11 +2188,13 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                                 maximumSupportRadius * maximumSupportRadius +
                                     1.0e-12) {
                             if (config.peakGradientWeight > 0.0) {
+                                ++workerProfile.gradientAttempts;
                                 const auto gradient = presenceGradient(z, y, x);
                                 if (gradient.has_value()) {
                                     observation.presenceGradientPredictionXYZ =
                                         *gradient;
                                     observation.presenceGradientValid = true;
+                                    ++workerProfile.validGradients;
                                 }
                             }
                             cellObservations.push_back(observation);
@@ -2163,8 +2202,18 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                 }
             }
-            return fitFiberCellAnchors(
+            workerProfile.retainedObservations += cellObservations.size();
+            workerProfile.observationConstructionSeconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - observationStart).count();
+            const auto fittingStart = std::chrono::steady_clock::now();
+            auto result = fitFiberCellAnchors(
                 cellZYX, begin, end, cellObservations, config);
+            workerProfile.fittingSeconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - fittingStart).count();
+            for (const auto& component : result.components)
+                workerProfile.fitIterations += component.anchor.refinementIterations;
+            return result;
         };
 
         std::atomic<size_t> nextJob{0};
@@ -2172,7 +2221,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         std::mutex progressMutex;
         auto lastProgressTime = phaseStart;
         std::exception_ptr progressError;
-        const auto worker = [&]() {
+        const auto worker = [&](size_t workerIndex) {
+            auto& workerProfile = workerProfiles[workerIndex];
             while (true) {
                 const size_t job = nextJob.fetch_add(1);
                 if (job >= tiles.size())
@@ -2186,6 +2236,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     };
                     const size_t sampleCount = checkedProduct(
                         sampleShape, "fiber anchor tile sample");
+                    const auto coordinateStart = std::chrono::steady_clock::now();
                     std::vector<CellIndex> indices;
                     indices.reserve(sampleCount);
                     for (size_t z = tile.sampleBegin[0]; z < tile.sampleEnd[0]; ++z) {
@@ -2194,8 +2245,17 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                                 indices.push_back({z, y, x});
                         }
                     }
+                    workerProfile.coordinateConstructionSeconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - coordinateStart).count();
                     std::vector<FiberStoredPredictionSample> samples;
+                    const auto samplingStart = std::chrono::steady_clock::now();
                     sampler(indices, 1, samples);
+                    workerProfile.predictionSamplingSeconds +=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - samplingStart).count();
+                    ++workerProfile.predictionSamplerCalls;
+                    workerProfile.submittedPredictionVoxels += sampleCount;
                     if (samples.size() != indices.size()) {
                         throw std::runtime_error(
                             "fiber stored prediction sampler returned the wrong sample count");
@@ -2204,7 +2264,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     indices.shrink_to_fit();
                     for (const size_t cellIndex : tile.cells) {
                         jobResults[cellIndex] = processCell(
-                            requestedCells[cellIndex], tile, samples, sampleShape);
+                            requestedCells[cellIndex], tile, samples,
+                            sampleShape, workerProfile);
                         const size_t completed = completedJobs.fetch_add(1) + 1;
                         if (progressCallback) {
                             const auto now = std::chrono::steady_clock::now();
@@ -2233,12 +2294,38 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 }
             }
         };
+        const auto cellProcessingStart = std::chrono::steady_clock::now();
+        const double cellProcessingCpuStart = processCpuSeconds();
         std::vector<std::thread> workers;
         workers.reserve(workerCount);
         for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
-            workers.emplace_back(worker);
+            workers.emplace_back(worker, workerIndex);
         for (auto& thread : workers)
             thread.join();
+        report.profile.cellProcessingSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - cellProcessingStart).count();
+        report.profile.cellProcessingCpuSeconds +=
+            processCpuSeconds() - cellProcessingCpuStart;
+        for (const auto& workerProfile : workerProfiles) {
+            report.profile.predictionSamplerCalls +=
+                workerProfile.predictionSamplerCalls;
+            report.profile.submittedPredictionVoxels +=
+                workerProfile.submittedPredictionVoxels;
+            report.profile.candidateObservations +=
+                workerProfile.candidateObservations;
+            report.profile.retainedObservations +=
+                workerProfile.retainedObservations;
+            report.profile.gradientAttempts += workerProfile.gradientAttempts;
+            report.profile.validGradients += workerProfile.validGradients;
+            report.profile.fitIterations += workerProfile.fitIterations;
+            report.profile.coordinateConstructionWorkSeconds +=
+                workerProfile.coordinateConstructionSeconds;
+            report.profile.predictionSamplingWorkSeconds +=
+                workerProfile.predictionSamplingSeconds;
+            report.profile.observationConstructionWorkSeconds +=
+                workerProfile.observationConstructionSeconds;
+            report.profile.fittingWorkSeconds += workerProfile.fittingSeconds;
+        }
 
         for (const auto& error : jobErrors) {
             if (error)
@@ -2256,6 +2343,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             });
         }
 
+        const auto selectionStart = std::chrono::steady_clock::now();
         std::vector<FiberCellAnchorResult> results;
         results.reserve(requestedCells.size());
         for (auto& result : jobResults) {
@@ -2266,6 +2354,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 for (auto& component : cell.components) {
                     if (!component.retained)
                         continue;
+                    ++report.profile.retainPredicateCalls;
                     const FiberAnchorRetainEvaluation evaluation =
                         retainPredicate(component.anchor);
                     if (!evaluation.retained &&
@@ -2303,12 +2392,15 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             if (cell.retainedAnchorCount > 0 || tallyCell)
                 results.push_back(std::move(cell));
         }
+        report.profile.selectionSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - selectionStart).count();
         return results;
     };
 
     std::vector<FiberCellAnchorResult> contextResults = processCells(
         workCells, true, refinedOnly ? "selected_cells" : "anchor_cells");
 
+    const auto initialDiagnosticsStart = std::chrono::steady_clock::now();
     report.diagnostics.totalCells = usesExplicitCells
         ? explicitCells.size()
         : checkedProduct({
@@ -2373,13 +2465,20 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 std::tie(right.cellZYX, right.candidateId);
         });
     }
+    report.profile.initialDiagnosticsSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - initialDiagnosticsStart).count();
     if (refinedOnly) {
         report.elapsedSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
+        report.profile.elapsedCpuSeconds = processCpuSeconds() - startCpuSeconds;
         return report;
     }
 
+    const auto duplicateSuppressionStart = std::chrono::steady_clock::now();
     suppressFiberAnchorDuplicates(contextResults, config);
+    report.profile.duplicateSuppressionSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - duplicateSuppressionStart).count();
+    const auto finalizationStart = std::chrono::steady_clock::now();
     for (auto& cell : contextResults) {
         if (!selectedCell(cell.cellZYX))
             continue;
@@ -2454,8 +2553,11 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 std::tie(right.cellZYX, right.candidateId);
         });
     }
+    report.profile.finalizationSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - finalizationStart).count();
     report.elapsedSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
+    report.profile.elapsedCpuSeconds = processCpuSeconds() - startCpuSeconds;
     return report;
 }
 
