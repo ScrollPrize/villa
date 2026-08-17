@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,5 +48,42 @@ namespace vc::core::util {
     // never be mistaken downstream for a legacy unstamped file.
     [[nodiscard]] ScrollUmbilicusResolution resolveScrollUmbilicus(
         const VolumePkg& pkg);
+
+    // How a scale was arrived at, because callers trust the three differently:
+    // the stamped ones are stated by the file, the inferred one is this code's
+    // best reading of it.
+    enum class UmbilicusScaleSource {
+        StampedDimensions,
+        StampedVoxelSize,
+        InferredFromGrid,
+    };
+
+    struct UmbilicusScale {
+        double factor = 1.0;
+        UmbilicusScaleSource source = UmbilicusScaleSource::StampedDimensions;
+        // Plain-text account of the derivation, for logs and status lines.
+        std::string description;
+    };
+
+    // The factor that carries an umbilicus file's coordinates into the frame
+    // whose extent is targetGridXyz (x, y, z voxel counts) — the frame the
+    // caller's own coordinates live in, which is not necessarily any single
+    // volume's own grid.
+    //
+    // Tried in descending order of trust: the stamped grid dimensions against
+    // the target grid (exact integers, no micrometres involved, and rejected
+    // outright if the three axis ratios disagree); the stamped voxel size
+    // against targetVoxelSizeUm; and finally which power-of-two downsample of
+    // the target grid the points fit inside and nearly fill, which is a reading
+    // of the file rather than a statement by it. Empty when none of the three
+    // applies, which callers must treat as "frame unknown" rather than 1.0.
+    //
+    // Deliberately says nothing about registration: this answers which grid the
+    // numbers index, not which pose that grid was in. A file needing both is
+    // outside what the format can currently express.
+    [[nodiscard]] std::optional<UmbilicusScale> deriveUmbilicusScale(
+        const UmbilicusFileInfo& info,
+        const std::array<double, 3>& targetGridXyz,
+        std::optional<double> targetVoxelSizeUm);
 
 } // namespace vc::core::util

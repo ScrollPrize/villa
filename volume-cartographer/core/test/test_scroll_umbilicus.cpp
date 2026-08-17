@@ -15,7 +15,10 @@
 #include <string>
 
 namespace fs = std::filesystem;
+using vc::core::util::deriveUmbilicusScale;
 using vc::core::util::resolveScrollUmbilicus;
+using vc::core::util::UmbilicusFileInfo;
+using vc::core::util::UmbilicusScaleSource;
 
 namespace {
 
@@ -70,6 +73,16 @@ struct TestAutosaveRoot {
 TestAutosaveRoot testAutosaveRoot;
 
 // A saved project rooted at <dir>/project.json.
+// Discovery treats a directory as an individual segment only when it carries the
+// tifxyz payload, so fixtures standing in for one have to as well.
+void writeSegment(const fs::path& dir)
+{
+    fs::create_directories(dir);
+    for (const char* plane : {"x.tif", "y.tif", "z.tif"}) {
+        std::ofstream(dir / plane) << "tif";
+    }
+}
+
 std::shared_ptr<VolumePkg> projectIn(const fs::path& dir)
 {
     auto pkg = VolumePkg::newEmpty();
@@ -372,7 +385,7 @@ TEST_CASE("resolver: <volpkg>/paths/<segment> finds <volpkg>/umbilicus.json")
     // The project lives one level above the volpkg, so the package root alone
     // does not reach <volpkg>/umbilicus.json.
     const auto volpkg = d / "scroll.volpkg";
-    fs::create_directories(volpkg / "paths" / "seg1");
+    writeSegment(volpkg / "paths" / "seg1");
     writeUmbilicus(volpkg / "umbilicus.json", 2.4);
 
     auto pkg = projectIn(d);
@@ -390,7 +403,7 @@ TEST_CASE("resolver: one file reachable via parent and grandparent is not ambigu
 {
     auto d = tmpDir("parent_grandparent");
     const auto volpkg = d / "scroll.volpkg";
-    fs::create_directories(volpkg / "paths" / "seg1");
+    writeSegment(volpkg / "paths" / "seg1");
     writeUmbilicus(volpkg / "paths" / "umbilicus.json", 2.4);
 
     auto pkg = projectIn(d);
@@ -405,11 +418,70 @@ TEST_CASE("resolver: one file reachable via parent and grandparent is not ambigu
     fs::remove_all(d);
 }
 
+TEST_CASE("resolver: a segments-folder attachment does not search above the volpkg")
+{
+    auto d = tmpDir("folder_attachment_scope");
+    // The project file and the volpkg live in different places, so the
+    // directory holding the volpkg is not already a root by another route.
+    const auto project = d / "project";
+    const auto store = d / "scrolls";
+    const auto volpkg = store / "scroll.volpkg";
+    fs::create_directories(project);
+    fs::create_directories(volpkg / "paths");
+    writeUmbilicus(volpkg / "umbilicus.json", 2.4);
+    // A neighbour of the volpkg. Taking the grandparent of the attached folder
+    // would pull this in and either win outright or force a false ambiguity.
+    writeUmbilicus(store / "umbilicus.json", 9.6);
+
+    auto pkg = projectIn(project);
+    REQUIRE(pkg->addSegmentsEntry((volpkg / "paths").string()));
+
+    const auto resolved = resolveScrollUmbilicus(*pkg);
+    CHECK(resolved.ambiguous.empty());
+    CHECK(fs::equivalent(resolved.path, volpkg / "umbilicus.json"));
+    CHECK(resolved.info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+    fs::remove_all(d);
+}
+
+TEST_CASE("resolver: an individual-segment attachment still reaches the volpkg")
+{
+    auto d = tmpDir("segment_attachment_scope");
+    const auto project = d / "project";
+    const auto store = d / "scrolls";
+    const auto volpkg = store / "scroll.volpkg";
+    fs::create_directories(project);
+    writeSegment(volpkg / "paths" / "seg1");
+    writeUmbilicus(volpkg / "umbilicus.json", 2.4);
+
+    auto pkg = projectIn(project);
+    REQUIRE(pkg->addSegmentsEntry((volpkg / "paths" / "seg1").string()));
+
+    const auto resolved = resolveScrollUmbilicus(*pkg);
+    CHECK(resolved.error.empty());
+    CHECK(fs::equivalent(resolved.path, volpkg / "umbilicus.json"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("resolver: metadata that is not an object refuses the file")
+{
+    auto d = tmpDir("metadata_not_object");
+    std::ofstream(d / "umbilicus.json")
+        << R"({"metadata": "nope", "control_points": [)"
+        << R"({"x": 1, "y": 2, "z": 3}]})";
+
+    auto pkg = projectIn(d);
+
+    const auto resolved = resolveScrollUmbilicus(*pkg);
+    CHECK(resolved.path.empty());
+    CHECK(resolved.error.find("metadata: expected an object") != std::string::npos);
+    fs::remove_all(d);
+}
+
 TEST_CASE("resolver: parent and grandparent holding different files still refuse")
 {
     auto d = tmpDir("parent_grandparent_distinct");
     const auto volpkg = d / "scroll.volpkg";
-    fs::create_directories(volpkg / "paths" / "seg1");
+    writeSegment(volpkg / "paths" / "seg1");
     writeUmbilicus(volpkg / "umbilicus.json", 2.4);
     writeUmbilicus(volpkg / "paths" / "umbilicus.json", 9.6);
 
@@ -422,4 +494,71 @@ TEST_CASE("resolver: parent and grandparent holding different files still refuse
     CHECK(resolved.error.find("set the project's \"umbilicus\" field") !=
           std::string::npos);
     fs::remove_all(d);
+}
+
+TEST_CASE("deriveUmbilicusScale: stamped dimensions give an exact integer ratio")
+{
+    UmbilicusFileInfo info;
+    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    info.volumeWidth = 8174;
+    info.volumeHeight = 8174;
+    info.volumeSlices = 18946;
+    info.voxelsizeUm = 9.6;
+
+    // The annotation frame is four times finer than the stamped grid.
+    const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4);
+    REQUIRE(scale.has_value());
+    CHECK(scale->factor == doctest::Approx(4.0));
+    CHECK(scale->source == UmbilicusScaleSource::StampedDimensions);
+}
+
+TEST_CASE("deriveUmbilicusScale: dimensions that are not a uniform rescale say nothing")
+{
+    UmbilicusFileInfo info;
+    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    info.volumeWidth = 8174;
+    info.volumeHeight = 4000;   // a different aspect: not this grid at all
+    info.volumeSlices = 18946;
+    info.voxelsizeUm = 9.6;     // must not be used as a consolation prize
+
+    CHECK_FALSE(deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4).has_value());
+}
+
+TEST_CASE("deriveUmbilicusScale: voxel sizes are used when dimensions are absent")
+{
+    UmbilicusFileInfo info;
+    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    info.voxelsizeUm = 9.6;
+
+    const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4);
+    REQUIRE(scale.has_value());
+    CHECK(scale->factor == doctest::Approx(4.0));
+    CHECK(scale->source == UmbilicusScaleSource::StampedVoxelSize);
+}
+
+TEST_CASE("deriveUmbilicusScale: an unstamped file is read off the grid it fills")
+{
+    UmbilicusFileInfo info;
+    // Spans nearly all of a grid four times coarser than the target.
+    info.controlPoints = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 18000.0f}};
+
+    const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, std::nullopt);
+    REQUIRE(scale.has_value());
+    CHECK(scale->factor == doctest::Approx(4.0));
+    CHECK(scale->source == UmbilicusScaleSource::InferredFromGrid);
+
+    // A short span fills no candidate grid, so nothing is claimed.
+    UmbilicusFileInfo shortSpan;
+    shortSpan.controlPoints = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 900.0f}};
+    CHECK_FALSE(
+        deriveUmbilicusScale(shortSpan, {32696.0, 32696.0, 75784.0}, std::nullopt)
+            .has_value());
+}
+
+TEST_CASE("deriveUmbilicusScale: no target grid and no voxel size means no answer")
+{
+    UmbilicusFileInfo info;
+    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    info.voxelsizeUm = 9.6;
+    CHECK_FALSE(deriveUmbilicusScale(info, {0.0, 0.0, 0.0}, std::nullopt).has_value());
 }

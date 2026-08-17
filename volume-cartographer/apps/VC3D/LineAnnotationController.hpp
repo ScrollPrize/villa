@@ -6,6 +6,7 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -27,6 +28,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -538,6 +540,11 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // Extent, in voxels (x, y, z), of the frame fibers are annotated in: the
+    // current volume's grid lifted by the coordinate identity's scale factor,
+    // which is the frame line points and control points are expressed in. All
+    // zeroes when no volume is loaded.
+    [[nodiscard]] std::array<double, 3> annotationFrameExtentXyz() const;
     void finishOptimization(const std::string& surfaceName);
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);

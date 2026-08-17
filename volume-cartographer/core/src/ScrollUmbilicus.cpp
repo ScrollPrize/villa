@@ -1,6 +1,10 @@
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <limits>
+#include <cmath>
+#include <array>
 #include <exception>
 #include <system_error>
 
@@ -9,6 +13,22 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+// A tifxyz surface directory carries all three coordinate planes; a directory of
+// such surfaces carries none of its own. Checking the payload rather than
+// meta.json keeps this from matching directories that happen to hold a file by
+// that name for unrelated reasons.
+bool isTifxyzSegmentDir(const fs::path& dir)
+{
+    std::error_code ec;
+    for (const char* plane : {"x.tif", "y.tif", "z.tif"}) {
+        if (!fs::exists(dir / plane, ec) || ec) {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 fs::path canonicalize(const fs::path& path)
 {
@@ -107,13 +127,15 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
     addRoot(pkg.path().empty() ? fs::path(pkg.getVolpkgDirectory())
                                : pkg.path().parent_path());
     for (const auto& segment : pkg.availableSegmentPaths()) {
-        // Both attachment layouts: the entry may be the segments directory
-        // itself (parent is then the volpkg) or a single segment inside
-        // <volpkg>/paths (the volpkg is then the grandparent). Overlaps are
-        // harmless — identical roots dedup below, and one file reached through
-        // two roots collapses on its weakly_canonical form.
+        // The entry may be the segments directory itself, whose parent is the
+        // volpkg, or a single segment inside it, whose grandparent is. Only the
+        // latter earns the extra level: taking the grandparent of a segments
+        // directory would search whatever holds the volpkg, where an unrelated
+        // umbilicus could win or force a false ambiguity.
         addRoot(segment.parent_path());
-        addRoot(segment.parent_path().parent_path());
+        if (isTifxyzSegmentDir(segment)) {
+            addRoot(segment.parent_path().parent_path());
+        }
     }
 
     std::vector<fs::path> hits;
@@ -165,6 +187,100 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
                            e.what();
     }
     return resolution;
+}
+
+std::optional<UmbilicusScale> deriveUmbilicusScale(
+    const UmbilicusFileInfo& info,
+    const std::array<double, 3>& targetGridXyz,
+    std::optional<double> targetVoxelSizeUm)
+{
+    const bool haveTarget = targetGridXyz[0] > 0.0 && targetGridXyz[1] > 0.0 &&
+                            targetGridXyz[2] > 0.0;
+
+    const bool haveStampedDims = info.volumeWidth && info.volumeHeight &&
+                                 info.volumeSlices && *info.volumeWidth > 0 &&
+                                 *info.volumeHeight > 0 && *info.volumeSlices > 0;
+    if (haveStampedDims && haveTarget) {
+        const std::array<double, 3> ratios{
+            targetGridXyz[0] / *info.volumeWidth,
+            targetGridXyz[1] / *info.volumeHeight,
+            targetGridXyz[2] / *info.volumeSlices};
+        const double lo = std::min({ratios[0], ratios[1], ratios[2]});
+        const double hi = std::max({ratios[0], ratios[1], ratios[2]});
+        if (lo > 0.0 && hi <= lo * 1.02) {
+            UmbilicusScale scale;
+            scale.factor = (ratios[0] + ratios[1] + ratios[2]) / 3.0;
+            scale.source = UmbilicusScaleSource::StampedDimensions;
+            scale.description = "stamped " + std::to_string(*info.volumeWidth) + "x" +
+                                std::to_string(*info.volumeHeight) + "x" +
+                                std::to_string(*info.volumeSlices) + " grid";
+            return scale;
+        }
+        // Axis ratios that disagree mean this is not a rescale of the target
+        // grid at all, so neither of the weaker readings below applies either.
+        return std::nullopt;
+    }
+
+    if (info.voxelsizeUm && targetVoxelSizeUm && *targetVoxelSizeUm > 0.0) {
+        const double ratio = *info.voxelsizeUm / *targetVoxelSizeUm;
+        if (std::isfinite(ratio) && ratio > 0.0) {
+            UmbilicusScale scale;
+            scale.factor = ratio;
+            scale.source = UmbilicusScaleSource::StampedVoxelSize;
+            scale.description = "stamped " + std::to_string(*info.voxelsizeUm) +
+                                " um voxels";
+            return scale;
+        }
+    }
+
+    if (!haveTarget || info.controlPoints.empty()) {
+        return std::nullopt;
+    }
+
+    // Nothing stated: read the grid off the points. An umbilicus runs the length
+    // of the scroll, so the right grid is the one it nearly fills and still fits
+    // inside. Candidates are a factor of two apart, so a grid this well covered
+    // leaves the next coarser one under half covered and the match is unique.
+    constexpr double kMinZCoverage = 0.6;
+    constexpr int kMaxDownsampleSteps = 5;
+    std::array<double, 3> lo{std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::infinity()};
+    std::array<double, 3> hi{-std::numeric_limits<double>::infinity(),
+                             -std::numeric_limits<double>::infinity(),
+                             -std::numeric_limits<double>::infinity()};
+    for (const auto& point : info.controlPoints) {
+        for (int axis = 0; axis < 3; ++axis) {
+            lo[axis] = std::min(lo[axis], static_cast<double>(point[axis]));
+            hi[axis] = std::max(hi[axis], static_cast<double>(point[axis]));
+        }
+    }
+
+    std::optional<UmbilicusScale> match;
+    for (int step = 0; step <= kMaxDownsampleSteps; ++step) {
+        const double candidate = std::pow(2.0, step);
+        bool fits = lo[0] >= 0.0 && lo[1] >= 0.0 && lo[2] >= 0.0;
+        for (int axis = 0; axis < 3 && fits; ++axis) {
+            fits = hi[axis] <= targetGridXyz[axis] / candidate;
+        }
+        if (!fits) {
+            continue;
+        }
+        const double gridZ = targetGridXyz[2] / candidate;
+        const double coverage = gridZ > 0.0 ? (hi[2] - lo[2]) / gridZ : 0.0;
+        if (coverage < kMinZCoverage) {
+            continue;
+        }
+        if (match) {
+            return std::nullopt;  // more than one grid fits: say nothing
+        }
+        UmbilicusScale scale;
+        scale.factor = candidate;
+        scale.source = UmbilicusScaleSource::InferredFromGrid;
+        scale.description = "inferred from the volume grid";
+        match = scale;
+    }
+    return match;
 }
 
 } // namespace vc::core::util
