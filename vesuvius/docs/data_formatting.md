@@ -120,7 +120,7 @@ Label files must exist for each task (e.g., `fragment01_ink.tif` and `fragment01
 
 ### Auxiliary Targets
 
-The trainer can synthesize auxiliary regression targets on the fly. Declare them under `auxiliary_tasks` and reference the source classification task:
+The auxiliary trainer APIs can consume derived regression targets, but the current `ZarrDataset` does not generate them. Declaring them under `auxiliary_tasks` therefore fails at dataset startup with an actionable error until a dataset implementation provides those tensors:
 
 ```yaml
 auxiliary_tasks:
@@ -133,7 +133,7 @@ auxiliary_tasks:
         weight: 1.0
 ```
 
-During training the dataset computes distance transforms from the `ink` labels; you do not need to save additional volumes unless you want complete control over the tensors.
+Do not use this configuration with `ZarrDataset` yet; adding on-the-fly generation requires explicit distance-transform, dimensionality, padding, and augmentation semantics.
 
 ## Dataset Parameters Worth Tuning
 
@@ -177,4 +177,4 @@ Watch the log for messages about missing targets, unlabeled patches, or normaliz
 | Binary segmentation | One label file per volume with `{0, 1}` values | `out_channels: 1`, `activation: sigmoid` | Any positive voxel counts as foreground |
 | Multi-class segmentation | Single label map with integer class IDs | `out_channels: N`, `activation: softmax`, CE/Dice losses | Provide sequential integers `[0, N-1]` |
 | Multi-task | Separate label file per target | Multiple entries in `dataset_config.targets` | Targets share the same image volume |
-| Auxiliary regression | Primary label only | Configure under `auxiliary_tasks` | Auxiliary tensors are derived automatically |
+| Auxiliary regression | Dataset-specific | Configure under `auxiliary_tasks` only when the dataset provides tensors | `ZarrDataset` currently fails closed |

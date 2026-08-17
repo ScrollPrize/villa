@@ -99,6 +99,18 @@ class ZarrDataset(Dataset):
         self.data_path = Path(mgr.data_path)
         self.patch_size = tuple(mgr.train_patch_size)
         self.targets = getattr(mgr, 'targets', {})
+        self.auxiliary_target_names = [
+            name for name, info in self.targets.items()
+            if info.get("auxiliary_task", False)
+        ]
+        if self.auxiliary_target_names:
+            names = ", ".join(self.auxiliary_target_names)
+            raise ValueError(
+                "ZarrDataset cannot generate auxiliary targets yet: "
+                f"{names}. Remove auxiliary_tasks from this config or use a "
+                "dataset implementation that provides those tensors; refusing "
+                "to start prevents silently training zero-loss auxiliary heads."
+            )
         self.target_names = [
             name for name, info in self.targets.items()
             if not info.get("auxiliary_task", False)
