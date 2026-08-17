@@ -1,6 +1,7 @@
 #include "LineAnnotationDialog.hpp"
 
 #include "FiberNameDisplay.hpp"
+#include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
@@ -3135,9 +3136,15 @@ cv::Vec3f LineAnnotationDialog::branchLinkDirectionForViewer(CChunkedVolumeViewe
 
 bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) const
 {
-    return vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+    std::vector<double> controlLinePositions;
+    controlLinePositions.reserve(_generatedViews.controlPoints.size());
+    for (const auto& control : _generatedViews.controlPoints) {
+        controlLinePositions.push_back(control.linePosition);
+    }
+    return vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+        _generatedViews.stripPositionMap.originalArclengths,
         linePosition,
-        _generatedViews.controlPoints,
+        controlLinePositions,
         static_cast<double>(maxControlPointDistanceVx()));
 }
 
@@ -3147,9 +3154,15 @@ LineAnnotationDialog::currentLineMarkerState() const
     if (maxControlPointDistanceVx() <= 0) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral;
     }
-    return vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
+    std::vector<double> controlLinePositions;
+    controlLinePositions.reserve(_generatedViews.controlPoints.size());
+    for (const auto& control : _generatedViews.controlPoints) {
+        controlLinePositions.push_back(control.linePosition);
+    }
+    return vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+               _generatedViews.stripPositionMap.originalArclengths,
                _currentLinePosition,
-               _generatedViews.controlPoints,
+               controlLinePositions,
                static_cast<double>(maxControlPointDistanceVx()))
         ? vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed
         : vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;

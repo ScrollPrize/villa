@@ -28,6 +28,56 @@ TEST_CASE("fiber slice arclength sampling interpolates point and tangent")
           doctest::Approx(1.5));
 }
 
+TEST_CASE("fiber slice line positions map through physical polyline arclength")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {3.0, 0.0, 0.0},
+        {3.0, 40.0, 0.0},
+        {43.0, 40.0, 0.0},
+    };
+    const auto cumulative =
+        vc3d::fiber_slice::cumulativePolylineArclengths(linePoints);
+    REQUIRE(cumulative.size() == 4);
+    CHECK(cumulative[0] == doctest::Approx(0.0));
+    CHECK(cumulative[1] == doctest::Approx(3.0));
+    CHECK(cumulative[2] == doctest::Approx(43.0));
+    CHECK(cumulative[3] == doctest::Approx(83.0));
+    CHECK(vc3d::fiber_slice::arclengthAtLinePosition(cumulative, 1.5) ==
+          doctest::Approx(23.0));
+    CHECK(vc3d::fiber_slice::linePositionAtArclength(cumulative, 23.0) ==
+          doctest::Approx(1.5));
+
+    const std::vector<double> candidates{0.0, 1.0, 1.8, 2.0, 3.0};
+    const auto matches =
+        vc3d::fiber_slice::linePositionIndicesWithinArclengthDistance(
+            cumulative, 1.8, candidates, 32.0);
+    CHECK(matches == std::vector<size_t>{1, 2, 3});
+    const auto justOutside =
+        vc3d::fiber_slice::linePositionIndicesWithinArclengthDistance(
+            cumulative, 2.0, std::vector<double>{2.8, 2.800001}, 32.0);
+    REQUIRE(justOutside.size() == 1);
+    CHECK(justOutside.front() == 0);
+}
+
+TEST_CASE("fiber slice max placement distance uses arclength not point indices")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {36.0, 0.0, 0.0},
+        {68.0, 0.0, 0.0},
+    };
+    const auto cumulative =
+        vc3d::fiber_slice::cumulativePolylineArclengths(linePoints);
+    CHECK(vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+        cumulative, 2.0, std::vector<double>{1.0}, 32.0));
+    CHECK_FALSE(vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+        cumulative, 2.01, std::vector<double>{1.0}, 32.0));
+    CHECK(vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+        cumulative, 3.0, std::vector<double>{0.0}, 0.0));
+}
+
 TEST_CASE("fiber slice control triplet selects previous current and next positions")
 {
     const std::vector<cv::Vec3d> linePoints{

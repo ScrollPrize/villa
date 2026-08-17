@@ -1,19 +1,12 @@
-# Direct Zarr mirror disk-cache status
+# VC3D short line-segment status
 
 - [x] Capture task requirements.
-- [x] Inspect current remote opener, source keys, legacy cache precedence,
-      maintenance requests, settings, and persistent budget.
+- [x] Inspect strip generation, click handling, optimization, and branch sync.
 - [x] Write implementation/test/spec/docs plan.
 - [x] Complete independent plan review and incorporate findings.
-- [x] Review sharded storage-object semantics with the user.
-- [x] Implement immutable cache-layout detection.
-- [x] Mirror Zarr metadata and exact source chunk paths.
-- [x] Route ordinary and maintenance persistence through selected layout.
-- [x] Preserve legacy read/write compatibility.
-- [x] Remove remote-cache recompression production and UI/settings.
-- [x] Make redownload, prefill, and budget accounting layout-aware.
+- [x] Implement fixed 32-vx strip pitch.
+- [x] Implement arclength control collapse and branch remapping.
 - [x] Add/update regression tests.
-- [x] Update spec, docs, changelog, and task log.
-- [x] Build and run focused tests.
-- [x] Run configured volume-cartographer CTest suite.
-- [x] Run `git diff --check` and review final diff.
+- [x] Update specification, documentation, changelog, and task log.
+- [x] Build and run focused tests with 32 cores.
+- [x] Run `git diff --check` and review the final diff.

@@ -85,6 +85,24 @@ double distanceScaledSize(double distanceToPlane,
                           double minVisibleViewportSpanVx,
                           double fullSize,
                           double minSize);
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3d>& linePoints);
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3f>& linePoints);
+double arclengthAtLinePosition(const std::vector<double>& cumulativeArclengths,
+                               double linePosition);
+double linePositionAtArclength(const std::vector<double>& cumulativeArclengths,
+                               double arclength);
+std::vector<size_t> linePositionIndicesWithinArclengthDistance(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& candidateLinePositions,
+    double maxDistanceVx);
+bool linePositionWithinAnyArclengthDistance(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& candidateLinePositions,
+    double maxDistanceVx);
 ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
                                           double arclength);
 double linePositionAtArclength(const std::vector<cv::Vec3d>& linePoints,

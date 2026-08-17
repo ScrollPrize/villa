@@ -94,7 +94,7 @@ TEST_CASE("LineViewBuilder creates ribbons from optimized control points")
     checkVec(surfacePoints(10, 2), {20.0, 0.0, 0.0});
 }
 
-TEST_CASE("LineViewBuilder keeps legacy strip height with 50 voxel along target")
+TEST_CASE("LineViewBuilder keeps legacy strip height with fixed 32 voxel along target")
 {
     const auto views = vc::lasagna::buildLineViewSurfaces(simpleLine());
     const auto surfacePoints = views.lineSurface->rawPoints();
@@ -111,9 +111,9 @@ TEST_CASE("LineViewBuilder keeps legacy strip height with 50 voxel along target"
     checkVec(sideSlicePoints(9, 0), {0.0, 0.0, -10.0});
     checkVec(sideSlicePoints(10, 0), {0.0, 0.0, 0.0});
     checkVec(sideSlicePoints(11, 0), {0.0, 0.0, 10.0});
-    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 32.0));
     CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
-    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 10.0));
+    CHECK(views.lineSideSlice->scale()[0] == doctest::Approx(1.0 / 32.0));
     CHECK(views.lineSideSlice->scale()[1] == doctest::Approx(1.0 / 10.0));
 }
 
@@ -428,8 +428,8 @@ TEST_CASE("LineViewBuilder resamples uneven control-point segments and maps posi
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
     REQUIRE(points.cols == 4);
-    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(40.0));
-    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 40.0));
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(50.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 50.0));
     CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
     checkVec(points(2, 0), {0.0, 0.0, 0.0});
     checkVec(points(2, 1), {15.0, 0.0, 0.0});
@@ -444,6 +444,36 @@ TEST_CASE("LineViewBuilder resamples uneven control-point segments and maps posi
     CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(
               views.stripPositionMap.originalPositionToStripGridColumn(fractional)) ==
           doctest::Approx(fractional));
+}
+
+TEST_CASE("LineViewBuilder keeps mixed short supports and declares fixed target pitch")
+{
+    vc::lasagna::LineModel line;
+    for (const double x : {0.0, 4.0, 36.0, 116.0}) {
+        line.points.push_back({{x, 0.0, 0.0}, normal({0.0, 0.0, 1.0}), true});
+    }
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line);
+    const auto points = views.lineSurface->rawPoints();
+    REQUIRE(points.cols == 6);
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(32.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 32.0));
+    checkVec(points(points.rows / 2, 0), {0.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {4.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 2), {36.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 3), {62.6666666667, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 4), {89.3333333333, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 5), {116.0, 0.0, 0.0});
+
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
+          doctest::Approx(1.0));
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(2.0) ==
+          doctest::Approx(2.0));
+    for (const double position : {0.5, 1.5, 2.5}) {
+        CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(
+                  views.stripPositionMap.originalPositionToStripGridColumn(position)) ==
+              doctest::Approx(position));
+    }
 }
 
 TEST_CASE("LineViewBuilder preserves reversed uneven arclength orientation")

@@ -234,6 +234,150 @@ double distanceScaledSize(double distanceToPlane,
     return fullSize + (minSize - fullSize) * std::clamp(t, 0.0, 1.0);
 }
 
+namespace {
+
+template <typename Point>
+std::vector<double> buildCumulativePolylineArclengths(
+    const std::vector<Point>& linePoints)
+{
+    if (linePoints.empty()) {
+        return {};
+    }
+    std::vector<double> cumulative(linePoints.size(), 0.0);
+    for (size_t index = 1; index < linePoints.size(); ++index) {
+        const auto& previous = linePoints[index - 1];
+        const auto& current = linePoints[index];
+        const bool finite = std::isfinite(previous[0]) &&
+                            std::isfinite(previous[1]) &&
+                            std::isfinite(previous[2]) &&
+                            std::isfinite(current[0]) &&
+                            std::isfinite(current[1]) &&
+                            std::isfinite(current[2]);
+        if (!finite) {
+            return {};
+        }
+        const double dx = static_cast<double>(current[0]) -
+                          static_cast<double>(previous[0]);
+        const double dy = static_cast<double>(current[1]) -
+                          static_cast<double>(previous[1]);
+        const double dz = static_cast<double>(current[2]) -
+                          static_cast<double>(previous[2]);
+        const double step = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!std::isfinite(step)) {
+            return {};
+        }
+        cumulative[index] = cumulative[index - 1] + step;
+    }
+    return cumulative;
+}
+
+}  // namespace
+
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3d>& linePoints)
+{
+    return buildCumulativePolylineArclengths(linePoints);
+}
+
+std::vector<double> cumulativePolylineArclengths(
+    const std::vector<cv::Vec3f>& linePoints)
+{
+    return buildCumulativePolylineArclengths(linePoints);
+}
+
+double arclengthAtLinePosition(const std::vector<double>& cumulativeArclengths,
+                               double linePosition)
+{
+    if (cumulativeArclengths.empty() || !std::isfinite(linePosition)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    linePosition = std::clamp(
+        linePosition, 0.0, static_cast<double>(cumulativeArclengths.size() - 1));
+    const size_t lower = static_cast<size_t>(std::floor(linePosition));
+    const size_t upper = std::min(lower + 1, cumulativeArclengths.size() - 1);
+    const double t = linePosition - static_cast<double>(lower);
+    return cumulativeArclengths[lower] * (1.0 - t) +
+           cumulativeArclengths[upper] * t;
+}
+
+double linePositionAtArclength(const std::vector<double>& cumulativeArclengths,
+                               double arclength)
+{
+    if (cumulativeArclengths.empty() || !std::isfinite(arclength)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    arclength = std::clamp(arclength, 0.0, cumulativeArclengths.back());
+    const auto upper = std::lower_bound(cumulativeArclengths.begin(),
+                                        cumulativeArclengths.end(), arclength);
+    if (upper == cumulativeArclengths.end()) {
+        return static_cast<double>(cumulativeArclengths.size() - 1);
+    }
+    const size_t upperIndex = static_cast<size_t>(
+        std::distance(cumulativeArclengths.begin(), upper));
+    if (upperIndex == 0 || std::abs(*upper - arclength) <= kEpsilon) {
+        return static_cast<double>(upperIndex);
+    }
+    size_t lowerIndex = upperIndex - 1;
+    while (lowerIndex > 0 &&
+           cumulativeArclengths[upperIndex] - cumulativeArclengths[lowerIndex] <=
+               kEpsilon) {
+        --lowerIndex;
+    }
+    const double span = cumulativeArclengths[upperIndex] -
+                        cumulativeArclengths[lowerIndex];
+    if (span <= kEpsilon) {
+        return static_cast<double>(lowerIndex);
+    }
+    return static_cast<double>(lowerIndex) +
+           (arclength - cumulativeArclengths[lowerIndex]) / span *
+               static_cast<double>(upperIndex - lowerIndex);
+}
+
+std::vector<size_t> linePositionIndicesWithinArclengthDistance(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& candidateLinePositions,
+    double maxDistanceVx)
+{
+    std::vector<size_t> matches;
+    if (!std::isfinite(maxDistanceVx) || maxDistanceVx < 0.0) {
+        return matches;
+    }
+    const double targetArclength = arclengthAtLinePosition(
+        cumulativeArclengths, linePosition);
+    if (!std::isfinite(targetArclength)) {
+        return matches;
+    }
+    constexpr double kDistanceTolerance = 1.0e-6;
+    for (size_t index = 0; index < candidateLinePositions.size(); ++index) {
+        const double candidateArclength = arclengthAtLinePosition(
+            cumulativeArclengths, candidateLinePositions[index]);
+        if (std::isfinite(candidateArclength) &&
+            std::abs(candidateArclength - targetArclength) <=
+                maxDistanceVx + kDistanceTolerance) {
+            matches.push_back(index);
+        }
+    }
+    return matches;
+}
+
+bool linePositionWithinAnyArclengthDistance(
+    const std::vector<double>& cumulativeArclengths,
+    double linePosition,
+    const std::vector<double>& candidateLinePositions,
+    double maxDistanceVx)
+{
+    if (!std::isfinite(maxDistanceVx) || maxDistanceVx <= 0.0) {
+        return true;
+    }
+    return !linePositionIndicesWithinArclengthDistance(
+                cumulativeArclengths,
+                linePosition,
+                candidateLinePositions,
+                maxDistanceVx)
+                .empty();
+}
+
 ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
                                           double arclength)
 {

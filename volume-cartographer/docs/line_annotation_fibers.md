@@ -50,17 +50,24 @@ show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
 The rendered strips are derived views, not stored line geometry. Their columns
-retain every distinct control point and subdivide each control-point segment at
-the interval count whose spacing is closest to the 50-base-voxel target. This
-keeps every stored bend in the generated quad geometry. Explicit support
-arclengths provide a bidirectional mapping that keeps control points, span
-labels, hover positions, cut planes, and saved line positions in the original
-fractional point-index coordinate. The strip grid's scalar along-line scale is
-the mean support density; exact geometry and interaction use the point grid and
-support arclengths. Scales remain declared in base-volume voxel units, so input
-line spacing does not change render LOD. Automatic strip height retains the
-legacy behavior: its cross-row spacing is the median optimized control-point
-step, independent of the 50-voxel along-line target.
+retain every distinct optimized line point. Consecutive spans are subdivided at
+the interval count whose spacing is closest to the 32-base-voxel target, while
+short spans remain one interval with their endpoints unchanged. Explicit
+support arclengths provide a bidirectional mapping that keeps control points,
+span labels, hover positions, cut planes, and saved line positions in the
+original fractional point-index coordinate. The strip grid always declares an
+along-line scale of `1/32`, so a short physical span expands to one nominal
+display interval instead of changing the scale of the rest of the strip. Exact
+geometry and interaction still use the point grid and support arclengths.
+Automatic strip height retains the legacy behavior: its cross-row spacing is
+the median optimized line-point step, independent of the 32-voxel along-line
+target.
+
+Clicking to place a control point uses optimized-polyline arclength in base
+voxels. Every existing control within an inclusive 32-voxel radius is collapsed
+into one control at the clicked location. This keeps adjacent control spans from
+becoming shorter than the generated strip's nominal sampling distance. Seed,
+surviving span policy, and branch links follow the collapsed control.
 
 The current cut view draws its solid yellow control-point marker only while the
 control point is inside the cut plane's thin slab, so fast panning would

@@ -174,8 +174,7 @@ LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& sa
     }
 
     map.stripGridColumnCount = map.stripGridArclengths.size();
-    map.stripGridSpacingBaseVoxels = map.totalArclength /
-        static_cast<double>(map.stripGridColumnCount - 1);
+    map.stripGridSpacingBaseVoxels = targetSpacingBaseVoxels;
     return map;
 }
 

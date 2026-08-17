@@ -868,6 +868,88 @@ TEST_CASE("line annotation max control distance uses nearest flattened control")
         40.0));
 }
 
+TEST_CASE("line annotation collapses nearby controls with explicit span ownership")
+{
+    const auto metadata = [](const std::string& message) {
+        vc3d::line_annotation::FiberTraceSegmentMetadata value;
+        value.message = message;
+        return value;
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {1.0, {32.0, 0.0, 0.0}, true, 1},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+        {3.0, {96.0, 0.0, 0.0}, false, 3},
+    };
+    controls[0].segmentToNext = metadata("left");
+    controls[1].segmentToNext = metadata("removed");
+    controls[2].segmentToNext = metadata("right");
+
+    const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+        controls, {2, 1}, 1.5, {48.0, 2.0, 0.0});
+    REQUIRE(collapsed.controlPoints.size() == 3);
+    CHECK(collapsed.replacementIndex == 1);
+    CHECK(collapsed.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(collapsed.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(collapsed.controlPoints[0].segmentToNext->message == "left");
+    CHECK(collapsed.controlPoints[1].linePosition == doctest::Approx(1.5));
+    CHECK(collapsed.controlPoints[1].volumePoint == cv::Vec3d(48.0, 2.0, 0.0));
+    CHECK(collapsed.controlPoints[1].optimizedIndex == -1);
+    CHECK(collapsed.controlPoints[1].isSeed);
+    REQUIRE(collapsed.controlPoints[1].segmentToNext);
+    CHECK(collapsed.controlPoints[1].segmentToNext->message == "right");
+    CHECK_FALSE(collapsed.controlPoints.back().segmentToNext.has_value());
+}
+
+TEST_CASE("line annotation control collapse handles insertion endpoints and all controls")
+{
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.message = "span";
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, 0},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+    };
+    controls[0].segmentToNext = metadata;
+
+    SUBCASE("insertion keeps controls ordered and splits the existing policy")
+    {
+        const auto inserted = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(inserted.controlPoints.size() == 3);
+        CHECK_FALSE(inserted.replacedExisting());
+        CHECK(inserted.replacementIndex == 1);
+        CHECK(inserted.oldToNewIndices == std::vector<size_t>{0, 2});
+        CHECK(inserted.dirtySegmentIndices == std::vector<size_t>{0, 1});
+        REQUIRE(inserted.controlPoints[0].segmentToNext);
+        REQUIRE(inserted.controlPoints[1].segmentToNext);
+        CHECK(inserted.controlPoints[0].segmentToNext->message == "span");
+        CHECK(inserted.controlPoints[1].segmentToNext->message == "span");
+    }
+
+    SUBCASE("replacing the final control leaves no outgoing metadata")
+    {
+        const auto replaced = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {1}, 2.25, {72.0, 0.0, 0.0});
+        REQUIRE(replaced.controlPoints.size() == 2);
+        CHECK(replaced.replacementIndex == 1);
+        CHECK_FALSE(replaced.controlPoints.back().segmentToNext.has_value());
+        CHECK(replaced.controlPoints.front().isSeed);
+        CHECK_FALSE(replaced.controlPoints.back().isSeed);
+    }
+
+    SUBCASE("collapsing every control produces one seed and no dirty spans")
+    {
+        const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {0, 1}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(collapsed.controlPoints.size() == 1);
+        CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 0});
+        CHECK(collapsed.dirtySegmentIndices.empty());
+        CHECK(collapsed.controlPoints.front().isSeed);
+        CHECK_FALSE(collapsed.controlPoints.front().segmentToNext.has_value());
+    }
+}
+
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 {
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");

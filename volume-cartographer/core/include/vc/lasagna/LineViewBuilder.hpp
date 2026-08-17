@@ -11,12 +11,15 @@ class QuadSurface;
 
 namespace vc::lasagna {
 
+inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
+
 struct LineViewConfig {
-    // Derived ribbons retain every control-point bend and subdivide each
-    // control-point segment as closely as possible to this spacing. This is a
-    // view parameter in level-0/base-volume voxels, independent of stored point
-    // or optimizer spacing.
-    double targetSpacingBaseVoxels = 50.0;
+    // Derived ribbons retain every optimized line point and subdivide each
+    // consecutive span as closely as possible to this spacing. The declared
+    // along-strip scale always uses this target, so shorter spans occupy one
+    // full display interval. This is a view parameter in level-0/base-volume
+    // voxels, independent of stored point or optimizer spacing.
+    double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
     // Non-positive values retain the legacy automatic strip height: cross-row
     // spacing matches the median optimized control-point step.
     double surfaceHalfWidth = 0.0;
@@ -39,8 +42,8 @@ struct LineStripPositionMap {
     std::vector<double> originalArclengths;
     std::vector<double> stripGridArclengths;
     double totalArclength = 0.0;
-    // Nominal mean spacing used for the QuadSurface's scalar grid-density
-    // metadata. Exact mapping uses stripGridArclengths.
+    // Fixed target spacing used for the QuadSurface's scalar grid-density
+    // metadata. Exact source mapping uses stripGridArclengths.
     double stripGridSpacingBaseVoxels = 0.0;
     size_t stripGridColumnCount = 0;
 
