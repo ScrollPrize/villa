@@ -424,6 +424,17 @@ class Volume:
                         first_key = key
                         break
                 if first_key is None:
+                    # HTTP-backed stores may allow direct key access without directory
+                    # listing, so probe the canonical level before treating the group
+                    # as empty. Same reason as choose_pyramid_array() in
+                    # ink_detection/inference/infer.py.
+                    try:
+                        candidate = self.data['0']
+                    except (KeyError, FileNotFoundError):
+                        candidate = None
+                    if isinstance(candidate, zarr.Array):
+                        first_key = '0'
+                if first_key is None:
                     raise ValueError(f"No arrays found in zarr Group at {self.path}")
                 first_array = self.data[first_key]
                 if hasattr(first_array.dtype, 'numpy_dtype'):
@@ -602,7 +613,18 @@ class Volume:
             return 1
         n = getattr(self, "_num_levels_memo", None)
         if n is None:
-            n = self._num_levels_memo = len(self.data)
+            n = len(self.data)
+            if n == 0:
+                # An HTTP-backed group reports length 0 because the store cannot
+                # list a directory, not because the levels are missing. Count them
+                # by probing instead, so a remote multiscale is not read as empty.
+                while True:
+                    try:
+                        self.data[str(n)]
+                    except (KeyError, FileNotFoundError):
+                        break
+                    n += 1
+            self._num_levels_memo = n
         return n
 
     def _level(self, idx: int = 0):
