@@ -57,6 +57,7 @@ class ThresholdTask(ZarrTask):
         super().__init__(config)
         self.config: ThresholdConfig = config
         self._lvl0_path: str = ""
+        self._input_path: str = ""
         self._axes_names = ["z", "y", "x"]
 
     @classmethod
@@ -99,9 +100,9 @@ class ThresholdTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure."""
-        input_z = self._get_input_array(
-            str(self.config.level) if self.config.level is not None else "0"
-        )
+        level = str(self.config.level) if self.config.level is not None else "0"
+        input_z = self._get_input_array(level)
+        self._input_path = self._get_input_path(level)
 
         print(f"Input array shape: {input_z.shape}")
         print(f"Input array chunks: {input_z.chunks}")
@@ -132,7 +133,7 @@ class ThresholdTask(ZarrTask):
 
         for coords in chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self.config.threshold,
                 self.config.erase_blank,

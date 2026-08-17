@@ -62,6 +62,7 @@ class TransposeTask(ZarrTask):
         super().__init__(config)
         self.config: TransposeConfig = config
         self._lvl0_path: str = ""
+        self._input_path: str = ""
         self._axes_names: List[str] = []
         self._out_shape: Tuple[int, ...] = ()
         self._out_chunks: Tuple[int, ...] = ()
@@ -110,9 +111,9 @@ class TransposeTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure with transposed shape."""
-        input_z = self._get_input_array(
-            str(self.config.level) if self.config.level is not None else "0"
-        )
+        level = str(self.config.level) if self.config.level is not None else "0"
+        input_z = self._get_input_array(level)
+        self._input_path = self._get_input_path(level)
 
         # Parse transpose order string to permutation
         valid_axes = {"x": 2, "y": 1, "z": 0}
@@ -154,7 +155,7 @@ class TransposeTask(ZarrTask):
 
         for coords in out_chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self._perm,
                 coords,

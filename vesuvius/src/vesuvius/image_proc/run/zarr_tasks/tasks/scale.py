@@ -76,6 +76,7 @@ class ScaleTask(ZarrTask):
         super().__init__(config)
         self.config: ScaleConfig = config
         self._lvl0_path: str = ""
+        self._input_path: str = ""
         self._axes_names = ["z", "y", "x"]
         self._out_shape: Tuple[int, ...] = ()
         self._out_chunks: Tuple[int, ...] = ()
@@ -122,9 +123,9 @@ class ScaleTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure with scaled shape."""
-        input_z = self._get_input_array(
-            str(self.config.level) if self.config.level is not None else "0"
-        )
+        level = str(self.config.level) if self.config.level is not None else "0"
+        input_z = self._get_input_array(level)
+        self._input_path = self._get_input_path(level)
 
         sf = self.config.scale_factor
         self._out_shape = tuple(max(1, int(round(d * sf))) for d in input_z.shape)
@@ -157,7 +158,7 @@ class ScaleTask(ZarrTask):
 
         for coords in out_chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self.config.scale_factor,
                 coords,

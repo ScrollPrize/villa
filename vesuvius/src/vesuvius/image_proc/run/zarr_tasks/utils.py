@@ -112,16 +112,32 @@ def create_level_dataset(
     if overwrite and level_path.exists():
         shutil.rmtree(level_path)
 
-    store = zarr.NestedDirectoryStore(str(level_path))
+    if hasattr(zarr, "NestedDirectoryStore"):        # zarr 2.x
+        return zarr.open(
+            store=zarr.NestedDirectoryStore(str(level_path)),
+            shape=shape,
+            chunks=chunks,
+            dtype=dtype,
+            compressor=compressor,
+            mode="w",
+            write_empty_chunks=False,
+            fill_value=0,
+        )
+
+    # zarr 3 dropped NestedDirectoryStore; a v2 array with a "/" dimension
+    # separator is the same layout on disk, and empty chunks are skipped through
+    # the array config rather than a keyword.
     return zarr.open(
-        store=store,
+        str(level_path),
         shape=shape,
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
         mode="w",
-        write_empty_chunks=False,
         fill_value=0,
+        zarr_format=2,
+        dimension_separator="/",
+        config={"write_empty_chunks": False},
     )
 
 
