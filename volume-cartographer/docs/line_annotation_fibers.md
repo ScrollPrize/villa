@@ -71,6 +71,13 @@ into one control at the clicked location. This keeps adjacent control spans from
 becoming shorter than the generated strip's nominal sampling distance. Seed,
 surviving span policy, and branch links follow the collapsed control.
 
+The independent **Max extrap CP dist** setting limits how far a new control may
+be placed beyond the first or last control point. It is measured along the
+optimized polyline in base-volume voxels from the relevant outer control. It
+does not restrict insertion between existing controls, and `0` means unlimited.
+The current-position marker shows allowed or blocked state using this same
+base-voxel arclength calculation.
+
 The current cut view draws its solid yellow control-point marker only while the
 control point is inside the cut plane's thin slab, so fast panning would
 otherwise skip past control points unseen. To keep them findable, the view also
@@ -94,8 +101,9 @@ the nearest control point in that direction; holding the key cruises straight
 through the intermediate points at a constant speed and, when it is released,
 decelerates onto the next control point ahead (never short of the one a tap
 would have reached). Beyond the outermost control point the pan continues one
-more hop, to the Max CP distance allowance or the end of the extrapolated
-line, whichever is shorter. Pressing the opposite arrow
+more hop, to the Max extrap CP distance allowance or the end of the extrapolated
+line, whichever is shorter. The boundary is converted from base-voxel
+arclength back into optimized-line position. Pressing the opposite arrow
 mid-pan decelerates through zero and reverses. Up and Down scale the cruising
 speed (default 12 line positions per second, roughly 360 voxels per second),
 which is shown in a transient badge and remembered between sessions. A Left or

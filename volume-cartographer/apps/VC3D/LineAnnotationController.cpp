@@ -266,6 +266,9 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+constexpr double kMinimumControlPointSpacingBaseVoxels =
+    vc::lasagna::kLineViewSamplingDistanceBaseVoxels;
+
 std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
     const CState* state)
 {
@@ -6412,23 +6415,25 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     for (const auto& control : session.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    if (pane->dialog && pane->dialog->maxControlPointDistanceVx() > 0) {
-        if (!vc3d::fiber_slice::linePositionWithinAnyArclengthDistance(
+    if (pane->dialog &&
+        pane->dialog->maxControlPointExtrapolationDistanceVx() > 0) {
+        if (!vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
                 cumulativeArclengths,
                 linePosition,
                 controlLinePositions,
-                static_cast<double>(pane->dialog->maxControlPointDistanceVx()))) {
+                static_cast<double>(
+                    pane->dialog->maxControlPointExtrapolationDistanceVx()))) {
             return;
         }
     }
     const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
 
     const std::vector<size_t> nearbyControlIndices =
-        vc3d::fiber_slice::linePositionIndicesWithinArclengthDistance(
+        vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
             cumulativeArclengths,
             linePosition,
             controlLinePositions,
-            vc::lasagna::kLineViewSamplingDistanceBaseVoxels);
+            kMinimumControlPointSpacingBaseVoxels);
     if (!confirmLinkedControlPointEdits(session,
                                         nearbyControlIndices,
                                         tr("Replacing the nearby control points"))) {

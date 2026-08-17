@@ -10,10 +10,11 @@
    density from the configured target rather than the mean physical source
    interval. Remove cross-direction configuration and use seven rows at the
    shared 32-base-voxel pitch for a fixed 192-vx cross extent.
-3. Add one reusable cumulative-arclength mapping for fractional line positions,
-   inverse mapping, and inclusive radius matching. Use it for both deduplication
-   and the existing maximum-control-distance gate, whose setting is also in
-   base voxels.
+3. Add reusable cumulative-arclength mapping, inverse mapping, and inclusive
+   radius matching for fractional line positions. Use the radius only for the
+   fixed minimum-spacing collapse. Keep the configurable maximum extrapolation
+   gate separate: apply it only outside the outer controls and convert its base-
+   voxel arclength boundary back to line position for keyboard navigation.
 4. Implement control collapse as a pure operation returning ordered controls,
    every old-to-new index mapping, the replacement index, and adjacent dirty
    spans. The replacement receives the clicked position, clicked geometry, and

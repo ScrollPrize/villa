@@ -20,5 +20,8 @@ Requirements:
   arclength rather than line-index distance.
 - Collapse every existing control within an inclusive 32-base-voxel arclength
   radius into one control at the clicked location.
+- Keep Max extrap CP distance separate: it limits only placement beyond the
+  outer controls and is always measured by optimized-polyline arclength in base
+  voxels. Interior placement remains unrestricted.
 - Preserve seed, interpolation-span, branch-link, and endpoint semantics while
   collapsing controls.

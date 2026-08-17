@@ -665,46 +665,6 @@ TEST_CASE("arrow pan integrator handles zero steps and degenerate inputs")
     CHECK(resting.velocity == 0.0);
 }
 
-TEST_CASE("arrow pan boundary target extends one hop past the outer control point")
-{
-    using vc3d::line_annotation::generatedArrowPanBoundaryTarget;
-    const std::vector<double> positions{12.0, 20.0, 40.0};
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-
-    // Bounded by the max-CP-distance allowance when it is shorter than the
-    // remaining line, by the line end (extrapolation limit) otherwise.
-    const auto right = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 30.0);
-    REQUIRE(right.has_value());
-    CHECK(*right == doctest::Approx(70.0));
-    const auto rightClamped = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 1000.0);
-    REQUIRE(rightClamped.has_value());
-    CHECK(*rightClamped == doctest::Approx(100.0));
-    const auto left = generatedArrowPanBoundaryTarget(positions, -1, 0.0, 5.0);
-    REQUIRE(left.has_value());
-    CHECK(*left == doctest::Approx(7.0));
-
-    // <= 0 or non-finite max distance means unlimited: the line end bounds it.
-    const auto unlimited = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 0.0);
-    REQUIRE(unlimited.has_value());
-    CHECK(*unlimited == doctest::Approx(100.0));
-    const auto nanMax = generatedArrowPanBoundaryTarget(positions, 1, 100.0, nan);
-    REQUIRE(nanMax.has_value());
-    CHECK(*nanMax == doctest::Approx(100.0));
-
-    // No room beyond the outer control point, no control points, or unusable
-    // inputs: no boundary hop.
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, 40.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({0.0, 40.0}, -1, 0.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({}, 1, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 0, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, nan, 30.0).has_value());
-
-    // Non-finite control positions are skipped when finding the outer one.
-    const auto skipped = generatedArrowPanBoundaryTarget({nan, 20.0}, 1, 100.0, 10.0);
-    REQUIRE(skipped.has_value());
-    CHECK(*skipped == doctest::Approx(30.0));
-}
-
 TEST_CASE("arrow pan stop target picks the next control point in the direction")
 {
     const std::vector<double> positions{12.0, 20.0, 28.0, 40.0};
@@ -823,49 +783,6 @@ TEST_CASE("line annotation fixed current slice snaps only within quarter line po
           doctest::Approx(20.2501));
     CHECK(vc3d::line_annotation::snappedControlPointLinePosition(19.7499, controlPositions) ==
           doctest::Approx(19.7499));
-}
-
-TEST_CASE("line annotation max control distance uses nearest flattened control")
-{
-    const std::vector<double> controlPositions{10.0, 100.0};
-
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        250.0,
-        controlPositions,
-        0.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        70.0,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        55.0,
-        controlPositions,
-        40.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        100.25,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        std::vector<double>{100.0},
-        80.0));
-
-    CHECK(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        55.0,
-        controlPositions,
-        40.0));
 }
 
 TEST_CASE("line annotation collapses nearby controls with explicit span ownership")

@@ -333,14 +333,14 @@ double linePositionAtArclength(const std::vector<double>& cumulativeArclengths,
                static_cast<double>(upperIndex - lowerIndex);
 }
 
-std::vector<size_t> linePositionIndicesWithinArclengthDistance(
+std::vector<size_t> linePositionIndicesWithinArclengthRadius(
     const std::vector<double>& cumulativeArclengths,
     double linePosition,
     const std::vector<double>& candidateLinePositions,
-    double maxDistanceVx)
+    double radiusBaseVoxels)
 {
     std::vector<size_t> matches;
-    if (!std::isfinite(maxDistanceVx) || maxDistanceVx < 0.0) {
+    if (!std::isfinite(radiusBaseVoxels) || radiusBaseVoxels < 0.0) {
         return matches;
     }
     const double targetArclength = arclengthAtLinePosition(
@@ -354,28 +354,109 @@ std::vector<size_t> linePositionIndicesWithinArclengthDistance(
             cumulativeArclengths, candidateLinePositions[index]);
         if (std::isfinite(candidateArclength) &&
             std::abs(candidateArclength - targetArclength) <=
-                maxDistanceVx + kDistanceTolerance) {
+                radiusBaseVoxels + kDistanceTolerance) {
             matches.push_back(index);
         }
     }
     return matches;
 }
 
-bool linePositionWithinAnyArclengthDistance(
+bool linePositionWithinControlExtrapolationDistance(
     const std::vector<double>& cumulativeArclengths,
     double linePosition,
-    const std::vector<double>& candidateLinePositions,
-    double maxDistanceVx)
+    const std::vector<double>& controlLinePositions,
+    double maxDistanceBaseVoxels)
 {
-    if (!std::isfinite(maxDistanceVx) || maxDistanceVx <= 0.0) {
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+    if (!std::isfinite(maxDistanceBaseVoxels) ||
+        maxDistanceBaseVoxels <= 0.0) {
         return true;
     }
-    return !linePositionIndicesWithinArclengthDistance(
-                cumulativeArclengths,
-                linePosition,
-                candidateLinePositions,
-                maxDistanceVx)
-                .empty();
+
+    std::optional<double> firstControl;
+    std::optional<double> lastControl;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        firstControl = firstControl ? std::min(*firstControl, position) : position;
+        lastControl = lastControl ? std::max(*lastControl, position) : position;
+    }
+    if (!firstControl || !lastControl) {
+        return false;
+    }
+    if (linePosition >= *firstControl && linePosition <= *lastControl) {
+        return true;
+    }
+
+    const double boundaryPosition = linePosition < *firstControl
+        ? *firstControl
+        : *lastControl;
+    const double lineArclength = arclengthAtLinePosition(
+        cumulativeArclengths, linePosition);
+    const double boundaryArclength = arclengthAtLinePosition(
+        cumulativeArclengths, boundaryPosition);
+    constexpr double kDistanceTolerance = 1.0e-6;
+    return std::isfinite(lineArclength) && std::isfinite(boundaryArclength) &&
+           std::abs(lineArclength - boundaryArclength) <=
+               maxDistanceBaseVoxels + kDistanceTolerance;
+}
+
+std::optional<double> controlExtrapolationBoundaryLinePosition(
+    const std::vector<double>& cumulativeArclengths,
+    const std::vector<double>& controlLinePositions,
+    int direction,
+    double lineEndPosition,
+    double maxDistanceBaseVoxels)
+{
+    if (direction == 0 || !std::isfinite(lineEndPosition) ||
+        cumulativeArclengths.empty()) {
+        return std::nullopt;
+    }
+
+    std::optional<double> outerControl;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (!outerControl ||
+            (direction > 0 ? position > *outerControl : position < *outerControl)) {
+            outerControl = position;
+        }
+    }
+    if (!outerControl ||
+        (direction > 0 ? lineEndPosition <= *outerControl
+                       : lineEndPosition >= *outerControl)) {
+        return std::nullopt;
+    }
+
+    const double outerArclength = arclengthAtLinePosition(
+        cumulativeArclengths, *outerControl);
+    const double endArclength = arclengthAtLinePosition(
+        cumulativeArclengths, lineEndPosition);
+    if (!std::isfinite(outerArclength) || !std::isfinite(endArclength)) {
+        return std::nullopt;
+    }
+
+    double targetArclength = endArclength;
+    if (std::isfinite(maxDistanceBaseVoxels) &&
+        maxDistanceBaseVoxels > 0.0) {
+        targetArclength = direction > 0
+            ? std::min(endArclength,
+                       outerArclength + maxDistanceBaseVoxels)
+            : std::max(endArclength,
+                       outerArclength - maxDistanceBaseVoxels);
+    }
+    const double targetPosition = linePositionAtArclength(
+        cumulativeArclengths, targetArclength);
+    if (!std::isfinite(targetPosition) ||
+        (direction > 0 ? targetPosition <= *outerControl
+                       : targetPosition >= *outerControl)) {
+        return std::nullopt;
+    }
+    return targetPosition;
 }
 
 ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,

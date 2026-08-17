@@ -142,6 +142,9 @@
   typical width without depending on optimized-line spacing.
   Generated-view clicks collapse all controls within an inclusive 32-base-voxel
   optimized-polyline arclength radius into one control at the clicked point.
+  The separate maximum control-point extrapolation setting applies only outside
+  the outermost controls, measures optimized-polyline arclength in base voxels,
+  and does not restrict insertion between existing controls.
   Input line spacing may otherwise be arbitrary; cuts and persistence remain in
   original line-position coordinates.
 - A completed pre-pass atomically replaces that source's previous snapshot for
