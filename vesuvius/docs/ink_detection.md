@@ -90,13 +90,19 @@ not totals across the cache root.
 
 When a volume opens with a budget, the code scans that volume's cache
 subdirectory once. An over-budget directory is pruned oldest-mtime-first to at
-most 90% of the budget; an at- or under-budget directory is left alone. Zarr's
-CacheStore then applies a process-local steady-state LRU. Multiple workers may
-share the directory safely because LocalStore installs complete values
-atomically, but independent process accounting means the directory can briefly
-overshoot its budget before a later open-time sweep. Every process constructs
-its own source store after it starts; a remote fsspec store is never inherited
-as the active transport across a fork.
+most 90% of the budget; an at- or under-budget directory is left alone. The
+files that survive the scan are then registered, oldest first, in the LRU that
+Zarr's CacheStore builds for this process. Zarr starts that LRU empty in every
+new process and never scans the cache directory itself, so without the seed a
+re-open would spend a second full budget on top of whatever the sweep retained;
+with it, one budget bounds the directory across sequential runs, and reusing a
+file inherited from an earlier run refreshes its LRU position instead of
+leaving it ranked by its original mtime. Multiple workers may share the
+directory safely because LocalStore installs complete values atomically, but
+each worker still enforces the budget against its own view, so a directory
+written by several simultaneous processes can overshoot until the next
+open-time sweep. Every process constructs its own source store after it starts;
+a remote fsspec store is never inherited as the active transport across a fork.
 
 ## Shipped aligned-corpus configs
 
