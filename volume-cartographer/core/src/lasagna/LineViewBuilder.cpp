@@ -143,6 +143,31 @@ LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& sa
         throw std::invalid_argument("Cannot build line annotation views for a zero-length LineModel");
     }
 
+    // The ribbon draws one column per grid entry, so the strip is only
+    // distortion-free when columns are near-uniform in arclength. Spans
+    // interpolated at coarser steps (cspline "short span" and lasagna
+    // fallbacks, ~32 vx) would otherwise render squeezed next to
+    // native-trace spans (~4-8 vx). Subdivide toward the densest original
+    // segment, keeping the configured target as the upper bound and a floor
+    // that caps the total column count on pathological inputs. Original
+    // points always remain grid supports, so bends survive and integer
+    // original positions keep landing exactly on columns.
+    double smallestStep = std::numeric_limits<double>::infinity();
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const double segmentLength =
+            map.originalArclengths[i] - map.originalArclengths[i - 1];
+        if (segmentLength > kEpsilon) {
+            smallestStep = std::min(smallestStep, segmentLength);
+        }
+    }
+    constexpr double kMaxStripGridColumns = 60000.0;
+    const double spacingFloor =
+        std::max(1.0, map.totalArclength / kMaxStripGridColumns);
+    const double effectiveSpacing = std::isfinite(smallestStep)
+        ? std::clamp(smallestStep, std::min(spacingFloor, targetSpacingBaseVoxels),
+                     targetSpacingBaseVoxels)
+        : targetSpacingBaseVoxels;
+
     map.stripGridArclengths.push_back(0.0);
     for (size_t i = 1; i < samples.size(); ++i) {
         const double segmentStart = map.originalArclengths[i - 1];
@@ -152,14 +177,14 @@ LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& sa
             continue;
         }
 
-        const double idealIntervals = segmentLength / targetSpacingBaseVoxels;
+        const double idealIntervals = segmentLength / effectiveSpacing;
         const size_t lowerIntervals = std::max<size_t>(
             1, static_cast<size_t>(std::floor(idealIntervals)));
         const size_t upperIntervals = lowerIntervals + 1;
         const double lowerError = std::abs(
-            segmentLength / static_cast<double>(lowerIntervals) - targetSpacingBaseVoxels);
+            segmentLength / static_cast<double>(lowerIntervals) - effectiveSpacing);
         const double upperError = std::abs(
-            segmentLength / static_cast<double>(upperIntervals) - targetSpacingBaseVoxels);
+            segmentLength / static_cast<double>(upperIntervals) - effectiveSpacing);
         const size_t intervalCount = upperError < lowerError
             ? upperIntervals
             : lowerIntervals;

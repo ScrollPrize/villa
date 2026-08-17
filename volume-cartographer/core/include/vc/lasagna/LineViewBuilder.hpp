@@ -12,10 +12,14 @@ class QuadSurface;
 namespace vc::lasagna {
 
 struct LineViewConfig {
-    // Derived ribbons retain every control-point bend and subdivide each
-    // control-point segment as closely as possible to this spacing. This is a
-    // view parameter in level-0/base-volume voxels, independent of stored point
-    // or optimizer spacing.
+    // Upper bound on the ribbon column spacing, in level-0/base-volume voxels,
+    // independent of stored point or optimizer spacing. Derived ribbons retain
+    // every control-point bend and subdivide each control-point segment as
+    // closely as possible to the effective spacing: the densest original
+    // segment, clamped to this bound (and floored so pathological inputs
+    // cannot explode the column count). Matching the densest segment keeps
+    // strip columns near-uniform in arclength, so spans interpolated at
+    // coarser steps no longer render squeezed next to native-trace spans.
     double targetSpacingBaseVoxels = 50.0;
     // Non-positive values retain the legacy automatic strip height: cross-row
     // spacing matches the median optimized control-point step.

@@ -1409,9 +1409,18 @@ void writeReinitDebugObjOutput(
                            outputDir / "continuation_candidates.obj");
 }
 
-int scaledControlColumn(int sourceIndex, int renderScale, int cols)
+int scaledControlColumn(int sourceIndex,
+                        int renderScale,
+                        int cols,
+                        const vc::lasagna::LineStripPositionMap& positionMap)
 {
-    const double scaled = (static_cast<double>(sourceIndex) + 0.5) *
+    // The strip grid is subdivided per segment, so a point index is not a
+    // grid column; convert through the builder's position map first.
+    const double gridColumn = positionMap.valid()
+        ? positionMap.originalPositionToStripGridColumn(
+              static_cast<double>(sourceIndex))
+        : static_cast<double>(sourceIndex);
+    const double scaled = (gridColumn + 0.5) *
                           static_cast<double>(std::max(1, renderScale)) -
                           0.5;
     return std::clamp(static_cast<int>(std::lround(scaled)), 0, std::max(0, cols - 1));
@@ -1419,7 +1428,8 @@ int scaledControlColumn(int sourceIndex, int renderScale, int cols)
 
 cv::Mat makeStripOverlay(const cv::Mat& grayscale,
                          const std::vector<int>& fixedIndices,
-                         int renderScale)
+                         int renderScale,
+                         const vc::lasagna::LineStripPositionMap& positionMap)
 {
     cv::Mat image8;
     if (grayscale.depth() == CV_8U) {
@@ -1442,7 +1452,7 @@ cv::Mat makeStripOverlay(const cv::Mat& grayscale,
         if (index < 0) {
             continue;
         }
-        const int col = scaledControlColumn(index, renderScale, overlay.cols);
+        const int col = scaledControlColumn(index, renderScale, overlay.cols, positionMap);
         cv::line(overlay,
                  cv::Point(col, 0),
                  cv::Point(col, std::max(0, overlay.rows - 1)),
@@ -1462,6 +1472,7 @@ cv::Mat makeStripOverlay(const cv::Mat& grayscale,
 struct RenderedStrips {
     cv::Mat lineSurface;
     cv::Mat lineSideSlice;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
 };
 
 RenderedStrips renderLineViewStrips(const vc::lasagna::LineModel& line,
@@ -1476,6 +1487,7 @@ RenderedStrips renderLineViewStrips(const vc::lasagna::LineModel& line,
     return {
         renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale),
         renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale),
+        surfaces.stripPositionMap,
     };
 }
 
@@ -1490,10 +1502,12 @@ void writeStripImages(const vc::lasagna::LineModel& line,
     const RenderedStrips strips = renderLineViewStrips(line, textureVolume, textureLevel, renderScale);
     writeTif(outputDir / "line_surface.tif", strips.lineSurface);
     writeTif(outputDir / "line_surface_overlay.tif",
-             makeStripOverlay(strips.lineSurface, fixedIndices, renderScale));
+             makeStripOverlay(strips.lineSurface, fixedIndices, renderScale,
+                              strips.stripPositionMap));
     writeTif(outputDir / "side_slice.tif", strips.lineSideSlice);
     writeTif(outputDir / "side_slice_overlay.tif",
-             makeStripOverlay(strips.lineSideSlice, fixedIndices, renderScale));
+             makeStripOverlay(strips.lineSideSlice, fixedIndices, renderScale,
+                              strips.stripPositionMap));
 }
 
 void writeLineViewObjOutput(const vc::lasagna::LineModel& line,

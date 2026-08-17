@@ -427,14 +427,17 @@ TEST_CASE("LineViewBuilder resamples uneven control-point segments and maps posi
 
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
-    REQUIRE(points.cols == 4);
-    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(40.0));
-    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 40.0));
+    // The effective spacing matches the densest segment (15), so the 105-long
+    // segment subdivides into 7 uniform intervals instead of 2.
+    REQUIRE(points.cols == 9);
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(15.0));
+    CHECK(views.lineSurface->scale()[0] == doctest::Approx(1.0 / 15.0));
     CHECK(views.lineSurface->scale()[1] == doctest::Approx(1.0 / 10.0));
     checkVec(points(2, 0), {0.0, 0.0, 0.0});
     checkVec(points(2, 1), {15.0, 0.0, 0.0});
-    checkVec(points(2, 2), {67.5, 0.0, 0.0});
-    checkVec(points(2, 3), {120.0, 0.0, 0.0});
+    checkVec(points(2, 2), {30.0, 0.0, 0.0});
+    checkVec(points(2, 5), {75.0, 0.0, 0.0});
+    checkVec(points(2, 8), {120.0, 0.0, 0.0});
 
     CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
           doctest::Approx(1.0));
@@ -457,14 +460,14 @@ TEST_CASE("LineViewBuilder preserves reversed uneven arclength orientation")
 
     const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
     const auto points = views.lineSurface->rawPoints();
-    REQUIRE(points.cols == 4);
+    REQUIRE(points.cols == 9);
     checkVec(points(points.rows / 2, 0), {120.0, 0.0, 0.0});
-    checkVec(points(points.rows / 2, 1), {67.5, 0.0, 0.0});
-    checkVec(points(points.rows / 2, 2), {15.0, 0.0, 0.0});
-    checkVec(points(points.rows / 2, 3), {0.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 1), {105.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 7), {15.0, 0.0, 0.0});
+    checkVec(points(points.rows / 2, 8), {0.0, 0.0, 0.0});
     CHECK(views.stripPositionMap.originalPositionToStripGridColumn(1.0) ==
-          doctest::Approx(2.0));
-    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(2.0) ==
+          doctest::Approx(7.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(7.0) ==
           doctest::Approx(1.0));
 }
 
@@ -508,6 +511,47 @@ TEST_CASE("LineViewBuilder chooses closest spacing independently per segment")
           doctest::Approx(2.0));
     CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(2.0) ==
           doctest::Approx(1.0));
+}
+
+TEST_CASE("LineViewBuilder renders mixed-density spans at uniform column pitch")
+{
+    // The scrunch fixture: native-trace spans sample every ~4 vx while a
+    // cspline/lasagna span samples every ~32 vx. The effective spacing locks
+    // to the densest segment, so the sparse spans subdivide to the same pitch
+    // and every adjacent column pair sits the same arclength apart.
+    auto line = simpleLine();
+    line.segmentSamples.clear();
+    line.points = {
+        {{0.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+        {{4.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+        {{8.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+        {{12.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+        {{44.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+        {{76.0, 0.0, 0.0}, line.points[0].sampledNormal, true},
+    };
+    vc::lasagna::LineViewConfig config;
+    config.targetSpacingBaseVoxels = 50.0;
+
+    const auto views = vc::lasagna::buildLineViewSurfaces(line, config);
+    const auto points = views.lineSurface->rawPoints();
+    // 3 segments of 4 vx (one interval each) + 2 segments of 32 vx
+    // (eight 4 vx intervals each) = 20 columns.
+    REQUIRE(points.cols == 20);
+    CHECK(views.stripPositionMap.stripGridSpacingBaseVoxels == doctest::Approx(4.0));
+    for (int col = 1; col < points.cols; ++col) {
+        const cv::Vec3f step = points(points.rows / 2, col) -
+                               points(points.rows / 2, col - 1);
+        CHECK(cv::norm(step) == doctest::Approx(4.0));
+    }
+    // Original points stay grid supports: the sparse-span boundary at
+    // original position 4 (x = 44) lands exactly on column 11.
+    CHECK(views.stripPositionMap.originalPositionToStripGridColumn(4.0) ==
+          doctest::Approx(11.0));
+    CHECK(views.stripPositionMap.stripGridColumnToOriginalPosition(11.0) ==
+          doctest::Approx(4.0));
+    // Cut-view outputs stay per original line point.
+    CHECK(views.lineUpVectors.size() == line.points.size());
+    CHECK(views.lineZSlices.size() == line.points.size());
 }
 
 TEST_CASE("LineViewBuilder mapping canonicalizes duplicate control points")
