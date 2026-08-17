@@ -13,18 +13,16 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <fstream>
 #include <future>
 #include <limits>
-#include <map>
 #include <optional>
 #include <set>
-#include <span>
 #include <string_view>
 #include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -114,9 +112,6 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     spinViewerOverlaySurfaceCacheGB->setValue(
         settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                        viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
-    spinViewerPlaneChunkCacheMB->setValue(
-        settings.value(viewer_cache::PLANE_CHUNK_CACHE_MB,
-                       viewer_cache::PLANE_CHUNK_CACHE_MB_DEFAULT).toInt());
     {
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
@@ -135,37 +130,24 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
 
-    // IO threads is no longer user-configurable (tracks hardware_concurrency).
-    if (spinIOThreads) {
-        spinIOThreads->setEnabled(false);
-        spinIOThreads->setValue(static_cast<int>(std::thread::hardware_concurrency()));
-    }
-    if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
-    if (spinIOThreads) spinIOThreads->hide();
-
-    chkCompressRemoteCache->setChecked(
-        settings.value(perf::REMOTE_CACHE_COMPRESSION, perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
-
-    cmbCacheQuantization->addItem(tr("Lossless"), vc::kCacheQuantLossless);
-    cmbCacheQuantization->addItem(tr("Near-lossless (max error ±1)"),
-                                  vc::kCacheQuantMaxErr1);
-    cmbCacheQuantization->addItem(tr("Near-lossless (max error ±2)"),
-                                  vc::kCacheQuantMaxErr2);
-    {
-        const int width = settings.value(perf::REMOTE_CACHE_QUANTIZATION,
-                                         perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt();
-        const int idx = cmbCacheQuantization->findData(width);
-        cmbCacheQuantization->setCurrentIndex(idx >= 0 ? idx : 0);
-    }
+    const bool automaticDownloads = settings.value(
+        perf::REMOTE_DOWNLOAD_AUTOMATIC,
+        perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
+    chkAutoDownloadParallelism->setChecked(automaticDownloads);
+    spinIOThreads->setRange(1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY);
+    spinIOThreads->setValue(std::clamp(
+        settings.value(
+            perf::REMOTE_DOWNLOAD_PARALLELISM,
+            perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
+        1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
+    spinIOThreads->setEnabled(!automaticDownloads);
+    connect(chkAutoDownloadParallelism, &QCheckBox::toggled,
+            spinIOThreads, [this](bool automatic) {
+                spinIOThreads->setEnabled(!automatic);
+            });
 
     setupCacheActionControls();
 
-    // Compacting an existing cache needs a currently shown remote volume.
-    btnCompressExistingCache->setEnabled(!_currentVolumeCacheDir.empty());
-    if (_currentVolumeCacheDir.empty()) {
-        btnCompressExistingCache->setToolTip(
-            tr("Open a remote volume first — compression applies to the disk cache of the currently shown volume."));
-    }
     _redownloadCacheButton->setEnabled(!_currentVolumeCacheDir.empty() &&
                                        _currentVolume &&
                                        _currentVolume->isRemote());
@@ -173,8 +155,6 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
         _redownloadCacheButton->setToolTip(
             tr("Open a remote volume first — redownload applies to the disk cache of the currently shown volume."));
     }
-    connect(btnCompressExistingCache, &QPushButton::clicked, this,
-            &SettingsDialog::compressExistingCache);
     connect(_redownloadCacheButton, &QPushButton::clicked, this,
             &SettingsDialog::redownloadExistingCache);
 
@@ -198,34 +178,14 @@ void SettingsDialog::setupCacheActionControls()
     _redownloadCacheButton = new QPushButton(tr("Redownload cache..."), groupBox_5);
     _redownloadCacheButton->setObjectName(QStringLiteral("btnRedownloadCache"));
     _redownloadCacheButton->setToolTip(
-        tr("Fetch fresh versions of already-downloaded raw cache chunks for the currently shown volume, then write them using the selected compression setting."));
-
-    _cacheActionWorkersSpin = new QSpinBox(groupBox_5);
-    _cacheActionWorkersSpin->setObjectName(QStringLiteral("spinCacheActionWorkers"));
-    _cacheActionWorkersSpin->setRange(1, 100);
-    const int defaultWorkers = std::clamp(
-        static_cast<int>(std::max(1u, std::thread::hardware_concurrency() / 2)),
-        1,
-        100);
-    _cacheActionWorkersSpin->setValue(defaultWorkers);
-    _cacheActionWorkersSpin->setToolTip(
-        tr("Worker threads used by Compress existing cache and Redownload cache."));
-
-    auto* label = new QLabel(tr("Workers"), groupBox_5);
-    label->setObjectName(QStringLiteral("labelCacheActionWorkers"));
-    label->setBuddy(_cacheActionWorkersSpin);
+        tr("Fetch fresh exact source payloads for chunks already represented in the disk cache. This does not decode or recompress them."));
 
     auto* row = new QWidget(groupBox_5);
     row->setObjectName(QStringLiteral("cacheActionControls"));
     auto* layout = new QHBoxLayout(row);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(6);
-    if (gridLayout_5)
-        gridLayout_5->removeWidget(btnCompressExistingCache);
-    layout->addWidget(btnCompressExistingCache);
     layout->addWidget(_redownloadCacheButton);
-    layout->addWidget(label);
-    layout->addWidget(_cacheActionWorkersSpin);
 
     if (gridLayout_5)
         gridLayout_5->addWidget(row, 2, 2, 1, 1);
@@ -339,12 +299,18 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
-    settings.setValue(viewer_cache::PLANE_CHUNK_CACHE_MB,
-                      spinViewerPlaneChunkCacheMB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
-    settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
-    settings.setValue(perf::REMOTE_CACHE_QUANTIZATION,
-                      cmbCacheQuantization->currentData().toInt());
+    const bool automaticDownloads = chkAutoDownloadParallelism->isChecked();
+    const int downloadParallelism = spinIOThreads->value();
+    settings.setValue(
+        perf::REMOTE_DOWNLOAD_AUTOMATIC, automaticDownloads);
+    settings.setValue(
+        perf::REMOTE_DOWNLOAD_PARALLELISM, downloadParallelism);
+    vc::render::processChunkCacheService()->configureFetchConcurrency(
+        automaticDownloads
+            ? static_cast<std::size_t>(perf::REMOTE_DOWNLOAD_WORKER_CAPACITY)
+            : static_cast<std::size_t>(downloadParallelism),
+        automaticDownloads);
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
     constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
@@ -363,8 +329,6 @@ void SettingsDialog::accept()
         QuadSurface::setBackupCount(backupCount);
     }
 
-    // IO_THREADS setting removed — see CState::applyCacheBudget.
-
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
     QDialog::accept();
@@ -372,7 +336,6 @@ void SettingsDialog::accept()
 
 namespace {
 
-enum class RecompressResult { Done, Skipped, Failed };
 enum class RedownloadResult { Done, Missing, Failed };
 
 struct CacheFileEntry {
@@ -458,7 +421,8 @@ std::vector<CacheFileEntry> collectRawCacheEntries(
         if (!it->is_regular_file(ec))
             continue;
         const auto ext = it->path().extension();
-        if (ext != ".bin" && ext != ".empty" &&
+        if (ext != ".bin" && ext != ".empty" && ext != ".c3d" &&
+            ext != vc::render::kPersistentSourcePayloadExtension &&
             !(includeCompressed && ext == vc::kCompressedCacheExtension)) {
             continue;
         }
@@ -470,417 +434,25 @@ std::vector<CacheFileEntry> collectRawCacheEntries(
     return entries;
 }
 
-std::filesystem::path rawCachePath(const std::filesystem::path& cacheDir,
-                                   const vc::render::ChunkKey& key)
-{
-    return cacheDir / ("level_" + std::to_string(key.level)) /
-           std::to_string(key.iz) / std::to_string(key.iy) /
-           (std::to_string(key.ix) + ".bin");
-}
-
-std::filesystem::path compressedCachePath(const std::filesystem::path& cacheDir,
-                                          const vc::render::ChunkKey& key)
-{
-    return cacheDir / ("level_" + std::to_string(key.level)) /
-           std::to_string(key.iz) / std::to_string(key.iy) /
-           (std::to_string(key.ix) + vc::kCompressedCacheExtension);
-}
-
-std::filesystem::path emptyCachePath(const std::filesystem::path& cacheDir,
-                                     const vc::render::ChunkKey& key)
-{
-    return cacheDir / ("level_" + std::to_string(key.level)) /
-           std::to_string(key.iz) / std::to_string(key.iy) /
-           (std::to_string(key.ix) + ".empty");
-}
-
-bool writeFileAtomically(const std::filesystem::path& path,
-                         std::span<const std::byte> bytes)
-{
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
-    if (ec)
-        return false;
-    const auto tmp = path.string() + ".tmp";
-    {
-        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
-        if (!file)
-            return false;
-        file.write(reinterpret_cast<const char*>(bytes.data()),
-                   static_cast<std::streamsize>(bytes.size()));
-        if (!file) {
-            fs::remove(tmp, ec);
-            return false;
-        }
-    }
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        fs::remove(path, ec);
-        ec.clear();
-        fs::rename(tmp, path, ec);
-    }
-    if (ec) {
-        fs::remove(tmp, ec);
-        return false;
-    }
-    return true;
-}
-
 RedownloadResult redownloadCacheEntry(
-    vc::render::IChunkedArray& source,
-    const std::shared_ptr<vc::render::PersistentZarrCacheBudget>& budget,
-    const std::filesystem::path& cacheDir,
-    const CacheFileEntry& entry,
-    std::size_t elemSize,
-    bool compress,
-    int quantBinWidth,
-    std::uint64_t& bytesOut)
+    vc::render::ChunkCache& source,
+    const CacheFileEntry& entry)
 {
-    namespace fs = std::filesystem;
-
-    const auto chunk = source.getChunkBlocking(
-        entry.key.level, entry.key.iz, entry.key.iy, entry.key.ix);
-    if (chunk.status == vc::render::ChunkStatus::Missing ||
-        chunk.status == vc::render::ChunkStatus::AllFill) {
-        const auto path = emptyCachePath(cacheDir, entry.key);
-        std::vector<fs::path> replacements{
-            rawCachePath(cacheDir, entry.key),
-            compressedCachePath(cacheDir, entry.key)};
-        auto reservation = budget
-            ? budget->reserveWrite(path, 1, replacements)
-            : vc::render::PersistentZarrCacheBudget::WriteReservation{};
-        if (budget && !reservation)
-            return RedownloadResult::Failed;
-        std::error_code ec;
-        fs::remove(replacements[0], ec);
-        ec.clear();
-        fs::remove(replacements[1], ec);
-        ec.clear();
-        fs::remove(path, ec);
-        const std::byte newline{static_cast<unsigned char>('\n')};
-        if (!writeFileAtomically(path, std::span<const std::byte>(&newline, 1))) {
-            if (budget)
-                reservation.commit();
-            return RedownloadResult::Failed;
-        }
-        if (budget)
-            reservation.commit();
-        bytesOut += 1;
+    const auto result = source.persistChunkBlocking(
+        entry.key.level, entry.key.iz, entry.key.iy, entry.key.ix,
+        vc::render::ChunkCache::PersistentRequestMode::Refresh);
+    switch (result.status) {
+    case vc::render::ChunkCache::PersistentRequestStatus::Data:
+        return RedownloadResult::Done;
+    case vc::render::ChunkCache::PersistentRequestStatus::Missing:
         return RedownloadResult::Missing;
-    }
-    if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes)
-        return RedownloadResult::Failed;
-
-    std::span<const std::byte> payload(chunk.bytes->data(), chunk.bytes->size());
-    std::vector<std::byte> compressed;
-    fs::path path = rawCachePath(cacheDir, entry.key);
-    if (compress) {
-        try {
-            compressed = vc::cacheCompress(
-                payload,
-                entry.shapeZYX,
-                elemSize,
-                vc::kCacheCompressionLevel,
-                quantBinWidth);
-        } catch (const std::exception&) {
-            return RedownloadResult::Failed;
-        }
-        payload = std::span<const std::byte>(compressed.data(), compressed.size());
-        path = compressedCachePath(cacheDir, entry.key);
-    }
-    std::vector<fs::path> replacements;
-    for (const auto& candidate : {rawCachePath(cacheDir, entry.key),
-                                  compressedCachePath(cacheDir, entry.key),
-                                  emptyCachePath(cacheDir, entry.key)}) {
-        if (candidate != path)
-            replacements.push_back(candidate);
-    }
-    auto reservation = budget
-        ? budget->reserveWrite(path, payload.size(), replacements)
-        : vc::render::PersistentZarrCacheBudget::WriteReservation{};
-    if (budget && !reservation)
-        return RedownloadResult::Failed;
-    std::error_code ec;
-    for (const auto& replacement : replacements) {
-        fs::remove(replacement, ec);
-        ec.clear();
-    }
-    if (!writeFileAtomically(path, payload)) {
-        if (budget)
-            reservation.commit();
+    case vc::render::ChunkCache::PersistentRequestStatus::Error:
         return RedownloadResult::Failed;
     }
-    if (budget)
-        reservation.commit();
-    bytesOut += payload.size();
-    return RedownloadResult::Done;
-}
-
-// Recompress one cache chunk in place with the requested quantization
-// (atomic tmp+rename; a replaced ".bin" source is removed on success).
-// Raw ".bin" chunks are always encoded; ".zst" chunks are re-encoded when
-// their recorded quantization width is below the requested one, when they
-// carry an outdated entropy codec, or when they predate per-chunk delta
-// filter selection (re-quantizing at or below the recorded width is a
-// lossless no-op, so a codec or filter upgrade never loses data; the
-// recorded width is kept when it exceeds the requested one). Returns Failed
-// on any error — including a mismatched or unknown chunk shape, which
-// cacheCompress rejects — and the original file is left untouched then.
-RecompressResult compressCacheFile(
-    const std::shared_ptr<vc::render::PersistentZarrCacheBudget>& budget,
-    const std::filesystem::path& srcPath,
-    std::array<int, 3> shapeZYX,
-    std::size_t elemSize,
-    int quantBinWidth,
-    std::uint64_t& bytesIn,
-    std::uint64_t& bytesOut)
-{
-    namespace fs = std::filesystem;
-
-    auto readPin = budget
-        ? budget->pinRead(srcPath)
-        : vc::render::PersistentZarrCacheBudget::ReadPin{};
-    std::vector<std::byte> input;
-    {
-        std::ifstream file(srcPath, std::ios::binary | std::ios::ate);
-        if (!file)
-            return RecompressResult::Failed;
-        const auto size = file.tellg();
-        if (size < 0)
-            return RecompressResult::Failed;
-        input.resize(static_cast<std::size_t>(size));
-        file.seekg(0);
-        file.read(reinterpret_cast<char*>(input.data()), size);
-        if (!file)
-            return RecompressResult::Failed;
-    }
-    if (budget)
-        readPin.complete(true);
-
-    const bool alreadyCompressed =
-        srcPath.extension() == vc::kCompressedCacheExtension;
-    std::vector<std::byte> raw;
-    std::span<const std::byte> rawSpan(input.data(), input.size());
-    if (alreadyCompressed) {
-        const std::span<const std::byte> inputSpan(input.data(), input.size());
-        const auto existingWidth = vc::cacheQuantBinWidth(inputSpan);
-        if (!existingWidth)
-            return RecompressResult::Failed;
-        if (*existingWidth >= quantBinWidth &&
-            vc::cacheCodec(inputSpan) == vc::kCacheDefaultCodec &&
-            vc::cacheDeltaMask(inputSpan).has_value())
-            return RecompressResult::Skipped;
-        quantBinWidth = std::max(quantBinWidth, *existingWidth);
-        const std::size_t expectedSize =
-            static_cast<std::size_t>(shapeZYX[0]) * shapeZYX[1] * shapeZYX[2] *
-            elemSize;
-        auto decoded = vc::cacheDecompress(
-            std::span<const std::byte>(input.data(), input.size()), expectedSize);
-        if (!decoded)
-            return RecompressResult::Failed;
-        raw = std::move(*decoded);
-        rawSpan = {raw.data(), raw.size()};
-    }
-
-    std::vector<std::byte> compressed;
-    try {
-        compressed = vc::cacheCompress(rawSpan, shapeZYX, elemSize,
-                                       vc::kCacheCompressionLevel, quantBinWidth);
-    } catch (const std::exception&) {
-        return RecompressResult::Failed;
-    }
-
-    fs::path zstPath = srcPath;
-    zstPath.replace_extension(vc::kCompressedCacheExtension);
-    std::vector<fs::path> replacements;
-    if (!alreadyCompressed)
-        replacements.push_back(srcPath);
-    auto reservation = budget
-        ? budget->reserveWrite(zstPath, compressed.size(), replacements)
-        : vc::render::PersistentZarrCacheBudget::WriteReservation{};
-    if (budget && !reservation)
-        return RecompressResult::Failed;
-    const fs::path tmpPath = zstPath.string() + ".tmp";
-    {
-        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!file) {
-            if (budget)
-                reservation.commit();
-            return RecompressResult::Failed;
-        }
-        file.write(reinterpret_cast<const char*>(compressed.data()),
-                   static_cast<std::streamsize>(compressed.size()));
-        if (!file) {
-            std::error_code ec;
-            fs::remove(tmpPath, ec);
-            if (budget)
-                reservation.commit();
-            return RecompressResult::Failed;
-        }
-    }
-    std::error_code ec;
-    fs::rename(tmpPath, zstPath, ec);
-    if (ec) {
-        fs::remove(zstPath, ec);
-        ec.clear();
-        fs::rename(tmpPath, zstPath, ec);
-    }
-    if (ec) {
-        fs::remove(tmpPath, ec);
-        if (budget)
-            reservation.commit();
-        return RecompressResult::Failed;
-    }
-    if (!alreadyCompressed)
-        fs::remove(srcPath, ec);
-    if (budget)
-        reservation.commit();
-
-    bytesIn += input.size();
-    bytesOut += compressed.size();
-    return RecompressResult::Done;
+    return RedownloadResult::Failed;
 }
 
 } // namespace
-
-void SettingsDialog::compressExistingCache()
-{
-    namespace fs = std::filesystem;
-
-    const fs::path cacheDir = _currentVolumeCacheDir;
-    std::error_code ec;
-    if (cacheDir.empty() || !fs::is_directory(cacheDir, ec)) {
-        QMessageBox::information(this, tr("Compress cache"),
-            tr("No disk cache found for the currently shown volume."));
-        return;
-    }
-
-    // Uncompressed chunks are stored as ".bin". When a near-lossless mode
-    // is selected, already-compressed ".zst" chunks are candidates too —
-    // the worker re-encodes only those recorded with a narrower
-    // quantization than requested. ".c3d"/".empty" entries have nothing to
-    // gain. Each file's pyramid level ("level_N" path component) selects
-    // the chunk shape used by the delta-zyx compression filter.
-    const int quantBinWidth = cmbCacheQuantization->currentData().toInt();
-    const auto& layout = _currentVolumeChunkLayout;
-    const auto budget =
-        vc::render::PersistentZarrCacheBudget::findForPath(cacheDir);
-    struct RecompressFile {
-        fs::path path;
-        std::array<int, 3> shapeZYX;
-    };
-    std::vector<RecompressFile> files;
-    auto keyLess = [](const vc::render::ChunkKey& a,
-                      const vc::render::ChunkKey& b) {
-        return std::tie(a.level, a.iz, a.iy, a.ix) <
-               std::tie(b.level, b.iz, b.iy, b.ix);
-    };
-    std::map<vc::render::ChunkKey, std::size_t, decltype(keyLess)> fileByKey(keyLess);
-    for (auto it = fs::recursive_directory_iterator(
-             cacheDir, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec)
-            break;
-        if (!it->is_regular_file(ec))
-            continue;
-        const auto ext = it->path().extension();
-        if (ext == ".bin" ||
-            (quantBinWidth > vc::kCacheQuantLossless &&
-             ext == vc::kCompressedCacheExtension)) {
-            if (auto entry = cacheFileEntryForPath(cacheDir, it->path(), layout)) {
-                if (auto [pos, inserted] = fileByKey.emplace(entry->key, files.size());
-                    inserted) {
-                    files.push_back({it->path(), entry->shapeZYX});
-                } else if (ext == ".bin") {
-                    files[pos->second] = {it->path(), entry->shapeZYX};
-                }
-            }
-        }
-    }
-    if (files.empty()) {
-        QMessageBox::information(this, tr("Compress cache"),
-            tr("The cache for the currently shown volume has no chunks to compress."));
-        return;
-    }
-
-    QProgressDialog progress(
-        tr("Compressing %1 cached chunks...").arg(files.size()),
-        tr("Cancel"), 0, static_cast<int>(files.size()), this);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(0);
-    progress.setValue(0);
-
-    std::atomic<std::size_t> nextIndex{0};
-    std::atomic<std::size_t> done{0};
-    std::atomic<std::size_t> failures{0};
-    std::atomic<std::size_t> skipped{0};
-    std::atomic<std::uint64_t> totalIn{0};
-    std::atomic<std::uint64_t> totalOut{0};
-    std::atomic<bool> cancelled{false};
-
-    // std::async workers: VC3D pins OpenMP/cv::parallel_for_ to one thread,
-    // so explicit fan-out is the supported parallelism route here.
-    const std::size_t workerCount = std::min<std::size_t>(
-        files.size(),
-        static_cast<std::size_t>(_cacheActionWorkersSpin->value()));
-    std::vector<std::future<void>> workers;
-    workers.reserve(workerCount);
-    for (std::size_t w = 0; w < workerCount; ++w) {
-        workers.push_back(std::async(std::launch::async, [&]{
-            std::uint64_t bytesIn = 0;
-            std::uint64_t bytesOut = 0;
-            std::size_t localFailures = 0;
-            std::size_t localSkipped = 0;
-            while (!cancelled.load(std::memory_order_relaxed)) {
-                const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
-                if (i >= files.size())
-                    break;
-                switch (compressCacheFile(budget, files[i].path, files[i].shapeZYX,
-                                          layout.elemSize, quantBinWidth,
-                                          bytesIn, bytesOut)) {
-                case RecompressResult::Failed: ++localFailures; break;
-                case RecompressResult::Skipped: ++localSkipped; break;
-                case RecompressResult::Done: break;
-                }
-                done.fetch_add(1, std::memory_order_relaxed);
-            }
-            totalIn += bytesIn;
-            totalOut += bytesOut;
-            failures += localFailures;
-            skipped += localSkipped;
-        }));
-    }
-
-    while (done.load() < files.size() && !progress.wasCanceled()) {
-        progress.setValue(static_cast<int>(done.load()));
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    cancelled = progress.wasCanceled();
-    for (auto& worker : workers)
-        worker.wait();
-    progress.setValue(static_cast<int>(files.size()));
-
-    const auto gib = [](std::uint64_t bytes) {
-        return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 2);
-    };
-    const std::size_t compressed =
-        done.load() - failures.load() - skipped.load();
-    QString summary =
-        tr("Compressed %1 of %2 chunks: %3 GiB -> %4 GiB.")
-            .arg(compressed)
-            .arg(files.size())
-            .arg(gib(totalIn.load()))
-            .arg(gib(totalOut.load()));
-    if (cancelled)
-        summary += tr("\nCancelled — the remaining chunks are unchanged and can be compressed later.");
-    if (skipped.load() > 0)
-        summary += tr("\n%1 chunks already matched the selected accuracy and were left as-is.").arg(skipped.load());
-    if (failures.load() > 0)
-        summary += tr("\n%1 chunks could not be compressed and were left as-is.").arg(failures.load());
-    QMessageBox::information(this, tr("Compress cache"), summary);
-}
 
 void SettingsDialog::redownloadExistingCache()
 {
@@ -895,21 +467,31 @@ void SettingsDialog::redownloadExistingCache()
         return;
     }
 
-    const auto entries = collectRawCacheEntries(
-        cacheDir, _currentVolumeChunkLayout, true);
-    if (entries.empty()) {
-        QMessageBox::information(this, tr("Redownload cache"),
-            tr("The cache for the currently shown volume has no raw chunks to redownload."));
+    auto source = _currentVolume->sharedChunkCache();
+    if (!source) {
+        QMessageBox::warning(this, tr("Redownload cache"),
+            tr("Could not access the shared remote chunk cache."));
         return;
     }
 
-    const bool compress = chkCompressRemoteCache->isChecked();
-    const int quantBinWidth = cmbCacheQuantization->currentData().toInt();
-    const auto budget =
-        vc::render::PersistentZarrCacheBudget::findForPath(cacheDir);
-    const std::size_t workerCount = std::min<std::size_t>(
-        entries.size(),
-        static_cast<std::size_t>(_cacheActionWorkersSpin->value()));
+    std::vector<CacheFileEntry> entries;
+    if (source->persistentCacheLayout() ==
+        vc::render::PersistentCacheLayout::ZarrMirror) {
+        for (const auto& key : source->persistedStorageObjectRepresentatives())
+            entries.push_back({key, {}});
+    } else {
+        entries = collectRawCacheEntries(
+            cacheDir, _currentVolumeChunkLayout, true);
+    }
+    if (entries.empty()) {
+        QMessageBox::information(this, tr("Redownload cache"),
+            tr("The cache for the currently shown volume has no chunks to redownload."));
+        return;
+    }
+
+    // These workers only produce bounded maintenance requests. Source I/O is
+    // performed and admission-controlled by the process-wide cache scheduler.
+    const std::size_t producerCount = std::min<std::size_t>(entries.size(), 64);
 
     QProgressDialog progress(
         tr("Redownloading %1 cached chunks...").arg(entries.size()),
@@ -918,40 +500,17 @@ void SettingsDialog::redownloadExistingCache()
     progress.setMinimumDuration(0);
     progress.setValue(0);
 
-    std::shared_ptr<vc::render::ChunkCache> source;
-    try {
-        auto freshVolume = Volume::NewFromUrl(
-            _currentVolume->remoteLocator(), {}, _currentVolume->remoteAuth());
-        vc::render::ChunkCache::Options options;
-        options.maxConcurrentReads = workerCount;
-        options.compressPersistentCache = false;
-        options.decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
-        source = freshVolume->createChunkCache(std::move(options));
-    } catch (const std::exception& e) {
-        QMessageBox::warning(this, tr("Redownload cache"),
-            tr("Could not open the remote volume for redownload:\n%1")
-                .arg(QString::fromUtf8(e.what())));
-        return;
-    }
-    if (!source) {
-        QMessageBox::warning(this, tr("Redownload cache"),
-            tr("Could not create a remote chunk reader for redownload."));
-        return;
-    }
-
     std::atomic<std::size_t> nextIndex{0};
     std::atomic<std::size_t> done{0};
     std::atomic<std::size_t> refreshed{0};
     std::atomic<std::size_t> missing{0};
     std::atomic<std::size_t> failures{0};
-    std::atomic<std::uint64_t> totalOut{0};
     std::atomic<bool> cancelled{false};
 
     std::vector<std::future<void>> workers;
-    workers.reserve(workerCount);
-    for (std::size_t w = 0; w < workerCount; ++w) {
+    workers.reserve(producerCount);
+    for (std::size_t w = 0; w < producerCount; ++w) {
         workers.push_back(std::async(std::launch::async, [&]{
-            std::uint64_t bytesOut = 0;
             std::size_t localRefreshed = 0;
             std::size_t localMissing = 0;
             std::size_t localFailures = 0;
@@ -959,16 +518,13 @@ void SettingsDialog::redownloadExistingCache()
                 const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
                 if (i >= entries.size())
                     break;
-                switch (redownloadCacheEntry(*source, budget, cacheDir, entries[i],
-                                             _currentVolumeChunkLayout.elemSize,
-                                             compress, quantBinWidth, bytesOut)) {
+                switch (redownloadCacheEntry(*source, entries[i])) {
                 case RedownloadResult::Done: ++localRefreshed; break;
                 case RedownloadResult::Missing: ++localMissing; break;
                 case RedownloadResult::Failed: ++localFailures; break;
                 }
                 done.fetch_add(1, std::memory_order_relaxed);
             }
-            totalOut += bytesOut;
             refreshed += localRefreshed;
             missing += localMissing;
             failures += localFailures;
@@ -985,16 +541,10 @@ void SettingsDialog::redownloadExistingCache()
         worker.wait();
     progress.setValue(static_cast<int>(entries.size()));
 
-    const auto gib = [](std::uint64_t bytes) {
-        return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 2);
-    };
     QString summary =
-        tr("Redownloaded %1 of %2 chunks; wrote %3 GiB using %4.")
+        tr("Refreshed exact source payloads for %1 of %2 chunks.")
             .arg(refreshed.load())
-            .arg(entries.size())
-            .arg(gib(totalOut.load()))
-            .arg(compress ? tr("the selected compression setting")
-                          : tr("uncompressed cache files"));
+            .arg(entries.size());
     if (missing.load() > 0)
         summary += tr("\n%1 chunks are currently missing remotely and were stored as empty markers.").arg(missing.load());
     if (cancelled)

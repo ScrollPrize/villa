@@ -1,7 +1,9 @@
 """Synthetic tests for the phase dense-spacing bundle: complete-band
 detection, soft-sequence registration, shared phase/count rays, native
-anti-collapse, and the two-mode session contract."""
+anti-collapse, and the dense-spacing mode contract."""
 
+from dataclasses import replace
+import json
 import math
 import os
 
@@ -515,11 +517,11 @@ class TestModeContract:
         base.update(config)
         return paths, SpiralRunConfig(z_begin=1, z_end=2, config=base)
 
-    def test_exactly_the_two_modes_are_accepted(self, tmp_path):
-        # 'phase' and 'grad_mag' pass mode validation; anything else -
+    def test_exactly_the_supported_modes_are_accepted(self, tmp_path):
+        # The three current modes pass mode validation; anything else -
         # including retired values like the old 'crossing_count' - is a
         # plain error (no migration handling).
-        for mode in ('phase', 'grad_mag'):
+        for mode in ('phase', 'grad_mag', 'winding_model'):
             paths, run = self.base_request(tmp_path, {
                 'dense_spacing_mode': mode,
                 'loss_weight_dense_spacing': 0.0,
@@ -534,6 +536,29 @@ class TestModeContract:
             fields = {error['field']
                       for error in validate_session_request(paths, run)}
             assert 'dense_spacing_mode' in fields
+
+    def test_winding_model_mode_requires_a_valid_crossing_manifest(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'winding_model',
+        })
+        fields = {error['field']
+                  for error in validate_session_request(paths, run)}
+        assert 'winding_inference' in fields
+
+        store = tmp_path / 'winding_inference'
+        store.mkdir()
+        paths = replace(paths, winding_inference=str(store))
+        messages = {error['field']: error['message']
+                    for error in validate_session_request(paths, run)}
+        assert messages['winding_inference'] == 'manifest.json is missing'
+
+        (store / 'manifest.json').write_text(json.dumps({
+            'artifact_type': 'winding_inference_crossings',
+            'format_version': 1,
+        }))
+        fields = {error['field']
+                  for error in validate_session_request(paths, run)}
+        assert 'winding_inference' not in fields
 
     def test_missing_mode_defaults_to_phase_and_requires_bundle_assets(
         self, tmp_path,

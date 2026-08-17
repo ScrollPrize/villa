@@ -107,7 +107,11 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         sampling: str = "trilinear",
         blocking: bool = True,
     ) -> None:
-        from vc.volume import Volume
+        from vc.volume import (
+            Volume,
+            set_chunk_cache_budget,
+            set_chunk_cache_io_threads,
+        )
 
         self.level = int(level)
         self.sampling = str(sampling)
@@ -127,22 +131,12 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             budget = int(cache_budget_bytes)
             if budget <= 0:
                 raise ValueError("cache_budget_bytes must be positive when provided")
-            set_cache_budget = getattr(self.volume, "set_cache_budget", None)
-            if set_cache_budget is None:
-                raise RuntimeError(
-                    "VC3D volume binding does not expose set_cache_budget; rebuild volume-cartographer"
-                )
-            set_cache_budget(budget)
+            set_chunk_cache_budget(budget)
         if io_threads is not None:
             threads = int(io_threads)
             if threads <= 0:
                 raise ValueError("io_threads must be positive when provided")
-            set_io_threads = getattr(self.volume, "set_io_threads", None)
-            if set_io_threads is None:
-                raise RuntimeError(
-                    "VC3D volume binding does not expose set_io_threads; rebuild volume-cartographer"
-                )
-            set_io_threads(threads)
+            set_chunk_cache_io_threads(threads)
 
     @property
     def store_identity(self) -> str:

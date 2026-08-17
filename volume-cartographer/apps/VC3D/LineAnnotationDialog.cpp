@@ -138,15 +138,26 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
         return camera;
     }
 
-    constexpr float kPadding = 0.85f;
-    const float scaleX = kNominalGeneratedRowWidth / static_cast<float>(std::max(1, size.width));
-    const float scaleY = kNominalGeneratedRowHeight / static_cast<float>(std::max(1, size.height));
-    camera.scale = std::clamp(std::min(scaleX, scaleY) * kPadding, 0.5f, 16.0f);
+    const cv::Vec2d first = quad->gridToSurface({0.0, 0.0});
+    const cv::Vec2d last = quad->gridToSurface(
+        {static_cast<double>(std::max(0, size.width - 1)),
+         static_cast<double>(std::max(0, size.height - 1))});
+    const double extentX = std::abs(last[0] - first[0]);
+    const double extentY = std::abs(last[1] - first[1]);
+    if (!(extentX > 0.0) || !(extentY > 0.0)) {
+        return camera;
+    }
+    constexpr double kPadding = 0.85;
+    const double scaleX = static_cast<double>(kNominalGeneratedRowWidth) / extentX;
+    const double scaleY = static_cast<double>(kNominalGeneratedRowHeight) / extentY;
+    camera.scale = static_cast<float>(
+        std::clamp(std::min(scaleX, scaleY) * kPadding, 0.01, 100000.0));
     return camera;
 }
 
 std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewer,
-                                                     double linePosition)
+                                                     double linePosition,
+                                                     const vc::lasagna::LineStripPositionMap* positionMap)
 {
     auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
     if (!quad || !std::isfinite(linePosition)) {
@@ -156,20 +167,22 @@ std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewe
     if (!points || points->empty()) {
         return std::nullopt;
     }
-    const cv::Vec2f scale = quad->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+    const double gridColumn = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(linePosition)
+        : linePosition;
+    if (!std::isfinite(gridColumn)) {
         return std::nullopt;
     }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return cv::Vec2f{surfaceX, surfaceY};
+    const cv::Vec2d surfacePoint = quad->gridToSurface(
+        {gridColumn, static_cast<double>(points->rows / 2)});
+    return cv::Vec2f{static_cast<float>(surfacePoint[0]),
+                     static_cast<float>(surfacePoint[1])};
 }
 
 std::optional<float> generatedStripScaleForLinePositionRange(
     CChunkedVolumeViewer* viewer,
-    const std::optional<std::pair<double, double>>& range)
+    const std::optional<std::pair<double, double>>& range,
+    const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!range) {
         return std::nullopt;
@@ -178,12 +191,18 @@ std::optional<float> generatedStripScaleForLinePositionRange(
     if (!quad || !std::isfinite(range->first) || !std::isfinite(range->second)) {
         return std::nullopt;
     }
-    const cv::Vec2f scale = quad->scale();
-    const double lineSpan = std::abs(range->second - range->first);
-    if (!std::isfinite(lineSpan) || lineSpan <= 1.0e-6 || scale[0] == 0.0f) {
+    const double firstGrid = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(range->first)
+        : range->first;
+    const double secondGrid = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(range->second)
+        : range->second;
+    if (!std::isfinite(firstGrid) || !std::isfinite(secondGrid)) {
         return std::nullopt;
     }
-    const double surfaceSpan = lineSpan / std::abs(static_cast<double>(scale[0]));
+    const double surfaceSpan = std::abs(
+        quad->gridToSurface({secondGrid, 0.0})[0] -
+        quad->gridToSurface({firstGrid, 0.0})[0]);
     if (!std::isfinite(surfaceSpan) || surfaceSpan <= 1.0e-6) {
         return std::nullopt;
     }
@@ -2048,13 +2067,15 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             : generatedPaneCamera(viewer, camera);
         if (!haveStripCamera) {
             if (const auto center =
-                    generatedStripSurfaceCenter(viewer, _currentLinePosition)) {
+                    generatedStripSurfaceCenter(viewer, _currentLinePosition,
+                                                &views.stripPositionMap)) {
                 stripCamera.surfacePtrX = (*center)[0];
                 stripCamera.surfacePtrY = (*center)[1];
             }
             if (const auto focusedScale = generatedStripScaleForLinePositionRange(
                     viewer,
-                    views.initialStripLinePositionRange)) {
+                    views.initialStripLinePositionRange,
+                    &views.stripPositionMap)) {
                 stripCamera.scale = *focusedScale;
             }
             if (stripIndex < _savedStripZooms.size()) {
@@ -2229,6 +2250,7 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.linePointCount = _generatedViews.linePoints.size();
     options.linePosition = linePosition;
     options.stripViewer = stripViewer;
+    options.stripPositionMap = _generatedViews.stripPositionMap;
     options.linkWithCandidateEnabled = linkCandidateState.enabled;
     options.linkWithCandidateLabel = linkCandidateState.label;
     options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
@@ -2357,7 +2379,8 @@ double LineAnnotationDialog::linePositionFromStripScene(CChunkedVolumeViewer* vi
     if (!viewer || !_hasGeneratedViews) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    return vc3d::line_annotation::generatedLinePositionFromStripScene(viewer, scenePoint);
+    return vc3d::line_annotation::generatedLinePositionFromStripScene(
+        viewer, scenePoint, &_generatedViews.stripPositionMap);
 }
 
 void LineAnnotationDialog::requestCurrentLinePosition(double position)
@@ -2793,7 +2816,8 @@ void LineAnnotationDialog::centerStripsOnLinePosition(double linePosition, bool 
         if (!stripViewer) {
             continue;
         }
-        if (const auto center = generatedStripSurfaceCenter(stripViewer, linePosition)) {
+        if (const auto center = generatedStripSurfaceCenter(
+                stripViewer, linePosition, &_generatedViews.stripPositionMap)) {
             CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
             camera.surfacePtrX = (*center)[0];
             if (includeVertical) {
@@ -3537,7 +3561,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         const QPointF currentScenePoint =
             vc3d::line_annotation::generatedStripLinePositionToScene(viewer,
                                                                       quad,
-                                                                      stripPosition);
+                                                                      stripPosition,
+                                                                      &stripViews.stripPositionMap);
         auto* view = viewer->graphicsView();
         auto* viewport = view ? view->viewport() : nullptr;
         if (std::isfinite(currentScenePoint.x()) &&
@@ -3601,12 +3626,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                     vc3d::line_annotation::generatedStripLinePositionToScene(
                         viewer,
                         quad,
-                        metric.firstControlLinePosition);
+                        metric.firstControlLinePosition,
+                        &stripViews.stripPositionMap);
                 const QPointF secondScenePoint =
                     vc3d::line_annotation::generatedStripLinePositionToScene(
                         viewer,
                         quad,
-                        metric.secondControlLinePosition);
+                        metric.secondControlLinePosition,
+                        &stripViews.stripPositionMap);
                 if (!std::isfinite(firstScenePoint.x()) ||
                     !std::isfinite(secondScenePoint.x())) {
                     continue;
@@ -4334,22 +4361,8 @@ QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* vie
                                                        QuadSurface* surface,
                                                        double linePosition) const
 {
-    if (!viewer || !surface) {
-        return {};
-    }
-    const auto* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return {};
-    }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
-        return {};
-    }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+    return vc3d::line_annotation::generatedStripLinePositionToScene(
+        viewer, surface, linePosition, &_generatedViews.stripPositionMap);
 }
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
@@ -4667,7 +4680,8 @@ void LineAnnotationDialog::forwardOverviewControlContextMenu(double linePosition
     if (!quad || !view) {
         return;
     }
-    const QPointF scenePoint = stripLinePositionToScene(strip, quad, linePosition);
+    const QPointF scenePoint = vc3d::line_annotation::generatedStripLinePositionToScene(
+        strip, quad, linePosition, &_generatedViews.stripPositionMap);
     if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
         return;
     }
@@ -4709,7 +4723,8 @@ void LineAnnotationDialog::snapPanesToOverviewCursor()
         if (!stripViewer) {
             continue;
         }
-        if (const auto center = generatedStripSurfaceCenter(stripViewer, *position)) {
+        if (const auto center = generatedStripSurfaceCenter(
+                stripViewer, *position, &_generatedViews.stripPositionMap)) {
             CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
             camera.surfacePtrX = (*center)[0];
             camera.surfacePtrY = (*center)[1];

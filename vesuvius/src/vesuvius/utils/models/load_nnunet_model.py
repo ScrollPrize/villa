@@ -1,5 +1,6 @@
 import ast
 import importlib
+import inspect
 import os
 import json
 import torch
@@ -15,6 +16,7 @@ import shutil
 
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 import nnunetv2
 import torch.nn as nn
@@ -119,27 +121,50 @@ def initialize_network(architecture_class_name: str,
         The initialized network
     """
 
-    for i in arch_init_kwargs_req_import:
-        if i != "":
-            exec(f"import {i}")
-            
-    network_class = recursive_find_python_class(
-        os.path.join(nnunetv2.__path__[0], "network_architecture"),
+    return get_network_from_plans(
         architecture_class_name,
-        current_module="nnunetv2.network_architecture"
-    )
-    
-    if network_class is None:
-        raise RuntimeError(f"Network architecture class {architecture_class_name} not found in nnunetv2.network_architecture.")
-    
-    network = network_class(
-        input_channels=num_input_channels,
-        num_classes=num_output_channels,
+        arch_init_kwargs,
+        arch_init_kwargs_req_import,
+        num_input_channels,
+        num_output_channels,
+        allow_init=True,
         deep_supervision=enable_deep_supervision,
-        **arch_init_kwargs
     )
-    
-    return network
+
+
+def _build_network_from_trainer(
+    trainer_class,
+    plans_manager,
+    configuration_manager,
+    num_input_channels: int,
+    num_output_channels: int,
+):
+    """Call the network builder used by the installed nnU-Net version.
+
+    nnU-Net 2.8 changed this static method from architecture arguments to
+    plans/configuration managers. Inspect the declared parameters rather than
+    catching ``TypeError``, so errors raised inside a trainer are not mistaken
+    for an API-version mismatch.
+    """
+    build_network = trainer_class.build_network_architecture
+    parameters = inspect.signature(build_network).parameters
+    if 'plans_manager' in parameters and 'configuration_manager' in parameters:
+        return build_network(
+            plans_manager,
+            configuration_manager,
+            num_input_channels,
+            num_output_channels,
+            enable_deep_supervision=False,
+        )
+
+    return build_network(
+        configuration_manager.network_arch_class_name,
+        configuration_manager.network_arch_init_kwargs,
+        configuration_manager.network_arch_init_kwargs_req_import,
+        num_input_channels,
+        num_output_channels,
+        enable_deep_supervision=False,
+    )
 
 def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: str = 'checkpoint_final.pth', 
             device='cuda', custom_plans_json=None, custom_dataset_json=None, verbose: bool = False, rank: int = 0):
@@ -238,13 +263,12 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
         if should_print:
             print(f"Resolved trainer {trainer_name} from {trainer_class.__module__}")
         try:
-            network = trainer_class.build_network_architecture(
-                configuration_manager.network_arch_class_name,
-                configuration_manager.network_arch_init_kwargs,
-                configuration_manager.network_arch_init_kwargs_req_import,
+            network = _build_network_from_trainer(
+                trainer_class,
+                plans_manager,
+                configuration_manager,
                 num_input_channels,
                 label_manager.num_segmentation_heads,
-                enable_deep_supervision=False
             )
         except Exception as e:
             raise RuntimeError(

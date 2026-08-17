@@ -37,6 +37,7 @@
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "MenuActionController.hpp"
+#include "OpenDataLasagna.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
@@ -118,8 +119,26 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
 
     // Internal mode: ensureServiceRunning() blocks until the process is up (or
     // fails) and returns synchronously -- no deferral needed.
+    //
+    // The data directory is resolved the same way every UI call site does
+    // (CWindow's resolvedLasagnaForState): via the active project's volume
+    // package and current volume ID. Previously this call site passed no
+    // directory at all, so ensureServiceRunning() always failed with "No
+    // Lasagna data directory was provided" regardless of what was open or
+    // selected -- the resolution step below was simply missing here.
     const QString pythonPath = p.value("pythonPath").toString();
-    if (!mgr.ensureServiceRunning(pythonPath)) {
+    QString dataDirectory;
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (vpkg) {
+        const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+            *vpkg, state->currentVolumeId());
+        if (resolved && !resolved->manifestPath.empty()) {
+            dataDirectory = QString::fromStdString(
+                resolved->manifestPath.parent_path().string());
+        }
+    }
+    if (!mgr.ensureServiceRunning(pythonPath, dataDirectory)) {
         QJsonObject data;
         data["detail"] = mgr.lastError();
         throw AgentBridgeError{-32005, "Failed to start lasagna service", data};

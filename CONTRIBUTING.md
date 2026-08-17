@@ -25,8 +25,9 @@ every script or line of code ever commited. We are only interested in supporting
 We support the use of LLMs as coding assistants, and we make broad use of them ourselves. However, because reviewing PRs takes a significant amount of time away from the goal of unrolling the scrolls, we have a few rules regarding llm assisted PRs:
 - PRs for bugfixes or improvements must come as a result of a human interacting with the codebase in an attempt to work on the scroll data. 
 - Any LLM generated PR must be accompanied by human-written commentary explaining why this PR is relevant or useful
+- The description of what you propose to change and why should be as concise and jargon-free as possible.
 - Usefulness of any change must be calculated on real scroll data. Synthetic or toy examples are not allowed. 
-- We expect that you have reviewed the code yourself for simplicity/accuracy
+- We expect that you have reviewed the code yourself for simplicity/accuracy.
 - We may close PRs which appear to be simple "fishing expeditions" for llms (ie. "claude find bugs in this codebase") unrelated to humans actually using the code in pursuit of our goals. 
 
 ## Developer installation 
