@@ -1794,9 +1794,17 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
           report.profile.selectedCells + report.profile.contextCells);
     CHECK(report.profile.contextCells > 0);
     CHECK(report.profile.tiles > 0);
+    CHECK(report.profile.samplingGroups > 0);
+    CHECK(report.profile.samplingGroups <= report.profile.tiles);
     CHECK(report.profile.workers > 0);
     CHECK(report.profile.predictionSamplerCalls == report.profile.tiles);
     CHECK(report.profile.submittedPredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels <=
+          report.profile.submittedPredictionVoxels);
+    CHECK(report.profile.submittedPredictionVoxels +
+              report.profile.reusedPredictionVoxels >=
+          report.profile.uniqueTilePredictionVoxels);
     CHECK(report.profile.candidateObservations >=
           report.profile.retainedObservations);
     CHECK(report.profile.retainedObservations > 0);
@@ -1861,6 +1869,33 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
         vc::fiber_tracer::fiberAnchorCellReportObj(report);
     CHECK(occurrenceCount(cellObj, "\np ") == 2);
     CHECK(occurrenceCount(cellObj, "\nl ") == 1);
+}
+
+TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {32, 8, 8};
+    grid.predictionToBaseScale = 1.0;
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    value.parallelThreads = 2;
+
+    const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
+        grid,
+        value,
+        [](const auto& indices, int, auto& samples) {
+            samples.assign(
+                indices.size(),
+                vc::fiber_tracer::FiberStoredPredictionSample{
+                    {1.0, 0.0, 0.0}, 1.0, true});
+        },
+        {{5, 1, 1}, {6, 1, 1}});
+
+    CHECK(report.profile.tiles >= 2);
+    CHECK(report.profile.samplingGroups < report.profile.tiles);
+    CHECK(report.profile.reusedPredictionVoxels > 0);
+    CHECK(report.profile.uniqueTilePredictionVoxels <=
+          report.profile.submittedPredictionVoxels);
 }
 
 TEST_CASE("anchor diagnostics retain unavailable attempts in zero-anchor cells")

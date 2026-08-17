@@ -535,7 +535,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=6` row. Both commands use the same field
+`fiberlet_extraction_profile version=7` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -601,6 +601,22 @@ stores only canonical-order 32-bit indices into that tile plus its cell-local
 gradient-validity byte. The public expanded-observation fitting API uses the
 same templated fitter. Tile observation storage and maximum cell-reference
 scratch are included in the existing concurrent sample-memory budget.
+
+Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
+deterministically by maximum overlapping sample volume while preserving at
+least one independent job per pair. The first tile is sampled normally; the
+second copies bit-identical raw prediction samples from the overlap and submits
+only missing coordinates. Gradient construction, compact observations, and
+cell iteration remain tile-local and unchanged. Group memory includes both the
+active tile working set and retained raw samples and remains bounded by
+`maximumConcurrentSampleBytes`.
+
+`anchor_sampling_groups` counts independent jobs,
+`anchor_reused_prediction_voxels` counts copied overlap,
+`anchor_submitted_prediction_voxels` counts actual sampler coordinates, and
+`anchor_unique_tile_prediction_voxels` is the exact global union of all dense
+tile boxes. The union is measured with a coordinate-compressed box sweep and
+does not alter extraction work.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

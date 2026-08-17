@@ -95,6 +95,14 @@ for difficult overlapping-fiber data.
 3. Preserve cache behavior, sample values, memory limits, and enough jobs for
    effective 32-worker scheduling.
 
+Measured and accepted: the 192 tile boxes submitted 39,701,808 coordinates but
+their exact union contained only 6,162,456 voxels. Deterministic
+maximum-overlap pairs formed 98 bounded jobs, retained all 32 workers, reused
+12,960,096 samples, and reduced actual submissions to 26,741,712. Median total
+wall improved from 13.69 to 13.54 seconds and anchor CPU from 184.80 to 174.07
+seconds. Anchor/fiberlet populations, DP work, and replay failures were
+unchanged.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

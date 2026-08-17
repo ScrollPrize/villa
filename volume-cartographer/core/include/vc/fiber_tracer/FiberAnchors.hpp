@@ -262,9 +262,12 @@ struct FiberAnchorExtractionProfile {
     size_t contextCells = 0;
     size_t workCells = 0;
     size_t tiles = 0;
+    size_t samplingGroups = 0;
     size_t workers = 0;
     size_t predictionSamplerCalls = 0;
     size_t submittedPredictionVoxels = 0;
+    size_t uniqueTilePredictionVoxels = 0;
+    size_t reusedPredictionVoxels = 0;
     size_t candidateObservations = 0;
     size_t retainedObservations = 0;
     size_t gradientAttempts = 0;

@@ -20,4 +20,8 @@
 - [x] Generate matched one-pass/two-pass failure visualizations.
 - [x] Review checkpoint 4 and accept one pass as the default.
 - [x] Document `--maximum-iterations` prominently as an anchor quality knob.
-- [ ] Obtain approval before checkpoint 5 shared tile-halo sampling.
+- [x] Obtain approval for checkpoint 5 shared tile-halo sampling.
+- [x] Measure exact tile overlap on the canonical replay.
+- [x] Implement deterministic bounded tile-pair sample reuse.
+- [x] Benchmark checkpoint 5 with unchanged extraction and replay output.
+- [x] Add focused cross-tile reuse coverage and documentation.

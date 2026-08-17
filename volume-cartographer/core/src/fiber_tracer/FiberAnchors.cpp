@@ -2577,6 +2577,23 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         }
         return result;
     };
+    const auto checkedMultiply = [](size_t left, size_t right,
+                                     const char* description) {
+        if (right != 0 &&
+            left > std::numeric_limits<size_t>::max() / right) {
+            throw std::overflow_error(
+                std::string(description) + " size overflows");
+        }
+        return left * right;
+    };
+    const auto checkedAdd = [](size_t left, size_t right,
+                                const char* description) {
+        if (left > std::numeric_limits<size_t>::max() - right) {
+            throw std::overflow_error(
+                std::string(description) + " size overflows");
+        }
+        return left + right;
+    };
     const double broadTransverseSupport =
         config.localWindowRadiusPredictionVoxels +
         config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
@@ -2762,7 +2779,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             const size_t tileSamples =
                 checkedProduct(tileShape, "fiber anchor tile sample");
             const size_t denseBytes =
-                sizeof(CellIndex) + sizeof(FiberStoredPredictionSample) +
+                sizeof(CellIndex) + sizeof(size_t) +
+                sizeof(FiberStoredPredictionSample) +
                 sizeof(CompactFiberAnchorObservation) +
                 (config.peakGradientWeight > 0.0
                     ? sizeof(CachedPresenceGradient)
@@ -2838,17 +2856,191 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             [](const Tile& left, const Tile& right) {
                 return left.cells.front() < right.cells.front();
             });
-        size_t maximumTileBytes = 0;
-        for (const auto& tile : tiles)
-            maximumTileBytes = std::max(maximumTileBytes, tile.estimatedBytes);
+        const auto exactTileSampleUnion = [&]() {
+            std::vector<size_t> zBoundaries;
+            zBoundaries.reserve(2 * tiles.size());
+            for (const auto& tile : tiles) {
+                zBoundaries.push_back(tile.sampleBegin[0]);
+                zBoundaries.push_back(tile.sampleEnd[0]);
+            }
+            std::sort(zBoundaries.begin(), zBoundaries.end());
+            zBoundaries.erase(
+                std::unique(zBoundaries.begin(), zBoundaries.end()),
+                zBoundaries.end());
+
+            size_t unionVoxels = 0;
+            for (size_t zIndex = 0;
+                 zIndex + 1 < zBoundaries.size(); ++zIndex) {
+                const size_t zBegin = zBoundaries[zIndex];
+                const size_t zEnd = zBoundaries[zIndex + 1];
+                std::vector<const Tile*> zTiles;
+                std::vector<size_t> yBoundaries;
+                for (const auto& tile : tiles) {
+                    if (tile.sampleBegin[0] > zBegin ||
+                        tile.sampleEnd[0] < zEnd) {
+                        continue;
+                    }
+                    zTiles.push_back(&tile);
+                    yBoundaries.push_back(tile.sampleBegin[1]);
+                    yBoundaries.push_back(tile.sampleEnd[1]);
+                }
+                std::sort(yBoundaries.begin(), yBoundaries.end());
+                yBoundaries.erase(
+                    std::unique(yBoundaries.begin(), yBoundaries.end()),
+                    yBoundaries.end());
+
+                size_t unionArea = 0;
+                for (size_t yIndex = 0;
+                     yIndex + 1 < yBoundaries.size(); ++yIndex) {
+                    const size_t yBegin = yBoundaries[yIndex];
+                    const size_t yEnd = yBoundaries[yIndex + 1];
+                    std::vector<std::pair<size_t, size_t>> xIntervals;
+                    for (const Tile* tile : zTiles) {
+                        if (tile->sampleBegin[1] <= yBegin &&
+                            tile->sampleEnd[1] >= yEnd) {
+                            xIntervals.emplace_back(
+                                tile->sampleBegin[2],
+                                tile->sampleEnd[2]);
+                        }
+                    }
+                    std::sort(xIntervals.begin(), xIntervals.end());
+                    size_t coveredX = 0;
+                    if (!xIntervals.empty()) {
+                        size_t intervalBegin = xIntervals.front().first;
+                        size_t intervalEnd = xIntervals.front().second;
+                        for (size_t interval = 1;
+                             interval < xIntervals.size(); ++interval) {
+                            if (xIntervals[interval].first <= intervalEnd) {
+                                intervalEnd = std::max(
+                                    intervalEnd,
+                                    xIntervals[interval].second);
+                                continue;
+                            }
+                            coveredX += intervalEnd - intervalBegin;
+                            intervalBegin = xIntervals[interval].first;
+                            intervalEnd = xIntervals[interval].second;
+                        }
+                        coveredX += intervalEnd - intervalBegin;
+                    }
+                    const size_t yExtent = yEnd - yBegin;
+                    if (coveredX != 0 &&
+                        yExtent >
+                            std::numeric_limits<size_t>::max() / coveredX) {
+                        throw std::overflow_error(
+                            "fiber anchor tile union area overflows");
+                    }
+                    const size_t stripArea = yExtent * coveredX;
+                    if (unionArea >
+                        std::numeric_limits<size_t>::max() - stripArea) {
+                        throw std::overflow_error(
+                            "fiber anchor tile union area overflows");
+                    }
+                    unionArea += stripArea;
+                }
+                const size_t zExtent = zEnd - zBegin;
+                if (unionArea != 0 &&
+                    zExtent >
+                        std::numeric_limits<size_t>::max() / unionArea) {
+                    throw std::overflow_error(
+                        "fiber anchor tile union volume overflows");
+                }
+                const size_t slabVoxels = zExtent * unionArea;
+                if (unionVoxels >
+                    std::numeric_limits<size_t>::max() - slabVoxels) {
+                    throw std::overflow_error(
+                        "fiber anchor tile union volume overflows");
+                }
+                unionVoxels += slabVoxels;
+            }
+            return unionVoxels;
+        };
+        report.profile.uniqueTilePredictionVoxels += exactTileSampleUnion();
+
+        const auto tileSampleCount = [&](const Tile& tile) {
+            return checkedProduct({
+                tile.sampleEnd[0] - tile.sampleBegin[0],
+                tile.sampleEnd[1] - tile.sampleBegin[1],
+                tile.sampleEnd[2] - tile.sampleBegin[2],
+            }, "fiber anchor tile sample");
+        };
+        const auto overlapVoxels = [&](const Tile& left, const Tile& right) {
+            std::array<size_t, 3> extent{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const size_t begin = std::max(
+                    left.sampleBegin[axis], right.sampleBegin[axis]);
+                const size_t end = std::min(
+                    left.sampleEnd[axis], right.sampleEnd[axis]);
+                if (begin >= end)
+                    return size_t{0};
+                extent[axis] = end - begin;
+            }
+            return checkedProduct(extent, "fiber anchor tile overlap");
+        };
+        struct TileSamplingGroup {
+            std::array<size_t, 2> tileIndices{};
+            size_t tileCount = 0;
+            size_t estimatedBytes = 0;
+        };
+        std::vector<TileSamplingGroup> samplingGroups;
+        std::vector<uint8_t> grouped(tiles.size(), 0);
+        for (size_t first = 0; first < tiles.size(); ++first) {
+            if (grouped[first])
+                continue;
+            size_t bestSecond = tiles.size();
+            size_t bestOverlap = 0;
+            for (size_t second = first + 1; second < tiles.size(); ++second) {
+                if (grouped[second])
+                    continue;
+                const size_t overlap =
+                    overlapVoxels(tiles[first], tiles[second]);
+                if (overlap > bestOverlap) {
+                    bestOverlap = overlap;
+                    bestSecond = second;
+                }
+            }
+            TileSamplingGroup group;
+            group.tileIndices[0] = first;
+            group.tileCount = 1;
+            group.estimatedBytes = tiles[first].estimatedBytes;
+            grouped[first] = 1;
+            if (bestSecond != tiles.size()) {
+                group.tileIndices[1] = bestSecond;
+                group.tileCount = 2;
+                grouped[bestSecond] = 1;
+                const size_t firstRawBytes =
+                    checkedMultiply(
+                        tileSampleCount(tiles[first]),
+                        sizeof(FiberStoredPredictionSample),
+                        "fiber anchor retained tile");
+                const size_t secondRawBytes =
+                    checkedMultiply(
+                        tileSampleCount(tiles[bestSecond]),
+                        sizeof(FiberStoredPredictionSample),
+                        "fiber anchor retained tile");
+                group.estimatedBytes = std::max(
+                    checkedAdd(
+                        tiles[first].estimatedBytes, secondRawBytes,
+                        "fiber anchor tile sampling group"),
+                    checkedAdd(
+                        tiles[bestSecond].estimatedBytes, firstRawBytes,
+                        "fiber anchor tile sampling group"));
+            }
+            samplingGroups.push_back(group);
+        }
+        size_t maximumGroupBytes = 0;
+        for (const auto& group : samplingGroups) {
+            maximumGroupBytes = std::max(
+                maximumGroupBytes, group.estimatedBytes);
+        }
         const size_t memoryWorkers = std::max<size_t>(
-            1, config.maximumConcurrentSampleBytes / maximumTileBytes);
+            1, config.maximumConcurrentSampleBytes / maximumGroupBytes);
         const size_t workerCount = std::min({
-            tiles.size(),
+            samplingGroups.size(),
             static_cast<size_t>(config.parallelThreads),
             memoryWorkers,
         });
         report.profile.tiles += tiles.size();
+        report.profile.samplingGroups += samplingGroups.size();
         report.profile.workers = std::max(report.profile.workers, workerCount);
         report.profile.tilePlanningSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - tilePlanningStart).count();
@@ -2859,6 +3051,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         struct WorkerProfile {
             size_t predictionSamplerCalls = 0;
             size_t submittedPredictionVoxels = 0;
+            size_t reusedPredictionVoxels = 0;
             size_t candidateObservations = 0;
             size_t retainedObservations = 0;
             size_t gradientAttempts = 0;
@@ -2996,10 +3189,15 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             auto& workerProfile = workerProfiles[workerIndex];
             while (true) {
                 const size_t job = nextJob.fetch_add(1);
-                if (job >= tiles.size())
+                if (job >= samplingGroups.size())
                     break;
                 try {
-                    const Tile& tile = tiles[job];
+                    const auto& group = samplingGroups[job];
+                    const Tile* previousTile = nullptr;
+                    std::vector<FiberStoredPredictionSample> previousSamples;
+                    for (size_t groupIndex = 0;
+                         groupIndex < group.tileCount; ++groupIndex) {
+                    const Tile& tile = tiles[group.tileIndices[groupIndex]];
                     const std::array<size_t, 3> sampleShape{
                         tile.sampleEnd[0] - tile.sampleBegin[0],
                         tile.sampleEnd[1] - tile.sampleBegin[1],
@@ -3016,29 +3214,73 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     const auto coordinateStart = std::chrono::steady_clock::now();
                     std::vector<CellIndex> indices;
                     indices.reserve(sampleCount);
+                    std::vector<size_t> sampledOffsets;
+                    sampledOffsets.reserve(sampleCount);
+                    std::vector<FiberStoredPredictionSample> samples(sampleCount);
+                    const size_t plane = sampleShape[1] * sampleShape[2];
                     for (size_t z = tile.sampleBegin[0]; z < tile.sampleEnd[0]; ++z) {
                         for (size_t y = tile.sampleBegin[1]; y < tile.sampleEnd[1]; ++y) {
-                            for (size_t x = tile.sampleBegin[2]; x < tile.sampleEnd[2]; ++x)
-                                indices.push_back({z, y, x});
+                            for (size_t x = tile.sampleBegin[2]; x < tile.sampleEnd[2]; ++x) {
+                                const size_t offset =
+                                    (z - tile.sampleBegin[0]) * plane +
+                                    (y - tile.sampleBegin[1]) * sampleShape[2] +
+                                    (x - tile.sampleBegin[2]);
+                                const bool reusable = previousTile != nullptr &&
+                                    z >= previousTile->sampleBegin[0] &&
+                                    z < previousTile->sampleEnd[0] &&
+                                    y >= previousTile->sampleBegin[1] &&
+                                    y < previousTile->sampleEnd[1] &&
+                                    x >= previousTile->sampleBegin[2] &&
+                                    x < previousTile->sampleEnd[2];
+                                if (reusable) {
+                                    const size_t previousWidth =
+                                        previousTile->sampleEnd[2] -
+                                        previousTile->sampleBegin[2];
+                                    const size_t previousPlane =
+                                        (previousTile->sampleEnd[1] -
+                                         previousTile->sampleBegin[1]) *
+                                        previousWidth;
+                                    const size_t previousOffset =
+                                        (z - previousTile->sampleBegin[0]) *
+                                            previousPlane +
+                                        (y - previousTile->sampleBegin[1]) *
+                                            previousWidth +
+                                        (x - previousTile->sampleBegin[2]);
+                                    samples[offset] = previousSamples[previousOffset];
+                                } else {
+                                    indices.push_back({z, y, x});
+                                    sampledOffsets.push_back(offset);
+                                }
+                            }
                         }
                     }
                     workerProfile.coordinateConstructionSeconds +=
                         std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - coordinateStart).count();
-                    std::vector<FiberStoredPredictionSample> samples;
-                    const auto samplingStart = std::chrono::steady_clock::now();
-                    sampler(indices, 1, samples);
-                    workerProfile.predictionSamplingSeconds +=
-                        std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - samplingStart).count();
-                    ++workerProfile.predictionSamplerCalls;
-                    workerProfile.submittedPredictionVoxels += sampleCount;
-                    if (samples.size() != indices.size()) {
-                        throw std::runtime_error(
-                            "fiber stored prediction sampler returned the wrong sample count");
+                    if (!indices.empty()) {
+                        std::vector<FiberStoredPredictionSample> sampled;
+                        const auto samplingStart =
+                            std::chrono::steady_clock::now();
+                        sampler(indices, 1, sampled);
+                        workerProfile.predictionSamplingSeconds +=
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                samplingStart).count();
+                        ++workerProfile.predictionSamplerCalls;
+                        if (sampled.size() != indices.size()) {
+                            throw std::runtime_error(
+                                "fiber stored prediction sampler returned the wrong sample count");
+                        }
+                        for (size_t index = 0; index < sampled.size(); ++index)
+                            samples[sampledOffsets[index]] = sampled[index];
                     }
+                    workerProfile.submittedPredictionVoxels += indices.size();
+                    workerProfile.reusedPredictionVoxels +=
+                        sampleCount - indices.size();
                     indices.clear();
                     indices.shrink_to_fit();
+                    sampledOffsets.clear();
+                    sampledOffsets.shrink_to_fit();
                     std::vector<CachedPresenceGradient> gradients;
                     if (config.peakGradientWeight > 0.0) {
                         const auto gradientStart = std::chrono::steady_clock::now();
@@ -3104,7 +3346,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     const auto compactStart = std::chrono::steady_clock::now();
                     std::vector<CompactFiberAnchorObservation> observations(
                         sampleCount);
-                    const size_t plane = sampleShape[1] * sampleShape[2];
                     for (size_t z = tile.sampleBegin[0];
                          z < tile.sampleEnd[0]; ++z) {
                         for (size_t y = tile.sampleBegin[1];
@@ -3146,7 +3387,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                         std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - compactStart)
                             .count();
-                    std::vector<FiberStoredPredictionSample>().swap(samples);
                     std::vector<CachedPresenceGradient>().swap(gradients);
                     std::vector<uint32_t> cellObservationIndices;
                     std::vector<uint8_t> cellGradientValidity;
@@ -3177,9 +3417,18 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             }
                         }
                     }
+                    previousTile = &tile;
+                    previousSamples = std::move(samples);
+                    }
                 } catch (...) {
-                    for (const size_t cellIndex : tiles[job].cells)
-                        jobErrors[cellIndex] = std::current_exception();
+                    for (size_t groupIndex = 0;
+                         groupIndex < samplingGroups[job].tileCount;
+                         ++groupIndex) {
+                        const auto& tile = tiles[
+                            samplingGroups[job].tileIndices[groupIndex]];
+                        for (const size_t cellIndex : tile.cells)
+                            jobErrors[cellIndex] = std::current_exception();
+                    }
                 }
             }
         };
@@ -3200,6 +3449,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 workerProfile.predictionSamplerCalls;
             report.profile.submittedPredictionVoxels +=
                 workerProfile.submittedPredictionVoxels;
+            report.profile.reusedPredictionVoxels +=
+                workerProfile.reusedPredictionVoxels;
             report.profile.candidateObservations +=
                 workerProfile.candidateObservations;
             report.profile.retainedObservations +=

@@ -14,6 +14,9 @@
   sweeps; canonical anchor wall time fell from 11.59 to 10.34 seconds.
 - Stored transient peak-search observations and evaluated transverse peak
   responses in float32, reducing canonical anchor wall time to 9.76 seconds.
+- Paired overlapping anchor tiles into bounded sampling jobs and reused raw
+  prediction samples across pair halos. This reduced canonical sampler
+  submissions by 32.6% with unchanged extraction output.
 
 # 2026-08-17: fiberlet extraction profiling
 

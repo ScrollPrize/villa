@@ -149,3 +149,31 @@
   `--maximum-iterations` remains available and is documented prominently as
   a quality/speed knob because additional passes materially change difficult
   overlapping-fiber fits.
+
+## Checkpoint 5: Shared Tile-Halo Sampling
+
+- Exact coordinate-compressed union accounting found 39,701,808 total tile
+  coordinates but only 6,162,456 globally unique tile voxels: 84.5% of the
+  original submissions were duplicate halo coordinates.
+- Retained a conservative reuse design that pairs tiles deterministically by
+  maximum overlap. Each pair is one bounded worker job. The second tile copies
+  overlapping raw prediction samples and submits only missing coordinates;
+  gradients, compact observations, and cell processing remain unchanged.
+- The canonical workload forms 98 groups from 192 tiles, keeps 32 workers,
+  reuses 12,960,096 samples, and reduces actual sampler submissions by 32.6%
+  to 26,741,712.
+
+  | metric | minimum | median | maximum | checkpoint 4 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 13.54 s | 13.54 s | 13.55 s | 13.69 s |
+  | total CPU | 343.82 s | 345.87 s | 349.19 s | 359.31 s |
+  | anchor wall | 6.64 s | 6.65 s | 6.70 s | 6.72 s |
+  | anchor CPU | 173.22 s | 174.07 s | 175.78 s | 184.80 s |
+  | prediction sampling work | 22.26 s | 23.08 s | 23.15 s | 42.44 s |
+
+- Median total wall improved 1.1%, total CPU improved 3.7%, and anchor CPU
+  improved 5.8%. Coordinate construction increased by about 0.8 summed-worker
+  seconds due to overlap copy/scatter bookkeeping.
+- All three runs retained exactly 2603 anchors, 51,782 searched / 26,494
+  accepted fiberlets, 170,813 sampled fiberlet voxels, 50,822,225 DP nodes,
+  2 greedy failures, and 1 fiberlet failure.
