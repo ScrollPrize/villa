@@ -3,6 +3,10 @@
 Dinovol is an implementation of DINO-style self-supervised pretraining on 3D
 volumes.
 
+The canonical source is
+[`ScrollPrize/villa/dinovol`](https://github.com/ScrollPrize/villa/tree/main/dinovol).
+Run project commands from the monorepository's `dinovol/` directory.
+
 - `dinov2_eva` is adapted from [dynamic-network-architectures](https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py), with minimal changes.
 - The augmentation library is a modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2).
 - Normalization is mostly borrowed from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet).
