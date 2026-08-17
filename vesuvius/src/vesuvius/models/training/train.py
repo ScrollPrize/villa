@@ -1293,7 +1293,7 @@ class BaseTrainer:
         return create_optimizer(optimizer_config, model)
 
     # --- scheduler --- #
-    def _get_scheduler(self, optimizer, steps_per_epoch=None):
+    def _get_scheduler(self, optimizer):
 
         scheduler_type = getattr(self.mgr, 'scheduler', 'poly')
         scheduler_kwargs = getattr(self.mgr, 'scheduler_kwargs', {})
@@ -1305,6 +1305,7 @@ class BaseTrainer:
         # These are stepped once per optimizer step, so their horizon is a step
         # count; handing them max_epoch makes the schedule end steps_per_epoch
         # times too early and then repeat.
+        steps_per_epoch = getattr(self, '_steps_per_epoch', None)
         max_steps = self.mgr.max_epoch
         if is_per_iteration and steps_per_epoch:
             max_steps = self.mgr.max_epoch * steps_per_epoch
@@ -1664,7 +1665,8 @@ class BaseTrainer:
         steps_per_epoch = len(train_dataloader)
         if getattr(self.mgr, 'max_steps_per_epoch', None):
             steps_per_epoch = min(steps_per_epoch, self.mgr.max_steps_per_epoch)
-        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer, steps_per_epoch)
+        self._steps_per_epoch = steps_per_epoch
+        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
         self._is_per_iteration_scheduler = is_per_iteration_scheduler
 
         ckpt_out_base = str(self.mgr.ckpt_out_base)
@@ -1709,7 +1711,7 @@ class BaseTrainer:
                     pass
 
             if checkpoint_loaded and self.mgr.load_weights_only:
-                scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer, steps_per_epoch)
+                scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
         ds_enabled = bool(getattr(self.mgr, 'enable_deep_supervision', False))
         self._set_deep_supervision_enabled(model, ds_enabled)
