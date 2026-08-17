@@ -3071,6 +3071,11 @@
   spatial objectives, and transverse peak evaluation may regroup otherwise
   equivalent floating-point operations; small numeric differences from
   version 4 are accepted for this anchor fitter.
+- Transient direction-conditioned peak observations and transverse response
+  math use float32. Persistent anchor state, accepted positions, diagnostics,
+  and serialized output remain double precision. Peak ties and downstream DP
+  counts need not be numerically identical, but retained populations and replay
+  quality must be checked on the canonical workload.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's

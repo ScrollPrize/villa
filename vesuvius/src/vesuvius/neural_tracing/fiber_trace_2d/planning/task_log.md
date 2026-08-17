@@ -176,3 +176,9 @@
   compensated hot-loop sums with ordinary double reductions was neutral to
   slightly slower (10.45 seconds anchor wall, 298.30 seconds anchor CPU) and
   was also removed.
+- Converting only the transient peak-search record to float32 reduced the run
+  to 16.57 seconds total wall, 10.05 seconds anchor wall, and 288.29 seconds
+  anchor CPU. Extending float32 through radial distance, Gaussian, gradient,
+  and vote calculations reduced it further to 16.37 seconds total wall, 9.76
+  seconds anchor wall, and 277.38 seconds anchor CPU. Both runs retained 2520
+  anchors, 24,518 accepted fiberlets, 2 greedy failures, and 1 fiberlet failure.

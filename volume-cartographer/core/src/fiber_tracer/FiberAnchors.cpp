@@ -1045,28 +1045,28 @@ struct DirectionConditionedPeak {
 {
     const cv::Vec3d axis = components[selectedComponent].axis;
     const auto basis = transverseBasis(axis);
-    const double cutoff =
-        config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels;
+    const float cutoff = static_cast<float>(
+        config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels);
     const double axialCutoff =
         config.gaussianCutoffSigmas *
         config.peakAxialSigmaPredictionVoxels;
     const double unionRadius = config.localWindowRadiusPredictionVoxels + cutoff;
-    const double invTwoTransverseSigma2 = 1.0 /
+    const float invTwoTransverseSigma2 = static_cast<float>(1.0 /
         (2.0 * config.peakSigmaPredictionVoxels *
-         config.peakSigmaPredictionVoxels);
+         config.peakSigmaPredictionVoxels));
     const double invTwoAxialSigma2 = 1.0 /
         (2.0 * config.peakAxialSigmaPredictionVoxels *
          config.peakAxialSigmaPredictionVoxels);
 
     struct PeakObservation {
-        double first = 0.0;
-        double second = 0.0;
-        double axialGaussian = 0.0;
-        double signal = 0.0;
-        double directionAlignmentSquared = 0.0;
-        double gradientFirst = 0.0;
-        double gradientSecond = 0.0;
-        double gradientNorm = 0.0;
+        float first = 0.0F;
+        float second = 0.0F;
+        float axialGaussian = 0.0F;
+        float signal = 0.0F;
+        float directionAlignmentSquared = 0.0F;
+        float gradientFirst = 0.0F;
+        float gradientSecond = 0.0F;
+        float gradientNorm = 0.0F;
         bool presenceGradientValid = false;
     };
     std::vector<PeakObservation> peakObservations;
@@ -1105,30 +1105,32 @@ struct DirectionConditionedPeak {
             signal = observation.presence * selectedAlignment;
         }
         PeakObservation peakObservation;
-        peakObservation.first = first;
-        peakObservation.second = second;
-        peakObservation.axialGaussian = std::exp(
-            -axial * axial * invTwoAxialSigma2);
-        peakObservation.signal = signal;
-        peakObservation.directionAlignmentSquared = selectedAlignment;
+        peakObservation.first = static_cast<float>(first);
+        peakObservation.second = static_cast<float>(second);
+        peakObservation.axialGaussian = static_cast<float>(std::exp(
+            -axial * axial * invTwoAxialSigma2));
+        peakObservation.signal = static_cast<float>(signal);
+        peakObservation.directionAlignmentSquared =
+            static_cast<float>(selectedAlignment);
         if (observation.presenceGradientValid &&
             finiteVector(observation.presenceGradientPredictionXYZ)) {
-            peakObservation.gradientFirst =
-                observation.presenceGradientPredictionXYZ.dot(basis[0]);
-            peakObservation.gradientSecond =
-                observation.presenceGradientPredictionXYZ.dot(basis[1]);
+            peakObservation.gradientFirst = static_cast<float>(
+                observation.presenceGradientPredictionXYZ.dot(basis[0]));
+            peakObservation.gradientSecond = static_cast<float>(
+                observation.presenceGradientPredictionXYZ.dot(basis[1]));
             const double gradientNorm2 =
                 peakObservation.gradientFirst * peakObservation.gradientFirst +
                 peakObservation.gradientSecond * peakObservation.gradientSecond;
             if (gradientNorm2 > kMatrixEpsilon) {
-                peakObservation.gradientNorm = std::sqrt(gradientNorm2);
+                peakObservation.gradientNorm =
+                    static_cast<float>(std::sqrt(gradientNorm2));
                 peakObservation.presenceGradientValid = true;
             }
         }
         peakObservations.push_back(peakObservation);
     }
 
-    const auto responseAt = [&](double candidateFirst, double candidateSecond, bool acceptance) {
+    const auto responseAt = [&](float candidateFirst, float candidateSecond, bool acceptance) {
         if (profile != nullptr) {
             if (acceptance)
                 ++profile->peakAcceptanceResponses;
@@ -1143,17 +1145,20 @@ struct DirectionConditionedPeak {
         CompensatedSum inward;
         CompensatedSum outward;
         for (const auto& observation : peakObservations) {
-            const double radialFirst = candidateFirst - observation.first;
-            const double radialSecond = candidateSecond - observation.second;
-            const double distanceSquared = radialFirst * radialFirst + radialSecond * radialSecond;
+            const float radialFirst = candidateFirst - observation.first;
+            const float radialSecond = candidateSecond - observation.second;
+            const float distanceSquared =
+                radialFirst * radialFirst + radialSecond * radialSecond;
             if (distanceSquared > cutoff * cutoff)
                 continue;
-            const double gaussian = observation.axialGaussian * std::exp(-distanceSquared * invTwoTransverseSigma2);
+            const float gaussian = observation.axialGaussian *
+                std::exp(-distanceSquared * invTwoTransverseSigma2);
             denominator.add(gaussian);
             numerator.add(gaussian * observation.signal);
             if (!(observation.directionAlignmentSquared > 0.0))
                 continue;
-            const double eligibleWeight = gaussian * observation.directionAlignmentSquared;
+            const float eligibleWeight =
+                gaussian * observation.directionAlignmentSquared;
             eligibleGradientWeight.add(eligibleWeight);
             if (!observation.presenceGradientValid) {
                 continue;
@@ -1162,9 +1167,14 @@ struct DirectionConditionedPeak {
                 continue;
             }
             validGradientWeight.add(eligibleWeight);
-            const double cosine =
-                std::clamp((observation.gradientFirst * radialFirst + observation.gradientSecond * radialSecond) / (observation.gradientNorm * std::sqrt(distanceSquared)), -1.0, 1.0);
-            const double vote = eligibleWeight * observation.gradientNorm * config.peakSigmaPredictionVoxels * cosine * cosine;
+            const float cosine = std::clamp(
+                (observation.gradientFirst * radialFirst +
+                 observation.gradientSecond * radialSecond) /
+                    (observation.gradientNorm * std::sqrt(distanceSquared)),
+                -1.0F, 1.0F);
+            const float vote = eligibleWeight * observation.gradientNorm *
+                static_cast<float>(config.peakSigmaPredictionVoxels) *
+                cosine * cosine;
             if (cosine > 0.0)
                 inward.add(vote);
             else if (cosine < 0.0)
@@ -1192,10 +1202,10 @@ struct DirectionConditionedPeak {
     };
     const auto responseAtIndex = [&](const GridIndex& index, bool acceptance) {
         return responseAt(
-            static_cast<double>(index.first) *
-                config.peakGridStepPredictionVoxels,
-            static_cast<double>(index.second) *
-                config.peakGridStepPredictionVoxels,
+            static_cast<float>(index.first) *
+                static_cast<float>(config.peakGridStepPredictionVoxels),
+            static_cast<float>(index.second) *
+                static_cast<float>(config.peakGridStepPredictionVoxels),
             acceptance);
     };
     const auto feasible = [&](const GridIndex& index) {
@@ -1271,7 +1281,9 @@ struct DirectionConditionedPeak {
         return insidePeakDomain(
                    candidate, pivot, owner,
                    config.localWindowRadiusPredictionVoxels) &&
-            responseAt(offset.dot(basis[0]), offset.dot(basis[1]), true) +
+            responseAt(
+                static_cast<float>(offset.dot(basis[0])),
+                static_cast<float>(offset.dot(basis[1])), true) +
                 tolerance >= centerResponse;
     };
 

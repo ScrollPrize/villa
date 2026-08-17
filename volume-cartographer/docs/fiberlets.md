@@ -579,6 +579,12 @@ responses use an equivalent two-dimensional transverse representation. These
 grouped reductions can introduce small floating-point differences; exact
 numeric identity with version 4 is not a requirement.
 
+Peak-search observations and their transverse response calculations use
+float32. Accepted anchor positions, component state, aggregate diagnostics, and
+serialized output remain double precision. This halves the repeatedly scanned
+peak-search working set; small differences in peak ties and downstream path
+node counts are expected.
+
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and
 accepted steps, and backtracking evaluations. Observation visits are counted
