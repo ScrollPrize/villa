@@ -1,5 +1,6 @@
 import colorsys
 import dbm
+import hashlib
 import importlib
 import itertools
 import json
@@ -37,6 +38,8 @@ TRACK_CROSSING_CACHE_VERSION = 1
 TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
+# Window read at the head, middle and tail of a DBM to fingerprint its contents.
+TRACK_STORE_PROBE_BYTES = 1 << 20
 TRACK_STORE_MAGIC = b'VCTRK01\0'
 
 
@@ -226,6 +229,67 @@ def _tracks_db_signature(path):
     return sorted(result)
 
 
+def _file_content_probe(path, size):
+    """Digest a bounded sample of a file: its size plus head, middle and tail."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(int(size).to_bytes(8, 'little'))
+    offsets = sorted({0,
+                      max(0, size // 2 - TRACK_STORE_PROBE_BYTES // 2),
+                      max(0, size - TRACK_STORE_PROBE_BYTES)})
+    with open(path, 'rb') as stream:
+        for offset in offsets:
+            stream.seek(offset)
+            digest.update(stream.read(TRACK_STORE_PROBE_BYTES))
+    return digest.hexdigest()
+
+
+def _tracks_db_content_signature(path):
+    """Fingerprint a logical DBM using only properties of its contents.
+
+    Same shape as :func:`_tracks_db_signature`, with the modification time
+    replaced by a bounded content probe. Reading three 1 MiB windows costs a
+    few milliseconds even on a 12 GiB DBM, and unlike a timestamp it survives
+    being copied or downloaded.
+    """
+    result = []
+    for name, size, _ in _tracks_db_signature(path):
+        candidate = Path(normalize_tracks_dbm_path(path)).with_name(name)
+        result.append((name, size, _file_content_probe(candidate, size)))
+    return sorted(result)
+
+
+def _tracks_db_signature_matches(path, metadata, signature_key):
+    """Does a sidecar's recorded signature still describe this DBM?
+
+    Returns ``(ok, note)``; a non-empty ``note`` is worth printing even when
+    ``ok``.
+
+    The signature originally recorded ``st_mtime_ns``. A modification time is
+    not a property of the bytes and is not preserved by copying or downloading,
+    so a sidecar published alongside a dataset is rejected on every machine
+    except the one that wrote it -- the dataset's own 12 GiB packed store is
+    refused by every downloader for exactly this reason. The portable content
+    signature is authoritative when present; a legacy signature is honoured on
+    the fields it can actually attest to, which are the name and the size.
+    """
+    recorded = metadata.get(signature_key + '_content')
+    if recorded is not None:
+        expected = [list(item) for item in _tracks_db_content_signature(path)]
+        return recorded == expected, ''
+    legacy = metadata.get(signature_key)
+    if legacy is None:
+        return False, ''
+    expected = [list(item) for item in _tracks_db_signature(path)]
+    if legacy == expected:
+        return True, ''
+    if [list(item[:2]) for item in legacy] == [item[:2] for item in expected]:
+        return True, (
+            'sidecar predates the portable signature and records a different '
+            'modification time than the local DBM; accepted on name and size, '
+            'which are unchanged. Repack to record a content signature.')
+    return False, ''
+
+
 def track_store_path(path):
     """Return the conventional packed-store directory beside a tracks DBM."""
     return Path(normalize_tracks_dbm_path(path) + TRACK_STORE_SUFFIX)
@@ -345,6 +409,11 @@ def write_packed_track_store(
             os.fsync(stream.fileno())
         metadata = {
             'version': TRACK_STORE_VERSION,
+            # Both are written: the content signature is the one that travels
+            # with the store, the legacy timestamp signature keeps older
+            # readers working against a newly written store.
+            'source_db_signature_content':
+                [list(item) for item in _tracks_db_content_signature(logical)],
             'source_db_signature': [list(item) for item in _tracks_db_signature(logical)],
             'track_count': track_count,
             'point_count': point_count,
@@ -383,9 +452,12 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
             metadata = json.load(stream)
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
-        expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        current, note = _tracks_db_signature_matches(
+            path, metadata, 'source_db_signature')
+        if not current:
             raise ValueError('source DBM changed after the packed store was written')
+        if note and warn:
+            print(f'NOTE: packed track store {store}: {note}')
         result = native.load(
             os.fspath(store),
             z_minimum=-(1 << 63) if z_lo is None else int(z_lo),
@@ -416,8 +488,9 @@ def _packed_store_if_current(path):
             metadata = json.load(stream)
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
-        expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        current, _ = _tracks_db_signature_matches(
+            path, metadata, 'source_db_signature')
+        if not current:
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
@@ -1762,6 +1835,8 @@ def write_track_crossing_cache(
                  else source_signature)
     metadata = {
         'version': TRACK_CROSSING_CACHE_VERSION,
+        'db_signature_content':
+            [list(item) for item in _tracks_db_content_signature(path)],
         'db_signature': [list(item) for item in signature],
         'angle_degrees': 30.0,
         'tangent_radius_voxels': 12.0,
@@ -1809,9 +1884,12 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
             if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
-            expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            if metadata.get('db_signature') != expected_signature:
+            current, note = _tracks_db_signature_matches(
+                path, metadata, 'db_signature')
+            if not current:
                 raise ValueError('tracks DBM has changed since the cache was built')
+            if note and warn:
+                print(f'NOTE: crossing cache {cache_path}: {note}')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])
                     != list(expected_z_range)):
