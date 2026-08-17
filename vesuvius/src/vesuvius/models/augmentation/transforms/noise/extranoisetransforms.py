@@ -248,15 +248,22 @@ class SmearTransform(ImageOnlyTransform):
             dims = list(range(chan_img.ndim))
             if local_smear_axis != 0:
                 dims = [local_smear_axis] + [d for d in dims if d != local_smear_axis]
-                moved = chan_img.permute(*dims)
+                # permute returns a view: without a copy the writes below land in
+                # the caller's tensor, and each slice is smeared into the next, so
+                # the effect runs the length of the axis instead of num_prev_slices
+                moved = chan_img.permute(*dims).contiguous()
             else:
-                moved = chan_img
+                moved = chan_img.clone()
+            # Read the neighbours from an untouched copy: smearing slice i from
+            # slices that were themselves smeared turns a num_prev_slices window
+            # into a filter that runs the whole length of the axis.
+            source = moved.clone()
             N = moved.shape[0]
             for i in range(self.num_prev_slices, N):
                 aggregated = torch.zeros_like(moved[i], dtype=torch.float32, device=moved.device)
                 count = 0
                 for j in range(i - self.num_prev_slices, i):
-                    slice_j = moved[j]
+                    slice_j = source[j]
                     # Determine shift behavior based on dimensionality of slice
                     if slice_j.ndim == 0:
                         shifted = slice_j
@@ -271,7 +278,7 @@ class SmearTransform(ImageOnlyTransform):
                     count += 1
                 if count > 0:
                     aggregated = aggregated / float(count)
-                moved[i] = ((1 - self.alpha) * moved[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
+                moved[i] = ((1 - self.alpha) * source[i].to(torch.float32) + self.alpha * aggregated).to(moved.dtype)
             # Restore original axis order
             if local_smear_axis != 0:
                 inv_perm = list(range(1, moved.ndim))
