@@ -1186,6 +1186,99 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
     return result;
 }
 
+ControlPointCollapseResult collapseControlPointsAtClick(
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint)
+{
+    if (!std::isfinite(clickedLinePosition) ||
+        !std::isfinite(clickedPoint[0]) ||
+        !std::isfinite(clickedPoint[1]) ||
+        !std::isfinite(clickedPoint[2])) {
+        throw std::invalid_argument(
+            "control-point collapse requires a finite clicked position");
+    }
+
+    std::sort(collapsedIndices.begin(), collapsedIndices.end());
+    collapsedIndices.erase(
+        std::unique(collapsedIndices.begin(), collapsedIndices.end()),
+        collapsedIndices.end());
+    if (!collapsedIndices.empty() && collapsedIndices.back() >= controls.size()) {
+        throw std::out_of_range("collapsed control-point index is out of range");
+    }
+
+    std::vector<bool> collapsed(controls.size(), false);
+    for (const size_t index : collapsedIndices) {
+        collapsed[index] = true;
+    }
+
+    LineControlPoint replacement;
+    replacement.linePosition = clickedLinePosition;
+    replacement.volumePoint = clickedPoint;
+    replacement.optimizedIndex = -1;
+    if (!collapsedIndices.empty()) {
+        size_t rightmost = collapsedIndices.front();
+        for (const size_t index : collapsedIndices) {
+            replacement.isSeed = replacement.isSeed || controls[index].isSeed;
+            if (controls[index].linePosition > controls[rightmost].linePosition) {
+                rightmost = index;
+            }
+        }
+        replacement.segmentToNext = controls[rightmost].segmentToNext;
+    }
+
+    struct PendingControl {
+        LineControlPoint control;
+        std::optional<size_t> oldIndex;
+        bool replacement = false;
+    };
+    std::vector<PendingControl> pending;
+    pending.reserve(controls.size() + (collapsedIndices.empty() ? 1 : 0));
+    for (size_t index = 0; index < controls.size(); ++index) {
+        if (!collapsed[index]) {
+            pending.push_back({controls[index], index, false});
+        }
+    }
+    pending.push_back({std::move(replacement), std::nullopt, true});
+    std::stable_sort(pending.begin(), pending.end(),
+                     [](const PendingControl& lhs, const PendingControl& rhs) {
+                         return lhs.control.linePosition < rhs.control.linePosition;
+                     });
+
+    ControlPointCollapseResult result;
+    result.oldToNewIndices.resize(controls.size());
+    result.collapsedOldIndices = std::move(collapsedIndices);
+    result.controlPoints.reserve(pending.size());
+    for (size_t newIndex = 0; newIndex < pending.size(); ++newIndex) {
+        auto& item = pending[newIndex];
+        if (item.replacement) {
+            result.replacementIndex = newIndex;
+        } else {
+            result.oldToNewIndices[*item.oldIndex] = newIndex;
+        }
+        result.controlPoints.push_back(std::move(item.control));
+    }
+    for (const size_t oldIndex : result.collapsedOldIndices) {
+        result.oldToNewIndices[oldIndex] = result.replacementIndex;
+    }
+
+    if (!result.replacedExisting() && result.replacementIndex > 0) {
+        result.controlPoints[result.replacementIndex].segmentToNext =
+            result.controlPoints[result.replacementIndex - 1].segmentToNext;
+    }
+    if (result.replacementIndex + 1 == result.controlPoints.size()) {
+        result.controlPoints[result.replacementIndex].segmentToNext.reset();
+    }
+    if (result.replacementIndex > 0) {
+        result.dirtySegmentIndices.push_back(result.replacementIndex - 1);
+    }
+    if (result.replacementIndex + 1 < result.controlPoints.size()) {
+        result.dirtySegmentIndices.push_back(result.replacementIndex);
+    }
+    return result;
+}
+
 void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls, size_t controlIndex)
 {
     if (controlIndex >= controls.size()) {

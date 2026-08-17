@@ -1,61 +1,62 @@
-# Direct Zarr mirror disk-cache task log
+# VC3D short line-segment task log
 
-## 2026-08-16
+## Findings
 
-- Committed the preceding shared cache-service and persistence work as
-  `03fac62b9` before starting this layout change.
-- Confirmed legacy caches support per-chunk mixed representations. Legacy
-  `.zst` wins over `.bin`, corrupt `.zst` falls back to `.bin`, and `.empty` is
-  considered only when no data representation exists.
-- Confirmed `ZarrChunkFetcher::sourceChunkKey()` already exposes the physical
-  source-relative object key needed by a direct mirror.
-- Confirmed remote Zarr metadata is fetched during pyramid opening, before
-  normal chunk-cache work, so metadata mirroring must be integrated with the
-  remote opener rather than inferred from decoded chunks.
-- Independent review found that the first plan incorrectly treated an extracted
-  sharded inner payload as a complete source object. The revised plan separates
-  logical decode keys from physical storage-object keys and requires full-shard
-  download, persistence, read deduplication, and decode fanout.
-- The revised plan also makes physical download notifications distinct from
-  logical overlay/ready notifications, moves mirror bookkeeping outside the
-  Zarr root, requires explicit metadata collection, and makes prefill,
-  redownload, and budget accounting storage-object-aware.
-- Implemented immutable layout selection: a complete legacy cache footprint
-  retains legacy behavior, native/empty cache roots use direct mirrors, and
-  ambiguous nonempty roots fail rather than mixing representations.
-- Added exact metadata publication and source-relative object persistence with
-  validated store keys. Structural metadata is protected from eviction while
-  still respecting the disk free-space floor.
-- Separated logical decoded chunks from physical storage objects throughout
-  probe, persistent-read, source-download, write, and decode stages. Concurrent
-  inner-chunk requests now share one complete outer-shard transfer and exact
-  write, then decode independently from the shared payload.
-- Updated `.empty` handling so whole missing shards receive one outer marker,
-  while missing inner entries in present shards do not create false sidecars.
-- Made Open Data prefill and redownload enumerate physical storage objects in
-  mirror mode and retain the existing logical legacy scanners otherwise.
-- Removed VC3D remote-cache recompression controls and production writes while
-  retaining mixed legacy `.bin`, `.zst`, `.c3d`, `.source`, and `.empty`
-  decoding/writing compatibility.
-- Added regression coverage for mirror selection, exact-byte reopen, complete
-  shard coalescing and notifications, missing-shard semantics, unsafe metadata
-  paths, protected metadata accounting, and legacy selection.
-- Final concurrency review corrected physical-transfer activity retirement so
-  consumers joining during the post-download mirror write cannot retain stale
-  active notifications, and retired fetcher generations cannot decrement a
-  newer transfer's in-flight count.
-- Native budget discovery now parses v2/v3 array metadata and validates exact
-  chunk-key syntax. Unrelated files inside an array directory remain protected
-  and untracked rather than becoming eviction candidates.
-- Mirror layout selection now validates physical storage-object support before
-  admitting any request, so incompatible generic fetchers fail immediately
-  instead of leaving logical requests unresolved.
-- Validation:
-  - `cmake --build volume-cartographer/build -j 8`
-  - `ctest --test-dir volume-cartographer/build -j 8 --output-on-failure`
-    (`150/150` passed)
-  - `git diff --check`
-- The first aggregate rebuild exposed a corrupt generated `test_atlas.cpp.o`.
-  Forcing that target to rebuild cleared the build-tree artifact; the following
-  complete build and test run passed.
-- No implementation deviations from the reviewed full-shard mirror plan.
+- Current strip subdivision already retains every original endpoint and keeps a
+  short span as one interval.
+- Current strip scale is derived from total arclength divided by total interval
+  count, so mixed short/long spans distort one another's displayed pitch.
+- Current generated-click replacement uses `abs(linePosition difference) <=
+  0.5`, which depends on producer point density rather than physical arclength.
+- The local control update API supports one inserted/moved control, not several
+  simultaneous removals.
+- Branch links are indexed by the live control vector and therefore require an
+  explicit old-to-new index remap during a multi-control collapse.
+- The initial implementation incorrectly made every optimized line point a
+  strip support. Production now supplies the annotation control positions, and
+  only those controls plus line endpoints are fixed supports; each intervening
+  optimized polyline is resampled by arclength.
+- The generated ribbons have no physical fiber-width input. Main's default
+  cross width was typically about 200 base voxels.
+- `surfaceHalfWidth`, `sideSliceHalfDepth`, and `crossSamples` have no production
+  overrides; only `test_lasagna_line_view_surfaces` changes them.
+- The unused cross configuration fields and median-step helper are removed.
+  Seven rows at 32 voxels give a fixed 192-vx extent close to main's typical
+  physical width. The generated-pane camera fitting passed scale-adjusted
+  `QuadSurface::size()` values back as grid indices; this task corrects that
+  related pre-existing extent calculation with `gridSize()`.
+
+## Deviations
+
+- The private Qt controller has no isolated interaction-test target. The pure
+  collapse operation and its old-to-new mapping are unit tested, reciprocal
+  branch synchronization was reviewed and compiled in the full VC3D target,
+  but modal confirmation and asynchronous UI orchestration are not directly
+  exercised by an automated test.
+- The related generated-pane camera-fit correction is compiled in the full
+  VC3D target but its private dialog helper has no isolated unit-test seam.
+
+## Validation
+
+- Built with all 32 cores:
+  `cmake --build volume-cartographer/build --parallel 32 --target test_lasagna_line_view_surfaces test_fiber_slice_geometry test_line_annotation_generated_views VC3D`
+- `test_lasagna_line_view_surfaces`: 24 test cases passed.
+- `test_fiber_slice_geometry`: 10 test cases passed.
+- `test_line_annotation_generated_views`: 76 test cases passed.
+- `git diff --check`: passed.
+
+## Strip sampling follow-up
+
+- Removed `surfaceHalfWidth`, `sideSliceHalfDepth`, `crossSamples`, and the
+  median optimized-point cross spacing. Both ribbons use seven rows at 32
+  voxels for a fixed 192-vx extent.
+- Generated strips preserve exact annotation controls and line endpoints, and
+  resample the optimized polyline by arclength between those supports.
+- Generated-pane initial fitting now converts actual `gridSize()` endpoints to
+  surface coordinates instead of reusing scale-adjusted `size()` as grid
+  indices.
+- Rebuilt `test_lasagna_line_view_surfaces` and `VC3D` with 32 cores.
+- `test_lasagna_line_view_surfaces`: 24 test cases passed.
+- `test_fiber_slice_geometry`: 10 test cases passed.
+- `test_line_annotation_generated_views`: 76 test cases passed.
+- Final `git diff --check`: passed.

@@ -267,6 +267,8 @@ protected:
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
+    // Thin guard around onSurfaceChangedImpl; see the definition for why the
+    // lazy surface load has to be contained before it reaches Qt.
     void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
     void onSurfaceWillBeDeleted(const std::string& name, const std::shared_ptr<Surface>& surf);
     void onVolumeClosing();
@@ -436,6 +438,7 @@ private:
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void refreshMeasurementOverlay();
+    void onSurfaceChangedImpl(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate);
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-17
+
+- Resampled generated strips between exact control-point supports at a 32-vx pitch, fixed their cross width near the previous default, and made nearby control-point replacement use physical polyline arclength.
+
 - Added a VC3D Download parallelism setting that switches the process-wide
   chunk scheduler between automatic bandwidth-based admission and an explicit
   fixed number of simultaneous downloads. Changes apply live without replacing
