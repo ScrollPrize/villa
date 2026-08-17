@@ -494,7 +494,13 @@ class ZarrDataset(Dataset):
             if self.skip_patch_validation:
                 self._enumerate_all_patches()
             else:
-                self._find_valid_patches()
+                # Same path _build_patch_index takes when there is no mapping:
+                # a validated cache if one exists, otherwise plain enumeration.
+                cache_data = self._try_load_cache()
+                if cache_data is not None:
+                    self._load_from_cache(cache_data)
+                else:
+                    self._enumerate_all_patches()
             return
 
         logger.info(f"Loading patches from mapping file: {len(samples)} samples")
