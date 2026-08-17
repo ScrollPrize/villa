@@ -1,3 +1,6 @@
+# Adapted from dynamic-network-architectures for Dinovol.
+# See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt.
+
 from itertools import product
 from typing import Literal, Optional, Tuple, List, Union, Type
 

@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 from typing import Union, Tuple, List, Callable
 import numpy as np
 import torch
@@ -22,7 +28,7 @@ class BlankRectangleTransform(BasicTransform):
     Overwrites areas in tensors with rectangles of specified intensity.
     Supports nD data.
     """
-    def __init__(self, 
+    def __init__(self,
                  rectangle_size: Union[int, Tuple, List],
                  rectangle_value: Union[int, Tuple, List, Callable],
                  num_rectangles: Union[int, Tuple[int, int]],
@@ -57,18 +63,18 @@ class BlankRectangleTransform(BasicTransform):
 
     def _get_rectangle_size(self, img_shape: Tuple[int, ...]) -> List[int]:
         img_dim = len(img_shape)
-        
+
         if isinstance(self.rectangle_size, int):
             return [self.rectangle_size] * img_dim
-        
+
         elif isinstance(self.rectangle_size, (tuple, list)) and all([isinstance(i, int) for i in self.rectangle_size]):
             return list(self.rectangle_size)
-        
+
         elif isinstance(self.rectangle_size, (tuple, list)) and all([isinstance(i, (tuple, list)) for i in self.rectangle_size]):
             if self.force_square:
                 return [np.random.randint(self.rectangle_size[0][0], self.rectangle_size[0][1] + 1)] * img_dim
             else:
-                return [np.random.randint(self.rectangle_size[d][0], self.rectangle_size[d][1] + 1) 
+                return [np.random.randint(self.rectangle_size[d][0], self.rectangle_size[d][1] + 1)
                         for d in range(img_dim)]
         else:
             raise RuntimeError("unrecognized format for rectangle_size")
@@ -76,25 +82,25 @@ class BlankRectangleTransform(BasicTransform):
     def _apply_to_image(self, img: torch.Tensor, **kwargs) -> torch.Tensor:
         result = img.clone()
         img_shape = img.shape[1:]  # DHW
-        
+
         if np.random.uniform() < self.p_per_sample:
             for c in range(img.shape[0]):
                 if np.random.uniform() < self.p_per_channel:
                     # Number of rectangles
-                    n_rect = (self.num_rectangles if isinstance(self.num_rectangles, int) 
+                    n_rect = (self.num_rectangles if isinstance(self.num_rectangles, int)
                             else np.random.randint(self.num_rectangles[0], self.num_rectangles[1] + 1))
-                    
+
                     for _ in range(n_rect):
                         rectangle_size = self._get_rectangle_size(img_shape)
-                        
+
                         # Get random starting positions
-                        lb = [np.random.randint(0, max(img_shape[i] - rectangle_size[i], 1)) 
+                        lb = [np.random.randint(0, max(img_shape[i] - rectangle_size[i], 1))
                             for i in range(len(img_shape))]
                         ub = [i + j for i, j in zip(lb, rectangle_size)]
-                        
+
                         # Create slice for the rectangle
                         my_slice = tuple([c, *[slice(i, j) for i, j in zip(lb, ub)]])
-                        
+
                         # Compute intensity value; prefer torch-native paths, fallback to numpy for custom callables
                         rv = getattr(self.color_fn, 'rectangle_value', None)
                         slice_t = result[my_slice]
@@ -115,7 +121,7 @@ class BlankRectangleTransform(BasicTransform):
                             intensity = self.color_fn(slice_t.detach().cpu().numpy())
                             intensity_t = torch.tensor(intensity, device=result.device, dtype=result.dtype)
                         result[my_slice] = intensity_t
-        
+
         return result
 
     def _apply_to_segmentation(self, segmentation: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -134,7 +140,7 @@ class BlankRectangleTransform(BasicTransform):
 
     def _apply_to_regr_target(self, regr_target: torch.Tensor, **kwargs) -> torch.Tensor:
         return regr_target  # Don't modify regression targets
-    
+
 import numpy as np
 import torch
 from typing import Union, Tuple
@@ -142,25 +148,25 @@ from typing import Union, Tuple
 def augment_rician_noise(data: torch.Tensor, noise_variance: Tuple[float, float]) -> torch.Tensor:
     """
     Adds Rician noise to the input tensor.
-    
-    Rician noise occurs in MRI when taking the magnitude of complex data with 
+
+    Rician noise occurs in MRI when taking the magnitude of complex data with
     Gaussian noise in both real and imaginary parts.
-    
+
     Args:
         data: Input tensor (treated as the underlying signal magnitude)
         noise_variance: Range for variance of the Gaussian distributions
-        
+
     Returns:
         Tensor with added Rician noise
     """
     variance = np.random.uniform(*noise_variance)
     std_dev = np.sqrt(variance)
-    
+
     # Generate independent Gaussian noise for real and imaginary components
     # The data is treated as the underlying signal magnitude
     real_noise = torch.normal(0, std_dev, size=data.shape, device=data.device, dtype=data.dtype)
     imag_noise = torch.normal(0, std_dev, size=data.shape, device=data.device, dtype=data.dtype)
-    
+
     # In Rician noise, the signal is in the real component, imaginary starts at 0
     # Result is the magnitude of complex signal + noise
     return torch.sqrt((data + real_noise) ** 2 + imag_noise ** 2)
@@ -168,14 +174,14 @@ def augment_rician_noise(data: torch.Tensor, noise_variance: Tuple[float, float]
 class RicianNoiseTransform(BasicTransform):
     """
     Adds Rician noise with the given variance.
-    The Noise of MRI data tends to have a Rician distribution: 
+    The Noise of MRI data tends to have a Rician distribution:
     https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2254141/
-    
+
     Args:
         noise_variance: Tuple of (min, max) for variance of Gaussian distributions
         p_per_sample: Probability of applying the transform per sample
     """
-    def __init__(self, 
+    def __init__(self,
                  noise_variance: Union[Tuple[float, float], float] = (0, 0.1),
                  p_per_sample: float = 1.0):
         super().__init__()

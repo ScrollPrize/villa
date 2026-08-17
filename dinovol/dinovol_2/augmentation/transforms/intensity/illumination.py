@@ -8,7 +8,7 @@ class InhomogeneousSliceIlluminationTransform(BasicTransform):
     """
     Simulates inhomogeneous illumination across image slices for batchgeneratorsv2.
     """
-    def __init__(self, 
+    def __init__(self,
                  num_defects: Tuple[int, int],
                  defect_width: Tuple[float, float],
                  mult_brightness_reduction_at_defect: Tuple[float, float],
@@ -83,7 +83,7 @@ class InhomogeneousSliceIlluminationTransform(BasicTransform):
     def _apply_to_image(self, img: torch.Tensor, **kwargs) -> torch.Tensor:
         assert len(img.shape) == 4, "This transform expects 4D input (CDHW)"
         result = img.clone()
-        
+
         if np.random.uniform() < self.p_per_sample:
             if self.per_channel:
                 for c in range(img.shape[0]):
@@ -95,7 +95,7 @@ class InhomogeneousSliceIlluminationTransform(BasicTransform):
                 for c in range(img.shape[0]):
                     if np.random.uniform() < self.p_per_channel:
                         result[c] *= defects.view(-1, 1, 1)
-        
+
         return result
 
     def _apply_to_segmentation(self, segmentation: torch.Tensor, **kwargs) -> torch.Tensor:

@@ -20,7 +20,7 @@ class OneOfTransform(BasicTransform):
         selected_transform = self.list_of_transforms[params['selected_index']]
         # Apply the selected transform
         return selected_transform(**data_dict)
-    
+
     def get_parameters(self, **data_dict) -> dict:
         # Randomly choose which transform to apply
         return {'selected_index': np.random.choice(len(self.list_of_transforms))}

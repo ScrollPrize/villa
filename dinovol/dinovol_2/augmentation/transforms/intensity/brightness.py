@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 import torch
 
 from dinovol_2.augmentation.helpers.scalar_type import RandomScalar, sample_scalar

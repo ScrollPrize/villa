@@ -97,7 +97,7 @@ def _max_3tuple(*values):
 def load_volume_auth(auth_json_path):
     if auth_json_path is None:
         return None, None
-    
+
     with open(str(auth_json_path), "r", encoding="utf-8") as f:
         auth = json.load(f)
     return str(auth["username"]), str(auth["password"])
@@ -197,7 +197,7 @@ class SSLZarrDataset(Dataset):
         self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
-        
+
         if not self.single_crop_only:
             if self.num_global_crops != 2:
                 raise ValueError(
@@ -241,7 +241,7 @@ class SSLZarrDataset(Dataset):
                 "computed source_read_window_size must be at least as large as the largest requested view size, "
                 f"got source_read_window_size={self.source_read_window_size} and required={required_read_window_size}"
             )
-        
+
         self.global_transforms = [create_training_transforms(self.global_view_size) for _ in
                                   range(self.num_global_crops)]
         self.local_transforms = (
@@ -249,9 +249,9 @@ class SSLZarrDataset(Dataset):
             if self.local_view_size is not None
             else []
         )
-        
+
         self.volumes = []
-        
+
         for dataset in self.config["datasets"]:
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
@@ -274,7 +274,7 @@ class SSLZarrDataset(Dataset):
                 valid_y = max(0, (y1 - y0) - crop_y + 1)
                 valid_x = max(0, (x1 - x0) - crop_x + 1)
                 valid_crop_starts = valid_z * valid_y * valid_x
-                
+
                 self.volumes.append(Volume(
                     path=str(volume_path),
                     scale=volume_scale,
@@ -283,11 +283,11 @@ class SSLZarrDataset(Dataset):
                 ))
             finally:
                 handle.close()
-        
+
         self.total_valid_crop_starts = sum(vol.valid_crop_starts for vol in self.volumes)
         if self.total_valid_crop_starts <= 0:
             raise ValueError("No valid crop starts found across configured volumes for the selected source crop size.")
-        
+
         for volume in self.volumes:
             volume.weight = volume.valid_crop_starts / self.total_valid_crop_starts
 
@@ -333,7 +333,7 @@ class SSLZarrDataset(Dataset):
             self.close()
         except Exception:
             pass
-    
+
     def _sample_crop_shape(self, scale_range):
         ref_depth, ref_height, ref_width = self.source_sampling_size
         min_scale, max_scale = scale_range
@@ -344,7 +344,7 @@ class SSLZarrDataset(Dataset):
             max(1, int(round(ref_height * scale_per_dim))),
             max(1, int(round(ref_width * scale_per_dim))),
         )
-    
+
     def _finalize_crop(self, crop, target_size):
         crop = np.asarray(crop, dtype=np.float32)
         if self.normalizer is not None:
@@ -359,7 +359,7 @@ class SSLZarrDataset(Dataset):
             align_corners=False,
         )
         return resized.squeeze(0)
-    
+
     def _read_source_crop_3d(self, d_zarr, usable_bbox):
         z0, y0, x0, z1, y1, x1 = usable_bbox
         crop_d, crop_h, crop_w = self.source_read_window_size
@@ -373,7 +373,7 @@ class SSLZarrDataset(Dataset):
                 x_start:x_start + crop_w,
             ]
         )
-    
+
     @staticmethod
     def _expand_crop_shape(crop_shape, target_size, reference_size):
         return tuple(
@@ -489,7 +489,7 @@ class SSLZarrDataset(Dataset):
             reference_size=reference_size,
         )
         return self._materialize_crop_from_region(source_crop, crop_region, target_size)
-    
+
     def _read_random_resized_crop_3d(self, d_zarr, usable_bbox, scale_range, target_size, *, reference_size=None):
         if reference_size is None:
             reference_size = target_size
@@ -531,16 +531,16 @@ class SSLZarrDataset(Dataset):
         augmented_gram_teacher = transform(image=gram_teacher_view)["image"]
         self._restore_rng_state(state_after)
         return augmented_global, augmented_gram_teacher
-    
+
     def __len__(self):
         if self.epoch_length is not None:
             return self.epoch_length
         return self.total_valid_crop_starts
-    
+
     def __getitem__(self, idx):
         vol_weights = [vol.weight for vol in self.volumes]
         nonzero_threshold = float(self.config.get("nonzero_threshold", 0.30))
-        
+
         while True:
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
@@ -549,7 +549,7 @@ class SSLZarrDataset(Dataset):
             nominal_source = self._extract_nominal_source_region(source_crop)
             if nominal_source.size > 0 and (np.count_nonzero(nominal_source) / nominal_source.size) >= nonzero_threshold:
                 break
-        
+
         if self.single_crop_only:
             crop = self._random_resized_crop_3d_from_array(
                 source_crop,
@@ -589,7 +589,7 @@ class SSLZarrDataset(Dataset):
             global_views.append(global_view)
             if gram_teacher_view is not None:
                 gram_teacher_views.append(gram_teacher_view)
-        
+
         local_views = []
         if self.local_crop_size is not None:
             local_views = [
@@ -606,7 +606,7 @@ class SSLZarrDataset(Dataset):
                     transform(image=view)["image"]
                     for transform, view in zip(self.local_transforms, local_views)
                 ]
-        
+
         sample = {
             "global_views": global_views,
             "local_views": local_views,

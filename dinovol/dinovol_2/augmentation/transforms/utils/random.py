@@ -1,3 +1,9 @@
+# Portions adapted from batchgeneratorsv2.
+# Copyright 2019 Division of Medical Image Computing,
+# German Cancer Research Center (DKFZ), Heidelberg, Germany.
+# Licensed under Apache License, Version 2.0; see LICENSES/Apache-2.0.txt.
+# Modified for Dinovol.
+
 import torch
 
 from dinovol_2.augmentation.transforms.base.basic_transform import BasicTransform
@@ -22,7 +28,7 @@ class RandomTransform(BasicTransform):
             return self.transform(**data_dict)
         else:
             return data_dict
-    
+
     def __repr__(self):
         ret_str = f"{type(self).__name__}(p={self.apply_probability}, transform={self.transform})"
         return ret_str
