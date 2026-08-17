@@ -208,10 +208,26 @@ instances. Discovery checks the newest records first and skips endpoints that
 do not respond or use an incompatible protocol version. It leaves valid
 registry records in place because a busy VC3D can time out temporarily.
 
+### The wrong VC3D *build* answered
+
+Auto-launch resolves `--launch`, then `VC3D_BINARY`, then `VC3D` on `PATH`,
+then a fixed list of standard build directories (the CMake presets, plus
+`build-macos`). **A build in any other directory is invisible to that scan**,
+so a repo with both a stale preset build and a fresh custom one can silently
+launch the stale one. Discovery records contain process/server/socket timing
+metadata, but not the executable path or revision.
+
+Call `vc3d_ping` and read `executablePath` and `gitSha`. They are the only
+authoritative answer to "which revision am I driving", and any before/after
+comparison that does not record them is not a comparison. Pass `--launch` or
+`VC3D_BINARY` explicitly when the build you mean is not on the preset list.
+
 ### Large screenshots fail
 
 Inline screenshots cross the local bridge as base64. For large captures, pass
 `file_path` to `vc3d_screenshot` and let VC3D write the PNG directly.
+For remote data, position the viewer and allow the requested chunks to render
+before capture; the screenshot call itself does not wait for remote tiles.
 
 ## What the tools cover
 
@@ -222,6 +238,9 @@ Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 - segment loading, growth, editing, masks, refinement, and review;
 - points, tags, winding annotations, seeding, and push/pull;
 - fiber annotation, Atlas search, and Lasagna workflows;
+- direct attachment of a known local or remote Lasagna manifest;
+- existing Spiral service connection, input, iteration, preview, and checkpoint
+  workflows;
 - tracing, flattening, rendering, jobs, progress, and cancellation.
 
 The MCP client displays each installed tool with its current description and
@@ -249,12 +268,25 @@ propagates.
 Only asynchronous tools expose `wait`; check the generated input schema to see
 whether a tool supports it.
 
+### Spiral workflow
+
+Use [`.claude/skills/vc3d-spiral/SKILL.md`](../../.claude/skills/vc3d-spiral/SKILL.md)
+for saved-profile connection, input, run, preview, and checkpoint sequencing.
+Registered MCP tool descriptions remain authoritative for individual schemas.
+
+### Remote Open Data inference workflow
+
+Use [`.claude/skills/vc3d-open-data/SKILL.md`](../../.claude/skills/vc3d-open-data/SKILL.md)
+to select and open bounded catalog resources, then the Fiber, Lasagna, render,
+or flatten skill for the intended workflow. Preserve selector/provenance
+identity and avoid accidental full downloads.
+
 ## Development
 
-The C++ method descriptors are the bridge contract. `rpc.describe` exposes
-them, the checked-in description snapshot records them, and the Python tests
-compare FastMCP schemas and SPEC mappings against that snapshot. Do not add a
-second hand-maintained contract.
+The C++ method descriptors are the bridge contract. Live `rpc.describe`
+describes the running binary, the checked-in description snapshot records the
+repository contract, and the Python tests compare FastMCP schemas and mappings
+against that snapshot. Do not add a second hand-maintained contract.
 
 The Python layout is deliberately explicit:
 
