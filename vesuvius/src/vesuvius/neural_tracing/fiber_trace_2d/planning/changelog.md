@@ -6,6 +6,10 @@
   and full `fiberlet-replay` extraction.
 - Documented a reproducible, exact-output performance protocol and recorded the
   initial optimization candidates for the fiberlet tracing pipeline.
+- Added extraction-profile version 2 with exclusive anchor-fitting subphases,
+  repeated observation-visit counters, and exact peak-cache/backtracking
+  diagnostics. Measurement identified local component refinement, not
+  seed-pair fitting, as the next dominant extraction hotspot.
 
 # 2026-08-13: fiberlet graph replay
 
@@ -545,3 +549,7 @@
   R-tree and prioritized each local corridor's layer-adjacent segment. On the
   5,000-base-voxel Paris4 replay workload, median wall time fell from 58.61 to
   25.32 seconds while complete published artifacts remained byte-identical.
+- Added a conservative exact support-sphere broad phase to repeated anchor
+  refined-state evaluation. On the same 5,000-base-voxel replay, median wall
+  time fell from 24.92 to 22.09 seconds and complete artifacts remained
+  byte-identical.

@@ -47,6 +47,18 @@ contain the sample; unusable and zero-evidence samples remain unassigned. This
 keeps nearby non-orthogonal modes from being assigned solely by which moving
 Gaussian is closer.
 
+Repeated refined-state evaluation first applies a conservative geometric broad
+phase. For each actual component axis `u` and position `p`, axial support
+reaches at most `axial_half_width / |u|` from the pivot along the normalized
+axis and transverse support reaches at most
+`Gaussian_cutoff + |p - pivot|`. Evaluation takes the largest resulting
+pivot-centered sphere over active components and expands it by a small
+scale-relative floating-point margin plus one outward ULP. This covers initial,
+backtracked, and post-peak positions directly. Samples beyond the sphere still
+add the same zeros to compensated support denominators, but skip
+component-specific axial, transverse, and exponential work. Samples inside it
+use the unchanged kernel path.
+
 Each direction update is the principal eigenvector of its assigned
 `g_ik q_i d_i d_i^T`. The aligned-evidence centroid is projected onto the plane
 through the cell pivot normal to that updated direction and clamped to the
@@ -512,7 +524,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=1` row. Both commands use the same field
+`fiberlet_extraction_profile version=2` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -527,6 +539,28 @@ benchmark writes it to stdout after the existing summary. The row separates:
   sampler calls and submitted coordinates, observations and gradients, lattice
   nodes and corridor tests, corner insertion attempts and globally unique
   sampled voxels, and DP lookups/visits/relaxations.
+
+Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
+phases for weighted-observation setup, seed generation, seed-pair refinement,
+initialized-component finalization, local direction/position refinement,
+direction-conditioned peak search, and final evaluation. The corresponding
+`anchor_fit_profiled_work_seconds` sum and
+`anchor_fit_residual_work_seconds` expose instrumentation gaps.
+
+Anchor-fit counters distinguish fitter invocations from nonempty cells and
+report seeds, seed pairs, seed-pair iterations, local-refinement attempts and
+accepted steps, and backtracking evaluations. Observation visits are counted
+separately for seed assignment/tensors/objectives, local tensors/centroids,
+refined-state evaluations, peak preparation/responses, and final evaluation.
+They are logical work counts: an exact broad phase can skip detailed kernel
+calculations without reducing the corresponding visit count.
+Peak grid-response requests include cache hits;
+`anchor_fit_peak_computed_grid_responses` counts cache misses, while
+`anchor_fit_peak_acceptance_responses` counts uncached subpixel checks. The
+legacy `anchor_fit_iterations` field remains for compatibility and counts a
+cell's accepted local-refinement steps once per output component; use
+`anchor_fit_local_refinement_accepted_steps` for the unambiguous cell-level
+count.
 
 Fields ending in `_seconds` are enclosing wall phases unless their name contains
 `_work_`; work fields sum per-candidate or per-worker elapsed time and may exceed

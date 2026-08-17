@@ -181,6 +181,40 @@ struct FiberAnchorExtractionDiagnostics {
     size_t outsideSelectionComponents = 0;
 };
 
+struct FiberAnchorFitProfile {
+    size_t invocations = 0;
+    size_t nonemptyCells = 0;
+    size_t weightedObservations = 0;
+    size_t seeds = 0;
+    size_t seedGenerationObservationVisits = 0;
+    size_t seedPairs = 0;
+    size_t seedPairIterations = 0;
+    size_t seedAssignmentObservationVisits = 0;
+    size_t seedTensorObservationVisits = 0;
+    size_t seedObjectiveObservationVisits = 0;
+    size_t initializationObservationVisits = 0;
+    size_t localRefinementAttempts = 0;
+    size_t localRefinementAcceptedSteps = 0;
+    size_t backtrackingEvaluations = 0;
+    size_t localTensorObservationVisits = 0;
+    size_t localCentroidObservationVisits = 0;
+    size_t refinedEvaluationObservationVisits = 0;
+    size_t peakComponents = 0;
+    size_t peakPreparationObservationVisits = 0;
+    size_t peakGridResponseRequests = 0;
+    size_t peakComputedGridResponses = 0;
+    size_t peakAcceptanceResponses = 0;
+    size_t peakResponseObservationVisits = 0;
+    size_t finalEvaluationObservationVisits = 0;
+    double setupWorkSeconds = 0.0;
+    double seedGenerationWorkSeconds = 0.0;
+    double seedPairRefinementWorkSeconds = 0.0;
+    double initializationWorkSeconds = 0.0;
+    double localRefinementWorkSeconds = 0.0;
+    double peakSearchWorkSeconds = 0.0;
+    double finalEvaluationWorkSeconds = 0.0;
+};
+
 struct FiberAnchorExtractionProfile {
     size_t selectedCells = 0;
     size_t contextCells = 0;
@@ -208,6 +242,7 @@ struct FiberAnchorExtractionProfile {
     double duplicateSuppressionSeconds = 0.0;
     double finalizationSeconds = 0.0;
     double elapsedCpuSeconds = 0.0;
+    FiberAnchorFitProfile fit;
 };
 
 struct FiberAnchorExtractionReport {
@@ -293,7 +328,8 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX,
     const std::vector<FiberAnchorObservation>& observations,
-    const FiberAnchorConfig& config);
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile = nullptr);
 
 [[nodiscard]] FiberAnchorExtractionReport extractFiberAnchors(
     const FiberPredictionGridInfo& grid,

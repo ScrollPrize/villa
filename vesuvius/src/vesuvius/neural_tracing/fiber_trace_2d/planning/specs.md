@@ -2528,6 +2528,16 @@
   Transverse displacement is clamped to the local window and the prediction
   grid. The next iteration recomputes falloff about the new provisional
   position.
+- Refined-state evaluation uses an exact conservative support broad phase. A
+  component with axis `u` and position `p` can only receive contributions from
+  observations within `axial_half_width / |u|` of the pivot along the
+  normalized axis and within `Gaussian_cutoff + |p - pivot|` transversely.
+  Evaluation takes the maximum resulting pivot-centered squared radius over
+  the actual active components, then expands it by a scale-relative numerical
+  margin and one outward ULP. This covers initial, backtracked, and post-peak
+  states without assuming exact unit axes or an exact configured position
+  radius. Observations beyond the sphere retain their original zero additions
+  to compensated denominators while component-specific kernel work is skipped.
 - Proposed joint updates use deterministic backtracking and are accepted only
   when the normalized joint objective strictly improves. This bounded monotonic
   direction-refinement phase is retained unchanged. A component's denominator is
@@ -3009,7 +3019,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=1` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=2` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3019,6 +3029,25 @@
   cost remains in its enclosing phase. Diagnostics must not change sampling,
   fitting, candidate generation, DP math, ordering, serialized artifacts, or
   determinism.
+- Version 2 divides anchor fitting into exclusive summed-worker setup, seed
+  generation, seed-pair refinement, initialized-component finalization, local
+  direction/position refinement including backtracking, direction-conditioned
+  peak search, and final-evaluation phases. Their explicit profiled sum and
+  residual reconcile against total fitting work. It separately counts fitter
+  invocations/nonempty cells, seeds/pairs/pair iterations, local attempts and
+  accepted steps, backtracking evaluations, peak components, and observation
+  visits for every repeated assignment, tensor, objective, centroid,
+  refined-state, peak-response, and final-evaluation scan. Peak response
+  requests include grid-cache hits; computed-grid responses are cache misses;
+  acceptance responses are uncached subpixel evaluations. Seed-pair iterations
+  exclude their final reassignment/objective pass, and local attempts exclude
+  the initial refined-state evaluation. The legacy `anchor_fit_iterations`
+  field counts accepted cell-level refinement once per output component;
+  `anchor_fit_local_refinement_accepted_steps` is the canonical cell-level
+  value.
+- Version-2 observation-visit fields are logical operation counts. Exact broad
+  phases may avoid detailed kernel calculations while retaining these counts,
+  so before/after workloads and fitting decisions remain directly comparable.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's

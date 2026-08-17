@@ -340,13 +340,60 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     std::array<CompensatedSum, 2> denominators;
     std::array<CompensatedSum, 2> numerators;
     std::array<CompensatedSum, 2> presenceMasses;
+    const double cutoff = config.gaussianCutoffSigmas *
+        config.gaussianSigmaPredictionVoxels;
+    double maximumDistanceSquared = 0.0;
+    // Resolve each finite kernel into pivot-parallel and pivot-transverse reach.
+    for (size_t component = 0; component < activeComponents; ++component) {
+        const double axisNormSquared =
+            components[component].axis.dot(components[component].axis);
+        const cv::Vec3d positionOffset =
+            components[component].position - pivot;
+        const double positionDistanceSquared =
+            positionOffset.dot(positionOffset);
+        if (!(axisNormSquared > kMatrixEpsilon * kMatrixEpsilon) ||
+            !std::isfinite(axisNormSquared) ||
+            !std::isfinite(positionDistanceSquared)) {
+            maximumDistanceSquared =
+                std::numeric_limits<double>::infinity();
+            break;
+        }
+        const double maximumAxialDistance =
+            config.axialSupportHalfWidthPredictionVoxels /
+            std::sqrt(axisNormSquared);
+        const double maximumTransverseDistance =
+            cutoff + std::sqrt(std::max(0.0, positionDistanceSquared));
+        const double broadPhaseMargin = 1.0e-9 * std::max({
+            1.0, maximumAxialDistance, maximumTransverseDistance});
+        const double conservativeAxialDistance =
+            maximumAxialDistance + broadPhaseMargin;
+        const double conservativeTransverseDistance =
+            maximumTransverseDistance + broadPhaseMargin;
+        const double componentDistanceSquared = std::nextafter(
+            conservativeAxialDistance * conservativeAxialDistance +
+                conservativeTransverseDistance *
+                    conservativeTransverseDistance,
+            std::numeric_limits<double>::infinity());
+        maximumDistanceSquared = std::max(
+            maximumDistanceSquared, componentDistanceSquared);
+    }
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto& observation = observations[index];
         std::array<double, 2> gaussian{0.0, 0.0};
         std::array<double, 2> evidence{0.0, 0.0};
+        bool potentiallySupported = false;
+        if (finiteVector(observation.positionPredictionXYZ)) {
+            const cv::Vec3d pivotOffset =
+                observation.positionPredictionXYZ - pivot;
+            const double pivotDistanceSquared = pivotOffset.dot(pivotOffset);
+            potentiallySupported = !std::isfinite(pivotDistanceSquared) ||
+                pivotDistanceSquared <= maximumDistanceSquared;
+        }
         for (size_t component = 0; component < activeComponents; ++component) {
-            gaussian[component] = transverseGaussian(
-                observation, components[component], pivot, config);
+            gaussian[component] = potentiallySupported
+                ? transverseGaussian(
+                      observation, components[component], pivot, config)
+                : 0.0;
             denominators[component].add(gaussian[component]);
             if (!(gaussian[component] > 0.0) || !observation.valid ||
                 !finiteVector(observation.direction) ||
@@ -400,7 +447,8 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
     const cv::Vec3d& pivot,
     const std::array<cv::Vec3d, 2>& seedAxes,
     size_t activeComponents,
-    const FiberAnchorConfig& config)
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile)
 {
     RefinedFitState state;
     state.activeComponents = activeComponents;
@@ -428,10 +476,19 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 upper[coordinate], observation.positionPredictionXYZ[coordinate]);
         }
     }
+    if (profile != nullptr)
+        profile->refinedEvaluationObservationVisits += observations.size();
     state.evaluation = evaluateRefinedState(
         observations, state.components, activeComponents, pivot, config);
 
     for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
+        if (profile != nullptr) {
+            ++profile->localRefinementAttempts;
+            profile->localTensorObservationVisits +=
+                activeComponents * observations.size();
+            profile->localCentroidObservationVisits +=
+                activeComponents * observations.size();
+        }
         auto proposed = state.components;
         for (size_t component = 0; component < activeComponents; ++component) {
             std::array<CompensatedSum, 9> tensorSums;
@@ -452,8 +509,10 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
             }
             cv::Matx33d tensor;
             for (int row = 0; row < 3; ++row) {
-                for (int column = 0; column < 3; ++column)
-                    tensor(row, column) = tensorSums[static_cast<size_t>(row * 3 + column)].sum;
+                for (int column = 0; column < 3; ++column) {
+                    tensor(row, column) = tensorSums[
+                        static_cast<size_t>(row * 3 + column)].sum;
+                }
             }
             const FiberPrincipalAxis principal = principalFiberAxis(tensor);
             if (principal.unique)
@@ -479,8 +538,10 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
                 const double dot = direction.dot(centered.axis);
                 const double weight = gaussian * observation.presence * dot * dot;
                 centroidMass.add(weight);
-                for (int axis = 0; axis < 3; ++axis)
-                    centroid[axis].add(weight * observation.positionPredictionXYZ[axis]);
+                for (int axis = 0; axis < 3; ++axis) {
+                    centroid[axis].add(
+                        weight * observation.positionPredictionXYZ[axis]);
+                }
             }
             if (centroidMass.sum > 0.0) {
                 const cv::Vec3d mean{
@@ -503,6 +564,11 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
         double acceptedDirectionUpdate = 0.0;
         double acceptedPositionUpdate = 0.0;
         for (int backtrack = 0; backtrack <= 8; ++backtrack) {
+            if (profile != nullptr) {
+                ++profile->backtrackingEvaluations;
+                profile->refinedEvaluationObservationVisits +=
+                    observations.size();
+            }
             const double fraction = std::ldexp(1.0, -backtrack);
             auto interpolated = state.components;
             for (size_t component = 0; component < activeComponents; ++component) {
@@ -556,6 +622,8 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
             break;
         }
     }
+    if (profile != nullptr)
+        profile->localRefinementAcceptedSteps += state.acceptedIterations;
     return state;
 }
 
@@ -618,7 +686,8 @@ struct DirectionConditionedPeak {
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     size_t selectedComponent,
-    const FiberAnchorConfig& config)
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile)
 {
     const cv::Vec3d axis = components[selectedComponent].axis;
     const auto basis = transverseBasis(axis);
@@ -644,6 +713,10 @@ struct DirectionConditionedPeak {
     };
     std::vector<PeakObservation> peakObservations;
     peakObservations.reserve(observations.size());
+    if (profile != nullptr) {
+        ++profile->peakComponents;
+        profile->peakPreparationObservationVisits += observations.size();
+    }
     for (const auto& observation : observations) {
         if (!finiteVector(observation.positionPredictionXYZ))
             continue;
@@ -690,7 +763,14 @@ struct DirectionConditionedPeak {
         });
     }
 
-    const auto responseAt = [&](const cv::Vec3d& candidate) {
+    const auto responseAt = [&](const cv::Vec3d& candidate, bool acceptance) {
+        if (profile != nullptr) {
+            if (acceptance)
+                ++profile->peakAcceptanceResponses;
+            else
+                ++profile->peakComputedGridResponses;
+            profile->peakResponseObservationVisits += peakObservations.size();
+        }
         CompensatedSum numerator;
         CompensatedSum denominator;
         CompensatedSum eligibleGradientWeight;
@@ -790,10 +870,12 @@ struct DirectionConditionedPeak {
 
     std::map<GridIndex, double> responseCache;
     const auto response = [&](const GridIndex& index) {
+        if (profile != nullptr)
+            ++profile->peakGridResponseRequests;
         const auto found = responseCache.find(index);
         if (found != responseCache.end())
             return found->second;
-        return responseCache.emplace(index, responseAt(pointAt(index)))
+        return responseCache.emplace(index, responseAt(pointAt(index), false))
             .first->second;
     };
 
@@ -850,7 +932,7 @@ struct DirectionConditionedPeak {
         return insidePeakDomain(
                    candidate, pivot, owner,
                    config.localWindowRadiusPredictionVoxels) &&
-            responseAt(candidate) + tolerance >= centerResponse;
+            responseAt(candidate, true) + tolerance >= centerResponse;
     };
 
     std::array<double, 2> separableOffsetGridSteps{0.0, 0.0};
@@ -932,13 +1014,22 @@ struct DirectionConditionedPeak {
 [[nodiscard]] FitState refineSeedPair(
     const std::vector<WeightedObservation>& observations,
     std::array<cv::Vec3d, 2> axes,
-    const FiberAnchorConfig& config)
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile)
 {
+    if (profile != nullptr)
+        ++profile->seedPairs;
     FitState best;
     best.objectiveNumerator = -1.0;
     std::vector<uint8_t> previousAssignments;
     std::vector<uint8_t> twoBackAssignments;
     for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
+        if (profile != nullptr) {
+            ++profile->seedPairIterations;
+            profile->seedAssignmentObservationVisits += observations.size();
+            profile->seedTensorObservationVisits += 2 * observations.size();
+            profile->seedObjectiveObservationVisits += observations.size();
+        }
         auto assignments = assignObservations(observations, axes);
         std::array<cv::Vec3d, 2> updated = axes;
         for (uint8_t component = 0; component < 2; ++component) {
@@ -968,6 +1059,10 @@ struct DirectionConditionedPeak {
             break;
         twoBackAssignments = std::move(previousAssignments);
         previousAssignments = std::move(assignments);
+    }
+    if (profile != nullptr) {
+        profile->seedAssignmentObservationVisits += observations.size();
+        profile->seedObjectiveObservationVisits += observations.size();
     }
     best.assignments = assignObservations(observations, best.axes);
     best.objectiveNumerator = objectiveNumerator(observations, best.axes);
@@ -999,6 +1094,53 @@ struct DirectionConditionedPeak {
 [[nodiscard]] size_t ceilDivide(size_t value, size_t divisor)
 {
     return value / divisor + (value % divisor != 0 ? 1 : 0);
+}
+
+void accumulateFitProfile(
+    FiberAnchorFitProfile& total,
+    const FiberAnchorFitProfile& value)
+{
+    total.invocations += value.invocations;
+    total.nonemptyCells += value.nonemptyCells;
+    total.weightedObservations += value.weightedObservations;
+    total.seeds += value.seeds;
+    total.seedGenerationObservationVisits +=
+        value.seedGenerationObservationVisits;
+    total.seedPairs += value.seedPairs;
+    total.seedPairIterations += value.seedPairIterations;
+    total.seedAssignmentObservationVisits +=
+        value.seedAssignmentObservationVisits;
+    total.seedTensorObservationVisits += value.seedTensorObservationVisits;
+    total.seedObjectiveObservationVisits +=
+        value.seedObjectiveObservationVisits;
+    total.initializationObservationVisits +=
+        value.initializationObservationVisits;
+    total.localRefinementAttempts += value.localRefinementAttempts;
+    total.localRefinementAcceptedSteps += value.localRefinementAcceptedSteps;
+    total.backtrackingEvaluations += value.backtrackingEvaluations;
+    total.localTensorObservationVisits += value.localTensorObservationVisits;
+    total.localCentroidObservationVisits +=
+        value.localCentroidObservationVisits;
+    total.refinedEvaluationObservationVisits +=
+        value.refinedEvaluationObservationVisits;
+    total.peakComponents += value.peakComponents;
+    total.peakPreparationObservationVisits +=
+        value.peakPreparationObservationVisits;
+    total.peakGridResponseRequests += value.peakGridResponseRequests;
+    total.peakComputedGridResponses += value.peakComputedGridResponses;
+    total.peakAcceptanceResponses += value.peakAcceptanceResponses;
+    total.peakResponseObservationVisits +=
+        value.peakResponseObservationVisits;
+    total.finalEvaluationObservationVisits +=
+        value.finalEvaluationObservationVisits;
+    total.setupWorkSeconds += value.setupWorkSeconds;
+    total.seedGenerationWorkSeconds += value.seedGenerationWorkSeconds;
+    total.seedPairRefinementWorkSeconds +=
+        value.seedPairRefinementWorkSeconds;
+    total.initializationWorkSeconds += value.initializationWorkSeconds;
+    total.localRefinementWorkSeconds += value.localRefinementWorkSeconds;
+    total.peakSearchWorkSeconds += value.peakSearchWorkSeconds;
+    total.finalEvaluationWorkSeconds += value.finalEvaluationWorkSeconds;
 }
 
 struct NmsCandidate {
@@ -1383,8 +1525,15 @@ FiberCellAnchorResult fitFiberCellAnchors(
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX,
     const std::vector<FiberAnchorObservation>& input,
-    const FiberAnchorConfig& config)
+    const FiberAnchorConfig& config,
+    FiberAnchorFitProfile* profile)
 {
+    using FitClock = std::chrono::steady_clock;
+    auto phaseStart = profile != nullptr
+        ? FitClock::now()
+        : FitClock::time_point{};
+    if (profile != nullptr)
+        ++profile->invocations;
     validateFiberAnchorConfig(config);
     const size_t expected =
         (cellEndZYX[0] - cellBeginZYX[0]) *
@@ -1458,10 +1607,20 @@ FiberCellAnchorResult fitFiberCellAnchors(
             index,
         });
     }
+    if (profile != nullptr) {
+        profile->setupWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+        profile->weightedObservations += observations.size();
+    }
     if (observations.empty()) {
         for (auto& component : result.components)
             component.rejectionReason = "empty";
         return result;
+    }
+    if (profile != nullptr) {
+        ++profile->nonemptyCells;
+        phaseStart = FitClock::now();
+        profile->seedGenerationObservationVisits += observations.size();
     }
 
     const FiberPrincipalAxis global = principalFiberAxis(weightedTensor(observations, nullptr, 0));
@@ -1470,6 +1629,8 @@ FiberCellAnchorResult fitFiberCellAnchors(
     if (global.unique) {
         seeds.push_back(global.axis);
     } else {
+        if (profile != nullptr)
+            profile->seedGenerationObservationVisits += observations.size();
         size_t best = 0;
         for (size_t index = 1; index < observations.size(); ++index) {
             if (observations[index].weight > observations[best].weight)
@@ -1479,6 +1640,8 @@ FiberCellAnchorResult fitFiberCellAnchors(
     }
     std::vector<bool> selected(observations.size(), false);
     while (seeds.size() < config.maximumSeedCount) {
+        if (profile != nullptr)
+            profile->seedGenerationObservationVisits += observations.size();
         size_t best = observations.size();
         double bestScore = 0.0;
         for (size_t index = 0; index < observations.size(); ++index) {
@@ -1501,20 +1664,35 @@ FiberCellAnchorResult fitFiberCellAnchors(
         selected[best] = true;
         seeds.push_back(canonicalFiberAxis(observations[best].direction));
     }
+    if (profile != nullptr) {
+        profile->seeds += seeds.size();
+        profile->seedGenerationWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+        phaseStart = FitClock::now();
+    }
 
     FitState bestFit;
     bestFit.objectiveNumerator = -1.0;
     if (seeds.size() == 1) {
-        bestFit = refineSeedPair(observations, {seeds[0], seeds[0]}, config);
+        bestFit = refineSeedPair(
+            observations, {seeds[0], seeds[0]}, config, profile);
     } else {
         for (size_t first = 0; first + 1 < seeds.size(); ++first) {
             for (size_t second = first + 1; second < seeds.size(); ++second) {
                 const FitState fit = refineSeedPair(
-                    observations, {seeds[first], seeds[second]}, config);
+                    observations, {seeds[first], seeds[second]}, config,
+                    profile);
                 if (bestFit.objectiveNumerator < 0.0 || betterState(fit, bestFit))
                     bestFit = fit;
             }
         }
+    }
+    if (profile != nullptr) {
+        profile->seedPairRefinementWorkSeconds +=
+            std::chrono::duration<double>(FitClock::now() - phaseStart).count();
+        phaseStart = FitClock::now();
+        profile->initializationObservationVisits +=
+            2 * observations.size();
     }
     const double seededObjective = denominator.sum > 0.0
         ? bestFit.objectiveNumerator / denominator.sum
@@ -1525,6 +1703,8 @@ FiberCellAnchorResult fitFiberCellAnchors(
         principalFiberAxis(weightedTensor(observations, &bestFit.assignments, 1)),
     };
     std::array<size_t, 2> fittedAssignedCounts{0, 0};
+    if (profile != nullptr)
+        profile->initializationObservationVisits += bestFit.assignments.size();
     for (const uint8_t assignment : bestFit.assignments) {
         if (assignment < fittedAssignedCounts.size())
             ++fittedAssignedCounts[assignment];
@@ -1549,7 +1729,9 @@ FiberCellAnchorResult fitFiberCellAnchors(
         } else {
             diagnostic.transition.reason = std::any_of(
                 bestFit.assignments.begin(), bestFit.assignments.end(),
-                [componentIndex](uint8_t assigned) {
+                [profile, componentIndex](uint8_t assigned) {
+                    if (profile != nullptr)
+                        ++profile->initializationObservationVisits;
                     return assigned == componentIndex;
                 }) ? "degenerate" : "empty";
         }
@@ -1612,17 +1794,36 @@ FiberCellAnchorResult fitFiberCellAnchors(
             } else {
                 result.components[componentIndex].rejectionReason = std::any_of(
                     bestFit.assignments.begin(), bestFit.assignments.end(),
-                    [componentIndex](uint8_t assigned) {
+                    [profile, componentIndex](uint8_t assigned) {
+                        if (profile != nullptr)
+                            ++profile->initializationObservationVisits;
                         return assigned == componentIndex;
                     }) ? "degenerate" : "empty";
             }
         }
     }
-    if (activeComponents == 0)
+    if (activeComponents == 0) {
+        if (profile != nullptr) {
+            profile->initializationWorkSeconds +=
+                std::chrono::duration<double>(FitClock::now() - phaseStart)
+                    .count();
+        }
         return result;
+    }
+
+    if (profile != nullptr) {
+        profile->initializationWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+        phaseStart = FitClock::now();
+    }
 
     RefinedFitState refined = refineLocalComponents(
-        input, center, seedAxes, activeComponents, config);
+        input, center, seedAxes, activeComponents, config, profile);
+    if (profile != nullptr) {
+        profile->localRefinementWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+        phaseStart = FitClock::now();
+    }
     const PeakOwnerBounds owner = peakOwnerBounds(
         input, cellBeginZYX, cellEndZYX);
     const auto broadRefinedComponents = refined.components;
@@ -1630,7 +1831,7 @@ FiberCellAnchorResult fitFiberCellAnchors(
          ++componentIndex) {
         const auto peak = findDirectionConditionedLocalPeak(
             input, center, owner, broadRefinedComponents,
-            activeComponents, componentIndex, config);
+            activeComponents, componentIndex, config, profile);
         result.components[componentIndex]
             .discretePeakPositionPredictionXYZ = peak.discrete;
         result.components[componentIndex]
@@ -1638,6 +1839,12 @@ FiberCellAnchorResult fitFiberCellAnchors(
         result.components[componentIndex]
             .jointPeakPositionPredictionXYZ = peak.joint2d;
         refined.components[componentIndex].position = peak.separable1d;
+    }
+    if (profile != nullptr) {
+        profile->peakSearchWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+        phaseStart = FitClock::now();
+        profile->finalEvaluationObservationVisits += input.size();
     }
     refined.evaluation = evaluateRefinedState(
         input, refined.components, activeComponents, center, config);
@@ -1681,6 +1888,10 @@ FiberCellAnchorResult fitFiberCellAnchors(
         result.components[1].rejectionReason = "empty";
     if (componentLess(result.components[1], result.components[0]))
         std::swap(result.components[0], result.components[1]);
+    if (profile != nullptr) {
+        profile->finalEvaluationWorkSeconds += std::chrono::duration<double>(
+            FitClock::now() - phaseStart).count();
+    }
     return result;
 }
 
@@ -2075,6 +2286,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             double predictionSamplingSeconds = 0.0;
             double observationConstructionSeconds = 0.0;
             double fittingSeconds = 0.0;
+            FiberAnchorFitProfile fit;
         };
         std::vector<WorkerProfile> workerProfiles(workerCount);
         const auto processCell = [&]
@@ -2208,7 +2420,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     std::chrono::steady_clock::now() - observationStart).count();
             const auto fittingStart = std::chrono::steady_clock::now();
             auto result = fitFiberCellAnchors(
-                cellZYX, begin, end, cellObservations, config);
+                cellZYX, begin, end, cellObservations, config,
+                &workerProfile.fit);
             workerProfile.fittingSeconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - fittingStart).count();
             for (const auto& component : result.components)
@@ -2325,6 +2538,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             report.profile.observationConstructionWorkSeconds +=
                 workerProfile.observationConstructionSeconds;
             report.profile.fittingWorkSeconds += workerProfile.fittingSeconds;
+            accumulateFitProfile(report.profile.fit, workerProfile.fit);
         }
 
         for (const auto& error : jobErrors) {

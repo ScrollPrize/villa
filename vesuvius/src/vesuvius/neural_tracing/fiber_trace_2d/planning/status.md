@@ -1,15 +1,11 @@
-# Status: accelerate fiberlet tracing
+# Status: accelerate anchor local refinement
 
-- [x] Capture the tube-containment optimization task
-- [x] Record the supplied workload and measured profile
-- [x] Log the deferred anchor-fitting proposal
-- [x] Draft the indexed-containment plan
-- [x] Complete independent plan review
-- [x] Revise the plan for approved float32 Boost R-tree containment
-- [x] Record a local warmed baseline and artifact hashes
-- [x] Add the immutable float32 replay-tube Boost segment index
-- [x] Add the local-corridor interior fast path
-- [x] Add float32 parity, boundary, and concurrency tests
-- [x] Update specification, documentation, and changelog
-- [x] Build and run focused validation
-- [x] Run before/after benchmark and artifact comparison
+- [x] Record the measured bottleneck and exactness constraints in `task.md`.
+- [x] Write the implementation, validation, spec, docs, and changelog plan.
+- [x] Complete independent plan review against task/spec/workflow documents.
+- [x] Measure and reject cached-direction and fused-scan regressions.
+- [x] Implement the exact actual-component support-sphere broad phase.
+- [x] Add focused regression coverage.
+- [x] Run GCC and Clang focused builds/tests and `git diff --check`.
+- [x] Run three canonical replays and compare complete artifact inventories.
+- [x] Record final measurements and finish specs, docs, task log, and changelog.

@@ -170,10 +170,18 @@ TEST_CASE("fiber anchor extraction rejects an empty cell")
     auto observations = cellObservations(4, {1.0, 0.0, 0.0});
     for (auto& observation : observations)
         observation.valid = false;
-    const auto result = vc::fiber_tracer::fitFiberCellAnchors({0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config());
+    vc::fiber_tracer::FiberAnchorFitProfile profile;
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config(),
+        &profile);
     CHECK(result.retainedAnchorCount == 0);
     CHECK(result.components[0].rejectionReason == "empty");
     CHECK(result.components[1].rejectionReason == "empty");
+    CHECK(profile.invocations == 1);
+    CHECK(profile.nonemptyCells == 0);
+    CHECK(profile.weightedObservations == 0);
+    CHECK(profile.setupWorkSeconds >= 0.0);
+    CHECK(profile.seedGenerationWorkSeconds == 0.0);
 }
 
 TEST_CASE("fiber anchor extraction emits one unoriented straight component")
@@ -191,6 +199,143 @@ TEST_CASE("fiber anchor extraction emits one unoriented straight component")
     CHECK(axialDot(axes[0], expected) > 1.0 - 1.0e-12);
     CHECK(result.components[0].anchor.alignedSupport == doctest::Approx(1.0));
     CHECK(result.components[0].anchor.directionalCoherence == doctest::Approx(1.0));
+}
+
+TEST_CASE("fiber anchor fit profile separates repeated fitting work")
+{
+    const auto observations = cellObservations(
+        4, {1.0, 0.0, 0.0}, directionAtDegrees(45.0));
+    vc::fiber_tracer::FiberAnchorFitProfile profile;
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config(),
+        &profile);
+
+    CHECK(result.retainedAnchorCount == 2);
+    CHECK(profile.invocations == 1);
+    CHECK(profile.nonemptyCells == 1);
+    CHECK(profile.weightedObservations == observations.size());
+    CHECK(profile.seeds > 0);
+    CHECK(profile.seedPairs > 0);
+    CHECK(profile.seedPairIterations >= profile.seedPairs);
+    CHECK(profile.seedAssignmentObservationVisits > 0);
+    CHECK(profile.seedTensorObservationVisits > 0);
+    CHECK(profile.seedObjectiveObservationVisits > 0);
+    CHECK(profile.localRefinementAttempts > 0);
+    CHECK(profile.localRefinementAcceptedSteps <=
+          profile.localRefinementAttempts);
+    CHECK(profile.backtrackingEvaluations >=
+          profile.localRefinementAttempts);
+    CHECK(profile.localTensorObservationVisits > 0);
+    CHECK(profile.localCentroidObservationVisits > 0);
+    CHECK(profile.refinedEvaluationObservationVisits > 0);
+    CHECK(profile.peakComponents == 2);
+    CHECK(profile.peakGridResponseRequests >=
+          profile.peakComputedGridResponses);
+    CHECK(profile.peakComputedGridResponses > 0);
+    CHECK(profile.peakAcceptanceResponses > 0);
+    CHECK(profile.peakResponseObservationVisits > 0);
+    CHECK(profile.finalEvaluationObservationVisits == observations.size());
+    CHECK(profile.setupWorkSeconds >= 0.0);
+    CHECK(profile.seedGenerationWorkSeconds >= 0.0);
+    CHECK(profile.seedPairRefinementWorkSeconds >= 0.0);
+    CHECK(profile.initializationWorkSeconds >= 0.0);
+    CHECK(profile.localRefinementWorkSeconds >= 0.0);
+    CHECK(profile.peakSearchWorkSeconds >= 0.0);
+    CHECK(profile.finalEvaluationWorkSeconds >= 0.0);
+}
+
+TEST_CASE("fiber anchor refinement preserves unsupported observation semantics")
+{
+    auto baseline = cellObservations(4, {1.0, 0.0, 0.0});
+    auto observations = baseline;
+    for (const size_t index : {size_t{0}, size_t{1}, size_t{2},
+                              size_t{4}, size_t{5}, size_t{6}}) {
+        baseline[index].valid = false;
+    }
+    observations[0].valid = false;
+    observations[0].direction = {
+        std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0};
+    observations[1].direction = {0.0, 0.0, 0.0};
+    observations[2].direction = {0.5e-15, 0.0, 0.0};
+    observations[3].direction = {2.0e-15, 0.0, 0.0};
+    observations[4].direction = {
+        std::numeric_limits<double>::infinity(), 0.0, 0.0};
+    observations[5].presence = std::numeric_limits<double>::quiet_NaN();
+    observations[6].presence = 0.5 * config().observationPresenceFloor;
+    observations[7].direction = {7.0, 0.0, 0.0};
+
+    baseline.push_back({{1000.0, 1000.0, 1000.0}, {1.0, 0.0, 0.0}, 1.0, true});
+    observations.push_back(
+        {{1000.0, 1000.0, 1000.0}, {13.0, 0.0, 0.0}, 1.0, true});
+    const double huge = std::numeric_limits<double>::max() * 0.5;
+    baseline.push_back({{huge, huge, huge}, {1.0, 0.0, 0.0}, 1.0, true});
+    observations.push_back(
+        {{huge, huge, huge}, {17.0, 0.0, 0.0}, 1.0, true});
+
+    vc::fiber_tracer::FiberAnchorFitProfile baselineProfile;
+    vc::fiber_tracer::FiberAnchorFitProfile profile;
+    const auto baselineResult = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, baseline, config(),
+        &baselineProfile);
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config(), &profile);
+
+    CHECK(result.retainedAnchorCount == baselineResult.retainedAnchorCount);
+    CHECK(result.objective == baselineResult.objective);
+    CHECK(result.mergeEvaluation.has_value() ==
+          baselineResult.mergeEvaluation.has_value());
+    for (size_t component = 0; component < result.components.size(); ++component) {
+        const auto& actual = result.components[component];
+        const auto& expected = baselineResult.components[component];
+        CHECK(actual.retained == expected.retained);
+        CHECK(actual.rejectionReason == expected.rejectionReason);
+        CHECK(actual.assignedObservationCount == expected.assignedObservationCount);
+        CHECK(actual.anchor.refinementIterations ==
+              expected.anchor.refinementIterations);
+        CHECK(actual.anchor.alignedSupport == expected.anchor.alignedSupport);
+        CHECK(actual.anchor.directionalCoherence ==
+              expected.anchor.directionalCoherence);
+        CHECK(actual.anchor.refinementScore == expected.anchor.refinementScore);
+        for (int axis = 0; axis < 3; ++axis) {
+            CHECK(actual.anchor.axisXYZ[axis] == expected.anchor.axisXYZ[axis]);
+            CHECK(actual.anchor.positionPredictionXYZ[axis] ==
+                  expected.anchor.positionPredictionXYZ[axis]);
+        }
+    }
+    CHECK(profile.weightedObservations == baselineProfile.weightedObservations);
+    CHECK(profile.localRefinementAttempts ==
+          baselineProfile.localRefinementAttempts);
+    CHECK(profile.localRefinementAcceptedSteps ==
+          baselineProfile.localRefinementAcceptedSteps);
+    CHECK(profile.backtrackingEvaluations ==
+          baselineProfile.backtrackingEvaluations);
+    CHECK(profile.refinedEvaluationObservationVisits ==
+          baselineProfile.refinedEvaluationObservationVisits);
+}
+
+TEST_CASE("fiber anchor broad phase keeps combined support-boundary evidence")
+{
+    auto options = config();
+    const cv::Vec3d pivot{1.5, 1.5, 1.5};
+    const double cutoff = options.gaussianCutoffSigmas *
+        options.gaussianSigmaPredictionVoxels;
+    auto observations = cellObservations(4, {1.0, 0.0, 0.0});
+    observations.push_back({
+        pivot + cv::Vec3d{
+            options.axialSupportHalfWidthPredictionVoxels,
+            std::nextafter(cutoff, 0.0),
+            0.0,
+        },
+        {1.0, 0.0, 0.0},
+        1.0,
+        true,
+    });
+
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options);
+
+    REQUIRE(result.retainedAnchorCount == 1);
+    CHECK(result.components[0].assignedObservationCount == observations.size());
 }
 
 TEST_CASE("fiber anchor extraction fits two non-orthogonal direction modes")
@@ -1520,6 +1665,12 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.predictionSamplingWorkSeconds >= 0.0);
     CHECK(report.profile.observationConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.fittingWorkSeconds >= 0.0);
+    CHECK(report.profile.fit.invocations == report.profile.workCells);
+    CHECK(report.profile.fit.nonemptyCells > 0);
+    CHECK(report.profile.fit.nonemptyCells <= report.profile.fit.invocations);
+    CHECK(report.profile.fit.weightedObservations > 0);
+    CHECK(report.profile.fit.seedPairs > 0);
+    CHECK(report.profile.fit.peakComputedGridResponses > 0);
     CHECK(report.profile.duplicateSuppressionSeconds >= 0.0);
     CHECK(report.profile.elapsedCpuSeconds >= 0.0);
     const auto& initialized = report.diagnosticStages[static_cast<size_t>(

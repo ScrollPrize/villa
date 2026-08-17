@@ -556,6 +556,7 @@ void printTubeExtractionProfile(
 {
     const auto previousPrecision = output.precision();
     const auto& anchor = extraction.anchors.profile;
+    const auto& fit = anchor.fit;
     const auto& paths = extraction.paths;
     const double anchorProfiledSeconds =
         anchor.setupSeconds + anchor.tilePlanningSeconds +
@@ -567,8 +568,13 @@ void printTubeExtractionProfile(
         paths.cornerMergeSeconds + paths.predictionSamplingSeconds +
         paths.normalSamplingSeconds + paths.samplingMaterializationSeconds +
         paths.searchSeconds;
+    const double fitProfiledWorkSeconds =
+        fit.setupWorkSeconds + fit.seedGenerationWorkSeconds +
+        fit.seedPairRefinementWorkSeconds + fit.initializationWorkSeconds +
+        fit.localRefinementWorkSeconds + fit.peakSearchWorkSeconds +
+        fit.finalEvaluationWorkSeconds;
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=1"
+           << "fiberlet_extraction_profile version=2"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -600,6 +606,63 @@ void printTubeExtractionProfile(
            << " anchor_observation_construction_work_seconds="
            << anchor.observationConstructionWorkSeconds
            << " anchor_fitting_work_seconds=" << anchor.fittingWorkSeconds
+           << " anchor_fit_invocations=" << fit.invocations
+           << " anchor_fit_nonempty_cells=" << fit.nonemptyCells
+           << " anchor_fit_weighted_observations=" << fit.weightedObservations
+           << " anchor_fit_seeds=" << fit.seeds
+           << " anchor_fit_seed_generation_observation_visits="
+           << fit.seedGenerationObservationVisits
+           << " anchor_fit_seed_pairs=" << fit.seedPairs
+           << " anchor_fit_seed_pair_iterations=" << fit.seedPairIterations
+           << " anchor_fit_seed_assignment_observation_visits="
+           << fit.seedAssignmentObservationVisits
+           << " anchor_fit_seed_tensor_observation_visits="
+           << fit.seedTensorObservationVisits
+           << " anchor_fit_seed_objective_observation_visits="
+           << fit.seedObjectiveObservationVisits
+           << " anchor_fit_initialization_observation_visits="
+           << fit.initializationObservationVisits
+           << " anchor_fit_local_refinement_attempts="
+           << fit.localRefinementAttempts
+           << " anchor_fit_local_refinement_accepted_steps="
+           << fit.localRefinementAcceptedSteps
+           << " anchor_fit_backtracking_evaluations="
+           << fit.backtrackingEvaluations
+           << " anchor_fit_local_tensor_observation_visits="
+           << fit.localTensorObservationVisits
+           << " anchor_fit_local_centroid_observation_visits="
+           << fit.localCentroidObservationVisits
+           << " anchor_fit_refined_evaluation_observation_visits="
+           << fit.refinedEvaluationObservationVisits
+           << " anchor_fit_peak_components=" << fit.peakComponents
+           << " anchor_fit_peak_preparation_observation_visits="
+           << fit.peakPreparationObservationVisits
+           << " anchor_fit_peak_grid_response_requests="
+           << fit.peakGridResponseRequests
+           << " anchor_fit_peak_computed_grid_responses="
+           << fit.peakComputedGridResponses
+           << " anchor_fit_peak_acceptance_responses="
+           << fit.peakAcceptanceResponses
+           << " anchor_fit_peak_response_observation_visits="
+           << fit.peakResponseObservationVisits
+           << " anchor_fit_final_evaluation_observation_visits="
+           << fit.finalEvaluationObservationVisits
+           << " anchor_fit_setup_work_seconds=" << fit.setupWorkSeconds
+           << " anchor_fit_seed_generation_work_seconds="
+           << fit.seedGenerationWorkSeconds
+           << " anchor_fit_seed_pair_refinement_work_seconds="
+           << fit.seedPairRefinementWorkSeconds
+           << " anchor_fit_initialization_work_seconds="
+           << fit.initializationWorkSeconds
+           << " anchor_fit_local_refinement_work_seconds="
+           << fit.localRefinementWorkSeconds
+           << " anchor_fit_peak_search_work_seconds="
+           << fit.peakSearchWorkSeconds
+           << " anchor_fit_final_evaluation_work_seconds="
+           << fit.finalEvaluationWorkSeconds
+           << " anchor_fit_profiled_work_seconds=" << fitProfiledWorkSeconds
+           << " anchor_fit_residual_work_seconds="
+           << std::max(0.0, anchor.fittingWorkSeconds - fitProfiledWorkSeconds)
            << " anchor_selection_seconds=" << anchor.selectionSeconds
            << " anchor_initial_diagnostics_seconds="
            << anchor.initialDiagnosticsSeconds
