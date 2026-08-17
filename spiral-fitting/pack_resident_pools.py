@@ -29,18 +29,49 @@ from __future__ import annotations
 
 import argparse
 import glob
+import itertools
 import json
 import os
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 RESPOOL_FORMAT_VERSION = 2
+
+# Chunk reads in flight per worker thread. Enough to keep every thread busy
+# across one write, small enough that the decoded bricks waiting to be written
+# stay a bounded cost rather than a function of how many chunks the store has.
+READS_IN_FLIGHT_PER_THREAD = 4
+
+
+def map_bounded(executor, function, items, max_in_flight):
+    """Like ``executor.map``, but with a bounded number of pending results.
+
+    ``Executor.map`` submits every task before yielding anything and holds each
+    finished result until the consumer reaches it, so a reader that outruns the
+    writer accumulates the whole input in memory. Packing a lasagna store that
+    way peaked at 26.2 GB and was killed; the only workaround was --io-threads 1,
+    which serialises the reads to make the pile-up small. Keeping a sliding
+    window of submissions instead bounds the resident results directly, so the
+    thread count goes back to being a throughput knob.
+
+    (``chunksize`` does not help here: ThreadPoolExecutor uses the base
+    ``Executor.map``, which ignores it.)
+    """
+    items = iter(items)
+    pending = deque(
+        executor.submit(function, item)
+        for item in itertools.islice(items, max(1, max_in_flight)))
+    while pending:
+        result = pending.popleft().result()
+        for item in itertools.islice(items, 1):
+            pending.append(executor.submit(function, item))
+        yield result
 
 
 def sidecar_path(zarr_path: str, group: str, *, pair: bool = False) -> str:
@@ -354,8 +385,9 @@ def pack_arrays(
             f.write(bytes(brick_voxels))  # row 0: reserved all-zero brick
         with ThreadPoolExecutor(io_threads) as executor:
             done = 0
-            for key, keep_idx, channel_bricks in executor.map(
-                    read_chunk, keys, chunksize=4):
+            for key, keep_idx, channel_bricks in map_bounded(
+                    executor, read_chunk, keys,
+                    io_threads * READS_IN_FLIGHT_PER_THREAD):
                 base = np.multiply(key, sub)
                 for sz, sy, sx in sub_grid[keep_idx]:
                     coords.append((base[0] + sz, base[1] + sy, base[2] + sx))
