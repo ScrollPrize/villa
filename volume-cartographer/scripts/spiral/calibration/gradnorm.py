@@ -99,9 +99,7 @@ def main():
         # their production weights: 'dense_spacing' is the legacy spacing
         # objective the bundle replaced, 'dense_normals' the ever-present
         # stabilizer — the magnitude yardsticks for the bundle terms.
-        import losses as losses_module
         from losses import iter_lasagna_losses
-        losses_module.configure_losses(cfg, args.z_begin, args.z_end)
         lasagna_weights = {
             'dense_spacing': float(cfg['loss_weight_dense_spacing']),
             'dense_normals': float(cfg['loss_weight_dense_normals']),
@@ -115,7 +113,8 @@ def main():
                 for name, loss in iter_lasagna_losses(
                         transform, dr, normals, outer,
                         cfg['sample_count_dense_normal_points'],
-                        compute_spacing=True):
+                        compute_spacing=True,
+                        cfg=cfg, z_begin=args.z_begin, z_end=args.z_end):
                     if name != target_name:
                         continue
                     weighted = loss * lasagna_weights[name]

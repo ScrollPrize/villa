@@ -312,6 +312,87 @@ TEST_CASE("VolumePkg::attachPreparedVolume recognizes a loaded relative entry")
     fs::remove_all(d);
 }
 
+// The relative-path case above only reaches fs::equivalent on macOS, where the
+// temp directory sits under a symlinked /var. These two create the symlink
+// themselves, so the behaviour is exercised on every platform.
+namespace
+{
+// Returns an alias directory symlinked to `target`, or an empty path when the
+// filesystem will not create one (Windows without developer mode, some CIFS).
+fs::path aliasFor(const fs::path& target)
+{
+    auto alias = target.parent_path() / (target.filename().string() + "_alias");
+    std::error_code ec;
+    fs::create_directory_symlink(target, alias, ec);
+    if (ec) return {};
+    return alias;
+}
+}  // namespace
+
+TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
+{
+    auto d = tmpDir("attach_symlink");
+    const auto volumePath = makeLocalVolume(d, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto detached = VolumePkg::newDetached(deferred);
+    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
+    detached->save(project);
+
+    const auto alias = aliasFor(d);
+    if (alias.empty()) {
+        fs::remove_all(d);
+        return;
+    }
+
+    // Package opened through the alias, volume attached through the real path.
+    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto prepared = Volume::New(volumePath);
+    REQUIRE(prepared);
+    CHECK(
+        package->attachPreparedVolume(
+            volumePath.string(), {"ignored"}, prepared) ==
+        VolumePkg::AttachVolumeResult::AlreadyAttached);
+    CHECK(package->volumeEntries().size() == 1);
+
+    fs::remove(alias);
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a symlink")
+{
+    auto d = tmpDir("attach_container_symlink");
+    const auto volumePath = makeLocalVolume(d, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto detached = VolumePkg::newDetached(deferred);
+    // "volumes" is a collection entry: it holds zarr volumes but is not one.
+    REQUIRE(detached->addVolumeEntry("volumes", {"collection"}));
+    detached->save(project);
+
+    const auto alias = aliasFor(d);
+    if (alias.empty()) {
+        fs::remove_all(d);
+        return;
+    }
+
+    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto prepared = Volume::New(volumePath);
+    REQUIRE(prepared);
+    CHECK(
+        package->attachPreparedVolume(
+            volumePath.string(), {"ignored"}, prepared) ==
+        VolumePkg::AttachVolumeResult::AlreadyAttached);
+    CHECK(package->volumeEntries().size() == 1);
+
+    fs::remove(alias);
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg::attachPreparedVolume persists a directly loaded volume")
 {
     auto d = tmpDir("attach_loaded_only");

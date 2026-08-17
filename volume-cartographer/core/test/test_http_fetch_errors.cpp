@@ -5,7 +5,11 @@
 
 #include "vc/core/util/HttpFetch.hpp"
 
+#include <utils/http_fetch.hpp>
+
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -70,4 +74,35 @@ TEST_CASE("httpGetString: empty URL handled gracefully")
     } catch (const std::exception&) {
         CHECK(true);
     }
+}
+
+TEST_CASE("HttpClient preserves libcurl transport errors")
+{
+    utils::HttpClient::Config config;
+    config.max_retries = 0;
+    const auto response = utils::HttpClient(config).get("not://a/real/scheme");
+    CHECK(response.status_code == 0);
+    CHECK_FALSE(response.error_message.empty());
+}
+
+TEST_CASE("HttpClient scoped observer receives response body bytes")
+{
+    const auto path = std::filesystem::temp_directory_path() /
+        "vc_http_download_observer_fixture.bin";
+    constexpr std::string_view payload = "streamed response bytes";
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(output.good());
+        output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    std::size_t observed = 0;
+    {
+        utils::HttpClient::ScopedDownloadObserver observer(
+            [&](std::size_t bytes) { observed += bytes; });
+        const auto response = utils::HttpClient{}.get("file://" + path.string());
+        CHECK(response.body.size() == payload.size());
+    }
+    std::filesystem::remove(path);
+    CHECK(observed == payload.size());
 }

@@ -1,7 +1,7 @@
 from pathlib import Path
 import tomllib
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, find_packages, setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 
@@ -38,9 +38,28 @@ py_modules = sorted(
 packages = find_packages(
     include=("lasagna3d", "lasagna3d.*", "snap_surf", "snap_surf.*", "scripts")
 )
+# Also expose the legacy root modules through their canonical ``lasagna.*``
+# imports.  They remain top-level ``py_modules`` for backwards compatibility.
+packages.append("lasagna")
 # Preserve the programmatic import already used by callers and tests while the
 # legacy internal imports continue to use the top-level ``scripts`` package.
 packages.append("lasagna.scripts")
+packages.append("lasagna.manager")
+
+# Managed Fiber inference is part of the supported Lasagna runtime.  Package
+# the sibling source directly so both editable installs and wheels made from
+# the monorepo work without an ambient PYTHONPATH.  ``neural_tracing`` is a
+# namespace package, hence find_namespace_packages rather than find_packages.
+VESUVIUS_SOURCE = ROOT.parent / "vesuvius" / "src"
+if not VESUVIUS_SOURCE.is_dir():
+    raise RuntimeError(
+        "the Lasagna build requires the sibling vesuvius/src tree; "
+        "build from the villa monorepo checkout"
+    )
+packages.extend(find_namespace_packages(
+    where=str(VESUVIUS_SOURCE),
+    include=("vesuvius", "vesuvius.*", "vc3d_fiber_format", "vc3d_fiber_format.*"),
+))
 
 fit_service_requires = [
     "numpy>=1.24",
@@ -79,6 +98,11 @@ ext_modules = [
         "monotone_norm",
         ["monotone_norm.cpp"],
     ),
+    Pybind11Extension(
+        "accumulator_add",
+        ["accumulator_add.cpp"],
+        cxx_std=17,
+    ),
 ]
 
 setup(
@@ -90,7 +114,14 @@ setup(
     python_requires=">=3.14,<3.15",
     py_modules=py_modules,
     packages=packages,
-    package_dir={"lasagna.scripts": "scripts"},
+    package_dir={
+        "lasagna": ".",
+        "lasagna.scripts": "scripts",
+        "lasagna.manager": "manager",
+        "vesuvius": "../vesuvius/src/vesuvius",
+        "vc3d_fiber_format": "../vesuvius/src/vc3d_fiber_format",
+    },
+    package_data={"vesuvius": ["**/*.json", "**/*.yaml", "**/*.yml"]},
     install_requires=all_requires,
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
@@ -104,6 +135,7 @@ setup(
             "lasagna-download-list=lasagna.scripts.download_volume_list:main",
             "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main",
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
+            "las_manager=lasagna.manager.cli:main",
             "lasagna-predict3d-holescan=predict3d_holescan:main",
         ],
     },

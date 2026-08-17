@@ -55,6 +55,8 @@ option(VC_ENABLE_TYSAN    "TypeSanitizer (clang-only, LLVM 18+)"         OFF)
 option(VC_ENABLE_NSAN     "NumericalStabilitySanitizer (clang-only, LLVM 19+)" OFF)
 option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
+option(VC_RUN_RENDER_BENCHMARKS
+       "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
@@ -916,20 +918,24 @@ if(VC_TESTING)
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-core-offline
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$" -LE "^network$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-specialized
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-specialized$"
         DEPENDS vc_test_specialized
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         DEPENDS ${_vc_test_targets}
+        VERBATIM
         USES_TERMINAL)
 
     if(VC_ENABLE_COVERAGE)

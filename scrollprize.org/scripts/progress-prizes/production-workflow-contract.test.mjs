@@ -9,6 +9,8 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../.
 const googleJobs = [
   'validate',
   'dry-run',
+  'sync-responses',
+  'reconcile-active',
   'prepare-google',
   'activate-production',
   'verify-completed-activation',
@@ -24,6 +26,7 @@ const githubOnlyJobs = [
   'activation-binding',
   'activation-gate',
   'activation-approval',
+  'reconcile-approval',
   'merge',
   'verify-prepared-state',
   'report-scheduled-failure',
@@ -112,6 +115,8 @@ test('production accepts only a secret-free manual dispatch contract', async () 
   assert.match(preflight, /assert\.equal\(process\.env\.EVENT_NAME, 'workflow_dispatch'\)/);
   assert.match(preflight, /process\.env\.TARGET_CYCLE, target/);
   assert.match(preflight, /\^\[1-9\]\\d\*\$/);
+  assert.match(preflight, /process\.env\.OPERATION === 'reconcile-active'/);
+  assert.match(preflight, /assert\.equal\(process\.env\.REQUEST_ID, ''\)/);
   assert.deepEqual(
     new Set(jobNames(source)),
     new Set([...googleJobs, ...githubOnlyJobs]),
@@ -148,6 +153,7 @@ test('production preflight executes a strict valid and invalid control matrix', 
     { OPERATION: 'cleanup' },
     { TARGET_CYCLE: '2026-09' },
     { REQUEST_ID: 'untrusted' },
+    { OPERATION: 'reconcile-active', REQUEST_ID: '123' },
   ]) {
     assert.notEqual(execute(overrides).status, 0, JSON.stringify(overrides));
   }
@@ -209,6 +215,22 @@ test('production dry-run immediately exercises a read-only public proposal', asy
   );
 });
 
+test('response sync is append-only, reviewer-free, and isolated from GitHub writes', async () => {
+  const production = await productionWorkflow();
+  const sync = jobBlock(production, 'sync-responses');
+
+  assert.match(sync, /^    if: inputs\.operation == 'sync-responses'$/m);
+  assert.match(sync, /^    needs: preflight$/m);
+  assert.match(sync, /^    environment: progress-prizes-production$/m);
+  assert.match(sync, /permissions:\n      contents: read\n      id-token: write/);
+  assert.match(sync, /^          operation: sync-responses$/m);
+  assert.match(sync, /^          source-cycle: \$\{\{ inputs\['source-cycle'\] \}\}$/m);
+  assert.match(sync, /^          branch: main$/m);
+  assert.match(sync, /^          target-branch: main$/m);
+  assert.doesNotMatch(sync, /activation-approval|pull-requests: write|contents: write/);
+  assert.doesNotMatch(sync, /simulated-now:|fault:|dry-run:|head-sha:|base-sha:/);
+});
+
 test('normal preparation no-ops safely outside the seven-day window', async () => {
   const production = await productionWorkflow();
   const google = jobBlock(production, 'prepare-google');
@@ -236,11 +258,45 @@ test('GitHub control-plane jobs have no Google identity or OIDC', async () => {
   const approval = jobBlock(source, 'activation-approval');
   assert.match(approval, /environment: progress-prizes-production-activation/);
   assert.match(approval, /permissions: \{\}/);
+  const reconciliationApproval = jobBlock(source, 'reconcile-approval');
+  assert.match(reconciliationApproval, /environment: progress-prizes-production-activation/);
+  assert.match(reconciliationApproval, /permissions: \{\}/);
+  assert.match(reconciliationApproval, /test -z "\$REQUEST_ID"/);
   const reporter = jobBlock(source, 'report-scheduled-failure');
   assert.match(reporter, /permissions:\n      issues: write/);
   assert.match(reporter, /\/search\/issues\?\$\{query\}/);
   assert.match(reporter, /search\.total_count > 100/);
   assert.match(reporter, /Google identifiers, ACL identities, and operation output are intentionally omitted/);
+});
+
+test('reconcile-active requires secret-free approval and permits only marker metadata writes', async () => {
+  const production = await productionWorkflow();
+  const action = await googleAction();
+  const approval = jobBlock(production, 'reconcile-approval');
+  const reconciliation = jobBlock(production, 'reconcile-active');
+
+  assert.match(approval, /^    if: inputs\.operation == 'reconcile-active'$/m);
+  assert.match(approval, /^    needs: preflight$/m);
+  assert.doesNotMatch(approval, /secrets\.|id-token|google-github-actions/);
+  assert.match(
+    reconciliation,
+    /needs:\n      - preflight\n      - reconcile-approval/,
+  );
+  assert.match(reconciliation, /^          operation: reconcile-active$/m);
+  assert.match(reconciliation, /^          branch: main$/m);
+  assert.match(reconciliation, /^          target-branch: main$/m);
+  assert.doesNotMatch(reconciliation, /simulated-now:|fault:|dry-run:|head-sha:|base-sha:/);
+
+  assert.match(action, /test "\$OPERATION" = reconcile-active/);
+  assert.match(action, /test -z "\$SIMULATED_NOW"/);
+  assert.match(action, /test -z "\$FAULT"/);
+  assert.match(action, /test -z "\$HEAD_SHA"/);
+  assert.match(action, /test -z "\$BASE_SHA"/);
+  assert.match(
+    action,
+    /if: inputs\.operation != 'validate' && inputs\.operation != 'verify' && inputs\.operation != 'sync-responses' && inputs\.operation != 'reconcile-active' && inputs\['dry-run'\] != 'true'/,
+  );
+  assert.match(action, /Authenticate marker-only reconciliation without a credential file/);
 });
 
 test('every privileged checkout executes the immutable trigger code', async () => {

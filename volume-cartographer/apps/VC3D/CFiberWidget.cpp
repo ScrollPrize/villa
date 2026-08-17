@@ -1,6 +1,7 @@
 #include "CFiberWidget.hpp"
 
 #include "FiberNameDisplay.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -43,8 +44,7 @@ enum FiberColumn {
     kControlPointsColumn,
     kLinePointsColumn,
     kTagsColumn,
-    kMeanAlignErrorColumn,
-    kMaxAlignErrorColumn,
+    kInterpStatusColumn,
     kColumnCount,
 };
 
@@ -156,42 +156,6 @@ QString formatTags(const std::vector<std::string>& tags)
     return parts.join(QStringLiteral(", "));
 }
 
-QString formatMetric(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
-                     bool showMetrics)
-{
-    if (!showMetrics) {
-        return QStringLiteral("-");
-    }
-    if (metric.pending) {
-        return QStringLiteral("...");
-    }
-    if (!metric.error.empty()) {
-        return QStringLiteral("err");
-    }
-    if (!metric.available) {
-        return QStringLiteral("-");
-    }
-    return formatDouble(metric.meanErrorDegrees, 1);
-}
-
-QString formatMaxMetric(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
-                        bool showMetrics)
-{
-    if (!showMetrics) {
-        return QStringLiteral("-");
-    }
-    if (metric.pending) {
-        return QStringLiteral("...");
-    }
-    if (!metric.error.empty()) {
-        return QStringLiteral("err");
-    }
-    if (!metric.available) {
-        return QStringLiteral("-");
-    }
-    return formatDouble(metric.maxErrorDegrees, 1);
-}
-
 QString metricTooltip(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
                       bool showMetrics)
 {
@@ -228,7 +192,8 @@ void applyRowMetadata(const QList<QStandardItem*>& row,
     const bool highlight = shouldHighlight(metric, showMetrics);
     const QColor warningColor(255, 232, 232);
     const QString tooltip = metricTooltip(metric, showMetrics);
-    for (QStandardItem* item : row) {
+    for (int column = 0; column < row.size(); ++column) {
+        QStandardItem* item = row[column];
         if (!item) {
             continue;
         }
@@ -239,7 +204,11 @@ void applyRowMetadata(const QList<QStandardItem*>& row,
         } else {
             item->setData(QVariant(), Qt::BackgroundRole);
         }
-        item->setToolTip(tooltip);
+        if (column != kInterpStatusColumn) {
+            // The interp cell keeps its predictions-provenance tooltip;
+            // metric refreshes must not overwrite it.
+            item->setToolTip(tooltip);
+        }
     }
 }
 
@@ -346,8 +315,7 @@ void CFiberWidget::setupUi()
         tr("cps"),
         tr("pts"),
         tr("tags"),
-        tr("mean align deg"),
-        tr("max align deg"),
+        tr("interp"),
     });
     _treeView = new QTreeView(mainWidget);
     _treeView->setObjectName(QStringLiteral("fiberTreeView"));
@@ -373,8 +341,7 @@ void CFiberWidget::setupUi()
     _treeView->setColumnWidth(kControlPointsColumn, 48);
     _treeView->setColumnWidth(kLinePointsColumn, 48);
     _treeView->setColumnWidth(kTagsColumn, 110);
-    _treeView->setColumnWidth(kMeanAlignErrorColumn, 110);
-    _treeView->setColumnWidth(kMaxAlignErrorColumn, 105);
+    _treeView->setColumnWidth(kInterpStatusColumn, 150);
     layout->addWidget(_treeView, 1);
 
     connect(_treeView->selectionModel(), &QItemSelectionModel::selectionChanged,
@@ -520,6 +487,21 @@ QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
         return QString::fromStdString(fiber.automaticHvTag);
     }
     return QStringLiteral("-");
+}
+
+QString CFiberWidget::statusTextForFiber(const FiberEntry& fiber)
+{
+    // Interpolation provenance only; the human review verdict lives in the
+    // tags column as the ordinary 'reviewed' tag.
+    switch (fiber.traceState) {
+    case FiberEntry::TraceState::Predictions:
+        return tr("predictions");
+    case FiberEntry::TraceState::Mixed:
+        return tr("mixed");
+    case FiberEntry::TraceState::Legacy:
+        break;
+    }
+    return tr("legacy");
 }
 
 std::vector<uint64_t> CFiberWidget::selectedFiberIds() const
@@ -688,8 +670,7 @@ void CFiberWidget::rebuildModel()
         tr("cps"),
         tr("pts"),
         tr("tags"),
-        tr("mean align deg"),
-        tr("max align deg"),
+        tr("interp"),
     });
     if (_treeView && _treeView->header()) {
         _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
@@ -709,10 +690,22 @@ void CFiberWidget::rebuildModel()
             readOnlyItem(QString::number(fiber.controlPointCount)),
             readOnlyItem(QString::number(fiber.linePointCount)),
             readOnlyItem(formatTags(fiber.tags)),
-            readOnlyItem(formatMetric(fiber.alignment, showMetrics)),
-            readOnlyItem(formatMaxMetric(fiber.alignment, showMetrics)),
+            readOnlyItem(statusTextForFiber(fiber)),
         };
         applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
+        // Predictions provenance: which fiber-inference manifests produced
+        // the traced spans, shown on the interp status cell.
+        QStringList tracedManifests;
+        for (const auto& span : fiber.spans) {
+            const QString manifest = QString::fromStdString(span.fiberManifest);
+            if (!manifest.isEmpty() && !tracedManifests.contains(manifest)) {
+                tracedManifests.push_back(manifest);
+            }
+        }
+        if (!tracedManifests.isEmpty()) {
+            row[kInterpStatusColumn]->setToolTip(
+                tr("Traced with:\n%1").arg(tracedManifests.join(QStringLiteral("\n"))));
+        }
 
         QStandardItem* root = row[kNameColumn];
         for (const auto& span : fiber.spans) {
@@ -729,11 +722,15 @@ void CFiberWidget::rebuildModel()
                 readOnlyItem(QString::number(span.controlPointCount)),
                 readOnlyItem(QString::number(span.linePointCount)),
                 readOnlyItem(QString()),
-                readOnlyItem(formatMetric(span.alignment, showMetrics)),
-                readOnlyItem(formatMaxMetric(span.alignment, showMetrics)),
+                readOnlyItem(QString(QChar::fromLatin1(span.interpMarker))),
             };
             applyRowMetadata(childRow, fiber.id, true, span.alignment, showMetrics);
             applySpanMetadata(childRow, span.firstControlIndex, span.secondControlIndex);
+            if (!span.fiberManifest.empty()) {
+                childRow[kInterpStatusColumn]->setToolTip(
+                    tr("Traced with: %1")
+                        .arg(QString::fromStdString(span.fiberManifest)));
+            }
             root->appendRow(childRow);
         }
 
@@ -770,13 +767,6 @@ void CFiberWidget::updateMetricDisplayForRow(
     }
 
     const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
-    if (row[kMeanAlignErrorColumn]) {
-        row[kMeanAlignErrorColumn]->setText(formatMetric(alignment, showMetrics));
-    }
-    if (row[kMaxAlignErrorColumn]) {
-        row[kMaxAlignErrorColumn]->setText(formatMaxMetric(alignment, showMetrics));
-    }
-
     const uint64_t fiberId = row[kNameColumn]->data(kFiberIdRole).toULongLong();
     const bool isSpan = row[kNameColumn]->data(kIsSpanRole).toBool();
     applyRowMetadata(row, fiberId, isSpan, alignment, showMetrics);
@@ -811,30 +801,6 @@ void CFiberWidget::sortFibers()
         }
         return ascending ? lhs < rhs : lhs > rhs;
     };
-    auto metricValue = [](const FiberEntry::AlignmentMetrics& metric) {
-        return metric.available && std::isfinite(metric.maxErrorDegrees)
-            ? std::optional<double>(metric.maxErrorDegrees)
-            : std::nullopt;
-    };
-    auto metricMeanValue = [](const FiberEntry::AlignmentMetrics& metric) {
-        return metric.available && std::isfinite(metric.meanErrorDegrees)
-            ? std::optional<double>(metric.meanErrorDegrees)
-            : std::nullopt;
-    };
-    auto compareOptionalNumber = [ascending](std::optional<double> lhs,
-                                             std::optional<double> rhs) {
-        if (lhs && rhs) {
-            if (*lhs == *rhs) {
-                return false;
-            }
-            return ascending ? *lhs < *rhs : *lhs > *rhs;
-        }
-        if (lhs != rhs) {
-            return lhs.has_value();
-        }
-        return false;
-    };
-
     std::stable_sort(_fibers.begin(), _fibers.end(), [&](const FiberEntry& lhs, const FiberEntry& rhs) {
         bool different = false;
         bool less = false;
@@ -880,18 +846,11 @@ void CFiberWidget::sortFibers()
             less = compareText(a, b);
             break;
         }
-        case kMeanAlignErrorColumn: {
-            const auto a = metricMeanValue(lhs.alignment);
-            const auto b = metricMeanValue(rhs.alignment);
-            different = a != b;
-            less = compareOptionalNumber(a, b);
-            break;
-        }
-        case kMaxAlignErrorColumn: {
-            const auto a = metricValue(lhs.alignment);
-            const auto b = metricValue(rhs.alignment);
-            different = a != b;
-            less = compareOptionalNumber(a, b);
+        case kInterpStatusColumn: {
+            const QString a = statusTextForFiber(lhs);
+            const QString b = statusTextForFiber(rhs);
+            different = QString::localeAwareCompare(a, b) != 0;
+            less = compareText(a, b);
             break;
         }
         default:
@@ -1093,11 +1052,24 @@ void CFiberWidget::rebuildTagList()
         return;
     }
 
+    // _knownTags is alphabetically sorted, but the review verdict tag is
+    // pinned to the top of the checkbox list and is always offered, even in
+    // a package where no fiber carries it yet.
+    const std::string reviewedTag{vc3d::line_annotation::kReviewedTag};
+    std::vector<std::string> orderedTags;
+    orderedTags.reserve(_knownTags.size() + 1);
+    orderedTags.push_back(reviewedTag);
+    for (const auto& tag : _knownTags) {
+        if (tag != reviewedTag) {
+            orderedTags.push_back(tag);
+        }
+    }
+
     auto checkboxes = tagCheckboxesInLayout(_tagListLayout);
-    bool canReuseCheckboxes = checkboxes.size() == _knownTags.size();
+    bool canReuseCheckboxes = checkboxes.size() == orderedTags.size();
     if (canReuseCheckboxes) {
-        for (size_t i = 0; i < _knownTags.size(); ++i) {
-            if (checkboxes[i]->text() != QString::fromStdString(_knownTags[i])) {
+        for (size_t i = 0; i < orderedTags.size(); ++i) {
+            if (checkboxes[i]->text() != QString::fromStdString(orderedTags[i])) {
                 canReuseCheckboxes = false;
                 break;
             }
@@ -1110,7 +1082,7 @@ void CFiberWidget::rebuildTagList()
             delete item;
         }
 
-        for (const auto& tag : _knownTags) {
+        for (const auto& tag : orderedTags) {
             const QString tagText = QString::fromStdString(tag);
             auto* checkbox = new QCheckBox(tagText, _tagListWidget);
             checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
@@ -1125,14 +1097,14 @@ void CFiberWidget::rebuildTagList()
 
     const FiberEntry* fiber = selectedFiber();
     const bool hasSelection = fiber != nullptr;
-    for (size_t i = 0; i < checkboxes.size() && i < _knownTags.size(); ++i) {
+    for (size_t i = 0; i < checkboxes.size() && i < orderedTags.size(); ++i) {
         QCheckBox* checkbox = checkboxes[i];
         if (!checkbox) {
             continue;
         }
         const QSignalBlocker blocker(checkbox);
         checkbox->setEnabled(hasSelection);
-        checkbox->setChecked(hasSelection && containsTag(fiber->tags, _knownTags[i]));
+        checkbox->setChecked(hasSelection && containsTag(fiber->tags, orderedTags[i]));
     }
 
     const bool canEditTags = hasSelection;

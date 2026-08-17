@@ -7,7 +7,31 @@
 # so we compile its source straight into the test and link just Qt6::Core (for
 # QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
 # in, keeping the test fast and self-contained.
-find_package(Qt6 REQUIRED COMPONENTS Core Test Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+
+add_executable(test_unified_browser_dialog
+    test_unified_browser_dialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.hpp)
+
+set_target_properties(test_unified_browser_dialog PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_unified_browser_dialog PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_unified_browser_dialog PRIVATE
+    vc_core
+    Qt6::Concurrent
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME unified_browser_dialog COMMAND test_unified_browser_dialog)
+vc_register_test_target(test_unified_browser_dialog)
+vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
+set_tests_properties(unified_browser_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_reload_comparison
     test_spiral_reload_comparison.cpp)
@@ -25,6 +49,47 @@ target_link_libraries(test_spiral_reload_comparison PRIVATE
 add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
 vc_register_test_target(test_spiral_reload_comparison)
 vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
+
+add_executable(test_download_queue_stats
+    test_download_queue_stats.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueStats.cpp)
+
+set_target_properties(test_download_queue_stats PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_download_queue_stats PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_download_queue_stats PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME download_queue_stats COMMAND test_download_queue_stats)
+vc_register_test_target(test_download_queue_stats)
+vc_register_ctest(download_queue_stats test_download_queue_stats)
+
+add_executable(test_download_queue_debug
+    test_download_queue_debug.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/DownloadQueueDebugOverlay.cpp)
+
+set_target_properties(test_download_queue_debug PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_download_queue_debug PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_download_queue_debug PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test)
+
+add_test(NAME download_queue_debug COMMAND test_download_queue_debug)
+vc_register_test_target(test_download_queue_debug)
+vc_register_ctest(download_queue_debug test_download_queue_debug)
+set_tests_properties(download_queue_debug PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp

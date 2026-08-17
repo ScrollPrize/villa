@@ -260,7 +260,10 @@ private:
     MatPtr _points;
 };
 
-//quads based surface class with a pointer implementing a nominal scale of 1 voxel
+// Quad-grid surface. Renderable surface coordinates are level-0/base-volume
+// voxel units. `scale()` is grid samples per surface unit (x=column, y=row),
+// so a grid spaced 50 base voxels apart declares scale 1/50. This is
+// parameterization metadata; the source Zarr level is the renderer's only LOD.
 class QuadSurface : public Surface
 {
 public:
@@ -314,6 +317,7 @@ public:
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;
+    // Grid samples per level-0/base-volume voxel in each parameter direction.
     [[nodiscard]] cv::Vec2f scale() const;
     [[nodiscard]] cv::Vec3f center() const;
     [[nodiscard]] cv::Vec2d surfaceToGrid(const cv::Vec2d& surface) const;

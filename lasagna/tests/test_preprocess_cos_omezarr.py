@@ -4,6 +4,7 @@ import unittest
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 import types
 from unittest import mock
@@ -26,6 +27,8 @@ sys.modules.setdefault("train_unet_3d", train_stub)
 
 from preprocess_cos_omezarr import (
 	LasagnaCosPredict3DAdapter,
+	DEFAULT_FLUSH_WORKERS,
+	DEFAULT_ACCUMULATOR_WORKERS,
 	ModelAdapter,
 	OmeZarrOutputAdapter,
 	OutputAdapter,
@@ -35,6 +38,8 @@ from preprocess_cos_omezarr import (
 	PYRAMID_POLICY_NONE,
 	PYRAMID_POLICY_SCALAR,
 	_CircularZBand,
+	_TensorStoreTileReader,
+	_read_tile_zarr,
 	_plan_circular_z_depth,
 	_atomic_zarr_write,
 	_canonical_local_tile_positions,
@@ -43,6 +48,7 @@ from preprocess_cos_omezarr import (
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
 	run_tiled_inference_3d,
+	resolve_inference_devices,
 	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
@@ -57,6 +63,11 @@ from omezarr_pyramid import (
 	build_scalar_omezarr_pyramid,
 	downsample_normal_pair_chunk_worker,
 	downsample_scalar_chunk_worker,
+)
+from lasagna.tests.predict3d_spawn_helpers import (
+	SpawnFileOutputAdapter,
+	SpawnHardExitAdapter,
+	SpawnIdentityAdapter,
 )
 
 
@@ -189,6 +200,397 @@ class _RaisingProductAdapter(_IdentityProductAdapter):
 
 
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_native_accumulator_matches_numpy_for_half_float_and_strides(self):
+		module = shared_predict3d._accumulator_native_module()
+		if not module:
+			self.skipTest("optional accumulator_add extension is not built")
+		rng = np.random.default_rng(712)
+		for dtype in (np.float16, np.float32):
+			base = np.zeros((5, 9, 43), dtype=dtype)
+			destination = base[1:4, 1:8:2, 2:39]
+			destination[:] = rng.standard_normal(destination.shape).astype(dtype)
+			source = (rng.standard_normal(destination.shape) * 0.125).astype(np.float32)
+			reference = np.array(destination, copy=True)
+			np.add(reference, source, out=reference, casting="unsafe")
+			for backend in ("scalar", "auto"):
+				actual_base = base.copy()
+				actual = actual_base[1:4, 1:8:2, 2:39]
+				module.add_inplace(actual, source, backend)
+				np.testing.assert_array_equal(actual, reference)
+		self.assertIn(module.backend(), {"scalar", "avx512"})
+		# Exercise every binary16 input, including subnormals, infinities and
+		# NaNs; finite values must match NumPy bit-for-bit for one add.
+		all_half = np.arange(65536, dtype=np.uint16).view(np.float16).reshape(1, 256, 256)
+		increment = np.full(all_half.shape, 0.00031, dtype=np.float32)
+		with np.errstate(invalid="ignore", over="ignore"):
+			reference = np.add(all_half, increment, out=np.empty_like(all_half), casting="unsafe")
+		for backend in ("scalar", "auto"):
+			actual = all_half.copy()
+			module.add_inplace(actual, increment, backend)
+			finite = np.isfinite(reference)
+			np.testing.assert_array_equal(actual[finite], reference[finite])
+			np.testing.assert_array_equal(np.isnan(actual), np.isnan(reference))
+
+	def test_input_tile_cpu_conversion_preserves_uint8_and_uint16_mapping(self):
+		u8 = np.array([0, 1, 127, 255], dtype=np.uint8).reshape(1, 2, 2)
+		actual_u8 = shared_predict3d._input_tile_to_device(u8, torch.device("cpu")).numpy()[0, 0]
+		np.testing.assert_array_equal(actual_u8, u8.astype(np.float32) / 255.0)
+		u16 = np.array([0, 256, 257, 65534, 65535], dtype=np.uint16).reshape(1, 1, 5)
+		actual_u16 = shared_predict3d._input_tile_to_device(u16, torch.device("cpu")).numpy()[0, 0]
+		expected_u16 = (u16 // 257).astype(np.uint8).astype(np.float32) / 255.0
+		np.testing.assert_array_equal(actual_u16, expected_u16)
+
+	def test_tensorstore_tile_reader_matches_python_zarr_with_reflect_padding(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			data = np.arange(8 * 8 * 8, dtype=np.dtype("<u2")).reshape(8, 8, 8)
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 8, 8], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				for yc in range(2):
+					for xc in range(2):
+						block = data[zc*4:(zc+1)*4, yc*4:(yc+1)*4, xc*4:(xc+1)*4]
+						(path / f"{zc}.{yc}.{xc}").write_bytes(block.tobytes(order="C"))
+			reader = _TensorStoreTileReader(
+				str(path), cache_bytes=1 << 20, file_io_threads=2, data_copy_threads=1,
+			)
+			for coord in ((0, 0, 0), (-2, -1, -3), (4, 5, 6)):
+				with self.subTest(coord=coord):
+					expected = _read_tile_zarr(data, data.shape, (0, 0, 0), *coord, 4, 1)
+					task = reader.submit(
+						volume_shape=data.shape, crop_offset=(0, 0, 0), coord=coord,
+						tile_size=4, border=1,
+					)
+					actual, _elapsed = reader.result(task)
+					np.testing.assert_array_equal(actual, expected)
+
+	def test_tensorstore_serial_prefetch_matches_python_zarr_inference(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			data = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 4, 4], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				(path / f"{zc}.0.0").write_bytes(data[zc*4:(zc+1)*4].tobytes(order="C"))
+			common = dict(
+				crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+				products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+				full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+				overlap=0, border=0, tmp_dir=td,
+			)
+			outputs = []
+			for backend in ("python-zarr", "tensorstore"):
+				adapter = _IdentityProductAdapter(product)
+				output = Output()
+				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), data,
+						model_adapter=adapter, output_adapter=output,
+						input_zarr_path=str(path), input_reader=backend,
+						prefetch_tiles_per_gpu=2, input_cache_bytes=1 << 20,
+						input_io_threads=2, input_copy_threads=1, **common,
+					)
+				outputs.append(output.chunks)
+			self.assertEqual(set(outputs[0]), set(outputs[1]))
+			for origin in outputs[0]:
+				np.testing.assert_array_equal(outputs[0][origin], outputs[1][origin])
+
+	def test_shared_multi_gpu_device_resolution(self):
+		self.assertEqual(
+			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0),
+			(torch.device("cpu"),),
+		)
+		self.assertEqual(
+			resolve_inference_devices(devices="all", cuda_available=True, cuda_count=3),
+			(torch.device("cuda:0"), torch.device("cuda:1"), torch.device("cuda:2")),
+		)
+		self.assertEqual(
+			resolve_inference_devices(devices="cuda,cuda:2", cuda_available=True, cuda_count=3),
+			(torch.device("cuda:0"), torch.device("cuda:2")),
+		)
+		with self.assertRaisesRegex(ValueError, "either --device or --devices"):
+			resolve_inference_devices(device="cuda", devices="all", cuda_available=True, cuda_count=2)
+		with self.assertRaisesRegex(ValueError, "duplicate"):
+			resolve_inference_devices(devices="cuda,cuda:0", cuda_available=True, cuda_count=2)
+
+	def test_shared_auto_download_forwards_workers_to_input_and_pred_dt(self):
+		with mock.patch.object(shared_predict3d, "_download_one_path") as download_one:
+			shared_predict3d._auto_download(
+				"input.zarr/1", (1, 2, 3, 4, 5, 6), "pred.zarr/1", download_workers=321,
+			)
+		self.assertEqual(download_one.call_args_list, [
+			mock.call("input.zarr/1", (1, 2, 3, 4, 5, 6), 321),
+			mock.call("pred.zarr/1", (1, 2, 3, 4, 5, 6), 321),
+		])
+		with self.assertRaisesRegex(ValueError, "positive integer"):
+			shared_predict3d._auto_download("input.zarr", None, download_workers=0)
+
+	def test_shared_tile_events_are_lazy_and_mark_row_flushes(self):
+		events = shared_predict3d._iter_canonical_tile_events((0, 4), (0, 4), (0, 4), 8)
+		self.assertNotIsInstance(events, (list, tuple))
+		self.assertEqual(next(events), (0, 0, 0, False, 4))
+		self.assertEqual(next(events), (0, 0, 4, False, 4))
+		self.assertEqual(next(events), (0, 4, 0, False, 4))
+		self.assertEqual(next(events), (0, 4, 4, True, 4))
+		self.assertEqual(next(events), (4, 0, 0, False, 8))
+
+	def test_shared_result_layout_is_packed_without_queue_payloads(self):
+		layouts, total = shared_predict3d._packed_layouts((
+			("product:a", (7, 16, 16, 16), np.float32),
+			("weight:4", (16, 16, 16), np.float32),
+		))
+		self.assertEqual(layouts[0].offset, 0)
+		self.assertGreaterEqual(layouts[1].offset, layouts[0].nbytes)
+		self.assertGreaterEqual(total, layouts[1].offset + layouts[1].nbytes)
+		self.assertEqual(total % 64, 0)
+
+	def test_lasagna_calibrated_worker_prepares_instance_norm_buffers(self):
+		cos = OutputProductSpec(name="cos", level=0, scaledown=1, channels=("cos",), chunk_size=4)
+		normal = OutputProductSpec(
+			name="normal", level=0, scaledown=1,
+			channels=("grad_mag", "nx", "ny"), accumulator_channel_count=7,
+			chunk_size=4,
+		)
+		adapter = LasagnaCosPredict3DAdapter(
+			checkpoint="unused.pt", tile_size=4, device_name="cpu",
+			cos_product=cos, normal_product=normal,
+		)
+		adapter.calibrated_instance_norm = True
+		layer = torch.nn.InstanceNorm3d(3, track_running_stats=False)
+		adapter.prepare_model_for_state_load(layer, {}, device=torch.device("cpu"))
+		self.assertTrue(layer.track_running_stats)
+		self.assertEqual(tuple(layer.running_mean.shape), (3,))
+		self.assertEqual(tuple(layer.running_var.shape), (3,))
+
+	def test_shared_worker_uses_descriptor_queues_and_shared_results(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		input_layouts, input_bytes = shared_predict3d._packed_layouts((("input", (4, 4, 4), np.uint8),))
+		result_layouts, result_bytes = shared_predict3d._packed_layouts((
+			("product:identity", (1, 4, 4, 4), np.float32),
+			("weight:1", (4, 4, 4), np.float32),
+		))
+		input_shm = shared_predict3d.shared_memory.SharedMemory(create=True, size=input_bytes)
+		result_shm = shared_predict3d.shared_memory.SharedMemory(create=True, size=result_bytes)
+		ctx = shared_predict3d.mp.get_context("spawn")
+		work_queue = ctx.Queue(maxsize=1)
+		result_queue = ctx.Queue(maxsize=4)
+		input_specs = (shared_predict3d._SharedSlotSpec(input_shm.name, input_bytes, input_layouts),)
+		result_specs = (shared_predict3d._SharedSlotSpec(result_shm.name, result_bytes, result_layouts),)
+		process = ctx.Process(
+			target=shared_predict3d._multi_gpu_worker_main,
+			args=(0, "cpu", SpawnIdentityAdapter(product), {"gain": torch.tensor(2.0)}, 4,
+				np.ones(4, dtype=np.float32), {"identity": 1}, input_specs,
+				result_specs, work_queue, result_queue),
+		)
+		try:
+			shared_predict3d._slot_array(input_shm, input_layouts[0])[:] = 255
+			process.start()
+			work_queue.put((0, (0, 0, 0), 0, 0, ("identity",)))
+			messages = [result_queue.get(timeout=20), result_queue.get(timeout=20)]
+			self.assertEqual([message[0] for message in messages], ["input_released", "result"])
+			layouts = {layout.name: layout for layout in result_layouts}
+			np.testing.assert_array_equal(
+				shared_predict3d._slot_array(result_shm, layouts["product:identity"]),
+				np.full((1, 4, 4, 4), 2.0, dtype=np.float32),
+			)
+			np.testing.assert_array_equal(
+				shared_predict3d._slot_array(result_shm, layouts["weight:1"]),
+				np.ones((4, 4, 4), dtype=np.float32),
+			)
+		finally:
+			try:
+				work_queue.put_nowait(None)
+			except Exception:
+				pass
+			process.join(timeout=10)
+			if process.is_alive():
+				process.terminate()
+				process.join(timeout=10)
+			work_queue.close()
+			result_queue.close()
+			input_shm.close()
+			input_shm.unlink()
+			result_shm.close()
+			result_shm.unlink()
+
+	def test_shared_parallel_pipeline_matches_serial_output_exactly(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		serial_output = Output()
+		parallel_output = Output()
+		common = dict(
+			crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+			full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+			overlap=0, border=0, product_accumulator_dtype="float16",
+		)
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				serial_adapter = _IdentityProductAdapter(product)
+				run_tiled_inference_3d(
+					serial_adapter.load_model(device=torch.device("cpu")), volume,
+					model_adapter=serial_adapter, output_adapter=serial_output,
+					tmp_dir=td, **common,
+				)
+				parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
+				run_tiled_inference_3d(
+					None, volume, model_adapter=parallel_adapter,
+					output_adapter=parallel_output, tmp_dir=td,
+					devices=(torch.device("cpu"), torch.device("cpu")),
+					slots_per_gpu=1, prefetch_workers=2, accumulator_workers=2, **common,
+				)
+		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
+		for origin in serial_output.chunks:
+			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+
+	def test_shared_parallel_tensorstore_pipeline_matches_python_zarr_exactly(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 4, 4], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				(path / f"{zc}.0.0").write_bytes(volume[zc*4:(zc+1)*4].tobytes(order="C"))
+			outputs = []
+			for backend in ("python-zarr", "tensorstore"):
+				output = Output()
+				adapter = SpawnIdentityAdapter(product)
+				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+					run_tiled_inference_3d(
+						None, volume, crop_slices=(0, 8, 0, 4, 0, 4),
+						device=torch.device("cpu"), model_adapter=adapter, output_adapter=output,
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")), slots_per_gpu=1,
+						input_zarr_path=str(path), input_reader=backend,
+						prefetch_tiles_per_gpu=2, input_cache_bytes=1 << 20,
+						input_io_threads=2, input_copy_threads=1,
+					)
+				outputs.append(output.chunks)
+			self.assertEqual(set(outputs[0]), set(outputs[1]))
+			for origin in outputs[0]:
+				np.testing.assert_array_equal(outputs[0][origin], outputs[1][origin])
+
+	def test_shared_parallel_pipeline_profile_reports_bounded_stage_aggregates(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				pass
+
+		with tempfile.TemporaryDirectory() as td:
+			stream = io.StringIO()
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with mock.patch("sys.stdout", stream):
+					run_tiled_inference_3d(
+						None, np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=SpawnIdentityAdapter(product), output_adapter=Output(),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=2, profile_pipeline=True,
+					)
+			text = stream.getvalue()
+		self.assertIn("[predict3d:profile] loader reads=2", text)
+		self.assertIn("effective_request_concurrency=", text)
+		self.assertIn("cpu_convert_wall_s=", text)
+		self.assertIn("result_receive_lag_sum=", text)
+
+	def test_shared_parallel_pipeline_detects_hard_worker_exit(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				raise AssertionError("a crashed worker must not produce output")
+
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 23"):
+					run_tiled_inference_3d(
+						None, np.ones((4, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 4, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=SpawnHardExitAdapter(product), output_adapter=Output(),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 4, 4)},
+						full_output_shapes_zyx={"identity": (4, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=1,
+					)
+
 	def test_predict3d_shared_helpers_are_reexported_for_compatibility(self):
 		self.assertIs(preprocess_wrapper.OutputProductSpec, shared_predict3d.OutputProductSpec)
 		self.assertIs(preprocess_wrapper.OutputChannelSpec, shared_predict3d.OutputChannelSpec)
@@ -464,6 +866,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["output_path"], "out.lasagna.json")
 		self.assertEqual(kwargs["unet3d_checkpoint"], "model.pt")
 		self.assertEqual(kwargs["device"], "cpu")
+		self.assertIsNone(kwargs["devices"])
+		self.assertEqual(kwargs["prefetch_workers"], 0)
+		self.assertEqual(kwargs["slots_per_gpu"], 2)
+		self.assertEqual(kwargs["flush_workers"], DEFAULT_FLUSH_WORKERS)
+		self.assertEqual(kwargs["accumulator_workers"], DEFAULT_ACCUMULATOR_WORKERS)
+		self.assertEqual(kwargs["input_reader"], "tensorstore")
+		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 4)
+		self.assertEqual(kwargs["input_cache_gib"], 4.0)
+		self.assertEqual(kwargs["input_io_threads"], 16)
+		self.assertEqual(kwargs["input_copy_threads"], 4)
+		self.assertEqual(kwargs["download_workers"], 64)
 		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
 		self.assertEqual(kwargs["tile_size"], 64)
 		self.assertEqual(kwargs["overlap"], 8)
@@ -480,7 +893,44 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_ref"], "base.zarr")
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
-		self.assertEqual(kwargs["ome_chunk"], 64)
+		self.assertEqual(kwargs["ome_chunk"], 32)
+		self.assertEqual(kwargs["ome_compressor"], "blosc-zstd")
+
+	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
+		args = [
+			"predict3d", "--input", "in.zarr", "--output", "out.lasagna.json",
+			"--unet-checkpoint", "model.pt", "--tile-size", "64",
+			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
+			"--slots-per-gpu", "3", "--no-download",
+			"--flush-workers", "6",
+			"--accumulator-workers", "9",
+			"--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
+			"--input-cache-gib", "2.5", "--input-io-threads", "11",
+			"--input-copy-threads", "3",
+			"--profile-pipeline",
+			"--product-accumulator-dtype", "float32",
+			"--download-workers", "123",
+			"--ome-compressor", "none",
+		]
+		with mock.patch("builtins.open", side_effect=PermissionError):
+			with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
+				self.assertEqual(cli_main(args), 0)
+		kwargs = run.call_args.kwargs
+		self.assertIsNone(kwargs["device"])
+		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
+		self.assertEqual(kwargs["prefetch_workers"], 6)
+		self.assertEqual(kwargs["slots_per_gpu"], 3)
+		self.assertEqual(kwargs["flush_workers"], 6)
+		self.assertEqual(kwargs["accumulator_workers"], 9)
+		self.assertEqual(kwargs["input_reader"], "python-zarr")
+		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 7)
+		self.assertEqual(kwargs["input_cache_gib"], 2.5)
+		self.assertEqual(kwargs["input_io_threads"], 11)
+		self.assertEqual(kwargs["input_copy_threads"], 3)
+		self.assertTrue(kwargs["profile_pipeline"])
+		self.assertEqual(kwargs["product_accumulator_dtype"], "float32")
+		self.assertEqual(kwargs["download_workers"], 123)
+		self.assertEqual(kwargs["ome_compressor"], "none")
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
 		progress = {
@@ -786,6 +1236,42 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			band.cleanup()
 			self.assertEqual([p for p in Path(td).iterdir() if p.name.startswith(".predict3d_")], [])
 
+	def test_float16_product_band_widens_and_validates_storage_dtype(self):
+		with tempfile.TemporaryDirectory() as td:
+			band = _CircularZBand(
+				name="product", channel_count=1, z_size=4, y_size=2, x_size=2,
+				tmp_dir=td, prefix="unit_", dtype=np.float16,
+			)
+			values = np.array([1.0, -0.75, 2.0 ** -14, 2.0 ** -20], dtype=np.float32).reshape(1, 2, 2)
+			expected = np.zeros((4, 2, 2), dtype=np.float32)
+			for _ in range(8):
+				data = np.broadcast_to(values, (4, 2, 2))
+				band.add(0, 0, 4, 0, 2, 0, 2, data)
+				expected += data
+			actual = band.read(0, 0, 4, 0, 2, 0, 2)
+			self.assertEqual(actual.dtype, np.float32)
+			self.assertTrue(np.all(np.isfinite(actual)))
+			np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=1e-6)
+			descriptor = band.mmap_descriptor()
+			self.assertEqual(descriptor.dtype, "float16")
+			self.assertEqual(Path(descriptor.paths[0]).stat().st_size, 4 * 2 * 2 * 2)
+			cache = {}
+			try:
+				widened = shared_predict3d._read_mmap_band_chunk(descriptor, 0, 0, 4, 0, 2, 0, 2, cache)
+				self.assertEqual(widened.dtype, np.float32)
+				np.testing.assert_array_equal(widened, actual)
+			finally:
+				for array in cache.values():
+					array._mmap.close()
+			band.cleanup()
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "float16 or float32"):
+				_CircularZBand(
+					name="bad", channel_count=1, z_size=1, y_size=1, x_size=1,
+					tmp_dir=td, prefix="unit_", dtype=np.float64,
+				)
+
 	def test_rolling_z_band_sparse_ranges_read_as_zero(self):
 		with tempfile.TemporaryDirectory() as td:
 			band = _CircularZBand(
@@ -850,6 +1336,199 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			_plan_circular_z_depth(z_size=832, **kwargs),
 			_plan_circular_z_depth(z_size=8_000_032, **kwargs),
 		)
+
+	def test_circular_depth_keeps_prefix_until_flush_frontier_advances(self):
+		self.assertEqual(
+			_plan_circular_z_depth(
+				z_positions=(-64, 96, 256, 416),
+				tile_size=256,
+				scaledown=4,
+				z_size=592,
+				chunk_size=64,
+				output_begin=8,
+				output_end=584,
+			),
+			168,
+		)
+
+	def test_async_circular_depth_for_256_tile_inference_scales(self):
+		z_positions = _canonical_local_tile_positions(
+			volume_size=4096, crop_start=0, crop_padded_size=4160,
+			tile_size=256, stride=160, border=32, scaledown_multiple=4,
+		)
+		expected = {1: 448, 2: 256, 4: 184}
+		for sd, depth in expected.items():
+			with self.subTest(sd=sd):
+				self.assertEqual(
+					_plan_circular_z_depth(
+						z_positions=z_positions, tile_size=256, scaledown=sd,
+						z_size=4160 // sd, chunk_size=64,
+						output_begin=32 // sd,
+						output_end=32 // sd + 4096 // sd,
+					),
+					depth,
+				)
+
+	def test_shared_runner_overlaps_one_mmap_flush_with_next_z_band(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		progress = {}
+		with tempfile.TemporaryDirectory() as td:
+			marker = str(Path(td) / "next-band-started")
+			adapter = SpawnIdentityAdapter(product, marker_on_second_call=marker)
+			output = SpawnFileOutputAdapter(td, wait_for_marker=marker)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), np.ones((12, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 12, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 12, 4, 4)},
+					full_output_shapes_zyx={"identity": (12, 4, 4)},
+					output_scaledown_base=1, tile_size=4, overlap=0, border=0,
+					tmp_dir=td, progress=progress, flush_workers=1,
+				)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+			self.assertEqual(
+				{path.stem.removeprefix("chunk_") for path in Path(td).glob("chunk_*.npy")},
+				{"0_0_0", "4_0_0", "8_0_0"},
+			)
+
+		self.assertEqual(adapter.calls, 3)
+		self.assertEqual(progress["finalized_base_z"], 12)
+
+	def test_shared_runner_propagates_process_flush_failure_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "forced process flush failure"):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, fail=True),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td, flush_workers=1,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+	def test_shared_runner_detects_hard_process_flush_exit_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "flush worker 0 exited unexpectedly with code 24"):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, hard_exit=True),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td, flush_workers=1,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+	def test_shared_runner_flushes_distinct_chunks_in_multiple_processes(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), np.ones((4, 8, 8), dtype=np.uint8),
+					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, delay_s=0.1),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
+					full_output_shapes_zyx={"identity": (4, 8, 8)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td, flush_workers=2,
+				)
+			pids = {path.read_text() for path in Path(td).glob("chunk_*.pid")}
+			self.assertEqual(len(list(Path(td).glob("chunk_*.npy"))), 4)
+			self.assertEqual(len(pids), 2)
+
+	def test_shared_runner_propagates_async_flush_failure_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Adapter:
+			def run_tile_inference(self, model, tile, *, device):
+				return tile
+
+			def product_tensors_from_output(self, output):
+				return {"identity": output}
+
+			def finalize_product_slab(self, product, raw):
+				return {"value": raw[0]}
+
+		class FailingOutput:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				raise OSError("forced asynchronous write failure")
+
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(OSError, "forced asynchronous write failure"):
+					run_tiled_inference_3d(
+						object(), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=Adapter(), output_adapter=FailingOutput(), products=(product,),
+						output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)},
+						tile_size=4, overlap=0, border=0, tmp_dir=td,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+	def test_shared_runner_ring_survives_initial_noop_flushes(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=4,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(24, 24, 24),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			arr[:] = 1
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(4, 20, 0, 16, 0, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (1, 0, 0, 5, 4, 4)},
+				full_output_shapes_zyx={"identity": (6, 6, 6)},
+				input_zarr_path=str(input_path), tile_size=16, overlap=8, border=4,
+				tmp_dir=td,
+			)
+
+		self.assertGreater(adapter.calls, 0)
+		self.assertGreater(len(output.written), 0)
 
 	def test_shared_runner_infers_multiscale_products_once_per_tile(self):
 		fine = OutputProductSpec(
@@ -992,6 +1671,81 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				)
 		self.assertEqual(output.written, [(0, 0, 0)])
 		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
+
+	def test_shared_runner_supports_global_crop_beyond_local_ring_at_sd4(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(16, 16, 16),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			arr[8:16, 8:16, 8:16] = 1
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+				full_output_shapes_zyx={"identity": (4, 4, 4)},
+				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
+				tmp_dir=td,
+			)
+
+		self.assertGreater(adapter.calls, 0)
+		self.assertEqual(output.written, [(2, 2, 2)])
+
+	def test_shared_runner_skips_absent_global_crop_source_at_sd4(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			zarr.open(
+				str(input_path), mode="w", shape=(16, 16, 16),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+				full_output_shapes_zyx={"identity": (4, 4, 4)},
+				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
+				tmp_dir=td,
+			)
+
+		self.assertEqual(adapter.calls, 0)
+		self.assertEqual(output.written, [])
 
 	def test_canonical_tile_positions_do_not_shift_with_crop_origin(self):
 		kwargs = {
@@ -1173,6 +1927,61 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertIn("pred_dt", raw["groups"])
 			self.assertEqual(raw["groups"]["pred_dt"]["zarr"], "vol_pred_dt.ome.zarr/0")
 			self.assertEqual(int(np.asarray(dt_arr[0, 0, 0])), 13)
+
+	def test_direct_predict3d_writes_portable_lasagna_provenance(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = root / "volume.ome.zarr" / "1"
+			input_path.mkdir(parents=True)
+			checkpoint = root / "model.pt"
+			torch.save({"state_dict": {}, "patch_size": 256, "norm_type": "group"}, checkpoint)
+			output = root / "artifacts" / "result.lasagna.json"
+			context = root / "context.json"
+			context.write_text(json.dumps({
+				"run_uuid": "run-lasagna",
+				"source": {"volume_id": "vol", "requested_group": 1},
+				"model": {"atlas_model_id": "20260806123000"},
+			}), encoding="utf-8")
+
+			def fake_run(**kwargs):
+				manifest = Path(kwargs["output_path"])
+				channel = manifest.parent / "result_cos.ome.zarr" / "2"
+				channel.mkdir(parents=True)
+				(channel / ".zarray").write_text(json.dumps({
+					"shape": [2, 2, 2], "chunks": [2, 2, 2], "dtype": "|u1",
+					"compressor": {"id": "blosc", "cname": "zstd", "clevel": 3},
+				}), encoding="utf-8")
+				manifest.write_text(json.dumps({
+					"version": 2, "source_to_base": 1.0,
+					"grad_mag_encode_scale": 1000.0, "grad_mag_factor": 2.0,
+					"base_shape_zyx": [16, 16, 16], "crops": [],
+					"provenance": "inference.json",
+					"groups": {"cos": {
+						"zarr": "result_cos.ome.zarr/2", "scaledown": 2,
+						"channels": ["cos"],
+					}},
+				}), encoding="utf-8")
+
+			with mock.patch.object(preprocess_wrapper, "run_preprocess_3d", side_effect=fake_run), \
+				 mock.patch.object(preprocess_wrapper.zarr, "open", return_value=types.SimpleNamespace(shape=(8, 8, 8))), \
+				 mock.patch.object(preprocess_wrapper, "_resolve_base_shape", return_value=(16, 16, 16)), \
+				 mock.patch.object(preprocess_wrapper, "_predict3d_repository_state", return_value={"revision": "abc", "dirty": False}):
+				result = preprocess_wrapper.main_predict3d([
+					"--input", str(input_path), "--output", str(output),
+					"--unet-checkpoint", str(checkpoint), "--no-download",
+					"--provenance-context", str(context),
+				])
+
+			self.assertEqual(result, 0)
+			provenance = json.loads((output.parent / "inference.json").read_text())
+			self.assertEqual(provenance["artifact_kind"], "lasagna")
+			self.assertEqual(provenance["status"], "completed")
+			self.assertEqual(provenance["source_scale"]["source_to_base_factor"], 2)
+			self.assertEqual(provenance["inference"]["tile_size"], 256)
+			self.assertRegex(provenance["inference"]["code_commit"], r"^[0-9a-f]{40}$")
+			self.assertEqual(provenance["product"]["groups"]["cos"]["scaledown"], 2)
+			self.assertEqual(provenance["atlas_model_identity"]["model_id"], "20260806123000")
+			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")
 
 
 if __name__ == "__main__":

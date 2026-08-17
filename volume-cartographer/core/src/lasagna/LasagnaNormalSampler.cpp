@@ -94,14 +94,12 @@ public:
 
         if (sameLasagnaSamplingGrid(gradMag_, nx_) &&
             sameLasagnaSamplingGrid(gradMag_, ny_)) {
-            cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(
-                options.maxCachedBytes);
             gradMagCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
-                gradMag_, options.maxCachedBytes, cornerBudget_);
+                gradMag_);
             nxCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
-                nx_, options.maxCachedBytes, cornerBudget_);
+                nx_);
             nyCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
-                ny_, options.maxCachedBytes, cornerBudget_);
+                ny_);
         }
 
         if (nx_.shapeZYX != ny_.shapeZYX) {
@@ -740,7 +738,6 @@ private:
     double gradMagDecodeScale_ = 1000.0;
     LasagnaNormalSamplerOptions options_;
     std::shared_ptr<LasagnaChannelChunkCache> cache_;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
     std::unique_ptr<LasagnaChannelCornerSampler> gradMagCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nxCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nyCorners_;

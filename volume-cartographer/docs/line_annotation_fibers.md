@@ -49,10 +49,100 @@ the current cut from mouse position, accept control-point interactions, and
 show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
-The Annotation popup owns Auto-reoptimize, Reinit reoptimization, and Show as
-mesh. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
-base-voxel extrapolation-distance control. Tag pills are edited directly from
-the same toolbar.
+The rendered strips are derived views, not stored line geometry. Their columns
+retain every distinct control point and subdivide each control-point segment at
+the interval count whose spacing is closest to the 50-base-voxel target. This
+keeps every stored bend in the generated quad geometry. Explicit support
+arclengths provide a bidirectional mapping that keeps control points, span
+labels, hover positions, cut planes, and saved line positions in the original
+fractional point-index coordinate. The strip grid's scalar along-line scale is
+the mean support density; exact geometry and interaction use the point grid and
+support arclengths. Scales remain declared in base-volume voxel units, so input
+line spacing does not change render LOD. Automatic strip height retains the
+legacy behavior: its cross-row spacing is the median optimized control-point
+step, independent of the 50-voxel along-line target.
+
+The current cut view draws its solid yellow control-point marker only while the
+control point is inside the cut plane's thin slab, so fast panning would
+otherwise skip past control points unseen. To keep them findable, the view also
+always draws two parallax ghosts: a hollow dashed yellow ring for the nearest
+control point behind the cursor and one for the nearest ahead. Each ghost sits
+at its true in-plane landing spot shifted horizontally toward the side it will
+arrive from: the ring for a control point ahead of the cursor (higher line
+position) sits to the right, matching the strips where line position runs left
+to right. The shift is proportional to the signed line-position delta over a
+fixed 8 line-position slide range and is clamped at 35% of the visible view
+width, and the ring brightens from a faint floor at or beyond that range to
+nearly opaque as the delta closes. Ghosts only appear while the control point
+is within ten times the solid-marker window (so they don't linger far from any
+control point), fading out over the outer quarter of that distance. Because the
+shift decays continuously to zero, the ghost converges on the solid marker as a
+landing ring instead of popping into place.
+
+The Left and Right arrow keys pan the current position between control points
+with a smooth velocity ramp. A tap accelerates, brakes, and lands exactly on
+the nearest control point in that direction; holding the key cruises straight
+through the intermediate points at a constant speed and, when it is released,
+decelerates onto the next control point ahead (never short of the one a tap
+would have reached). Beyond the outermost control point the pan continues one
+more hop, to the Max CP distance allowance or the end of the extrapolated
+line, whichever is shorter. Pressing the opposite arrow
+mid-pan decelerates through zero and reverses. Up and Down scale the cruising
+speed (default 12 line positions per second, roughly 360 voxels per second),
+which is shown in a transient badge and remembered between sessions. A Left or
+Right press pauses the mouse hover-follow exactly as the space bar does, so the
+❚❚ badge appears; space (or a click in a strip or cut view) resumes hover-follow
+and cancels the pan. While the keyboard is panning, the strips stay centered
+on the current-position line and scroll underneath it.
+
+`/` and `0` both place a control point on the blue current-position dot in the
+current cut, so points can be dropped without leaving the keyboard while
+arrow-panning along the line. The key stops an active pan, because the
+placement renumbers the line positions the pan is steering by, but unlike a
+click in the cut view it leaves hover-follow exactly as it was rather than
+resuming it; the panes then land on the new control point once the
+re-optimized line arrives. It does nothing while the Max CP distance rule
+blocks placement at the current position, and stays inert while a spinbox or
+combo box has the keyboard.
+
+The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
+Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
+the initial centerline length and the base-voxel extrapolation distance,
+Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
+the shared cursor cross between the four generated panes: on by default,
+remembered between sessions, and independent of the global "Sync cursor across
+views" setting, so unchecking it keeps the cross in the hovered pane even while
+that global setting is on. The toolbar retains the fiber-global Lasagna/Fiber
+model selector. Tag pills are edited directly from the same toolbar.
+
+Switching the fiber-global mode asks for confirmation before it re-optimizes,
+because the switch overwrites the current line: to Fiber model it re-traces
+every global-goal span with model predictions; back to Lasagna it re-fits them.
+Suppressed (agent-driven) sessions skip the prompt. Either direction also
+strips the `reviewed` tag on the save that follows the successful
+re-optimization, because the human verdict no longer covers the new geometry.
+
+Review state is the ordinary free-form `reviewed` tag — there is no
+specialized review mechanism. It is set and cleared through the generic tag
+UI like any other tag: the fiber panel's tag checkboxes and the Line
+Annotation toolbar's tag pills, where `reviewed` is pinned first and always
+offered even in a volpkg where no fiber carries it yet. The only
+programmatic change is the mode-switch strip described above; ordinary
+control-point edits, merges, and splits never touch it, and
+`scripts/fiber_merge.py` treats it as a plain tag under the usual
+three-way tag merge. `scripts/vc_sync.py hfsync` publishes gated on it
+(`reviewed` is its default `--tag`), so the tag doubles as the publish gate.
+
+The fiber panel's `interp` column shows the interpolation provenance per
+fiber — `legacy` (no trace spans), `predictions` (trace spans, native mode),
+or `mixed` (trace spans under a lasagna-global fiber); the review state
+itself is visible as an ordinary tag. Span child rows show the stored
+producer marker `C`/`L`/`T`. Predictions provenance is the per-span
+`segment_to_next.fiber_manifest` written at trace acceptance (the selected
+fiber-inference manifest identity); the panel surfaces it as a tooltip on
+the `interp` cells, and `fiber.list` over the agent bridge exposes the same
+data as `traceState` and per-span `interpMode` plus `fiberManifest`.
+
 
 Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves
