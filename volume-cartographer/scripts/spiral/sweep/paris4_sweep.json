@@ -8,10 +8,10 @@
   },
   "seeds": [1, 2, 3],
   "fixed": {
-    "z_begin": 8500,
-    "z_end": 14500,
+    "z_begin": 11000,
+    "z_end": 16500,
     "optimizer_num_training_steps": 30000,
-    "sample_count_winding_model_pairs": 24000
+    "sample_count_winding_model_pairs": 90000
   },
   "parameters": {
     "patch_selection": {
@@ -23,7 +23,7 @@
 
         {
           "patch_uuid_filter_regex": null,
-          "patch_2d_sampling_max_area": 542534.0
+          "patch_2d_sampling_max_area": 9542534.0
         },
         {
           "patch_uuid_filter_regex": "^(?!.*band-seed).*$",
