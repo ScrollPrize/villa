@@ -329,7 +329,14 @@ UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
 
     if (document.is_object() && document.contains("metadata")) {
         const auto& metadata = document.at("metadata");
-        if (metadata.is_object()) {
+        if (!metadata.is_object() && !metadata.is_null()) {
+            // Without this a wrong-typed block reads as a legacy file that never
+            // declared a frame, which is the same failure the per-field errors
+            // exist to prevent. Null stays legal: that is how a writer spells
+            // "no value", so it means the same as leaving the key out.
+            info.metadataErrors.push_back("metadata: expected an object, got " +
+                                          metadata.dump());
+        } else if (metadata.is_object()) {
             // A present-but-invalid field is recorded so that consumers can
             // tell a typo from a legacy file that never declared the field.
             // Format is fixed: "<key>: <reason>, got <value-as-written>".

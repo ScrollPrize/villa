@@ -520,8 +520,36 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
         CHECK_FALSE(info.volumeWidth.has_value());
         CHECK_FALSE(info.volumeHeight.has_value());
         CHECK_FALSE(info.volumeSlices.has_value());
-        // No field was declared, so there is no field to blame.
+        // The block is blamed as a whole: read as legacy it would let a
+        // consumer guess the frame, which is what these errors prevent.
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] == "metadata: expected an object, got \"nope\"");
+        fs::remove(path);
+    }
+
+    SUBCASE("metadata of any non-object type is malformed")
+    {
+        for (const char* value : {"3", "[1,2]", "true"}) {
+            const auto path = tmpFile("info_metadata_type", ".json");
+            writeFile(path, std::string(R"({"metadata": )") + value + ", " + points);
+
+            const auto info = Umbilicus::LoadFileInfo(path);
+            REQUIRE(info.metadataErrors.size() == 1);
+            CHECK(info.metadataErrors[0].rfind("metadata: expected an object", 0) == 0);
+            CHECK(info.controlPoints.size() == 1);
+            fs::remove(path);
+        }
+    }
+
+    SUBCASE("metadata null means the same as leaving it out")
+    {
+        const auto path = tmpFile("info_metadata_null", ".json");
+        writeFile(path, R"({"metadata": null, )" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
         CHECK(info.metadataErrors.empty());
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.controlPoints.size() == 1);
         fs::remove(path);
     }
 }
