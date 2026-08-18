@@ -248,9 +248,11 @@ class SmearTransform(ImageOnlyTransform):
             dims = list(range(chan_img.ndim))
             if local_smear_axis != 0:
                 dims = [local_smear_axis] + [d for d in dims if d != local_smear_axis]
-                moved = chan_img.permute(*dims)
+                # permute returns a view; without a copy the writes below land in
+                # the caller's tensor, which the img.clone() above means to avoid
+                moved = chan_img.permute(*dims).contiguous()
             else:
-                moved = chan_img
+                moved = chan_img.clone()
             N = moved.shape[0]
             for i in range(self.num_prev_slices, N):
                 aggregated = torch.zeros_like(moved[i], dtype=torch.float32, device=moved.device)
