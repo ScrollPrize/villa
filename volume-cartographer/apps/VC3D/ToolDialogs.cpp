@@ -3153,9 +3153,6 @@ QString GrowTrackPatchesDialog::resolvedPython() const
 
 QString GrowTrackPatchesDialog::scriptPath() const
 {
-    const QString hardcoded = QStringLiteral("/home/sean/villa/volume-cartographer/scripts/spiral/grow_track_graph.py");
-    if (QFileInfo(hardcoded).isFile()) return hardcoded;
-
     const QString appDir = QCoreApplication::applicationDirPath();
     const QStringList candidates = {
         QDir(appDir).filePath("../scripts/spiral/grow_track_graph.py"),
@@ -3163,11 +3160,12 @@ QString GrowTrackPatchesDialog::scriptPath() const
         QDir(appDir).filePath("scripts/spiral/grow_track_graph.py"),
         QDir(QDir::currentPath()).filePath("scripts/spiral/grow_track_graph.py"),
         QDir(QDir::currentPath()).filePath("volume-cartographer/scripts/spiral/grow_track_graph.py"),
+        QDir(appDir).filePath("../share/volume-cartographer/spiral/grow_track_graph.py"),
     };
     for (const auto& c : candidates) {
         if (QFileInfo(c).isFile()) return QDir::cleanPath(c);
     }
-    return hardcoded;
+    return {};
 }
 
 QStringList GrowTrackPatchesDialog::buildArgs() const

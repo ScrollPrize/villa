@@ -397,6 +397,7 @@ def previously_used_seed_rows(
                 recorded_path is not None
                 and Path(recorded_path).resolve() == target
                 and seed is not None
+                and is_complete_tifxyz(metadata_path.parent)
             ):
                 used.add(int(seed))
         except OSError, TypeError, ValueError, json.JSONDecodeError:
@@ -2314,6 +2315,29 @@ def write_tifxyz(
     (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
+def is_complete_tifxyz(path: str | Path) -> bool:
+    """Return whether a directory contains a readable tifxyz output."""
+    import tifffile
+
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    try:
+        metadata = json.loads((path / "meta.json").read_text())
+        if not isinstance(metadata, dict) or metadata.get("format") != "tifxyz":
+            return False
+        shapes = []
+        for name in ("x.tif", "y.tif", "z.tif"):
+            channel = path / name
+            if not channel.is_file():
+                return False
+            with tifffile.TiffFile(channel) as image:
+                shapes.append(image.series[0].shape)
+        return len(set(shapes)) == 1 and len(shapes[0]) == 2 and all(shapes[0])
+    except (IndexError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _collect_trimmed_surface(grower, args, *, min_points: int = 0):
     """Collect the currently published surface and apply all point trims."""
     uv, xyz, track_ids, arcs = grower.surface_points_arcs()
@@ -2612,7 +2636,7 @@ def _initialize_worker(tracks_path: str, crossings_path: str, args) -> None:
 
     _THREADPOOL_LIMITER = threadpool_limits(limits=1)
     tracks = PackedTracks(tracks_path)
-    crossings = CrossingCsr(crossings_path, tracks, validate_source_ids=False)
+    crossings = CrossingCsr(crossings_path, tracks)
     _WORKER = (tracks, crossings, args)
 
 
@@ -2764,8 +2788,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
-    if bool(args.seeds) == bool(args.random_count):
+    if (args.seeds is None) == (args.random_count is None):
         parser.error("pass exactly one of --seeds or --random-count")
+    if args.random_count is not None and args.random_count <= 0:
+        parser.error("--random-count must be positive")
     if not math.isfinite(args.random_top_percent) or not (
         0.0 < args.random_top_percent <= 100.0
     ):
@@ -2786,7 +2812,7 @@ def main(argv=None) -> int:
     if not math.isfinite(args.resample_spacing) or args.resample_spacing <= 0:
         parser.error("--resample-spacing must be finite and positive")
     tracks = PackedTracks(args.tracks)
-    crossings = CrossingCsr(args.crossings, tracks, validate_source_ids=False)
+    crossings = CrossingCsr(args.crossings, tracks)
     args.output.mkdir(parents=True, exist_ok=True)
 
     if args.seeds:
@@ -2825,12 +2851,17 @@ def main(argv=None) -> int:
             ]
             if existing:
                 if not args.overwrite:
-                    print(f"skip existing {existing[0]}")
-                    if args.seeds:
-                        successes += 1
-                    continue
+                    complete = [path for path in existing if is_complete_tifxyz(path)]
+                    if complete:
+                        print(f"skip existing {complete[0]}")
+                        if args.seeds:
+                            successes += 1
+                        continue
+                    for path in existing:
+                        print(f"incomplete existing output {path}; regenerating")
                 for p in existing:
-                    shutil.rmtree(p)
+                    if args.overwrite:
+                        shutil.rmtree(p)
             now = time.time()
             stamp = (
                 time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
