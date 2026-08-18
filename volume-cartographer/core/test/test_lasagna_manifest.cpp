@@ -174,6 +174,7 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
         std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
         out << R"({
           "artifact_url":"s3://bucket/path/artifact/",
+          "anonymous":true,
           "manifest_file":"dataset.lasagna.json"
         })";
     }
@@ -188,6 +189,8 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
     CHECK(group.remoteCacheRoot == dir);
     CHECK(group.sourceLocation ==
           "s3://bucket/path/artifact/pred.zarr");
+    CHECK_FALSE(dataset.manifest().discoverAwsCredentials);
+    CHECK_FALSE(group.discoverAwsCredentials);
 
     fs::remove_all(dir);
 }

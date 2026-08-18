@@ -36,6 +36,7 @@ struct LasagnaChannelGroup {
     std::string remoteZarrKey;
     std::filesystem::path remoteCacheRoot;
     vc::HttpAuth remoteAuth;
+    bool discoverAwsCredentials = true;
     int scaledown = 0;
     std::vector<std::string> channels;
 
@@ -68,6 +69,9 @@ struct LasagnaDatasetManifest {
     // Original marker or manifest origin used to form readable project paths.
     std::string remoteSourceBaseLocation;
     std::filesystem::path remoteCacheRoot;
+    // A cached public catalog marker sets this false so later group opens do
+    // not accidentally inherit invalid credentials from the host machine.
+    bool discoverAwsCredentials = true;
 
     // Backward-compatible summary for old callers: a Lasagna dataset's
     // normal source is its manifest when nx/ny channels are present.

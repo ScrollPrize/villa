@@ -50,6 +50,11 @@ bool hasEntryTag(const Entry& entry, std::string_view tag)
     return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
 }
 
+bool usesAnonymousRemoteAuth(const Entry& entry)
+{
+    return hasEntryTag(entry, kAnonymousRemoteAuthTag);
+}
+
 bool isFiberLasagnaEntry(const Entry& entry)
 {
     return hasEntryTag(entry, kFiberLasagnaTag);
@@ -878,13 +883,16 @@ bool VolumePkg::reconcileVolumeEntryTags(
                 !samePersistedVolumeIdentity(volume->remoteLocator(), entry.location))
                 continue;
             try {
+                const bool anonymous =
+                    vc::project::usesAnonymousRemoteAuth(entry);
                 auto refreshed = Volume::NewFromUrl(
                     entry.location,
                     opts_.remoteCacheRoot.empty()
                         ? volume->remoteCacheRoot()
                         : opts_.remoteCacheRoot,
-                    volume->remoteAuth(),
-                    vc::project::volumeMetadataFromEntryTags(entry.tags));
+                    anonymous ? vc::HttpAuth{} : volume->remoteAuth(),
+                    vc::project::volumeMetadataFromEntryTags(entry.tags),
+                    !anonymous);
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
                 if (newId != oldId && loadedVolumes_.count(newId) != 0) {
@@ -935,12 +943,15 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
                 auto metadata = vc::project::volumeMetadataFromEntryTags(e.tags);
                 if (!metadata.empty()) {
                     try {
+                        const bool anonymous =
+                            vc::project::usesAnonymousRemoteAuth(e);
                         auto refreshed = Volume::NewFromUrl(
                             e.location,
                             opts_.remoteCacheRoot.empty()
                                 ? volume->remoteCacheRoot()
                                 : opts_.remoteCacheRoot,
-                            volume->remoteAuth(), metadata);
+                            anonymous ? vc::HttpAuth{} : volume->remoteAuth(),
+                            metadata, !anonymous);
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
                             loadedVolumes_.erase(it);
@@ -1908,7 +1919,8 @@ void VolumePkg::resolveAll()
                 remoteResults[i] = {
                     Volume::NewFromUrl(
                         entry.location, remoteCacheRoot, {},
-                        vc::project::volumeMetadataFromEntryTags(entry.tags)),
+                        vc::project::volumeMetadataFromEntryTags(entry.tags),
+                        !vc::project::usesAnonymousRemoteAuth(entry)),
                     {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
@@ -2019,7 +2031,8 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                 e.location,
                 opts_.remoteCacheRoot,
                 {},
-                vc::project::volumeMetadataFromEntryTags(e.tags));
+                vc::project::volumeMetadataFromEntryTags(e.tags),
+                !vc::project::usesAnonymousRemoteAuth(e));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);

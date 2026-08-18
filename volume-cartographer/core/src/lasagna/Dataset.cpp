@@ -65,13 +65,16 @@ namespace {
     return resolved;
 }
 
-[[nodiscard]] utils::HttpClient makeRemoteClient(const vc::ResolvedUrl& endpoint, const vc::HttpAuth& explicitAuth)
+[[nodiscard]] utils::HttpClient makeRemoteClient(
+    const vc::ResolvedUrl& endpoint,
+    const vc::HttpAuth& explicitAuth,
+    bool discoverAwsCredentials)
 {
     utils::HttpClient::Config config;
     config.transfer_timeout = std::chrono::seconds{60};
     config.aws_auth = explicitAuth;
     if (endpoint.useAwsSigv4) {
-        if (config.aws_auth.empty())
+        if (config.aws_auth.empty() && discoverAwsCredentials)
             config.aws_auth = utils::AwsAuth::load();
         if (!endpoint.awsRegion.empty())
             config.aws_auth.region = endpoint.awsRegion;
@@ -114,7 +117,12 @@ namespace {
     return normalized.generic_string();
 }
 
-void applyRemoteGroup(LasagnaChannelGroup& group, std::string remoteBaseUrl, std::string remoteKey, std::filesystem::path remoteCacheRoot, const vc::HttpAuth& remoteAuth)
+void applyRemoteGroup(LasagnaChannelGroup& group,
+                      std::string remoteBaseUrl,
+                      std::string remoteKey,
+                      std::filesystem::path remoteCacheRoot,
+                      const vc::HttpAuth& remoteAuth,
+                      bool discoverAwsCredentials)
 {
     if (remoteCacheRoot.empty()) {
         throw std::runtime_error("Remote Lasagna group requires a remote cache directory: " + group.relativeZarrKey);
@@ -124,6 +132,7 @@ void applyRemoteGroup(LasagnaChannelGroup& group, std::string remoteBaseUrl, std
     group.remoteZarrKey = std::move(remoteKey);
     group.remoteCacheRoot = std::move(remoteCacheRoot);
     group.remoteAuth = remoteAuth;
+    group.discoverAwsCredentials = discoverAwsCredentials;
 }
 
 void resolveGroupLocations(
@@ -138,12 +147,18 @@ void resolveGroupLocations(
         manifest.remoteCacheRoot.empty()
             ? optionRemoteCacheRoot
             : manifest.remoteCacheRoot;
+    const bool discoverAwsCredentials =
+        manifest.discoverAwsCredentials && options.discoverAwsCredentials;
+    const vc::HttpAuth remoteAuth = discoverAwsCredentials
+        ? options.remoteAuth
+        : vc::HttpAuth{};
 
     for (auto& group : manifest.groups) {
         group.sourceLocation.clear();
         group.remoteZarrBaseUrl.clear();
         group.remoteZarrKey.clear();
         group.remoteCacheRoot.clear();
+        group.discoverAwsCredentials = true;
 
         if (isRemoteLocation(group.relativeZarrKey)) {
             const auto endpoint = resolveRemoteEndpoint(group.relativeZarrKey);
@@ -156,7 +171,8 @@ void resolveGroupLocations(
                 vc::core::util::remoteFileCachePath(group.relativeZarrKey);
             group.sourceLocation = vc::core::util::remoteFileCacheSource(
                 group.relativeZarrKey);
-            applyRemoteGroup(group, endpoint.httpsUrl, {}, cacheRoot, options.remoteAuth);
+            applyRemoteGroup(group, endpoint.httpsUrl, {}, cacheRoot,
+                             remoteAuth, discoverAwsCredentials);
             continue;
         }
 
@@ -175,7 +191,8 @@ void resolveGroupLocations(
                     : manifest.remoteSourceBaseLocation,
                 key);
             applyRemoteGroup(group, manifest.remoteBaseUrl, key,
-                             manifest.remoteCacheRoot, options.remoteAuth);
+                             manifest.remoteCacheRoot, remoteAuth,
+                             discoverAwsCredentials);
             continue;
         }
 
@@ -193,14 +210,15 @@ class PersistentHttpStore final : public utils::Store {
 public:
     PersistentHttpStore(std::string baseUrl,
                         std::filesystem::path cacheRoot,
-                        vc::HttpAuth remoteAuth)
+                        vc::HttpAuth remoteAuth,
+                        bool discoverAwsCredentials)
         : cacheRoot_(std::move(cacheRoot)),
           budget_(vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_))
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
         client_ = std::make_unique<utils::HttpClient>(
-            makeRemoteClient(endpoint, remoteAuth));
+            makeRemoteClient(endpoint, remoteAuth, discoverAwsCredentials));
     }
 
     bool exists(const std::string& key) const override
@@ -489,6 +507,8 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
     manifest.remoteSourceBaseLocation =
         vc::core::util::remoteFileCacheSource(url);
     manifest.remoteCacheRoot = manifest.baseDirectory;
+    manifest.discoverAwsCredentials =
+        !marker.value("anonymous", false);
 }
 
 } // namespace
@@ -524,7 +544,10 @@ MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manife
     cacheOptions.cacheRoot = root;
     cacheOptions.destination = manifestPath.lexically_relative(root);
     cacheOptions.policy = options.cachePolicy;
-    cacheOptions.auth = options.remoteAuth;
+    cacheOptions.auth = options.discoverAwsCredentials
+        ? options.remoteAuth
+        : vc::HttpAuth{};
+    cacheOptions.discoverAwsCredentials = options.discoverAwsCredentials;
     cacheOptions.fetcher = options.remoteFileFetcher;
     const auto cached = vc::core::util::cacheRemoteFile(manifestLocation, cacheOptions);
     std::clog << "Lasagna manifest cache "
@@ -642,7 +665,8 @@ utils::ZarrArray openLasagnaChannelArray(
     auto registry = vc::buildZarrCodecRegistry(dtypeSize);
     if (group.isRemote()) {
         auto store = std::make_shared<PersistentHttpStore>(
-            group.remoteZarrBaseUrl, group.remoteCacheRoot, group.remoteAuth);
+            group.remoteZarrBaseUrl, group.remoteCacheRoot, group.remoteAuth,
+            group.discoverAwsCredentials);
         return utils::ZarrArray::open(
             std::move(store), group.remoteZarrKey, std::move(registry));
     }
