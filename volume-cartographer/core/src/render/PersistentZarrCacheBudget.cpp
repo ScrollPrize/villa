@@ -280,6 +280,10 @@ struct PersistentZarrCacheBudget::Impl {
     std::uint64_t freeBytes = 0;
     bool lowSpace = false;
     bool scanInFlight = true;
+    // A subtree may be renamed while the startup scan is running. Discard that
+    // scan's potentially stale paths and repeat it once the filesystem layout
+    // is stable instead of blocking the caller that performs the rename.
+    bool scanRestartRequested = false;
     bool trimInFlight = false;
     std::size_t retirementsInFlight = 0;
 };
@@ -370,72 +374,87 @@ void PersistentZarrCacheBudget::startScan()
 {
     auto self = shared_from_this();
     std::thread([self] {
-        std::vector<fs::path> files;
-        std::vector<fs::path> artifacts;
-        std::vector<NativeZarrArrayLayout> zarrArrays;
-        std::vector<fs::path> retiredRoots;
-        std::error_code ec;
-        fs::recursive_directory_iterator it(
-            self->impl_->root, fs::directory_options::skip_permission_denied, ec);
-        const fs::recursive_directory_iterator end;
-        while (!ec && it != end) {
-            if (it->is_directory(ec) && !ec &&
-                it->path().filename() == kRetiredCacheDirectory) {
-                retiredRoots.push_back(normalizedPath(it->path()));
-                it.disable_recursion_pending();
-            } else if (it->is_regular_file(ec)) {
-                const auto path = normalizedPath(it->path());
-                files.push_back(path);
-                if (path.filename() == "lasagna-remote.json")
-                    artifacts.push_back(path.parent_path());
-                if (path.filename() == ".zarray" ||
-                    path.filename() == "zarr.json") {
-                    if (auto layout = nativeZarrArrayLayout(path))
-                        zarrArrays.push_back(std::move(*layout));
+        for (;;) {
+            std::vector<fs::path> files;
+            std::vector<fs::path> artifacts;
+            std::vector<NativeZarrArrayLayout> zarrArrays;
+            std::vector<fs::path> retiredRoots;
+            std::error_code ec;
+            fs::recursive_directory_iterator it(
+                self->impl_->root,
+                fs::directory_options::skip_permission_denied, ec);
+            const fs::recursive_directory_iterator end;
+            while (!ec && it != end) {
+                if (it->is_directory(ec) && !ec &&
+                    it->path().filename() == kRetiredCacheDirectory) {
+                    retiredRoots.push_back(normalizedPath(it->path()));
+                    it.disable_recursion_pending();
+                } else if (it->is_regular_file(ec)) {
+                    const auto path = normalizedPath(it->path());
+                    files.push_back(path);
+                    if (path.filename() == "lasagna-remote.json")
+                        artifacts.push_back(path.parent_path());
+                    if (path.filename() == ".zarray" ||
+                        path.filename() == "zarr.json") {
+                        if (auto layout = nativeZarrArrayLayout(path))
+                            zarrArrays.push_back(std::move(*layout));
+                    }
+                }
+                if (ec)
+                    ec.clear();
+                it.increment(ec);
+            }
+
+            std::unordered_map<std::string, Impl::Entry> found;
+            std::uint64_t total = 0;
+            const auto genericPayloads = managedGenericPayloads(files);
+            for (const auto& path : files) {
+                if (!isVolumeChunk(path, self->impl_->root) &&
+                    !isLasagnaData(path, artifacts) &&
+                    !isNativeZarrPayload(path, zarrArrays) &&
+                    !genericPayloads.contains(path.string()))
+                    continue;
+                std::error_code fileEc;
+                const auto size = fs::file_size(path, fileEc);
+                if (fileEc)
+                    continue;
+                const auto touched = fs::last_write_time(path, fileEc);
+                if (fileEc)
+                    continue;
+                found.emplace(path.string(), Impl::Entry{size, touched});
+                total += size;
+            }
+
+            bool restart = false;
+            {
+                std::lock_guard lock(self->impl_->mutex);
+                restart = self->impl_->scanRestartRequested;
+                self->impl_->scanRestartRequested = false;
+                if (!restart) {
+                    self->impl_->entries = std::move(found);
+                    self->impl_->managedBytes = total;
+                    self->impl_->scanInFlight = false;
+                    self->impl_->retirementsInFlight += retiredRoots.size();
                 }
             }
-            if (ec)
-                ec.clear();
-            it.increment(ec);
+            if (!restart) {
+                for (auto& retired : retiredRoots) {
+                    self->removeRetiredSubtreeAsync(
+                        std::move(retired), true);
+                }
+                break;
+            }
         }
-
-        std::unordered_map<std::string, Impl::Entry> found;
-        std::uint64_t total = 0;
-        const auto genericPayloads = managedGenericPayloads(files);
-        for (const auto& path : files) {
-            if (!isVolumeChunk(path, self->impl_->root) &&
-                !isLasagnaData(path, artifacts) &&
-                !isNativeZarrPayload(path, zarrArrays) &&
-                !genericPayloads.contains(path.string()))
-                continue;
-            std::error_code fileEc;
-            const auto size = fs::file_size(path, fileEc);
-            if (fileEc)
-                continue;
-            const auto touched = fs::last_write_time(path, fileEc);
-            if (fileEc)
-                continue;
-            found.emplace(path.string(), Impl::Entry{size, touched});
-            total += size;
-        }
-
-        {
-            std::lock_guard lock(self->impl_->mutex);
-            self->impl_->entries = std::move(found);
-            self->impl_->managedBytes = total;
-            self->impl_->scanInFlight = false;
-        }
-        for (auto& retired : retiredRoots)
-            self->removeRetiredSubtreeAsync(std::move(retired));
         self->startTrim();
         self->impl_->cv.notify_all();
         self->pollSpace();
     }).detach();
 }
 
-void PersistentZarrCacheBudget::removeRetiredSubtreeAsync(fs::path retired)
+void PersistentZarrCacheBudget::removeRetiredSubtreeAsync(
+    fs::path retired, bool alreadyRegistered)
 {
-    {
+    if (!alreadyRegistered) {
         std::lock_guard lock(impl_->mutex);
         ++impl_->retirementsInFlight;
     }
@@ -595,7 +614,11 @@ PersistentZarrCacheBudget::reserveWriteImpl(
         path = normalizedPath(path);
 
     std::unique_lock lock(impl_->mutex);
-    impl_->cv.wait(lock, [&] { return !impl_->scanInFlight; });
+    // Protected structural metadata is not part of the managed chunk index, so
+    // it can be published while an accounting scan is running. Managed payload
+    // writes still wait for an exact index before enforcing size limits.
+    if (managed)
+        impl_->cv.wait(lock, [&] { return !impl_->scanInFlight; });
     impl_->cv.wait(lock, [&] {
         if (impl_->writePins.contains(normalizedTarget.string()) ||
             impl_->readPins.contains(normalizedTarget.string()))
@@ -721,7 +744,7 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
     };
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
-        if (impl_->scanInFlight || impl_->trimInFlight)
+        if (impl_->trimInFlight && !impl_->scanInFlight)
             return false;
         for (const auto& [path, count] : impl_->readPins) {
             (void)count;
@@ -747,20 +770,20 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
         return false;
     }
 
-    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
-        if (!overlaps(it->first)) {
-            ++it;
-            continue;
-        }
-        impl_->managedBytes -=
-            std::min(impl_->managedBytes, it->second.size);
-        it = impl_->entries.erase(it);
-    }
+    const bool startRescan = retired && !impl_->scanInFlight;
+    if (startRescan)
+        impl_->scanInFlight = true;
+    else if (retired)
+        impl_->scanRestartRequested = true;
     lock.unlock();
-    if (retired)
-        removeRetiredSubtreeAsync(std::move(*retired));
-    else
+    if (retired) {
+        // The restarted scan skips retired cache trees, accounts the live root,
+        // and schedules deletion exactly once after publishing that index.
+        if (startRescan)
+            startScan();
+    } else {
         pollSpace();
+    }
     return true;
 }
 
@@ -791,7 +814,11 @@ bool PersistentZarrCacheBudget::moveCacheSubtree(
     };
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
-        if (impl_->scanInFlight || impl_->trimInFlight)
+        // A trim that is waiting for the startup scan has not touched the
+        // filesystem yet. The scan will be restarted after this rename and the
+        // trim will consume the resulting paths. An active post-scan trim must
+        // still finish first.
+        if (impl_->trimInFlight && !impl_->scanInFlight)
             return false;
         for (const auto& [path, count] : impl_->readPins) {
             (void)count;
@@ -817,23 +844,14 @@ bool PersistentZarrCacheBudget::moveCacheSubtree(
     if (ec)
         return false;
 
-    std::vector<std::pair<std::string, Impl::Entry>> movedEntries;
-    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
-        const auto path = fs::path(it->first);
-        if (!isWithin(path, normalizedSource)) {
-            ++it;
-            continue;
-        }
-        movedEntries.emplace_back(
-            (normalizedDestination /
-             path.lexically_relative(normalizedSource)).string(),
-            it->second);
-        it = impl_->entries.erase(it);
-    }
-    for (auto& [path, entry] : movedEntries)
-        impl_->entries.insert_or_assign(std::move(path), std::move(entry));
+    const bool startRescan = !impl_->scanInFlight;
+    if (startRescan)
+        impl_->scanInFlight = true;
+    else
+        impl_->scanRestartRequested = true;
     lock.unlock();
-    pollSpace();
+    if (startRescan)
+        startScan();
     return true;
 }
 

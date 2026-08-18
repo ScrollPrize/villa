@@ -11,9 +11,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -111,6 +113,53 @@ public:
     {
         return true;
     }
+};
+
+class BlockingDecodeCountingFetcher final : public CountingFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        {
+            std::lock_guard lock(blockMutex_);
+            fetchEntered_ = true;
+        }
+        blockCv_.notify_all();
+        {
+            std::unique_lock lock(blockMutex_);
+            blockCv_.wait(lock, [&] { return fetchReleased_; });
+        }
+        return CountingFetcher::fetch(key);
+    }
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult fetched) const override
+    {
+        decodeCalls.fetch_add(1, std::memory_order_relaxed);
+        return fetched;
+    }
+
+    void waitForFetch()
+    {
+        std::unique_lock lock(blockMutex_);
+        blockCv_.wait(lock, [&] { return fetchEntered_; });
+    }
+
+    void releaseFetch()
+    {
+        {
+            std::lock_guard lock(blockMutex_);
+            fetchReleased_ = true;
+        }
+        blockCv_.notify_all();
+    }
+
+    mutable std::atomic<int> decodeCalls{0};
+
+private:
+    std::mutex blockMutex_;
+    std::condition_variable blockCv_;
+    bool fetchEntered_ = false;
+    bool fetchReleased_ = false;
 };
 
 fs::path tmpDir(const std::string& tag)
@@ -796,6 +845,45 @@ TEST_CASE("Delta3D prefill decodes and persists without populating decoded RAM")
     fs::remove_all(persist);
 }
 
+TEST_CASE("Delta3D foreground and persistence requests share one source decode")
+{
+    auto persist = tmpDir("delta3d_shared_decode");
+    auto fetcher = std::make_shared<BlockingDecodeCountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    fetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(fetcher, persist);
+
+    auto rendered = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    fetcher->waitForFetch();
+    auto persisted = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    // Refresh joins the already-running keyed source transfer. Give its
+    // scheduler publication a chance to complete before releasing the source.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    fetcher->releaseFetch();
+
+    REQUIRE(rendered.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    REQUIRE(persisted.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    CHECK(rendered.get().status == ChunkStatus::Data);
+    CHECK(persisted.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    cache->waitForPersistentWrites();
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
+    CHECK(fs::is_regular_file(persist / "0" / "0.0.0"));
+
+    cache.reset();
+    fs::remove_all(persist);
+}
+
 TEST_CASE("Delta3D disk budget accounts the final encoded payload size")
 {
     const auto root = tmpDir("delta3d_budget");
@@ -900,6 +988,7 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
     auto delta = makeDelta3dCache(deltaFetcher, persist, parent);
     REQUIRE(delta->persistentCacheLayout() ==
             vc::render::PersistentCacheLayout::Delta3d);
+    budget->waitForIdle();
     CHECK(budget->stats().managedBytes == 0);
     CHECK_FALSE(fs::exists(persist / "scale0" / "0.0.0"));
     CHECK_FALSE(fs::exists(bookkeeping));

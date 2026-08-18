@@ -134,6 +134,8 @@ TEST_CASE("budget-coordinated cache migration preserves accounting")
     CHECK(fs::is_regular_file(
         groupedVolume / "level_0" / "0" / "0" / "0.bin"));
     CHECK(budget->stats().managedBytes == 37);
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 37);
 
     auto pin = budget->pinRead(
         groupedVolume / "level_0" / "0" / "0" / "0.bin");
@@ -156,8 +158,8 @@ TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting
     CHECK(budget->removeCacheSubtree(oldVolume, ec));
     CHECK_FALSE(ec);
     CHECK_FALSE(fs::exists(oldVolume));
-    CHECK(budget->stats().managedBytes == 0);
     budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 0);
     CHECK_FALSE(fs::exists(root / ".vc_cache_retired"));
 
     CHECK(publish(*budget, volumeChunk(root, 1), 100));

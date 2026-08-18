@@ -569,7 +569,8 @@ private:
         const std::shared_ptr<State>& state,
         ChunkKey key,
         FetchContext context,
-        std::shared_ptr<ChunkFetchResult> fetched);
+        std::shared_ptr<ChunkFetchResult> fetched,
+        std::shared_ptr<PersistenceOperation> persistence = {});
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
@@ -632,22 +633,26 @@ private:
     static void queueFetchedDecode(const std::shared_ptr<State>& state,
                                    const ChunkKey& key,
                                    FetchContext context,
-                                   ChunkFetchResult fetched);
+                                   ChunkFetchResult fetched,
+                                   std::shared_ptr<PersistenceOperation> persistence = {});
     static void finishAndStore(const std::shared_ptr<State>& state,
                                const ChunkKey& key,
                                FetchContext context,
                                ChunkFetchResult fetch,
-                               bool loadedFromPersistentCache);
+                               bool loadedFromPersistentCache,
+                               std::shared_ptr<PersistenceOperation> persistence = {});
     static PersistentProbeResult probePersistent(const State& state,
                                                   const ChunkKey& key);
     static std::optional<PersistentReadResult> readPersistent(
         const State& state,
         const ChunkKey& key,
         const PersistentProbeResult& probe);
-    static void storeFetchResultLocked(const std::shared_ptr<State>& state,
-                                       const ChunkKey& key,
-                                       ChunkFetchResult fetch,
-                                       bool loadedFromPersistentCache);
+    [[nodiscard]] static bool storeFetchResultLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        ChunkFetchResult fetch,
+        bool loadedFromPersistentCache,
+        const std::shared_ptr<PersistenceOperation>& persistence = {});
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
@@ -655,7 +660,8 @@ private:
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
         std::shared_ptr<const std::vector<std::byte>> bytes,
-        std::shared_ptr<PersistenceOperation> operation = {});
+        std::shared_ptr<PersistenceOperation> operation = {},
+        bool stateAlreadyLocked = false);
     static void queueDelta3dMaintenanceDecode(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
