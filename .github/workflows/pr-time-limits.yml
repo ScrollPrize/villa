@@ -1,0 +1,38 @@
+name: PR time limits
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+      timezone: "America/Los_Angeles"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  close-prs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Close inactive or unmerged PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          inactive_cutoff=$(date -u -d '14 days ago' +%s)
+          age_cutoff=$(date -u -d '28 days ago' +%s)
+
+          gh pr list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --limit 1000 \
+            --json number,createdAt,updatedAt,labels \
+            --jq '.[] | select([.labels[].name] | index("keep-open") | not) | [.number, .createdAt, .updatedAt] | @tsv' |
+          while IFS=$'\t' read -r number created_at updated_at; do
+            created_ts=$(date -u -d "$created_at" +%s)
+            updated_ts=$(date -u -d "$updated_at" +%s)
+
+            if [ "$updated_ts" -le "$inactive_cutoff" ] || [ "$created_ts" -le "$age_cutoff" ]; then
+              gh pr close "$number" --repo "${{ github.repository }}"
+            fi
+          done
