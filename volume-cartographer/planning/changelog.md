@@ -102,7 +102,7 @@
 
 ## 2026-08-18
 
-- Re-enabled the 5% synthetic-rendering gate with native paired attribution and production-cache lookup coverage.
+- Re-enabled the 5% synthetic-rendering gate with native scheduler-matched paired attribution and production-cache lookup coverage.
 
 ## 2026-08-12
 

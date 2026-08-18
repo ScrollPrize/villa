@@ -139,10 +139,12 @@
   Periodic Callgrind deltas must be placed chronologically over matched DRD work
   windows while preserving each thread's exact aggregate modeled cost.
 - Raw Valgrind worker IDs must never be treated as identities across independent
-  runs. Main thread 1 remains fixed; workers are matched by canonical work rank.
-  Equal DRD signatures require predeclared cost and chronological-shape
-  equivalence. All admissible equivalent mappings must be replayed and the
-  maximum makespan reported; non-equivalent ambiguity is an error.
+  runs. Main thread 1 remains fixed. Each Valgrind run must passively record its
+  own measured-window scheduler stream. All worker permutations must be scored
+  from normalized activity share and cumulative activity, and all assignments
+  indistinguishable at the configured scheduler-quantum resolution must be
+  replayed. The maximum makespan is reported; a case whose compatible mappings
+  exceed the predeclared makespan-spread limit is an attribution error.
 - The relative modeled-runtime score is not a validated absolute runtime claim.
   Each case may be at most the configured tolerance slower than its versioned
   reference, initially 10%. Faster scores are accepted without a lower bound.
@@ -161,6 +163,9 @@
   metadata must describe the same case, dimensions, repetitions, worker count,
   and checksum. Parallel traces must have one unambiguous measured window and
   no unresolved in-window happens-before edge.
+- Any retry for insufficient worker-assignment evidence must recollect only the
+  affected case. A valid modeled-runtime regression must never be retried as an
+  attribution failure.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,

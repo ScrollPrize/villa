@@ -178,3 +178,19 @@ enumerated and scored conservatively; non-equivalent ambiguous groups fail.
   0.22% normalized chronological-shape spread. The predeclared native gates are
   therefore separate: 5% total cost and 2% 32-bin shape. Every passing tie is
   still fully enumerated and scored by its maximum makespan.
+
+## Scheduler-evidence repair
+
+- Rank matching still failed when DRD workers tied even though their Callgrind
+  costs differed. Callgrind now records the passive scheduler stream from its
+  own run, with no benchmark or renderer changes.
+- The native matcher enumerates all 24 four-worker assignments and compares
+  normalized worker activity share plus cumulative activity in 16 bins. It
+  replays every assignment within one scheduler quantum of the best match and
+  reports the maximum makespan.
+- The repaired eight-case matrix passed the existing references. The four
+  parallel cases retained 20, 2, 2, and 2 mappings respectively; their
+  conservative makespan spreads were 1.295%, 0.249%, 0.005%, and 0.011%.
+- Attribution fails when compatible mappings span more than 2% in makespan.
+  A future retry must recollect only that failed case. It must not retry a valid
+  score regression.

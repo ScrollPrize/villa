@@ -589,16 +589,20 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     "${_callgrind_dir}/callgrind.out")
                 set(_callgrind_metadata
                     "${_callgrind_dir}/metadata.json")
+                set(_callgrind_scheduler)
+                set(_callgrind_scheduler_args)
                 set(_callgrind_byproducts
-                    "${_callgrind_dir}/callgrind.out"
-                    "${_callgrind_dir}/callgrind.out-01"
                     "${_callgrind_metadata}")
                 if(_fixture STREQUAL "parallel")
+                    set(_callgrind_scheduler
+                        "${_callgrind_dir}/scheduler.log")
+                    list(APPEND _callgrind_scheduler_args
+                        --trace-sched=yes
+                        --trace-syscalls=yes
+                        --time-stamp=yes
+                        "--log-file=${_callgrind_scheduler}")
                     list(APPEND _callgrind_byproducts
-                        "${_callgrind_dir}/callgrind.out-02"
-                        "${_callgrind_dir}/callgrind.out-03"
-                        "${_callgrind_dir}/callgrind.out-04"
-                        "${_callgrind_dir}/callgrind.out-05")
+                        "${_callgrind_scheduler}")
                 endif()
                 add_custom_command(
                     OUTPUT "${_callgrind_stamp}"
@@ -623,6 +627,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         --I1=32768,8,64
                         --D1=32768,8,64
                         --LL=8388608,16,64
+                        ${_callgrind_scheduler_args}
                         "--callgrind-out-file=${_callgrind_prefix}"
                         $<TARGET_FILE:bench_render_synthetic>
                         --fixture ${_fixture}
@@ -687,6 +692,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     --output "${_evaluation}")
                 if(_fixture STREQUAL "parallel")
                     list(APPEND _evaluation_command
+                        --callgrind-scheduler "${_callgrind_scheduler}"
                         --drd-trace "${_drd_trace}"
                         --drd-metadata "${_drd_metadata}")
                 endif()
@@ -714,6 +720,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     --output "${_gate}")
                 if(_fixture STREQUAL "parallel")
                     list(APPEND _gate_command
+                        --callgrind-scheduler "${_callgrind_scheduler}"
                         --drd-trace "${_drd_trace}"
                         --drd-metadata "${_drd_metadata}")
                 endif()

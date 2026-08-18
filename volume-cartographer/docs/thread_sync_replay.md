@@ -2,10 +2,12 @@
 
 The regular rendering estimate is native C++ end to end after Valgrind writes
 its raw files. `bench_thread_sync_replay evaluate-render` parses periodic
-separate-thread Callgrind profiles, locates the measured DRD window from the
-benchmark's existing clock calls, reconstructs vector-clock dependencies,
-matches logical workers, attributes chronological costs, and replays the graph.
-Python remains only in offline calibration and compatibility tooling.
+separate-thread Callgrind profiles and the scheduler stream from that same run,
+locates the measured DRD window from the benchmark's existing clock calls,
+reconstructs vector-clock dependencies, evaluates all logical-worker
+assignments supported by both scheduler traces, attributes chronological costs,
+and replays the graph conservatively. Python remains only in offline
+calibration and compatibility tooling.
 
 Python starts one persistent process and exchanges one JSON object per line.
 Every request and response uses `schema_version: 2` and an ordered

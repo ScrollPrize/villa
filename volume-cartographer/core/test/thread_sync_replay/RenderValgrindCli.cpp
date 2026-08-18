@@ -170,8 +170,8 @@ int renderValgrindCli(int argc, char** argv)
     double score = 0.0;
     json paired = nullptr;
     if (fixture == "serial") {
-        if (arguments.contains("drd-trace") || arguments.contains("drd-metadata")) {
-            throw std::runtime_error("serial evaluation must not use DRD");
+        if (arguments.contains("callgrind-scheduler") || arguments.contains("drd-trace") || arguments.contains("drd-metadata")) {
+            throw std::runtime_error("serial evaluation must not use scheduler traces or DRD");
         }
         for (const auto& [thread, profile] : callgrind.totals) {
             (void)thread;
@@ -182,18 +182,20 @@ int renderValgrindCli(int argc, char** argv)
         const auto drd_metadata = readJson(required(arguments, "drd-metadata"));
         validateMetadata(drd_metadata, fixture, scenario);
         validatePair(metadata, drd_metadata);
+        const auto callgrind_scheduler = parseMeasuredScheduler(required(arguments, "callgrind-scheduler"));
         const auto drd = parseMeasuredDrd(required(arguments, "drd-trace"));
         const auto& replay_config = model.at("replay");
         const auto result = replayPaired(
             callgrind,
+            callgrind_scheduler,
             drd,
             event_model,
             {
                 .residual_fraction = replay_config.at("residual_fraction").get<double>(),
                 .split_policy = replay_config.at("split_policy").get<std::string>(),
-                .equivalent_cost_tolerance = 0.05,
-                .equivalent_shape_tolerance = 0.02,
-                .equivalence_bins = 32,
+                .scheduler_bins = 16,
+                .scheduler_quantum_slack = 1.0,
+                .maximum_makespan_spread = 0.02,
                 .maximum_mappings = 100000,
                 .replay = parseReplayOptions(model),
             });
@@ -207,9 +209,15 @@ int renderValgrindCli(int argc, char** argv)
             {"minimum_makespan", result.minimum_makespan},
             {"maximum_makespan", result.conservative.modeled_makespan},
             {"mapping_count", result.mapping_count},
-            {"maximum_equivalent_cost_spread", result.maximum_equivalent_cost_spread},
-            {"maximum_equivalent_shape_spread", result.maximum_equivalent_shape_spread},
+            {"evaluated_mapping_count", result.evaluated_mapping_count},
+            {"best_assignment_score", result.best_assignment_score},
+            {"assignment_score_tolerance", result.assignment_score_tolerance},
+            {"maximum_assignment_score", result.maximum_assignment_score},
+            {"makespan_relative_spread", result.makespan_relative_spread},
             {"selected_source_by_trace_thread", std::move(mapping)},
+            {"callgrind_scheduler_quanta", callgrind_scheduler.quantum_threads.size()},
+            {"callgrind_scheduler_begin_line", callgrind_scheduler.begin_line},
+            {"callgrind_scheduler_end_line", callgrind_scheduler.end_line},
             {"drd_event_count", drd.events.size()},
             {"drd_happens_before_edges", drd.happens_before_edges},
             {"drd_dropped_pre_window_edges", drd.dropped_pre_window_edges},

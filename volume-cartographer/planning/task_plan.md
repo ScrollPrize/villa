@@ -13,13 +13,12 @@
 3. Parse periodic Callgrind dumps as chronological per-thread event-cost slices.
    Preserve every event counter and require their sum to equal the complete
    measured Callgrind profile.
-4. Keep main thread 1 as the stable control role. Canonically order worker
-   Callgrind traces by deterministic non-cache work signature and DRD worker
-   traces by measured work-quanta/dependency signature. Match ranks only when
-   order is unambiguous; tied DRD signatures require equivalent Callgrind traces
-   within a predeclared tolerance or the pair fails. Enumerate every admissible
-   mapping inside an equivalent tie and use the maximum replay makespan, while
-   reporting the permutation range.
+4. Keep main thread 1 as the stable control role. Capture the passive scheduler
+   stream in the Callgrind execution as well as DRD, enumerate all four-worker
+   assignments, and score them from normalized activity share and cumulative
+   measured-window activity. Replay every mapping within scheduler-quantum
+   resolution of the best score and use the maximum replay makespan. Fail the
+   case when compatible mappings exceed the predeclared makespan-spread limit.
 5. Resample each matched chronological Callgrind cost trace over that DRD
    worker's measured eligible windows while preserving order and exact total
    cost. Keep original DRD thread IDs, program order, blocking, and dependency
@@ -67,8 +66,9 @@
   placement, invalid window vectors, and unchanged generic per-thread
   attribution.
 - Native parser tests for periodic Callgrind dumps and passive measured-window
-  trimming, plus native matching tests for equivalent ties, ambiguous ties,
-  chronological attribution, and exact event-counter conservation.
+  trimming, plus native matching tests for scheduler-selected assignments,
+  scheduler ties, material makespan ambiguity, chronological attribution, and
+  exact event-counter conservation.
 - Repeated complete render matrices before freezing any reference.
 - Exact synthetic-render checksums and existing `ChunkedPlaneSampler` and
   `ChunkCache` tests for speed changes.

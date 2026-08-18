@@ -66,6 +66,7 @@ Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:
 
 - `callgrind/callgrind.out.*`, benchmark metadata, and a collection stamp;
+- `callgrind/scheduler.log` for parallel cases;
 - `drd/drd.log`, benchmark metadata, and a collection stamp for parallel cases;
 - `evaluation.json` for the ungated score;
 - `checked.json` after a passing comparison;
@@ -78,11 +79,19 @@ score. A score above the allowed slowdown is a performance regression requiring
 investigation or an intentional reference update.
 
 Parallel collection uses the same fair scheduler and 10,000-basic-block
-quantum in both Valgrind runs. Periodic Callgrind deltas are matched to the DRD
-measured window by canonical worker work rank. Equal DRD worker signatures are
-accepted only when their total costs differ by at most 5% and their normalized
-32-bin chronological shapes differ by at most 2%. Every admissible mapping is
-replayed and the maximum makespan is the score.
+quantum in both Valgrind runs. Callgrind also records the scheduler stream from
+its own execution. Main thread 1 remains fixed; the four worker identities are
+matched by exhaustively scoring all 24 permutations against normalized worker
+activity share and cumulative activity in 16 measured-window bins. Assignments
+within the scheduler-quantum resolution of the best score are all replayed, and
+the maximum makespan is the case score. The case fails as insufficient
+attribution evidence if those compatible assignments span more than 2% in
+makespan.
+
+An attribution retry, if enabled, must recollect only the affected case and
+only after an `assignment evidence insufficient` failure. It must not retry a
+completed evaluation whose modeled-runtime score exceeds the reference; that
+is a performance regression, not a collection-quality failure.
 
 ## CI Activation
 
