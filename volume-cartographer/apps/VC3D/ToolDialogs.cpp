@@ -2966,7 +2966,7 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     auto* radioRow = new QHBoxLayout();
     rbSeeds_ = new QRadioButton(tr("Explicit seeds"), seedBox);
     rbRandom_ = new QRadioButton(tr("Random count"), seedBox);
-    rbSeeds_->setChecked(true);
+    rbRandom_->setChecked(true);
     radioRow->addWidget(rbSeeds_);
     radioRow->addWidget(rbRandom_);
     radioRow->addStretch();
@@ -2981,14 +2981,14 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     auto* randForm = new QFormLayout();
     spRandomCount_ = new QSpinBox(seedBox);
     spRandomCount_->setRange(1, 1000000);
-    spRandomCount_->setValue(10);
+    spRandomCount_->setValue(50000);
     spRandomSeed_ = new QSpinBox(seedBox);
     spRandomSeed_->setRange(0, INT_MAX);
     spRandomSeed_->setValue(0);
     spRandomTopPercent_ = new QDoubleSpinBox(seedBox);
     spRandomTopPercent_->setRange(0.0001, 100.0);
     spRandomTopPercent_->setDecimals(2);
-    spRandomTopPercent_->setValue(30.0);
+    spRandomTopPercent_->setValue(80.0);
     spMinValidVertices_ = new QSpinBox(seedBox);
     spMinValidVertices_->setRange(0, 100000000);
     spMinValidVertices_->setValue(20000);
