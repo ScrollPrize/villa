@@ -37,7 +37,7 @@ from vesuvius.ink_detection.training.dilation import (
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.ink_detection.training.metrics import BalancedAccuracy, Confusion
 from vesuvius.ink_detection.training.stitching import run_model_forward
-from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch
+from vesuvius.ink_detection.types import ConfusionCounts, MetricBatch, SamplingPolicy
 from vesuvius.ink_detection.training.visualization import (
     PreviewAccumulator,
     build_validation_preview_log,
@@ -63,6 +63,28 @@ def stage_training_request(
     config_path = Path(config_path)
     with config_path.open("r", encoding="utf-8") as stream:
         authored = json.load(stream)
+    if not isinstance(authored, Mapping):
+        raise TypeError("ink training config must be an object")
+    dynamic_label = authored.get("dynamic_label") or {}
+    if isinstance(dynamic_label, Mapping) and bool(
+        dynamic_label.get("enabled", False)
+    ):
+        dynamic_label = dict(dynamic_label)
+        for key in (
+            "unet_ckpt",
+            "dino_ckpt",
+            "ref_embedding",
+            "primary_ckpt",
+            "ensemble_ckpt",
+        ):
+            value = dynamic_label.get(key)
+            if value in (None, ""):
+                continue
+            path = Path(os.path.expanduser(str(value)))
+            if not path.is_absolute():
+                path = config_path.parent / path
+            dynamic_label[key] = str(path)
+        authored["dynamic_label"] = dynamic_label
     config = TrainingConfig.from_mapping(resolve_training_mapping(authored))
     checkpoint_path = resolve_checkpoint_path(
         config.ink.checkpoint.path, config_path
@@ -105,7 +127,9 @@ def prepare_model_input(
     )
 
 
-def prepare_loss_inputs(predictions, batch, *, mode: str):
+def prepare_loss_inputs(
+    predictions, batch, *, mode: str, force_full_supervision: bool = False
+):
     """Return float-workflow predictions, binary targets, and ignore masks."""
 
     if isinstance(predictions, (list, tuple)):
@@ -114,7 +138,10 @@ def prepare_loss_inputs(predictions, batch, *, mode: str):
         ignore_mask = None
         for index, prediction_level in enumerate(predictions):
             prepared, current_targets, current_ignore = prepare_loss_inputs(
-                prediction_level, batch, mode=mode
+                prediction_level,
+                batch,
+                mode=mode,
+                force_full_supervision=force_full_supervision,
             )
             prepared_predictions.append(prepared)
             if index == 0:
@@ -132,8 +159,10 @@ def prepare_loss_inputs(predictions, batch, *, mode: str):
                 align_corners=True,
             )
         targets = batch["inklabels"]
-        ignore_mask = (batch["supervision_mask"] <= 0).to(
-            dtype=targets.dtype
+        ignore_mask = (
+            torch.zeros_like(targets)
+            if force_full_supervision
+            else (batch["supervision_mask"] <= 0).to(dtype=targets.dtype)
         )
         return predictions, targets, ignore_mask
 
@@ -141,7 +170,11 @@ def prepare_loss_inputs(predictions, batch, *, mode: str):
         dtype=batch["inklabels"].dtype
     )
     supervision = torch.amax(batch["supervision_mask"], dim=2)
-    ignore_mask = (supervision <= 0).to(dtype=targets.dtype)
+    ignore_mask = (
+        torch.zeros_like(targets)
+        if force_full_supervision
+        else (supervision <= 0).to(dtype=targets.dtype)
+    )
     output_size = tuple(int(value) for value in predictions.shape[-2:])
     if tuple(int(value) for value in targets.shape[-2:]) != output_size:
         targets = F.interpolate(
@@ -151,6 +184,40 @@ def prepare_loss_inputs(predictions, batch, *, mode: str):
             ignore_mask.float(), size=output_size, mode="nearest"
         ).to(dtype=targets.dtype)
     return predictions, targets, ignore_mask
+
+
+def apply_dynamic_label_substitution(batch, generator, *, kind: str) -> None:
+    """Replace training labels while keeping stored validation labels untouched."""
+
+    image = batch.get("image_for_label", batch["image"])
+    mask = batch.get("image_mask_for_label")
+    kwargs = {}
+    if kind == "self_distill":
+        kwargs = {
+            "raw_mean": batch["image_raw_mean"],
+            "raw_std": batch["image_raw_std"],
+        }
+    labels = generator.generate(image, mask_b1zyx=mask, **kwargs)
+    batch["inklabels"] = labels.to(dtype=batch["inklabels"].dtype)
+    for key in (
+        "image_for_label",
+        "image_mask_for_label",
+        "image_raw_mean",
+        "image_raw_std",
+    ):
+        batch.pop(key, None)
+
+
+def should_save_checkpoint(
+    step: int, *, save_every: int, save_iterations: Sequence[int]
+) -> bool:
+    """Select periodic and explicitly requested completed-iteration checkpoints."""
+
+    completed_iterations = int(step) + 1
+    return (
+        completed_iterations % int(save_every) == 0
+        or completed_iterations in save_iterations
+    )
 
 
 def masked_unsmoothed_bce_with_logits(
@@ -322,7 +389,7 @@ def _run_training(request: TrainingRequest) -> int:
             "ink training requires the models extra with accelerate installed"
         ) from exc
 
-    from torch.utils.data import DataLoader
+    from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
     from tqdm import tqdm
 
     from vesuvius.ink_detection.data.dataset import InkDataset
@@ -387,12 +454,17 @@ def _run_training(request: TrainingRequest) -> int:
         raise ValueError(
             "InkDataset produced no training patches after applying supervision masking"
         )
-    train_dataset = InkDataset(
-        dataset_config,
-        do_augmentations=True,
-        patches=shared_dataset.training_patches,
-        segments=shared_dataset.segments,
-    )
+    train_dataset_kwargs = {
+        "do_augmentations": True,
+        "patches": shared_dataset.training_patches,
+        "segments": shared_dataset.segments,
+    }
+    if config.dynamic_label is not None:
+        train_dataset_kwargs.update(
+            emit_image_for_label=True,
+            input_mask_threshold=config.dynamic_label.input_mask_threshold,
+        )
+    train_dataset = InkDataset(dataset_config, **train_dataset_kwargs)
     val_dataset = InkDataset(
         dataset_config,
         do_augmentations=False,
@@ -415,11 +487,60 @@ def _run_training(request: TrainingRequest) -> int:
                 "prefetch_factor": config.prefetch_factor,
             }
         )
-    policy = build_sampling_policy(
-        shared_dataset.training_patches,
-        dataset_config,
-        batch_size=config.batch_size,
-    )
+    if config.extra_patches.enabled:
+        from vesuvius.ink_detection.data.coord_patch_dataset import (
+            CoordPatchDataset,
+        )
+
+        source = dataset_config.datasets[0]
+        if source.volume_path is None:
+            raise ValueError(
+                "extra_patches requires datasets[0].volume_path"
+            )
+        coord_dataset = CoordPatchDataset(
+            volume_path=str(source.volume_path),
+            resolution=source.volume_scale,
+            coords_xyz=config.extra_patches.coords_xyz,
+            jitter=config.extra_patches.jitter,
+            length=max(64, len(train_dataset) // 8),
+            patch_size=dataset_config.patch_size,
+            normalization=dataset_config.normalization,
+            input_mask_threshold=config.dynamic_label.input_mask_threshold,
+            volume_auth_json=dataset_config.volume_auth_json,
+            volume_cache_dir=dataset_config.volume_cache_dir,
+            volume_cache_max_gb=dataset_config.volume_cache_max_gb,
+        )
+        primary_length = len(train_dataset)
+        coord_length = len(coord_dataset)
+        fraction = config.extra_patches.fraction
+        weights = torch.tensor(
+            [((1.0 - fraction) / primary_length)] * primary_length
+            + [(fraction / coord_length)] * coord_length,
+            dtype=torch.double,
+        )
+        generator = torch.Generator().manual_seed(config.seed)
+        train_dataset = ConcatDataset([train_dataset, coord_dataset])
+        policy = SamplingPolicy(
+            generator=generator,
+            sampler=WeightedRandomSampler(
+                weights,
+                num_samples=config.num_iterations * config.batch_size,
+                replacement=True,
+                generator=generator,
+            ),
+            audit={
+                "strategy": "v3_coordinate_mixture",
+                "base_patches": primary_length,
+                "coordinate_patches": coord_length,
+                "coordinate_fraction": fraction,
+            },
+        )
+    else:
+        policy = build_sampling_policy(
+            shared_dataset.training_patches,
+            dataset_config,
+            batch_size=config.batch_size,
+        )
     accelerator.print(
         "sampling_audit=" + json.dumps(policy.audit, sort_keys=True), flush=True
     )
@@ -478,6 +599,21 @@ def _run_training(request: TrainingRequest) -> int:
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
+    dynamic_label_generator = None
+    if config.dynamic_label is not None:
+        from vesuvius.ink_detection.training.dynamic_labels import (
+            build_dynamic_label_generator,
+        )
+
+        dynamic_label_generator = build_dynamic_label_generator(
+            config.dynamic_label,
+            device=accelerator.device,
+            dtype={
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "no": torch.float32,
+            }.get(config.mixed_precision, torch.float32),
+        )
     # NOTE: we intentionally do NOT prepare lr_scheduler with Accelerate.
     # AcceleratedScheduler calls scheduler.step() num_processes times per
     # optimizer step (when split_batches=False), which makes the LR schedule
@@ -553,7 +689,12 @@ def _run_training(request: TrainingRequest) -> int:
         validation_metrics: Mapping | None = None,
     ) -> None:
         if not accelerator.is_main_process or (
-            not force and (step + 1) % config.save_every != 0
+            not force
+            and not should_save_checkpoint(
+                step,
+                save_every=config.save_every,
+                save_iterations=config.save_iterations,
+            )
         ):
             return
         payload = build_training_checkpoint_payload(
@@ -610,6 +751,14 @@ def _run_training(request: TrainingRequest) -> int:
             train_iterator = iter(train_loader)
             batch = next(train_iterator)
         fetch_seconds = time.perf_counter() - fetch_started_at
+        if dynamic_label_generator is not None:
+            apply_dynamic_label_substitution(
+                batch,
+                dynamic_label_generator,
+                kind=config.dynamic_label.kind,
+            )
+            if accelerator.device.type == "cuda":
+                torch.cuda.empty_cache()
         if label_distance > 0.0 or supervision_distance > 0.0:
             batch = apply_label_dilation(
                 batch, label_distance, supervision_distance
@@ -627,7 +776,10 @@ def _run_training(request: TrainingRequest) -> int:
                     ),
                 )
             loss_predictions, targets, ignore_mask = prepare_loss_inputs(
-                predictions, batch, mode=config.ink.data.mode
+                predictions,
+                batch,
+                mode=config.ink.data.mode,
+                force_full_supervision=config.force_full_supervision,
             )
             primary_predictions = (
                 loss_predictions[0]
@@ -845,6 +997,7 @@ def _run_training(request: TrainingRequest) -> int:
                         val_predictions,
                         val_batch,
                         mode=config.ink.data.mode,
+                        force_full_supervision=config.force_full_supervision,
                     )
                     primary_val_predictions = (
                         val_loss_predictions[0]
@@ -920,6 +1073,7 @@ def _run_training(request: TrainingRequest) -> int:
                             ema_predictions,
                             val_batch,
                             mode=config.ink.data.mode,
+                            force_full_supervision=config.force_full_supervision,
                         )
                         ema_targets_with_ignore = (
                             concatenate_deep_supervision_ignore(
