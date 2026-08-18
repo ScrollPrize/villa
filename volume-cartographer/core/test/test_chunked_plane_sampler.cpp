@@ -11,9 +11,11 @@
 #include <opencv2/core.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using vc::render::ChunkedPlaneSampler;
@@ -117,6 +119,41 @@ private:
     ChunkStatus status_;
 };
 
+class PyramidArray : public vc::render::IChunkedArray {
+public:
+    int numLevels() const override { return 8; }
+    std::array<int, 3> shape(int level) const override
+    {
+        const int extent = std::max(1, 4096 >> level);
+        return {extent, extent, extent};
+    }
+    std::array<int, 3> chunkShape(int) const override { return {32, 32, 32}; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int level) const override
+    {
+        LevelTransform transform;
+        const double scale = std::ldexp(1.0, -level);
+        transform.scaleFromLevel0 = {scale, scale, scale};
+        return transform;
+    }
+    ChunkResult tryGetChunk(int level, int, int, int) override
+    {
+        ChunkResult result;
+        result.status = ChunkStatus::MissQueued;
+        result.dtype = dtype();
+        result.shape = chunkShape(level);
+        return result;
+    }
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+};
+
 cv::Mat_<cv::Vec3f> axisAlignedCoords(int rows, int cols, float z = 0.f)
 {
     cv::Mat_<cv::Vec3f> c(rows, cols);
@@ -140,6 +177,205 @@ TEST_CASE("collectPlaneDependencies / collectCoordsDependencies enumerate keys")
     auto keysCoords = ChunkedPlaneSampler::collectCoordsDependencies(
         a, 0, coords, coverage);
     CHECK_FALSE(keysCoords.empty());
+}
+
+TEST_CASE("collectViewportDependencies is resident-only and keeps distant occurrences")
+{
+    class UnresolvedArray final : public UniformStatusArray {
+    public:
+        UnresolvedArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+
+        ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
+        {
+            ++queuedReads;
+            return UniformStatusArray::tryGetChunk(level, iz, iy, ix);
+        }
+
+        ChunkResult getChunkIfCached(int, int, int, int) override
+        {
+            ChunkResult result;
+            result.status = ChunkStatus::MissQueued;
+            result.dtype = vc::render::ChunkDtype::UInt8;
+            result.shape = shape(0);
+            return result;
+        }
+
+        int queuedReads = 0;
+    } array;
+
+    const std::vector<cv::Vec3f> coords{
+        {1.0f, 1.0f, 1.0f}, {1.1f, 1.0f, 1.0f}, {1.2f, 1.0f, 1.0f}};
+    const std::vector<std::array<float, 2>> viewport{
+        {4.0f, 4.0f}, {8.0f, 4.0f}, {40.0f, 4.0f}};
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 0;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, coords, viewport, 1.0f, options);
+
+    CHECK(array.queuedReads == 0);
+    REQUIRE(samples.size() == 2);
+    CHECK(samples[0].key == samples[1].key);
+}
+
+TEST_CASE("viewport dependency dedup uses projected chunk footprint, not sample spacing")
+{
+    class LargeChunkArray final : public UniformStatusArray {
+    public:
+        LargeChunkArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+        std::array<int, 3> shape(int) const override { return {64, 64, 64}; }
+        std::array<int, 3> chunkShape(int) const override { return {32, 32, 32}; }
+    } array;
+
+    const std::vector<cv::Vec3f> coords{
+        {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}};
+    const std::vector<std::array<float, 2>> viewport{
+        {0.0f, 0.0f}, {16.0f, 0.0f}, {40.0f, 0.0f}};
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 0;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, coords, viewport, 1.0f, options);
+
+    REQUIRE(samples.size() == 2);
+    CHECK(samples[0].key == samples[1].key);
+    CHECK_THROWS_AS(
+        ChunkedPlaneSampler::collectViewportDependencies(
+            array, 0, coords, viewport, 0.0f, options),
+        std::invalid_argument);
+}
+
+TEST_CASE("representative chunk extent honors anisotropic declared transforms")
+{
+    class AnisotropicArray final : public UniformStatusArray {
+    public:
+        AnisotropicArray() : UniformStatusArray(ChunkStatus::MissQueued) {}
+        std::array<int, 3> shape(int) const override { return {64, 64, 64}; }
+        std::array<int, 3> chunkShape(int) const override { return {8, 16, 32}; }
+        LevelTransform levelTransform(int) const override
+        {
+            LevelTransform transform;
+            transform.scaleFromLevel0 = {0.5, 0.25, 0.125};
+            return transform;
+        }
+    } array;
+
+    CHECK(ChunkedPlaneSampler::representativeChunkExtentBaseVoxels(array, 0) ==
+          doctest::Approx(112.0));
+}
+
+TEST_CASE("viewport fallback range stops at coverage or five levels")
+{
+    PyramidArray array;
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 300, 100, 1.0f) == 4);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 100, 300, 1.0f) == 4);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 4096, 4096, 1.0f) == 5);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 20, 20, 1.0f) == 0);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 6, 4096, 4096, 1.0f) == 1);
+}
+
+TEST_CASE("parameterized viewport fallback uses the bounded full range")
+{
+    PyramidArray array;
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 0, 300, 100, std::nullopt) == 5);
+    CHECK(ChunkedPlaneSampler::fallbackLevelCountForViewport(
+              array, 6, 300, 100, std::nullopt) == 1);
+}
+
+TEST_CASE("viewport dependencies publish coarse levels first")
+{
+    PyramidArray array;
+    ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 8);
+    options.queuedFallbackLevels = 3;
+    const auto samples = ChunkedPlaneSampler::collectViewportDependencies(
+        array, 0, {{64.0f, 64.0f, 64.0f}}, {{4.0f, 4.0f}}, 1.0f,
+        options);
+    REQUIRE(samples.size() == 4);
+    CHECK(samples[0].key.level == 3);
+    CHECK(samples[0].relativeLevel == 3);
+    CHECK(samples[1].key.level == 2);
+    CHECK(samples[1].relativeLevel == 2);
+    CHECK(samples[2].key.level == 1);
+    CHECK(samples[2].relativeLevel == 1);
+    CHECK(samples[3].key.level == 0);
+    CHECK(samples[3].relativeLevel == 0);
+}
+
+TEST_CASE("compact chunk pixel lookup preserves levels transforms and source")
+{
+    PyramidArray array;
+    cv::Mat_<cv::Vec3f> coords(2, 3);
+    coords(0, 0) = {1.0f, 1.0f, 1.0f};
+    coords(0, 1) = {33.0f, 1.0f, 1.0f};
+    coords(0, 2) = {34.0f, 1.0f, 1.0f};
+    coords(1, 0) = {-1.0f, -1.0f, -1.0f};
+    coords(1, 1) = {0.0f, 0.0f, 0.0f};
+    coords(1, 2) = {4097.0f, 1.0f, 1.0f};
+    const vc::render::VolumeSourceId source{73};
+
+    const auto lookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, source, 0, 1, coords, vc::Sampling::Nearest);
+
+    REQUIRE(lookup.size() == 2);
+    CHECK(lookup[0].level == 0);
+    REQUIRE(lookup[0].chunks.size() == 2);
+    CHECK(lookup[0].pixelIds(0, 0) == 1);
+    CHECK(lookup[0].pixelIds(0, 1) == 2);
+    CHECK(lookup[0].pixelIds(0, 2) == 2);
+    CHECK(lookup[0].pixelIds(1, 0) == 0);
+    CHECK(lookup[0].pixelIds(1, 1) == 0);
+    CHECK(lookup[0].pixelIds(1, 2) == 0);
+    CHECK(lookup[0].chunks[0] == ChunkKey{0, 0, 0, 0, source});
+    CHECK(lookup[0].chunks[1] == ChunkKey{0, 0, 0, 1, source});
+
+    // Level 1 is half-resolution, so both x=33 and x=34 remain in chunk 0.
+    CHECK(lookup[1].level == 1);
+    REQUIRE(lookup[1].chunks.size() == 1);
+    CHECK(lookup[1].pixelIds(0, 0) == 1);
+    CHECK(lookup[1].pixelIds(0, 1) == 1);
+    CHECK(lookup[1].pixelIds(0, 2) == 1);
+    CHECK(lookup[1].chunks[0] == ChunkKey{1, 0, 0, 0, source});
+    CHECK_FALSE(lookup[0].overflowed);
+    CHECK_FALSE(lookup[1].overflowed);
+
+    const auto planeLookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, source, 0, 0, coords, vc::Sampling::Nearest,
+        /*zeroIsSentinel=*/false);
+    REQUIRE(planeLookup.size() == 1);
+    CHECK(planeLookup[0].pixelIds(1, 1) != 0);
+    CHECK(planeLookup[0].chunks[
+        static_cast<std::size_t>(planeLookup[0].pixelIds(1, 1) - 1)] ==
+        ChunkKey{0, 0, 0, 0, source});
+}
+
+TEST_CASE("compact chunk pixel lookup reports uint16 ID overflow")
+{
+    class ManyChunksArray final : public PyramidArray {
+    public:
+        int numLevels() const override { return 1; }
+        std::array<int, 3> shape(int) const override { return {1, 1, 70000}; }
+        std::array<int, 3> chunkShape(int) const override { return {1, 1, 1}; }
+        LevelTransform levelTransform(int) const override { return {}; }
+    } array;
+
+    constexpr int distinctChunks = 65536;
+    cv::Mat_<cv::Vec3f> coords(1, distinctChunks);
+    for (int x = 0; x < distinctChunks; ++x)
+        coords(0, x) = {static_cast<float>(x + 1), 0.0f, 0.0f};
+
+    const auto lookup = ChunkedPlaneSampler::buildChunkPixelLookup(
+        array, vc::render::VolumeSourceId{91}, 0, 0, coords,
+        vc::Sampling::Nearest, /*zeroIsSentinel=*/false);
+
+    REQUIRE(lookup.size() == 1);
+    CHECK(lookup[0].overflowed);
+    CHECK(lookup[0].chunks.size() == 65535);
+    CHECK(lookup[0].pixelIds(0, distinctChunks - 2) == 65535);
+    CHECK(lookup[0].pixelIds(0, distinctChunks - 1) == 0);
 }
 
 TEST_CASE("requestPlaneDependencies / requestCoordsDependencies run without crashing")

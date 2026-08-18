@@ -92,6 +92,9 @@ set_target_properties(vc_track_crossings PROPERTIES
 )
 target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PRIVATE cxx_std_23)
+target_compile_options(vc_track_crossings PRIVATE
+    $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
+)
 
 nanobind_add_module(vc_track_store
     NOMINSIZE
@@ -117,6 +120,21 @@ set_target_properties(vc_spiral_sampling PROPERTIES
 target_link_libraries(vc_spiral_sampling PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_spiral_sampling PRIVATE cxx_std_23)
 
+nanobind_add_module(vc_grid_raycast
+    NOMINSIZE
+    vc/grid_raycast.cpp
+)
+set_target_properties(vc_grid_raycast PROPERTIES
+    OUTPUT_NAME grid_raycast
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+)
+target_link_libraries(vc_grid_raycast PRIVATE OpenMP::OpenMP_CXX)
+target_compile_features(vc_grid_raycast PRIVATE cxx_std_23)
+target_compile_options(vc_grid_raycast PRIVATE
+    $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
+)
+
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
@@ -128,7 +146,7 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling
+install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling vc_grid_raycast
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

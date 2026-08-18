@@ -39,7 +39,9 @@ std::unique_ptr<vc::render::ChunkCache> makeCache(
     double fillValue = 0.0)
 {
     vc::render::ChunkCache::Options options;
-    options.maxConcurrentReads = 1;
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.fetchConcurrency.workerCapacity = 1;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 1;
 
     std::vector<std::shared_ptr<vc::render::IChunkFetcher>> fetchers;
     fetchers.push_back(std::move(fetcher));
@@ -49,7 +51,7 @@ std::unique_ptr<vc::render::ChunkCache> makeCache(
         std::move(fetchers),
         fillValue,
         vc::render::ChunkDtype::UInt8,
-        std::move(options));
+        std::move(options), std::move(serviceOptions));
 }
 
 class ThrowingChunkFetcher final : public vc::render::IChunkFetcher {

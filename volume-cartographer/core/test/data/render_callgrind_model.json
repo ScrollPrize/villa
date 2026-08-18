@@ -1,0 +1,433 @@
+{
+  "cases": [
+    {
+      "estimated_ns_per_pixel": 78.38634931254782,
+      "modeled_cycles_per_pixel": 384.7689695645455,
+      "name": "parallel/w1/fallback_3",
+      "native_ns_per_pixel_mad": 0.06311973929405212,
+      "native_ns_per_pixel_max": 78.37878891825676,
+      "native_ns_per_pixel_median": 77.99276548624039,
+      "native_ns_per_pixel_min": 77.83499354124069,
+      "relative_error": 0.0050464145469604205,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 130.89580379994166,
+      "modeled_cycles_per_pixel": 642.5180403236902,
+      "name": "parallel/w1/fallback_3_shuffled",
+      "native_ns_per_pixel_mad": 0.13679629564285278,
+      "native_ns_per_pixel_max": 142.83256644010544,
+      "native_ns_per_pixel_median": 142.5930903851986,
+      "native_ns_per_pixel_min": 142.45629408955574,
+      "relative_error": -0.08203263253260085,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 29.806749428553758,
+      "modeled_cycles_per_pixel": 146.3100701113703,
+      "name": "parallel/w1/full_res",
+      "native_ns_per_pixel_mad": 0.06668642163276672,
+      "native_ns_per_pixel_max": 29.24926394224167,
+      "native_ns_per_pixel_median": 29.182577520608902,
+      "native_ns_per_pixel_min": 29.091175258159637,
+      "relative_error": 0.02138851194703628,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 67.49176342438854,
+      "modeled_cycles_per_pixel": 331.2915640879205,
+      "name": "parallel/w1/full_res_cache_stress",
+      "native_ns_per_pixel_mad": 0.3469390869140625,
+      "native_ns_per_pixel_max": 66.1123639345169,
+      "native_ns_per_pixel_median": 65.16661456227303,
+      "native_ns_per_pixel_min": 64.72459188103676,
+      "relative_error": 0.03568006221795672,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 72.76988996184262,
+      "modeled_cycles_per_pixel": 357.19989285763904,
+      "name": "parallel/w1/full_res_cache_stress_shuffled",
+      "native_ns_per_pixel_mad": 0.10213959217071533,
+      "native_ns_per_pixel_max": 84.04653295874596,
+      "native_ns_per_pixel_median": 83.48595476150513,
+      "native_ns_per_pixel_min": 82.82918673753738,
+      "relative_error": -0.12835769597742708,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 71.10189348479967,
+      "modeled_cycles_per_pixel": 349.01232842406523,
+      "name": "parallel/w1/full_res_shuffled",
+      "native_ns_per_pixel_mad": 0.2942139506340027,
+      "native_ns_per_pixel_max": 72.83283445239067,
+      "native_ns_per_pixel_median": 71.9793128669262,
+      "native_ns_per_pixel_min": 71.68509891629219,
+      "relative_error": -0.012189882720173628,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 52.251096425247695,
+      "modeled_cycles_per_pixel": 256.48088865572396,
+      "name": "parallel/w1/mixed_correlated",
+      "native_ns_per_pixel_mad": 0.017671197652816772,
+      "native_ns_per_pixel_max": 51.8357310295105,
+      "native_ns_per_pixel_median": 51.81805983185768,
+      "native_ns_per_pixel_min": 51.65385380387306,
+      "relative_error": 0.008356866212188452,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 119.9093779858721,
+      "modeled_cycles_per_pixel": 588.5898273535757,
+      "name": "parallel/w1/mixed_shuffled",
+      "native_ns_per_pixel_mad": 0.28396591544151306,
+      "native_ns_per_pixel_max": 123.91542440652847,
+      "native_ns_per_pixel_median": 123.63145849108696,
+      "native_ns_per_pixel_min": 123.22416114807127,
+      "relative_error": -0.03010625734455119,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 65.02285378609452,
+      "modeled_cycles_per_pixel": 319.1726195802918,
+      "name": "parallel/w2/fallback_3",
+      "native_ns_per_pixel_mad": 0.25003501772880554,
+      "native_ns_per_pixel_max": 68.77611055970192,
+      "native_ns_per_pixel_median": 66.38911837339401,
+      "native_ns_per_pixel_min": 65.75457027554512,
+      "relative_error": -0.02057964649590882,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 108.60417447290693,
+      "modeled_cycles_per_pixel": 533.0968551135129,
+      "name": "parallel/w2/fallback_3_shuffled",
+      "native_ns_per_pixel_mad": 0.7740511894226074,
+      "native_ns_per_pixel_max": 119.16392728686333,
+      "native_ns_per_pixel_median": 114.65621972084045,
+      "native_ns_per_pixel_min": 110.79495540261269,
+      "relative_error": -0.05278427339283254,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 24.90563661194591,
+      "modeled_cycles_per_pixel": 122.25235923818491,
+      "name": "parallel/w2/full_res",
+      "native_ns_per_pixel_mad": 0.997995525598526,
+      "native_ns_per_pixel_max": 26.138354420661926,
+      "native_ns_per_pixel_median": 24.784198462963104,
+      "native_ns_per_pixel_min": 23.78620293736458,
+      "relative_error": 0.0048998215199203,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 53.277433401937486,
+      "modeled_cycles_per_pixel": 261.51878906070823,
+      "name": "parallel/w2/full_res_cache_stress",
+      "native_ns_per_pixel_mad": 0.1588420867919922,
+      "native_ns_per_pixel_max": 52.3868193924427,
+      "native_ns_per_pixel_median": 52.10822048783302,
+      "native_ns_per_pixel_min": 51.578185856342316,
+      "relative_error": 0.022438166246292468,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 58.62050351011896,
+      "modeled_cycles_per_pixel": 287.7459012794299,
+      "name": "parallel/w2/full_res_cache_stress_shuffled",
+      "native_ns_per_pixel_mad": 1.3436199426651,
+      "native_ns_per_pixel_max": 66.94759005308151,
+      "native_ns_per_pixel_median": 64.53588065505028,
+      "native_ns_per_pixel_min": 63.19226071238518,
+      "relative_error": -0.09166028393645864,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 56.77172004702315,
+      "modeled_cycles_per_pixel": 278.67092184382716,
+      "name": "parallel/w2/full_res_shuffled",
+      "native_ns_per_pixel_mad": 0.9012890756130219,
+      "native_ns_per_pixel_max": 59.61668884754181,
+      "native_ns_per_pixel_median": 57.961580604314804,
+      "native_ns_per_pixel_min": 56.67814975976944,
+      "relative_error": -0.020528435299486558,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 43.42991105485206,
+      "modeled_cycles_per_pixel": 213.18102286185095,
+      "name": "parallel/w2/mixed_correlated",
+      "native_ns_per_pixel_mad": 0.28417062759399414,
+      "native_ns_per_pixel_max": 45.330040752887726,
+      "native_ns_per_pixel_median": 45.04587012529373,
+      "native_ns_per_pixel_min": 42.60076731443405,
+      "relative_error": -0.035873634274283694,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 100.32005338190645,
+      "modeled_cycles_per_pixel": 492.43323493108994,
+      "name": "parallel/w2/mixed_shuffled",
+      "native_ns_per_pixel_mad": 1.85105100274086,
+      "native_ns_per_pixel_max": 99.45599430799484,
+      "native_ns_per_pixel_median": 96.00347289443016,
+      "native_ns_per_pixel_min": 94.1524218916893,
+      "relative_error": 0.0449627535060424,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 43.818929986899086,
+      "modeled_cycles_per_pixel": 215.0905698038575,
+      "name": "parallel/w4/fallback_3",
+      "native_ns_per_pixel_mad": 0.39602482318878174,
+      "native_ns_per_pixel_max": 43.022203505039215,
+      "native_ns_per_pixel_median": 42.62617868185043,
+      "native_ns_per_pixel_min": 41.8930407166481,
+      "relative_error": 0.027981661550077197,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 73.13494734524483,
+      "modeled_cycles_per_pixel": 358.9918216115032,
+      "name": "parallel/w4/fallback_3_shuffled",
+      "native_ns_per_pixel_mad": 1.1821771264076233,
+      "native_ns_per_pixel_max": 72.86661955714226,
+      "native_ns_per_pixel_median": 71.68444243073463,
+      "native_ns_per_pixel_min": 69.77848011255264,
+      "relative_error": 0.02023458459500116,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 16.784026734843803,
+      "modeled_cycles_per_pixel": 82.38644519800162,
+      "name": "parallel/w4/full_res",
+      "native_ns_per_pixel_mad": 0.15236705541610718,
+      "native_ns_per_pixel_max": 16.62972667813301,
+      "native_ns_per_pixel_median": 16.472383499145508,
+      "native_ns_per_pixel_min": 15.830492317676546,
+      "relative_error": 0.01891913430223746,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 35.87674990799453,
+      "modeled_cycles_per_pixel": 176.10540884335097,
+      "name": "parallel/w4/full_res_cache_stress",
+      "native_ns_per_pixel_mad": 0.2008630335330963,
+      "native_ns_per_pixel_max": 36.43585094809532,
+      "native_ns_per_pixel_median": 36.13228723406792,
+      "native_ns_per_pixel_min": 35.81279572844505,
+      "relative_error": -0.007072270969673111,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 39.462755984670935,
+      "modeled_cycles_per_pixel": 193.70775765887498,
+      "name": "parallel/w4/full_res_cache_stress_shuffled",
+      "native_ns_per_pixel_mad": 0.20834368467330933,
+      "native_ns_per_pixel_max": 44.93799498677254,
+      "native_ns_per_pixel_median": 44.72965130209923,
+      "native_ns_per_pixel_min": 44.10897082090378,
+      "relative_error": -0.11774952775411218,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 38.224359004987136,
+      "modeled_cycles_per_pixel": 187.62893482857763,
+      "name": "parallel/w4/full_res_shuffled",
+      "native_ns_per_pixel_mad": 0.18945914506912231,
+      "native_ns_per_pixel_max": 41.725362062454224,
+      "native_ns_per_pixel_median": 41.444699198007584,
+      "native_ns_per_pixel_min": 41.23509582877159,
+      "relative_error": -0.07770210075925132,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 29.252961966904618,
+      "modeled_cycles_per_pixel": 143.59173671728792,
+      "name": "parallel/w4/mixed_correlated",
+      "native_ns_per_pixel_mad": 0.12237390875816345,
+      "native_ns_per_pixel_max": 29.779340654611588,
+      "native_ns_per_pixel_median": 29.640534907579422,
+      "native_ns_per_pixel_min": 29.499126344919205,
+      "relative_error": -0.013075774168154308,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 67.55833502672161,
+      "modeled_cycles_per_pixel": 331.6183389289049,
+      "name": "parallel/w4/mixed_shuffled",
+      "native_ns_per_pixel_mad": 0.6098238229751587,
+      "native_ns_per_pixel_max": 65.45737701654434,
+      "native_ns_per_pixel_median": 64.84755319356918,
+      "native_ns_per_pixel_min": 62.2492940723896,
+      "relative_error": 0.041802376491534954,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 64.37818384022708,
+      "modeled_cycles_per_pixel": 316.00817841220515,
+      "name": "serial/w1/fallback_3",
+      "native_ns_per_pixel_mad": 0.030368513531158214,
+      "native_ns_per_pixel_max": 64.40289192729526,
+      "native_ns_per_pixel_median": 64.29115178849962,
+      "native_ns_per_pixel_min": 64.2379474374983,
+      "relative_error": 0.0013537174137705499,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 72.7746158579054,
+      "modeled_cycles_per_pixel": 357.22309049567536,
+      "name": "serial/w1/fallback_3_shuffled",
+      "native_ns_per_pixel_mad": 0.10307502746582031,
+      "native_ns_per_pixel_max": 75.58148023817274,
+      "native_ns_per_pixel_median": 75.47840521070692,
+      "native_ns_per_pixel_min": 75.17387874921162,
+      "relative_error": -0.03582202545554025,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 27.054123020095247,
+      "modeled_cycles_per_pixel": 132.798467184747,
+      "name": "serial/w1/full_res",
+      "native_ns_per_pixel_mad": 0.07484401596916612,
+      "native_ns_per_pixel_max": 26.804646836386787,
+      "native_ns_per_pixel_median": 26.67129063606262,
+      "native_ns_per_pixel_min": 26.587856504652237,
+      "relative_error": 0.01435372548169811,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 69.44782334615444,
+      "modeled_cycles_per_pixel": 340.8931231234539,
+      "name": "serial/w1/full_res_cache_stress",
+      "native_ns_per_pixel_mad": 0.08925085597567772,
+      "native_ns_per_pixel_max": 72.48709275987413,
+      "native_ns_per_pixel_median": 66.29921754201253,
+      "native_ns_per_pixel_min": 66.16098414527045,
+      "relative_error": 0.04749084409852489,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 74.77328484610906,
+      "modeled_cycles_per_pixel": 367.03380133801124,
+      "name": "serial/w1/full_res_cache_stress_shuffled",
+      "native_ns_per_pixel_mad": 0.15224907133313081,
+      "native_ns_per_pixel_max": 81.53122560183208,
+      "native_ns_per_pixel_median": 81.26354087723627,
+      "native_ns_per_pixel_min": 80.91096994611952,
+      "relative_error": -0.07986676387793568,
+      "role": "held_out"
+    },
+    {
+      "estimated_ns_per_pixel": 33.29488292842449,
+      "modeled_cycles_per_pixel": 163.43199942966794,
+      "name": "serial/w1/full_res_shuffled",
+      "native_ns_per_pixel_mad": 0.08048717180887621,
+      "native_ns_per_pixel_max": 35.68385982513428,
+      "native_ns_per_pixel_median": 35.489461951785614,
+      "native_ns_per_pixel_min": 35.40897477997674,
+      "relative_error": -0.06183748365479813,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 46.03014695928557,
+      "modeled_cycles_per_pixel": 225.94459838677284,
+      "name": "serial/w1/mixed_correlated",
+      "native_ns_per_pixel_mad": 0.060072554482360374,
+      "native_ns_per_pixel_max": 45.849787606133354,
+      "native_ns_per_pixel_median": 45.62427944607205,
+      "native_ns_per_pixel_min": 45.56420689158969,
+      "relative_error": 0.008895866809102149,
+      "role": "training"
+    },
+    {
+      "estimated_ns_per_pixel": 67.04852555224316,
+      "modeled_cycles_per_pixel": 329.11587685624,
+      "name": "serial/w1/mixed_shuffled",
+      "native_ns_per_pixel_mad": 0.11765042940776027,
+      "native_ns_per_pixel_max": 70.78937591446771,
+      "native_ns_per_pixel_median": 70.59221458435059,
+      "native_ns_per_pixel_min": 70.40235217412312,
+      "relative_error": -0.05019943138167271,
+      "role": "training"
+    }
+  ],
+  "effective_parallelism": {
+    "1": 1.0,
+    "2": 1.2046539489136925,
+    "4": 1.7897158039630519
+  },
+  "fit": {
+    "acceptance": {
+      "held_out_max_absolute_relative_error": 0.15,
+      "training_max_absolute_relative_error": 0.08
+    },
+    "held_out": {
+      "max_absolute_relative_error": 0.12835769597742708,
+      "rms_relative_error": 0.08391151981842528
+    },
+    "multi_start_max_prediction_delta_ns_per_pixel": 7.316101573451306e-07,
+    "objective": "mean squared relative error over case medians",
+    "parameter_bounds": {
+      "branch_mispredict_cycles": [
+        5.0,
+        40.0
+      ],
+      "l1_miss_cycles": [
+        1.0,
+        20.0
+      ],
+      "parallel_2_effective_workers": [
+        1.0,
+        2.0
+      ],
+      "parallel_4_effective_workers": [
+        1.0,
+        4.0
+      ]
+    },
+    "training": {
+      "max_absolute_relative_error": 0.07770210075925132,
+      "rms_relative_error": 0.03265667027615298
+    }
+  },
+  "formula": {
+    "branch_mispredict_cycles": 23.792500113249446,
+    "l1_miss_cycles": 1.0,
+    "last_level_miss_cycles": 35.0,
+    "modeled_ipc": 4.0
+  },
+  "model_version": 2,
+  "nanoseconds_per_modeled_cycle": 0.20372315730465476,
+  "reference": {
+    "architecture_target": "x86-64-v3",
+    "binary_sha256": "1f768cec70c43a7ab471309e9c36fad6121c1d08bf027ca30092407caba404c1",
+    "build_type": "Release",
+    "calibration_date": "2026-08-05",
+    "case_execution": "strictly sequential",
+    "compiler": "GNU 16.1.1",
+    "cpu_affinity": {
+      "1": "2",
+      "2": "2-3",
+      "4": "2-5"
+    },
+    "cpu_governor": "powersave",
+    "cpu_scaling_max_khz": 5086181,
+    "cpu_scaling_min_khz": 1746460,
+    "host_cpu": "AMD Ryzen 9 5950X 16-Core Processor",
+    "host_logical_cpus": 32,
+    "host_physical_cores": 16,
+    "host_threads_per_core": 2,
+    "native_fresh_processes_per_case": 5,
+    "native_repetitions": {
+      "parallel": 512,
+      "serial": 4096
+    },
+    "native_trials_per_process": 1,
+    "operating_system": "Linux 7.1.2-arch3-1 x86_64",
+    "temperature_c_after_calibration": 60.5,
+    "valgrind_version": "valgrind-3.25.1"
+  },
+  "schema_version": 1
+}

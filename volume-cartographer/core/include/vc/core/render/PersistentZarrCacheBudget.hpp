@@ -76,12 +76,14 @@ public:
                          std::filesystem::path target,
                          std::vector<std::filesystem::path> replacements,
                          std::uint64_t reservedGrowth,
-                         std::uint64_t reservedTemporaryBytes);
+                         std::uint64_t reservedTemporaryBytes,
+                         bool managed);
         std::shared_ptr<PersistentZarrCacheBudget> owner_;
         std::filesystem::path target_;
         std::vector<std::filesystem::path> replacements_;
         std::uint64_t reservedGrowth_ = 0;
         std::uint64_t reservedTemporaryBytes_ = 0;
+        bool managed_ = true;
     };
 
     // Nested roots reuse an existing containing budget. Configuring a broader
@@ -104,6 +106,11 @@ public:
         const std::filesystem::path& target,
         std::uint64_t newSize,
         std::vector<std::filesystem::path> replacedPaths = {});
+    // Reserves temporary disk space and pins the path without adding it to
+    // the evictable managed-byte set. Used for structural Zarr metadata.
+    WriteReservation reserveProtectedWrite(
+        const std::filesystem::path& target,
+        std::uint64_t newSize);
 
     // Primarily useful for deterministic tests and orderly shutdown checks.
     void waitForIdle();
@@ -121,7 +128,13 @@ private:
                      const std::vector<std::filesystem::path>& replacements,
                      std::uint64_t reservedGrowth,
                      std::uint64_t reservedTemporaryBytes,
-                     bool committed);
+                     bool committed,
+                     bool managed);
+    WriteReservation reserveWriteImpl(
+        const std::filesystem::path& target,
+        std::uint64_t newSize,
+        std::vector<std::filesystem::path> replacedPaths,
+        bool managed);
 
     std::unique_ptr<Impl> impl_;
 };

@@ -1,7 +1,9 @@
 """Synthetic tests for the phase dense-spacing bundle: complete-band
 detection, soft-sequence registration, shared phase/count rays, native
-anti-collapse, and the two-mode session contract."""
+anti-collapse, and the dense-spacing mode contract."""
 
+from dataclasses import replace
+import json
 import math
 import os
 
@@ -21,8 +23,7 @@ from sdt_losses import (
 )
 from transforms import GapExpanderParams, GapExpandingTransform
 from fit_session import (
-    SpiralInputPaths, SpiralRunConfig, apply_optional_input_selection,
-    validate_session_request,
+    SpiralInputPaths, SpiralRunConfig, validate_session_request,
 )
 from test_sdt_losses import (
     DR_PER_WINDING,
@@ -74,7 +75,7 @@ def detect(ray, volume, normals, cfg):
 
 def phase_cfg(**overrides):
     values = {
-        'dense_spacing_num_pairs': 192,
+        'sample_count_dense_spacing_pairs': 192,
         'dense_spacing_pair_m_short': (2, 3),
         'dense_spacing_pair_m_long': (2, 3),
         'dense_spacing_max_steps': 160,
@@ -481,8 +482,8 @@ class TestBundleComposition:
         volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
         normals = normal_volume(volume['shape'])
         cfg = phase_cfg(
-            dense_spacing_num_pairs=0,
-            dense_spacing_density_extra_pairs=0,
+            sample_count_dense_spacing_pairs=0,
+            sample_count_dense_spacing_density_extra_pairs=0,
         )
         assert run_bundle(
             volume, normals, PerfectSpiralToX(), 8, cfg) == {}
@@ -508,7 +509,7 @@ class TestModeContract:
             umbilicus=str(umbilicus), output_directory=str(output),
             cache_directory=str(cache))
         base = {
-            'disable_patches': True,
+            'input_disable_patches': True,
             'loss_weight_shell_outer': 0.0,
             'loss_weight_shell_patch_radius': 0.0,
             'loss_weight_dense_normals': 0.0,
@@ -516,11 +517,11 @@ class TestModeContract:
         base.update(config)
         return paths, SpiralRunConfig(z_begin=1, z_end=2, config=base)
 
-    def test_exactly_the_two_modes_are_accepted(self, tmp_path):
-        # 'phase' and 'grad_mag' pass mode validation; anything else -
+    def test_exactly_the_supported_modes_are_accepted(self, tmp_path):
+        # The three current modes pass mode validation; anything else -
         # including retired values like the old 'crossing_count' - is a
         # plain error (no migration handling).
-        for mode in ('phase', 'grad_mag'):
+        for mode in ('phase', 'grad_mag', 'winding_model'):
             paths, run = self.base_request(tmp_path, {
                 'dense_spacing_mode': mode,
                 'loss_weight_dense_spacing': 0.0,
@@ -535,6 +536,29 @@ class TestModeContract:
             fields = {error['field']
                       for error in validate_session_request(paths, run)}
             assert 'dense_spacing_mode' in fields
+
+    def test_winding_model_mode_requires_a_valid_crossing_manifest(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'winding_model',
+        })
+        fields = {error['field']
+                  for error in validate_session_request(paths, run)}
+        assert 'winding_inference' in fields
+
+        store = tmp_path / 'winding_inference'
+        store.mkdir()
+        paths = replace(paths, winding_inference=str(store))
+        messages = {error['field']: error['message']
+                    for error in validate_session_request(paths, run)}
+        assert messages['winding_inference'] == 'manifest.json is missing'
+
+        (store / 'manifest.json').write_text(json.dumps({
+            'artifact_type': 'winding_inference_crossings',
+            'format_version': 1,
+        }))
+        fields = {error['field']
+                  for error in validate_session_request(paths, run)}
+        assert 'winding_inference' not in fields
 
     def test_missing_mode_defaults_to_phase_and_requires_bundle_assets(
         self, tmp_path,
@@ -554,16 +578,6 @@ class TestModeContract:
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert {'normal_x', 'normal_y', 'surf_sdt'} <= fields
 
-    def test_disabled_phase_inputs_are_not_required(self, tmp_path):
-        paths, run = self.base_request(tmp_path, {
-            'use_normals': False,
-            'use_surf_sdt': False,
-        })
-        fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'normal_x' not in fields
-        assert 'normal_y' not in fields
-        assert 'surf_sdt' not in fields
-
     def test_grad_mag_mode_requires_grad_mag_not_sdt(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
             'dense_spacing_mode': 'grad_mag',
@@ -574,11 +588,10 @@ class TestModeContract:
         assert 'surf_sdt' not in fields
         assert 'normal_x' not in fields
 
-    def test_disabled_grad_mag_is_not_required(self, tmp_path):
+    def test_zero_weight_grad_mag_is_not_required(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
             'dense_spacing_mode': 'grad_mag',
-            'loss_weight_dense_spacing': 12.0,
-            'use_gradient_magnitude': False,
+            'loss_weight_dense_spacing': 0.0,
         })
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert 'gradient_magnitude' not in fields
@@ -594,82 +607,6 @@ class TestModeContract:
         # mode-derived asset errors.
         assert 'surf_sdt' not in by_field
         assert 'gradient_magnitude' not in by_field
-
-
-class TestOptionalInputSelection:
-    def test_disabled_inputs_zero_their_weights_and_sampling(self):
-        config = {
-            'dense_spacing_mode': 'phase',
-            'use_verified_patches': False,
-            'use_unverified_patches': False,
-            'use_normals': False,
-            'use_surf_sdt': False,
-            'use_tracks': False,
-            'use_fibers': False,
-            'loss_weight_patch_radius': 8.0,
-            'loss_weight_patch_dt': 4.0,
-            'num_patches_per_step': 360,
-            'num_patches_per_step_for_dt': 240,
-            'num_points_per_patch': 800,
-            'loss_weight_unverified_patch_radius': 2.0,
-            'loss_weight_unverified_patch_dt': 1.0,
-            'unverified_num_patches_per_step': 120,
-            'unverified_num_patches_per_step_for_dt': 80,
-            'unverified_num_points_per_patch': 800,
-            'loss_weight_dense_normals': 100.0,
-            'dense_normals_num_points': 60_000,
-            'loss_weight_dense_spacing': 12.0,
-            'loss_weight_dense_spacing_count': 2.0,
-            'loss_weight_dense_spacing_density': 3.0,
-            'loss_weight_min_spacing': 4.0,
-            'loss_weight_dense_attachment': 5.0,
-            'dense_spacing_num_pairs': 12_000,
-            'dense_spacing_density_extra_pairs': 24_000,
-            'dense_attachment_num_points': 20_000,
-            'min_spacing_independent_samples': 2_000,
-            'loss_weight_track_radius': 50.0,
-            'loss_weight_track_dt': 10.0,
-            'track_num_per_step': 48_000,
-            'track_num_points_per_step': 24,
-            'loss_weight_unattached_pcl_radius': 2.0,
-            'loss_weight_unattached_pcl_dt': 4.0,
-            'unattached_pcl_num_per_step': 84,
-            'unattached_pcl_num_points_per_step': 32,
-        }
-        apply_optional_input_selection(config)
-        expected_zero = {
-            'loss_weight_patch_radius', 'loss_weight_patch_dt',
-            'num_patches_per_step', 'num_patches_per_step_for_dt',
-            'num_points_per_patch', 'loss_weight_unverified_patch_radius',
-            'loss_weight_unverified_patch_dt', 'unverified_num_patches_per_step',
-            'unverified_num_patches_per_step_for_dt',
-            'unverified_num_points_per_patch', 'loss_weight_dense_normals',
-            'dense_normals_num_points', 'loss_weight_dense_spacing',
-            'loss_weight_dense_spacing_count',
-            'loss_weight_dense_spacing_density',
-            'loss_weight_dense_attachment', 'dense_spacing_num_pairs',
-            'dense_spacing_density_extra_pairs', 'dense_attachment_num_points',
-            'loss_weight_track_radius',
-            'loss_weight_track_dt', 'track_num_per_step',
-            'track_num_points_per_step', 'loss_weight_unattached_pcl_radius',
-            'loss_weight_unattached_pcl_dt', 'unattached_pcl_num_per_step',
-            'unattached_pcl_num_points_per_step',
-        }
-        assert all(config[key] == 0 for key in expected_zero)
-        assert config['loss_weight_min_spacing'] == 4.0
-        assert config['min_spacing_independent_samples'] == 2_000
-
-    def test_disabled_grad_mag_zeroes_legacy_spacing(self):
-        config = {
-            'dense_spacing_mode': 'grad_mag',
-            'use_gradient_magnitude': False,
-            'loss_weight_dense_spacing': 12.0,
-            'dense_spacing_num_pairs': 12_000,
-        }
-        apply_optional_input_selection(config)
-        assert config['loss_weight_dense_spacing'] == 0
-        assert config['dense_spacing_num_pairs'] == 0
-
 
 class TestNativeMinimumGap:
     def make_transform(self, dr=None):
@@ -710,8 +647,8 @@ class TestNativeMinimumGap:
                 return transform.get_native_log_gaps(winding, theta, z)
 
         cfg = {
-            'min_spacing_independent_samples': 64,
-            'min_spacing_d_min_wv': 6.0,
+            'sample_count_minimum_spacing_independent_samples': 64,
+            'dense_min_spacing_d_min_wv': 6.0,
         }
         loss, metrics = get_min_spacing_loss(
             Wrapper(), 7, cfg, 1, 95,

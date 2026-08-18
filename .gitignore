@@ -3,6 +3,7 @@
 **/.idea/*
 **/__pycache__/
 *.pyc
+*.so
 node_modules/.yarn-integrity
 **/*.egg-info*/
 
@@ -61,3 +62,7 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/scripts/spiral/bench
 /volume-cartographer/scripts/cache
 /volume-cartographer/docs/plans
+/volume-cartographer/scripts/spiral/scratch
+/volume-cartographer/scripts/spiral/out
+/vesuvius/experiments
+/vesuvius/src/vesuvius/neural_tracing/winding_models/runs

@@ -28,6 +28,7 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -106,6 +107,87 @@ def _checkpoint_normalization_scheme(checkpoint_data):
     if image_normalization == 'percentile_minmax':
         return 'percentile_minmax'
     return image_normalization
+
+
+_NNUNET_NORMALIZATION_MAP = {
+    'CTNormalization': 'ct',
+    'ZScoreNormalization': 'instance_zscore',
+    'NoNormalization': 'none',
+    'RescaleTo01Normalization': 'instance_minmax',
+}
+
+
+def _nnunet_normalization_from_model_info(model_info):
+    """Return the normalization declared by an nnU-Net model's plans.
+
+    ``load_model_for_inference`` already returns the nnU-Net configuration and
+    plans managers.  Keep their native metadata authoritative rather than
+    silently falling back to the CLI's per-patch z-score default.
+
+    VCDataset currently accepts one normalization contract for the entire
+    input, so reject multi-channel plans instead of applying one channel's
+    fingerprint to another.
+    """
+    configuration_manager = model_info.get('configuration_manager')
+    plans_manager = model_info.get('plans_manager')
+    if configuration_manager is None or plans_manager is None:
+        return None, None
+
+    schemes = getattr(configuration_manager, 'normalization_schemes', None)
+    if schemes is None:
+        return None, None
+    if isinstance(schemes, str):
+        schemes = [schemes]
+    else:
+        schemes = list(schemes)
+    if len(schemes) != 1:
+        raise ValueError(
+            'vesuvius.predict cannot reproduce nnU-Net normalization for '
+            f'{len(schemes)} input channels; expected exactly one scheme')
+
+    native_scheme = schemes[0]
+    if not isinstance(native_scheme, str):
+        native_scheme = getattr(native_scheme, '__name__', str(native_scheme))
+    native_scheme = native_scheme.rsplit('.', 1)[-1]
+    try:
+        scheme = _NNUNET_NORMALIZATION_MAP[native_scheme]
+    except KeyError as exc:
+        raise ValueError(
+            'Unsupported nnU-Net normalization scheme in plans.json: '
+            f'{native_scheme!r}') from exc
+
+    use_mask = getattr(configuration_manager, 'use_mask_for_norm', None)
+    if isinstance(use_mask, (list, tuple)):
+        use_mask = use_mask[0] if use_mask else None
+    if scheme == 'instance_zscore' and bool(use_mask):
+        raise ValueError(
+            'nnU-Net plans require masked Z-score normalization, which '
+            'vesuvius.predict cannot reproduce without the preprocessing mask')
+
+    intensity_properties = None
+    if scheme == 'ct':
+        per_channel = getattr(
+            plans_manager, 'foreground_intensity_properties_per_channel', None)
+        if not isinstance(per_channel, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires '
+                'foreground_intensity_properties_per_channel in plans.json')
+        intensity_properties = per_channel.get('0', per_channel.get(0))
+        required = {
+            'mean', 'std', 'percentile_00_5', 'percentile_99_5',
+        }
+        if not isinstance(intensity_properties, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires intensity properties for '
+                'input channel 0')
+        missing = sorted(required.difference(intensity_properties))
+        if missing:
+            raise ValueError(
+                'nnU-Net CTNormalization channel-0 intensity properties are '
+                f'missing: {", ".join(missing)}')
+        intensity_properties = dict(intensity_properties)
+
+    return scheme, intensity_properties
 
 
 def _select_evenly_spaced_middle_indices(candidate_indices, limit):
@@ -434,7 +516,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -446,6 +528,26 @@ class Inferer():
                     verbose=self.verbose
                 )
         
+        # Prefer normalization metadata returned directly by train.py/external
+        # loaders. For nnU-Net, derive it from the plans managers that the
+        # loader already returns.
+        model_scheme = model_info.get('normalization_scheme')
+        model_intensity_properties = model_info.get('intensity_properties')
+        if model_scheme is None:
+            model_scheme, nnunet_intensity_properties = \
+                _nnunet_normalization_from_model_info(model_info)
+            if model_intensity_properties is None:
+                model_intensity_properties = nnunet_intensity_properties
+        if model_scheme is not None:
+            self.model_normalization_scheme = model_scheme
+            if model_scheme != self.normalization_scheme:
+                print(
+                    'Using model-declared normalization '
+                    f'{model_scheme!r} instead of CLI/default '
+                    f'{self.normalization_scheme!r}.')
+        if model_intensity_properties is not None:
+            self.model_intensity_properties = model_intensity_properties
+
         # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
@@ -726,6 +828,7 @@ class Inferer():
             normalization_scheme=normalization_scheme,
             global_mean=global_mean,
             global_std=global_std,
+            intensity_props=self.model_intensity_properties,
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -737,6 +840,14 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
+            # The float16 default suits the CUDA autocast path. CPU convolutions
+            # have no float16 kernels, so half patches meet float32 weights and
+            # raise "Input type (c10::Half) and bias type (float) should be the
+            # same". Ask for the dtype the CPU model can actually consume.
+            return_as_type=(
+                "np.float32" if self.device.type == "cpu"
+                else "np.float16"
+            ),
         )
 
         expected_attr_name = 'all_positions'
@@ -1018,8 +1129,9 @@ class Inferer():
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
-                        with torch.inference_mode(), torch.amp.autocast('cuda'):
+
+                        with torch.inference_mode(), torch.amp.autocast(
+                                self.device.type, enabled=(self.device.type == 'cuda')):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -1129,11 +1241,10 @@ def _parse_bbox_arg(value):
     return tuple(bounds)
 
 
-def main():
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1154,7 +1265,7 @@ def main():
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
-                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
+                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
@@ -1162,17 +1273,17 @@ def main():
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
@@ -1183,14 +1294,14 @@ def main():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+    parser.add_argument('--read_retries', type=int, default=4,
                       help='Attempts per patch read (default 4). Transient remote failures '
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
@@ -1205,8 +1316,13 @@ def main():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    import sys
+
+    args = build_parser().parse_args()
     
     # Parse optional patch size if provided
     patch_size = None

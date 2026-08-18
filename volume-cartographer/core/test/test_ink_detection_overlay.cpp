@@ -66,7 +66,7 @@ TEST_CASE("CState batches surface catalog mutations into one notification")
     int changedCount = 0;
     int willDeleteCount = 0;
     std::string changedName;
-    CState state(0);
+    CState state;
     auto first = makeSurface("first");
     auto second = makeSurface("second");
 
@@ -130,7 +130,7 @@ TEST_CASE("ink detection options survive transformed segmentation previews with 
     auto package = VolumePkg::newEmpty();
     REQUIRE(package->addSegmentsEntry(segmentDir.string()));
 
-    CState state(0);
+    CState state;
     state.setVpkg(package);
 
     auto source = makeSurface(segmentLongId);
@@ -175,7 +175,7 @@ TEST_CASE("ink detection overlay flips the displayed image")
     auto package = VolumePkg::newEmpty();
     REQUIRE(package->addSegmentsEntry(segmentDir.string()));
 
-    CState state(0);
+    CState state;
     state.setVpkg(package);
 
     auto source = makeSurface(segmentLongId);

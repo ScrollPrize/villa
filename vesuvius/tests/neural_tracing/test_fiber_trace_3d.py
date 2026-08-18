@@ -1,0 +1,7030 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import DataLoader
+import zarr
+
+from tests.zarr_utils import create_v2_array
+
+from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
+from vc3d_fiber_format import legacy_lasagna_segments
+from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
+from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
+    CoordinateSampleResult,
+    NumpyZarrCoordinateSampler,
+    Vc3dCoordinateSampler,
+)
+from vesuvius.neural_tracing.fiber_trace_3d import loader as loader3d_module
+from vesuvius.neural_tracing.fiber_trace_3d.direction import (
+    decode_lasagna_direction_3x2_analytic,
+    encode_lasagna_direction_2d,
+    encode_lasagna_direction_3x2,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
+    FIBER_TRACE_3D_INTERNAL_CHANNELS,
+    FIBER_TRACE_3D_PERSISTED_CHANNELS,
+    FiberTrace3DPredictAdapter,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _checkpoint_config_for_inference,
+    _input_scaledown_from_base,
+    _resolve_inference_precision,
+    _resolve_inference_device,
+    _select_and_expand_crop,
+    run_fiber_trace_3d_inference,
+)
+from vesuvius.neural_tracing.fiber_trace_3d import infer as fiber_infer_module
+from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
+    decode_grouped_direction_presence,
+    direction_branch_count_from_channels,
+)
+try:
+    from lasagna.tiled_predict3d import OmeZarrOutputAdapter
+except ImportError:  # pragma: no cover
+    from tiled_predict3d import OmeZarrOutputAdapter
+from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal
+from vesuvius.neural_tracing.fiber_trace_3d.loader import (
+    DEFAULT_VOLUME_CACHE_MEMORY_MIB,
+    FiberTrace3DBatch,
+    FiberTrace3DLoader,
+    _TARGET_MODE_CP_ONLY,
+    _TARGET_MODE_DENSE_LINE,
+    _anisotropic_blur_3d,
+    config_from_mapping,
+    load_config,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.model import (
+    FiberTrace3DModelConfig,
+    FiberTrace3DNet,
+    build_fiber_trace_3d_model,
+    direction_output,
+    direction_outputs,
+    presence_output,
+    presence_outputs,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
+from vesuvius.neural_tracing.fiber_trace_3d.projection import (
+    project_3d_direction_to_2d_frame,
+)
+from vesuvius.neural_tracing.fiber_trace_3d import trace2cp_tool as trace2cp_tool_module
+from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_bridge import (
+    project_3d_output_to_trace2cp_fields,
+    score_trace2cp_projected_fields,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
+    NativeTrace2CpConfig,
+    NativeTraceFieldCache,
+    NativeTraceResult,
+    NativeTargetPlane,
+    NativeWholeFiberResult,
+    _adaptive_trace2cp_cross_strip_height,
+    _aggregate_native_whole_fiber_results,
+    _build_native_whole_fiber_span_source,
+    _compose_whole_fiber_panel_blocks,
+    _draw_trace_panel,
+    _fiber_line_tangent_zyx_toward_target,
+    _FailFastNormalComparisonSampler,
+    _image_to_u8,
+    _indexed_trace2cp_output_stem,
+    _interpolate_plane_crossing,
+    _NativeLasagnaNormalSampler,
+    _native_cumulative_tangent_smoothness_loss_torch,
+    _native_trace2cp_whole_fiber_mode,
+    _native_whole_fiber_visual_spans,
+    _native_smoothness_loss_torch,
+    _parse_args,
+    _render_native_whole_fiber_span_panels,
+    _native_trace_geometry_normal_record,
+    _format_trace2cp_kvx_rate,
+    _format_trace2cp_meter_rate,
+    _project_trace_to_initial_strip,
+    _principal_tensor_axes_torch,
+    _resolve_native_trace2cp_selection,
+    _sample_presence_on_strip,
+    _sample_point_choices_for_points_torch,
+    _sample_trace_start_direction_aligned,
+    _sample_trace_point_aligned,
+    _save_whole_fiber_panel_pages,
+    _score_candidate_batch,
+    _score_candidate_loss_tensors_batched,
+    _split_whole_fiber_panel_blocks_for_pages,
+    _target_plane_in_plane_error_voxels,
+    _update_target_plane_crossings,
+    _trace_candidate_directions_torch,
+    _volume_trace_to_source_trace_xyz,
+    fuse_forward_reverse_traces,
+    generate_cone_candidates_by_angle_step,
+    generate_cone_candidates,
+    trace_native_3d_one_way,
+    trace_native_3d_pair,
+    trace_native_3d_whole_fiber,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _TrainingHangDiagnostics,
+    _diagnostic_cuda_synchronize,
+    _autocast_context,
+    _conditioned_perpendicular_queries,
+    _safe_probability_bce,
+    compute_conditioned_losses,
+    compute_losses,
+)
+
+
+def _run_hang_diagnostics_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    script = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "import torch\n"
+        "from vesuvius.neural_tracing.fiber_trace_3d.train import _TrainingHangDiagnostics\n"
+        f"run_dir = Path({str(tmp_path)!r})\n"
+        + body
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def test_training_hang_diagnostics_disabled_has_no_side_effects(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def record(name):
+        return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.register", record("register"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.unregister", record("unregister"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.dump_traceback_later", record("dump"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.cancel_dump_traceback_later", record("cancel"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.torch.cuda.synchronize", record("sync"))
+
+    diagnostics = _TrainingHangDiagnostics(
+        tmp_path,
+        rank=0,
+        device=torch.device("cuda", 0),
+        automatic_watchdog=True,
+        enabled=False,
+    )
+    diagnostics.marker("ignored")
+    diagnostics.arm_test_watchdog(10)
+    _diagnostic_cuda_synchronize(
+        diagnostics,
+        phase="ignored-sync",
+        step=10,
+        device=torch.device("cuda", 0),
+    )
+    diagnostics.close()
+
+    assert calls == []
+    assert not (tmp_path / "hang_diagnostics_rank_0.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("training", "cli_enabled", "expected"),
+    [
+        ({}, False, (False, False, False)),
+        ({"test_hang_diagnostics_enabled": True}, False, (True, False, True)),
+        ({"test_hang_diagnostics_enabled": False}, True, (False, True, True)),
+    ],
+)
+def test_training_hang_diagnostics_enable_resolution(training, cli_enabled, expected) -> None:
+    assert _resolve_test_hang_diagnostics_enabled(
+        training,
+        cli_enabled=cli_enabled,
+    ) == expected
+
+
+def test_training_hang_diagnostics_config_requires_json_boolean() -> None:
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        _resolve_test_hang_diagnostics_enabled(
+            {"test_hang_diagnostics_enabled": "false"},
+            cli_enabled=False,
+        )
+
+
+def test_training_watchdog_timeout_is_validated_only_when_enabled() -> None:
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": "invalid"},
+        diagnostics_enabled=False,
+    ) == 480.0
+    with pytest.raises(ValueError):
+        _resolve_test_watchdog_seconds(
+            {"test_watchdog_seconds": 600},
+            diagnostics_enabled=True,
+        )
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": 123},
+        diagnostics_enabled=True,
+    ) == 123.0
+
+
+def test_training_hang_watchdog_dumps_and_can_be_rearmed(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.arm_test_watchdog(12)\n"
+        "time.sleep(0.25)\n"
+        "d.arm_test_watchdog(13)\n"
+        "d.cancel_test_watchdog(step=13)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "Timeout" in text
+    assert "test-watchdog-arm" in text
+    assert "step=13" in text
+    assert "test-watchdog-cancel" in text
+
+
+def test_training_hang_watchdog_cancel_and_manual_dump(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.marker('unit-phase', step=7)\n"
+        "d.arm_test_watchdog(7)\n"
+        "d.cancel_test_watchdog(step=7)\n"
+        "time.sleep(0.2)\n"
+        "sig = getattr(signal, 'SIGUSR2', None)\n"
+        "if sig is not None: os.kill(os.getpid(), sig); time.sleep(0.05)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "phase=unit-phase" in text
+    assert "Timeout" not in text
+    if hasattr(signal, "SIGUSR2"):
+        assert "Current thread" in text
+from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _FiberTrace3DBatchDataset,
+    _DistributedConfig,
+    _Trace2Cp3DConfig,
+    _load_snapshot,
+    _optimizer_hparams_from_training,
+    _branch_choice_grid_offsets,
+    _branch_presence_views_from_sampled_output,
+    _single_output_presence_views_from_sampled_output,
+    _evaluate_trace2cp_metric_fixed_set_3d,
+    _draw_panel_line_aa,
+    _draw_projected_cp_direction,
+    _identity_batch_collate,
+    _make_batch_dataloader,
+    _make_test_loader_raw_config,
+    _make_train_sample_3d_contact_sheet,
+    _make_train_sample_3d_sheet,
+    _mixed_precision_config_from_training,
+    _oblique_line_presence_for_display,
+    _distributed_config_from_env,
+    _distributed_gather_dense_test_rows,
+    _distributed_should_use_sync_batchnorm,
+    _distributed_test_batch_indices,
+    _distributed_training_batch_index,
+    _distributed_training_sample_index,
+    _mean_dense_test_rows,
+    _report_test_timing,
+    _resolve_test_hang_diagnostics_enabled,
+    _resolve_test_watchdog_seconds,
+    _resolve_dense_test_selection,
+    _resolve_prefetch_sample_count,
+    _require_single_process_cli_mode,
+    _save_snapshot,
+    _select_branch_by_chunked_min_fraction,
+    _training_sample_index_limit,
+    _test_batch_take,
+    _validate_snapshot_intervals,
+    _write_3d_sample_sheet,
+)
+
+
+def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):
+    normal = np.asarray(normal_zyx, dtype=np.float32)
+
+    def normal_sampler(points_zyx):
+        points = np.asarray(points_zyx, dtype=np.float32)
+        normals = np.broadcast_to(normal[None, :], (points.shape[0], 3)).copy()
+        valid = np.ones((points.shape[0],), dtype=bool)
+        return normals, valid
+
+    return normal_sampler
+
+
+def test_snapshot_intervals_must_align_with_evaluation() -> None:
+    _validate_snapshot_intervals(
+        checkpoint_interval=500,
+        kept_snapshot_interval=10_000,
+        test_interval=500,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint_interval must be a multiple"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=100,
+            kept_snapshot_interval=10_000,
+            test_interval=500,
+        )
+
+    with pytest.raises(ValueError, match="kept_snapshot_interval must be 0 or a multiple"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=500,
+            kept_snapshot_interval=750,
+            test_interval=500,
+        )
+
+    with pytest.raises(ValueError, match="test_interval must be > 0"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=100,
+            kept_snapshot_interval=0,
+            test_interval=0,
+        )
+
+
+def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _resolve_inference_device(None) == torch.device("cuda")
+    assert _resolve_inference_device("auto") == torch.device("cuda")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _resolve_inference_device(None) == torch.device("cpu")
+    assert _resolve_inference_device("auto") == torch.device("cpu")
+    assert _resolve_inference_device("cpu") == torch.device("cpu")
+
+
+def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "snapshot.pt"
+    torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=checkpoint, devices=(torch.device("cpu"),)
+    ) == ("bf16", "checkpoint")
+
+
+def test_inference_precision_auto_legacy_and_unsupported_fall_back(tmp_path: Path) -> None:
+    ambiguous = tmp_path / "ambiguous.pt"
+    torch.save({"config": {"training": {"mixed_precision": "auto"}}}, ambiguous)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=ambiguous, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-ambiguous")
+    fp16 = tmp_path / "fp16.pt"
+    torch.save({"config": {"training": {"mixed_precision": "fp16"}}}, fp16)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=fp16, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-unsupported")
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        _resolve_inference_precision(
+            "fp16", checkpoint=None, devices=(torch.device("cpu"),)
+        )
+
+
+def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(fiber_infer_module, "run_fiber_trace_3d_inference", fake_run)
+    result = fiber_infer_module.main([
+        "config.json", "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--devices", "all",
+        "--prefetch-workers", "5", "--slots-per-gpu", "3",
+		"--flush-workers", "6",
+        "--accumulator-workers", "9",
+        "--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
+        "--input-cache-gib", "2.5", "--input-io-threads", "11",
+        "--input-copy-threads", "3",
+        "--profile-pipeline",
+        "--inference-precision", "bf16",
+        "--product-accumulator-dtype", "float32",
+        "--download-workers", "77",
+        "--ome-compressor", "none",
+    ])
+    assert result == 0
+    assert captured["device"] is None
+    assert captured["devices"] == "all"
+    assert captured["prefetch_workers"] == 5
+    assert captured["slots_per_gpu"] == 3
+    assert captured["flush_workers"] == 6
+    assert captured["accumulator_workers"] == 9
+    assert captured["input_reader"] == "python-zarr"
+    assert captured["prefetch_tiles_per_gpu"] == 7
+    assert captured["input_cache_gib"] == 2.5
+    assert captured["input_io_threads"] == 11
+    assert captured["input_copy_threads"] == 3
+    assert captured["profile_pipeline"] is True
+    assert captured["inference_precision"] == "bf16"
+    assert captured["product_accumulator_dtype"] == "float32"
+    assert captured["download_workers"] == 77
+    assert captured["ome_compressor"] == "none"
+
+
+def test_fiber_inference_cli_forwards_live_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module, "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--live-fetch",
+        "--live-cache-gib", "12.5", "--live-fetch-ahead-tiles", "4321",
+        "--download-workers", "123",
+    ]) == 0
+    assert captured["live_fetch"] is True
+    assert captured["live_cache_gib"] == 12.5
+    assert captured["live_fetch_ahead_tiles"] == 4321
+    assert captured["download_workers"] == 123
+
+
+@pytest.mark.parametrize("extra", [
+    ["--live-fetch", "--no-download"],
+    ["--live-fetch", "--crop", "0", "0", "0", "1", "1", "1"],
+    ["--live-cache-gib", "1"],
+])
+def test_fiber_inference_cli_rejects_invalid_live_cache_combinations(extra) -> None:
+    with pytest.raises(SystemExit):
+        fiber_infer_module.main([
+            "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+            "--checkpoint", "model.pt", *extra,
+        ])
+
+
+def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module,
+        "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt",
+    ]) == 0
+    assert captured["config_path"] is None
+
+
+def test_checkpoint_config_is_authoritative_with_legacy_fallback(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"patch_shape_zyx": [32, 32, 32]}), encoding="utf-8")
+    torch.save({"config": {"patch_shape_zyx": [64, 64, 64]}}, checkpoint)
+
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [64, 64, 64]
+    assert source == "checkpoint"
+
+    torch.save({"model": {}}, checkpoint)
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [32, 32, 32]
+    assert source == "legacy-file"
+    with pytest.raises(ValueError, match="legacy config"):
+        _checkpoint_config_for_inference(checkpoint, None)
+
+
+class _NativeTraceTestPredictionAdapter:
+    output_products = (SimpleNamespace(name="test_option"),)
+
+    def preprocess_tile(
+        self,
+        tile: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del valid_mask
+        return tile
+
+    def run_tile_inference(
+        self,
+        model: torch.nn.Module,
+        tile: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del device
+        return model(tile)
+
+    def product_tensors_from_output(self, raw_output: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"test_option": raw_output}
+
+
+def _straight_fiber() -> Vc3dFiber:
+    x = np.arange(20, 45, dtype=np.float32)
+    y = np.full_like(x, 32.0)
+    z = np.full_like(x, 32.0)
+    points = np.stack([x, y, z], axis=1)
+    return Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points[::4].copy(),
+        control_point_segments=legacy_lasagna_segments(len(points[::4])),
+        generation=1,
+        metadata={},
+    )
+
+
+def _centered_fiber() -> Vc3dFiber:
+    x = np.arange(120, 137, dtype=np.float32)
+    y = np.full_like(x, 128.0)
+    z = np.full_like(x, 128.0)
+    points = np.stack([x, y, z], axis=1)
+    return Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points[8:9].copy(),
+        control_point_segments=legacy_lasagna_segments(1),
+        generation=1,
+        metadata={},
+    )
+
+
+class _FakeChunkedVolume:
+    def __init__(
+        self,
+        *,
+        shape: tuple[int, int, int] = (256, 256, 256),
+        chunks: tuple[int, int, int] = (16, 16, 16),
+    ) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        self.chunks = tuple(int(v) for v in chunks)
+
+
+class _CapturingDependencySampler:
+    def __init__(self, *, chunks: tuple[int, int, int] = (16, 16, 16)) -> None:
+        self.chunks = np.asarray(chunks, dtype=np.int64)
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.store = object()
+
+    def chunk_requests_for_coords(
+        self,
+        coords_zyx_base: np.ndarray,
+        valid_mask: np.ndarray,
+    ) -> list[ZarrChunkRequest]:
+        del coords_zyx_base, valid_mask
+        raise AssertionError("3D prefetch must use bbox dependency requests")
+
+    def chunk_requests_for_bbox(
+        self,
+        start_zyx: np.ndarray,
+        end_zyx: np.ndarray,
+    ) -> list[ZarrChunkRequest]:
+        start = np.asarray(start_zyx, dtype=np.int64)
+        end = np.asarray(end_zyx, dtype=np.int64)
+        self.calls.append((start.copy(), end.copy()))
+        if not bool(np.all(end > start)):
+            return []
+        chunk_start = np.floor_divide(start, self.chunks)
+        chunk_end = np.floor_divide(end - 1, self.chunks) + 1
+        axes = [
+            np.arange(int(chunk_start[axis]), int(chunk_end[axis]), dtype=np.int64)
+            for axis in range(3)
+        ]
+        zz, yy, xx = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+        unique = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], axis=1)
+        return [
+            ZarrChunkRequest(
+                store=self.store,
+                store_identity="fake-dependency-store",
+                key=f"0/{int(chunk[0])}/{int(chunk[1])}/{int(chunk[2])}",
+            )
+            for chunk in unique
+        ]
+
+
+def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
+    config = config_from_mapping(
+        {
+            "datasets": [{"array_records": True}],
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 5,
+            "cp_margin_voxels": 3,
+            "presence_radius_voxels": 1.5,
+            "image_normalization": "none",
+            "round_source_to_chunk_boundaries": True,
+            **raw,
+        }
+    )
+    volume = _FakeChunkedVolume()
+    sampler = _CapturingDependencySampler(chunks=volume.chunks)
+    record = loader3d_module._Record(
+        fiber=_centered_fiber(),
+        volume=volume,
+        sampler=sampler,
+        volume_path="fake",
+        volume_scale=0,
+        volume_spacing_base=1.0,
+        base_shape_zyx=volume.shape,
+        fiber_identity="fake-centered-fiber",
+        dataset_config={},
+    )
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = config
+    loader.records = [record]
+    loader._flat_offsets = [0]
+    loader._flat_sample_count = 1
+    loader._random_pass_cache = {}
+    return loader
+
+
+def _long_segment_fiber(*, source_format: str | None = None) -> Vc3dFiber:
+    points = np.asarray(
+        [
+            [0.0, 32.0, 32.0],
+            [32.0, 32.0, 32.0],
+            [80.0, 32.0, 32.0],
+        ],
+        dtype=np.float32,
+    )
+    return Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points[1:2].copy(),
+        control_point_segments=legacy_lasagna_segments(1),
+        generation=1,
+        metadata={} if source_format is None else {"source_format": source_format},
+    )
+
+
+def _loader(*, augment_enabled: bool = False) -> FiberTrace3DLoader:
+    z, y, x = np.meshgrid(
+        np.arange(64, dtype=np.float32),
+        np.arange(64, dtype=np.float32),
+        np.arange(64, dtype=np.float32),
+        indexing="ij",
+    )
+    volume = z * 0.01 + y * 0.1 + x
+    config = config_from_mapping(
+        {
+            "batch_size": 2,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 7,
+            "cp_margin_voxels": 3,
+            "presence_radius_voxels": 1.5,
+            "image_normalization": "none",
+            "augment_enabled": augment_enabled,
+            "augment_shift_zyx": [3, 3, 3],
+            "augment_rotation_degrees": 10.0,
+            "augment_scale_min": 0.95,
+            "augment_scale_max": 1.05,
+            "round_source_to_chunk_boundaries": False,
+            "_array_records": [
+                {
+                    "volume": volume,
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+    )
+    return FiberTrace3DLoader(config)
+
+
+def _native_trace_record(
+    volume: np.ndarray,
+    *,
+    spacing_base: float = 1.0,
+    sampler: object | None = None,
+    base_shape_zyx: tuple[int, int, int] | None = None,
+) -> SimpleNamespace:
+    volume_arr = np.asarray(volume, dtype=np.float32)
+    spacing = float(spacing_base)
+    if base_shape_zyx is None:
+        base_shape_zyx = tuple(
+            int(round(float(size) * spacing)) for size in volume_arr.shape
+        )
+    if sampler is None:
+        sampler = NumpyZarrCoordinateSampler(
+            volume_arr,
+            level_spacing_base=spacing,
+        )
+    return SimpleNamespace(
+        volume=volume_arr,
+        sampler=sampler,
+        volume_spacing_base=spacing,
+        base_shape_zyx=tuple(int(v) for v in base_shape_zyx),
+    )
+
+
+def _long_segment_loader(
+    *,
+    source_format: str | None = None,
+    presence_negative_edge_margin_voxels: int | None = None,
+) -> FiberTrace3DLoader:
+    z, y, x = np.meshgrid(
+        np.arange(96, dtype=np.float32),
+        np.arange(96, dtype=np.float32),
+        np.arange(96, dtype=np.float32),
+        indexing="ij",
+    )
+    volume = z * 0.01 + y * 0.1 + x
+    raw = {
+        "batch_size": 1,
+        "patch_shape_zyx": [16, 16, 16],
+        "seed": 11,
+        "cp_margin_voxels": 3,
+        "presence_radius_voxels": 1.5,
+        "image_normalization": "none",
+        "augment_enabled": False,
+        "round_source_to_chunk_boundaries": False,
+        "_array_records": [
+            {
+                "volume": volume,
+                "fiber": _long_segment_fiber(source_format=source_format),
+                "volume_path": "synthetic",
+            }
+        ],
+    }
+    if presence_negative_edge_margin_voxels is not None:
+        raw["presence_negative_edge_margin_voxels"] = int(
+            presence_negative_edge_margin_voxels
+        )
+    config = config_from_mapping(raw)
+    return FiberTrace3DLoader(config)
+
+
+def _loader_with_mapping(raw: dict) -> FiberTrace3DLoader:
+    z, y, x = np.meshgrid(
+        np.arange(64, dtype=np.float32),
+        np.arange(64, dtype=np.float32),
+        np.arange(64, dtype=np.float32),
+        indexing="ij",
+    )
+    volume = z * 0.01 + y * 0.1 + x
+    base = {
+        "batch_size": 1,
+        "patch_shape_zyx": [16, 16, 16],
+        "seed": 13,
+        "cp_margin_voxels": 3,
+        "presence_radius_voxels": 1.5,
+        "image_normalization": "none",
+        "augment_enabled": True,
+        "augment_shift_zyx": [3, 3, 3],
+        "augment_rotation_degrees": 10.0,
+        "augment_scale_min": 0.95,
+        "augment_scale_max": 1.05,
+        "round_source_to_chunk_boundaries": False,
+        "_array_records": [
+            {
+                "volume": volume,
+                "fiber": _straight_fiber(),
+                "volume_path": "synthetic",
+            }
+        ],
+    }
+    base.update(raw)
+    return FiberTrace3DLoader(config_from_mapping(base))
+
+
+def test_3d_config_defaults_volume_cache_to_512_mib() -> None:
+    for extra in ({}, {"volume_cache_memory_mib": None}):
+        raw = {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 3,
+            "_array_records": [
+                {
+                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+        raw.update(extra)
+        config = config_from_mapping(raw)
+
+        assert config.volume_cache_memory_mib == DEFAULT_VOLUME_CACHE_MEMORY_MIB
+        assert config.volume_cache_memory_bytes == 512 * 1024 * 1024
+
+
+def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
+    config = config_from_mapping(
+        {
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "volume_cache_memory_mib": 128,
+            "_array_records": [
+                {
+                    "volume": np.zeros((16, 16, 16), dtype=np.float32),
+                    "fiber": _straight_fiber(),
+                    "volume_path": "synthetic",
+                }
+            ],
+        }
+    )
+
+    assert config.volume_cache_memory_mib == 128.0
+    assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
+
+
+def test_3d_dataset_manifest_is_optional_at_scale_zero() -> None:
+    volume = np.zeros((17, 19, 23), dtype=np.float32)
+    config = config_from_mapping(
+        {"datasets": [{"base_volume_path": "synthetic", "base_volume_scale": 0}]}
+    )
+    base_shape = loader3d_module._validate_dataset_manifest(
+        {"base_volume_path": "synthetic", "base_volume_scale": 0},
+        config,
+        volume=volume,
+        volume_path="synthetic",
+    )
+    assert base_shape == volume.shape
+
+
+def test_3d_dataset_manifest_is_optional_for_selected_scale(monkeypatch) -> None:
+    selected = np.zeros((8, 10, 12), dtype=np.float32)
+    base0 = np.zeros((32, 40, 48), dtype=np.float32)
+    calls: list[int] = []
+
+    def fake_open_zarr(*args, **kwargs):
+        del args
+        calls.append(int(kwargs["scale"]))
+        return base0
+
+    monkeypatch.setattr(loader3d_module, "open_zarr", fake_open_zarr)
+    config = config_from_mapping(
+        {"datasets": [{"base_volume_path": "synthetic", "base_volume_scale": 2}]}
+    )
+    base_shape = loader3d_module._validate_dataset_manifest(
+        {"base_volume_path": "synthetic", "base_volume_scale": 2},
+        config,
+        volume=selected,
+        volume_path="synthetic",
+    )
+    assert base_shape == base0.shape
+    assert calls == [0]
+
+
+def test_3d_prefetch_dependency_uses_augmentation_envelope_not_sampled_params(
+    monkeypatch,
+) -> None:
+    loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": True,
+            "augment_shift_zyx": [7, 5, 3],
+            "augment_rotation_degrees": 180.0,
+            "augment_scale_min": 0.75,
+            "augment_scale_max": 1.25,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [4, 2, 6],
+            "augment_smooth_displacement_probability": 1.0,
+        }
+    )
+
+    def fail_sampled_augmentation(*_args, **_kwargs):
+        raise AssertionError("_sample_augment_params must not drive prefetch dependencies")
+
+    monkeypatch.setattr(loader, "_sample_augment_params", fail_sampled_augmentation)
+
+    valid_a, requests_a = loader._chunk_requests_and_valid_voxels_for_sample_index(
+        0,
+        sample_index_limit=1,
+    )
+    valid_b, requests_b = loader._chunk_requests_and_valid_voxels_for_sample_index(
+        99,
+        sample_index_limit=1,
+    )
+
+    assert valid_a == valid_b
+    assert valid_a > 0
+    assert sorted(request.key for request in requests_a) == sorted(
+        request.key for request in requests_b
+    )
+    sampler = loader.records[0].sampler
+    assert isinstance(sampler, _CapturingDependencySampler)
+    assert len(sampler.calls) == 2
+    assert sampler.calls[0][0].shape == (3,)
+    assert sampler.calls[0][1].shape == (3,)
+
+
+def test_3d_prefetch_envelope_extrema_expand_dependency_region() -> None:
+    base_loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": False,
+            "augment_shift_zyx": [32, 32, 32],
+            "augment_scale_min": 0.5,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [16, 16, 16],
+        }
+    )
+    augmented_loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": True,
+            "augment_shift_zyx": [32, 32, 32],
+            "augment_scale_min": 0.5,
+            "augment_scale_max": 2.0,
+            "augment_rotation_degrees": 180.0,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [16, 16, 16],
+            "augment_smooth_displacement_probability": 1.0,
+        }
+    )
+
+    base_valid, base_requests = base_loader._chunk_requests_and_valid_voxels_for_sample_index(
+        0,
+        sample_index_limit=1,
+    )
+    augmented_valid, augmented_requests = (
+        augmented_loader._chunk_requests_and_valid_voxels_for_sample_index(
+            0,
+            sample_index_limit=1,
+        )
+    )
+
+    assert augmented_valid > base_valid
+    assert len(augmented_requests) > len(base_requests)
+
+
+def _load_materialized_batch(
+    loader: FiberTrace3DLoader,
+    start_sample_index: int,
+    *,
+    sample_mode: str = "random",
+) -> object:
+    batch = loader.load_batch(start_sample_index, sample_mode=sample_mode)
+    return materialize_targets(batch, loader.config, profile=True)
+
+
+def _has_sparse_direction_at(batch: object, sample: int, z: int, y: int, x: int) -> bool:
+    indices = batch.direction_indices_bzyx
+    assert indices is not None
+    target = torch.tensor([sample, z, y, x], dtype=indices.dtype, device=indices.device)
+    return bool(torch.any(torch.all(indices == target.view(1, 4), dim=1)))
+
+
+def test_lasagna_3x2_encoding_matches_projection_formula() -> None:
+    encoded_2d = encode_lasagna_direction_2d(
+        np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    )
+    assert np.allclose(encoded_2d[0], [1.0, 0.5 + 0.5 / np.sqrt(2.0)])
+    assert np.allclose(encoded_2d[1], [0.0, 0.5 - 0.5 / np.sqrt(2.0)])
+
+    encoded_3d = encode_lasagna_direction_3x2(
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+    )[0]
+    assert np.allclose(encoded_3d[:2], encoded_2d[0])
+    assert np.allclose(encoded_3d[2:4], encoded_2d[0])
+    assert np.allclose(encoded_3d[4:], [0.5, 0.5])
+
+
+def test_fiber_trace_3d_imports_with_package_style_lasagna_path() -> None:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "vesuvius/src:."
+    code = "\n".join(
+        [
+            "import vesuvius.neural_tracing.fiber_trace_3d",
+            "import vesuvius.neural_tracing.fiber_trace_3d.infer",
+            "import vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[3],
+        env=env,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_lasagna_compact_normal_encoding_is_shared() -> None:
+    axis = np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+    encoded = encode_lasagna_direction_3x2(axis)[0]
+    channels = [np.asarray([float(value)], dtype=np.float32) for value in encoded]
+
+    _wz, _wy, _wx, nx_n, ny_n, nz_n = estimate_normal(*channels)
+    nx_u8, ny_u8 = encode_normal_nxny_u8(*channels)
+
+    flip = np.where(nz_n < 0.0, -1.0, 1.0)
+    expected_nx = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(
+        np.uint8
+    )
+    expected_ny = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(
+        np.uint8
+    )
+    assert np.array_equal(nx_u8, expected_nx)
+    assert np.array_equal(ny_u8, expected_ny)
+
+
+def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
+    axes = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 2.0, 3.0],
+            [-0.2, 0.4, 0.9],
+            [1.0e-4, 1.0, 2.0e-4],
+        ],
+        dtype=torch.float32,
+    )
+    axes = axes / torch.linalg.vector_norm(axes, dim=1, keepdim=True)
+    encoded = encode_lasagna_direction_3x2(axes)
+    decoded = decode_lasagna_direction_3x2_analytic(encoded)
+    agreement = torch.abs(torch.sum(decoded * axes, dim=1))
+    assert torch.all(agreement > 0.999)
+
+
+def test_fiber_prediction_decodes_direction_only_output() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+
+    directions, presence, valid = decode_grouped_direction_presence(encoded)
+
+    assert direction_branch_count_from_channels(6) == 1
+    assert directions.shape == (1, 1, 3)
+    assert presence.shape == (1, 1)
+    assert valid.shape == (1, 1)
+    assert bool(valid[0, 0])
+    assert torch.allclose(presence, torch.ones_like(presence))
+    assert torch.allclose(torch.abs(directions[0, 0, 2]), torch.tensor(1.0), atol=1.0e-5)
+
+
+def test_fiber_prediction_decodes_multi_branch_output() -> None:
+    encoded_a = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+    encoded_b = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+    )
+    raw = torch.cat(
+        [
+            encoded_a,
+            torch.tensor([[0.25]], dtype=torch.float32),
+            encoded_b,
+            torch.tensor([[0.75]], dtype=torch.float32),
+        ],
+        dim=1,
+    )
+
+    directions, presence, valid = decode_grouped_direction_presence(raw)
+
+    assert direction_branch_count_from_channels(14) == 2
+    assert directions.shape == (1, 2, 3)
+    assert torch.allclose(presence, torch.tensor([[0.25, 0.75]], dtype=torch.float32))
+    assert torch.equal(valid, torch.ones((1, 2), dtype=torch.bool))
+
+
+def test_lasagna_3x2_zero_query_is_reserved_off_manifold_token() -> None:
+    zero_query = torch.zeros((1, 6), dtype=torch.float32)
+    decoded = decode_lasagna_direction_3x2_analytic(zero_query)
+    reencoded = encode_lasagna_direction_3x2(decoded)
+
+    assert torch.isfinite(decoded).all()
+    assert not torch.allclose(reencoded, zero_query)
+
+
+def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
+    loader = _loader(augment_enabled=False)
+    raw_batch = loader.load_batch(0)
+    assert raw_batch.direction_target is None
+    assert raw_batch.direction_indices_bzyx is None
+    assert raw_batch.presence_target is None
+    assert raw_batch.target_modes.shape == (2,)
+    assert raw_batch.target_tangent_zyx.shape == (2, 3)
+    batch_a = _load_materialized_batch(loader, 0)
+    batch_b = _load_materialized_batch(loader, 0)
+    assert batch_a.volume.shape == (2, 1, 16, 16, 16)
+    assert batch_a.direction_target is None
+    assert batch_a.direction_indices_bzyx.shape[1] == 4
+    assert batch_a.direction_target_sparse.shape[1] == 6
+    assert batch_a.presence_target.shape == (2, 1, 16, 16, 16)
+    assert torch.equal(batch_a.stream_indices, batch_b.stream_indices)
+    assert torch.equal(batch_a.data_indices, batch_b.data_indices)
+    assert torch.allclose(batch_a.volume, batch_b.volume)
+    assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
+    assert bool((batch_a.presence_target > 0.5).any())
+    assert bool((batch_a.presence_target < 0.5).any())
+
+
+def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
+    config = _loader(augment_enabled=False).config
+    serial_dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=3,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+    serial_batches = [serial_dataset[index] for index in range(3)]
+    dataloader_dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=3,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+    assert (
+        _make_batch_dataloader(
+            config,
+            raw_config={"training": {"loader_workers": 0}},
+            start_batch_index=0,
+            batch_count=3,
+            sample_mode="random",
+        )
+        is None
+    )
+    dataloader = DataLoader(
+        dataloader_dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_identity_batch_collate,
+    )
+    dataloader_batches = list(dataloader)
+    assert len(dataloader_batches) == len(serial_batches)
+    for expected, actual in zip(serial_batches, dataloader_batches, strict=True):
+        expected = materialize_targets(expected, config, profile=True)
+        actual = materialize_targets(actual, config, profile=True)
+        assert type(actual).__name__ == "FiberTrace3DBatch"
+        assert torch.equal(actual.stream_indices, expected.stream_indices)
+        assert torch.equal(actual.data_indices, expected.data_indices)
+        assert torch.equal(actual.record_indices, expected.record_indices)
+        assert torch.equal(actual.control_point_indices, expected.control_point_indices)
+        assert actual.fiber_paths == expected.fiber_paths
+        assert torch.allclose(actual.volume, expected.volume)
+        assert torch.allclose(actual.presence_target, expected.presence_target)
+        assert torch.equal(actual.direction_indices_bzyx, expected.direction_indices_bzyx)
+        assert torch.allclose(actual.direction_target_sparse, expected.direction_target_sparse)
+
+
+def test_3d_batch_dataset_applies_sample_index_limit_to_data_only() -> None:
+    config = _loader(augment_enabled=True).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=0,
+        batch_count=2,
+        sample_index_limit=1,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    first = dataset[0]
+    second = dataset[1]
+
+    assert torch.equal(first.stream_indices, torch.tensor([0, 1], dtype=torch.long))
+    assert torch.equal(second.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(first.data_indices, torch.zeros_like(first.data_indices))
+    assert torch.equal(second.data_indices, torch.zeros_like(second.data_indices))
+    assert torch.equal(first.control_point_indices, second.control_point_indices)
+    assert not torch.allclose(first.cp_local_zyx, second.cp_local_zyx)
+
+
+def test_3d_batch_dataset_strides_batch_indices_for_distributed_ranks() -> None:
+    config = _loader(augment_enabled=False).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=1,
+        batch_index_stride=3,
+        batch_count=2,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    first = dataset[0]
+    second = dataset[1]
+
+    assert torch.equal(first.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(second.stream_indices, torch.tensor([8, 9], dtype=torch.long))
+
+
+def test_3d_batch_dataset_applies_non_aligned_sample_offset_before_stride() -> None:
+    config = _loader(augment_enabled=False).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=1,
+        batch_index_stride=3,
+        sample_index_offset=5,
+        batch_count=2,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    assert torch.equal(dataset[0].stream_indices, torch.tensor([7, 8], dtype=torch.long))
+    assert torch.equal(dataset[1].stream_indices, torch.tensor([13, 14], dtype=torch.long))
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "batch_size", "world_size"),
+    [(3, 8, 8), (123, 8, 8), (16, 8, 3), (0, 8, 4)],
+)
+def test_3d_distributed_test_batches_are_disjoint_and_complete(
+    sample_count: int,
+    batch_size: int,
+    world_size: int,
+) -> None:
+    assignments = []
+    for rank in range(world_size):
+        config = _DistributedConfig(
+            enabled=world_size > 1,
+            rank=rank,
+            local_rank=rank,
+            world_size=world_size,
+            is_main=rank == 0,
+            backend="gloo",
+            device=torch.device("cpu"),
+        )
+        assignments.extend(
+            _distributed_test_batch_indices(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                config=config,
+            )
+        )
+    expected_count = math.ceil(sample_count / batch_size)
+    assert sorted(assignments) == list(range(expected_count))
+    assert len(assignments) == len(set(assignments))
+    if expected_count:
+        assert sum(
+            _test_batch_take(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                global_batch_index=index,
+            )
+            for index in range(expected_count)
+        ) == sample_count
+
+
+def test_3d_gathered_test_rows_restore_serial_global_batch_mean(monkeypatch) -> None:
+    rows_by_rank = [
+        [(0, {"total": 1.0, "direction": 10.0}), (2, {"total": 3.0, "direction": 30.0})],
+        [(1, {"total": 2.0, "direction": 20.0})],
+    ]
+    config = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+
+    def fake_gather_object(local_rows, gathered, *, dst):
+        assert local_rows == rows_by_rank[0]
+        assert dst == 0
+        gathered[:] = rows_by_rank
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.dist.gather_object", fake_gather_object)
+    gathered = _distributed_gather_dense_test_rows(rows_by_rank[0], config)
+    assert [index for index, _row in sorted(gathered)] == [0, 1, 2]
+    assert _mean_dense_test_rows(gathered) == {"total": 2.0, "direction": 20.0}
+
+
+def test_3d_test_timing_prints_and_logs_tensorboard_scalar(capsys) -> None:
+    class Writer:
+        def __init__(self):
+            self.scalars = []
+
+        def add_scalar(self, tag, value, step):
+            self.scalars.append((tag, value, step))
+
+    writer = Writer()
+    _report_test_timing(step=1200, total_seconds=12.3456, writer=writer)
+    assert capsys.readouterr().out == "test_timing step=1200 total_seconds=12.346\n"
+    assert writer.scalars == [("timing/test_total_seconds", 12.3456, 1200)]
+
+
+def test_3d_distributed_config_defaults_to_single_process() -> None:
+    config = _distributed_config_from_env(torch.device("cpu"), env={})
+
+    assert not config.enabled
+    assert config.rank == 0
+    assert config.local_rank == 0
+    assert config.world_size == 1
+    assert config.is_main
+    assert config.backend == ""
+    assert config.device == torch.device("cpu")
+
+
+def test_3d_distributed_config_parses_torchrun_cpu_env() -> None:
+    config = _distributed_config_from_env(
+        torch.device("cpu"),
+        env={"WORLD_SIZE": "4", "RANK": "2", "LOCAL_RANK": "1"},
+    )
+
+    assert config.enabled
+    assert config.rank == 2
+    assert config.local_rank == 1
+    assert config.world_size == 4
+    assert not config.is_main
+    assert config.backend == "gloo"
+    assert config.device == torch.device("cpu")
+
+
+def test_3d_distributed_config_requires_complete_torchrun_env() -> None:
+    with pytest.raises(ValueError, match="WORLD_SIZE, RANK, and LOCAL_RANK"):
+        _distributed_config_from_env(
+            torch.device("cpu"),
+            env={"WORLD_SIZE": "2", "RANK": "0"},
+        )
+
+
+def test_3d_distributed_training_sample_indices_partition_by_rank() -> None:
+    config = _DistributedConfig(
+        enabled=True,
+        rank=1,
+        local_rank=1,
+        world_size=4,
+        is_main=False,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+
+    assert _distributed_training_batch_index(1, config) == 1
+    assert _distributed_training_batch_index(2, config) == 5
+    assert _distributed_training_sample_index(2, batch_size=8, config=config) == 40
+    with pytest.raises(ValueError, match="positive"):
+        _distributed_training_batch_index(0, config)
+
+
+def test_3d_sync_batchnorm_is_only_automatic_for_cuda_ddp() -> None:
+    cpu_ddp = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+    cuda_ddp = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="nccl",
+        device=torch.device("cuda", 0),
+    )
+    single = _DistributedConfig(
+        enabled=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        is_main=True,
+        backend="",
+        device=torch.device("cuda", 0),
+    )
+
+    assert not _distributed_should_use_sync_batchnorm(cpu_ddp)
+    assert _distributed_should_use_sync_batchnorm(cuda_ddp)
+    assert not _distributed_should_use_sync_batchnorm(single)
+
+
+def test_3d_torchrun_rejects_single_process_only_subcommands(monkeypatch) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    with pytest.raises(SystemExit, match="single-process only"):
+        _require_single_process_cli_mode("--benchmark")
+
+
+def test_loader_augmented_batch_is_finite() -> None:
+    loader = _loader(augment_enabled=True)
+    batch = _load_materialized_batch(loader, 1)
+    assert torch.isfinite(batch.volume).all()
+    assert torch.isfinite(batch.direction_target_sparse).all()
+    assert batch.volume.shape == (2, 1, 16, 16, 16)
+
+
+def test_3d_augmentation_index_is_separate_from_data_index() -> None:
+    loader = _loader(augment_enabled=True)
+    record, _record_index, cp_index = loader.descriptor_for_sample_index(0, sample_mode="flat")
+
+    params_a = loader._sample_augment_params(record, cp_index, 0)
+    params_a_repeat = loader._sample_augment_params(record, cp_index, 0)
+    params_b = loader._sample_augment_params(record, cp_index, 1000)
+
+    assert np.allclose(params_a.cp_volume_zyx, params_b.cp_volume_zyx)
+    assert np.allclose(params_a.cp_local_zyx, params_a_repeat.cp_local_zyx)
+    assert np.allclose(params_a.source_to_output_zyx, params_a_repeat.source_to_output_zyx)
+    assert not np.allclose(params_a.source_to_output_zyx, params_b.source_to_output_zyx)
+
+
+def test_3d_bounded_data_index_reuses_cp_but_not_augmentation() -> None:
+    loader = _loader(augment_enabled=True)
+
+    batch_a = loader.load_batch(
+        0,
+        sample_mode="random",
+        sample_index_limit=1,
+    )
+    batch_b = loader.load_batch(
+        2,
+        sample_mode="random",
+        sample_index_limit=1,
+    )
+
+    assert torch.equal(batch_a.stream_indices, torch.tensor([0, 1], dtype=torch.long))
+    assert torch.equal(batch_b.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(batch_a.data_indices, torch.zeros_like(batch_a.data_indices))
+    assert torch.equal(batch_b.data_indices, torch.zeros_like(batch_b.data_indices))
+    assert torch.equal(batch_a.record_indices, batch_b.record_indices)
+    assert torch.equal(batch_a.control_point_indices, batch_b.control_point_indices)
+    assert not torch.allclose(batch_a.cp_local_zyx, batch_b.cp_local_zyx)
+
+
+def test_3d_branch_choice_grid_offset_uses_stream_index() -> None:
+    offsets = _branch_choice_grid_offsets(
+        torch.tensor([0, 1], dtype=torch.long),
+        chunk_size=2,
+    )
+    assert offsets.shape == (2, 3)
+    assert bool(torch.all((offsets >= 0) & (offsets <= 1)))
+    assert not torch.equal(offsets[0], offsets[1])
+
+    indices = torch.tensor(
+        [
+            [0, 0, 0, 0],
+            [0, 0, 0, 1],
+            [0, 0, 0, 2],
+            [0, 0, 0, 3],
+        ],
+        dtype=torch.long,
+    )
+    score = torch.tensor(
+        [
+            [2.0, 1.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    selected_stream0 = _select_branch_by_chunked_min_fraction(
+        score,
+        indices,
+        stream_indices=torch.tensor([0], dtype=torch.long),
+        chunk_size=2,
+        min_fraction=0.10,
+    )
+    selected_stream1 = _select_branch_by_chunked_min_fraction(
+        score,
+        indices,
+        stream_indices=torch.tensor([1], dtype=torch.long),
+        chunk_size=2,
+        min_fraction=0.10,
+    )
+
+    assert torch.equal(selected_stream0, torch.tensor([1, 1, 0, 0], dtype=torch.long))
+    assert torch.equal(selected_stream1, torch.tensor([1, 0, 0, 0], dtype=torch.long))
+
+
+def test_loader_clips_long_label_segments_to_patch_domain() -> None:
+    loader = _long_segment_loader(source_format="nml")
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    assert int(raw_batch.target_segment_counts[0]) > 0
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+    assert batch.volume.shape == (1, 1, 16, 16, 16)
+    assert int(batch.direction_indices_bzyx.shape[0]) > 0
+    assert bool((batch.presence_target > 0.5).any())
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] > 0.5
+    off_line_y = min(int(cp[1]) + 1, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), off_line_y, far_on_segment_x] == 0.0
+
+
+def test_nml_dense_line_presence_mask_covers_patch_edges() -> None:
+    loader = _long_segment_loader(
+        source_format="nml",
+        presence_negative_edge_margin_voxels=4,
+    )
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+
+    assert int(batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    z = int(cp[0])
+    y = int(cp[1])
+    assert bool(batch.presence_mask[0, 0, z, y, 0])
+    assert batch.presence_target[0, 0, z, y, 0] > 0.5
+    assert bool(batch.presence_mask[0, 0, 0, 0, 0])
+    assert batch.presence_target[0, 0, 0, 0, 0] == 0.0
+
+
+def test_nml_dense_line_batch_keeps_cp_tangent_for_oblique_visuals() -> None:
+    loader = _long_segment_loader(source_format="nml")
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_DENSE_LINE
+    assert torch.allclose(
+        raw_batch.target_tangent_zyx[0],
+        torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32),
+        atol=1.0e-5,
+    )
+
+
+def test_cp_only_presence_mask_keeps_edge_exclusion() -> None:
+    loader = _long_segment_loader(
+        source_format=None,
+        presence_negative_edge_margin_voxels=4,
+    )
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+
+    assert int(batch.target_modes[0]) == _TARGET_MODE_CP_ONLY
+    assert not bool(batch.presence_mask[0, 0, 0, 0, 0])
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    assert bool(batch.presence_mask[0, 0, int(cp[0]), int(cp[1]), int(cp[2])])
+
+
+def test_loader_uses_cp_only_supervision_for_non_nml_fibers() -> None:
+    loader = _long_segment_loader(source_format=None)
+    raw_batch = loader.load_batch(0, sample_mode="flat")
+    assert int(raw_batch.target_modes[0]) == _TARGET_MODE_CP_ONLY
+    assert int(raw_batch.target_segment_counts[0]) > 0
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), int(cp[2])] > 0.5
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
+    assert not _has_sparse_direction_at(batch, 0, int(cp[0]), int(cp[1]), far_on_segment_x)
+
+
+def test_3d_sheet_visualizes_line_context_for_cp_only_presence() -> None:
+    loader = _long_segment_loader(source_format=None)
+    batch = _load_materialized_batch(loader, 0, sample_mode="flat")
+    cp = torch.round(batch.cp_local_zyx[0]).to(dtype=torch.long)
+    far_on_segment_x = min(int(cp[2]) + 4, 15)
+    assert batch.presence_target[0, 0, int(cp[0]), int(cp[1]), far_on_segment_x] == 0.0
+
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    patch = int(batch.volume.shape[-1])
+    gap = 4
+    target_panel = sheet[:patch, patch + gap : patch * 2 + gap]
+
+    assert target_panel[int(cp[1]), far_on_segment_x, 0] > 0
+
+
+def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    with torch.no_grad():
+        output = model(batch.volume[:1])
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    assert sheet.ndim == 3
+    assert sheet.shape[2] == 3
+    assert sheet.dtype == np.uint8
+    assert sheet.shape[0] > 16
+    assert sheet.shape[1] == 16 * 5 + 4 * 4
+    first_image_panel = sheet[:16, :16]
+    colored = (
+        (first_image_panel[..., 0] != first_image_panel[..., 1])
+        | (first_image_panel[..., 1] != first_image_panel[..., 2])
+    )
+    assert bool(np.any(colored))
+
+
+def test_train_sample_3d_sheet_maxpools_target_presence_for_display() -> None:
+    patch = 8
+    cp = torch.tensor([[4.0, 4.0, 4.0]], dtype=torch.float32)
+    target = torch.zeros((1, 1, patch, patch, patch), dtype=torch.float32)
+    target[0, 0, 5, 5, 4] = 1.0
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, patch, patch, patch), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, patch, patch, patch), dtype=torch.bool),
+        cp_local_zyx=cp,
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.ones((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32),
+        presence_target=target,
+        presence_mask=torch.ones((1, 1, patch, patch, patch), dtype=torch.bool),
+    )
+    output = torch.full((1, 7, patch, patch, patch), 0.5, dtype=torch.float32)
+
+    sheet = _make_train_sample_3d_sheet(batch, output)
+    target_panel = sheet[:patch, patch + 4 : patch * 2 + 4]
+    assert target_panel[5, 4, 0] == 255
+    assert target_panel[5, 4, 1] == 255
+    assert target_panel[5, 4, 2] == 255
+
+
+def test_affine_only_forward_map_matches_matrix_transform() -> None:
+    loader = _loader(augment_enabled=True)
+    record, _record_index, cp_index = loader.descriptor_for_sample_index(0)
+    params = loader._sample_augment_params(record, cp_index, 0)
+    map_start, map_end = loader._source_bbox_for_maps(record, params)
+    geometry = loader._build_geometry_maps(
+        params,
+        forward_start_zyx=map_start,
+        forward_end_zyx=map_end,
+        device=torch.device("cpu"),
+    )
+    points = params.cp_volume_zyx.reshape(1, 3) + np.asarray(
+        [[0.0, 0.0, -1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    mapped, valid = loader._source_points_to_output_np(points, geometry)
+    expected = params.cp_local_zyx.reshape(1, 3) + (
+        points - params.cp_volume_zyx.reshape(1, 3)
+    ) @ params.source_to_output_zyx.T
+    assert bool(valid.all())
+    assert np.allclose(mapped, expected, atol=1.0e-4)
+
+
+def test_smooth_displacement_modes_are_deterministic_and_finite() -> None:
+    for mode in ("1d", "2d", "3d"):
+        loader = _loader_with_mapping(
+            {
+                "augment_smooth_displacement_mode": mode,
+                "augment_smooth_displacement_amplitude_zyx": [1.0, 0.75, 0.5],
+                "augment_smooth_displacement_control_spacing_zyx": [8.0, 8.0, 8.0],
+                "augment_smooth_displacement_probability": 1.0,
+            }
+        )
+        batch_a = _load_materialized_batch(loader, 2)
+        batch_b = _load_materialized_batch(loader, 2)
+        assert torch.isfinite(batch_a.volume).all()
+        assert torch.isfinite(batch_a.direction_target_sparse).all()
+        assert torch.allclose(batch_a.volume, batch_b.volume)
+        assert torch.equal(batch_a.direction_indices_bzyx, batch_b.direction_indices_bzyx)
+        assert torch.allclose(batch_a.direction_target_sparse, batch_b.direction_target_sparse)
+        assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
+
+
+def test_anisotropic_blur_spreads_along_configured_axis() -> None:
+    volume = torch.zeros((9, 9, 9), dtype=torch.float32)
+    volume[4, 4, 4] = 1.0
+    blurred = _anisotropic_blur_3d(
+        volume,
+        axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        sigma_along=1.5,
+        sigma_across=0.0,
+    )
+    assert blurred[3, 4, 4] > 0.0
+    assert blurred[5, 4, 4] > 0.0
+    assert blurred[4, 4, 3] == 0.0
+
+
+def test_nonzero_unsupported_3d_shear_and_ringing_raise(tmp_path) -> None:
+    config_path = tmp_path / "bad.json"
+    raw = {
+        "datasets": [{"base_volume_path": "synthetic", "lasagna_manifest_path": "synthetic"}],
+        "augment_shear_x": 1.0,
+    }
+    config_path.write_text(__import__("json").dumps(raw), encoding="utf-8")
+    try:
+        load_config(config_path)
+    except ValueError as exc:
+        assert "augment_shear_x" in str(exc)
+    else:
+        raise AssertionError("non-zero augment_shear_x should fail")
+
+
+def test_local_prefetch_has_no_remote_chunks() -> None:
+    loader = _loader(augment_enabled=False)
+    summary = loader.prefetch(0, 2)
+    assert summary["chunks"] == 0
+    assert summary["errors"] == 0
+
+
+def test_3d_training_sample_index_limit_validation() -> None:
+    assert _training_sample_index_limit({}, 10) == 0
+    assert _training_sample_index_limit({"max_sample_index": 4}, 10) == 4
+    try:
+        _training_sample_index_limit({"max_sample_index": -1}, 10)
+    except ValueError as exc:
+        assert "max_sample_index" in str(exc)
+    else:
+        raise AssertionError("negative max_sample_index should fail")
+    try:
+        _training_sample_index_limit({"max_sample_index": 11}, 10)
+    except ValueError as exc:
+        assert "<= configured sample count" in str(exc)
+    else:
+        raise AssertionError("too-large max_sample_index should fail")
+
+
+def test_3d_prefetch_step_count_resolution_matches_2d_sentinels() -> None:
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=None,
+        )
+        == 24
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=2,
+        )
+        == 16
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3, "max_sample_index": 12},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=2,
+        )
+        == 12
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 0},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=None,
+        )
+        == 100
+    )
+    assert (
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3, "max_sample_index": 12},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=0,
+        )
+        == 12
+    )
+    try:
+        _resolve_prefetch_sample_count(
+            training={"max_steps": 3},
+            loader_sample_count=100,
+            batch_size=8,
+            prefetch_steps=-1,
+        )
+    except ValueError as exc:
+        assert "--prefetch-steps" in str(exc)
+    else:
+        raise AssertionError("negative prefetch steps should fail")
+
+
+def test_3d_resume_reapplies_current_optimizer_hparams_preserving_state(tmp_path: Path) -> None:
+    torch.manual_seed(5)
+    original_model = torch.nn.Linear(3, 2)
+    original_optimizer = torch.optim.AdamW(
+        original_model.parameters(),
+        lr=1.0e-4,
+        weight_decay=0.125,
+    )
+    original_loss = original_model(torch.ones(4, 3)).square().mean()
+    original_loss.backward()
+    original_optimizer.step()
+    original_state_norms = sorted(
+        float(state["exp_avg"].abs().sum().item())
+        for state in original_optimizer.state.values()
+    )
+    original_state_steps = sorted(
+        float(state["step"].detach().cpu().item())
+        for state in original_optimizer.state.values()
+    )
+    checkpoint = tmp_path / "snapshot.pt"
+    _save_snapshot(
+        checkpoint,
+        model=original_model,
+        optimizer=original_optimizer,
+        step=17,
+        config={},
+        metric=None,
+    )
+
+    resumed_model = torch.nn.Linear(3, 2)
+    current_hparams = _optimizer_hparams_from_training(
+        {"learning_rate": 0.02, "weight_decay": 0.5}
+    )
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), **current_hparams)
+    loaded_step = _load_snapshot(
+        checkpoint,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        optimizer_hparams=current_hparams,
+        map_location="cpu",
+    )
+
+    assert loaded_step == 17
+    assert [group["lr"] for group in resumed_optimizer.param_groups] == [0.02]
+    assert [group["weight_decay"] for group in resumed_optimizer.param_groups] == [0.5]
+    resumed_state_norms = sorted(
+        float(state["exp_avg"].abs().sum().item())
+        for state in resumed_optimizer.state.values()
+    )
+    resumed_state_steps = sorted(
+        float(state["step"].detach().cpu().item())
+        for state in resumed_optimizer.state.values()
+    )
+    assert resumed_state_norms == pytest.approx(original_state_norms)
+    assert resumed_state_steps == pytest.approx(original_state_steps)
+
+
+def test_3d_save_snapshot_unwraps_parallel_model_state(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    wrapped = torch.nn.DataParallel(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    checkpoint = tmp_path / "wrapped.pt"
+
+    _save_snapshot(
+        checkpoint,
+        model=wrapped,
+        optimizer=optimizer,
+        step=3,
+        config={},
+        metric=1.25,
+    )
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert sorted(payload["model"].keys()) == ["bias", "weight"]
+
+
+def test_3d_mixed_precision_config_parsing_cpu() -> None:
+    cpu = torch.device("cpu")
+
+    off = _mixed_precision_config_from_training({}, cpu)
+    assert off.mode == "off"
+    assert not off.enabled
+    assert off.dtype is None
+
+    bf16 = _mixed_precision_config_from_training({"mixed_precision": "bf16"}, cpu)
+    assert bf16.mode == "bf16"
+    assert bf16.enabled
+    assert bf16.dtype == torch.bfloat16
+    assert not bf16.use_grad_scaler
+
+    bool_enabled = _mixed_precision_config_from_training({"mixed_precision": True}, cpu)
+    assert bool_enabled.mode == "bf16"
+
+    auto_cpu = _mixed_precision_config_from_training({"mixed_precision": "auto"}, cpu)
+    assert auto_cpu.mode == "off"
+    assert not auto_cpu.enabled
+
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        _mixed_precision_config_from_training({"mixed_precision": "fp16"}, cpu)
+    with pytest.raises(ValueError, match="mixed_precision"):
+        _mixed_precision_config_from_training({"mixed_precision": "tf32"}, cpu)
+
+
+def test_3d_mixed_precision_autocast_context_cpu_bf16() -> None:
+    precision = _mixed_precision_config_from_training(
+        {"mixed_precision": "bf16"},
+        torch.device("cpu"),
+    )
+    x = torch.ones((4, 4), dtype=torch.float32)
+
+    with _autocast_context(precision):
+        y = x @ x
+
+    assert y.shape == (4, 4)
+    assert y.dtype == torch.bfloat16
+
+
+def test_3d_conditioned_loss_runs_under_cpu_bf16_autocast() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    precision = _mixed_precision_config_from_training(
+        {"mixed_precision": "bf16"},
+        torch.device("cpu"),
+    )
+
+    with _autocast_context(precision):
+        losses = compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=1.0,
+            presence_weight=1.0,
+        )
+    losses["total"].backward()
+
+    assert losses["total"].ndim == 0
+    assert torch.isfinite(losses["total"])
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_3d_probability_bce_is_safe_under_cuda_bf16_autocast() -> None:
+    values = torch.tensor([0.2, 0.8], dtype=torch.float32, device="cuda", requires_grad=True)
+    target = torch.ones_like(values)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = _safe_probability_bce(values, target, reduction="mean")
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert values.grad is not None
+    assert torch.isfinite(values.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_3d_conditioned_loss_runs_under_cuda_bf16_autocast() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0).to("cuda")
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    ).to("cuda")
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        losses = compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=1.0,
+            presence_weight=1.0,
+        )
+    losses["total"].backward()
+
+    assert torch.isfinite(losses["total"])
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.parameters()
+    )
+
+
+def test_3d_test_loader_raw_config_disables_augmentation_by_default() -> None:
+    raw = {
+        "datasets": [{"name": "train"}],
+        "test_datasets": [{"name": "test"}],
+        "augment_enabled": True,
+    }
+
+    default_test = _make_test_loader_raw_config(raw, {})
+    augmented_test = _make_test_loader_raw_config(raw, {"test_augment_enabled": True})
+
+    assert default_test["datasets"] == [{"name": "test"}]
+    assert default_test["augment_enabled"] is False
+    assert "test_datasets" not in default_test
+    assert augmented_test["augment_enabled"] is True
+
+
+def test_3d_dense_test_control_points_zero_uses_random_full_set() -> None:
+    assert _resolve_dense_test_selection(
+        {"test_control_points": 0, "test_start_sample_index": 99},
+        loader_sample_count=17,
+        default_count=4,
+    ) == (17, 0, "random")
+    assert _resolve_dense_test_selection(
+        {"test_start_sample_index": 99},
+        loader_sample_count=17,
+        default_count=0,
+    ) == (17, 0, "random")
+    assert _resolve_dense_test_selection(
+        {"test_control_points": 5, "test_start_sample_index": 9},
+        loader_sample_count=17,
+        default_count=4,
+    ) == (5, 9, "random")
+
+
+def test_train_sample_3d_sheet_has_single_output_presence_columns_and_line_overlay() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+    sheet = _make_train_sample_3d_sheet(batch, output)
+
+    patch = int(batch.volume.shape[-1])
+    gap = 4
+    assert sheet.shape[1] == patch * 5 + 4 * gap
+    first_image_panel = sheet[:patch, :patch]
+    colored = (
+        (first_image_panel[..., 0] != first_image_panel[..., 1])
+        | (first_image_panel[..., 1] != first_image_panel[..., 2])
+    )
+    assert bool(np.any(colored))
+
+
+def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
+    z_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+    )[0]
+    x_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    sampled = torch.zeros((2, 3, 14), dtype=torch.float32)
+    sampled[..., 0:6] = z_dir
+    sampled[..., 6] = 0.25
+    sampled[..., 7:13] = x_dir
+    sampled[..., 13] = 0.75
+
+    branch0, branch1, close, other, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
+        sampled,
+        normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.allclose(branch0, 0.25)
+    assert np.allclose(branch1, 0.75)
+    assert np.allclose(close, 0.25)
+    assert np.allclose(other, 0.75)
+    assert np.allclose(max_p, 0.75)
+    assert np.allclose(min_p, 0.25)
+    assert np.allclose(avg_p, 0.5)
+
+
+def test_single_output_presence_views_include_normal_and_tangent_modulation() -> None:
+    x_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    sampled = torch.zeros((2, 3, 7), dtype=torch.float32)
+    sampled[..., 0:6] = x_dir
+    sampled[..., 6] = 0.6
+
+    raw_p, normal_p, tangent_p = _single_output_presence_views_from_sampled_output(
+        sampled,
+        normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        tangent_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.allclose(raw_p, 0.6)
+    assert np.allclose(normal_p, 0.6, atol=1.0e-5)
+    assert np.allclose(tangent_p, 0.0, atol=1.0e-5)
+
+
+def test_oblique_line_presence_uses_slice_frame_axes() -> None:
+    center = np.asarray([8.0, 8.0, 8.0], dtype=np.float32)
+    segment_start = np.asarray([[8.0, 8.0, 0.0]], dtype=np.float32)
+    segment_end = np.asarray([[8.0, 8.0, 16.0]], dtype=np.float32)
+
+    cross = _oblique_line_presence_for_display(
+        height=17,
+        width=17,
+        segments_start_zyx=segment_start,
+        segments_end_zyx=segment_end,
+        center_zyx=center,
+        row_axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        col_axis_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        threshold_voxels=1.0,
+    )
+    tangent = _oblique_line_presence_for_display(
+        height=17,
+        width=17,
+        segments_start_zyx=segment_start,
+        segments_end_zyx=segment_end,
+        center_zyx=center,
+        row_axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        col_axis_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        threshold_voxels=1.0,
+    )
+
+    cross_cols = np.nonzero(cross > 0.0)[1]
+    tangent_cols = np.nonzero(tangent > 0.0)[1]
+    assert int(cross_cols.max() - cross_cols.min()) <= 4
+    assert int(tangent_cols.max() - tangent_cols.min()) >= 14
+
+
+def test_panel_line_aa_draws_fractional_thin_line() -> None:
+    panel = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    _draw_panel_line_aa(
+        panel,
+        np.asarray([2.25, 1.5], dtype=np.float32),
+        np.asarray([13.25, 10.5], dtype=np.float32),
+        (255, 80, 0),
+    )
+
+    red = panel[..., 0]
+    assert int(np.count_nonzero(red)) > 0
+    assert bool(np.any((red > 0) & (red < 255)))
+    assert int(np.count_nonzero(red)) < 16 * 4
+
+
+def test_projected_cp_direction_shortens_out_of_slice_direction() -> None:
+    full_panel = np.zeros((40, 40, 3), dtype=np.uint8)
+    shortened_panel = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    _draw_projected_cp_direction(
+        full_panel,
+        cp_row=20,
+        cp_col=20,
+        direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        row_axis=1,
+        col_axis=2,
+    )
+    _draw_projected_cp_direction(
+        shortened_panel,
+        cp_row=20,
+        cp_col=20,
+        direction_zyx=np.asarray([np.sqrt(3.0), 0.0, 1.0], dtype=np.float32),
+        row_axis=1,
+        col_axis=2,
+    )
+
+    full_cols = np.nonzero(full_panel[..., 0] > 0)[1]
+    shortened_cols = np.nonzero(shortened_panel[..., 0] > 0)[1]
+    full_extent = int(full_cols.max() - full_cols.min() + 1)
+    shortened_extent = int(shortened_cols.max() - shortened_cols.min() + 1)
+    assert shortened_extent < full_extent
+    assert shortened_extent <= int(round(full_extent * 0.75))
+
+
+def test_write_3d_sample_sheet_adds_image() -> None:
+    class _ZeroModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(
+                (int(volume.shape[0]), 7, *tuple(int(v) for v in volume.shape[-3:])),
+                dtype=volume.dtype,
+                device=volume.device,
+            )
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, np.ndarray, int, str]] = []
+
+        def add_image(self, tag: str, image: np.ndarray, step: int, *, dataformats: str) -> None:
+            self.calls.append((tag, image, step, dataformats))
+
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    writer = _Writer()
+
+    _write_3d_sample_sheet(writer, "test_sample_3d/principal_slices", _ZeroModel(), batch, 7)
+
+    assert len(writer.calls) == 1
+    tag, image, step, dataformats = writer.calls[0]
+    assert tag == "test_sample_3d/principal_slices"
+    assert step == 7
+    assert dataformats == "HWC"
+    assert image.ndim == 3
+
+
+def test_train_sample_3d_contact_sheet_stacks_multiple_samples() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    output = torch.zeros(
+        (
+            int(batch.volume.shape[0]),
+            7,
+            *tuple(int(v) for v in batch.volume.shape[-3:]),
+        ),
+        dtype=batch.volume.dtype,
+    )
+
+    single = _make_train_sample_3d_contact_sheet(batch, output, sample_count=1)
+    multi = _make_train_sample_3d_contact_sheet(batch, output, sample_count=2)
+
+    assert multi.shape[0] == single.shape[0]
+    assert multi.shape[1] > single.shape[1]
+
+
+def test_3d_prefetch_streams_producers_but_downloads_in_sample_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = SimpleNamespace(
+        prefetch_workers=1,
+        prefetch_sampler_workers=2,
+        volume_cache_retry_seconds=0.0,
+    )
+
+    store = object()
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="fake-store",
+            key=key,
+            cache_path=tmp_path / f"{key}.bin",
+            empty_path=tmp_path / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            remote_chunk_key=key,
+            cache_payload_format="source_bytes",
+        )
+
+    samples = {
+        0: [request("a")],
+        1: [request("b")],
+        2: [request("b"), request("c")],
+    }
+
+    def fake_requests(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
+    ) -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode, sample_index_limit
+        if int(sample_index) == 0:
+            time.sleep(0.05)
+        return 8, list(samples[int(sample_index)])
+
+    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
+    download_order: list[str] = []
+
+    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
+        del retry_seconds
+        download_order.append(request.key)
+        return {"status": "downloaded", "bytes": 4}
+
+    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
+    summary = loader.prefetch(0, 3)
+
+    assert download_order == ["a", "b", "c"]
+    assert summary["samples"] == 3
+    assert summary["chunks"] == 3
+    assert summary["downloaded"] == 3
+    assert summary["download_done"] == 3
+    assert summary["max_exclusive_sample_index"] == 3
+    assert summary["valid_voxels"] == 24
+
+
+def test_3d_prefetch_classifies_cache_hit_empty_and_skip(tmp_path, monkeypatch) -> None:
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = SimpleNamespace(
+        prefetch_workers=2,
+        prefetch_sampler_workers=2,
+        volume_cache_retry_seconds=0.0,
+    )
+
+    store = object()
+    hit_path = tmp_path / "hit.bin"
+    hit_path.write_bytes(b"cached")
+    empty_path = tmp_path / "missing.empty"
+    empty_path.write_bytes(b"")
+
+    def request(key: str, *, cache_path: object | None, empty_path_value: object | None) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="fake-store",
+            key=key,
+            cache_path=None if cache_path is None else Path(cache_path),
+            empty_path=None if empty_path_value is None else Path(empty_path_value),
+            remote_url=f"https://example.invalid/{key}",
+            remote_chunk_key=key,
+            cache_payload_format="source_bytes",
+        )
+
+    def fake_requests(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
+    ) -> tuple[int, list[ZarrChunkRequest]]:
+        del sample_mode, sample_index_limit
+        if int(sample_index) == 1:
+            raise ValueError("invalid synthetic sample")
+        if int(sample_index) == 0:
+            return 7, [
+                request("hit", cache_path=hit_path, empty_path_value=tmp_path / "hit.empty"),
+                request("missing", cache_path=tmp_path / "missing.bin", empty_path_value=empty_path),
+            ]
+        return 5, [
+            request("download", cache_path=tmp_path / "download.bin", empty_path_value=tmp_path / "download.empty")
+        ]
+
+    loader._chunk_requests_and_valid_voxels_for_sample_index = fake_requests
+    downloaded_keys: list[str] = []
+
+    def fake_download(request: ZarrChunkRequest, *, retry_seconds: float) -> dict[str, object]:
+        del retry_seconds
+        downloaded_keys.append(request.key)
+        return {"status": "downloaded", "bytes": 3}
+
+    monkeypatch.setattr(loader3d_module, "_download_prefetch_request", fake_download)
+    summary = loader.prefetch(0, 3)
+
+    assert downloaded_keys == ["download"]
+    assert summary["samples"] == 3
+    assert summary["skipped_samples"] == 1
+    assert summary["chunks"] == 3
+    assert summary["cache_hits"] == 1
+    assert summary["known_missing"] == 1
+    assert summary["downloaded"] == 1
+    assert summary["errors"] == 0
+    assert summary["max_exclusive_sample_index"] == 3
+    assert "invalid synthetic sample" in summary["first_sample_skip"]
+
+
+def test_vc3d_dependency_prefetch_flattens_3d_coords_like_training_sampling() -> None:
+    class _FakeVolume:
+        remote_url = "s3://example/volume.zarr"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, ...]] = []
+
+        def collect_coords_dependencies(
+            self,
+            coords_xyz: np.ndarray,
+            valid_mask: np.ndarray,
+            level: int,
+            sampling: str,
+            workers: int,
+        ) -> list[dict[str, object]]:
+            if coords_xyz.ndim != 3 or coords_xyz.shape[-1] != 3:
+                raise ValueError("coords_xyz must have shape [H, W, 3]")
+            if valid_mask.shape != coords_xyz.shape[:2]:
+                raise ValueError("valid_mask must have shape [H, W]")
+            call_index = len(self.calls)
+            self.calls.append(tuple(int(v) for v in coords_xyz.shape))
+            assert level == 2
+            assert sampling == "trilinear"
+            assert workers == 32
+            return [
+                {
+                    "key": f"2/0/0/{call_index}",
+                    "cache_path": f"/tmp/cache/{call_index}.bin",
+                    "empty_path": f"/tmp/cache/{call_index}.empty",
+                    "remote_url": "https://example.invalid/volume.zarr",
+                    "remote_chunk_key": f"2/0/0/{call_index}",
+                    "cache_payload_format": "direct",
+                    "persistent_extension": ".bin",
+                },
+                {
+                    "key": "2/shared",
+                    "cache_path": "/tmp/cache/shared.bin",
+                    "empty_path": "/tmp/cache/shared.empty",
+                    "remote_url": "https://example.invalid/volume.zarr",
+                    "remote_chunk_key": "2/shared",
+                    "cache_payload_format": "direct",
+                    "persistent_extension": ".bin",
+                },
+            ]
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    coords = np.zeros((3, 4, 5, 3), dtype=np.float32)
+    valid = np.ones((3, 4, 5), dtype=bool)
+    valid[1, :, :] = False
+    requests = sampler.chunk_requests_for_coords(coords, valid)
+
+    assert fake.calls == [(12, 5, 3)]
+    assert [request.key for request in requests] == ["2/0/0/0", "2/shared"]
+    assert requests[0].cache_path is not None
+
+
+def test_vc3d_dependency_prefetch_uses_bbox_metadata() -> None:
+    class _FakeVolume:
+        remote_url = "s3://example/volume.zarr"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int]] = []
+
+        def collect_bbox_dependencies(
+            self,
+            offset: tuple[int, int, int],
+            shape: tuple[int, int, int],
+            level: int,
+        ) -> list[dict[str, object]]:
+            self.calls.append((tuple(offset), tuple(shape), int(level)))
+            return [
+                {
+                    "key": "2/3/4/5",
+                    "cache_path": "/tmp/cache/2/3/4/5.bin",
+                    "empty_path": "/tmp/cache/2/3/4/5.empty",
+                    "remote_url": "https://example.invalid/volume.zarr/2/3/4/5",
+                    "remote_chunk_key": "2/3/4/5",
+                    "cache_payload_format": "source_bytes",
+                    "persistent_extension": ".bin",
+                }
+            ]
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    requests = sampler.chunk_requests_for_bbox(
+        np.asarray([1.2, 2.0, 3.1], dtype=np.float32),
+        np.asarray([5.0, 7.9, 9.0], dtype=np.float32),
+    )
+
+    assert fake.calls == [((1, 2, 3), (4, 6, 6), 2)]
+    assert [request.key for request in requests] == ["2/3/4/5"]
+    assert requests[0].cache_path == Path("/tmp/cache/2/3/4/5.bin")
+    assert requests[0].cache_payload_format == "source_bytes"
+
+
+def test_vc3d_bbox_dependency_reports_missing_binding() -> None:
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = SimpleNamespace(remote_url="s3://example/volume.zarr")
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    with pytest.raises(RuntimeError, match="collect_bbox_dependencies"):
+        sampler.chunk_requests_for_bbox(
+            np.asarray([0, 0, 0], dtype=np.int64),
+            np.asarray([1, 1, 1], dtype=np.int64),
+        )
+
+
+def test_vc3d_coordinate_sampler_direct_block_read_uses_binding() -> None:
+    class _FakeVolume:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int, bool]] = []
+
+        def sample_zyx_block(
+            self,
+            offset: tuple[int, int, int],
+            shape: tuple[int, int, int],
+            level: int,
+            blocking: bool,
+        ):
+            self.calls.append((tuple(offset), tuple(shape), int(level), bool(blocking)))
+            image = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+            valid = np.ones(shape, dtype=np.uint8)
+            stats = {
+                "requested_level_only": True,
+                "fallback_levels": 0,
+                "error_chunks": 0,
+                "missing_chunks": 0,
+                "requested_chunks": 1,
+            }
+            return image, valid, stats
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    result = sampler.sample_block_zyx(np.asarray([1, 2, 3], dtype=np.int64), (4, 5, 6))
+
+    assert fake.calls == [((1, 2, 3), (4, 5, 6), 2, True)]
+    assert result.image.shape == (4, 5, 6)
+    assert result.valid_mask.shape == (4, 5, 6)
+    assert result.valid_mask.all()
+    assert result.stats["sample_block_zyx"] == 1
+
+
+def test_numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds() -> None:
+    array = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=2.0)
+
+    result = sampler.sample_block_zyx(
+        np.asarray([-1, 2, 3], dtype=np.int64),
+        (3, 2, 4),
+    )
+
+    assert result.image.shape == (3, 2, 4)
+    assert result.valid_mask.shape == (3, 2, 4)
+    assert not bool(result.valid_mask[0].any())
+    assert bool(result.valid_mask[1:, :, :3].all())
+    assert not bool(result.valid_mask[1:, :, 3].any())
+    assert np.allclose(result.image[1, 0, 0], array[0, 2, 3])
+    assert np.allclose(result.image[2, 1, 2], array[1, 3, 5])
+    assert result.image[2, 1, 3] == 0.0
+    assert not bool(result.valid_mask[2, 1, 3])
+    assert result.stats["requested_level_only"] is True
+
+
+def test_3d_model_and_losses_smoke() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    output = model(batch.volume)
+    assert direction_output(output).shape == (2, 6, 16, 16, 16)
+    assert presence_output(output).shape == (2, 1, 16, 16, 16)
+    losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    assert losses["total"].ndim == 0
+    assert torch.isfinite(losses["total"])
+    assert losses["angle_mean_deg"].ndim == 0
+    assert torch.isfinite(losses["angle_mean_deg"])
+
+
+def test_3d_conditioned_model_shapes_and_pointwise_decoder() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    assert model.conditioned_latent_channels == 64
+    assert model.direction_branch_count == 1
+    assert model.conditioned_decoder is not None
+    convs = [
+        module
+        for module in model.conditioned_decoder.modules()
+        if isinstance(module, torch.nn.Conv3d)
+    ]
+    assert convs
+    assert all(tuple(conv.kernel_size) == (1, 1, 1) for conv in convs)
+
+    volume = torch.zeros((2, 1, 8, 8, 8), dtype=torch.float32)
+    with torch.no_grad():
+        output = model(volume)
+        grouped = model.forward_recurrent_grouped(volume, steps=2)
+        latent = model.encode_volume(volume)
+        points = model.decode_conditioned_points(
+            latent,
+            torch.tensor([[0, 2, 3, 4], [1, 5, 6, 7]], dtype=torch.long),
+            torch.zeros((2, 6), dtype=torch.float32),
+        )
+
+    assert output.shape == (2, 7, 8, 8, 8)
+    assert grouped.shape == (2, 14, 8, 8, 8)
+    assert latent.shape[1] == 64
+    assert points.shape == (2, 7)
+
+
+def test_3d_conditioned_perpendicular_query_is_deterministic_and_perpendicular() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    indices = batch.direction_indices_bzyx[:8]
+    target = batch.direction_target_sparse[:8]
+    target_axis = decode_lasagna_direction_3x2_analytic(target)
+
+    query_a = _conditioned_perpendicular_queries(
+        batch,
+        indices,
+        target_axis,
+        jitter_degrees=0.0,
+    )
+    query_b = _conditioned_perpendicular_queries(
+        batch,
+        indices,
+        target_axis,
+        jitter_degrees=0.0,
+    )
+    query_axis = decode_lasagna_direction_3x2_analytic(query_a)
+    agreement = torch.abs(torch.sum(query_axis * target_axis, dim=1))
+
+    assert torch.allclose(query_a, query_b)
+    assert torch.max(agreement) < 1.0e-4
+
+
+def test_3d_conditioned_model_and_loss_backprop_smoke() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    losses = compute_conditioned_losses(
+        model,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+    )
+    losses["total"].backward()
+
+    assert losses["total"].ndim == 0
+    assert torch.isfinite(losses["total"])
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.5))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(0.5))
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.net.parameters()
+    )
+    assert model.conditioned_decoder is not None
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.conditioned_decoder.parameters()
+    )
+
+
+def test_3d_conditioned_presence_loss_includes_dense_negatives_at_positive_pixels() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+
+    class _FakeConditionedModel(torch.nn.Module):
+        conditioned_decoder_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.zero = torch.zeros((1, 7, 1, 1, 2), dtype=torch.float32)
+            self.zero[0, :6, 0, 0, :] = target_dir.view(6, 1).expand(6, 2)
+            self.zero[0, 6, 0, 0, :] = torch.tensor([0.8, 0.2])
+            self.random = torch.zeros((1, 7, 1, 1, 2), dtype=torch.float32)
+            self.random[0, :6, 0, 0, :] = target_dir.view(6, 1).expand(6, 2)
+            self.random[0, 6, 0, 0, :] = torch.tensor([0.4, 0.3])
+            self.perp = torch.zeros((1, 7), dtype=torch.float32)
+            self.perp[0, :6] = target_dir[0]
+            self.perp[0, 6] = 0.6
+
+        def encode_volume(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((1, 1, 1, 1, 2), dtype=volume.dtype, device=volume.device)
+
+        def decode_conditioned_latent(
+            self,
+            latent: torch.Tensor,
+            query: torch.Tensor,
+        ) -> torch.Tensor:
+            del latent
+            if bool(torch.all(query == 0.0)):
+                return self.zero.to(device=query.device)
+            return self.random.to(device=query.device)
+
+        def decode_conditioned_points(
+            self,
+            latent: torch.Tensor,
+            indices_bzyx: torch.Tensor,
+            query_n6: torch.Tensor,
+        ) -> torch.Tensor:
+            del latent, query_n6
+            return self.perp.to(device=indices_bzyx.device).expand(int(indices_bzyx.shape[0]), -1)
+
+        def forward(
+            self,
+            volume: torch.Tensor,
+            *,
+            conditioned_random_query: torch.Tensor | None = None,
+            conditioned_point_indices_bzyx: torch.Tensor | None = None,
+            conditioned_point_query_n6: torch.Tensor | None = None,
+            return_conditioned_components: bool = False,
+        ) -> dict[str, torch.Tensor | None] | torch.Tensor:
+            latent = self.encode_volume(volume)
+            zero = self.decode_conditioned_latent(
+                latent,
+                torch.zeros((1, 6), dtype=volume.dtype, device=volume.device),
+            )
+            if not return_conditioned_components:
+                return zero
+            assert conditioned_random_query is not None
+            random = self.decode_conditioned_latent(latent, conditioned_random_query)
+            point_query = (
+                torch.empty(
+                    (int(conditioned_point_indices_bzyx.shape[0]), 6),
+                    dtype=volume.dtype,
+                    device=volume.device,
+                )
+                if conditioned_point_query_n6 is None
+                and conditioned_point_indices_bzyx is not None
+                else conditioned_point_query_n6
+            )
+            point = (
+                None
+                if conditioned_point_indices_bzyx is None
+                else self.decode_conditioned_points(
+                    latent,
+                    conditioned_point_indices_bzyx,
+                    point_query,
+                )
+            )
+            return {"zero_output": zero, "random_output": random, "point_output": point}
+
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir,
+        direction_weight_sparse=torch.zeros((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+    )
+
+    losses = compute_conditioned_losses(
+        _FakeConditionedModel(),
+        batch,
+        direction_weight=0.0,
+        presence_weight=1.0,
+    )
+
+    positive_expected = -torch.log(torch.tensor([0.8, 0.6])).mean()
+    negative_expected = -torch.log(
+        1.0 - torch.tensor([0.8, 0.2, 0.4, 0.3])
+    ).mean()
+    assert torch.allclose(losses["presence"], positive_expected + negative_expected)
+
+
+def test_3d_model_branch_helpers_preserve_branch_zero_layout() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            direction_branch_count=2,
+            output_channels=14,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    with torch.no_grad():
+        model_output = model(torch.zeros((2, 1, 8, 8, 8), dtype=torch.float32))
+    assert direction_outputs(model_output).shape == (2, 2, 6, 8, 8, 8)
+    assert presence_outputs(model_output).shape == (2, 2, 1, 8, 8, 8)
+
+    output = torch.zeros((2, 14, 3, 4, 5), dtype=torch.float32)
+    output[:, 0:6] = 0.1
+    output[:, 6:7] = 0.2
+    output[:, 7:13] = 0.3
+    output[:, 13:14] = 0.4
+
+    dirs = direction_outputs(output)
+    presences = presence_outputs(output)
+
+    assert dirs.shape == (2, 2, 6, 3, 4, 5)
+    assert presences.shape == (2, 2, 1, 3, 4, 5)
+    assert torch.allclose(direction_output(output), dirs[:, 0])
+    assert torch.allclose(presence_output(output), presences[:, 0])
+    assert torch.allclose(dirs[:, 1], torch.full_like(dirs[:, 1], 0.3))
+    assert torch.allclose(presences[:, 1], torch.full_like(presences[:, 1], 0.4))
+
+
+def test_3d_fiber_inference_adapter_schema_preserves_branch_options() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 2,
+                "output_channels": 14,
+                "features_per_stage": [4, 8],
+                "strides": [[1, 1, 1], [2, 2, 2]],
+            },
+        },
+        level=2,
+        scaledown=4,
+        chunk_size=16,
+        product_prefix="fiber",
+    )
+
+    assert adapter.option_count == 2
+    assert [product.name for product in adapter.output_products] == [
+        "fiber_option_000",
+        "fiber_option_001",
+    ]
+    for option_index, product in enumerate(adapter.output_products):
+        assert product.level == 2
+        assert product.scaledown == 4
+        assert product.chunk_size == 16
+        assert product.raw_channel_count == len(FIBER_TRACE_3D_INTERNAL_CHANNELS)
+        assert product.channel_names == tuple(
+            f"option_{option_index:03d}_{channel}"
+            for channel in FIBER_TRACE_3D_PERSISTED_CHANNELS
+        )
+        assert [
+            channel.relative_path for channel in product.channels
+        ] == [
+            f"fiber_option_{option_index:03d}_{channel}.ome.zarr"
+            for channel in FIBER_TRACE_3D_PERSISTED_CHANNELS
+        ]
+
+
+def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 2,
+                "output_channels": 14,
+            },
+        },
+        product_prefix="fiber",
+    )
+    output = torch.zeros((1, 14, 2, 2, 2), dtype=torch.float32)
+    output[:, 0:6] = 0.1
+    output[:, 6:7] = 0.2
+    output[:, 7:13] = 0.7
+    output[:, 13:14] = 0.8
+
+    tensors = adapter.product_tensors_from_output(output)
+    assert torch.allclose(
+        tensors["fiber_option_000"][:, :6],
+        torch.full((1, 6, 2, 2, 2), 0.1),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_000"][:, 6:7],
+        torch.full((1, 1, 2, 2, 2), 0.2),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_001"][:, :6],
+        torch.full((1, 6, 2, 2, 2), 0.7),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_001"][:, 6:7],
+        torch.full((1, 1, 2, 2, 2), 0.8),
+    )
+
+    tensors = adapter.product_tensors_from_output(output)
+    arrays0 = adapter.finalize_product_slab(
+        adapter.product_by_name("fiber_option_000"),
+        tensors["fiber_option_000"][0].detach().cpu().numpy(),
+    )
+    arrays1 = adapter.finalize_product_slab(
+        adapter.product_by_name("fiber_option_001"),
+        tensors["fiber_option_001"][0].detach().cpu().numpy(),
+    )
+    assert arrays0["option_000_presence"].dtype == np.uint8
+    assert int(arrays0["option_000_presence"][0, 0, 0]) == 51
+    assert int(arrays1["option_001_presence"][0, 0, 0]) == 204
+    assert set(arrays0) == {"option_000_presence", "option_000_nx", "option_000_ny"}
+
+
+def test_3d_fiber_inference_adapter_uses_checkpoint_config_for_model(
+    tmp_path: Path,
+) -> None:
+    checkpoint_config = {
+        "patch_shape_zyx": [8, 8, 8],
+        "model_3d": {
+            "input_channels": 1,
+            "direction_branch_count": 2,
+            "output_channels": 14,
+            "features_per_stage": [4, 8],
+            "strides": [[1, 1, 1], [2, 2, 2]],
+            "conditioned_decoder_enabled": False,
+        },
+        "image_normalization": "none",
+    }
+    checkpoint_model = build_fiber_trace_3d_model(checkpoint_config)
+    checkpoint_path = tmp_path / "legacy_branch_checkpoint.pt"
+    torch.save(
+        {
+            "model": checkpoint_model.state_dict(),
+            "config": checkpoint_config,
+            "step": 123,
+        },
+        checkpoint_path,
+    )
+    runtime_conditioned_config = {
+        "patch_shape_zyx": [8, 8, 8],
+        "model_3d": {
+            "input_channels": 1,
+            "output_channels": 7,
+            "features_per_stage": [4, 8],
+            "strides": [[1, 1, 1], [2, 2, 2]],
+            "conditioned_decoder_enabled": True,
+            "conditioned_latent_channels": 64,
+        },
+        "inference": {"recurrent_steps": 2},
+        "image_normalization": "zscore",
+    }
+
+    adapter = FiberTrace3DPredictAdapter(
+        runtime_conditioned_config,
+        checkpoint=checkpoint_path,
+        product_prefix="fiber",
+    )
+    model = adapter.load_model(device=torch.device("cpu"))
+
+    assert adapter.option_count == 2
+    assert not model.conditioned_decoder_enabled
+    assert model.output_channels == 14
+    assert [product.name for product in adapter.output_products] == [
+        "fiber_option_000",
+        "fiber_option_001",
+    ]
+
+
+def test_3d_fiber_finalizer_sign_folds_lasagna_direction_encoding() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [4, 4, 4],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 1,
+                "output_channels": 7,
+            },
+        },
+        product_prefix="fiber",
+    )
+    product = adapter.output_products[0]
+    direction = encode_lasagna_direction_3x2(
+        torch.tensor([[0.2, 0.3, 0.9]], dtype=torch.float32)
+    )[0].numpy()
+    flipped = encode_lasagna_direction_3x2(
+        torch.tensor([[-0.2, -0.3, -0.9]], dtype=torch.float32)
+    )[0].numpy()
+    slab = np.zeros((7, 1, 1, 2), dtype=np.float32)
+    slab[:6, 0, 0, 0] = direction
+    slab[:6, 0, 0, 1] = flipped
+    slab[6, 0, 0, 0] = 0.0
+    slab[6, 0, 0, 1] = 1.0
+
+    arrays = adapter.finalize_product_slab(product, slab)
+
+    assert set(arrays) == set(FIBER_TRACE_3D_PERSISTED_CHANNELS)
+    assert int(arrays["presence"][0, 0, 0]) == 0
+    assert int(arrays["presence"][0, 0, 1]) == 255
+    assert int(arrays["nx"][0, 0, 0]) == int(arrays["nx"][0, 0, 1])
+    assert int(arrays["ny"][0, 0, 0]) == int(arrays["ny"][0, 0, 1])
+
+
+def test_3d_fiber_inference_adapter_recurrent_conditioned_output_is_grouped() -> None:
+    class _RecurrentModel(torch.nn.Module):
+        conditioned_decoder_enabled = True
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("recurrent inference should use forward_recurrent_grouped")
+
+        def forward_recurrent_grouped(
+            self,
+            volume: torch.Tensor,
+            *,
+            steps: int,
+            detach_query: bool = True,
+        ) -> torch.Tensor:
+            del detach_query
+            batch, _channels, depth, height, width = (int(v) for v in volume.shape)
+            output = torch.zeros((batch, int(steps) * 7, depth, height, width))
+            output[:, 6:7] = 0.25
+            output[:, 13:14] = 0.75
+            return output
+
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "output_channels": 7,
+                "conditioned_decoder_enabled": True,
+            },
+        },
+        recurrent_steps=2,
+        product_prefix="fiber",
+    )
+
+    output = adapter.run_tile_inference(
+        _RecurrentModel(),
+        torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32),
+        device=torch.device("cpu"),
+    )
+    products = adapter.product_tensors_from_output(output)
+    assert list(products) == ["fiber_option_000", "fiber_option_001"]
+    assert torch.allclose(
+        products["fiber_option_000"][:, 6],
+        torch.full((1, 2, 2, 2), 0.25),
+    )
+    assert torch.allclose(
+        products["fiber_option_001"][:, 6],
+        torch.full((1, 2, 2, 2), 0.75),
+    )
+
+
+def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) -> None:
+    predict_adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 1,
+                "output_channels": 7,
+            },
+        },
+        chunk_size=16,
+        product_prefix="fiber",
+        zarr_path_prefix=tmp_path / "fiber",
+    )
+    product = predict_adapter.output_products[0]
+    output_adapter = OmeZarrOutputAdapter(
+        products=predict_adapter.output_products,
+        n_levels=0,
+    )
+
+    for channel in product.channels[:-1]:
+        chunk_path = Path(str(channel.relative_path)) / "0" / "0.0.0"
+        chunk_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_path.write_bytes(b"x")
+    assert not output_adapter.product_chunk_complete(
+        product,
+        chunk_origin_zyx=(0, 0, 0),
+    )
+
+    presence_path = Path(str(product.channels[-1].relative_path)) / "0" / "0.0.0"
+    presence_path.parent.mkdir(parents=True, exist_ok=True)
+    presence_path.write_bytes(b"x")
+    assert output_adapter.product_chunk_complete(
+        product,
+        chunk_origin_zyx=(0, 0, 0),
+    )
+
+
+def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.zarr"
+    arr = create_v2_array(
+        input_path,
+        shape=(8, 8, 8),
+        chunks=(4, 4, 4),
+        dtype=np.uint8,
+    )
+    arr[:] = np.arange(8 * 8 * 8, dtype=np.uint16).reshape(8, 8, 8) % 251
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "patch_shape_zyx": [8, 8, 8],
+                "image_normalization": "none",
+                "model_3d": {
+                    "input_channels": 1,
+                    "direction_branch_count": 1,
+                    "output_channels": 7,
+                    "features_per_stage": [2, 4],
+                    "strides": [[1, 1, 1], [2, 2, 2]],
+                    "decoder_upsample_mode": "pixelshuffle",
+                    "normalization": "batch",
+                },
+                "training": {"mixed_precision": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "fiber_out.lasagna.json"
+
+    run_fiber_trace_3d_inference(
+        config_path=config_path,
+        input_path=str(input_path),
+        output_path=output_path,
+        checkpoint=None,
+        device="cpu",
+        crop_xyzwhd=None,
+        tile_size=8,
+        overlap=0,
+        border=0,
+        inference_scaledown_power=0,
+        base_ref=str(input_path),
+        base_scale=0,
+        no_download=True,
+        levels=2,
+        ome_chunk=4,
+        pyramid_workers=1,
+        flush_workers=0,
+        accumulator_workers=0,
+    )
+
+    for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
+        channel_level = tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "0"
+        assert (channel_level / ".zarray").is_file()
+        data = zarr.open(str(channel_level), mode="r")
+        assert tuple(int(v) for v in data.shape) == (8, 8, 8)
+        assert tuple(int(v) for v in data.chunks) == (4, 4, 4)
+        assert data.dtype == np.dtype(np.uint8)
+        assert int(np.asarray(data[:]).max()) > 0
+        assert (tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "1" / ".zarray").is_file()
+
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert set(manifest["groups"]) == set(FIBER_TRACE_3D_PERSISTED_CHANNELS)
+    assert manifest["base_shape_zyx"] == [8, 8, 8]
+    for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
+        group = manifest["groups"][channel_name]
+        assert group["channels"] == [channel_name]
+        assert group["scaledown"] == 0
+        assert group["zarr"] == f"fiber_out_{channel_name}.ome.zarr/0"
+    provenance = json.loads((tmp_path / "inference.json").read_text(encoding="utf-8"))
+    assert provenance["status"] == "completed"
+    assert provenance["artifact_kind"] == "fiber3d-prediction"
+    assert provenance["source_scale"]["requested_group"] == 0
+    assert provenance["inference"]["effective_base_factor"] == 1
+    assert len(provenance["inference"]["code_commit"]) == 40
+    assert set(provenance["inference"]["code_commit"]) <= set("0123456789abcdef")
+    assert len(provenance["artifacts"]) == 4
+    assert manifest["provenance"] == "inference.json"
+    for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:
+        assert not (tmp_path / "fiber" / "option_000" / raw_channel).exists()
+
+
+def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
+    import inspect
+
+    parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
+    assert parameters["inference_scaledown_power"].default == 2
+    assert parameters["ome_chunk"].default == 64
+    assert parameters["ome_compressor"].default == "blosc-zstd"
+    assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
+    with pytest.raises(ValueError, match="isotropic power-of-two"):
+        _input_scaledown_from_base((17, 33, 65), (5, 17, 17))
+
+
+def test_3d_fiber_inference_storage_bounds_include_odd_edge_chunks() -> None:
+    crop, output_region, output_shape = _select_and_expand_crop(
+        input_shape_zyx=(257, 129, 17),
+        crop_xyzwhd_base=None,
+        input_scaledown_from_base=1,
+        output_scaledown_from_input=4,
+        ome_chunk=64,
+    )
+
+    assert crop == (0, 257, 0, 129, 0, 17)
+    assert output_shape == (65, 33, 5)
+    assert output_region == (0, 0, 0, 65, 33, 5)
+
+
+def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    bad_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+    )[0]
+    better_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.9, 0.2, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 2), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = bad_dir
+    output[0, 7:13, 0, 0, 0] = better_dir
+    output[0, 6, 0, 0, 0] = 0.95
+    output[0, 13, 0, 0, 0] = 0.55
+    output[0, 6, 0, 0, 1] = 0.40
+    output[0, 13, 0, 0, 1] = 0.30
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir.view(1, 6),
+        direction_weight_sparse=torch.ones((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+    )
+
+    eval_losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    assert torch.allclose(eval_losses["branch0_fraction"], torch.tensor(0.0))
+    assert torch.allclose(eval_losses["branch1_fraction"], torch.tensor(1.0))
+
+    losses = compute_losses(
+        output,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+        branch_selection_mode="train_offset_grid_min_fraction",
+    )
+    losses["total"].backward()
+
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.0))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(1.0))
+    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 0]) == 0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 0]) > 0
+    assert output.grad[0, 6, 0, 0, 0] == 0.0
+    assert output.grad[0, 13, 0, 0, 0] != 0.0
+    assert output.grad[0, 6, 0, 0, 1] != 0.0
+    assert output.grad[0, 13, 0, 0, 1] != 0.0
+
+
+def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    weaker_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[0.95, 0.25, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 12), dtype=torch.float32)
+    output[0, 0:6, 0, 0, :] = target_dir.view(6, 1)
+    output[0, 7:13, 0, 0, :] = weaker_dir.view(6, 1)
+    output[0, 6, 0, 0, :] = 0.95
+    output[0, 13, 0, 0, :] = torch.tensor(
+        [0.10, 0.10, 0.10, 0.10, 0.70, 0.60, 0.50, 0.40, 0.80, 0.10, 0.10, 0.10],
+        dtype=torch.float32,
+    )
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 12), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 12), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.stack(
+            [
+                torch.zeros((12,), dtype=torch.long),
+                torch.zeros((12,), dtype=torch.long),
+                torch.zeros((12,), dtype=torch.long),
+                torch.arange(12, dtype=torch.long),
+            ],
+            dim=1,
+        ),
+        direction_target_sparse=target_dir.view(1, 6).expand(12, 6),
+        direction_weight_sparse=torch.ones((12, 6), dtype=torch.float32),
+        presence_target=torch.ones((1, 1, 1, 1, 12), dtype=torch.float32),
+        presence_mask=torch.ones((1, 1, 1, 1, 12), dtype=torch.bool),
+    )
+
+    eval_losses = compute_losses(output, batch, direction_weight=1.0, presence_weight=1.0)
+    assert torch.allclose(eval_losses["branch0_fraction"], torch.tensor(1.0))
+    assert torch.allclose(eval_losses["branch1_fraction"], torch.tensor(0.0))
+
+    losses = compute_losses(
+        output,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+        branch_selection_mode="train_offset_grid_min_fraction",
+    )
+    losses["total"].backward()
+
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(10.0 / 12.0))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(2.0 / 12.0))
+    for x in range(4, 6):
+        assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, x]) > 0
+        assert output.grad[0, 13, 0, 0, x] != 0.0
+        assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, x]) == 0
+        assert output.grad[0, 6, 0, 0, x] == 0.0
+    for x in range(6, 8):
+        assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, x]) == 0
+        assert output.grad[0, 13, 0, 0, x] == 0.0
+        assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, x]) == 0
+        assert output.grad[0, 6, 0, 0, x] != 0.0
+    assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 8]) == 0
+    assert output.grad[0, 13, 0, 0, 8] == 0.0
+    assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 8]) == 0
+    assert output.grad[0, 6, 0, 0, 8] != 0.0
+
+
+def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((1, 14, 1, 1, 2), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = target_dir
+    output[0, 7:13, 0, 0, 0] = target_dir
+    output[0, 6, 0, 0, :] = torch.tensor([0.8, 0.4], dtype=torch.float32)
+    output[0, 13, 0, 0, :] = torch.tensor([0.9, 0.3], dtype=torch.float32)
+    output.requires_grad_()
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir.view(1, 6),
+        direction_weight_sparse=torch.ones((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.tensor([False, True], dtype=torch.bool).view(1, 1, 1, 1, 2),
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    losses["total"].backward()
+
+    assert output.grad[0, 6, 0, 0, 0] == 0.0
+    assert output.grad[0, 13, 0, 0, 0] == 0.0
+    assert output.grad[0, 6, 0, 0, 1] != 0.0
+    assert output.grad[0, 13, 0, 0, 1] != 0.0
+
+
+def test_3d_fiber_model_uses_batchnorm_by_default() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    assert any(isinstance(module, torch.nn.BatchNorm3d) for module in model.modules())
+    assert not any(
+        isinstance(module, (torch.nn.GroupNorm, torch.nn.InstanceNorm3d))
+        for module in model.modules()
+    )
+
+
+def test_3d_fiber_model_can_disable_normalization_explicitly() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+            normalization="none",
+        )
+    )
+    assert not any(
+        isinstance(
+            module,
+            (torch.nn.BatchNorm3d, torch.nn.GroupNorm, torch.nn.InstanceNorm3d),
+        )
+        for module in model.modules()
+    )
+
+
+def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
+    presence_values = torch.tensor([0.9, 0.2, 0.8, 0.4], dtype=torch.float32)
+    output = torch.zeros((1, 7, 1, 1, 4), dtype=torch.float32)
+    output[0, 0:6, 0, 0, 0] = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    output[0, 6, 0, 0, :] = presence_values
+    presence_target = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 4)
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 4), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=encode_lasagna_direction_3x2(
+            torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+        ),
+        direction_weight_sparse=torch.zeros((1, 6), dtype=torch.float32),
+        presence_target=presence_target,
+        presence_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    pos_expected = -torch.log(torch.tensor(0.9))
+    neg_expected = -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean()
+    expected = pos_expected + neg_expected
+    assert torch.allclose(losses["presence"], expected)
+
+
+def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
+    output = torch.zeros((2, 14, 1, 1, 3), dtype=torch.float32)
+    output[0, 6, 0, 0, :] = torch.tensor([0.2, 0.8, 0.4], dtype=torch.float32)
+    output[0, 13, 0, 0, :] = torch.tensor([0.1, 0.1, 0.1], dtype=torch.float32)
+    output[1, 6, 0, 0, :] = torch.tensor([0.7, 0.0, 0.0], dtype=torch.float32)
+    output[1, 13, 0, 0, :] = torch.tensor([0.6, 0.0, 0.0], dtype=torch.float32)
+    presence_mask = torch.tensor(
+        [
+            [True, True, True],
+            [True, False, False],
+        ],
+        dtype=torch.bool,
+    ).view(2, 1, 1, 1, 3)
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((2, 1, 1, 1, 3), dtype=torch.float32),
+        valid_mask=torch.ones((2, 1, 1, 1, 3), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((2,), dtype=torch.long),
+        data_indices=torch.zeros((2,), dtype=torch.long),
+        record_indices=torch.zeros((2,), dtype=torch.long),
+        control_point_indices=torch.zeros((2,), dtype=torch.long),
+        fiber_paths=("synthetic0.json", "synthetic1.json"),
+        target_modes=torch.zeros((2,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((2,), dtype=torch.long),
+        target_segment_counts=torch.zeros((2,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((2, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.zeros((0, 4), dtype=torch.long),
+        direction_target_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        direction_weight_sparse=torch.zeros((0, 6), dtype=torch.float32),
+        presence_target=torch.zeros((2, 1, 1, 1, 3), dtype=torch.float32),
+        presence_mask=presence_mask,
+    )
+
+    losses = compute_losses(output, batch, direction_weight=0.0, presence_weight=1.0)
+    expected = torch.stack(
+        [
+            -torch.log(1.0 - torch.tensor([0.2, 0.8, 0.4])).mean(),
+            -torch.log(1.0 - torch.tensor([0.1, 0.1, 0.1])).mean(),
+            -torch.log(1.0 - torch.tensor(0.7)),
+            -torch.log(1.0 - torch.tensor(0.6)),
+        ]
+    ).mean()
+    global_mean = -torch.log(
+        1.0 - torch.tensor([0.2, 0.8, 0.4, 0.1, 0.1, 0.1, 0.7, 0.6])
+    ).mean()
+    assert torch.allclose(losses["presence"], expected)
+    assert not torch.allclose(losses["presence"], global_mean)
+
+
+def test_3d_projection_bridge_recovers_straight_xy_direction() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+    projected = project_3d_direction_to_2d_frame(
+        encoded,
+        frame_x_xyz=torch.tensor([1.0, 0.0, 0.0]),
+        frame_y_xyz=torch.tensor([0.0, 1.0, 0.0]),
+    )
+    assert torch.abs(projected[0, 0]) > 0.95
+    assert torch.abs(projected[0, 1]) < 0.15
+
+
+def test_trace2cp_bridge_scores_projected_3d_field() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    output = torch.zeros((7, 3, 8, 12), dtype=torch.float32)
+    output[:6] = encoded.view(6, 1, 1, 1)
+    output[6] = 1.0
+    yy, xx = np.meshgrid(
+        np.arange(8, dtype=np.float32),
+        np.arange(12, dtype=np.float32),
+        indexing="ij",
+    )
+    coords = np.stack([np.ones_like(xx), yy, xx], axis=-1)
+    fields = project_3d_output_to_trace2cp_fields(
+        output,
+        coords,
+        np.ones((8, 12), dtype=bool),
+        frame_x_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        frame_y_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+    score = score_trace2cp_projected_fields(
+        fields,
+        start_xy=np.asarray([1.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=0.0,
+    )
+    assert score.trace2cp_error < 0.05
+    assert score.reached_target_columns
+
+
+def test_3d_trace2cp_fixed_set_evaluator_scores_synthetic_source() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantTrace2CpModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    yy, xx = np.meshgrid(
+        np.arange(8, dtype=np.float32),
+        np.arange(12, dtype=np.float32),
+        indexing="ij",
+    )
+    coords_xyz = np.stack([xx, yy, np.ones_like(xx)], axis=-1)
+    valid = np.ones((8, 12), dtype=bool)
+    grid = SimpleNamespace(
+        coords_xyz=torch.as_tensor(coords_xyz, dtype=torch.float32),
+        valid_mask=torch.as_tensor(valid, dtype=torch.bool),
+        frame=FiberStripFrame(
+            tangent_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            side_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            mesh_normal_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        ),
+        offset_axis_xyz=torch.as_tensor(
+            np.broadcast_to(np.asarray([0.0, 1.0, 0.0], dtype=np.float32), (8, 12, 3)).copy()
+        ),
+    )
+    source = SimpleNamespace(
+        grid=grid,
+        record=SimpleNamespace(
+            volume=np.ones((3, 8, 12), dtype=np.float32),
+            volume_spacing_base=1.0,
+        ),
+        start_control_point_xy=np.asarray([1.0, 4.0], dtype=np.float32),
+        target_control_point_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+    )
+
+    class FakeGeometryLoader:
+        sample_count = 1
+
+        def build_trace2cp_segment_source(self, *_args, **_kwargs):
+            return source
+
+    cfg = _Trace2Cp3DConfig(
+        enabled=True,
+        control_points=1,
+        start_sample_index=0,
+        sample_mode="flat",
+        step_px=1.0,
+        rf_margin_px=0.0,
+        presence_enabled=True,
+        patch_shape_hw=(8, 12),
+        strip_z_offset_count=1,
+        strip_z_offset_step=1.0,
+        tile_shape_hw=(8, 12),
+        block_context_voxels=0,
+        loader_config_path=None,
+    )
+    result = _evaluate_trace2cp_metric_fixed_set_3d(
+        ConstantTrace2CpModel(),
+        FakeGeometryLoader(),
+        image_normalization="none",
+        cfg=cfg,
+        device=torch.device("cpu"),
+    )
+    assert result.error_mean < 0.05
+    assert result.segments == 1
+    assert result.skipped_segments == 0
+
+
+def test_native_3d_trace2cp_cone_candidates_are_deterministic_and_bounded() -> None:
+    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates_a = generate_cone_candidates(
+        axis,
+        max_angle_degrees=25.0,
+        grid_size=5,
+    )
+    candidates_b = generate_cone_candidates(
+        axis,
+        max_angle_degrees=25.0,
+        grid_size=5,
+    )
+
+    assert np.allclose(candidates_a, candidates_b)
+    assert candidates_a.shape == (5 * 5, 3)
+    assert np.allclose(candidates_a[0], axis)
+    assert np.allclose(np.linalg.norm(candidates_a, axis=1), 1.0, atol=1.0e-5)
+    angles = np.rad2deg(np.arccos(np.clip(candidates_a @ axis, -1.0, 1.0)))
+    assert float(np.max(angles)) <= 25.0 + 1.0e-4
+
+
+def test_native_3d_trace2cp_angle_step_candidates_are_deterministic_and_bounded() -> None:
+    axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates_a = generate_cone_candidates_by_angle_step(
+        axis,
+        max_angle_degrees=25.0,
+        angle_step_degrees=5.0,
+    )
+    candidates_b = generate_cone_candidates_by_angle_step(
+        axis,
+        max_angle_degrees=25.0,
+        angle_step_degrees=5.0,
+    )
+
+    assert np.allclose(candidates_a, candidates_b)
+    assert candidates_a.shape == (81, 3)
+    assert np.allclose(candidates_a[0], axis)
+    assert np.allclose(np.linalg.norm(candidates_a, axis=1), 1.0, atol=1.0e-5)
+    angles = np.rad2deg(np.arccos(np.clip(candidates_a @ axis, -1.0, 1.0)))
+    assert float(np.max(angles)) <= 25.0 + 1.0e-4
+
+
+def test_native_3d_trace2cp_torch_candidate_generation_matches_numpy() -> None:
+    axes = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    cfg = NativeTrace2CpConfig(cone_angle_degrees=25.0, cone_angle_step_degrees=5.0)
+
+    candidates = _trace_candidate_directions_torch(axes, cfg).detach().cpu().numpy()
+
+    assert candidates.shape == (2, 81, 3)
+    assert np.allclose(
+        candidates[0],
+        generate_cone_candidates_by_angle_step(
+            axes[0].numpy(),
+            max_angle_degrees=25.0,
+            angle_step_degrees=5.0,
+        ),
+        atol=1.0e-6,
+    )
+    assert np.allclose(
+        candidates[1],
+        generate_cone_candidates_by_angle_step(
+            axes[1].numpy(),
+            max_angle_degrees=25.0,
+            angle_step_degrees=5.0,
+        ),
+        atol=1.0e-6,
+    )
+
+
+def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
+    assert NativeTrace2CpConfig().inference_patch_shape_zyx == (128, 128, 128)
+    assert NativeTrace2CpConfig().cone_grid_size == 25
+    assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
+    assert NativeTrace2CpConfig().beam_width == 8
+    assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
+    assert NativeTrace2CpConfig().beam_lookahead_steps == 2
+    assert NativeTrace2CpConfig().candidate_substeps == 1
+    assert NativeTrace2CpConfig().max_step_factor == 3.0
+    assert NativeTrace2CpConfig().max_steps is None
+    assert NativeTrace2CpConfig().smoothness_weight == 2.0
+    assert NativeTrace2CpConfig().smoothness_tangent_weight == 10.0
+    assert NativeTrace2CpConfig().smoothness_normal_weight == 0.1
+    assert NativeTrace2CpConfig().smoothness_free_angle_degrees == 0.0
+    assert NativeTrace2CpConfig().cumulative_smoothness_steps == 4
+    assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
+    assert NativeTrace2CpConfig().all_pairs_direction_product is True
+    assert NativeTrace2CpConfig().core_margin_voxels == 48
+    assert NativeTrace2CpConfig().inference_scaledown_power == 0
+    assert NativeTrace2CpConfig().inference_blur_sigma_voxels == pytest.approx(0.0)
+    assert NativeTrace2CpConfig().inference_block_batch_size == 2
+    assert NativeTrace2CpConfig().whole_fiber_error_threshold_base_voxels == 20.0
+    assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
+
+
+def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.sample_index is None
+    assert args.beam_width == 8
+    assert args.beam_lookahead_steps == 2
+    assert args.smoothness_normal_weight == 0.1
+    assert args.smoothness_tangent_weight == 10.0
+    assert args.core_margin_voxels == 48
+    assert args.inference_scaledown_power == 0
+    assert args.inference_blur_sigma_voxels == pytest.approx(0.0)
+    assert args.inference_block_batch_size == 2
+    assert args.max_cached_inference_gib == pytest.approx(8.0)
+    assert args.normal_sampler == "sparse-corner-principal"
+    assert args.whole_fiber_start_cp_index == 0
+    assert args.whole_fiber_error_threshold_base_voxels == pytest.approx(20.0)
+    assert args.vis is False
+    assert args.profile is False
+
+
+def test_native_3d_trace2cp_cli_accepts_multiple_fiber_jsons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+            "--fiber-json",
+            "a.json",
+            "b.json",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.fiber_json == [Path("a.json"), Path("b.json")]
+
+
+def test_native_3d_trace2cp_cli_accepts_whole_fiber_start_cp_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+            "--fiber-json",
+            "fiber.json",
+            "--whole-fiber-start-cp-index",
+            "7",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.whole_fiber_start_cp_index == 7
+
+
+def test_native_3d_trace2cp_multi_fiber_output_stems_are_indexed() -> None:
+    assert _indexed_trace2cp_output_stem(0, 2) == "trace2cp_native_3d_000"
+    assert _indexed_trace2cp_output_stem(12, 1000) == "trace2cp_native_3d_012"
+    assert _indexed_trace2cp_output_stem(12, 1001) == "trace2cp_native_3d_0012"
+
+
+def test_native_3d_trace2cp_help_shows_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.argv", ["trace2cp_tool", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        _parse_args()
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    option_text = help_text.split("options:", 1)[1]
+    assert "--step-voxels" in option_text
+    assert "[4.0]" in option_text
+    assert "--inference-scaledown-power" in option_text
+    assert "[0] Power-of-two Gaussian pyramid scaledown applied" in option_text
+    assert "--inference-blur-sigma-voxels" in option_text
+    assert "[0.0] 3D Gaussian sigma applied" in option_text
+    assert "--normal-sampler" in option_text
+    assert "[sparse-corner-principal]" in option_text
+    assert "--core-margin-voxels" in option_text
+    assert "[48]" in option_text
+    assert "STEP_VOXELS" not in option_text
+    assert "(default:" not in help_text
+
+
+def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
+    assert _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=None,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=0,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=Path("fiber.json"),
+        sample_index=None,
+        start_cp_index=0,
+        target_cp_index=1,
+    )
+    assert not _native_trace2cp_whole_fiber_mode(
+        fiber_json=None,
+        sample_index=None,
+        start_cp_index=None,
+        target_cp_index=None,
+    )
+    with pytest.raises(ValueError, match="provided together"):
+        _native_trace2cp_whole_fiber_mode(
+            fiber_json=Path("fiber.json"),
+            sample_index=None,
+            start_cp_index=0,
+            target_cp_index=None,
+        )
+
+
+def test_native_3d_trace2cp_explicit_segment_selection_uses_fiber_cp_indices() -> None:
+    record = SimpleNamespace(
+        fiber=SimpleNamespace(
+            control_points_zyx=np.zeros((5, 3), dtype=np.float32),
+        ),
+    )
+    loader = SimpleNamespace(records=[record])
+
+    selection = _resolve_native_trace2cp_selection(
+        loader,
+        sample_index=99,
+        fiber_json=Path("fiber.json"),
+        start_cp_index=3,
+        target_cp_index=1,
+        target_offset=1,
+        sample_mode=None,
+    )
+
+    assert selection.record is record
+    assert selection.sample_index == 3
+    assert selection.sample_mode == "flat"
+    assert selection.start_cp_index == 3
+    assert selection.target_cp_index == 1
+    assert selection.explicit_segment is True
+
+
+def test_native_3d_trace2cp_explicit_segment_selection_requires_fiber_json() -> None:
+    loader = SimpleNamespace(
+        records=[
+            SimpleNamespace(
+                fiber=SimpleNamespace(control_points_zyx=np.zeros((3, 3), dtype=np.float32))
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="require --fiber-json"):
+        _resolve_native_trace2cp_selection(
+            loader,
+            sample_index=0,
+            fiber_json=None,
+            start_cp_index=0,
+            target_cp_index=1,
+            target_offset=1,
+            sample_mode=None,
+        )
+
+
+def test_native_3d_trace2cp_sample_index_selection_stays_unchanged() -> None:
+    record = SimpleNamespace(
+        fiber=SimpleNamespace(
+            control_points_zyx=np.zeros((5, 3), dtype=np.float32),
+        ),
+    )
+
+    class FakeLoader:
+        def descriptor_for_sample_index(self, sample_index: int, *, sample_mode: str):
+            assert sample_index == 11
+            assert sample_mode == "random"
+            return record, 7, 2
+
+    selection = _resolve_native_trace2cp_selection(
+        FakeLoader(),
+        sample_index=11,
+        fiber_json=None,
+        start_cp_index=None,
+        target_cp_index=None,
+        target_offset=2,
+        sample_mode=None,
+    )
+
+    assert selection.record is record
+    assert selection.record_index == 7
+    assert selection.sample_index == 11
+    assert selection.sample_mode == "random"
+    assert selection.start_cp_index == 2
+    assert selection.target_cp_index == 4
+    assert selection.explicit_segment is False
+
+
+def test_native_3d_trace2cp_image_to_u8_uses_inference_zscore_values() -> None:
+    image = np.asarray(
+        [
+            [0.0, 1.0, 2.0],
+            [np.nan, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    valid = np.asarray(
+        [
+            [True, True, True],
+            [True, False, False],
+        ],
+        dtype=bool,
+    )
+
+    rendered = _image_to_u8(image, valid, normalization="zscore")
+
+    assert rendered[0, 1] == 128
+    assert rendered[0, 0] < rendered[0, 1] < rendered[0, 2]
+    assert rendered[1, 0] == 0
+    assert rendered[1, 1] == 0
+
+
+def test_native_3d_trace2cp_strip_presence_samples_cache_in_one_batch() -> None:
+    class FakeCache:
+        def __init__(self) -> None:
+            self.points_zyx: np.ndarray | None = None
+
+        def sample_points_torch(
+            self,
+            points_zyx: np.ndarray,
+            *,
+            progress_label: str | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            assert progress_label is None
+            self.points_zyx = np.asarray(points_zyx, dtype=np.float32).copy()
+            count = int(points_zyx.shape[0])
+            directions = torch.zeros((count, 3), dtype=torch.float32)
+            presence = torch.arange(count, dtype=torch.float32) / max(1, count - 1)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    coords_xyz = np.asarray(
+        [
+            [[2.0, 4.0, 6.0], [4.0, 6.0, 8.0]],
+            [[6.0, 8.0, 10.0], [8.0, 10.0, 12.0]],
+        ],
+        dtype=np.float32,
+    )
+    grid_valid = np.asarray([[True, False], [True, True]], dtype=bool)
+    cache = FakeCache()
+
+    presence, valid = _sample_presence_on_strip(
+        cache,
+        coords_xyz,
+        grid_valid,
+        spacing_base=2.0,
+    )
+
+    assert cache.points_zyx is not None
+    expected_points = coords_xyz[grid_valid][:, [2, 1, 0]] / np.float32(2.0)
+    assert np.allclose(cache.points_zyx, expected_points)
+    assert presence.shape == (2, 2)
+    assert valid.tolist() == [[True, False], [True, True]]
+    assert presence[0, 0] == pytest.approx(0.0)
+    assert presence[1, 1] == pytest.approx(1.0)
+
+
+def test_native_3d_trace2cp_strip_presence_can_scale_by_strip_plane_alignment() -> None:
+    class FakeCache:
+        def sample_points_torch(
+            self,
+            points_zyx: np.ndarray,
+            *,
+            progress_label: str | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            del progress_label
+            count = int(points_zyx.shape[0])
+            assert count == 4
+            # Cache returns ZYX directions. The strip below lies in XYZ z=0,
+            # so XYZ x/y should stay visible and XYZ z should be suppressed.
+            directions_zyx = torch.tensor(
+                [
+                    [0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [math.sqrt(0.5), 0.0, math.sqrt(0.5)],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count,), dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions_zyx, presence, valid
+
+    coords_xyz = np.asarray(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    grid_valid = np.ones((2, 2), dtype=bool)
+
+    presence, valid = _sample_presence_on_strip(
+        FakeCache(),
+        coords_xyz,
+        grid_valid,
+        spacing_base=1.0,
+        scale_by_strip_tangent_plane=True,
+    )
+
+    assert valid.tolist() == [[True, True], [True, True]]
+    assert presence[0, 0] == pytest.approx(1.0)
+    assert presence[0, 1] == pytest.approx(1.0)
+    assert presence[1, 0] == pytest.approx(0.0)
+    assert presence[1, 1] == pytest.approx(math.sqrt(0.5), abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_projects_trace_to_initial_strip_axis() -> None:
+    line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)
+    axes = np.zeros((16, 16, 3), dtype=np.float32)
+    axes[..., 1] = 1.0
+    source = SimpleNamespace(
+        record=SimpleNamespace(volume_spacing_base=1.0),
+        line_window=SimpleNamespace(line_points_xyz=line_points_xyz),
+        line_xy=line_xy,
+        grid=SimpleNamespace(
+            offset_axis_xyz=axes,
+            valid_mask=np.ones((16, 16), dtype=bool),
+        ),
+    )
+    trace_xyz = np.asarray([[2.0, 3.0, 0.0], [8.0, -2.0, 0.0]], dtype=np.float32)
+
+    projected = _project_trace_to_initial_strip(
+        source,
+        trace_xyz,
+        axis_name="offset_axis_xyz",
+    )
+
+    assert np.allclose(projected, [[2.0, 8.0], [8.0, 3.0]], atol=1.0e-5)
+
+
+def test_native_3d_trace2cp_adaptive_cross_height_expands_and_caps() -> None:
+    centered = (np.asarray([[1.0, 9.5], [4.0, 9.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((centered,),)) == 5
+
+    shifted = (np.asarray([[1.0, 12.5], [4.0, 26.5]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(40, ((shifted,),)) == 27
+
+    far = (np.asarray([[1.0, -100.0], [4.0, 100.0]], dtype=np.float32), (0, 0, 0, 255))
+    assert _adaptive_trace2cp_cross_strip_height(20, ((far,),)) == 19
+
+
+def test_native_3d_trace2cp_converts_volume_trace_to_source_xyz_offsets() -> None:
+    line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)
+    row_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    row_axes[..., 1] = 1.0
+    side_axes = np.zeros((16, 16, 3), dtype=np.float32)
+    side_axes[..., 2] = 1.0
+    source = SimpleNamespace(
+        record=SimpleNamespace(volume_spacing_base=2.0),
+        line_window=SimpleNamespace(line_points_xyz=line_points_xyz),
+        line_xy=line_xy,
+        grid=SimpleNamespace(
+            offset_axis_xyz=row_axes,
+            side_axis_xyz=side_axes,
+            valid_mask=np.ones((16, 16), dtype=bool),
+        ),
+    )
+    trace_xyz = np.asarray(
+        [
+            [2.0, 4.0, 6.0],
+            [8.0, -2.0, -4.0],
+        ],
+        dtype=np.float32,
+    )
+
+    source_trace = _volume_trace_to_source_trace_xyz(source, trace_xyz)
+
+    assert np.allclose(source_trace, [[2.0, 7.0, 3.0], [8.0, 4.0, -2.0]], atol=1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_uses_pairwise_arc_length_score() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 2.0, 0.0],
+            [5.0, 2.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.45, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [4.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_reverse_zyx, [5.0, 2.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [4.5, 1.0, 0.0], atol=1.0e-6)
+    assert fusion.raw_gap_voxels == pytest.approx(math.sqrt(5.0), abs=1.0e-6)
+    assert fusion.considered_gap_voxels == pytest.approx(9.0 + 2.0 * math.sqrt(5.0), abs=1.0e-6)
+    assert fusion.center_penalty == pytest.approx(1.0, abs=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+    progress = fusion.fused_zyx[:, 0] / 10.0
+    assert np.all(np.diff(progress) >= -1.0e-5)
+
+
+def test_native_3d_trace2cp_fusion_tie_prefers_balanced_meeting() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.5, abs=1.0e-6)
+    assert fusion.raw_gap_voxels == pytest.approx(0.0, abs=1.0e-6)
+    assert fusion.considered_gap_voxels == pytest.approx(10.0, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_reverse_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.closest_midpoint_zyx, [5.0, 0.0, 0.0], atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_fusion_preserves_wrong_direction_trace_order() -> None:
+    start = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    forward = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    reverse = np.asarray(
+        [
+            [10.0, 10.0, 0.0],
+            [12.0, 10.0, 0.0],
+            [14.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    fusion = fuse_forward_reverse_traces(
+        forward,
+        reverse,
+        start_zyx=start,
+        target_zyx=target,
+        step_voxels=1.0,
+    )
+
+    assert fusion.reached_overlap
+    assert fusion.reason == "pairwise_arc_length_meeting"
+    assert fusion.closest_progress == pytest.approx(0.7, abs=1.0e-6)
+    assert np.allclose(fusion.closest_forward_zyx, [4.0, 0.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_reverse_zyx, [10.0, 10.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.closest_midpoint_zyx, [7.0, 5.0, 0.0], atol=1.0e-5)
+    assert np.allclose(fusion.fused_zyx[0], start, atol=1.0e-6)
+    assert np.allclose(fusion.fused_zyx[-1], target, atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_plane_crossing_interpolates() -> None:
+    crossing = _interpolate_plane_crossing(
+        np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        plane_point_zyx=np.asarray([0.0, 0.0, 4.0], dtype=np.float32),
+        plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert crossing is not None
+    assert np.allclose(crossing, [0.0, 0.0, 4.0])
+
+
+def test_native_3d_trace2cp_target_plane_error_uses_in_plane_distance() -> None:
+    error = _target_plane_in_plane_error_voxels(
+        np.asarray([3.0, 4.0, 12.0], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert error == pytest.approx(5.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_target_plane_crossing_replaces_farther_crossing() -> None:
+    plane = NativeTargetPlane(
+        name="y_plane",
+        point_zyx=np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+    crossed = np.zeros((1,), dtype=bool)
+    crossings = np.zeros((1, 3), dtype=np.float32)
+
+    crossed, crossings = _update_target_plane_crossings(
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        end_zyx=np.asarray([0.0, -1.0, 0.0], dtype=np.float32),
+        planes=(plane,),
+        crossed=crossed,
+        crossings_zyx=crossings,
+    )
+    crossed, crossings = _update_target_plane_crossings(
+        start_zyx=np.asarray([0.0, -1.0, 9.0], dtype=np.float32),
+        end_zyx=np.asarray([0.0, 1.0, 9.0], dtype=np.float32),
+        planes=(plane,),
+        crossed=crossed,
+        crossings_zyx=crossings,
+    )
+
+    assert crossed.tolist() == [True]
+    assert np.allclose(crossings[0], [0.0, 0.0, 9.0], atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_one_way_requires_explicit_target_planes() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+    with pytest.raises(ValueError, match="explicit target planes"):
+        trace_native_3d_one_way(
+            FakeCache(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([4.0, 0.0, 0.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(
+                step_voxels=1.0,
+                cone_angle_degrees=0.0,
+                beam_width=1,
+                smoothness_weight=0.0,
+                smoothness_tangent_weight=0.0,
+                smoothness_normal_weight=0.0,
+            ),
+            normal_sampler=_constant_native_normal_sampler(),
+        )
+
+
+def test_native_3d_trace2cp_one_way_waits_for_all_target_planes() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([4.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="x_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="y_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=1,
+            trace_step_limit=5,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert not result.reached_target_plane
+    assert "missing_target_planes=y_plane" in result.reason
+    assert [crossing.name for crossing in result.target_plane_crossings] == ["x_plane"]
+
+
+def test_native_3d_trace2cp_one_way_selects_best_crossed_target_plane_error() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([4.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="x_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="diagonal_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=1,
+            trace_step_limit=5,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.reached_target_plane
+    assert result.selected_target_plane_name == "x_plane"
+    assert result.selected_target_plane_error_voxels == pytest.approx(1.0, abs=1.0e-6)
+    assert np.allclose(result.trace_zyx[-1], [4.0, 1.0, 0.0], atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_one_way_continues_when_crossing_error_exceeds_threshold() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 5.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="early_1",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 1.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="early_2",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.5, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=2,
+            beam_lookahead_steps=2,
+            trace_step_limit=15,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+        target_plane_accept_threshold_voxels=1.0,
+    )
+
+    assert result.reached_target_plane
+    assert result.reason == "target_plane_error_threshold"
+    assert result.selected_target_plane_error_voxels > 1.0
+    assert result.trace_zyx.shape[0] == 16
+    assert np.allclose(result.trace_zyx[-1], [15.0, 5.0, 0.0], atol=1.0e-6)
+
+
+def _whole_native_trace_record() -> SimpleNamespace:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    fiber = Vc3dFiber(
+        path=Path("fiber.json"),
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points.copy(),
+        control_point_segments=legacy_lasagna_segments(len(points)),
+        generation=1,
+        metadata={},
+    )
+    return SimpleNamespace(fiber=fiber, volume_spacing_base=1.0)
+
+
+def test_native_3d_whole_fiber_trace_all_success_has_zero_restarts_per_kvx() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 2
+    assert result.restart_count == 0
+    assert result.reference_length_voxels == pytest.approx(20.0)
+    assert result.restarts_per_kvx == pytest.approx(0.0)
+    assert [segment.success for segment in result.segments] == [True, True]
+    assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 0.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_success_continues_from_live_trace_state() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [10.5, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    record = SimpleNamespace(
+        fiber=Vc3dFiber(
+            path=Path("fiber.json"),
+            version=1,
+            line_points_xyz=points,
+            control_points_xyz=points.copy(),
+            control_point_segments=legacy_lasagna_segments(len(points)),
+            generation=1,
+            metadata={},
+        ),
+        volume_spacing_base=1.0,
+    )
+
+    class FakeCache:
+        _blocks = {}
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    result = trace_native_3d_whole_fiber(
+        FakeCache(),
+        record=record,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=4.0,
+            cone_angle_degrees=0.0,
+            beam_width=2,
+            beam_lookahead_steps=1,
+            max_step_factor=3.0,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+            cumulative_smoothness_tangent_weight=0.0,
+        ),
+        error_threshold_base_voxels=1.0,
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.restart_count == 0
+    assert result.segments[0].success
+    assert result.segments[0].selected_target_plane_crossing_zyx is not None
+    assert np.allclose(
+        result.segments[0].selected_target_plane_crossing_zyx,
+        [0.0, 0.0, 10.5],
+        atol=1.0e-5,
+    )
+    assert np.allclose(result.segments[0].trace_zyx[-1], [0.0, 0.0, 12.0], atol=1.0e-5)
+    assert np.allclose(result.segments[1].trace_zyx[0], [0.0, 0.0, 12.0], atol=1.0e-5)
+    assert np.allclose(result.stitched_trace_zyx[-1], [0.0, 0.0, 20.0], atol=1.0e-5)
+
+
+def test_native_3d_whole_fiber_trace_can_start_at_later_control_point() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+    starts: list[np.ndarray] = []
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        starts.append(np.asarray(start_zyx, dtype=np.float32).copy())
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        start_cp_index=1,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 1
+    assert result.reference_length_voxels == pytest.approx(10.0)
+    assert result.restarts_per_kvx == pytest.approx(0.0)
+    assert [(segment.start_cp_index, segment.target_cp_index) for segment in result.segments] == [(1, 2)]
+    assert np.allclose(starts[0], [0.0, 0.0, 10.0])
+    assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 10.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_trace_rejects_start_at_final_control_point() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    with pytest.raises(ValueError, match="start CP index"):
+        trace_native_3d_whole_fiber(
+            cache,
+            record=record,
+            cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+            error_threshold_base_voxels=1.0,
+            start_cp_index=2,
+            trace_segment_fn=lambda *_args, **_kwargs: None,
+        )
+
+
+def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+    starts: list[np.ndarray] = []
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        starts.append(np.asarray(start_zyx, dtype=np.float32).copy())
+        if len(starts) == 1:
+            return NativeTraceResult(
+                trace_zyx=np.stack(
+                    [
+                        start_zyx,
+                        np.asarray(start_zyx, dtype=np.float32) + np.asarray([0.0, 0.0, 2.0], dtype=np.float32),
+                    ],
+                    axis=0,
+                ).astype(np.float32),
+                reached_target_plane=False,
+                reason="max_step_factor",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 1
+    assert result.reference_length_voxels == pytest.approx(20.0)
+    assert result.restarts_per_kvx == pytest.approx(50.0)
+    assert result.segments[0].reason == "max_step_factor"
+    assert result.segments[0].restart
+    assert np.allclose(starts[1], [0.0, 0.0, 10.0])
+
+
+def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_known() -> None:
+    record = _whole_native_trace_record()
+    record.sampler = SimpleNamespace(
+        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
+    )
+    cache = SimpleNamespace(_blocks={})
+    calls = 0
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return NativeTraceResult(
+                trace_zyx=np.stack(
+                    [
+                        start_zyx,
+                        np.asarray(start_zyx, dtype=np.float32)
+                        + np.asarray([0.0, 0.0, 2.0], dtype=np.float32),
+                    ],
+                    axis=0,
+                ).astype(np.float32),
+                reached_target_plane=False,
+                reason="max_step_factor",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 1
+    assert result.reference_length_meters == pytest.approx(40.0e-6)
+    assert result.restarts_per_meter == pytest.approx(25_000.0)
+
+
+def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(capsys) -> None:
+    record = _whole_native_trace_record()
+    record.sampler = SimpleNamespace(
+        volume=SimpleNamespace(metadata={"voxelsize": 2000.0})
+    )
+    cache = SimpleNamespace(_blocks={})
+    calls = 0
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return NativeTraceResult(
+                trace_zyx=np.stack(
+                    [
+                        start_zyx,
+                        np.asarray(start_zyx, dtype=np.float32)
+                        + np.asarray([0.0, 0.0, 2.0], dtype=np.float32),
+                    ],
+                    axis=0,
+                ).astype(np.float32),
+                reached_target_plane=False,
+                reason="max_step_factor",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+        progress=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "err/kvx=50.0" in output
+    assert "err/m=25.0 (20.0mm)" in output
+    assert "\r" in output
+    assert output.count("\n") == 2
+    assert "err/kvx=50.000" not in output
+    assert "err/m=25.000" not in output
+    assert "restarts_per_kvx=" not in output
+    assert "restarts_per_meter=" not in output
+    assert "reference_length_meters=" not in output
+    assert "physical_unit=m" not in output
+
+
+def test_native_3d_whole_fiber_error_format_helpers_use_one_decimal() -> None:
+    assert _format_trace2cp_kvx_rate(0.502) == "0.5"
+    assert (
+        _format_trace2cp_meter_rate(
+            52.329,
+            restart_count=8,
+            reference_length_meters=0.153,
+        )
+        == "err/m=52.3 (17.0mm)"
+    )
+
+
+def test_native_3d_multi_fiber_aggregation_sums_restart_metric_denominators() -> None:
+    empty_trace = np.zeros((0, 3), dtype=np.float32)
+    first = NativeWholeFiberResult(
+        segments=(),
+        restart_count=1,
+        restarts_per_kvx=10.0,
+        segment_count=4,
+        reference_length_voxels=100.0,
+        reference_length_meters=0.2,
+        restarts_per_meter=5.0,
+        stitched_trace_zyx=empty_trace,
+        inferred_blocks=0,
+    )
+    second = NativeWholeFiberResult(
+        segments=(),
+        restart_count=2,
+        restarts_per_kvx=10.0,
+        segment_count=6,
+        reference_length_voxels=200.0,
+        reference_length_meters=0.3,
+        restarts_per_meter=6.6666666667,
+        stitched_trace_zyx=empty_trace,
+        inferred_blocks=0,
+    )
+
+    aggregate = _aggregate_native_whole_fiber_results([first, second])
+
+    assert aggregate.restart_count == 3
+    assert aggregate.segment_count == 10
+    assert aggregate.reference_length_voxels == pytest.approx(300.0)
+    assert aggregate.restarts_per_kvx == pytest.approx(10.0)
+    assert aggregate.reference_length_meters == pytest.approx(0.5)
+    assert aggregate.restarts_per_meter == pytest.approx(6.0)
+    assert aggregate.run_count == 5
+
+
+def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:
+    record = _whole_native_trace_record()
+    record.dataset_config = {"base_voxel_size_um": 2.0}
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.reference_length_meters is None
+    assert result.restarts_per_meter is None
+
+
+def test_native_3d_whole_fiber_trace_restarts_after_large_in_plane_error() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        if np.allclose(target_zyx, [0.0, 0.0, 10.0]):
+            crossing = np.asarray(target_zyx, dtype=np.float32) + np.asarray([0.0, 5.0, 0.0], dtype=np.float32)
+            return NativeTraceResult(
+                trace_zyx=np.stack([start_zyx, crossing], axis=0).astype(np.float32),
+                reached_target_plane=True,
+                reason="target_plane",
+                steps=(),
+            )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 1
+    assert result.segments[0].reached_target_plane
+    assert result.segments[0].reason == "in_plane_error"
+    assert result.segments[0].in_plane_error_voxels == pytest.approx(5.0, abs=1.0e-6)
+
+
+def test_native_3d_whole_fiber_threshold_is_measured_in_base_voxels() -> None:
+    record = _whole_native_trace_record()
+    record.volume_spacing_base = 4.0
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        crossing = np.asarray(target_zyx, dtype=np.float32) + np.asarray(
+            [0.0, 5.0, 0.0], dtype=np.float32
+        )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, crossing], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=20.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 0
+    assert result.segments[0].success
+    assert result.segments[0].in_plane_error_voxels == pytest.approx(5.0)
+    assert result.segments[0].in_plane_error_base_voxels == pytest.approx(20.0)
+
+
+def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
+    points = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
+    record = SimpleNamespace(
+        fiber=Vc3dFiber(
+            path=Path("fiber.json"),
+            version=1,
+            line_points_xyz=points,
+            control_points_xyz=points.copy(),
+            control_point_segments=legacy_lasagna_segments(len(points)),
+            generation=1,
+            metadata={},
+        ),
+        volume_spacing_base=1.0,
+    )
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack(
+                [start_zyx, np.asarray(start_zyx, dtype=np.float32) + np.asarray([0.0, 0.0, 1.0], dtype=np.float32)],
+                axis=0,
+            ).astype(np.float32),
+            reached_target_plane=False,
+            reason="trace_step_limit",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 1
+    assert result.restart_count == 1
+    assert result.segments[0].reason == "trace_step_limit"
+
+
+def _native_whole_fiber_segment(
+    start_cp: int,
+    target_cp: int,
+    *,
+    success: bool,
+) -> object:
+    return SimpleNamespace(
+        start_cp_index=int(start_cp),
+        target_cp_index=int(target_cp),
+        trace_zyx=np.asarray(
+            [[0.0, 0.0, float(start_cp)], [0.0, 0.0, float(target_cp)]],
+            dtype=np.float32,
+        ),
+        start_zyx=np.asarray([0.0, 0.0, float(start_cp)], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, float(target_cp)], dtype=np.float32),
+        reached_target_plane=bool(success),
+        success=bool(success),
+        restart=not bool(success),
+        reason="target_plane" if success else "trace_step_limit",
+        in_plane_error_voxels=0.0 if success else float("inf"),
+        in_plane_error_base_voxels=0.0 if success else float("inf"),
+        reference_arc_distance_voxels=float(target_cp),
+        step_count=1,
+    )
+
+
+def test_native_3d_whole_fiber_visual_spans_are_restart_delimited() -> None:
+    segments = [
+        _native_whole_fiber_segment(0, 1, success=True),
+        _native_whole_fiber_segment(1, 2, success=False),
+        _native_whole_fiber_segment(2, 3, success=True),
+        _native_whole_fiber_segment(3, 4, success=True),
+    ]
+
+    spans = _native_whole_fiber_visual_spans(segments)
+
+    assert [(span.start_cp_index, span.end_cp_index, span.restart_after) for span in spans] == [
+        (0, 2, True),
+        (2, 4, False),
+    ]
+    assert [len(span.segments) for span in spans] == [2, 2]
+
+
+def test_native_3d_whole_fiber_span_source_uses_fixed_cross_width() -> None:
+    class FakeGeometryLoader:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return "source"
+
+    loader = FakeGeometryLoader()
+
+    source = _build_native_whole_fiber_span_source(
+        loader,
+        start_cp_index=3,
+        end_cp_index=9,
+        trace2cp_rf_margin_px=17.5,
+    )
+
+    assert source == "source"
+    assert len(loader.calls) == 1
+    args, kwargs = loader.calls[0]
+    assert args == (3,)
+    assert kwargs["target_control_point_index"] == 9
+    assert kwargs["rf_margin_px"] == pytest.approx(17.5)
+    assert kwargs["cross_strip_height_px"] == 64
+    assert kwargs["sample_mode"] == "flat"
+
+
+def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch) -> None:
+    from PIL import Image
+
+    def make_source(tag: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            tag=tag,
+            record=SimpleNamespace(volume_spacing_base=1.0),
+            line_xy=np.asarray([[0.0, 1.0], [3.0, 1.0]], dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([3.0, 1.0], dtype=np.float32),
+        )
+
+    class FakeGeometryLoader:
+        def __init__(self) -> None:
+            self.source = make_source("initial")
+            self.regenerated_source = make_source("regenerated")
+            self.refined_calls: list[np.ndarray] = []
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            return self.source
+
+        def build_trace2cp_volume_trace_segment_source(self, source, trace, *, device):
+            assert source is self.source
+            assert device == torch.device("cpu")
+            self.refined_calls.append(np.asarray(trace, dtype=np.float32))
+            return self.regenerated_source
+
+        def sample_trace2cp_segment_source(self, source):
+            value = 32.0 if source.tag == "initial" else 96.0
+            image = np.full((3, 4), value, dtype=np.float32)
+            valid = np.ones((3, 4), dtype=bool)
+            return None, image, valid
+
+        def sample_trace2cp_top_strip_source(self, source):
+            value = 64.0 if source.tag == "initial" else 128.0
+            image = np.full((3, 4), value, dtype=np.float32)
+            valid = np.ones((3, 4), dtype=bool)
+            return image, valid
+
+        def trace2cp_segment_coords_xyz(self, _source):
+            return np.zeros((3, 4, 3), dtype=np.float32), np.ones((3, 4), dtype=bool)
+
+        def trace2cp_top_strip_coords_xyz(self, _source):
+            return np.zeros((3, 4, 3), dtype=np.float32), np.ones((3, 4), dtype=bool)
+
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_whole_fiber_segment_group_overlays_for_view",
+        lambda *args, **kwargs: (),
+    )
+    def fail_old_source_trace_conversion(*_args, **_kwargs):
+        raise AssertionError("regenerated native strips must use volume traces directly")
+
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_volume_trace_to_source_trace_xyz",
+        fail_old_source_trace_conversion,
+    )
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_sample_presence_on_strip",
+        lambda *args, **kwargs: (
+            np.full((3, 4), 0.75, dtype=np.float32),
+            np.ones((3, 4), dtype=bool),
+        ),
+    )
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_trace2cp_source_control_point_xy",
+        lambda _source, cp_index: np.asarray(
+            [1.5 * float(cp_index), 1.0],
+            dtype=np.float32,
+        ),
+    )
+    cp_marker_calls: list[tuple[str, str]] = []
+
+    def fake_control_points_for_view(source, _span, *, axis_name):
+        cp_marker_calls.append((str(source.tag), str(axis_name)))
+        return np.asarray([[0.0, 1.0], [1.5, 1.0], [3.0, 1.0]], dtype=np.float32)
+
+    draw_control_points: list[np.ndarray] = []
+    draw_control_point_labels: list[tuple[str, ...]] = []
+
+    def fake_draw_trace_panel(
+        *args,
+        control_points_xy=None,
+        control_point_labels=None,
+        **kwargs,
+    ):
+        draw_control_points.append(np.asarray(control_points_xy, dtype=np.float32))
+        draw_control_point_labels.append(tuple(control_point_labels or ()))
+        return Image.new("RGBA", (4, 3), (0, 0, 0, 255))
+
+    monkeypatch.setattr(
+        trace2cp_tool_module,
+        "_whole_fiber_span_control_points_for_view",
+        fake_control_points_for_view,
+    )
+    monkeypatch.setattr(trace2cp_tool_module, "_draw_trace_panel", fake_draw_trace_panel)
+    segment_01 = _native_whole_fiber_segment(0, 1, success=True)
+    segment_01.in_plane_error_voxels = 3.25
+    segment_12 = _native_whole_fiber_segment(1, 2, success=False)
+    span = SimpleNamespace(
+        start_cp_index=0,
+        end_cp_index=2,
+        segments=(segment_01, segment_12),
+        restart_after=False,
+    )
+    loader = FakeGeometryLoader()
+
+    panels = _render_native_whole_fiber_span_panels(
+        loader,
+        span=span,
+        trace2cp_rf_margin_px=0.0,
+        cache=object(),
+        image_normalization="none",
+    )
+    sheet = _compose_whole_fiber_panel_blocks([panels])
+
+    assert len(panels) == 8
+    assert len(loader.refined_calls) == 1
+    assert loader.refined_calls[0].shape == (4, 3)
+    assert sheet.height == sum(panel.height for panel in panels)
+    assert cp_marker_calls == [
+        ("initial", "offset_axis_xyz"),
+        ("initial", "side_axis_xyz"),
+        ("regenerated", "offset_axis_xyz"),
+        ("regenerated", "side_axis_xyz"),
+    ]
+    assert len(draw_control_points) == 8
+    assert all(points.shape == (3, 2) for points in draw_control_points)
+    assert draw_control_point_labels == [("cp=0 d=0.0", "cp=1 d=3.2", "cp=2 miss")] * 8
+
+
+def test_native_3d_trace_panel_draws_cp_labels_at_strip_bottom() -> None:
+    from PIL import ImageChops
+
+    image = np.full((32, 80), 80, dtype=np.uint8)
+    valid = np.ones((32, 80), dtype=bool)
+    line = np.asarray([[10.0, 8.0], [70.0, 8.0]], dtype=np.float32)
+    cp = np.asarray([[20.0, 8.0]], dtype=np.float32)
+
+    without_label = _draw_trace_panel(
+        image,
+        valid,
+        line,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([70.0, 8.0], dtype=np.float32),
+        title="panel",
+        control_points_xy=cp,
+    )
+    with_label = _draw_trace_panel(
+        image,
+        valid,
+        line,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([70.0, 8.0], dtype=np.float32),
+        title="panel",
+        control_points_xy=cp,
+        control_point_labels=("cp=7 d=3.0",),
+    )
+    diff = ImageChops.difference(with_label, without_label)
+    diff_arr = np.asarray(diff)
+    changed = np.argwhere(np.any(diff_arr != 0, axis=2))
+
+    assert changed.size > 0
+    assert int(changed[:, 0].min()) > 24 + 8 + 4
+
+
+def test_native_3d_whole_fiber_composer_can_prefix_closed_sheet() -> None:
+    from PIL import Image
+
+    closed = Image.new("RGBA", (5, 6), (11, 12, 13, 255))
+    block = (
+        Image.new("RGBA", (3, 2), (21, 22, 23, 255)),
+        Image.new("RGBA", (3, 4), (31, 32, 33, 255)),
+    )
+
+    sheet = _compose_whole_fiber_panel_blocks([block], prefix_sheet=closed)
+
+    assert sheet.size == (20, 6)
+    assert sheet.getpixel((0, 0)) == (11, 12, 13, 255)
+    assert sheet.getpixel((17, 0)) == (21, 22, 23, 255)
+    assert sheet.getpixel((17, 3)) == (31, 32, 33, 255)
+
+
+def test_native_3d_whole_fiber_vis_splits_pages_at_restart_blocks() -> None:
+    from PIL import Image
+
+    block_a = (Image.new("RGBA", (20, 4), (1, 2, 3, 255)),)
+    block_b = (Image.new("RGBA", (20, 4), (4, 5, 6, 255)),)
+
+    pages = _split_whole_fiber_panel_blocks_for_pages(
+        [block_a, block_b],
+        split_target_px=32,
+        single_block_max_px=64,
+    )
+
+    assert len(pages) == 2
+    assert pages[0] == (block_a,)
+    assert pages[1] == (block_b,)
+
+
+def test_native_3d_whole_fiber_vis_splits_single_wide_block_before_jpeg_limit(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    block = (Image.new("RGBA", (70, 4), (1, 2, 3, 255)),)
+    image_path = tmp_path / "trace2cp_native_3d_vis.jpg"
+
+    written = _save_whole_fiber_panel_pages(
+        [block],
+        image_path=image_path,
+        quality=90,
+        split_target_px=32,
+        single_block_max_px=64,
+    )
+
+    assert [path.name for path in written] == [
+        "trace2cp_native_3d_vis.jpg",
+        "trace2cp_native_3d_vis_001.jpg",
+    ]
+    with Image.open(written[0]) as first, Image.open(written[1]) as second:
+        assert first.size[0] <= 64
+        assert second.size[0] <= 64
+
+
+def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ConstantNativeModel(),
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=4,
+        device=torch.device("cpu"),
+    )
+
+    first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+    second = cache.block_for_point(np.asarray([12.25, 8.0, 8.0], dtype=np.float32))
+
+    assert np.allclose(first.origin_zyx, [0, 0, 0])
+    assert np.allclose(second.origin_zyx, [8, 0, 0])
+
+
+def test_native_3d_trace2cp_field_cache_evicts_lru_blocks() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class CountingNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((64, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=CountingNativeModel(),
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=4,
+        device=torch.device("cpu"),
+        max_cached_bytes=2 * (7 * 9**3 * 4 + 9**3),
+    )
+
+    first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+    second = cache.block_for_point(np.asarray([16.0, 8.0, 8.0], dtype=np.float32))
+    third = cache.block_for_point(np.asarray([24.0, 8.0, 8.0], dtype=np.float32))
+    refetched_first = cache.block_for_point(np.asarray([8.0, 8.0, 8.0], dtype=np.float32))
+
+    assert np.allclose(first.origin_zyx, [0, 0, 0])
+    assert np.allclose(second.origin_zyx, [8, 0, 0])
+    assert np.allclose(third.origin_zyx, [16, 0, 0])
+    assert np.allclose(refetched_first.origin_zyx, [0, 0, 0])
+    assert len(cache._blocks) == 2
+    assert cache.total_inferred_blocks == 4
+    assert cache.evicted_inferred_blocks == 2
+
+
+def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
+    class UnsliceableVolume:
+        def __getitem__(self, _key):
+            raise AssertionError("native trace field cache must not slice volume directly")
+
+    class RecordingSampler:
+        blocking = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[np.ndarray, tuple[int, int, int]]] = []
+
+        def sample_coord_batch(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            del coords_zyx_base, valid_mask
+            raise AssertionError("native trace field cache must use sample_block_zyx")
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            start = np.asarray(start_zyx, dtype=np.int64)
+            shape = tuple(int(v) for v in shape_zyx)
+            self.calls.append((start.copy(), shape))
+            zz = (
+                np.arange(shape[0], dtype=np.float32)[:, None, None]
+                + np.float32(start[0])
+            )
+            image = np.broadcast_to(zz, shape).astype(np.float32, copy=True)
+            valid = np.ones(shape, dtype=bool)
+            return CoordinateSampleResult(
+                image=image,
+                valid_mask=valid,
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class RecordingModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_volume: torch.Tensor | None = None
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            self.input_volume = volume.detach().cpu()
+            b, _c, d, h, w = volume.shape
+            return torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+
+    sampler = RecordingSampler()
+    model = RecordingModel()
+    record = SimpleNamespace(
+        volume=UnsliceableVolume(),
+        sampler=sampler,
+        volume_spacing_base=4.0,
+        base_shape_zyx=(128, 128, 128),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=model,
+        patch_shape_zyx=(4, 4, 4),
+        core_margin_voxels=1,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([1, 2, 3], dtype=np.int64))
+
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert block.valid_mask_zyx.shape == (3, 3, 3)
+    assert np.allclose(block.origin_zyx, [1, 2, 3])
+    assert np.allclose(block.sample_origin_zyx, [2, 3, 4])
+    assert block.output_czyx.device.type == "cpu"
+    assert block.valid_mask_zyx.device.type == "cpu"
+    assert len(sampler.calls) == 1
+    start, shape = sampler.calls[0]
+    assert np.allclose(start, [1, 2, 3])
+    assert shape == (4, 4, 4)
+    assert model.input_volume is not None
+    assert float(model.input_volume[0, 0, 0, 0, 0]) == 1.0
+
+
+def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ZRampSampler:
+        blocking = True
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            start = np.asarray(start_zyx, dtype=np.int64)
+            shape = tuple(int(v) for v in shape_zyx)
+            zz = np.arange(shape[0], dtype=np.float32)[:, None, None] + np.float32(start[0])
+            return CoordinateSampleResult(
+                image=np.broadcast_to(zz, shape).astype(np.float32, copy=True),
+                valid_mask=np.ones(shape, dtype=bool),
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class PresenceRampModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6:7] = volume / 10.0
+            return out
+
+    record = _native_trace_record(
+        np.zeros((16, 16, 16), dtype=np.float32),
+        sampler=ZRampSampler(),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=PresenceRampModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=2,
+        inference_scaledown_power=1,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert cache.inference_scaledown_factor == 2
+    assert cache.inference_field_shape_zyx == (4, 4, 4)
+    assert cache.scaled_core_margin == 1
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert block.valid_mask_zyx.shape == (3, 3, 3)
+    assert np.allclose(block.sample_origin_zyx, [2.0, 2.0, 2.0])
+    assert np.allclose(block.sample_spacing_zyx, [2.0, 2.0, 2.0])
+    assert float(block.output_czyx[6, 0, 0, 0]) == pytest.approx(0.2)
+    assert float(block.output_czyx[6, 1, 0, 0]) == pytest.approx(0.4)
+
+    _directions, presence, valid = cache.sample_points_torch(
+        np.asarray([[4.0, 2.0, 2.0]], dtype=np.float32)
+    )
+
+    assert bool(valid[0].item())
+    assert float(presence[0].item()) == pytest.approx(0.4)
+
+
+def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() -> None:
+    class OnesSampler:
+        blocking = True
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            del start_zyx
+            return CoordinateSampleResult(
+                image=np.ones(shape_zyx, dtype=np.float32),
+                valid_mask=np.ones(shape_zyx, dtype=bool),
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class ScaledImpulseModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, 6, 4:6, 4:6, 4:6] = 8.0
+            return out
+
+    record = _native_trace_record(
+        np.zeros((16, 16, 16), dtype=np.float32),
+        sampler=OnesSampler(),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ScaledImpulseModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=2,
+        inference_scaledown_power=1,
+        inference_blur_sigma_voxels=2.0,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+    presence = block.output_czyx[6]
+
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert float(presence[1, 1, 1]) < 8.0
+    assert float(presence[1, 1, 1]) > float(presence[0, 1, 1])
+    assert float(presence[0, 1, 1]) > 0.0
+    assert float(presence[1, 0, 1]) > 0.0
+    assert float(presence[1, 1, 0]) > 0.0
+
+
+def test_native_3d_trace2cp_scaled_inference_rejects_indivisible_shapes() -> None:
+    record = _native_trace_record(np.zeros((16, 16, 16), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="inference_patch_shape_zyx.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(7, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="core_margin_voxels.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=3,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="inference_scaledown_power"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=-1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="inference_blur_sigma_voxels"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_blur_sigma_voxels=-0.1,
+            device=torch.device("cpu"),
+        )
+
+
+def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [-1.0, 0.0, 0.0],  # sign-ambiguous match to candidate 0
+                    [1.0, 0.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor([0.51, 1.0], dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidate_b = np.asarray(
+        [0.7, math.sqrt(1.0 - 0.7 * 0.7), 0.0],
+        dtype=np.float32,
+    )
+    best_index, total_loss, direction_loss, presence_loss, smoothness_loss, rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=np.stack(
+                [
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                    candidate_b,
+                ],
+                axis=0,
+            ),
+            next_points=np.zeros((2, 3), dtype=np.float32),
+        )
+    )
+
+    assert best_index == 0
+    assert rejected == 0
+    assert total_loss == pytest.approx(0.49, abs=1.0e-6)
+    assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert presence_loss == pytest.approx(0.49, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_candidate_score_evaluates_all_branches() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                    ],
+                    [
+                        [0.7, 0.71414286, 0.0],
+                        [0.0, 1.0, 0.0],
+                    ],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor(
+                [
+                    [0.10, 0.95],
+                    [1.00, 0.20],
+                ],
+                dtype=torch.float32,
+            )
+            valid = torch.ones((count, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidate_b = np.asarray(
+        [0.7, math.sqrt(1.0 - 0.7 * 0.7), 0.0],
+        dtype=np.float32,
+    )
+    best_index, total_loss, direction_loss, presence_loss, smoothness_loss, rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=np.stack(
+                [
+                    np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                    candidate_b,
+                ],
+                axis=0,
+            ),
+            next_points=np.zeros((2, 3), dtype=np.float32),
+        )
+    )
+
+    assert best_index == 0
+    assert rejected == 0
+    assert total_loss == pytest.approx(0.05, abs=1.0e-6)
+    assert direction_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert presence_loss == pytest.approx(0.05, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_batched_candidate_score_couples_branches() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 4
+            directions = torch.tensor(
+                [
+                    [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor(
+                [
+                    [0.1, 0.9],
+                    [0.4, 1.0],
+                    [0.2, 0.8],
+                    [0.2, 1.0],
+                ],
+                dtype=torch.float32,
+            )
+            valid = torch.ones((count, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    total_loss, direction_loss, presence_loss, smoothness_loss, candidate_valid, rejected = (
+        _score_candidate_loss_tensors_batched(
+            FakeCache(),
+            current_directions=torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            previous_step_directions=torch.tensor(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            candidate_directions=torch.tensor(
+                [
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ],
+                dtype=torch.float32,
+            ),
+            next_points=torch.zeros((2, 2, 3), dtype=torch.float32),
+            smoothness_weight=0.0,
+        )
+    )
+
+    best_loss, best_branch = torch.min(total_loss, dim=2)
+    assert candidate_valid.tolist() == [[True, True], [True, True]]
+    assert rejected.tolist() == [0, 0]
+    assert int(torch.argmin(best_loss[0])) == 0
+    assert int(best_branch[0, 0]) == 1
+    assert int(torch.argmin(best_loss[1])) == 0
+    assert int(best_branch[1, 0]) == 1
+    assert float(direction_loss[0, 0, 1]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(presence_loss[0, 0, 1]) == pytest.approx(0.1, abs=1.0e-6)
+    assert int(torch.count_nonzero(smoothness_loss).item()) == 0
+
+
+def test_native_3d_trace2cp_all_pairs_direction_product_penalizes_previous_outlier() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.tensor([[1.0], [0.95]], dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+    candidates = torch.tensor(
+        [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    kwargs = dict(
+        cache=FakeCache(),
+        current_directions=torch.tensor([[inv_sqrt2, inv_sqrt2, 0.0]], dtype=torch.float32),
+        previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        candidate_directions=candidates,
+        next_points=candidates.clone(),
+        smoothness_weight=0.0,
+        cumulative_smoothness_tangent_weight=0.0,
+    )
+
+    legacy_total, *_ = _score_candidate_loss_tensors_batched(
+        **kwargs,
+        all_pairs_direction_product=False,
+    )
+    all_pairs_total, *_ = _score_candidate_loss_tensors_batched(
+        **kwargs,
+        all_pairs_direction_product=True,
+    )
+
+    assert int(torch.argmin(legacy_total[0, :, 0])) == 0
+    assert int(torch.argmin(all_pairs_total[0, :, 0])) == 1
+
+
+def test_native_3d_trace2cp_all_pairs_first_step_uses_regular_direction_gate() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.ones((points.shape[0], 1), dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidates = torch.tensor(
+        [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    total_loss, *_ = _score_candidate_loss_tensors_batched(
+        FakeCache(),
+        current_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        candidate_directions=candidates,
+        next_points=candidates.clone(),
+        smoothness_weight=0.0,
+        cumulative_smoothness_tangent_weight=0.0,
+        candidate_normals=torch.tensor(
+            [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        ),
+        candidate_normals_valid=torch.ones((1, 2), dtype=torch.bool),
+        all_pairs_direction_product=True,
+    )
+
+    assert float(total_loss[0, 0, 0]) == pytest.approx(1.0, abs=1.0e-6)
+    assert float(total_loss[0, 1, 0]) == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_candidate_substeps_reject_invalid_midpoint() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            self.call_sizes: list[int] = []
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            self.call_sizes.append(int(points.shape[0]))
+            directions: list[list[list[float]]] = []
+            presence: list[list[float]] = []
+            valid: list[list[bool]] = []
+            for point in points:
+                if abs(float(point[0])) > abs(float(point[1])):
+                    directions.append([[1.0, 0.0, 0.0]])
+                    presence.append([1.0])
+                    valid.append([abs(float(point[0]) - 1.0) > 1.0e-4])
+                else:
+                    directions.append([[0.0, 1.0, 0.0]])
+                    presence.append([0.7])
+                    valid.append([True])
+            return (
+                torch.tensor(directions, dtype=torch.float32),
+                torch.tensor(presence, dtype=torch.float32),
+                torch.tensor(valid, dtype=torch.bool),
+            )
+
+    current = np.zeros((3,), dtype=np.float32)
+    candidates = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    next_points = current[None, :] + candidates * np.float32(2.0)
+
+    endpoint_cache = FakeCache()
+    best_endpoint, endpoint_loss, *_endpoint_rest = _score_candidate_batch(
+        endpoint_cache,
+        current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        candidate_directions=candidates,
+        next_points=next_points,
+        smoothness_weight=0.0,
+    )
+
+    substep_cache = FakeCache()
+    best_substep, substep_loss, _dir_loss, _presence_loss, _smoothness_loss, rejected = (
+        _score_candidate_batch(
+            substep_cache,
+            current_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=candidates,
+            next_points=next_points,
+            current_point=current,
+            step_voxels=2.0,
+            candidate_substeps=2,
+            smoothness_weight=0.0,
+        )
+    )
+
+    assert endpoint_cache.call_sizes == [2]
+    assert best_endpoint == 0
+    assert endpoint_loss == pytest.approx(0.0, abs=1.0e-6)
+    assert substep_cache.call_sizes == [4]
+    assert best_substep == 1
+    assert rejected == 1
+    assert substep_loss == pytest.approx(1.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_splits_turn_components() -> None:
+    previous = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    tangent_turn = torch.tensor([[[0.0, 1.0, 0.0]]], dtype=torch.float32)
+    normal_tilt = torch.tensor(
+        [[[1.0 / math.sqrt(2.0), 0.0, 1.0 / math.sqrt(2.0)]]],
+        dtype=torch.float32,
+    )
+    normal = torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32)
+    valid = torch.ones((1, 1), dtype=torch.bool)
+
+    tangent_only = _native_smoothness_loss_torch(
+        previous,
+        tangent_turn,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=0.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    tangent_ignored = _native_smoothness_loss_torch(
+        previous,
+        tangent_turn,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=0.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    normal_only = _native_smoothness_loss_torch(
+        previous,
+        normal_tilt,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=0.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    normal_ignored = _native_smoothness_loss_torch(
+        previous,
+        normal_tilt,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=0.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(tangent_only[0, 0]) == pytest.approx((math.pi / 2.0) ** 2, abs=1.0e-6)
+    assert float(tangent_ignored[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(normal_only[0, 0]) == pytest.approx((math.pi / 4.0) ** 2, abs=1.0e-6)
+    assert float(normal_ignored[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_is_normal_sign_ambiguous() -> None:
+    previous = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidate = torch.tensor(
+        [[[0.5, 0.5, math.sqrt(0.5)]]],
+        dtype=torch.float32,
+    )
+    normal = torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32)
+    valid = torch.ones((1, 1), dtype=torch.bool)
+
+    positive = _native_smoothness_loss_torch(
+        previous,
+        candidate,
+        candidate_normals=normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+    negative = _native_smoothness_loss_torch(
+        previous,
+        candidate,
+        candidate_normals=-normal,
+        candidate_normals_valid=valid,
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=1.0,
+        smoothness_normal_weight=1.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(positive[0, 0]) == pytest.approx(float(negative[0, 0]), abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_start_direction_uses_best_alignment_not_presence() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx, dtype=np.float32).shape[0])
+            directions = torch.tensor(
+                [[[0.0, 0.0, 1.0], [0.0, 0.6, 0.8]]],
+                dtype=torch.float32,
+            ).expand(count, 2, 3)
+            presence = torch.tensor([[0.05, 1.0]], dtype=torch.float32).expand(count, 2)
+            valid = torch.ones((count, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    direction, presence, valid = _sample_trace_start_direction_aligned(
+        FakeCache(),
+        np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        cp_reference_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert valid
+    assert presence == pytest.approx(0.05, abs=1.0e-6)
+    assert np.allclose(direction, [0.0, 0.0, 1.0], atol=1.0e-6)
+
+
+def test_native_3d_trace2cp_requires_lasagna_normals_for_normal_aware_smoothing() -> None:
+    with pytest.raises(ValueError, match="requires Lasagna normals"):
+        trace_native_3d_one_way(
+            object(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(trace_step_limit=1),
+        )
+
+
+def test_native_3d_trace2cp_first_step_applies_regular_smoothness() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.ones((points.shape[0], 1), dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    current = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    previous = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidates = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]], dtype=torch.float32)
+    normals = torch.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32)
+    valid_normals = torch.ones((1, 2), dtype=torch.bool)
+
+    regular = _score_candidate_loss_tensors_batched(
+        FakeCache(),
+        current_directions=current,
+        previous_step_directions=previous,
+        candidate_directions=candidates,
+        next_points=candidates.clone(),
+        smoothness_weight=0.0,
+        smoothness_tangent_weight=10.0,
+        smoothness_normal_weight=0.0,
+        smoothness_free_angle_degrees=0.0,
+        candidate_normals=normals,
+        candidate_normals_valid=valid_normals,
+    )
+
+    regular_total, _regular_direction, _regular_presence, regular_smooth, *_ = regular
+    assert float(regular_total[0, 0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert math.isfinite(float(regular_total[0, 1, 0]))
+    assert float(regular_total[0, 1, 0]) > 1.0
+    assert float(regular_smooth[0, 1]) > 1.0
+
+
+def test_native_3d_trace2cp_first_step_candidate_direction_still_matters() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.ones((points.shape[0], 1), dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    tilted = np.asarray([math.sqrt(0.5), 0.0, math.sqrt(0.5)], dtype=np.float32)
+    candidates = torch.tensor([[[1.0, 0.0, 0.0], tilted.tolist()]], dtype=torch.float32)
+    total_loss, direction_loss, _presence_loss, smoothness_loss, *_ = (
+        _score_candidate_loss_tensors_batched(
+            FakeCache(),
+            current_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+            previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+            candidate_directions=candidates,
+            next_points=candidates.clone(),
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=10.0,
+            smoothness_normal_weight=10.0,
+            candidate_normals=torch.tensor(
+                [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]],
+                dtype=torch.float32,
+            ),
+            candidate_normals_valid=torch.ones((1, 2), dtype=torch.bool),
+        )
+    )
+
+    assert float(total_loss[0, 0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(total_loss[0, 1, 0]) > 1.0
+    assert float(direction_loss[0, 1, 0]) == pytest.approx(
+        0.5 * (1.0 - math.sqrt(0.5)),
+        abs=1.0e-6,
+    )
+    assert float(smoothness_loss[0, 1]) > 1.0
+
+
+def test_native_3d_trace2cp_cumulative_tangent_smoothness_is_tangent_only() -> None:
+    history = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidates = torch.tensor(
+        [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [math.sqrt(0.5), 0.0, math.sqrt(0.5)]]],
+        dtype=torch.float32,
+    )
+    normals = torch.tensor(
+        [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]],
+        dtype=torch.float32,
+    )
+
+    loss = _native_cumulative_tangent_smoothness_loss_torch(
+        history,
+        candidates,
+        candidate_normals=normals,
+        candidate_normals_valid=torch.ones((1, 3), dtype=torch.bool),
+        cumulative_smoothness_tangent_weight=2.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(loss[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+    assert float(loss[0, 1]) == pytest.approx(2.0 * (math.pi / 2.0) ** 2, abs=1.0e-6)
+    assert float(loss[0, 2]) == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_cumulative_tangent_smoothness_skips_invalid_normals() -> None:
+    history = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidates = torch.tensor([[[0.0, 1.0, 0.0]]], dtype=torch.float32)
+    normals = torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32)
+
+    loss = _native_cumulative_tangent_smoothness_loss_torch(
+        history,
+        candidates,
+        candidate_normals=normals,
+        candidate_normals_valid=torch.zeros((1, 1), dtype=torch.bool),
+        cumulative_smoothness_tangent_weight=2.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert float(loss[0, 0]) == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_cumulative_tangent_smoothness_applies_to_first_step() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = torch.as_tensor(points[:, None, :], dtype=torch.float32)
+            presence = torch.ones((points.shape[0], 1), dtype=torch.float32)
+            valid = torch.ones((points.shape[0], 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidates = torch.tensor([[[0.0, 1.0, 0.0]]], dtype=torch.float32)
+    total_loss, _direction_loss, _presence_loss, smoothness_loss, *_ = (
+        _score_candidate_loss_tensors_batched(
+            FakeCache(),
+            current_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+            previous_step_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+            history_directions=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+            candidate_directions=candidates,
+            next_points=candidates.clone(),
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+            cumulative_smoothness_tangent_weight=10.0,
+            candidate_normals=torch.tensor([[[0.0, 0.0, 1.0]]], dtype=torch.float32),
+            candidate_normals_valid=torch.ones((1, 1), dtype=torch.bool),
+        )
+    )
+
+    assert float(total_loss[0, 0, 0]) > 1.0
+    assert float(smoothness_loss[0, 0]) > 1.0
+
+
+def test_native_3d_trace2cp_normal_aware_smoothness_changes_candidate_choice() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [[0.0, 1.0, 0.0]],
+                    [[1.0, 0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count, 1), dtype=torch.float32)
+            valid = torch.ones((count, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    candidates = np.asarray(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    best_without, *_ = _score_candidate_batch(
+        FakeCache(),
+        current_direction=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=0.0,
+    )
+    best_with, total_loss, _direction_loss, _presence_loss, smoothness_loss, _rejected = (
+        _score_candidate_batch(
+            FakeCache(),
+            current_direction=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            previous_step_direction=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            candidate_directions=candidates,
+            next_points=np.zeros((2, 3), dtype=np.float32),
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=2.0,
+            smoothness_normal_weight=0.0,
+            smoothness_free_angle_degrees=0.0,
+            candidate_normals=np.asarray(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            ),
+            candidate_normals_valid=np.asarray([True, True]),
+        )
+    )
+
+    assert best_without == 0
+    assert best_with == 1
+    assert total_loss == pytest.approx(1.0, abs=1.0e-6)
+    assert smoothness_loss == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> None:
+    fiber = Vc3dFiber(
+        path=Path("same.json"),
+        version=1,
+        line_points_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        control_points_xyz=np.asarray(
+            [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=np.float32,
+        ),
+        control_point_segments=legacy_lasagna_segments(2),
+        generation=1,
+        metadata={},
+    )
+    trace_record = SimpleNamespace(
+        fiber=fiber,
+        volume_path="vol.zarr",
+        volume_scale=2,
+        volume_spacing_base=4.0,
+    )
+    normal_record = SimpleNamespace(
+        fiber=fiber,
+        volume_path="vol.zarr",
+        volume_scale=2,
+        volume_spacing_base=4.0,
+        grad_mag=object(),
+    )
+
+    class FakeGeometryLoader:
+        records = [normal_record]
+
+        def __init__(self) -> None:
+            self.used_record = None
+            self.points_base = None
+
+        def _lasagna_normals_at_zyx_batch(self, record, points_zyx_base, *, line_indices):
+            self.used_record = record
+            self.points_base = np.asarray(points_zyx_base, dtype=np.float64).copy()
+            assert hasattr(record, "grad_mag")
+            assert line_indices.tolist() == [0]
+            return (
+                np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+                np.asarray([True]),
+                {},
+            )
+
+    geometry_loader = FakeGeometryLoader()
+    resolved = _native_trace_geometry_normal_record(geometry_loader, trace_record)
+    sampler = _NativeLasagnaNormalSampler(
+        geometry_loader=geometry_loader,
+        trace_record=trace_record,
+        normal_record=resolved,
+    )
+
+    normals_zyx, valid = sampler(np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+    assert resolved is normal_record
+    assert geometry_loader.used_record is normal_record
+    assert np.allclose(geometry_loader.points_base, [[4.0, 8.0, 12.0]])
+    assert valid.tolist() == [True]
+    assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
+
+
+def test_native_3d_principal_tensor_axes_torch_matches_numpy() -> None:
+    rng = np.random.default_rng(7)
+    vectors = rng.normal(size=(9, 3, 3)).astype(np.float64)
+    weights = rng.uniform(0.1, 1.0, size=(9, 3)).astype(np.float64)
+    tensors = np.einsum("nk,nki,nkj->nij", weights, vectors, vectors, optimize=True)
+    hints = rng.normal(size=(9, 3)).astype(np.float64)
+    hints[1] = 0.0
+    hints[5] = np.nan
+
+    eigenvalues, eigenvectors = np.linalg.eigh(tensors)
+    expected = eigenvectors[
+        np.arange(int(tensors.shape[0])),
+        :,
+        np.argmax(eigenvalues, axis=1),
+    ]
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    hint_norm = np.linalg.norm(hints, axis=1)
+    valid_hint = np.isfinite(hint_norm) & (hint_norm > 1.0e-12)
+    hint_unit = np.zeros_like(hints)
+    hint_unit[valid_hint] = hints[valid_hint] / hint_norm[valid_hint, None]
+    expected[
+        valid_hint & (np.sum(expected * hint_unit, axis=1) < 0.0)
+    ] *= -1.0
+    expected[(~valid_hint) & (expected[:, 2] < 0.0)] *= -1.0
+    actual = (
+        _principal_tensor_axes_torch(
+            torch.as_tensor(tensors, dtype=torch.float32),
+            torch.as_tensor(hints, dtype=torch.float32),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    assert np.allclose(actual, expected, atol=2.0e-5)
+
+
+def test_native_3d_principal_tensor_axes_torch_analytic_matches_numpy() -> None:
+    rng = np.random.default_rng(11)
+    vectors = rng.normal(size=(12, 4, 3)).astype(np.float64)
+    weights = rng.uniform(0.2, 2.0, size=(12, 4)).astype(np.float64)
+    tensors = np.einsum("nk,nki,nkj->nij", weights, vectors, vectors, optimize=True)
+    tensors += np.eye(3, dtype=np.float64)[None, :, :] * 0.05
+    hints = rng.normal(size=(12, 3)).astype(np.float64)
+    hints[2] = 0.0
+    hints[7] = np.nan
+
+    eigenvalues, eigenvectors = np.linalg.eigh(tensors)
+    expected = eigenvectors[
+        np.arange(int(tensors.shape[0])),
+        :,
+        np.argmax(eigenvalues, axis=1),
+    ]
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    hint_norm = np.linalg.norm(hints, axis=1)
+    valid_hint = np.isfinite(hint_norm) & (hint_norm > 1.0e-12)
+    hint_unit = np.zeros_like(hints)
+    hint_unit[valid_hint] = hints[valid_hint] / hint_norm[valid_hint, None]
+    expected[
+        valid_hint & (np.sum(expected * hint_unit, axis=1) < 0.0)
+    ] *= -1.0
+    expected[(~valid_hint) & (expected[:, 2] < 0.0)] *= -1.0
+
+    actual = (
+        _principal_tensor_axes_torch(
+            torch.as_tensor(tensors, dtype=torch.float32),
+            torch.as_tensor(hints, dtype=torch.float32),
+            method="analytic",
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    assert np.allclose(actual, expected, atol=1.0e-3)
+
+
+def test_native_3d_trace2cp_normal_comparison_returns_alternate_below_threshold() -> None:
+    points = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    baseline_normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+    baseline_valid = torch.tensor([True])
+    alternate_normals = torch.tensor([[0.0, 0.01, 1.0]], dtype=torch.float32)
+    alternate_normals = torch.nn.functional.normalize(alternate_normals, p=2.0, dim=1)
+    alternate_valid = torch.tensor([True])
+
+    def baseline(_points):
+        return baseline_normals.clone(), baseline_valid.clone()
+
+    def alternate(_points):
+        return alternate_normals.clone(), alternate_valid.clone()
+
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=2.0,
+    )
+    normals, valid = sampler(points)
+
+    assert sampler.call_count == 1
+    assert torch.equal(normals, alternate_normals)
+    assert torch.equal(valid, alternate_valid)
+
+
+def test_native_3d_trace2cp_normal_comparison_raises_on_valid_mismatch() -> None:
+    def baseline(_points):
+        return torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32), torch.tensor([True])
+
+    def alternate(_points):
+        return torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32), torch.tensor([False])
+
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=1.0,
+    )
+
+    with pytest.raises(ValueError, match="valid_mismatch"):
+        sampler(torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32))
+
+
+def test_native_3d_trace2cp_normal_comparison_raises_on_angle_mismatch() -> None:
+    def baseline(_points):
+        return torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32), torch.tensor([True])
+
+    def alternate(_points):
+        return torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32), torch.tensor([True])
+
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=5.0,
+    )
+
+    with pytest.raises(ValueError, match="angle_mismatch"):
+        sampler(torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32))
+
+
+def test_native_3d_trace2cp_point_choice_helper_keeps_torch_points() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            self.received_type = None
+
+        def sample_point_choices_torch(self, points_zyx):
+            self.received_type = type(points_zyx)
+            assert isinstance(points_zyx, torch.Tensor)
+            assert tuple(points_zyx.shape) == (2, 3)
+            directions = torch.zeros((2, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            presence = torch.ones((2, 1), dtype=torch.float32)
+            valid = torch.ones((2, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    cache = FakeCache()
+    directions, presence, valid = _sample_point_choices_for_points_torch(
+        cache,
+        torch.ones((2, 3), dtype=torch.float32),
+    )
+
+    assert cache.received_type is torch.Tensor
+    assert tuple(directions.shape) == (2, 1, 3)
+    assert torch.all(presence == 1.0)
+    assert torch.all(valid)
+
+
+def test_native_3d_trace2cp_current_point_direction_uses_best_branch() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            assert int(np.asarray(points_zyx).shape[0]) == 1
+            directions = torch.tensor(
+                [
+                    [
+                        [0.0, 1.0, 0.0],
+                        [-1.0, 0.0, 0.0],
+                    ]
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.tensor([[1.0, 0.75]], dtype=torch.float32)
+            valid = torch.ones((1, 2), dtype=torch.bool)
+            return directions, presence, valid
+
+    direction, presence, valid = _sample_trace_point_aligned(
+        FakeCache(),
+        np.zeros((3,), dtype=np.float32),
+        reference_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert valid
+    assert presence == pytest.approx(0.75)
+    assert np.allclose(direction, [1.0, 0.0, 0.0])
+
+
+def test_native_3d_trace2cp_candidate_smoothness_can_reject_branch_switch() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            assert count == 2
+            directions = torch.tensor(
+                [
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count,), dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions, presence, valid
+
+    branch_direction = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    previous_direction = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    candidates = np.stack([branch_direction, previous_direction], axis=0)
+
+    best_index_without_smoothness, *_ = _score_candidate_batch(
+        FakeCache(),
+        current_direction=branch_direction,
+        previous_step_direction=previous_direction,
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=0.0,
+    )
+    best_index_with_smoothness, total_loss, *_rest = _score_candidate_batch(
+        FakeCache(),
+        current_direction=branch_direction,
+        previous_step_direction=previous_direction,
+        candidate_directions=candidates,
+        next_points=np.zeros((2, 3), dtype=np.float32),
+        smoothness_weight=2.0,
+        smoothness_free_angle_degrees=0.0,
+    )
+
+    assert best_index_without_smoothness == 0
+    assert best_index_with_smoothness == 1
+    assert total_loss == pytest.approx(1.0, abs=1.0e-6)
+
+
+def test_native_3d_trace2cp_fiber_line_tangent_uses_adjacent_segment_not_chord() -> None:
+    fiber = Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        ),
+        control_points_xyz=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        ),
+        control_point_segments=legacy_lasagna_segments(2),
+        generation=1,
+        metadata={},
+    )
+    record = SimpleNamespace(fiber=fiber, volume_spacing_base=2.0)
+
+    forward = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=0,
+        target_control_point_index=1,
+    )
+    reverse = _fiber_line_tangent_zyx_toward_target(
+        record,
+        start_control_point_index=1,
+        target_control_point_index=0,
+    )
+
+    assert np.allclose(forward, [0.0, 0.0, 1.0])
+    assert np.allclose(reverse, [-1.0, 0.0, 0.0])
+
+
+def test_native_3d_trace2cp_first_step_uses_sampled_direction_aligned_to_line_tangent() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point(self, point_zyx: np.ndarray):
+            point = np.asarray(point_zyx, dtype=np.float32)
+            if float(np.linalg.norm(point)) <= 1.0e-6:
+                return (
+                    np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+                    1.0,
+                    True,
+                )
+            return (
+                np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+                1.0,
+                True,
+            )
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            directions = points / np.maximum(norms, np.float32(1.0e-6))
+            return (
+                torch.as_tensor(directions, dtype=torch.float32),
+                torch.ones((points.shape[0],), dtype=torch.float32),
+                torch.ones((points.shape[0],), dtype=torch.bool),
+            )
+
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_zyx=np.asarray([10.0, 0.0, 10.0], dtype=np.float32),
+        initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=0.0,
+            cone_grid_size=1,
+            trace_step_limit=1,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.reason.startswith("trace_step_limit")
+    assert np.allclose(result.trace_zyx[1], [0.0, 2.0, 0.0])
+
+
+def test_native_3d_trace2cp_trace_paths_sample_candidate_normals() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            presence = torch.ones((count, 1), dtype=torch.float32)
+            valid = torch.ones((count, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    def run_with_beam_width(width: int) -> list[np.ndarray]:
+        calls: list[np.ndarray] = []
+
+        def normal_sampler(points_zyx):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            calls.append(points.copy())
+            normals = np.zeros((points.shape[0], 3), dtype=np.float32)
+            normals[:, 0] = 1.0
+            valid = np.ones((points.shape[0],), dtype=bool)
+            return normals, valid
+
+        result = trace_native_3d_one_way(
+            FakeCache(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([0.0, 0.0, 4.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(
+                step_voxels=1.0,
+                cone_angle_degrees=0.0,
+                cone_angle_step_degrees=5.0,
+                beam_width=width,
+                trace_step_limit=1,
+                smoothness_weight=0.5,
+            ),
+            normal_sampler=normal_sampler,
+        )
+        assert result.reason.startswith("trace_step_limit")
+        return calls
+
+    greedy_calls = run_with_beam_width(1)
+    beam_calls = run_with_beam_width(2)
+
+    assert len(greedy_calls) == 1
+    assert greedy_calls[0].shape == (1, 3)
+    assert np.allclose(greedy_calls[0][0], [0.0, 0.0, 1.0])
+    assert len(beam_calls) == 1
+    assert beam_calls[0].shape == (1, 3)
+    assert np.allclose(beam_calls[0][0], [0.0, 0.0, 1.0])
+
+
+def test_native_3d_trace2cp_trace_paths_apply_first_step_tangent_gate() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            directions = np.zeros((points.shape[0], 1, 3), dtype=np.float32)
+            norms = np.linalg.norm(points, axis=1)
+            nonzero = norms > 1.0e-6
+            directions[nonzero, 0, :] = points[nonzero] / norms[nonzero, None]
+            directions[~nonzero, 0, 0] = 1.0
+            presence = np.full((points.shape[0], 1), 0.1, dtype=np.float32)
+            presence[np.abs(points[:, 1] - 1.0) < 1.0e-4, 0] = 1.0
+            valid = np.ones((points.shape[0], 1), dtype=bool)
+            return (
+                torch.as_tensor(directions, dtype=torch.float32),
+                torch.as_tensor(presence, dtype=torch.float32),
+                torch.as_tensor(valid, dtype=torch.bool),
+            )
+
+    def normal_sampler(points_zyx):
+        points = np.asarray(points_zyx, dtype=np.float32)
+        normals = np.zeros((points.shape[0], 3), dtype=np.float32)
+        normals[:, 2] = 1.0
+        valid = np.ones((points.shape[0],), dtype=bool)
+        return normals, valid
+
+    for beam_width in (1, 2):
+        result = trace_native_3d_one_way(
+            FakeCache(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([0.0, 10.0, 0.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            target_plane_normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(
+                step_voxels=1.0,
+                cone_angle_degrees=90.0,
+                cone_angle_step_degrees=90.0,
+                beam_width=beam_width,
+                beam_lookahead_steps=1,
+                trace_step_limit=1,
+                smoothness_weight=0.0,
+                smoothness_tangent_weight=100.0,
+                smoothness_normal_weight=0.0,
+            ),
+            normal_sampler=normal_sampler,
+        )
+
+        assert not result.reached_target_plane
+        assert result.reason.startswith("trace_step_limit")
+        assert np.allclose(result.trace_zyx[-1], [1.0, 0.0, 0.0], atol=1.0e-5)
+
+
+def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point(self, point_zyx: np.ndarray):
+            point = np.asarray(point_zyx, dtype=np.float32)
+            radial_offset = float(np.linalg.norm(point[:2]))
+            if float(point[2]) > 0.5 and (radial_offset < 0.1 or float(point[1]) < -0.1):
+                return (
+                    np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+                    0.0,
+                    False,
+                )
+            return (
+                np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+                1.0,
+                True,
+            )
+
+        def sample_points_torch(self, points_zyx: np.ndarray):
+            points = np.asarray(points_zyx, dtype=np.float32)
+            count = int(points.shape[0])
+            directions = np.zeros((count, 3), dtype=np.float32)
+            directions[:, 2] = 1.0
+            radial_offset = np.linalg.norm(points[:, :2], axis=1)
+            presence = np.full((count,), 0.6, dtype=np.float32)
+            presence = np.where(points[:, 1] > 0.1, 0.7, presence)
+            presence = np.where(points[:, 1] < -0.1, 0.95, presence)
+            presence = np.where(radial_offset < 0.1, 1.0, presence).astype(np.float32)
+            valid = np.ones((count,), dtype=bool)
+            return (
+                torch.as_tensor(directions, dtype=torch.float32),
+                torch.as_tensor(presence, dtype=torch.float32),
+                torch.as_tensor(valid, dtype=torch.bool),
+            )
+
+    kwargs = dict(
+        cache=FakeCache(),
+        start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, 2.7], dtype=np.float32),
+        initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+    greedy = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=1,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+    one_step_beam = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=2,
+            beam_prune_distance_voxels=0.0,
+            beam_lookahead_steps=1,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+    lookahead_beam = trace_native_3d_one_way(
+        **kwargs,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=25.0,
+            cone_angle_step_degrees=25.0,
+            beam_width=2,
+            beam_prune_distance_voxels=0.0,
+            beam_lookahead_steps=3,
+            trace_step_limit=6,
+            smoothness_weight=0.0,
+        ),
+    )
+
+    assert not greedy.reached_target_plane
+    assert greedy.reason.startswith("invalid_current_point")
+    assert not one_step_beam.reached_target_plane
+    assert one_step_beam.reason.startswith("all_candidates_invalid")
+    assert lookahead_beam.reached_target_plane
+    assert lookahead_beam.reason == "target_plane"
+    assert np.max(np.linalg.norm(lookahead_beam.trace_zyx[:, :2], axis=1)) > 0.1
+
+
+def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:
+    class NonBlockingSampler:
+        blocking = False
+
+        def sample_coord_batch(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            del coords_zyx_base, valid_mask
+            raise AssertionError("non-blocking sampler should be rejected before sampling")
+
+    record = SimpleNamespace(
+        volume=object(),
+        sampler=NonBlockingSampler(),
+        volume_spacing_base=1.0,
+        base_shape_zyx=(32, 32, 32),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=torch.nn.Identity(),
+        patch_shape_zyx=(4, 4, 4),
+        core_margin_voxels=1,
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match="blocking coordinate sampling"):
+        cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+
+def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ConstantNativeModel(),
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=2,
+        device=torch.device("cpu"),
+    )
+    result = trace_native_3d_pair(
+        cache,
+        start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
+        target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=25.0,
+            cone_grid_size=5,
+            beam_width=1,
+            max_steps=20,
+            inference_patch_shape_zyx=(16, 16, 16),
+            core_margin_voxels=2,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.forward.reached_target_plane
+    assert result.reverse.reached_target_plane
+    assert result.plane_error < 1.0e-6
+    assert result.closest_target_error < 1.0e-6
+
+
+def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ConstantNativeModel(),
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=2,
+        device=torch.device("cpu"),
+    )
+
+    result = trace_native_3d_pair(
+        cache,
+        start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
+        target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=25.0,
+            cone_grid_size=5,
+            beam_width=1,
+            max_steps=20,
+            trace_step_limit=3,
+            inference_patch_shape_zyx=(16, 16, 16),
+            core_margin_voxels=2,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert not result.forward.reached_target_plane
+    assert result.forward.reason.startswith("trace_step_limit")
+    assert len(result.forward.steps) == 3
+    assert not result.reverse.reached_target_plane
+    assert result.reverse.reason.startswith("trace_step_limit")
+    assert len(result.reverse.steps) == 3
+
+
+def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ConstantNativeModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6] = 1.0
+            return out
+
+    record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ConstantNativeModel(),
+        patch_shape_zyx=(16, 16, 16),
+        core_margin_voxels=2,
+        device=torch.device("cpu"),
+    )
+
+    result = trace_native_3d_pair(
+        cache,
+        start_zyx=np.asarray([8.0, 8.0, 4.0], dtype=np.float32),
+        target_zyx=np.asarray([8.0, 8.0, 20.0], dtype=np.float32),
+        forward_initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        reverse_initial_direction_zyx=np.asarray([0.0, 0.0, -1.0], dtype=np.float32),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=2.0,
+            cone_angle_degrees=25.0,
+            cone_grid_size=5,
+            beam_width=1,
+            max_step_factor=0.25,
+            inference_patch_shape_zyx=(16, 16, 16),
+            core_margin_voxels=2,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert not result.forward.reached_target_plane
+    assert result.forward.reason.startswith("max_step_factor")
+    assert len(result.forward.steps) == 2
+    assert not result.reverse.reached_target_plane
+    assert result.reverse.reason.startswith("max_step_factor")
+    assert len(result.reverse.steps) == 2

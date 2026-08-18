@@ -72,7 +72,7 @@ This dataset contains manual annotations of the scroll wraps, recording which pa
 Spiral annotations for scroll PHercParis4 (Scroll 1). Contents include ~27,000 verified and ~204,000 unverified surface patches, traced tracks, and point collections, together with `same_windings` / `relative_windings` / `abs_winding` graphs, the fitted `umbilicus`, fiber and outer-shell geometry, and the volume inputs used by the fitting pipeline (~49.6 GB total).
 
 - [README](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
-- [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/spiral/PHercParis4)
+- [Browse on the data server](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/)
 - [Tutorial: Spiral Fitting](tutorial_spiral) — how to fit a whole-scroll surface to these annotations
 
 {/* TODO: add more scroll subsections here later, e.g. "### Scroll5", each following the Paris4 pattern above. */}

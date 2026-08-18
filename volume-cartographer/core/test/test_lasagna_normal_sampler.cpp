@@ -90,16 +90,11 @@ void writeText(const fs::path& path, const std::string& text)
 
 } // namespace
 
-TEST_CASE("LasagnaNormalSampler decodes 4D channel-group nx ny normals")
+TEST_CASE("LasagnaNormalSampler rejects 4D channel groups")
 {
     const auto dir = tmpDir("4d");
     const auto zarrPath = dir / "pred.zarr";
-    std::vector<uint8_t> payload(3 * 2 * 2 * 2, 0);
-    for (size_t i = 0; i < 2 * 2 * 2; ++i) {
-        payload[i] = 255;                  // grad_mag
-        payload[1 * 2 * 2 * 2 + i] = 128;  // nx -> 0
-        payload[2 * 2 * 2 * 2 + i] = 128;  // ny -> 0
-    }
+    std::vector<uint8_t> payload(3 * 2 * 2 * 2, 128);
     createU8Zarr(zarrPath, {3, 2, 2, 2}, {3, 2, 2, 2}, &payload);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
@@ -116,15 +111,11 @@ TEST_CASE("LasagnaNormalSampler decodes 4D channel-group nx ny normals")
         }
     })");
 
-    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    vc::lasagna::LasagnaNormalSampler sampler(dataset);
-
-    const auto sample = sampler.sampleNormal({1.0, 1.0, 1.0});
-
-    REQUIRE(sample.valid);
-    CHECK(sample.normal[0] == doctest::Approx(0.0));
-    CHECK(sample.normal[1] == doctest::Approx(0.0));
-    CHECK(sample.normal[2] == doctest::Approx(1.0));
+    const vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    CHECK_THROWS_WITH_AS(
+        vc::lasagna::LasagnaNormalSampler(dataset),
+        doctest::Contains("must reference a 3D (Z,Y,X) zarr"),
+        std::runtime_error);
     fs::remove_all(dir);
 }
 
@@ -165,6 +156,9 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     vc::lasagna::LasagnaNormalSampler scaledSampler(scaledDataset);
     const auto scaledSample = scaledSampler.sampleNormal({1.0, 1.0, 1.0});
     REQUIRE(scaledSample.valid);
+    CHECK(scaledSample.normal[0] == doctest::Approx(sample.normal[0]));
+    CHECK(scaledSample.normal[1] == doctest::Approx(sample.normal[1]));
+    CHECK(scaledSample.normal[2] == doctest::Approx(sample.normal[2]));
     REQUIRE(scaledSampler.predDtSpacing() == std::nullopt);
     fs::remove_all(dir);
 }
@@ -172,26 +166,24 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
 TEST_CASE("LasagnaNormalSampler samples pred_dt channel with accepted threshold")
 {
     const auto dir = tmpDir("pred_dt");
-    const auto zarrPath = dir / "pred.zarr";
-    std::vector<uint8_t> payload(4 * 2 * 2 * 2, 0);
-    for (size_t i = 0; i < 2 * 2 * 2; ++i) {
-        payload[i] = 255;                  // grad_mag
-        payload[1 * 2 * 2 * 2 + i] = 128;  // nx
-        payload[2 * 2 * 2 * 2 + i] = 128;  // ny
-        payload[3 * 2 * 2 * 2 + i] = 170;  // pred_dt, accepted inside prediction
-    }
-    createU8Zarr(zarrPath, {4, 2, 2, 2}, {4, 2, 2, 2}, &payload);
+    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
+    std::vector<uint8_t> nx(2 * 2 * 2, 128);
+    std::vector<uint8_t> ny(2 * 2 * 2, 128);
+    std::vector<uint8_t> predDtValues(2 * 2 * 2, 170);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &ny);
+    createU8Zarr(dir / "pred_dt.zarr", {2, 2, 2}, {2, 2, 2}, &predDtValues);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
         "version": 2,
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
         "groups": {
-            "pred": {
-                "zarr": "pred.zarr",
-                "scaledown": 0,
-                "channels": ["grad_mag", "nx", "ny", "pred_dt"]
-            }
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]},
+            "pred_dt_group": {"zarr": "pred_dt.zarr", "scaledown": 0, "channels": ["pred_dt"]}
         }
     })");
 
@@ -335,13 +327,17 @@ TEST_CASE("LasagnaNormalSampler requires grad_mag channel")
 TEST_CASE("LasagnaNormalSampler requires explicit grad_mag scale metadata")
 {
     const auto dir = tmpDir("missing_grad_mag_scale");
-    std::vector<uint8_t> payload(3 * 2 * 2 * 2, 128);
-    createU8Zarr(dir / "pred.zarr", {3, 2, 2, 2}, {3, 2, 2, 2}, &payload);
+    std::vector<uint8_t> payload(2 * 2 * 2, 128);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &payload);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &payload);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &payload);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
         "version": 2,
         "groups": {
-            "pred": {"zarr": "pred.zarr", "scaledown": 0, "channels": ["grad_mag", "nx", "ny"]}
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
         }
     })");
 
@@ -353,13 +349,14 @@ TEST_CASE("LasagnaNormalSampler requires explicit grad_mag scale metadata")
 TEST_CASE("LasagnaNormalSampler reports invalid samples for missing chunks and zero grad_mag")
 {
     const auto dir = tmpDir("invalid");
-    std::vector<uint8_t> zeros(3 * 2 * 2 * 2, 0);
-    for (size_t i = 0; i < 2 * 2 * 2; ++i) {
-        zeros[1 * 2 * 2 * 2 + i] = 128;
-        zeros[2 * 2 * 2 * 2 + i] = 128;
-    }
-    createU8Zarr(dir / "zero_gm.zarr", {3, 2, 2, 2}, {3, 2, 2, 2}, &zeros);
-    createU8Zarr(dir / "missing.zarr", {3, 2, 2, 2}, {3, 2, 2, 2}, nullptr);
+    std::vector<uint8_t> zeroGradMag(2 * 2 * 2, 0);
+    std::vector<uint8_t> normals(2 * 2 * 2, 128);
+    createU8Zarr(dir / "zero_grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &zeroGradMag);
+    createU8Zarr(dir / "zero_nx.zarr", {2, 2, 2}, {2, 2, 2}, &normals);
+    createU8Zarr(dir / "zero_ny.zarr", {2, 2, 2}, {2, 2, 2}, &normals);
+    createU8Zarr(dir / "missing_grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, nullptr);
+    createU8Zarr(dir / "missing_nx.zarr", {2, 2, 2}, {2, 2, 2}, nullptr);
+    createU8Zarr(dir / "missing_ny.zarr", {2, 2, 2}, {2, 2, 2}, nullptr);
 
     const auto zeroManifest = dir / "zero.lasagna.json";
     writeText(zeroManifest, R"({
@@ -367,7 +364,9 @@ TEST_CASE("LasagnaNormalSampler reports invalid samples for missing chunks and z
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
         "groups": {
-            "pred": {"zarr": "zero_gm.zarr", "scaledown": 0, "channels": ["grad_mag", "nx", "ny"]}
+            "grad_mag_group": {"zarr": "zero_grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "zero_nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "zero_ny.zarr", "scaledown": 0, "channels": ["ny"]}
         }
     })");
     vc::lasagna::LasagnaDataset zeroDataset = vc::lasagna::LasagnaDataset::open(zeroManifest);
@@ -380,7 +379,9 @@ TEST_CASE("LasagnaNormalSampler reports invalid samples for missing chunks and z
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
         "groups": {
-            "pred": {"zarr": "missing.zarr", "scaledown": 0, "channels": ["grad_mag", "nx", "ny"]}
+            "grad_mag_group": {"zarr": "missing_grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "missing_nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "missing_ny.zarr", "scaledown": 0, "channels": ["ny"]}
         }
     })");
     vc::lasagna::LasagnaDataset missingDataset = vc::lasagna::LasagnaDataset::open(missingManifest);
@@ -424,14 +425,11 @@ TEST_CASE("LasagnaNormalSampler reads absent chunks from the Zarr fill value")
 TEST_CASE("LasagnaNormalSampler integrates with LineOptimizer")
 {
     const auto dir = tmpDir("optimizer");
-    const auto zarrPath = dir / "pred.zarr";
-    std::vector<uint8_t> payload(3 * 4 * 4 * 4, 0);
-    for (size_t i = 0; i < 4 * 4 * 4; ++i) {
-        payload[i] = 255;
-        payload[1 * 4 * 4 * 4 + i] = 128;
-        payload[2 * 4 * 4 * 4 + i] = 128;
-    }
-    createU8Zarr(zarrPath, {3, 4, 4, 4}, {3, 4, 4, 4}, &payload);
+    std::vector<uint8_t> gradMag(4 * 4 * 4, 255);
+    std::vector<uint8_t> normals(4 * 4 * 4, 128);
+    createU8Zarr(dir / "grad_mag.zarr", {4, 4, 4}, {4, 4, 4}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {4, 4, 4}, {4, 4, 4}, &normals);
+    createU8Zarr(dir / "ny.zarr", {4, 4, 4}, {4, 4, 4}, &normals);
     const auto manifestPath = dir / "dataset.lasagna.json";
     writeText(manifestPath, R"({
         "version": 2,
@@ -439,7 +437,9 @@ TEST_CASE("LasagnaNormalSampler integrates with LineOptimizer")
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
         "groups": {
-            "pred": {"zarr": "pred.zarr", "scaledown": 0, "channels": ["grad_mag", "nx", "ny"]}
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
         }
     })");
 

@@ -8,135 +8,293 @@ stack in the service worker.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import datetime
 from enum import Enum
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 import zipfile
 
+from config import Config
 
 
-# Version 11 makes preview artifacts host-published Lasagna flatten results
-# with correspondence-mapped winding, loss-map, and run-diff metadata.
-API_VERSION = 11
+# Version 17 binds dataset/output/cache to the service connection: --dataset
+# and --output are required startup arguments, dataset resolution describes
+# inputs only (the service injects the startup-resolved output/cache into the
+# /dataset advertisement), and the /dataset/resolve browse endpoint is
+# removed — resolution happens once at startup.
+# Version 18 adds the structured /events stream and stops synthesizing
+# eta_seconds inside the /session/status progress snapshot: clients derive
+# the ETA from the raw step/total/elapsed fields.
+# Version 19 replaces the Ready/Paused session states with a single Idle
+# state, reported as both the state and the phase: a session that has never
+# run and a session paused after N iterations are the same lifecycle state,
+# and the difference is not one a user acts on. Clients that want to report
+# how much work has happened read current_iteration.
+# Version 20 adds POST /session/load-checkpoint: a strict, two-phase,
+# all-rank load of a checkpoint into the resident model, valid in Idle. The
+# service refuses (409) any checkpoint that is not an exact match for the
+# live model domain and structure instead of rebuilding the model behind the
+# client's back; a domain change stays the job of a new fit. An accepted load
+# restores the checkpoint's completed_iterations and publishes it.
+# Version 21 makes previews and pause-time saving explicit. POST
+# /session/export-preview exports and publishes one preview generation on
+# request; resuming from a checkpoint and pausing after a run no longer
+# export one by themselves, so inspecting a checkpoint costs a load rather
+# than a load plus a preview. The run request carries autosave_on_pause
+# (default true), which decides whether that run's pause writes the durable
+# autosave.
+# Version 22 makes the session eager and always loaded. The service creates
+# its runtime asynchronously at startup and reports Loading (then Idle, or
+# Error with the cause) without any client request; there is no "Empty"
+# state and DELETE /session is gone. POST /session/load is replaced by
+# POST /session/rebuild, the only verb that may replace the model domain or
+# structural configuration: it tears the resident session down and builds a
+# fresh one (Idle|Error -> Loading), and with {"defaults": true} it rebuilds
+# from launch defaults, ignoring any autosave. A startup autosave is chosen
+# from explicit metadata sidecars (session namespace, dataset identity,
+# completed iterations), never from filename ordering.
+# Version 22 also drops the status fields nothing consumed:
+# service_generation (the constant 1; process identity is /health's
+# process_id), command_generation (replay is keyed by operation and command
+# ID), session_replacement_in_progress and replacement_old_session_released.
+# The counters that remain are session_generation (session identity),
+# session_revision (configuration/input revision) and generation (status
+# ordering).
+# Version 23 removes the verbs no client called — GET /logs (every line it
+# carried is already a log-kind /events record), POST /session/export-full (a
+# 501 stub) and DELETE /session/inputs/<id> (abandoned uploads expire on
+# their own) — and POST /service/restart, whose only remaining job was
+# recovering a wedged process that an operator restarts directly.
+# POST /session/save-checkpoint now takes {"name"} instead of {"path"}: a
+# checkpoint was only ever allowed under the session output directory, so
+# the service resolves it and the client stops guessing host paths.
+# POST /session/export-preview accepts and returns instead of blocking for
+# the whole export; status carries preview_exporting while it runs.
+# dataset_owned is gone from /health and /session/status: --dataset is
+# required, so it was always true.
+# Version 25 makes the startup-resolved input manifest strictly read-only.
+# Version 26 removes the stateful run-plan handshake. POST /session/run carries
+# the complete request and rejects configuration that requires a rebuild;
+# run-boundary configuration is applied directly.
+# Version 27 makes spiral-scroll.json the only source of the facts it carries.
+# The run block no longer carries scroll_name, voxel_size_um, lasagna_group or
+# lasagna_scale, and a request that names any of them is rejected. Each
+# restated something the dataset root already specifies and silently won over
+# it, so a client could mislabel outputs, scale a fit against a resolution the
+# dataset contradicts, or read the Lasagna stores at the wrong zarr level.
+# Version 28 gives a rebuild two stages and folds the checkpoint rebuild into
+# the load. POST /session/rebuild reports the "stage" it took ("model" keeps
+# the loaded inputs and the brick pools; "all" is the whole build), and
+# /configuration advertises schema.model_stage_keys so a client can say in
+# advance which it would get. POST /session/load-checkpoint takes
+# "allow_rebuild", and its 409 carries the preflight's "reasons" with either
+# the "stage" a rebuild would need or "refused" when none would help.
+# Version 29 adds the compact winding-inference input and dense-spacing mode.
+API_VERSION = 29
 
 
-# Counts which describe how many training objects/points are sampled per
-# optimizer step. The service exposes the post-scaling values actually used by
-# the resident fitter, and Run-scoped edits set those active values directly.
-RUN_MUTABLE_SAMPLING_KEYS = frozenset({
-    "num_patches_per_step",
-    "num_patches_per_step_for_dt",
-    "num_points_per_patch",
-    "unverified_num_patches_per_step",
-    "unverified_num_patches_per_step_for_dt",
-    "unverified_num_points_per_patch",
-    "rel_winding_num_pcls",
-    "rel_winding_num_patch_pairs_per_pcl",
-    "abs_winding_num_pcls",
-    "abs_winding_num_points_per_pcl",
-    "unattached_pcl_num_per_step",
-    "unattached_pcl_num_points_per_step",
-    "track_num_per_step",
-    "track_num_points_per_step",
-    "dense_normals_num_points",
-    "dense_spacing_num_pairs",
-    "dense_spacing_density_extra_pairs",
-    "dense_attachment_num_points",
-    "min_spacing_independent_samples",
-    "regularisation_num_points",
-    "shell_num_samples",
+class SessionState(str, Enum):
+    """Lifecycle state of one resident fit session.
+
+    The wire form is the member name; the member is a ``str`` so a status
+    snapshot serializes and compares exactly like the string it replaces.
+
+    Ready and Paused are one state: an idle session that has never stepped
+    and an idle session paused after N iterations differ only in
+    ``completed_iterations``. Operation phase and progress are reported
+    separately (``phase``/``progress``) and are not part of this enum.
+
+    ``Empty`` is deliberately absent: it describes a service with no
+    session at all, not a state a session can be in.
+    """
+
+    Loading = "Loading"
+    Idle = "Idle"
+    Running = "Running"
+    Saving = "Saving"
+    ExportingPreview = "ExportingPreview"
+    Error = "Error"
+    Closing = "Closing"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
+
+
+# States in which a session is executing something on the fitter thread and
+# cannot accept a new run, a save, or a replacement.
+SESSION_BUSY_STATES = frozenset({
+    SessionState.Loading, SessionState.Running, SessionState.Saving,
+    SessionState.ExportingPreview,
 })
-
-
-RUN_MUTABLE_BOOLEAN_KEYS = frozenset({
-    "save_png_visualizations",
-})
-
-
-RUN_MUTABLE_TRACK_POLICY_KEYS = frozenset({
-    "track_length_bin_weights",
-    "max_track_crossing_per_step",
-    "track_min_sample_spacing",
-    "track_max_sample_spacing",
-})
-
-
-def is_run_mutable_config_key(key: str) -> bool:
-    """Return whether an advanced setting may change at a Run boundary."""
-    return (
-        key in RUN_MUTABLE_SAMPLING_KEYS
-        or key in RUN_MUTABLE_BOOLEAN_KEYS
-        or key in RUN_MUTABLE_TRACK_POLICY_KEYS
-        or (key.startswith("loss_weight_") and key != "loss_weight_anchor")
-        or key.startswith("loss_start_")
-    )
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Select the Run-scoped editor fields from a complete fitter config."""
-    return {
-        key: value for key, value in config.items()
-        if is_run_mutable_config_key(key)
-    }
-
-
-def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
-    """Force losses and sample counts off for session-disabled inputs."""
-    def zero(*keys: str) -> None:
-        for key in keys:
-            config[key] = 0
-
-    if not bool(config.get("use_verified_patches", True)):
-        zero("loss_weight_patch_radius", "loss_weight_patch_dt",
-             "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-             "num_patches_per_step", "num_patches_per_step_for_dt",
-             "num_points_per_patch")
-    if not bool(config.get("use_unverified_patches", True)):
-        zero("loss_weight_unverified_patch_radius",
-             "loss_weight_unverified_patch_dt",
-             "unverified_num_patches_per_step",
-             "unverified_num_patches_per_step_for_dt",
-             "unverified_num_points_per_patch")
-    normals = bool(config.get("use_normals", True))
-    sdt = bool(config.get("use_surf_sdt", True))
-    if not normals:
-        zero("loss_weight_dense_normals", "dense_normals_num_points")
-    if not bool(config.get("use_tracks", True)):
-        zero("loss_weight_track_radius", "loss_weight_track_dt",
-             "track_num_per_step", "track_num_points_per_step")
-    if not bool(config.get("use_fibers", True)):
-        zero("loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-             "unattached_pcl_num_per_step", "unattached_pcl_num_points_per_step")
-
-    spacing_mode = str(config.get("dense_spacing_mode", "phase"))
-    if not sdt or not normals:
-        zero("loss_weight_dense_spacing_count",
-             "loss_weight_dense_spacing_density",
-             "loss_weight_dense_attachment", "dense_spacing_count_extra_pairs",
-             "dense_spacing_density_extra_pairs", "dense_attachment_num_points")
-        if spacing_mode == "phase":
-            zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
-    if (not bool(config.get("use_gradient_magnitude", True))
-            and spacing_mode == "grad_mag"):
-        zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
-    return config
+    fields = Config.catalog()["schema"]["fields"]
+    return {key: value for key, value in config.items()
+            if fields[key]["runtime_impact"] == "run_boundary"}
 
 
 class PclRole(str, Enum):
     ABSOLUTE = "absolute"
-    PATCH_OVERLAP = "patch_overlap"
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
     DRAWN_CONTROL_POINTS = "drawn_control_points"
 
 
+# ---------------------------------------------------------------------------
+# Declarative fit-input catalog
+# ---------------------------------------------------------------------------
+#
+# One description of every fit input, consumed by request validation
+# (validate_session_request), dataset resolution (resolve_dataset_root /
+# conventional_input_paths) and run admission
+# (spiral_service.ServiceState.run). Each entry records the input's path kind
+# and its enabling/required predicates over the run configuration. Fit-input
+# paths are static for the lifetime of a resident session, so an entry says
+# nothing about rebuild scope: changing any of them rebuilds the session.
+
+
+def _always(config: Mapping[str, Any]) -> bool:
+    return True
+
+
+def _never(config: Mapping[str, Any]) -> bool:
+    return False
+
+
+def _patches_enabled(config: Mapping[str, Any]) -> bool:
+    return not bool(config.get("input_disable_patches", False))
+
+
+def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
+    return (
+        float(config.get("loss_weight_shell_outer", 1.0)) > 0
+        or float(config.get("loss_weight_shell_patch_radius", 0)) > 0
+    )
+
+
+def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
+    # An invalid mode is reported as its own validation error; the
+    # mode-derived asset predicates then all read as disabled so the invalid
+    # mode never masquerades as missing-file errors.
+    mode = str(config.get("dense_spacing_mode", "phase"))
+    return mode if mode in ("phase", "grad_mag", "winding_model") else None
+
+
+def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
+    return _dense_spacing_mode(config) == "phase"
+
+
+def _normals_required(config: Mapping[str, Any]) -> bool:
+    # The phase bundle requires both normal channels (band incidence
+    # handling) even when individual sub-weights are zero, so run-mutable
+    # weights can be raised at run boundaries.
+    return (float(config.get("loss_weight_dense_normals", 100.0)) > 0
+            or _phase_bundle_enabled(config))
+
+
+def _grad_mag_required(config: Mapping[str, Any]) -> bool:
+    return (_dense_spacing_mode(config) == "grad_mag"
+            and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
+
+
+def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
+    return _dense_spacing_mode(config) == "winding_model"
+
+
+@dataclass(frozen=True)
+class FitInputSpec:
+    """Declarative description of one fit input."""
+
+    # SpiralInputPaths field name (and manifest/path-change key).
+    key: str
+    # "file" | "directory" | "zarr-group" | "dbm" | "pcl-set".
+    kind: str
+    # File contents must parse as JSON.
+    json_content: bool = False
+    # Conventional dataset-relative location ("" = none: the input is only
+    # reached through an explicit path or a scroll-spec override).
+    conventional_relative: str = ""
+    # A missing conventional path is missing_required at dataset resolution.
+    resolve_required: bool = False
+    # enabled(config): the input participates at all; inactive inputs are
+    # not validated even when a path is set.
+    enabled: Callable[[Mapping[str, Any]], bool] = _always
+    # required(config): the input must exist for this configuration.
+    required: Callable[[Mapping[str, Any]], bool] = _never
+    # Whether changing the input breaks checkpoint compatibility. No fit
+    # input does today: the checkpoint domain is set by "new_fit" config
+    # keys (z-range, model shape, optimizer seed), never by an input path.
+    checkpoint_domain: bool = False
+
+
+# Entries are ordered as validate_session_request reports them.
+FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
+    FitInputSpec("umbilicus", "file", json_content=True,
+                 conventional_relative="umbilicus.json",
+                 resolve_required=True, required=_always),
+    FitInputSpec("verified_patches", "directory",
+                 conventional_relative="verified_patches",
+                 resolve_required=True, required=_patches_enabled),
+    FitInputSpec("unverified_patches", "directory",
+                 enabled=_patches_enabled),
+    FitInputSpec("fibers", "directory", conventional_relative="fibers"),
+    FitInputSpec("outer_shell", "directory",
+                 conventional_relative="outer_shell",
+                 required=_shell_losses_enabled),
+    FitInputSpec("tracks_dbm", "dbm",
+                 conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm"),
+    FitInputSpec("pcls", "pcl-set", json_content=True),
+    FitInputSpec("normal_x", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
+                 required=_normals_required),
+    FitInputSpec("normal_y", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_ny.ome.zarr",
+                 required=_normals_required),
+    FitInputSpec("gradient_magnitude", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_grad_mag.ome.zarr",
+                 required=_grad_mag_required),
+    FitInputSpec("surf_sdt", "zarr-group",
+                 conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
+                 required=_phase_bundle_enabled),
+    FitInputSpec("winding_inference", "directory",
+                 conventional_relative="winding_inference",
+                 enabled=_winding_model_enabled,
+                 required=_winding_model_enabled),
+)
+
+_FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
+
+
+def fit_input(key: str) -> FitInputSpec | None:
+    return _FIT_INPUTS_BY_KEY.get(key)
+
+
+# PCL point-collection inputs: (role, conventional filename). One filename
+# per role serves both directions: dataset resolution probes for it, and
+# committing an uploaded collection of that role merges into it. Every role
+# is discovered by resolve_dataset_root and listed by
+# conventional_input_paths; an absent file is simply skipped at load time
+# (load_point_collection warns and continues), since all of these are
+# optional annotations.
+PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str], ...] = (
+    (PclRole.ABSOLUTE, "abs_winding.json"),
+    (PclRole.RELATIVE, "relative_windings.json"),
+    (PclRole.SAME_WINDING, "same_windings.json"),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json"),
+)
+
+
 @dataclass(frozen=True)
 class PclInputSpec:
     path: str
-    role: PclRole
+    # None marks a legacy role-less input: fit_spiral then infers
+    # winding_is_absolute from the file's basename, as the historical CLI did.
+    role: PclRole | None
     required: bool = False
 
     @classmethod
@@ -162,6 +320,7 @@ class SpiralInputPaths:
     normal_y: str = ""
     gradient_magnitude: str = ""
     surf_sdt: str = ""
+    winding_inference: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
     output_directory: str = ""
@@ -184,21 +343,37 @@ class SpiralInputPaths:
     def manifest(self) -> dict[str, Any]:
         result = asdict(self)
         result["pcls"] = [
-            {"path": item.path, "role": item.role.value, "required": item.required}
+            {"path": item.path,
+             "role": item.role.value if item.role is not None else None,
+             "required": item.required}
             for item in self.pcls
         ]
         return result
 
 
+# Run-block keys the scroll specification owns, mapped to the ScrollSpec field
+# each one used to shadow. A request that carries one is rejected rather than
+# ignored: silently dropping it would let a client believe it had renamed a
+# scroll, changed its resolution, or moved the Lasagna stores.
+SCROLL_SPEC_OWNED_RUN_KEYS = {
+    "scroll_name": "name",
+    "voxel_size_um": "voxel_size_um",
+    "lasagna_group": "normal_zarr_group",
+    "lasagna_scale": "lasagna_scale",
+}
+
+
 @dataclass(frozen=True)
 class SpiralRunConfig:
+    """Deployment and presentation settings of one fit run.
+
+    Nothing spiral-scroll.json specifies is here — not the scroll's physical
+    facts (name, voxel size, outward sense) and not the dataset's Lasagna store
+    layout. That file is the single source for all of it (see ``ScrollSpec``).
+    """
+
     z_begin: int
     z_end: int
-    scroll_name: str = "scroll"
-    outward_sense: str = "CW"
-    voxel_size_um: float = 9.6
-    lasagna_group: str = "4"
-    lasagna_scale: int = 4
     storage_backend: str = "sparse_cuda"
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
@@ -210,11 +385,6 @@ class SpiralRunConfig:
         return cls(
             z_begin=int(value.get("z_begin", 0)),
             z_end=int(value.get("z_end", 0)),
-            scroll_name=str(value.get("scroll_name", "scroll")),
-            outward_sense=str(value.get("outward_sense", "CW")).upper(),
-            voxel_size_um=float(value.get("voxel_size_um", 9.6)),
-            lasagna_group=str(value.get("lasagna_group", "4")),
-            lasagna_scale=int(value.get("lasagna_scale", 4)),
             storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
@@ -247,6 +417,10 @@ class SpiralDatasetResolution:
     ambiguities: dict[str, list[str]] = field(default_factory=dict)
     detected_checkpoints: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Parsed spiral-scroll.json manifest (see ScrollSpec.manifest()); None when
+    # the specification is missing or invalid, which is a missing_required
+    # condition ("scroll_spec").
+    scroll_spec: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -258,23 +432,227 @@ class SpiralDatasetResolution:
         return result
 
 
-_CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
-    ("umbilicus", "umbilicus.json", "file", True),
-    ("fibers", "fibers", "directory", False),
-    ("verified_patches", "verified_patches", "directory", True),
-    ("outer_shell", "outer_shell", "directory", False),
-    ("normal_x", "lasagna_inputs/las_008_nx.ome.zarr", "directory", False),
-    ("normal_y", "lasagna_inputs/las_008_ny.ome.zarr", "directory", False),
-    ("gradient_magnitude", "lasagna_inputs/las_008_grad_mag.ome.zarr", "directory", False),
-    ("surf_sdt", "lasagna_inputs/las_008_surf_sdt.ome.zarr", "directory", False),
+# ---------------------------------------------------------------------------
+# Versioned scroll specification (spiral-scroll.json)
+# ---------------------------------------------------------------------------
+
+SCROLL_SPEC_FILENAME = "spiral-scroll.json"
+SCROLL_SPEC_SCHEMA_VERSION = 1
+
+# Input keys whose paths may depart from the directory conventions. Values in
+# the spec file are resolved relative to the dataset root; conventional paths
+# need no entry at all. PCL collections are per-role request entries, not
+# single overridable paths.
+SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(
+    spec.key for spec in FIT_INPUT_CATALOG if spec.kind != "pcl-set")
+
+_SCROLL_SPEC_TOP_LEVEL_KEYS = (
+    "schema_version", "name", "voxel_size_um", "spiral_outward_sense",
+    "umbilicus", "normal_zarr_group", "surf_sdt_zarr_group", "lasagna_scale",
+    "paths",
 )
 
-_PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
-    (PclRole.ABSOLUTE, "abs_winding.json", False),
-    (PclRole.RELATIVE, "relative_windings.json", False),
-    (PclRole.SAME_WINDING, "same_windings.json", False),
-    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", False),
-)
+# Conventional dataset layout for the headless CLI, mirroring the historical
+# fit_spiral module-global defaults. resolve_dataset_root() shares the same
+# relative paths for the entries it discovers.
+_CONVENTIONAL_INPUT_RELATIVES = {
+    spec.key: spec.conventional_relative
+    for spec in FIT_INPUT_CATALOG
+    if spec.conventional_relative and spec.kind != "pcl-set"
+}
+
+_CONVENTIONAL_PCL_INPUTS = tuple(
+    (filename, role) for role, filename in PCL_ROLE_CONVENTIONS)
+
+
+class ScrollSpecError(ValueError):
+    """A missing, malformed, or out-of-contract spiral-scroll.json."""
+
+
+@dataclass(frozen=True)
+class ScrollSpec:
+    """Physical/dataset facts of one scroll, parsed from spiral-scroll.json.
+
+    Torch-free and frozen: safe to resolve in the VC3D-facing service process
+    and to pickle into GPU worker processes. Deployment and presentation
+    values (output/cache roots, run tags, storage backend, render scale) are
+    deliberately not part of the scroll file.
+    """
+
+    name: str
+    voxel_size_um: float
+    spiral_outward_sense: str
+    umbilicus_coordinate_scale: float = 1.0
+    normal_zarr_group: str = "4"
+    surf_sdt_zarr_group: str = "1"
+    lasagna_scale: int = 4
+    # Allow-listed absolute-path overrides, (key, resolved path) pairs.
+    path_overrides: tuple[tuple[str, str], ...] = ()
+
+    def path_override(self, key: str) -> str:
+        return dict(self.path_overrides).get(key, "")
+
+    def manifest(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["path_overrides"] = dict(self.path_overrides)
+        return result
+
+
+def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
+                      *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
+    """Validate a spiral-scroll.json document strictly and freeze it.
+
+    Unknown keys are errors (named), schema_version is required, and path
+    overrides are resolved relative to the dataset root.
+    """
+    if not isinstance(document, Mapping):
+        raise ScrollSpecError(f"{source}: the scroll specification must be a JSON object")
+    unknown = sorted(set(document) - set(_SCROLL_SPEC_TOP_LEVEL_KEYS))
+    if unknown:
+        raise ScrollSpecError(f"{source}: unknown keys: {unknown}")
+    if "schema_version" not in document:
+        raise ScrollSpecError(f"{source}: schema_version is required")
+    if document["schema_version"] != SCROLL_SPEC_SCHEMA_VERSION:
+        raise ScrollSpecError(
+            f"{source}: unsupported schema_version {document['schema_version']!r} "
+            f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
+    missing = sorted(
+        key for key in ("name", "voxel_size_um", "spiral_outward_sense")
+        if key not in document)
+    if missing:
+        raise ScrollSpecError(f"{source}: missing required keys: {missing}")
+
+    name = str(document["name"]).strip()
+    if not name:
+        raise ScrollSpecError(f"{source}: name must be a non-empty string")
+    try:
+        voxel_size_um = float(document["voxel_size_um"])
+    except (TypeError, ValueError):
+        raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
+    if not voxel_size_um > 0:
+        raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
+    sense = str(document["spiral_outward_sense"]).upper()
+    if sense not in ("CW", "ACW"):
+        raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
+
+    umbilicus = document.get("umbilicus", {})
+    if not isinstance(umbilicus, Mapping):
+        raise ScrollSpecError(f"{source}: umbilicus must be an object")
+    unknown = sorted(set(umbilicus) - {"coordinate_scale"})
+    if unknown:
+        raise ScrollSpecError(f"{source}: unknown umbilicus keys: {unknown}")
+    try:
+        coordinate_scale = float(umbilicus.get("coordinate_scale", 1.0))
+    except (TypeError, ValueError):
+        raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
+
+    lasagna_scale = document.get("lasagna_scale", 4)
+    if type(lasagna_scale) is not int or lasagna_scale <= 0:
+        raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
+
+    paths = document.get("paths", {})
+    if not isinstance(paths, Mapping):
+        raise ScrollSpecError(f"{source}: paths must be an object")
+    unknown = sorted(set(paths) - set(SCROLL_SPEC_PATH_OVERRIDE_KEYS))
+    if unknown:
+        raise ScrollSpecError(
+            f"{source}: unknown path override keys: {unknown} "
+            f"(allowed: {sorted(SCROLL_SPEC_PATH_OVERRIDE_KEYS)})")
+    root = Path(_normalise_path(dataset_root))
+    overrides = []
+    for key in sorted(paths):
+        value = paths[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ScrollSpecError(f"{source}: path override {key!r} must be a non-empty string")
+        overrides.append((key, _normalise_path(value, base=root)))
+
+    return ScrollSpec(
+        name=name,
+        voxel_size_um=voxel_size_um,
+        spiral_outward_sense=sense,
+        umbilicus_coordinate_scale=coordinate_scale,
+        normal_zarr_group=str(document.get("normal_zarr_group", "4")),
+        surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),
+        lasagna_scale=lasagna_scale,
+        path_overrides=tuple(overrides),
+    )
+
+
+def load_scroll_spec(dataset_root: str | os.PathLike[str],
+                     spec_path: str | os.PathLike[str] | None = None) -> ScrollSpec:
+    """Load the scroll specification for a dataset.
+
+    Discovers the single conventional file <dataset_root>/spiral-scroll.json
+    unless an explicit spec_path is given. A missing or invalid file raises
+    ScrollSpecError with instructions.
+    """
+    root = Path(_normalise_path(dataset_root)) if str(dataset_root or "").strip() else None
+    if spec_path is not None:
+        path = Path(_normalise_path(spec_path))
+    elif root is not None:
+        path = root / SCROLL_SPEC_FILENAME
+    else:
+        raise ScrollSpecError(
+            "No dataset root given: cannot discover the scroll specification "
+            f"({SCROLL_SPEC_FILENAME})")
+    if not path.is_file():
+        raise ScrollSpecError(
+            f"No scroll specification found at {path}. Create {SCROLL_SPEC_FILENAME} "
+            "in the dataset root with schema_version, name, voxel_size_um, and "
+            "spiral_outward_sense (plus any non-conventional path overrides).")
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ScrollSpecError(f"{path}: invalid scroll specification: {exc}") from exc
+    return parse_scroll_spec(document, root if root is not None else path.parent,
+                             source=str(path))
+
+
+def conventional_input_paths(
+        dataset_root: str | os.PathLike[str], spec: ScrollSpec, *,
+        output_directory: str = "", cache_directory: str = "",
+        checkpoint: str = "") -> SpiralInputPaths:
+    """Resolve the conventional dataset layout (plus spec overrides) for the
+    headless CLI, mirroring the historical fit_spiral module-global defaults.
+
+    Unlike resolve_dataset_root() this performs no existence probing: the CLI
+    fails on the specific missing input during loading, exactly as the module
+    globals did. The dataset root is kept verbatim (no symlink resolution) so
+    conventional paths read exactly as the caller spelled the root; explicit
+    spec overrides are already normalised against the root at parse time.
+    """
+    root = str(dataset_root)
+
+    def resolve(key):
+        override = spec.path_override(key)
+        if override:
+            return override
+        relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
+        return f"{root}/{relative}" if relative else ""
+
+    pcls = tuple(
+        PclInputSpec(path=f"{root}/{relative}", role=role)
+        for relative, role in _CONVENTIONAL_PCL_INPUTS
+    )
+    return SpiralInputPaths(
+        dataset_root=str(root),
+        umbilicus=resolve("umbilicus"),
+        pcls=pcls,
+        fibers=resolve("fibers"),
+        tracks_dbm=resolve("tracks_dbm"),
+        verified_patches=resolve("verified_patches"),
+        unverified_patches=spec.path_override("unverified_patches"),
+        outer_shell=resolve("outer_shell"),
+        normal_x=resolve("normal_x"),
+        normal_y=resolve("normal_y"),
+        gradient_magnitude=resolve("gradient_magnitude"),
+        surf_sdt=resolve("surf_sdt"),
+        winding_inference=resolve("winding_inference"),
+        checkpoint=_normalise_path(checkpoint) if checkpoint else "",
+        output_directory=_normalise_path(output_directory) if output_directory else "",
+        cache_directory=_normalise_path(cache_directory) if cache_directory else "",
+    )
 
 
 def _normalise_path(value: Any, base: Path | None = None) -> str:
@@ -316,6 +694,217 @@ def validate_checkpoint_container(path: str | Path) -> None:
         raise ValueError("checkpoint is an incomplete or corrupt PyTorch ZIP archive")
 
 
+# ---------------------------------------------------------------------------
+# Autosave metadata and startup selection
+# ---------------------------------------------------------------------------
+#
+# A pause writes ``checkpoint_autosave.ckpt`` into that run's output directory
+# and, beside it, a metadata sidecar naming what the file *is*. An
+# always-loaded service picks its startup autosave from those sidecars alone:
+# a bare ``.ckpt`` with no metadata is never selected, and the winner is the
+# one with the most completed iterations, never the last filename in sort
+# order.
+
+AUTOSAVE_CHECKPOINT_NAME = "checkpoint_autosave.ckpt"
+AUTOSAVE_METADATA_NAME = "checkpoint_autosave.json"
+AUTOSAVE_METADATA_SCHEMA = "spiral-autosave/1"
+_AUTOSAVE_DIGEST_CHUNK = 1 << 20
+
+
+class AutosaveError(RuntimeError):
+    """The autosave selected for startup cannot be used, and why."""
+
+
+@dataclass(frozen=True)
+class AutosaveCandidate:
+    """One autosave that named itself through a metadata sidecar."""
+
+    checkpoint: str
+    metadata_path: str
+    session_namespace: str
+    dataset_root: str
+    completed_iterations: int
+    created: str
+    sha256: str
+    size: int
+
+    def manifest(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class AutosaveSelection:
+    """The startup autosave decision, and every candidate that lost."""
+
+    selected: AutosaveCandidate | None = None
+    #: ``(metadata or checkpoint path, reason)`` for each rejected candidate.
+    rejected: tuple[tuple[str, str], ...] = ()
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "selected": self.selected.manifest() if self.selected else None,
+            "rejected": [{"path": path, "reason": reason}
+                         for path, reason in self.rejected],
+        }
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(_AUTOSAVE_DIGEST_CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_autosave_metadata(
+    checkpoint_path: str | Path,
+    *,
+    session_namespace: str | Path,
+    dataset_root: str | Path,
+    completed_iterations: int,
+) -> str:
+    """Record what an autosave is, next to it, atomically.
+
+    ``session_namespace`` is the service output root the autosave belongs to
+    (``<output>/<session-name>`` for a named service); an autosave written
+    under a different namespace is never a startup candidate for this one.
+    """
+    checkpoint = Path(checkpoint_path)
+    metadata_path = checkpoint.with_name(AUTOSAVE_METADATA_NAME)
+    document = {
+        "schema": AUTOSAVE_METADATA_SCHEMA,
+        "session_namespace": _normalise_path(session_namespace),
+        "dataset_root": _normalise_path(dataset_root),
+        "checkpoint": checkpoint.name,
+        "completed_iterations": int(completed_iterations),
+        "created": datetime.datetime.now(datetime.timezone.utc)
+                   .replace(microsecond=0).isoformat(),
+        "size": checkpoint.stat().st_size,
+        "sha256": file_sha256(checkpoint),
+        "api_version": API_VERSION,
+    }
+    temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(document, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, metadata_path)
+    return str(metadata_path)
+
+
+def read_autosave_metadata(path: str | Path) -> AutosaveCandidate:
+    """Parse one sidecar strictly; a malformed sidecar is not a candidate."""
+    metadata_path = Path(path)
+    with metadata_path.open("r", encoding="utf-8") as stream:
+        document = json.load(stream)
+    if not isinstance(document, dict):
+        raise ValueError("autosave metadata is not a JSON object")
+    schema = str(document.get("schema") or "")
+    if schema != AUTOSAVE_METADATA_SCHEMA:
+        raise ValueError(
+            f"unsupported autosave metadata schema {schema!r} "
+            f"(expected {AUTOSAVE_METADATA_SCHEMA!r})")
+    name = str(document.get("checkpoint") or "")
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError("autosave metadata does not name a sibling checkpoint")
+    for key in ("session_namespace", "dataset_root", "sha256"):
+        if not str(document.get(key) or "").strip():
+            raise ValueError(f"autosave metadata is missing {key}")
+    return AutosaveCandidate(
+        checkpoint=str(metadata_path.parent / name),
+        metadata_path=str(metadata_path),
+        session_namespace=_normalise_path(document["session_namespace"]),
+        dataset_root=_normalise_path(document["dataset_root"]),
+        completed_iterations=int(document.get("completed_iterations", 0)),
+        created=str(document.get("created") or ""),
+        sha256=str(document["sha256"]),
+        size=int(document.get("size", -1)),
+    )
+
+
+def validate_autosave(candidate: AutosaveCandidate) -> None:
+    """Check container and checkpoint identity; raise ``AutosaveError``."""
+    checkpoint = Path(candidate.checkpoint)
+    if not checkpoint.is_file():
+        raise AutosaveError(
+            f"the autosave named by {candidate.metadata_path} is missing "
+            f"({candidate.checkpoint})")
+    size = checkpoint.stat().st_size
+    if candidate.size >= 0 and size != candidate.size:
+        raise AutosaveError(
+            f"{candidate.checkpoint} is {size} bytes; its metadata records "
+            f"{candidate.size}")
+    try:
+        validate_checkpoint_container(checkpoint)
+    except (OSError, ValueError) as exc:
+        raise AutosaveError(f"{candidate.checkpoint}: {exc}") from exc
+    digest = file_sha256(checkpoint)
+    if digest != candidate.sha256:
+        raise AutosaveError(
+            f"{candidate.checkpoint} has digest {digest}; its metadata "
+            f"records {candidate.sha256}")
+
+
+def discover_autosave_metadata(output_root: str | Path) -> list[Path]:
+    """Every autosave sidecar under a service output root, run dirs included."""
+    root = Path(output_root)
+    if not root.is_dir():
+        return []
+    found = {root / AUTOSAVE_METADATA_NAME}
+    found.update(root.glob(f"*/{AUTOSAVE_METADATA_NAME}"))
+    return sorted(path for path in found if path.is_file())
+
+
+def select_startup_autosave(
+    output_root: str | Path,
+    *,
+    session_namespace: str | Path,
+    dataset_root: str | Path,
+) -> AutosaveSelection:
+    """Choose the autosave an always-loaded service should resume from.
+
+    Selection is by metadata: the sidecar must parse, must carry this
+    service's session namespace, and must have been written against this
+    dataset root. Among the survivors the one with the most completed
+    iterations wins (ties broken by the recorded creation time), so the
+    result never depends on filename ordering. Container and identity
+    validation happens after selection, in ``validate_autosave``: a selected
+    autosave that fails it is an error, not a reason to silently resume from
+    an older one.
+    """
+    namespace = _normalise_path(session_namespace)
+    dataset = _normalise_path(dataset_root)
+    candidates: list[AutosaveCandidate] = []
+    rejected: list[tuple[str, str]] = []
+    for metadata_path in discover_autosave_metadata(output_root):
+        try:
+            candidate = read_autosave_metadata(metadata_path)
+        except (OSError, ValueError, TypeError) as exc:
+            rejected.append((str(metadata_path), f"unreadable metadata: {exc}"))
+            continue
+        if candidate.session_namespace != namespace:
+            rejected.append((
+                str(metadata_path),
+                f"belongs to session namespace {candidate.session_namespace}"))
+            continue
+        if candidate.dataset_root != dataset:
+            rejected.append((
+                str(metadata_path),
+                f"was written against dataset root {candidate.dataset_root}"))
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        return AutosaveSelection(rejected=tuple(rejected))
+    selected = max(candidates,
+                   key=lambda item: (item.completed_iterations, item.created))
+    rejected.extend(
+        (candidate.metadata_path,
+         f"superseded by {selected.checkpoint} at "
+         f"{selected.completed_iterations} iterations")
+        for candidate in candidates if candidate is not selected)
+    return AutosaveSelection(selected=selected, rejected=tuple(rejected))
+
+
 def _dbm_candidates(root: Path) -> list[str]:
     logical: set[str] = set()
     tracks = root / "tracks"
@@ -331,10 +920,19 @@ def _dbm_candidates(root: Path) -> list[str]:
     return sorted(logical)
 
 
+def default_user_cache_dir() -> str:
+    """The one documented user cache location, outside any dataset.
+
+    ``$XDG_CACHE_HOME/vc3d/spiral`` (``~/.cache/vc3d/spiral`` by default).
+    Cache entries are content-addressed, so one shared directory serves every
+    dataset; ``--cache`` overrides it per service or CLI run.
+    """
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    return _normalise_path(base / "vc3d" / "spiral")
+
+
 def resolve_dataset_root(
     root_value: str | os.PathLike[str],
-    *,
-    session_name: str = "",
 ) -> SpiralDatasetResolution:
     root = Path(_normalise_path(root_value))
     result = SpiralDatasetResolution(root=str(root))
@@ -343,30 +941,48 @@ def resolve_dataset_root(
         result.warnings.append(f"Dataset root is not a readable directory: {root}")
         return result
 
-    for key, relative, kind, required in _CONVENTIONAL_ENTRIES:
-        candidate = root / relative
-        found = candidate.is_file() if kind == "file" else candidate.is_dir()
-        if found and os.access(candidate, os.R_OK):
-            result.resolved[key] = _normalise_path(candidate)
-        elif required:
-            result.missing_required.append(key)
-        else:
-            result.missing_optional.append(key)
+    # The scroll specification is the dataset's one required source of
+    # physical facts; a dataset without it does not resolve.
+    try:
+        spec = load_scroll_spec(root)
+    except ScrollSpecError as exc:
+        spec = None
+        result.missing_required.append("scroll_spec")
+        result.warnings.append(str(exc))
+    else:
+        result.scroll_spec = spec.manifest()
 
-    for role, relative, required in _PCL_ENTRIES:
+    for input_spec in FIT_INPUT_CATALOG:
+        # DBM inputs need backing-file probing (below) and PCL collections
+        # are per-role files; neither is a plain path probe.
+        if input_spec.kind in ("dbm", "pcl-set") or not input_spec.conventional_relative:
+            continue
+        override = spec.path_override(input_spec.key) if spec is not None else ""
+        candidate = Path(override) if override \
+            else root / input_spec.conventional_relative
+        found = candidate.is_file() if input_spec.kind == "file" \
+            else candidate.is_dir()
+        if found and os.access(candidate, os.R_OK):
+            result.resolved[input_spec.key] = _normalise_path(candidate)
+        elif input_spec.resolve_required:
+            result.missing_required.append(input_spec.key)
+        else:
+            result.missing_optional.append(input_spec.key)
+
+    for role, relative in PCL_ROLE_CONVENTIONS:
         candidate = root / relative
         if candidate.is_file() and os.access(candidate, os.R_OK):
             result.pcl_inputs.append({
                 "path": _normalise_path(candidate),
                 "role": role.value,
-                "required": required,
+                "required": False,
             })
-        elif required:
-            result.missing_required.append(f"pcl:{role.value}")
         else:
             result.missing_optional.append(f"pcl:{role.value}")
 
-    preferred = root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
+    tracks_override = spec.path_override("tracks_dbm") if spec is not None else ""
+    preferred = Path(tracks_override) if tracks_override \
+        else root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
     preferred_logical = resolve_logical_dbm(preferred)
     if preferred_logical:
         result.resolved["tracks_dbm"] = preferred_logical
@@ -379,19 +995,10 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append("tracks_dbm")
 
-    output_directory = root / "spiral_output"
-    if session_name:
-        output_directory /= session_name
-    result.resolved["output_directory"] = _normalise_path(output_directory)
-    local_cache = root / ".spiral-cache"
-    parent_writable = os.access(root, os.W_OK)
-    if local_cache.is_dir() or parent_writable:
-        result.resolved["cache_directory"] = _normalise_path(local_cache)
-    else:
-        fallback = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "vc3d" / "spiral"
-        result.resolved["cache_directory"] = _normalise_path(fallback)
-        result.warnings.append("Dataset root is not writable; using the user Spiral cache")
-
+    # Dataset resolution describes inputs only. The service binds the
+    # startup-resolved --output/--cache into the advertised resolution
+    # (spiral_service.bind_service_paths); nothing generated lives under
+    # the dataset root.
     checkpoints = sorted(
         _normalise_path(path)
         for path in root.glob("*.ckpt")
@@ -443,73 +1050,67 @@ def validate_session_request(
         elif not os.access(path, os.R_OK):
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
-    require_file(paths.umbilicus, "umbilicus", json_file=True)
-    disable_patches = bool(run.config.get("disable_patches", False))
-    use_verified = bool(run.config.get("use_verified_patches", True)) and not disable_patches
-    use_unverified = bool(run.config.get("use_unverified_patches", True)) and not disable_patches
-    optional_dir(paths.verified_patches, "verified_patches", required=use_verified)
-    if use_unverified:
-        optional_dir(paths.unverified_patches, "unverified_patches")
-    if bool(run.config.get("use_fibers", True)):
-        optional_dir(paths.fibers, "fibers")
+    def check_catalog_input(spec: FitInputSpec) -> None:
+        if not spec.enabled(run.config):
+            return
+        if spec.kind == "file":
+            require_file(getattr(paths, spec.key), spec.key,
+                         json_file=spec.json_content)
+        elif spec.kind in ("directory", "zarr-group"):
+            optional_dir(getattr(paths, spec.key), spec.key,
+                         required=spec.required(run.config))
+        elif spec.kind == "dbm":
+            value = getattr(paths, spec.key)
+            if value and not resolve_logical_dbm(value):
+                errors.append({"field": spec.key, "message": "DBM logical base or backing file was not found"})
+        elif spec.kind == "pcl-set":
+            for index, pcl in enumerate(paths.pcls):
+                expanded = _expand_pcl(pcl)
+                if pcl.required and not expanded:
+                    errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
+                for expanded_path in expanded:
+                    path = Path(expanded_path)
+                    if not path.is_file():
+                        errors.append({"field": f"pcls[{index}]", "message": f"PCL file does not exist: {path}"})
+                    else:
+                        _validate_json_file(path, f"pcls[{index}]", errors)
 
-    shell_enabled = (
-        float(run.config.get("loss_weight_shell_outer", 1.0)) > 0
-        or float(run.config.get("loss_weight_shell_patch_radius", 0)) > 0
-    )
-    optional_dir(paths.outer_shell, "outer_shell", required=shell_enabled)
+    # The Lasagna store requirements (see the catalog's predicates: the
+    # phase bundle needs SDT and both normal channels even at zero
+    # sub-weights; grad_mag never needs the SDT) are checked after the
+    # dense-spacing mode below, so an invalid mode errors as itself rather
+    # than as missing-file errors.
+    for spec in FIT_INPUT_CATALOG:
+        if spec.kind != "zarr-group":
+            check_catalog_input(spec)
 
-    if (bool(run.config.get("use_tracks", True)) and paths.tracks_dbm
-            and not resolve_logical_dbm(paths.tracks_dbm)):
-        errors.append({"field": "tracks_dbm", "message": "DBM logical base or backing file was not found"})
-
-    for index, spec in enumerate(paths.pcls):
-        expanded = _expand_pcl(spec)
-        if spec.required and not expanded:
-            errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
-        for expanded_path in expanded:
-            path = Path(expanded_path)
-            if not path.is_file():
-                errors.append({"field": f"pcls[{index}]", "message": f"PCL file does not exist: {path}"})
-            else:
-                _validate_json_file(path, f"pcls[{index}]", errors)
-
-    # The dense-spacing mode is checked before any asset-path requirements
-    # so an invalid mode errors as itself, not as a missing-file error.
     spacing_mode = str(run.config.get("dense_spacing_mode", "phase"))
-    if spacing_mode not in ("phase", "grad_mag"):
+    if spacing_mode not in ("phase", "grad_mag", "winding_model"):
         errors.append({"field": "dense_spacing_mode",
-                       "message": "Must be phase or grad_mag"})
-        spacing_mode = None
+                       "message": "Must be phase, grad_mag, or winding_model"})
 
-    normals_selected = bool(run.config.get("use_normals", True))
-    sdt_selected = bool(run.config.get("use_surf_sdt", True))
-    grad_mag_selected = bool(run.config.get("use_gradient_magnitude", True))
-    use_normals = (normals_selected
-                   and float(run.config.get("loss_weight_dense_normals", 100.0)) > 0)
-    spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
-    use_phase = spacing_mode == "phase" and normals_selected and sdt_selected
-    use_grad_mag = (
-        spacing_mode == "grad_mag" and spacing_enabled and grad_mag_selected)
-    # The phase bundle requires its core inputs (SDT for phase, count, and
-    # attachment; both normal channels for band incidence handling) even when
-    # individual sub-weights are zero, so run-mutable weights can be raised
-    # at run boundaries. grad_mag never requires the SDT; normals are needed
-    # only for the independent dense-normal loss.
-    for value, label, required in (
-        (paths.normal_x, "normal_x", use_normals or use_phase),
-        (paths.normal_y, "normal_y", use_normals or use_phase),
-        (paths.gradient_magnitude, "gradient_magnitude", use_grad_mag),
-        (paths.surf_sdt, "surf_sdt", use_phase),
-    ):
-        optional_dir(value, label, required=required)
+    for spec in FIT_INPUT_CATALOG:
+        if spec.kind == "zarr-group":
+            check_catalog_input(spec)
+
+    if spacing_mode == "winding_model" and paths.winding_inference:
+        manifest = Path(paths.winding_inference) / "manifest.json"
+        if not manifest.is_file():
+            errors.append({"field": "winding_inference",
+                           "message": "manifest.json is missing"})
+        else:
+            try:
+                metadata = json.loads(manifest.read_text())
+                if metadata.get("artifact_type") != "winding_inference_crossings":
+                    raise ValueError("unexpected artifact_type")
+                if int(metadata.get("format_version", -1)) != 1:
+                    raise ValueError("unsupported format_version")
+            except Exception as exc:
+                errors.append({"field": "winding_inference",
+                               "message": f"Invalid inference manifest: {exc}"})
 
     if run.z_begin >= run.z_end:
         errors.append({"field": "z_range", "message": "z_begin must be less than z_end"})
-    if run.outward_sense not in {"CW", "ACW"}:
-        errors.append({"field": "outward_sense", "message": "Must be CW or ACW"})
-    if run.lasagna_scale <= 0:
-        errors.append({"field": "lasagna_scale", "message": "Must be positive"})
     if run.storage_backend != "sparse_cuda":
         errors.append({
             "field": "storage_backend",
@@ -528,7 +1129,10 @@ def validate_session_request(
         elif not probe_parent.is_dir() or not os.access(probe_parent, os.W_OK):
             errors.append({"field": "output_directory", "message": "Output directory is not writable"})
 
-    if (use_normals or use_phase or use_grad_mag) and not paths.cache_directory:
+    lasagna_inputs_enabled = any(
+        spec.required(run.config) for spec in FIT_INPUT_CATALOG
+        if spec.kind == "zarr-group")
+    if lasagna_inputs_enabled and not paths.cache_directory:
         errors.append({"field": "cache_directory", "message": "Cache directory is required for Lasagna inputs"})
 
     if paths.checkpoint and not Path(paths.checkpoint).is_file():
@@ -550,18 +1154,3 @@ def parse_session_request(value: Mapping[str, Any]) -> tuple[SpiralInputPaths, S
         variant=str(preview_map.get("variant", "raw")),
     )
     return paths, run, preview
-
-
-class SpiralFitSession:
-    """Interface implemented by the resident fitter owned by the service worker."""
-
-    completed_iterations: int
-
-    def step(self, count: int, stop_event: Any, progress_callback: Any) -> Mapping[str, Any]:
-        raise NotImplementedError
-
-    def save_checkpoint(self, path: str) -> str:
-        raise NotImplementedError
-
-    def export_preview(self, generation_dir: str) -> Mapping[str, Any]:
-        raise NotImplementedError

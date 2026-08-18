@@ -5,6 +5,7 @@
 #include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -43,28 +44,6 @@ bool finitePoint(const cv::Vec3d& p)
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
-cv::Vec3d pointFromJson(const nlohmann::json& value)
-{
-    if (!value.is_array() || value.size() != 3) {
-        throw std::runtime_error("fiber point must be a 3-element array");
-    }
-    return {value[0].get<double>(), value[1].get<double>(), value[2].get<double>()};
-}
-
-std::vector<cv::Vec3d> pointArrayFromJson(const nlohmann::json& root,
-                                          const char* key,
-                                          const fs::path& path)
-{
-    if (!root.contains(key) || !root.at(key).is_array()) {
-        throw std::runtime_error(path.string() + " is missing array field " + key);
-    }
-    std::vector<cv::Vec3d> out;
-    for (const auto& point : root.at(key)) {
-        out.push_back(pointFromJson(point));
-    }
-    return out;
-}
-
 struct LoadedFiber {
     FiberInput input;
     std::string manualHvTag;
@@ -80,10 +59,11 @@ LoadedFiber loadFiberForConstraints(const fs::path& path,
         throw std::runtime_error("failed to open fiber JSON: " + path.string());
     }
     const nlohmann::json root = nlohmann::json::parse(in);
+    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(root, path.string());
     LoadedFiber loaded;
     loaded.input.fiberPath = relativePath;
-    loaded.input.controlPoints = pointArrayFromJson(root, "control_points", path);
-    loaded.input.linePoints = pointArrayFromJson(root, "line_points", path);
+    loaded.input.controlPoints = parsed.controlPoints;
+    loaded.input.linePoints = parsed.linePoints;
     validateFiberInputControlPoints(loaded.input);
     loaded.hv = classifyFiberHv(loaded.input.controlPoints);
     if (root.contains("hv_classification") && root.at("hv_classification").is_object()) {
