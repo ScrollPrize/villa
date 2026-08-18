@@ -738,12 +738,20 @@ struct InterpolationProfileSample {
     double normalResolveSeconds = 0.0;
 };
 
+struct InterpolationResolutionStats {
+    size_t predictionClosedFormResolutions = 0;
+    size_t normalClosedFormResolutions = 0;
+    size_t predictionIterativeFallbacks = 0;
+    size_t normalIterativeFallbacks = 0;
+};
+
 template <typename Lookup>
 ScoringVoxel interpolateScoringPoint(
     const cv::Vec3d& point,
     const FiberPredictionGridInfo& grid,
     Lookup&& lookup,
-    InterpolationProfileSample* profile = nullptr)
+    InterpolationProfileSample* profile = nullptr,
+    InterpolationResolutionStats* resolutionStats = nullptr)
 {
     if (profile != nullptr)
         ++profile->points;
@@ -800,7 +808,14 @@ ScoringVoxel interpolateScoringPoint(
     });
     if (predictionValid && std::isfinite(presence)) {
         const auto resolveStart = profile == nullptr ? Clock::time_point{} : Clock::now();
-        const auto principal = principalFiberAxis(predictionTensor);
+        bool usedIterativeFallback = false;
+        const auto principal = principalFiberAxisClosedForm(
+            predictionTensor, &usedIterativeFallback);
+        if (resolutionStats != nullptr) {
+            ++resolutionStats->predictionClosedFormResolutions;
+            if (usedIterativeFallback)
+                ++resolutionStats->predictionIterativeFallbacks;
+        }
         if (profile != nullptr) {
             ++profile->predictionPrincipalSolves;
             if (predictionAxesIdentical && firstPredictionAxis.has_value())
@@ -822,7 +837,14 @@ ScoringVoxel interpolateScoringPoint(
     }
     if (normalValid) {
         const auto resolveStart = profile == nullptr ? Clock::time_point{} : Clock::now();
-        const auto principal = principalFiberAxis(normalTensor);
+        bool usedIterativeFallback = false;
+        const auto principal = principalFiberAxisClosedForm(
+            normalTensor, &usedIterativeFallback);
+        if (resolutionStats != nullptr) {
+            ++resolutionStats->normalClosedFormResolutions;
+            if (usedIterativeFallback)
+                ++resolutionStats->normalIterativeFallbacks;
+        }
         if (profile != nullptr) {
             ++profile->normalPrincipalSolves;
             if (normalAxesIdentical && firstNormalAxis.has_value())
@@ -2625,6 +2647,8 @@ FiberletPathReport traceFiberletPaths(
     std::atomic<size_t> completedMaterialization{0};
     std::vector<size_t> pageDirectoryProbes(workerCount);
     std::vector<InterpolationProfileSample> interpolationProfiles(workerCount);
+    std::vector<InterpolationResolutionStats> interpolationResolutionStats(
+        workerCount);
     const auto materializationWorker = [&](size_t workerIndex) {
         size_t localPageDirectoryProbes = 0;
         size_t localInterpolationCount = 0;
@@ -2640,7 +2664,9 @@ FiberletPathReport traceFiberletPaths(
                     InterpolationProfileSample* profile = nullptr;
                     if ((localInterpolationCount++ & 4095U) == 0)
                         profile = &interpolationProfiles[workerIndex];
-                    return interpolateScoringPoint(point, grid, lookup, profile);
+                    return interpolateScoringPoint(
+                        point, grid, lookup, profile,
+                        &interpolationResolutionStats[workerIndex]);
                 };
                 const auto& candidate =
                     report.candidates[searchCandidateIndices[searchIndex]];
@@ -2702,6 +2728,16 @@ FiberletPathReport traceFiberletPaths(
             profile.predictionResolveSeconds;
         report.interpolationProfiledNormalResolveSeconds +=
             profile.normalResolveSeconds;
+    }
+    for (const auto& stats : interpolationResolutionStats) {
+        report.interpolationPredictionClosedFormResolutions +=
+            stats.predictionClosedFormResolutions;
+        report.interpolationNormalClosedFormResolutions +=
+            stats.normalClosedFormResolutions;
+        report.interpolationPredictionIterativeFallbacks +=
+            stats.predictionIterativeFallbacks;
+        report.interpolationNormalIterativeFallbacks +=
+            stats.normalIterativeFallbacks;
     }
     report.samplingMaterializationSeconds = std::chrono::duration<double>(Clock::now() - materializationStart).count();
     report.samplingMaterializationCpuSeconds = processCpuSeconds() - materializationCpuStart;

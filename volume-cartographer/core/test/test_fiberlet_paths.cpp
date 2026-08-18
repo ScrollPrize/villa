@@ -473,6 +473,52 @@ TEST_CASE("fiber principal axis rejects an equal orthogonal tensor")
     CHECK_FALSE(principal.unique);
 }
 
+TEST_CASE("closed-form fiber principal axis matches the iterative resolver")
+{
+    const std::array<cv::Matx33d, 4> tensors{
+        vc::fiber_tracer::fiberAxisTensor(
+            {0.2672612419124244, 0.5345224838248488,
+             0.8017837257372732}),
+        vc::fiber_tracer::fiberAxisTensor({1.0, 0.0, 0.0}, 0.7) +
+            vc::fiber_tracer::fiberAxisTensor({0.0, 1.0, 0.0}, 0.3),
+        vc::fiber_tracer::fiberAxisTensor({0.8, 0.6, 0.0}, 0.55) +
+            vc::fiber_tracer::fiberAxisTensor({0.2, -0.3, 0.9327379053}, 0.45),
+        cv::Matx33d{0.2, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 0.4},
+    };
+    for (size_t tensorIndex = 0; tensorIndex < tensors.size(); ++tensorIndex) {
+        const auto& tensor = tensors[tensorIndex];
+        bool fallback = true;
+        const auto iterative = vc::fiber_tracer::principalFiberAxis(tensor);
+        const auto closedForm =
+            vc::fiber_tracer::principalFiberAxisClosedForm(tensor, &fallback);
+        REQUIRE(iterative.unique);
+        REQUIRE(closedForm.unique);
+        CHECK_FALSE(fallback);
+        CHECK(std::abs(iterative.axis.dot(closedForm.axis)) ==
+              doctest::Approx(1.0).epsilon(1.0e-10));
+        CHECK(closedForm.largestEigenvalue ==
+              doctest::Approx(iterative.largestEigenvalue).epsilon(1.0e-10));
+        const double secondTolerance = 1.0e-8 * std::max(
+            1.0, std::abs(iterative.largestEigenvalue));
+        CHECK(std::abs(
+                  closedForm.secondEigenvalue - iterative.secondEigenvalue) <=
+              secondTolerance);
+    }
+}
+
+TEST_CASE("closed-form fiber principal axis rejects ambiguous evidence")
+{
+    const auto tensor =
+        vc::fiber_tracer::fiberAxisTensor({1.0, 0.0, 0.0}, 0.5) +
+        vc::fiber_tracer::fiberAxisTensor({0.0, 1.0, 0.0}, 0.5);
+    bool fallback = true;
+    const auto principal =
+        vc::fiber_tracer::principalFiberAxisClosedForm(tensor, &fallback);
+    CHECK(principal.valid);
+    CHECK_FALSE(principal.unique);
+    CHECK_FALSE(fallback);
+}
+
 TEST_CASE("fiberlet graph uses directed dense tangents and strict joins")
 {
     auto report = graphPathReport();
@@ -858,6 +904,14 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
               report.interpolationProfiledPoints);
         CHECK(report.interpolationProfiledNormalPrincipalSolves <=
               report.interpolationProfiledPoints);
+        CHECK(report.interpolationPredictionClosedFormResolutions <=
+              report.interpolatedScoringPoints);
+        CHECK(report.interpolationNormalClosedFormResolutions <=
+              report.interpolatedScoringPoints);
+        CHECK(report.interpolationPredictionIterativeFallbacks <=
+              report.interpolationPredictionClosedFormResolutions);
+        CHECK(report.interpolationNormalIterativeFallbacks <=
+              report.interpolationNormalClosedFormResolutions);
         CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
         CHECK(report.dpNodeIndexSlots >= report.dpNodeIndexEntries);
         CHECK(report.dpRelaxations <= report.dpTransitionLookups);

@@ -152,6 +152,24 @@ and replay failures were unchanged; loss values changed around `1e-6` and a
 handful of DP work counters changed because of the intentional float32
 preparation boundary. The prepared scoring representation was accepted.
 
+## Checkpoint 9: Closed-Form Principal Axis
+
+1. Keep the shared iterative Jacobi resolver unchanged for anchors and other
+   existing users.
+2. Resolve interpolation tensors with analytic symmetric 3x3 eigenvalues and
+   stable row-cross-product eigenvector reconstruction.
+3. Reject zero/non-finite tensors and ambiguous top eigenvalues directly.
+   Fall back to Jacobi only when the top gap is clear but eigenvector
+   reconstruction fails a scale-aware residual check.
+4. Count every prediction/normal resolution and iterative fallback, and compare
+   complete replay artifacts against checkpoint 8.
+
+Three canonical runs resolved 101,644,450 tensors each with zero iterative
+fallbacks. Median interpolation materialization fell from 1.70 to 1.55 seconds,
+total wall from 12.51 to 12.42 seconds, and total CPU from 315.81 to 310.98
+seconds. Every run was byte-identical to checkpoint 8. The closed-form
+resolver was accepted.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

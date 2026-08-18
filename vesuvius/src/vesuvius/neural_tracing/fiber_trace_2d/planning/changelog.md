@@ -26,6 +26,9 @@
 - Prepared compact float32 prediction/normal axes and symmetric tensors once
   per sampled voxel, reducing interpolation materialization by 26.1% while
   preserving fiberlet geometry and replay outcomes.
+- Replaced fiberlet interpolation's iterative principal-axis solve with a
+  guarded closed form, reducing resolver materialization by another 8.8% with
+  zero fallbacks and byte-identical replay artifacts.
 
 # 2026-08-17: fiberlet extraction profiling
 

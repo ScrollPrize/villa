@@ -185,6 +185,10 @@ struct FiberletPathReport {
     size_t interpolationProfiledNormalIdentical = 0;
     size_t interpolationProfiledPredictionPrincipalSolves = 0;
     size_t interpolationProfiledNormalPrincipalSolves = 0;
+    size_t interpolationPredictionClosedFormResolutions = 0;
+    size_t interpolationNormalClosedFormResolutions = 0;
+    size_t interpolationPredictionIterativeFallbacks = 0;
+    size_t interpolationNormalIterativeFallbacks = 0;
     size_t dpNodeIndexEntries = 0;
     size_t dpNodeIndexSlots = 0;
     size_t dpTransitionLookups = 0;

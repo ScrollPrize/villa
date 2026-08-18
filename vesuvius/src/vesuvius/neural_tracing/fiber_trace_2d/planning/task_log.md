@@ -270,3 +270,27 @@
   unchanged. The output JSON differs only in loss values around `1e-6`; DP
   transition lookups changed by 9, reached-state visits by 1, and relaxations
   by 7 out of hundreds of millions.
+
+## Checkpoint 9: Closed-Form Principal Axis
+
+- Fiberlet interpolation now uses analytic eigenvalues for each symmetric 3x3
+  tensor and reconstructs the dominant eigenvector from the largest stable
+  cross-product of rows of `A - lambda I`. A scale-aware residual check gates
+  the existing Jacobi fallback. Ambiguous top eigenvalues remain invalid and
+  do not invoke a fallback.
+- Each canonical run performed 50,822,225 prediction and 50,822,225 normal
+  closed-form resolutions. All three recorded zero iterative fallbacks.
+
+  | metric | minimum | median | maximum | checkpoint 8 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 12.36 s | 12.42 s | 12.42 s | 12.51 s |
+  | total CPU | 310.05 s | 310.98 s | 311.10 s | 315.81 s |
+  | interpolation materialization wall | 1.50 s | 1.55 s | 1.55 s | 1.70 s |
+  | interpolation materialization CPU | 47.38 s | 48.81 s | 48.81 s | 53.89 s |
+  | peak RSS | 2.50 GiB | 2.50 GiB | 2.50 GiB | 2.51 GiB |
+
+- Median materialization wall improved 8.8%, materialization CPU 9.4%, total
+  wall 0.7%, and total CPU 1.5%. Anchor/fiberlet populations, DP work, replay
+  failures, and complete replay artifacts were unchanged. Checkpoint 8 and all
+  checkpoint-9 runs have SHA-256
+  `83bfadf690ac5d3badcd6a07822d95c2fa2d44fcb06e28dd8d821e308d4c7197`.

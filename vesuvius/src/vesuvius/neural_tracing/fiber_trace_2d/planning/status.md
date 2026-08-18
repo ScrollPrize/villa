@@ -41,3 +41,8 @@
 - [x] Run focused path/replay validation for checkpoint 8.
 - [x] Benchmark checkpoint 8 over three canonical runs.
 - [x] Review checkpoint 8 and retain float32 scoring preparation.
+- [x] Implement the interpolation-only closed-form principal-axis resolver.
+- [x] Add unique, diagonal, rank-one, and ambiguous tensor coverage.
+- [x] Benchmark checkpoint 9 over three canonical runs.
+- [x] Complete GCC and Clang anchor/path/replay validation for checkpoint 9.
+- [x] Review checkpoint 9 and retain the closed-form resolver.

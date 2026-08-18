@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <numbers>
 
 namespace vc::fiber_tracer
 {
@@ -14,6 +15,32 @@ constexpr double kMatrixEpsilon = 1.0e-15;
 bool finiteVector(const cv::Vec3d& value)
 {
     return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+}
+
+bool finiteMatrix(const cv::Matx33d& matrix)
+{
+    for (const double value : matrix.val) {
+        if (!std::isfinite(value))
+            return false;
+    }
+    return true;
+}
+
+double determinant(const cv::Matx33d& matrix)
+{
+    return
+        matrix(0, 0) * (matrix(1, 1) * matrix(2, 2) - matrix(1, 2) * matrix(2, 1)) -
+        matrix(0, 1) * (matrix(1, 0) * matrix(2, 2) - matrix(1, 2) * matrix(2, 0)) +
+        matrix(0, 2) * (matrix(1, 0) * matrix(2, 1) - matrix(1, 1) * matrix(2, 0));
+}
+
+cv::Vec3d cross(const cv::Vec3d& left, const cv::Vec3d& right)
+{
+    return {
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    };
 }
 
 cv::Vec3d normalized(const cv::Vec3d& value)
@@ -109,6 +136,118 @@ FiberPrincipalAxis principalFiberAxis(const cv::Matx33d& input)
     const double gapTolerance = 1.0e-12 * std::max(1.0, std::abs(result.largestEigenvalue));
     result.unique = result.valid && result.largestEigenvalue - result.secondEigenvalue > gapTolerance;
     return result;
+}
+
+FiberPrincipalAxis principalFiberAxisClosedForm(
+    const cv::Matx33d& input,
+    bool* usedIterativeFallback)
+{
+    if (usedIterativeFallback != nullptr)
+        *usedIterativeFallback = false;
+
+    FiberPrincipalAxis result;
+    if (!finiteMatrix(input))
+        return result;
+
+    double inputScale = 0.0;
+    for (const double value : input.val)
+        inputScale = std::max(inputScale, std::abs(value));
+    if (!(inputScale > kMatrixEpsilon))
+        return result;
+
+    const cv::Matx33d matrix = input * (1.0 / inputScale);
+    const double offDiagonalSquared =
+        matrix(0, 1) * matrix(0, 1) +
+        matrix(0, 2) * matrix(0, 2) +
+        matrix(1, 2) * matrix(1, 2);
+
+    std::array<double, 3> eigenvalues{};
+    if (!(offDiagonalSquared > kMatrixEpsilon * kMatrixEpsilon)) {
+        eigenvalues = {matrix(0, 0), matrix(1, 1), matrix(2, 2)};
+    } else {
+        const double mean =
+            (matrix(0, 0) + matrix(1, 1) + matrix(2, 2)) / 3.0;
+        const double centeredSquared =
+            (matrix(0, 0) - mean) * (matrix(0, 0) - mean) +
+            (matrix(1, 1) - mean) * (matrix(1, 1) - mean) +
+            (matrix(2, 2) - mean) * (matrix(2, 2) - mean) +
+            2.0 * offDiagonalSquared;
+        const double radius = std::sqrt(centeredSquared / 6.0);
+        if (!(radius > kMatrixEpsilon) || !std::isfinite(radius))
+            return result;
+        cv::Matx33d normalized = matrix;
+        for (int axis = 0; axis < 3; ++axis)
+            normalized(axis, axis) -= mean;
+        normalized *= 1.0 / radius;
+        const double halfDeterminant = std::clamp(
+            determinant(normalized) * 0.5, -1.0, 1.0);
+        const double angle = std::acos(halfDeterminant) / 3.0;
+        eigenvalues[0] = mean + 2.0 * radius * std::cos(angle);
+        eigenvalues[2] = mean + 2.0 * radius *
+            std::cos(angle + 2.0 * std::numbers::pi_v<double> / 3.0);
+        eigenvalues[1] = 3.0 * mean - eigenvalues[0] - eigenvalues[2];
+    }
+
+    std::array<int, 3> order{0, 1, 2};
+    std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
+        return eigenvalues[left] > eigenvalues[right];
+    });
+    const double largestScaled = eigenvalues[order[0]];
+    const double secondScaled = eigenvalues[order[1]];
+    result.largestEigenvalue = largestScaled * inputScale;
+    result.secondEigenvalue = secondScaled * inputScale;
+    result.valid = result.largestEigenvalue > kMatrixEpsilon;
+    const double gapTolerance =
+        1.0e-12 * std::max(1.0, std::abs(result.largestEigenvalue));
+    result.unique = result.valid &&
+        result.largestEigenvalue - result.secondEigenvalue > gapTolerance;
+    if (!result.unique)
+        return result;
+
+    if (!(offDiagonalSquared > kMatrixEpsilon * kMatrixEpsilon)) {
+        result.axis = {0.0, 0.0, 0.0};
+        result.axis[order[0]] = 1.0;
+        return result;
+    }
+
+    cv::Matx33d shifted = matrix;
+    for (int axis = 0; axis < 3; ++axis)
+        shifted(axis, axis) -= largestScaled;
+    const std::array<cv::Vec3d, 3> rows{
+        cv::Vec3d{shifted(0, 0), shifted(0, 1), shifted(0, 2)},
+        cv::Vec3d{shifted(1, 0), shifted(1, 1), shifted(1, 2)},
+        cv::Vec3d{shifted(2, 0), shifted(2, 1), shifted(2, 2)},
+    };
+    const std::array<cv::Vec3d, 3> candidates{
+        cross(rows[0], rows[1]),
+        cross(rows[0], rows[2]),
+        cross(rows[1], rows[2]),
+    };
+    size_t best = 0;
+    double bestNormSquared = candidates[0].dot(candidates[0]);
+    for (size_t index = 1; index < candidates.size(); ++index) {
+        const double normSquared = candidates[index].dot(candidates[index]);
+        if (normSquared > bestNormSquared) {
+            best = index;
+            bestNormSquared = normSquared;
+        }
+    }
+    if (bestNormSquared > kMatrixEpsilon * kMatrixEpsilon &&
+        std::isfinite(bestNormSquared)) {
+        result.axis = canonicalFiberAxis(candidates[best]);
+        const cv::Vec3d residual = matrix * result.axis -
+            largestScaled * result.axis;
+        const double residualTolerance =
+            1.0e-10 * std::max(1.0, std::abs(largestScaled));
+        if (finiteVector(result.axis) &&
+            residual.dot(residual) <= residualTolerance * residualTolerance) {
+            return result;
+        }
+    }
+
+    if (usedIterativeFallback != nullptr)
+        *usedIterativeFallback = true;
+    return principalFiberAxis(input);
 }
 
 }  // namespace vc::fiber_tracer
