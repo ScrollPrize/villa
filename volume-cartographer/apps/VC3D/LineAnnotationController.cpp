@@ -9546,10 +9546,12 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
 void LineAnnotationController::invalidateScrollUmbilicus()
 {
     _scrollUmbilicusLoadAttempted = false;
+    _scrollUmbilicusFingerprint.clear();
     _scrollUmbilicusFrame = {};
     _scrollUmbilicus.reset();
     _scrollUmbilicusMode = vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
     _scrollUmbilicusFactor = 0.0;
+    _scrollUmbilicusScaleSource.reset();
     _scrollUmbilicusTransformPath.clear();
     _scrollUmbilicusTransformSize = 0;
     _umbilicusNotice.clear();
@@ -9559,10 +9561,7 @@ vc3d::annotation::OrientationKey
 LineAnnotationController::currentOrientationKey() const
 {
     vc3d::annotation::OrientationKey key;
-    const auto frame = annotationFrame();
-    for (int axis = 0; axis < 3; ++axis) {
-        key.gridXyz[axis] = std::llround(frame.extentXyz[axis]);
-    }
+    key.frame = annotationFrame();
     try {
         if (const auto volume = _state ? _state->currentVolume() : nullptr) {
             key.rawVolumeShapeXyz = {volume->sliceWidth(),
@@ -9572,7 +9571,7 @@ LineAnnotationController::currentOrientationKey() const
     } catch (...) {
     }
     key.mode = _scrollUmbilicusMode;
-    key.umbilicusFactor = _scrollUmbilicusFactor;
+    key.scaleSource = _scrollUmbilicusScaleSource;
     key.transformPath = _scrollUmbilicusTransformPath;
     key.transformSize = _scrollUmbilicusTransformSize;
     return key;
@@ -9730,15 +9729,33 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     // signal so that switching between downsample levels of one scan — which
     // derives an identical frame — costs nothing.
     const auto currentAnnotationFrame = annotationFrame();
+    // The file itself is part of the key too, not just where it was looked for.
+    // Attaching a malformed umbilicus and then fixing it emits nothing, so without
+    // this the refusal stayed cached until an unrelated invalidation -- which
+    // contradicts the attach dialog telling the user that attaching and then fixing
+    // the file is a reasonable order of operations. A stat, no parse.
+    const QString currentUmbilicusFingerprint = umbilicusFingerprint();
     if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot ||
+        currentUmbilicusFingerprint != _scrollUmbilicusFingerprint ||
         !vc3d::annotation::sameAnnotationFrame(currentAnnotationFrame,
                                               _scrollUmbilicusFrame)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
+        _scrollUmbilicusFingerprint = currentUmbilicusFingerprint;
         _scrollUmbilicusFrame = currentAnnotationFrame;
         _scrollUmbilicus.reset();
         // Cleared before the attempt: whatever is set below describes this
         // attempt, and success has to be able to retract an earlier complaint.
+        // The recorded derivation goes with it, or a refused or throwing attempt
+        // would leave the previous mode, factor and transform in place and
+        // session.orientationKey would record provenance from a build that did not
+        // happen.
+        _scrollUmbilicusMode =
+            vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
+        _scrollUmbilicusFactor = 0.0;
+        _scrollUmbilicusScaleSource.reset();
+        _scrollUmbilicusTransformPath.clear();
+        _scrollUmbilicusTransformSize = 0;
         _umbilicusNotice.clear();
         try {
             if (_state && _state->vpkg() && volume) {
@@ -9785,8 +9802,39 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     const auto claim =
                         vc::core::util::umbilicusFrameClaim(resolved.info);
                     const bool haveTargetGrid = annotationGrid[2] > 0.0;
-                    const auto action = vc::core::util::decideUmbilicusLoadAction(
+                    auto action = vc::core::util::decideUmbilicusLoadAction(
                         scale, claim, haveTargetGrid);
+
+                    // An *inferred* scale must not outrank a registration
+                    // transform. Inference is a reading of the points -- do they fit
+                    // inside a candidate grid and nearly fill it -- and a
+                    // translated fixed-frame umbilicus can satisfy that while still
+                    // needing the transform: the offset moves it without pushing it
+                    // out of bounds or shortening its z span. Applying an inferred
+                    // scale there would skip the transform entirely and orient
+                    // normals about untranslated centres, which is a regression on
+                    // the reading this PR replaced. A file that *states* its frame
+                    // still wins, because a statement outranks a reading.
+                    if (action == vc::core::util::UmbilicusLoadAction::Apply &&
+                        scale &&
+                        scale->source ==
+                            vc::core::util::UmbilicusScaleSource::InferredFromGrid &&
+                        volume->baseScaleLevel() == 0) {
+                        fs::path candidate = volume->path() / "transform.json";
+                        if (!fs::exists(candidate)) {
+                            candidate = volpkgRoot / "transforms" / "transform.json";
+                        }
+                        if (fs::exists(candidate)) {
+                            Logger()->info(
+                                "Line annotation: umbilicus {} has no stated frame "
+                                "and {} exists, so the registration reading is used "
+                                "rather than an inferred x{:g}",
+                                resolved.path.string(),
+                                candidate.string(),
+                                scale->factor);
+                            action = vc::core::util::UmbilicusLoadAction::UseLegacy;
+                        }
+                    }
 
                     if (action == vc::core::util::UmbilicusLoadAction::Refuse) {
                         const auto stampedGrid =
@@ -9818,6 +9866,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                         _scrollUmbilicusMode =
                             vc3d::annotation::UmbilicusOrientationMode::Applied;
                         _scrollUmbilicusFactor = scale->factor;
+                        _scrollUmbilicusScaleSource = scale->source;
                         for (auto& point : controlPoints) {
                             point *= static_cast<float>(scale->factor);
                         }

@@ -816,6 +816,9 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The resolver's dependencies as of the cached load, so the file changing
+    // underneath VC3D -- being fixed, replaced or removed -- is noticed.
+    QString _scrollUmbilicusFingerprint;
     // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
     // key because the cached value is not the file's contents: its points are
     // already multiplied by a frame-dependent factor and its per-slice centres
@@ -829,6 +832,7 @@ private:
     vc3d::annotation::UmbilicusOrientationMode _scrollUmbilicusMode =
         vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
     double _scrollUmbilicusFactor = 0.0;
+    std::optional<vc::core::util::UmbilicusScaleSource> _scrollUmbilicusScaleSource;
     std::string _scrollUmbilicusTransformPath;
     std::uintmax_t _scrollUmbilicusTransformSize = 0;
     // Why the package's umbilicus could not be used, for the strip notice.

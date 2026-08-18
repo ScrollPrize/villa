@@ -5,6 +5,7 @@
 #include <limits>
 #include <cmath>
 #include <array>
+#include <vector>
 #include <exception>
 #include <system_error>
 
@@ -27,25 +28,6 @@ bool isTifxyzSegmentDir(const fs::path& dir)
         }
     }
     return true;
-}
-
-
-// The factor to report for a feasible interval of rescale factors. Every rescale
-// seen so far is integral, and an integer inside the interval is by construction
-// consistent with all three axes, so prefer it; that is what turns a stamp whose
-// axes round differently -- 8174/8174/18946 against 32693/32693/75784 -- into
-// exactly 4 rather than a near miss. Otherwise the midpoint, which commits to no
-// single axis.
-double factorFromInterval(double lo, double hi)
-{
-    const double firstInteger = std::ceil(lo);
-    if (firstInteger <= hi && firstInteger + 1.0 > hi) {
-        return firstInteger;
-    }
-    if (std::isinf(hi)) {
-        return lo;
-    }
-    return lo + (hi - lo) * 0.5;
 }
 
 
@@ -213,42 +195,54 @@ std::optional<double> uniformRescaleFactor(
     const std::array<double, 3>& targetXyz)
 {
     for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(stampedXyz[axis]) || stampedXyz[axis] <= 0.0 ||
-            !std::isfinite(targetXyz[axis]) || targetXyz[axis] <= 0.0) {
+        if (!std::isfinite(stampedXyz[axis]) || stampedXyz[axis] < 1.0 ||
+            !std::isfinite(targetXyz[axis]) || targetXyz[axis] < 1.0) {
             return std::nullopt;
         }
     }
 
-    // Per axis, |t - s*f| <= |f - 1| is a closed interval in f. Solving the two
-    // sides gives (t+1)/(s+1) and (t-1)/(s-1); which is the lower bound depends
-    // on whether f is above or below 1, and s == 1 leaves one side unbounded.
-    // Intersect the axes on each side of 1 separately and take whichever region
-    // survives.
-    constexpr double kInf = std::numeric_limits<double>::infinity();
-    double aboveLo = 1.0;
-    double aboveHi = kInf;
-    double belowLo = 0.0;
-    double belowHi = 1.0;
-    for (int axis = 0; axis < 3; ++axis) {
-        const double s = stampedXyz[axis];
-        const double t = targetXyz[axis];
-        const double sum = (t + 1.0) / (s + 1.0);
-        const double diff = s > 1.0 ? (t - 1.0) / (s - 1.0) : kInf;
-        // f >= 1: lower bound is (t+1)/(s+1), upper bound (t-1)/(s-1).
-        aboveLo = std::max(aboveLo, sum);
-        aboveHi = std::min(aboveHi, diff);
-        // f <= 1: the roles swap.
-        belowLo = std::max(belowLo, s > 1.0 ? diff : 0.0);
-        belowHi = std::min(belowHi, sum);
+    // Downsampling by an integer factor n maps a count c to floor(c/n) or
+    // ceil(c/n) and nothing else, so a candidate factor can be tested exactly:
+    // no tolerance, no averaging, no constant to tune. Both directions are
+    // tried, since the stamped grid may be the coarser one (target = stamped * n)
+    // or the finer one (stamped = target * m).
+    const auto explains = [&](double factor) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const double coarse =
+                factor >= 1.0 ? targetXyz[axis] : stampedXyz[axis];
+            const double fine =
+                factor >= 1.0 ? stampedXyz[axis] : targetXyz[axis];
+            const double step = factor >= 1.0 ? factor : 1.0 / factor;
+            const double exact = coarse / step;
+            if (fine != std::floor(exact) && fine != std::ceil(exact)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Six pyramid levels either way covers every store this format describes.
+    constexpr int kMaxStep = 64;
+    std::vector<double> candidates;
+    for (int n = 1; n <= kMaxStep; ++n) {
+        if (explains(static_cast<double>(n))) {
+            candidates.push_back(static_cast<double>(n));
+        }
+    }
+    for (int m = 2; m <= kMaxStep; ++m) {
+        if (explains(1.0 / static_cast<double>(m))) {
+            candidates.push_back(1.0 / static_cast<double>(m));
+        }
     }
 
-    if (aboveLo <= aboveHi) {
-        return factorFromInterval(aboveLo, aboveHi);
+    // Exactly one factor explains all three axes, or the counts do not identify
+    // one and this reading has no answer to give. Several can only happen on
+    // grids of a handful of voxels, where the rounding windows overlap; refusing
+    // there is right, since picking one would be a guess.
+    if (candidates.size() != 1) {
+        return std::nullopt;
     }
-    if (belowLo <= belowHi) {
-        return factorFromInterval(belowLo, belowHi);
-    }
-    return std::nullopt;
+    return candidates.front();
 }
 
 std::optional<UmbilicusScale> deriveUmbilicusScale(
@@ -362,10 +356,15 @@ UmbilicusLoadAction decideUmbilicusLoadAction(
     bool haveTargetGrid)
 {
     if (!haveTargetGrid) {
-        // Nothing to carry the points into, so there is nothing to conflict
-        // with either. A scale derived from a stated voxel size alone can exist
-        // here, but placing the points still needs the frame's extent.
-        return UmbilicusLoadAction::UseLegacy;
+        // No target grid means the stated frame cannot be checked -- which is not
+        // the same as the file stating nothing, and must not be treated as such.
+        // The legacy reading applies a registration inverse or takes the points
+        // raw; doing that to a file that declares a frame we could not evaluate is
+        // proceeding on a guess exactly where the check failed. So a stated frame
+        // is refused, and only a file that states nothing keeps its previous
+        // reading. The two diagnostics differ; neither uses the file.
+        return claim.any() ? UmbilicusLoadAction::Refuse
+                           : UmbilicusLoadAction::UseLegacy;
     }
     if (scale) {
         return UmbilicusLoadAction::Apply;

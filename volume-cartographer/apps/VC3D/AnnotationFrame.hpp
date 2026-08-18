@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include <optional>
 #include <string>
 
@@ -20,8 +22,9 @@ struct AnnotationFrame {
     // What carries the volume's own voxel counts into that frame, i.e. the
     // ratio of the two resolutions. 1.0 when the grids coincide.
     double factor = 1.0;
-    // The volume's dimensions in that frame; zeroes when the dimensions handed
-    // in were unusable.
+    // The volume's dimensions in that frame; zeroes when the dimensions handed in
+    // were unusable, and also when the factor is unknown — raw counts are not
+    // counts in this frame.
     std::array<double, 3> extentXyz{0.0, 0.0, 0.0};
 };
 
@@ -76,7 +79,11 @@ inline AnnotationFrame deriveAnnotationFrame(
         std::isfinite(volumeDimsXyz[0]) && volumeDimsXyz[0] > 0.0 &&
         std::isfinite(volumeDimsXyz[1]) && volumeDimsXyz[1] > 0.0 &&
         std::isfinite(volumeDimsXyz[2]) && volumeDimsXyz[2] > 0.0;
-    if (haveDims) {
+    // The factor is only known when the store could say what its own voxels are.
+    // Without it the counts cannot be carried into the annotated frame at all, and
+    // presenting the raw counts as though they were already in that frame is the
+    // fail-open this whole derivation exists to close.
+    if (haveDims && haveVolumeVoxel && frame.voxelSizeUm) {
         frame.extentXyz = {volumeDimsXyz[0] * frame.factor,
                            volumeDimsXyz[1] * frame.factor,
                            volumeDimsXyz[2] * frame.factor};
@@ -152,15 +159,24 @@ enum class UmbilicusOrientationMode {
 // The scale *source* is deliberately absent: identical resolved geometry must not
 // rebuild because its provenance changed.
 struct OrientationKey {
-    // The annotation grid, as integer voxel counts.
-    std::array<long long, 3> gridXyz{0, 0, 0};
+    // The annotation frame the views were built in. Compared through
+    // sameAnnotationGrid/sameAnnotationFrame below rather than field by field,
+    // because a differing physical voxel size does not always matter.
+    AnnotationFrame frame;
     // The session volume's own shape. The volume-centre fallback and the legacy
     // reading both use it directly, so two volumes sharing an annotation grid can
     // still need different orientation.
     std::array<int, 3> rawVolumeShapeXyz{0, 0, 0};
     UmbilicusOrientationMode mode = UmbilicusOrientationMode::VolumeCentre;
-    // The scale actually applied to the umbilicus points.
-    double umbilicusFactor = 0.0;
+    // Which reading produced the scale, when one was applied. This is what decides
+    // whether a changed physical voxel size reached the geometry: through stamped
+    // dimensions or grid inference the µm figure played no part.
+    //
+    // Deliberately the *recorded* source and not a live factor. A factor can only
+    // be recomputed by re-resolving the umbilicus, which is filesystem work, and a
+    // comparison that reads the cached factor would compare the old value against
+    // itself and conclude nothing had changed — missing the one case it exists for.
+    std::optional<vc::core::util::UmbilicusScaleSource> scaleSource;
     // Legacy reading only: the registration transform it went through, if any.
     std::string transformPath;
     std::uintmax_t transformSize = 0;
@@ -168,16 +184,22 @@ struct OrientationKey {
 
 inline bool sameOrientationKey(const OrientationKey& a, const OrientationKey& b)
 {
-    if (a.gridXyz != b.gridXyz || a.rawVolumeShapeXyz != b.rawVolumeShapeXyz)
+    if (a.rawVolumeShapeXyz != b.rawVolumeShapeXyz)
         return false;
     if (a.mode != b.mode)
         return false;
     if (a.transformPath != b.transformPath || a.transformSize != b.transformSize)
         return false;
-    // Relative, so floating-point representation noise cannot cause rebuild churn.
-    const double scale = std::max({std::abs(a.umbilicusFactor),
-                                   std::abs(b.umbilicusFactor), 1.0});
-    return std::abs(a.umbilicusFactor - b.umbilicusFactor) <= 1e-9 * scale;
+    // Different voxel counts: the geometry is about another grid.
+    if (!sameAnnotationGrid(a.frame, b.frame))
+        return false;
+    if (sameAnnotationFrame(a.frame, b.frame))
+        return true;
+    // Same counts, different physical scale. It only reached the geometry if the
+    // scale was derived from it; through stamped dimensions or grid inference the
+    // views are unaffected and rebuilding them would change nothing.
+    return a.scaleSource != vc::core::util::UmbilicusScaleSource::StampedVoxelSize &&
+           b.scaleSource != vc::core::util::UmbilicusScaleSource::StampedVoxelSize;
 }
 
 } // namespace vc3d::annotation

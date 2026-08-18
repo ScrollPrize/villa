@@ -14,6 +14,7 @@ using vc3d::annotation::sameAnnotationFrame;
 using vc3d::annotation::sameAnnotationGrid;
 using vc3d::annotation::sameOrientationKey;
 using vc3d::annotation::UmbilicusOrientationMode;
+using vc::core::util::UmbilicusScaleSource;
 
 namespace
 {
@@ -36,13 +37,24 @@ namespace
     constexpr double kPHerc0139RawUm = 9.596;
     constexpr double kPHerc0139SurfUm = 9.362;
 
-    OrientationKey appliedKey(double factor)
+    AnnotationFrame frameAt(double voxelUm)
+    {
+        return deriveAnnotationFrame(voxelUm, 0, std::nullopt, kPHerc0139Dims);
+    }
+
+    AnnotationFrame otherGrid()
+    {
+        return deriveAnnotationFrame(kPHerc0139RawUm, 0, std::nullopt,
+                                     {8174.0, 8174.0, 18946.0});
+    }
+
+    OrientationKey appliedKey(double voxelUm, UmbilicusScaleSource source)
     {
         OrientationKey key;
-        key.gridXyz = {6628, 6628, 19239};
+        key.frame = frameAt(voxelUm);
         key.rawVolumeShapeXyz = {6628, 6628, 19239};
         key.mode = UmbilicusOrientationMode::Applied;
-        key.umbilicusFactor = factor;
+        key.scaleSource = source;
         return key;
     }
 } // namespace
@@ -227,11 +239,13 @@ private slots:
         QVERIFY(!sameAnnotationGrid(here, elsewhere));
         QVERIFY(!sameAnnotationFrame(here, elsewhere));
 
-        // And an unknown voxel size never silently matches a known one, on either
-        // predicate's terms: the grid still compares equal, the frame does not.
+        // An unknown voxel size never silently matches a known one, on either
+        // predicate's terms. Not even the grid: without the store's own voxel size
+        // there is no factor, so its raw counts are not counts in the annotated
+        // frame and the extent is left at zero rather than guessed.
         const auto unknown = deriveAnnotationFrame(0.0, 0, std::nullopt, kSourceDims);
         QVERIFY(!sameAnnotationFrame(here, unknown));
-        QVERIFY(sameAnnotationGrid(here, unknown));
+        QVERIFY(!sameAnnotationGrid(here, unknown));
     }
 
     // Which scale path the umbilicus took is what decides whether the 2.5% voxel
@@ -271,32 +285,66 @@ private slots:
         QVERIFY(std::abs(viaVoxelSurf->factor - 1.024995) < 1e-5);
     }
 
-    // The orientation key is what the views were built from, so a factor that did
-    // not move must not cost a rebuild, and one that did must.
-    void orientationKeyFollowsTheFactor()
+    // The orientation key is what the views were built from, so it must rebuild
+    // exactly when the orientation would come out different — and it must reach
+    // that answer without re-resolving the umbilicus, since a comparison that read
+    // the cached factor would compare the old value against itself.
+    void orientationKeyFollowsWhatReachedTheGeometry()
     {
-        QVERIFY(sameOrientationKey(appliedKey(1.0), appliedKey(1.0)));
-        QVERIFY(!sameOrientationKey(appliedKey(1.0), appliedKey(1.024995)));
+        const auto dims = UmbilicusScaleSource::StampedDimensions;
+        const auto voxel = UmbilicusScaleSource::StampedVoxelSize;
+        const auto inferred = UmbilicusScaleSource::InferredFromGrid;
 
-        // Representation noise is not a change.
-        QVERIFY(sameOrientationKey(appliedKey(4.0), appliedKey(4.0 + 1e-13)));
+        // Identical inputs.
+        QVERIFY(sameOrientationKey(appliedKey(9.596, dims), appliedKey(9.596, dims)));
+
+        // Same voxel counts, 2.5% different µm figure. Through dimensions or
+        // inference the figure never reached the geometry, so nothing to rebuild.
+        QVERIFY(sameOrientationKey(appliedKey(9.596, dims), appliedKey(9.362, dims)));
+        QVERIFY(sameOrientationKey(appliedKey(9.596, inferred),
+                                   appliedKey(9.362, inferred)));
+
+        // Through a stamped voxel size it did: 9.596/9.362 is a real scale change.
+        QVERIFY(!sameOrientationKey(appliedKey(9.596, voxel), appliedKey(9.362, voxel)));
+
+        // Different voxel counts are a different grid regardless.
+        auto otherCounts = appliedKey(9.596, dims);
+        otherCounts.frame = otherGrid();
+        QVERIFY(!sameOrientationKey(appliedKey(9.596, dims), otherCounts));
 
         // The volume's own shape is in the key because the volume-centre fallback
         // and the legacy reading use it directly.
-        auto otherShape = appliedKey(1.0);
+        auto otherShape = appliedKey(9.596, dims);
         otherShape.rawVolumeShapeXyz = {3314, 3314, 9620};
-        QVERIFY(!sameOrientationKey(appliedKey(1.0), otherShape));
+        QVERIFY(!sameOrientationKey(appliedKey(9.596, dims), otherShape));
 
         // As is how the umbilicus was read at all.
-        auto legacy = appliedKey(1.0);
+        auto legacy = appliedKey(9.596, dims);
         legacy.mode = UmbilicusOrientationMode::Legacy;
-        QVERIFY(!sameOrientationKey(appliedKey(1.0), legacy));
+        QVERIFY(!sameOrientationKey(appliedKey(9.596, dims), legacy));
 
         // And the registration transform a legacy reading went through.
         auto viaTransform = legacy;
         viaTransform.transformPath = "/vol/transform.json";
         viaTransform.transformSize = 512;
         QVERIFY(!sameOrientationKey(legacy, viaTransform));
+    }
+
+    // An unknown voxel size means an unknown factor, so the volume's raw counts are
+    // not counts in the annotated frame and must not be presented as though they
+    // were.
+    void anUnknownFactorYieldsNoExtent()
+    {
+        const auto noVoxelSize =
+            deriveAnnotationFrame(0.0, 0, std::nullopt, kSourceDims);
+        QVERIFY(!noVoxelSize.voxelSizeUm.has_value());
+        QCOMPARE(noVoxelSize.extentXyz[0], 0.0);
+        QCOMPARE(noVoxelSize.extentXyz[2], 0.0);
+
+        // A stamped resolution alone does not rescue it: without the store's own
+        // voxel size there is no ratio to carry the counts by.
+        const auto stampedOnly = deriveAnnotationFrame(0.0, 0, 2.4, kSourceDims);
+        QCOMPARE(stampedOnly.extentXyz[2], 0.0);
     }
 };
 

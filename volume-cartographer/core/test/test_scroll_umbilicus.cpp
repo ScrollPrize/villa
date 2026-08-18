@@ -568,12 +568,19 @@ TEST_CASE("uniformRescaleFactor: a two percent spread is not a rescale")
 
 TEST_CASE("uniformRescaleFactor: small grids get no free tolerance")
 {
-    // Ratios (0.51, 0.51, 0.5). Every axis is within one target voxel of a
-    // single factor, so a fixed one-voxel slack would accept this; the bound
-    // scales with the factor instead, and 2% of a 100-voxel axis is not
-    // downsample rounding.
+    // Ratios (0.51, 0.51, 0.5). Halving 100 gives 50, and nothing rounds to 51,
+    // so no integer factor explains these counts -- where a tolerance measured in
+    // voxels, or a 2% spread, would have accepted them.
     CHECK_FALSE(uniformRescaleFactor({100.0, 100.0, 1000.0}, {51.0, 51.0, 500.0})
                     .has_value());
+}
+
+TEST_CASE("uniformRescaleFactor: several candidates is not an answer")
+{
+    // On a one-voxel grid every factor rounds to the same count, so the counts
+    // identify nothing. Picking the smallest would be a guess dressed as a
+    // derivation.
+    CHECK_FALSE(uniformRescaleFactor({1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}).has_value());
 }
 
 TEST_CASE("uniformRescaleFactor: a cropped axis is refused")
@@ -583,10 +590,10 @@ TEST_CASE("uniformRescaleFactor: a cropped axis is refused")
                     .has_value());
 }
 
-TEST_CASE("uniformRescaleFactor: the rounding bound is tight on both sides")
+TEST_CASE("uniformRescaleFactor: the rounding window is exactly floor/ceil")
 {
-    // f - 1 target voxels is the most a floor/ceil downsample can hide. At the
-    // bound it is accepted; well past it, refused.
+    // 75787/4 is 18946.75, whose floor is the stamped 18946, so a factor of 4
+    // explains it; 75800/4 is 18950 and nothing rounds to 18946.
     const std::array<double, 3> stamped{8174.0, 8174.0, 18946.0};
     CHECK(uniformRescaleFactor(stamped, {32696.0, 32696.0, 75787.0}).has_value());
     CHECK_FALSE(uniformRescaleFactor(stamped, {32696.0, 32696.0, 75800.0}).has_value());
@@ -594,20 +601,20 @@ TEST_CASE("uniformRescaleFactor: the rounding bound is tight on both sides")
 
 TEST_CASE("uniformRescaleFactor: a coarser target works with a real residual")
 {
-    // The stamp is the finer grid, so the rounding sits on the target side and
-    // the bound is 1 - f. The residual is non-zero, so this cannot pass by
-    // having zero error on some reference axis.
+    // The stamp is the finer grid, so the rounding sits on the target side, and
+    // 32693/4 is 8173.25 whose ceiling is the target's 8174. Exactly 1/4, not a
+    // point picked out of a range.
     const auto factor = uniformRescaleFactor({32693.0, 32693.0, 75784.0},
                                              {8174.0, 8174.0, 18946.0});
     REQUIRE(factor.has_value());
-    CHECK(*factor == doctest::Approx(0.25).epsilon(1e-4));
+    CHECK(*factor == doctest::Approx(0.25).epsilon(1e-12));
     CHECK(*factor < 1.0);
 }
 
-TEST_CASE("uniformRescaleFactor: fractional and unusable extents")
+TEST_CASE("uniformRescaleFactor: non-power-of-two factors, and unusable extents")
 {
-    // AnnotationFrame::extentXyz is integer voxel counts times a floating ratio,
-    // so a caller can hand in non-integral counts.
+    // x3 is not a pyramid level but is still an integer rescale, which is exactly
+    // what stamped counts are meant to express.
     const auto factor = uniformRescaleFactor({8174.0, 8174.0, 18946.0},
                                              {24522.0, 24522.0, 56838.0});
     REQUIRE(factor.has_value());
@@ -755,10 +762,18 @@ TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
     CHECK(decideUmbilicusLoadAction(std::nullopt, noClaim, true) ==
           UmbilicusLoadAction::UseLegacy);
 
-    // Without a target frame there is nothing to conflict with, so a claim that
-    // could not even be compared must not be blamed for the caller's gap.
+    // No target frame means a stated frame could not be *checked*, which is not
+    // the same as the file stating nothing. The legacy reading applies a
+    // registration inverse or takes the points raw, so using it on a file whose
+    // declaration we could not evaluate is proceeding exactly where the check
+    // failed. Refused; only the diagnostic differs from a mismatch.
     CHECK(decideUmbilicusLoadAction(std::nullopt, claimed, false) ==
-          UmbilicusLoadAction::UseLegacy);
+          UmbilicusLoadAction::Refuse);
     CHECK(decideUmbilicusLoadAction(stamped, claimed, false) ==
+          UmbilicusLoadAction::Refuse);
+
+    // A file that states nothing still keeps its previous reading, with or without
+    // a target grid: that is the compatibility promise, not a guess.
+    CHECK(decideUmbilicusLoadAction(std::nullopt, noClaim, false) ==
           UmbilicusLoadAction::UseLegacy);
 }

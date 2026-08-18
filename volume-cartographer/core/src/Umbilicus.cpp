@@ -9,6 +9,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <string>
 
 #include "utils/Json.hpp"
@@ -364,11 +365,16 @@ UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
                     reject("volume", "expected a non-empty string", value);
                 }
             }
+            bool dimensionRejected = false;
             const auto readDimension =
-                [&metadata, &reject](const char* key, std::optional<int>& out) {
+                [&metadata, &reject, &dimensionRejected](const char* key,
+                                                         std::optional<int>& out) {
                     if (!metadata.contains(key)) {
                         return;
                     }
+                    dimensionRejected = dimensionRejected ||
+                                        !(metadata.at(key).is_number_integer() &&
+                                          metadata.at(key).get_int() > 0);
                     const auto& value = metadata.at(key);
                     if (value.is_number_integer() && value.get_int() > 0) {
                         out = value.get_int();
@@ -379,6 +385,40 @@ UmbilicusFileInfo Umbilicus::LoadJsonFile(const std::filesystem::path& path)
             readDimension("volume_width", info.volumeWidth);
             readDimension("volume_height", info.volumeHeight);
             readDimension("volume_slices", info.volumeSlices);
+
+            // A partial triplet is a malformed statement, not an absent one. Two of
+            // three dimensions cannot describe a grid, and letting the pair sit
+            // there unread would make a typo'd or dropped key indistinguishable
+            // from a legacy file -- the same fail-open as a mistyped value, which
+            // is rejected two lines up. Consumers would go on to a voxel size or an
+            // inferred scale without ever checking what the file did declare.
+            const int declaredDimensions =
+                (info.volumeWidth ? 1 : 0) + (info.volumeHeight ? 1 : 0) +
+                (info.volumeSlices ? 1 : 0);
+            // Skipped when a dimension key was present but rejected: that file is
+            // already refused, and naming the bad value is more use than also
+            // complaining that the triplet it broke is now incomplete.
+            if (!dimensionRejected && declaredDimensions > 0 &&
+                declaredDimensions < 3) {
+                std::string missing;
+                for (const auto& [key, present] :
+                     {std::pair<const char*, bool>{"volume_width",
+                                                   info.volumeWidth.has_value()},
+                      std::pair<const char*, bool>{"volume_height",
+                                                   info.volumeHeight.has_value()},
+                      std::pair<const char*, bool>{"volume_slices",
+                                                   info.volumeSlices.has_value()}}) {
+                    if (!present) {
+                        if (!missing.empty()) {
+                            missing += ", ";
+                        }
+                        missing += key;
+                    }
+                }
+                info.metadataErrors.push_back(
+                    "volume dimensions: an incomplete triplet declares nothing; "
+                    "missing " + missing);
+            }
         }
     }
 

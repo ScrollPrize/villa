@@ -383,6 +383,77 @@ TEST_CASE("LoadFileInfo: text file parses points with no metadata")
     fs::remove(path);
 }
 
+TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absent")
+{
+    const std::string points =
+        R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
+
+    SUBCASE("two of three declares nothing and says so")
+    {
+        const auto path = tmpFile("info_partial_dims", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": 8174, "volume_slices": 18946},)"
+                      + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        // Points still parse: a caller wanting only the polyline must not lose its
+        // umbilicus over a frame field it never reads.
+        CHECK(info.controlPoints.size() == 1);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume dimensions: an incomplete triplet declares nothing; "
+              "missing volume_height");
+        fs::remove(path);
+    }
+
+    SUBCASE("one of three names both absent keys")
+    {
+        const auto path = tmpFile("info_one_dim", ".json");
+        writeFile(path, R"({"metadata": {"volume_height": 8174},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume dimensions: an incomplete triplet declares nothing; "
+              "missing volume_width, volume_slices");
+        fs::remove(path);
+    }
+
+    SUBCASE("a complete triplet is silent")
+    {
+        const auto path = tmpFile("info_full_dims", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": 8174, "volume_height": 8174,)"
+                  R"( "volume_slices": 18946},)" + points);
+
+        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        fs::remove(path);
+    }
+
+    SUBCASE("declaring none of them stays legal and silent")
+    {
+        const auto path = tmpFile("info_no_dims", ".json");
+        writeFile(path, R"({"metadata": {"voxelsize_um": 9.6},)" + points);
+
+        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        fs::remove(path);
+    }
+
+    SUBCASE("a rejected dimension is blamed once, not twice")
+    {
+        const auto path = tmpFile("info_bad_and_partial", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": -5, "volume_height": 8174},)"
+                      + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume_width: expected a positive integer, got -5");
+        fs::remove(path);
+    }
+}
+
 TEST_CASE("LoadFileInfo: a malformed field only costs that field")
 {
     const std::string points =
@@ -393,7 +464,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
         const auto path = tmpFile("info_bad_voxelsize", ".json");
         writeFile(path,
                   R"({"metadata": {"voxelsize_um": "nine point six",)"
-                  R"( "volume": "scroll.zarr", "volume_width": 8174},)" + points);
+                  R"( "volume": "scroll.zarr", "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
         const auto info = Umbilicus::LoadFileInfo(path);
         CHECK_FALSE(info.voxelsizeUm.has_value());
@@ -409,8 +481,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
     {
         const auto path = tmpFile("info_zero_voxelsize", ".json");
         writeFile(path,
-                  R"({"metadata": {"voxelsize_um": 0, "volume_slices": 18946},)"
-                      + points);
+                  R"({"metadata": {"voxelsize_um": 0, "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
         const auto info = Umbilicus::LoadFileInfo(path);
         CHECK_FALSE(info.voxelsizeUm.has_value());
@@ -426,7 +498,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
         const auto path = tmpFile("info_bad_volume", ".json");
         writeFile(path,
                   R"({"metadata": {"voxelsize_um": 2.4, "volume": 7,)"
-                  R"( "volume_height": 8174},)" + points);
+                  R"( "volume_width": 8174, "volume_height": 8174,)"
+                  R"( "volume_slices": 18946},)" + points);
 
         const auto info = Umbilicus::LoadFileInfo(path);
         CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
@@ -442,7 +515,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
     {
         const auto path = tmpFile("info_empty_volume", ".json");
         writeFile(path,
-                  R"({"metadata": {"volume": "", "volume_width": 8174},)" + points);
+                  R"({"metadata": {"volume": "", "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
         const auto info = Umbilicus::LoadFileInfo(path);
         CHECK_FALSE(info.volume.has_value());

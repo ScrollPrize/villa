@@ -68,25 +68,21 @@ namespace vc::core::util {
     // The single factor that carries `stampedXyz` voxel counts onto `targetXyz`
     // voxel counts, or nothing when no one factor explains all three axes.
     //
-    // Both triplets count the voxels of one physical volume sampled at two
-    // resolutions, and downsampling rounds, so an axis is consistent with a
-    // factor f when
+    // Downsampling by an integer factor n maps a count c to floor(c/n) or
+    // ceil(c/n) and to nothing else, so a candidate factor is tested exactly:
+    // every axis must land on one of those two values. There is no tolerance to
+    // tune and no averaging. An earlier version accepted any spread of axis
+    // ratios under 2% -- 654 voxels on a 32,696-voxel axis -- and returned their
+    // mean, a factor matching none of them.
     //
-    //     |target - stamped * f| <= |f - 1|
+    // Both directions are tried, so the stamped grid may be the coarser or the
+    // finer of the two. What this cannot do is pin a *fractional* rescale: voxel
+    // counts alone are consistent with a range of non-integer factors, so a file
+    // rescaled by, say, 1.5 is not identified here and must state its voxel size
+    // instead. Non-power-of-two integer factors are fine.
     //
-    // For f > 1 the stamped grid is the coarser one and its count is a floor or
-    // a ceiling of target/f, which hides up to f-1 target voxels; for f < 1 the
-    // rounding happens on the target side and the bound is 1-f. At f == 1 the
-    // tolerance is zero, which is right: identical grids must match exactly.
-    //
-    // That inequality is a closed interval in f per axis, so the answer is the
-    // intersection of three intervals: empty means the stamp does not describe a
-    // rescale of the target at all. Where the intersection holds exactly one
-    // integer that integer is returned, since it is the value consistent with
-    // every axis and every rescale seen so far is integral; otherwise the
-    // midpoint. No tuned tolerance is involved — an earlier version accepted any
-    // spread under 2% and returned the mean of the three ratios, which is a
-    // number that matches none of them.
+    // Several candidates can only survive on grids of a handful of voxels, where
+    // the rounding windows overlap; that yields nothing rather than a guess.
     [[nodiscard]] std::optional<double> uniformRescaleFactor(
         const std::array<double, 3>& stampedXyz,
         const std::array<double, 3>& targetXyz);
@@ -136,9 +132,12 @@ namespace vc::core::util {
     enum class UmbilicusLoadAction {
         // A scale was derived; carry the points into the target frame.
         Apply,
-        // The file states a frame that does not fit the target. Refusing is the
-        // point: a frame applied confidently but wrongly is worse than none,
-        // and silently reinterpreting it is what this replaced.
+        // The file states a frame that does not fit the target, or states one that
+        // could not be checked because there is no target grid. Refusing is the
+        // point: a frame applied confidently but wrongly is worse than none, and
+        // silently reinterpreting it is what this replaced. "Cannot evaluate" and
+        // "does not match" differ in their diagnostics, not in whether the file is
+        // used.
         Refuse,
         // The file states nothing usable, so a consumer may fall back to
         // whatever reading it used before frames were declarable.
