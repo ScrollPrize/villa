@@ -71,6 +71,18 @@ into one control at the clicked location. This keeps adjacent control spans from
 becoming shorter than the generated strip's nominal sampling distance. Seed,
 surviving span policy, and branch links follow the collapsed control.
 
+With automatic reoptimization, VC3D prepares the edit before changing the live
+session. The same local update is used for insertion, one-control replacement,
+and collapse: it reconstructs the surviving spans on both sides of the clicked
+control from that control's known line position, then starts full fiber
+optimization from the updated line. A collapse that leaves only one control
+reinitializes from the clicked point and derives its tangent from the known old-
+line position. It does not locate that tangent by nearest 3-D distance, which
+could select a neighboring winding. If local preparation fails, the prior line,
+controls, branches, focus, and optimization status remain unchanged. Reciprocal
+branch updates for a multi-control collapse are saved only after asynchronous
+optimization and generated-view rebuilding succeed.
+
 The independent **Max extrap CP dist** setting limits how far a new control may
 be placed beyond the first or last control point. It is measured along the
 optimized polyline in base-volume voxels from the relevant outer control. It

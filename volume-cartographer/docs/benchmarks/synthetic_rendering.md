@@ -2,9 +2,11 @@
 
 `bench_render_synthetic` measures the production
 `ChunkedPlaneSampler::sampleCoordsFineToCoarse` path without storage, network,
-decompression, or asynchronous chunk scheduling. It uses a four-level synthetic
-resident array whose deterministic pseudo-random chunk bytes are materialized
-before measurement.
+decompression, or asynchronous chunk scheduling. It uses the production
+`ChunkCache` with a four-level deterministic `IChunkFetcher`. The fetcher
+materializes pseudo-random chunk bytes during preload, and the benchmark fails
+if rendering reaches it after measurement setup. Production cache lookup,
+locking, and request-context handling remain inside the measured path.
 
 ## Scenarios
 

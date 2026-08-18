@@ -108,6 +108,12 @@ def _parser() -> argparse.ArgumentParser:
     inference_run.add_argument("--download-workers", type=int, default=64)
     inference_run.add_argument("--no-prefetch", action="store_true")
     inference_run.add_argument(
+        "--live-fetch", action="store_true",
+        help="Stream the selected scale through a conservative rolling disk cache.",
+    )
+    inference_run.add_argument("--live-cache-gib", type=float, default=None)
+    inference_run.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
+    inference_run.add_argument(
         "--legacy-config", default=None,
         help="Explicit config JSON for a legacy checkpoint without embedded config.",
     )
@@ -195,9 +201,11 @@ def _complete(config, kind: str, prefix: str) -> None:
                 shape = "x".join(str(v) for v in record.shape)
                 print(f"{record.selector}\t{shape} {record.pixel_size_um or '-'}um")
     elif kind == "snapshot":
-        for record in index_snapshots(config, cached_only=True):
-            if record.selector.startswith(prefix):
-                print(f"{record.selector}\tstep {record.step if record.step is not None else '-'}")
+        from .snapshots import completion_snapshot_candidates
+
+        for selector, description in completion_snapshot_candidates(config):
+            if selector.startswith(prefix):
+                print(f"{selector}\t{description}")
     else:
         client = Tmux()
         for _path, record in read_runs(config):
@@ -435,8 +443,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     config, snapshot, volume, args.scale,
                     original_argv=args_list, extra_args=inference_args,
                     legacy_config=args.legacy_config,
-                    prefetch=not args.no_prefetch,
+                    prefetch=not args.no_prefetch and not args.live_fetch,
                     download_workers=args.download_workers,
+                    live_fetch=bool(args.live_fetch),
+                    live_cache_gib=args.live_cache_gib,
+                    live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
                 )
                 print(run_dir)
         elif args.command == "run":

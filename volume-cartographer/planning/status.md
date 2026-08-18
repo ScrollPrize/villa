@@ -1,17 +1,15 @@
-# VC3D short line-segment status
+# VC3D render attribution and lookup repair status
 
-- [x] Capture task requirements.
-- [x] Inspect strip generation, click handling, optimization, and branch sync.
-- [x] Write implementation/test/spec/docs plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Implement fixed 32-vx control-span strip pitch.
-- [x] Implement arclength control collapse and branch remapping.
-- [x] Add/update regression tests.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Build and run focused tests with 32 cores.
-- [x] Run `git diff --check` and review the final diff.
-- [x] Pass annotation control positions from both production strip callers.
-- [x] Remove unused cross-strip configuration.
-- [x] Use a fixed seven-row, 192-vx physical strip width.
-- [x] Update control-span and cross-width regression tests and documentation.
-- [x] Rebuild and rerun focused validation with 32 cores.
+- [x] Capture the attribution-first task and deferred speed requirements.
+- [x] Confirm current cross-run worker-ID attribution behavior.
+- [x] Confirm render-job request lifetime and existing local chunk caching.
+- [x] Record attribution alternatives and a provisional recommendation.
+- [x] Replace rank/tie matching with same-run scheduler evidence.
+- [x] Collect initial repeated artifacts and identify worker/scope mismatch.
+- [x] Validate passive canonical pairing over three full parallel matrices.
+- [x] Implement and test deterministic paired attribution in native C++.
+- [x] Re-evaluate residual variation with three fresh current-binary pairs.
+- [x] Validate the repaired attribution against the existing enabled CI gate.
+- [ ] Profile and implement lookup optimization against the accepted gate.
+- [x] Update specifications, documentation, and changelog.
+- [x] Complete native unit, compatibility, matrix, reference, and repeatability validation.
