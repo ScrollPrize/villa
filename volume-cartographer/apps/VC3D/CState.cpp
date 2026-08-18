@@ -1,4 +1,5 @@
 #include "CState.hpp"
+
 #include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 
@@ -180,13 +181,9 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(
-    size_t cacheSizeBytes,
-    QObject* parent,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget)
+CState::CState(QObject* parent, bool debugDownloadQueue)
     : QObject(parent)
-    , _cacheSizeBytes(cacheSizeBytes)
-    , _decodedCacheBudget(std::move(decodedCacheBudget))
+    , _debugDownloadQueue(debugDownloadQueue)
 {
     _pointCollection = new VCCollection(this);
 
@@ -198,11 +195,7 @@ CState::CState(
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
 }
 
-CState::~CState()
-{
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
-}
+CState::~CState() = default;
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
@@ -229,17 +222,11 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     if (_currentVolume == vol) {
-        applyCacheBudget(vol);
         resolveCurrentVolumeId();
         emit volumeChanged(_currentVolume, _currentVolumeId);
         return;
     }
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
     _currentVolume = std::move(vol);
-    applyCacheBudget(_currentVolume);
-    if (_currentVolume)
-        _currentVolume->retainCacheClient();
     resolveCurrentVolumeId();
     _pointCollection->setFileMetadata(
         (_vpkg && !_currentVolumeId.empty())
@@ -284,21 +271,6 @@ void CState::clearActiveSurface()
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
 
-size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
-
-std::shared_ptr<vc::render::DecodedChunkCacheBudget>
-CState::decodedCacheBudget() const
-{
-    return _decodedCacheBudget;
-}
-
-void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
-{
-    if (vol && _cacheSizeBytes > 0) {
-        vol->setCacheBudget(_cacheSizeBytes, _decodedCacheBudget);
-    }
-}
-
 void CState::resolveCurrentVolumeId()
 {
     _currentVolumeId.clear();
@@ -336,8 +308,6 @@ void CState::closeAll()
         }
     }
 
-    if (_currentVolume)
-        _currentVolume->releaseCacheClient();
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();

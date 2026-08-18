@@ -22,11 +22,6 @@
 
 #include <array>
 
-namespace vc::render {
-class ChunkCache;
-class DecodedChunkCacheBudget;
-}
-
 class QMdiArea;
 class QTimer;
 class AxisAlignedSliceController;
@@ -94,43 +89,9 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
-    // --- Chunk-source policy ---
-    //
-    // Where a viewer of this manager samples from. PrivateBounded gives this
-    // manager its own hard-capped pools that are not joined to the
-    // process-wide decoded-byte budget: they can neither evict the shared
-    // working set nor be evicted by it, and they die with the workspace.
-    enum class ChunkCachePolicy { SharedVolumeCache, PrivateBounded };
-    // Plane views interleave in time (you use one pane at a time), so one
-    // capped pool beats three. Each surface-tile channel gets its own so plane,
-    // base-tile, and overlay-tile requests can supersede independently.
-    enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
-
-    // Re-read all per-workspace viewer-cache settings. Called during manager
+    // Re-read the derived surface-cache settings. Called during manager
     // construction and whenever the settings dialog applies.
     void applyViewerCacheSettings();
-    void setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes);
-    ChunkCachePolicy chunkCachePolicy() const { return _chunkCachePolicy; }
-    // The configured value is a *floor*: a setting that cannot hold one frame
-    // would thrash, so the effective LRU cap is raised to fit instead. The
-    // effective value is what the status bar reports as the capacity.
-    std::size_t chunkCacheFloorBytes(ChunkCachePool pool) const;
-    void setChunkCacheFloorBytes(ChunkCachePool pool, std::size_t bytes);
-    std::size_t effectiveChunkCacheCapacity(ChunkCachePool pool) const;
-    // Raise a pool's floor from an observed one-frame (or one-tile-set) chunk
-    // footprint. Doubling it is what keeps a render from re-reading chunks it
-    // just evicted, since the sampler only pins a small window at a time. The
-    // raise is capped (see below) so a bad estimate degrades into thrashing
-    // rather than unbounded retention.
-    void noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes);
-    // How far a derived footprint may raise the configured floor, and the
-    // absolute ceiling on a private pool regardless of setting.
-    static constexpr std::size_t kChunkCacheDerivedFloorMultiplier = 8;
-    static constexpr std::size_t kChunkCacheAbsoluteCapBytes =
-        16ULL * 1024 * 1024 * 1024;
-    std::shared_ptr<vc::render::ChunkCache> chunkCacheFor(
-        const std::shared_ptr<Volume>& volume,
-        ChunkCachePool pool = ChunkCachePool::PlaneViews);
 
     // --- SurfaceCache budgets (flattened segmentation view) ---
     //
@@ -375,31 +336,8 @@ private:
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
-    ChunkCachePolicy _chunkCachePolicy{ChunkCachePolicy::SharedVolumeCache};
     std::size_t _surfaceCacheBudgetBytes{0};
     std::size_t _overlaySurfaceCacheBudgetBytes{0};
-    struct PrivateChunkPool {
-        // Held weakly: a pool exists for the volume the workspace is showing,
-        // and switching volumes releases the previous one rather than
-        // accumulating a pool per volume ever visited.
-        std::weak_ptr<Volume> volume;
-        std::shared_ptr<vc::render::ChunkCache> cache;
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> budget;
-        // Configured floor, and the floor derived from observed footprints.
-        // The effective cap is the larger of the two.
-        std::size_t floorBytes{0};
-        std::size_t requiredBytes{0};
-        std::size_t builtCapacity{0};
-    };
-    std::array<PrivateChunkPool, 3> _privateChunkPools;
-    PrivateChunkPool& privateChunkPool(ChunkCachePool pool)
-    {
-        return _privateChunkPools[static_cast<std::size_t>(pool)];
-    }
-    const PrivateChunkPool& privateChunkPool(ChunkCachePool pool) const
-    {
-        return _privateChunkPools[static_cast<std::size_t>(pool)];
-    }
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};

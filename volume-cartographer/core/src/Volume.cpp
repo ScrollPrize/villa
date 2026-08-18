@@ -29,6 +29,7 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -40,21 +41,6 @@ static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 
 namespace
 {
-
-bool isRemoteAuthError(const std::exception& e)
-{
-    const std::string msg = e.what();
-    return msg.find("AWS credentials") != std::string::npos ||
-           msg.find("Access denied") != std::string::npos ||
-           msg.find("ExpiredToken") != std::string::npos ||
-           msg.find("InvalidToken") != std::string::npos ||
-           msg.find("TokenRefreshRequired") != std::string::npos ||
-           msg.find("InvalidAccessKeyId") != std::string::npos ||
-           msg.find("SignatureDoesNotMatch") != std::string::npos ||
-           msg.find("HTTP 400") != std::string::npos ||
-           msg.find("HTTP 401") != std::string::npos ||
-           msg.find("HTTP 403") != std::string::npos;
-}
 
 std::string normalizeRemoteVolumeUrl(std::string url)
 {
@@ -1341,41 +1327,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const vc::HttpAuth& authIn,
     const utils::Json& metadata)
 {
-    // Parse the client-side view selector before resolving S3 or constructing
-    // any network URL.
-    const auto spec = vc::parseRemoteVolumeSpec(url);
-    vc::HttpAuth auth = authIn;
-    if (spec.useAwsSigv4 && auth.empty()) {
-        auth = vc::loadAwsCredentials();
-        if (auth.region.empty())
-            auth.region = spec.awsRegion;
-        // SigV4 is implicitly enabled when access_key is non-empty.
-        // If credentials are missing, clear them so the request proceeds
-        // unsigned (anonymous access for public buckets).
-        if (auth.access_key.empty() || auth.secret_key.empty())
-            auth = {};  // anonymous — no SigV4
-    } else if (spec.useAwsSigv4 && auth.region.empty()) {
-        auth.region = spec.awsRegion;
-    }
-
+    vc::render::RemoteZarrOpenOptions openOptions;
+    openOptions.auth = authIn;
+    auto remoteOpen = vc::render::openRemoteZarrPyramid(url, std::move(openOptions));
+    auto opened = std::move(remoteOpen.opened);
+    auto auth = std::move(remoteOpen.auth);
+    const auto& spec = remoteOpen.spec;
     const std::string& remoteUrl = spec.sourceUrl;
-
-    vc::render::OpenedChunkedZarr opened;
-    // Open the zarr metadata in memory. This performs the normal zarr metadata
-    // reads, but does not stage .zarray/meta.json files on disk.
-    // If stale AWS credentials are present, public buckets may reject the
-    // signed request even though the same object is readable anonymously.
-    try {
-        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, auth);
-    } catch (const std::exception& e) {
-        if (!spec.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
-            throw;
-        }
-
-        vc::HttpAuth anonymousAuth;
-        opened = vc::render::openHttpZarrPyramid(spec.portableLocator, anonymousAuth);
-        auth = std::move(anonymousAuth);
-    }
 
     if (opened.shapes.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
@@ -1732,26 +1690,12 @@ std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!chunkedCache_) {
         vc::render::ChunkCache::Options options;
-        options.decodedByteCapacity = cacheBudgetHot_;
-        options.decodedByteBudget = decodedCacheBudget_;
-        options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16;
         chunkedCache_ = createChunkCacheConfigured(std::move(options));
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
     }
     return chunkedCache_;
-}
-
-std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
-    vc::render::ChunkCache::Options options) const
-{
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex_);
-        if (!options.decodedByteBudget)
-            options.decodedByteBudget = decodedCacheBudget_;
-    }
-    return createChunkCacheConfigured(std::move(options));
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
@@ -1780,64 +1724,45 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         return nullptr;
     }
 
-    return std::make_shared<vc::render::ChunkCache>(
-        makeChunkCacheLevelInfo(opened),
-        std::move(opened.fetchers),
-        opened.fillValue,
-        opened.dtype,
+    options.zarrMirrorMetadata = std::move(opened.zarrMirrorMetadata);
+    auto levels = makeChunkCacheLevelInfo(opened);
+    return vc::render::processChunkCacheService()->acquireSource(
+        chunkCacheSourceIdentity(), std::move(levels),
+        std::move(opened.fetchers), opened.fillValue, opened.dtype,
         std::move(options));
 }
 
-void Volume::setCacheBudget(
-    size_t hotBytes,
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget)
+std::string Volume::chunkCacheSourceIdentity() const
 {
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheBudgetHot_ == hotBytes && decodedCacheBudget_ == decodedBudget) {
-        // Re-applying the same budget must not drop the warm cache; multiple
-        // workspaces share Volume instances and each applies its budget on
-        // volume selection.
-        return;
+    if (isRemote_) {
+        const auto normalized = vc::core::util::remoteFileCacheSource(
+            vc::core::util::normalizeRemoteFileLocation(remoteUrl_));
+        return "remote|" + normalized +
+               "|base=" + std::to_string(baseScaleLevel_);
     }
-    cacheBudgetHot_ = hotBytes;
-    decodedCacheBudget_ = std::move(decodedBudget);
-    if (chunkedCache_)
-        chunkedCache_->invalidate();
-    chunkedCache_.reset();
-}
-
-void Volume::retainCacheClient()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    ++cacheClientCount_;
-}
-
-void Volume::releaseCacheClient()
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheClientCount_ == 0)
-        return;
-    --cacheClientCount_;
-    if (cacheClientCount_ == 0 && chunkedCache_) {
-        chunkedCache_->invalidate();
-        chunkedCache_.reset();
+    if (preparedSourceFactory_) {
+        return "prepared|" + id() + "|instance=" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(this));
     }
-}
-
-void Volume::setIOThreads(int count)
-{
-    std::lock_guard<std::mutex> lock(cacheMutex_);
-    ioThreads_ = count;
-    if (chunkedCache_)
-        chunkedCache_->invalidate();
-    chunkedCache_.reset();
+    std::error_code ec;
+    auto sourcePath = std::filesystem::weakly_canonical(path_, ec);
+    if (ec)
+        sourcePath = std::filesystem::absolute(path_, ec);
+    if (ec)
+        sourcePath = path_;
+    return "local|" + sourcePath.lexically_normal().string() +
+           "|base=" + std::to_string(baseScaleLevel_);
 }
 
 void Volume::invalidateCache()
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (chunkedCache_)
+    if (chunkedCache_) {
         chunkedCache_->invalidate();
+    } else {
+        vc::render::processChunkCacheService()->invalidateSource(
+            chunkCacheSourceIdentity());
+    }
     chunkedCache_.reset();
 }
 

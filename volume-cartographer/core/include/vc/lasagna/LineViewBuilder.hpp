@@ -11,13 +11,20 @@ class QuadSurface;
 
 namespace vc::lasagna {
 
+inline constexpr double kLineViewSamplingDistanceBaseVoxels = 32.0;
+inline constexpr int kLineViewCrossSampleCount = 7;
+
 struct LineViewConfig {
-    // Non-positive values auto-size from the optimized control-point step and
-    // crossSamples, so cross-strip spacing matches the line step.
-    double surfaceHalfWidth = 0.0;
-    double sideSliceHalfDepth = 0.0;
-    int crossSamples = 21;
-    // Optional per-control-point oriented sheet normals, indexed like
+    // Derived ribbons retain every annotation control point and subdivide the
+    // optimized polyline between adjacent controls as closely as possible to
+    // this spacing. The declared along-strip scale always uses this target, so
+    // a shorter control-point span occupies one full display interval.
+    double targetSpacingBaseVoxels = kLineViewSamplingDistanceBaseVoxels;
+    // Fractional indices into LineModel::points. Line endpoints are always
+    // retained as additional supports. Empty retains every line point for
+    // callers that do not have separate annotation-control metadata.
+    std::vector<double> controlPointLinePositions;
+    // Optional per-line-point oriented sheet normals, indexed like
     // LineModel::points (entries may be NaN/zero where unavailable).
     // When non-empty and size-matched, one global sign flip is applied so the
     // frame mesh normals AND the display up vectors agree with these on a
@@ -25,11 +32,32 @@ struct LineViewConfig {
     std::vector<cv::Vec3f> orientedPointNormals;
 };
 
+// Maps the original LineModel point-index coordinate to the ribbon grid and
+// back. Each configured annotation control point and each line endpoint is a
+// grid support, with span-local subdivisions between supports. Fractional
+// original positions interpolate within an optimized-line segment. Consecutive
+// duplicate line points share one arclength; inversion at that arclength
+// returns the first point in the duplicate run.
+struct LineStripPositionMap {
+    std::vector<double> originalArclengths;
+    std::vector<double> stripGridArclengths;
+    double totalArclength = 0.0;
+    // Fixed target spacing used for the QuadSurface's scalar grid-density
+    // metadata. Exact source mapping uses stripGridArclengths.
+    double stripGridSpacingBaseVoxels = 0.0;
+    size_t stripGridColumnCount = 0;
+
+    [[nodiscard]] bool valid() const;
+    [[nodiscard]] double originalPositionToStripGridColumn(double originalPosition) const;
+    [[nodiscard]] double stripGridColumnToOriginalPosition(double stripGridColumn) const;
+};
+
 struct LineViewSurfaces {
     std::shared_ptr<QuadSurface> lineSurface;
     std::shared_ptr<QuadSurface> lineSideSlice;
     std::vector<std::shared_ptr<PlaneSurface>> lineZSlices;
     std::vector<cv::Vec3f> lineUpVectors;
+    LineStripPositionMap stripPositionMap;
 };
 
 struct LineViewFrameIssue {

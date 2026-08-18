@@ -429,6 +429,11 @@ class ExportPreviewCommand(SessionCommand):
 
     kind: ClassVar[str] = "export_preview"
 
+    #: Compute the loss overlays alongside the surface. Off by default: they
+    #: cost about as much as the surface and only the client knows whether
+    #: anyone is looking at them.
+    diagnostics: bool = False
+
 
 @dataclasses.dataclass
 class PreflightCheckpointCommand(SessionCommand):
@@ -513,6 +518,7 @@ class InteractiveFitSession:
         self._output_path = paths.output_directory
         self._preview_manifest = None
         self._preview_generation = 0
+        self._preview_diagnostics = False
         self._preview_session_id = uuid.uuid4().hex
         # Set by every run; the default matters only for the interval before
         # the first one.
@@ -570,6 +576,10 @@ class InteractiveFitSession:
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
+                # Whether this generation carries loss overlays, so the host
+                # knows whether a diagnostics publication follows the surface.
+                "preview_diagnostics": getattr(
+                    self, "_preview_diagnostics", False),
                 "supports_input_incorporation": self._context is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
                 "progress": self._progress_reporter().snapshot(),
@@ -1137,7 +1147,7 @@ class InteractiveFitSession:
         try:
             self._progress_reporter().begin(
                 "exporting_preview", "Exporting preview")
-            self._publish_preview()
+            self._publish_preview(diagnostics=command.diagnostics)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -1396,16 +1406,18 @@ class InteractiveFitSession:
             self._progress_reporter().clear()
             self._transition(SessionState.Idle, IDLE_PHASE)
 
-    def _publish_preview(self):
+    def _publish_preview(self, diagnostics=False):
         with self._condition:
             generation = self._preview_generation + 1
         generation_path = (Path(self.paths.output_directory) / ".spiral-preview" /
                            self._preview_session_id / f"generation-{generation}")
         surface_id = f"spiral-output-generation-{generation}"
-        manifest = self._context.export_preview(str(generation_path), surface_id)
+        manifest = self._context.export_preview(
+            str(generation_path), surface_id, diagnostics=diagnostics)
         with self._condition:
             self._preview_generation = generation
             self._preview_manifest = str(manifest["manifest_path"])
+            self._preview_diagnostics = bool(diagnostics)
         # Publish while the session is still in ExportingPreview.  The host
         # service synchronously Lasagna-flattens and packages this generation
         # from the status callback, so clients cannot start another Run while
@@ -1591,7 +1603,8 @@ class InteractiveFitSession:
                 session_generation=self.session_generation, epoch=epoch)
         return self._queue_command(command, timeout)
 
-    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S,
+                       diagnostics=False):
         """Export and publish one preview generation, on request.
 
         A coordinator sub-operation: only the publishing rank exports, so it
@@ -1605,7 +1618,8 @@ class InteractiveFitSession:
                 raise RuntimeError("This rank does not publish outputs")
             command = ExportPreviewCommand(
                 session_generation=self.session_generation,
-                expected_iteration=self._completed)
+                expected_iteration=self._completed,
+                diagnostics=bool(diagnostics))
         return self._queue_command(command, timeout)
 
     def load_checkpoint(self, path, timeout=600.0):
@@ -1694,7 +1708,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                     # Coordinator sub-operation: only the publishing rank is
                     # asked, and it carries no barrier.
                     result = session.export_preview(
-                        arguments.get("timeout", PREVIEW_EXPORT_TIMEOUT_S))
+                        arguments.get("timeout", PREVIEW_EXPORT_TIMEOUT_S),
+                        diagnostics=arguments.get("diagnostics", False))
                 elif name == "rebuild_model":
                     result = session.rebuild_model(
                         arguments["paths"], arguments["run"],
@@ -2155,13 +2170,17 @@ class DistributedInteractiveFitSession:
             raise RuntimeError(f"Session is not running (state is {state})")
         return self._call("stop")
 
-    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S):
+    def export_preview(self, timeout=PREVIEW_EXPORT_TIMEOUT_S,
+                       diagnostics=False):
         state = self.status()["state"]
         if state != SessionState.Idle:
             raise RuntimeError(f"Preview export is not allowed in {state}")
         # Explicitly a coordinator sub-operation: rank 0 publishes outputs,
         # so rank 0 alone exports the preview, outside the epoch sequence.
-        return self._call("export_preview", {"timeout": timeout}, ranks=(0,),
+        return self._call("export_preview",
+                          {"timeout": timeout,
+                           "diagnostics": bool(diagnostics)},
+                          ranks=(0,),
                           timeout=timeout + COMMAND_ACK_GRACE_S,
                           collective=False)
 

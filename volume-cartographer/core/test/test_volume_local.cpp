@@ -5,6 +5,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
 
@@ -170,7 +171,7 @@ TEST_CASE("Volume: chunkExists turns true after writeChunk")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: final cache client release drops decoded chunks")
+TEST_CASE("Volume: regular cache retains decoded chunks")
 {
     auto d = tmpDir("cache-client");
     auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
@@ -178,27 +179,149 @@ TEST_CASE("Volume: final cache client release drops decoded chunks")
     std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
     v->writeChunk(0, {0, 0, 0}, chunk);
 
-    auto budget =
-        std::make_shared<vc::render::DecodedChunkCacheBudget>(64 * 1024);
-    v->setCacheBudget(64 * 1024, budget);
-    v->retainCacheClient();
-    v->retainCacheClient();
+    auto service = vc::render::processChunkCacheService();
+    service->configureDecodedByteCapacity(1);
+    service->configureDecodedByteCapacity(64 * 1024);
     auto cache = v->sharedChunkCache();
     REQUIRE(cache);
     CHECK(v->chunkedCache() == cache.get());
     CHECK(cache->getChunkBlocking(0, 0, 0, 0).status ==
           vc::render::ChunkStatus::Data);
-    CHECK(budget->stats().decodedBytes == chunk.size());
-
-    v->releaseCacheClient();
-    CHECK(budget->stats().decodedBytes == chunk.size());
-    v->releaseCacheClient();
-    CHECK(budget->stats().decodedBytes == 0);
-    CHECK(cache->stats().decodedBytes == 0);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
+    CHECK(cache->stats().decodedBytes == chunk.size());
 
     std::weak_ptr<vc::render::ChunkCache> weakCache = cache;
     cache.reset();
-    CHECK(weakCache.expired());
+    CHECK_FALSE(weakCache.expired());
+    CHECK(v->sharedChunkCache() == weakCache.lock());
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: process service keeps decoded chunks across handles")
+{
+    auto d = tmpDir("cache-service-client");
+    auto firstVolume = Volume::New(
+        d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(firstVolume);
+    std::vector<std::byte> chunk(
+        firstVolume->chunkByteSize(0), std::byte{0x3c});
+    firstVolume->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto service = vc::render::processChunkCacheService();
+    service->configureDecodedByteCapacity(1);
+    service->configureDecodedByteCapacity(64 * 1024);
+    const auto sourcesBefore = service->sourceCount();
+    auto first = firstVolume->sharedChunkCache();
+    REQUIRE(first->getChunkBlocking(0, 0, 0, 0).status ==
+            vc::render::ChunkStatus::Data);
+    const auto sourceId = first->sourceId();
+    first.reset();
+    firstVolume.reset();
+
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
+    auto secondVolume = Volume::New(d);
+    REQUIRE(secondVolume);
+    auto reacquired = secondVolume->sharedChunkCache();
+    CHECK(reacquired->sourceId() == sourceId);
+    CHECK(service->sourceCount() == sourcesBefore + 1);
+    CHECK(reacquired->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: service concurrency reconfigures without eviction")
+{
+    auto d = tmpDir("cache-service-threads");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x4d});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto service = vc::render::processChunkCacheService();
+    service->configureFetchConcurrency(2, false);
+
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    auto loaded = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(loaded.status == vc::render::ChunkStatus::Data);
+    REQUIRE(loaded.bytes);
+    service->configureFetchConcurrency(3, false);
+    const auto concurrency = service->fetchConcurrency();
+    CHECK(concurrency.maxConcurrentReads == 3);
+    CHECK_FALSE(concurrency.adaptive);
+    CHECK(v->sharedChunkCache() == cache);
+    const auto warm = cache->getChunkIfCached(0, 0, 0, 0);
+    REQUIRE(warm.status == vc::render::ChunkStatus::Data);
+    REQUIRE(warm.bytes);
+    CHECK(warm.bytes->front() == std::byte{0x4d});
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: cache budget reconfigures without replacing source state")
+{
+    auto d = tmpDir("cache-service-budget");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto service = vc::render::processChunkCacheService();
+    service->configureDecodedByteCapacity(1);
+    service->configureDecodedByteCapacity(64 * 1024);
+    const auto sourcesBefore = service->sourceCount();
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    const auto source = cache->sourceId();
+    REQUIRE(cache->getChunkBlocking(0, 0, 0, 0).status ==
+            vc::render::ChunkStatus::Data);
+
+    service->configureDecodedByteCapacity(128 * 1024);
+    CHECK(v->sharedChunkCache() == cache);
+    CHECK(cache->sourceId() == source);
+    CHECK(service->sourceCount() == sourcesBefore + 1);
+    CHECK(service->decodedByteBudget()->maximumBytes() == 128 * 1024);
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+
+    service->configureDecodedByteCapacity(16 * 1024);
+    CHECK(v->sharedChunkCache() == cache);
+    CHECK(cache->sourceId() == source);
+    CHECK(service->sourceCount() == sourcesBefore + 1);
+    CHECK(service->decodedByteBudget()->maximumBytes() == 16 * 1024);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+    CHECK(cache->getChunkIfCached(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::MissQueued);
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume: writes invalidate service state without a live handle")
+{
+    auto d = tmpDir("cache-service-write");
+    auto reader = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(reader);
+    std::vector<std::byte> chunk(reader->chunkByteSize(0), std::byte{0x21});
+    reader->writeChunk(0, {0, 0, 0}, chunk);
+    auto writer = Volume::New(d);
+    REQUIRE(writer);
+
+    auto service = vc::render::processChunkCacheService();
+    service->configureDecodedByteCapacity(1);
+    service->configureDecodedByteCapacity(64 * 1024);
+    auto first = reader->sharedChunkCache();
+    auto initial = first->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(initial.status == vc::render::ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*initial.bytes)[0]) == 0x21);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == chunk.size());
+
+    std::fill(chunk.begin(), chunk.end(), std::byte{0x43});
+    // The writer shares the source identity but has never acquired a handle.
+    writer->writeChunk(0, {0, 0, 0}, chunk);
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+
+    auto refreshed = reader->sharedChunkCache()->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(refreshed.status == vc::render::ChunkStatus::Data);
+    CHECK(std::to_integer<int>((*refreshed.bytes)[0]) == 0x43);
     fs::remove_all(d);
 }
 

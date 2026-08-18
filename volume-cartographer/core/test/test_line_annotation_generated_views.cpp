@@ -45,6 +45,14 @@ private:
     cv::Vec3d normal_;
 };
 
+class ThrowingFiberModeNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        throw std::runtime_error("test sampler failure");
+    }
+};
+
 class FiberModePrediction final : public vc::fiber_tracer::FiberPredictionSource {
 public:
     explicit FiberModePrediction(double invalidX =
@@ -292,7 +300,7 @@ TEST_CASE("generated display tangent sign is independent of stored point order")
 
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
-    CState state(64 * 1024 * 1024);
+    CState state;
     state.setSurface("line_annotation_slice_1", state.surface("xy plane"));
 
     const auto views = vc::lasagna::buildLineViewSurfaces(lineModel());
@@ -665,46 +673,6 @@ TEST_CASE("arrow pan integrator handles zero steps and degenerate inputs")
     CHECK(resting.velocity == 0.0);
 }
 
-TEST_CASE("arrow pan boundary target extends one hop past the outer control point")
-{
-    using vc3d::line_annotation::generatedArrowPanBoundaryTarget;
-    const std::vector<double> positions{12.0, 20.0, 40.0};
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-
-    // Bounded by the max-CP-distance allowance when it is shorter than the
-    // remaining line, by the line end (extrapolation limit) otherwise.
-    const auto right = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 30.0);
-    REQUIRE(right.has_value());
-    CHECK(*right == doctest::Approx(70.0));
-    const auto rightClamped = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 1000.0);
-    REQUIRE(rightClamped.has_value());
-    CHECK(*rightClamped == doctest::Approx(100.0));
-    const auto left = generatedArrowPanBoundaryTarget(positions, -1, 0.0, 5.0);
-    REQUIRE(left.has_value());
-    CHECK(*left == doctest::Approx(7.0));
-
-    // <= 0 or non-finite max distance means unlimited: the line end bounds it.
-    const auto unlimited = generatedArrowPanBoundaryTarget(positions, 1, 100.0, 0.0);
-    REQUIRE(unlimited.has_value());
-    CHECK(*unlimited == doctest::Approx(100.0));
-    const auto nanMax = generatedArrowPanBoundaryTarget(positions, 1, 100.0, nan);
-    REQUIRE(nanMax.has_value());
-    CHECK(*nanMax == doctest::Approx(100.0));
-
-    // No room beyond the outer control point, no control points, or unusable
-    // inputs: no boundary hop.
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, 40.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({0.0, 40.0}, -1, 0.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget({}, 1, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 0, 100.0, 30.0).has_value());
-    CHECK_FALSE(generatedArrowPanBoundaryTarget(positions, 1, nan, 30.0).has_value());
-
-    // Non-finite control positions are skipped when finding the outer one.
-    const auto skipped = generatedArrowPanBoundaryTarget({nan, 20.0}, 1, 100.0, 10.0);
-    REQUIRE(skipped.has_value());
-    CHECK(*skipped == doctest::Approx(30.0));
-}
-
 TEST_CASE("arrow pan stop target picks the next control point in the direction")
 {
     const std::vector<double> positions{12.0, 20.0, 28.0, 40.0};
@@ -825,47 +793,263 @@ TEST_CASE("line annotation fixed current slice snaps only within quarter line po
           doctest::Approx(19.7499));
 }
 
-TEST_CASE("line annotation max control distance uses nearest flattened control")
+TEST_CASE("line annotation collapses nearby controls with explicit span ownership")
 {
-    const std::vector<double> controlPositions{10.0, 100.0};
+    const auto metadata = [](const std::string& message) {
+        vc3d::line_annotation::FiberTraceSegmentMetadata value;
+        value.message = message;
+        return value;
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {1.0, {32.0, 0.0, 0.0}, true, 1},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+        {3.0, {96.0, 0.0, 0.0}, false, 3},
+    };
+    controls[0].segmentToNext = metadata("left");
+    controls[1].segmentToNext = metadata("removed");
+    controls[2].segmentToNext = metadata("right");
 
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        250.0,
-        controlPositions,
-        0.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        70.0,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        55.0,
-        controlPositions,
-        40.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        100.25,
-        controlPositions,
-        80.0));
-    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
-        5.0,
-        std::vector<double>{100.0},
-        80.0));
+    const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+        controls, {2, 1}, 1.5, {48.0, 2.0, 0.0});
+    REQUIRE(collapsed.controlPoints.size() == 3);
+    CHECK(collapsed.replacementIndex == 1);
+    CHECK(collapsed.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(collapsed.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(collapsed.controlPoints[0].segmentToNext->message == "left");
+    CHECK(collapsed.controlPoints[1].linePosition == doctest::Approx(1.5));
+    CHECK(collapsed.controlPoints[1].volumePoint == cv::Vec3d(48.0, 2.0, 0.0));
+    CHECK(collapsed.controlPoints[1].optimizedIndex == -1);
+    CHECK(collapsed.controlPoints[1].isSeed);
+    REQUIRE(collapsed.controlPoints[1].segmentToNext);
+    CHECK(collapsed.controlPoints[1].segmentToNext->message == "right");
+    CHECK_FALSE(collapsed.controlPoints.back().segmentToNext.has_value());
+}
 
-    CHECK(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        95.0,
-        controlPositions,
-        80.0));
-    CHECK_FALSE(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
-        55.0,
-        controlPositions,
-        40.0));
+TEST_CASE("line annotation control collapse handles insertion endpoints and all controls")
+{
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.message = "span";
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, true, 0},
+        {2.0, {64.0, 0.0, 0.0}, false, 2},
+    };
+    controls[0].segmentToNext = metadata;
+
+    SUBCASE("insertion keeps controls ordered and splits the existing policy")
+    {
+        const auto inserted = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(inserted.controlPoints.size() == 3);
+        CHECK_FALSE(inserted.replacedExisting());
+        CHECK(inserted.replacementIndex == 1);
+        CHECK(inserted.oldToNewIndices == std::vector<size_t>{0, 2});
+        CHECK(inserted.dirtySegmentIndices == std::vector<size_t>{0, 1});
+        REQUIRE(inserted.controlPoints[0].segmentToNext);
+        REQUIRE(inserted.controlPoints[1].segmentToNext);
+        CHECK(inserted.controlPoints[0].segmentToNext->message == "span");
+        CHECK(inserted.controlPoints[1].segmentToNext->message == "span");
+    }
+
+    SUBCASE("replacing the final control leaves no outgoing metadata")
+    {
+        const auto replaced = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {1}, 2.25, {72.0, 0.0, 0.0});
+        REQUIRE(replaced.controlPoints.size() == 2);
+        CHECK(replaced.replacementIndex == 1);
+        CHECK_FALSE(replaced.controlPoints.back().segmentToNext.has_value());
+        CHECK(replaced.controlPoints.front().isSeed);
+        CHECK_FALSE(replaced.controlPoints.back().isSeed);
+    }
+
+    SUBCASE("collapsing every control produces one seed and no dirty spans")
+    {
+        const auto collapsed = vc3d::line_annotation::collapseControlPointsAtClick(
+            controls, {0, 1}, 1.0, {32.0, 0.0, 0.0});
+        REQUIRE(collapsed.controlPoints.size() == 1);
+        CHECK(collapsed.oldToNewIndices == std::vector<size_t>{0, 0});
+        CHECK(collapsed.dirtySegmentIndices.empty());
+        CHECK(collapsed.controlPoints.front().isSeed);
+        CHECK_FALSE(collapsed.controlPoints.front().segmentToNext.has_value());
+    }
+}
+
+TEST_CASE("line annotation automatic multi-control edit reconstructs the clicked span")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {30.0, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+        {40.0, 1.0, 0.0},
+        {30.0, 1.0, 0.0},
+        {20.0, 1.0, 0.0},
+        {10.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {1.0, linePoints[1], true, 1},
+        {3.0, linePoints[3], false, 3},
+        {4.0, linePoints[4], false, 4},
+        {8.0, linePoints[8], false, 8},
+    };
+    const cv::Vec3d clicked{30.0, 1.1, 0.0};
+    FiberModeNormalSampler sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 4.0;
+    config.segmentsPerSide = 3;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    const auto prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+        linePoints, controls, {1, 2}, 3.5, clicked, sampler, config);
+
+    REQUIRE(prepared.controlPoints.size() == 3);
+    REQUIRE(prepared.replacementIndex == 1);
+    CHECK(prepared.lineReconstructed);
+    CHECK(prepared.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(prepared.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(prepared.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(prepared.controlPoints[prepared.replacementIndex].volumePoint == clicked);
+    const int replacementLineIndex =
+        prepared.controlPoints[prepared.replacementIndex].optimizedIndex;
+    REQUIRE(replacementLineIndex > 0);
+    REQUIRE(replacementLineIndex < static_cast<int>(prepared.linePoints.size()) - 1);
+    CHECK(prepared.linePoints[static_cast<size_t>(replacementLineIndex)] == clicked);
+    CHECK(prepared.controlPoints[0].optimizedIndex < replacementLineIndex);
+    CHECK(replacementLineIndex < prepared.controlPoints[2].optimizedIndex);
+}
+
+TEST_CASE("line annotation automatic edit preparation leaves inputs unchanged on failure")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    const std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const std::vector<cv::Vec3d> originalLinePoints = linePoints;
+    ThrowingFiberModeNormalSampler sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 4.0;
+    config.segmentsPerSide = 3;
+
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::prepareAutomaticControlPointEdit(
+            linePoints, controls, {}, 1.0, {10.0, 1.0, 0.0}, sampler, config),
+        std::runtime_error);
+    CHECK(linePoints == originalLinePoints);
+    REQUIRE(controls.size() == 2);
+    CHECK(controls[0].linePosition == doctest::Approx(0.0));
+    CHECK(controls[0].volumePoint == linePoints[0]);
+    CHECK(controls[1].linePosition == doctest::Approx(2.0));
+    CHECK(controls[1].volumePoint == linePoints[2]);
+}
+
+TEST_CASE("line annotation one-control tangent follows authoritative line position")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {20.0, 10.0, 0.0},
+        {10.0, 10.0, 0.0},
+        {10.0, 0.1, 0.0},
+    };
+
+    CHECK(vc3d::line_annotation::lineTangentAtPosition(linePoints, 1.5) ==
+          cv::Vec3d(10.0, 0.0, 0.0));
+    CHECK(vc3d::line_annotation::lineTangentAtPosition(linePoints, 4.5) ==
+          cv::Vec3d(0.0, -9.9, 0.0));
+
+    FiberModeNormalSampler sampler;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {1.5, {10.0, 0.1, 0.0}, true, -1},
+    };
+    request.linePointsBase = linePoints;
+    request.baseNormalSampler = &sampler;
+    request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 2.0;
+    request.lasagnaConfig.runGlobalOptimization = false;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto optimized =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    REQUIRE(optimized.optimization.line.points.size() >= 3);
+    const cv::Vec3d optimizedDirection =
+        optimized.optimization.line.points.back().position -
+        optimized.optimization.line.points.front().position;
+    CHECK(std::abs(optimizedDirection[0]) > std::abs(optimizedDirection[1]));
+}
+
+TEST_CASE("line annotation all-control collapse prepares one clicked control")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    const std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const cv::Vec3d clicked{10.0, 1.0, 0.0};
+    FiberModeNormalSampler sampler;
+
+    const auto prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+        linePoints,
+        controls,
+        {0, 1},
+        1.0,
+        clicked,
+        sampler,
+        vc::lasagna::LineOptimizationConfig{});
+
+    CHECK_FALSE(prepared.lineReconstructed);
+    CHECK(prepared.linePoints == linePoints);
+    REQUIRE(prepared.controlPoints.size() == 1);
+    CHECK(prepared.replacementIndex == 0);
+    CHECK(prepared.controlPoints[0].linePosition == doctest::Approx(1.0));
+    CHECK(prepared.controlPoints[0].volumePoint == clicked);
+    CHECK(prepared.controlPoints[0].isSeed);
+    CHECK(prepared.dirtySegmentIndices.empty());
+}
+
+TEST_CASE("line annotation optimizer metadata merge follows control order")
+{
+    std::vector<vc3d::line_annotation::LineControlPoint> original{
+        {1.0, {5.0, 5.0, 5.0}, true, 1},
+        {3.0, {5.0, 5.0, 5.0}, false, 3},
+        {5.0, {9.0, 5.0, 5.0}, false, 5},
+    };
+    original[0].segmentToNext.emplace();
+    original[0].segmentToNext->message = "first winding";
+    original[1].segmentToNext.emplace();
+    original[1].segmentToNext->message = "second winding";
+    auto optimizerControls =
+        vc3d::line_annotation::optimizerControlPoints(original);
+
+    const auto merged = vc3d::line_annotation::mergeOptimizerControlPoints(
+        std::move(optimizerControls), original);
+
+    REQUIRE(merged.size() == 3);
+    REQUIRE(merged[0].segmentToNext.has_value());
+    REQUIRE(merged[1].segmentToNext.has_value());
+    CHECK(merged[0].segmentToNext->message == "first winding");
+    CHECK(merged[1].segmentToNext->message == "second winding");
+    CHECK_FALSE(merged[2].segmentToNext.has_value());
 }
 
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
